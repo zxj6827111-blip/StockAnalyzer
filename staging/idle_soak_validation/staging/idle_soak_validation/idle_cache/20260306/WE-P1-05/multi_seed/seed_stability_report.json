@@ -1,0 +1,41 @@
+{
+  "task_id": "WE-P1-05",
+  "trade_date": "20260306",
+  "generated_at": "2026-03-07T13:20:00",
+  "status": "ok",
+  "seed_count": 5,
+  "completed_seeds": 5,
+  "insufficient_seeds": false,
+  "items": [
+    {
+      "seed": 11,
+      "samples": 180,
+      "prediction_mean": 0.00086946,
+      "prediction_std": 1.892e-05
+    },
+    {
+      "seed": 29,
+      "samples": 180,
+      "prediction_mean": 0.00086711,
+      "prediction_std": 1.996e-05
+    },
+    {
+      "seed": 47,
+      "samples": 180,
+      "prediction_mean": 0.00086863,
+      "prediction_std": 1.922e-05
+    },
+    {
+      "seed": 73,
+      "samples": 180,
+      "prediction_mean": 0.00087009,
+      "prediction_std": 1.855e-05
+    },
+    {
+      "seed": 97,
+      "samples": 180,
+      "prediction_mean": 0.00087129,
+      "prediction_std": 1.785e-05
+    }
+  ]
+}

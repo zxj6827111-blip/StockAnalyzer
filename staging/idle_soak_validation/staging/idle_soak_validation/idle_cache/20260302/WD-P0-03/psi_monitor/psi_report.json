@@ -1,0 +1,29 @@
+{
+  "task_id": "WD-P0-03",
+  "trade_date": "20260302",
+  "generated_at": "2026-03-02T20:50:00",
+  "status": "degraded",
+  "baseline": "auto_generated",
+  "coverage_ratio": 0.0,
+  "warning": "PSI_UNAVAILABLE",
+  "features": [
+    {
+      "feature": "intraday_range",
+      "status": "unavailable",
+      "baseline_samples": 120,
+      "current_samples": 2
+    },
+    {
+      "feature": "ret_1d",
+      "status": "unavailable",
+      "baseline_samples": 120,
+      "current_samples": 2
+    },
+    {
+      "feature": "volume_ratio_20",
+      "status": "unavailable",
+      "baseline_samples": 120,
+      "current_samples": 2
+    }
+  ]
+}

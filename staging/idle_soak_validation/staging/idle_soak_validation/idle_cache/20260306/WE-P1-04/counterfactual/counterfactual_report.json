@@ -1,0 +1,19 @@
+{
+  "task_id": "WE-P1-04",
+  "trade_date": "20260306",
+  "generated_at": "2026-03-07T13:15:00",
+  "status": "ok",
+  "reason": "",
+  "challengers": 1,
+  "success": 1,
+  "failed": 0,
+  "items": [
+    {
+      "challenger": "c1.json",
+      "status": "ok",
+      "counterfactual_entry_delta": 0.0012,
+      "counterfactual_exit_delta": 0.0008,
+      "counterfactual_risk_delta": 0.0004
+    }
+  ]
+}

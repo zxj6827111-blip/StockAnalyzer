@@ -1,0 +1,42 @@
+{
+  "task_id": "WD-P0-01",
+  "trade_date": "20260330",
+  "phase": "end",
+  "timestamp": "2026-03-31T00:40:13.764477",
+  "extra": {
+    "result": {
+      "status": "degraded",
+      "output_files": [
+        "E:\\Software Development\\StockAnalyzer\\staging\\idle_cache\\20260330\\WD-P0-01\\data_quality\\report.json"
+      ],
+      "quality_status": "no_symbols",
+      "fallback_source_trade_date": "",
+      "error_code": "unknown_error",
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "degraded",
+          "elapsed_seconds": 0.016445,
+          "error_code": "unknown_error"
+        }
+      ],
+      "retry_attempts": 0,
+      "elapsed_seconds": 0.016493,
+      "max_wall_time_minutes": 30,
+      "retry_policy": {
+        "max_retries": 1,
+        "retry_delay_seconds": 0,
+        "retry_only_on": [
+          "file_handle_busy",
+          "network_timeout",
+          "transient_io_error"
+        ],
+        "no_retry_on": [
+          "data_unavailable",
+          "forbidden_path",
+          "schema_mismatch"
+        ]
+      }
+    }
+  }
+}

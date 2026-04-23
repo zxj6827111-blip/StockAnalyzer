@@ -1,0 +1,64 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply m-0 text-ink font-sans min-h-screen bg-bg antialiased;
+    background: radial-gradient(circle at 15% 20%, rgba(65, 214, 179, 0.25), transparent 35%),
+      linear-gradient(135deg, #061420 0%, #0a2234 52%, #0f1f2a 100%);
+  }
+
+  /* Custom scrollbar */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: rgba(15, 36, 52, 0.5); 
+  }
+  ::-webkit-scrollbar-thumb {
+    background: rgba(94, 136, 170, 0.5); 
+    border-radius: 3px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(94, 136, 170, 0.8); 
+  }
+}
+
+@layer components {
+  /* Panels and cards */
+  .glass-panel {
+    @apply bg-panel border border-panelBorder rounded-2xl shadow-[0_18px_40px_rgba(1,14,23,0.45)] backdrop-blur-sm;
+  }
+  
+  /* Buttons */
+  .btn-primary {
+    @apply border-0 rounded-full px-4 py-2 bg-gradient-to-r from-[#38d2ae] to-[#61e1c4] text-[#062437] font-bold cursor-pointer transition-all hover:-translate-y-px hover:brightness-105 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2;
+  }
+  .btn-danger {
+    @apply btn-primary bg-gradient-to-r from-warn to-[#ff6f59] text-white;
+  }
+  .btn-outline {
+    @apply border border-panelBorder rounded-full px-4 py-2 bg-[rgba(16,43,61,0.66)] text-muted font-bold cursor-pointer transition-all hover:bg-[rgba(94,136,170,0.2)] hover:text-ink disabled:opacity-50 flex items-center justify-center gap-2;
+  }
+  
+  /* Inputs */
+  .input-field {
+    @apply px-3 py-2 rounded-lg border border-[rgba(108,158,190,0.35)] bg-[#0f2a3a] text-ink focus:outline-none focus:border-accent transition-colors w-full;
+  }
+
+  /* Tables */
+  .data-table {
+    @apply w-full text-left text-sm whitespace-nowrap;
+  }
+  .data-table th {
+    @apply bg-[rgba(8,25,39,0.95)] text-muted font-normal uppercase tracking-wider px-4 py-3 border-b border-[rgba(108,158,190,0.25)];
+  }
+  .data-table td {
+    @apply px-4 py-3 border-b border-[rgba(108,158,190,0.1)] transition-colors;
+  }
+  .data-table tbody tr:hover td {
+    @apply bg-[rgba(94,136,170,0.05)];
+  }
+}

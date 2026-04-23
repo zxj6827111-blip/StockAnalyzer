@@ -1,0 +1,18 @@
+services:
+  api:
+    volumes:
+      - runtime_artifacts:/app/artifacts
+      - runtime_suggestions:/app/suggestions
+
+  scheduler:
+    volumes:
+      - runtime_artifacts:/app/artifacts
+      - runtime_suggestions:/app/suggestions
+
+volumes:
+  runtime_artifacts:
+    external: true
+    name: stock_analyzer_runtime_artifacts
+  runtime_suggestions:
+    external: true
+    name: stock_analyzer_runtime_suggestions

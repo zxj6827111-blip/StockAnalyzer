@@ -1,0 +1,936 @@
+{
+  "task_id": "WD-P0-01",
+  "trade_date": "20260310",
+  "generated_at": "2026-03-10T21:26:58.453424",
+  "status": "ok",
+  "quality_status": "healthy",
+  "fallback_source_trade_date": "",
+  "data_quality": {
+    "timestamp": "2026-03-10T21:26:55.516950",
+    "source": "week6_data_prewarm",
+    "watchlist_size": 100,
+    "lookback_days": 160,
+    "status": "healthy",
+    "overall_coverage_ratio": 1.0,
+    "success_symbols": 100,
+    "failed_symbols": 0,
+    "coverage_by_field": {
+      "financial_data_complete": 1.0,
+      "roe": 1.0,
+      "debt_ratio": 1.0,
+      "holder_count": 1.0,
+      "block_trade_net": 1.0,
+      "financing_balance": 1.0,
+      "northbound_net": 1.0,
+      "dragon_tiger_flag": 1.0,
+      "background_data_complete": 1.0
+    },
+    "core_coverage_min": 1.0,
+    "warn_threshold": 0.88,
+    "critical_threshold": 0.72,
+    "warn_fields": [],
+    "critical_fields": [],
+    "symbols": [
+      {
+        "symbol": "600989",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "001896",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "600256",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000001",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000060",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000069",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000089",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000156",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000415",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000425",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000426",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000503",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000516",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000521",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000546",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000560",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000564",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000589",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000598",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000603",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000609",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000619",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000636",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000651",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000669",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000697",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000707",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000728",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000757",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000759",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000800",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000802",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000813",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000828",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000848",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000868",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000899",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "000950",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "001914",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "001965",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002007",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002008",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002027",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002073",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002076",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002081",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002084",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002120",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002122",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002133",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002146",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002155",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002168",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002177",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002231",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic+default",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "roe"
+      },
+      {
+        "symbol": "002239",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002256",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002261",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002273",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002327",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002351",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002352",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002373",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002410",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002426",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002455",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002463",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002485",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002491",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002500",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002507",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002517",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002535",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002542",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002550",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002570",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002572",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002591",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002594",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002602",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002622",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002641",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002661",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002662",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002673",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002676",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002693",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002716",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002726",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002737",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002753",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002786",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002790",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002822",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002928",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002936",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "002939",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "003012",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "300009",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      },
+      {
+        "symbol": "300014",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "tdxgp_heuristic",
+        "financial_missing_fields": "nan"
+      }
+    ]
+  }
+}

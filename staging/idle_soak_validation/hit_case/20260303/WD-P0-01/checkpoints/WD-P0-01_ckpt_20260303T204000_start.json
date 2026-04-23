@@ -1,0 +1,18 @@
+{
+  "task_id": "WD-P0-01",
+  "trade_date": "20260303",
+  "phase": "start",
+  "timestamp": "2026-03-03T20:40:00",
+  "extra": {
+    "context": {
+      "window": "workday",
+      "window_key": "WD-20260303",
+      "trade_date": "20260303",
+      "effective_hard_stop": "08:30:00",
+      "effective_soft_stop": "08:20:00",
+      "effective_report_deadline": "08:23:00",
+      "trigger_time": "08:15:00",
+      "now": "2026-03-03T20:40:00"
+    }
+  }
+}

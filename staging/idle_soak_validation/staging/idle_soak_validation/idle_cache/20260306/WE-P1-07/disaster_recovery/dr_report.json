@@ -1,0 +1,13 @@
+{
+  "task_id": "WE-P1-07",
+  "trade_date": "20260306",
+  "generated_at": "2026-03-07T13:30:00",
+  "status": "ok",
+  "backup_file": "D:\\软件开发\\谷歌反重力开发\\StockAnalyzer\\staging\\idle_soak_validation\\artifacts\\backups\\backup_01.json",
+  "backup_size_bytes": 11,
+  "rto_seconds": 5.0,
+  "consistency_check": {
+    "checksum_verified": true,
+    "data_match_ratio": 1.0
+  }
+}

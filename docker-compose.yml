@@ -1,0 +1,86 @@
+services:
+  api:
+    build: .
+    image: stock-analyzer:latest
+    container_name: stock-analyzer-api
+    command:
+      - /app/scripts/docker-entrypoint.sh
+      - uvicorn
+      - stock_analyzer.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    env_file:
+      - .env
+    environment:
+      STOCK_ANALYZER_CONTAINERIZED: "1"
+      STOCK_ANALYZER_CONFIG: /app/config/default.yaml
+      TZ: Asia/Shanghai
+      SA__CACHE__BACKEND: redis
+      SA__CACHE__REDIS_URL: redis://redis:6379/0
+      SA__DATA_SOURCE__PRIMARY: market_warehouse
+      SA__DATA_SOURCE__LOCAL_DATA_ROOT: /app/artifacts/warehouse/package
+      SA__DATA_SOURCE__WAREHOUSE_DB_PATH: /app/artifacts/warehouse/market.duckdb
+      SA__MARKET_WAREHOUSE__DB_PATH: /app/artifacts/warehouse/market.duckdb
+      SA__MARKET_WAREHOUSE__PACKAGE_ROOT: /app/artifacts/warehouse/package
+      SA__MARKET_WAREHOUSE__BOOTSTRAP_SOURCE_ROOT: /app/artifacts/imports/tdx_offline_package
+      SA__TDX_SYNC__OUTPUT_ROOT: /app/artifacts/imports/tdx_offline_package
+      SA__EVOLUTION__STRICT_DEPENDENCY_CHECK: ${SA__EVOLUTION__STRICT_DEPENDENCY_CHECK:-true}
+      SA__EVOLUTION__ACTIVE_CHAMPION_ID: ${SA__EVOLUTION__ACTIVE_CHAMPION_ID:-champion_v7_202603}
+      SA__EVOLUTION__CODE_COMMIT_ID: ${SA__EVOLUTION__CODE_COMMIT_ID:-git:release-20260301-local}
+    volumes:
+      - ./artifacts:/app/artifacts
+      - ./suggestions:/app/suggestions
+    ports:
+      - "${SA_API_HOST_PORT:-8001}:8000"
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  scheduler:
+    build: .
+    image: stock-analyzer:latest
+    container_name: stock-analyzer-scheduler
+    command:
+      - /app/scripts/docker-entrypoint.sh
+      - python
+      - -m
+      - stock_analyzer.runtime.scheduler_worker
+    env_file:
+      - .env
+    environment:
+      STOCK_ANALYZER_CONTAINERIZED: "1"
+      STOCK_ANALYZER_CONFIG: /app/config/default.yaml
+      TZ: Asia/Shanghai
+      SA__CACHE__BACKEND: redis
+      SA__CACHE__REDIS_URL: redis://redis:6379/0
+      SA__DATA_SOURCE__PRIMARY: market_warehouse
+      SA__DATA_SOURCE__LOCAL_DATA_ROOT: /app/artifacts/warehouse/package
+      SA__DATA_SOURCE__WAREHOUSE_DB_PATH: /app/artifacts/warehouse/market.duckdb
+      SA__MARKET_WAREHOUSE__DB_PATH: /app/artifacts/warehouse/market.duckdb
+      SA__MARKET_WAREHOUSE__PACKAGE_ROOT: /app/artifacts/warehouse/package
+      SA__MARKET_WAREHOUSE__BOOTSTRAP_SOURCE_ROOT: /app/artifacts/imports/tdx_offline_package
+      SA__TDX_SYNC__OUTPUT_ROOT: /app/artifacts/imports/tdx_offline_package
+      SA__EVOLUTION__STRICT_DEPENDENCY_CHECK: ${SA__EVOLUTION__STRICT_DEPENDENCY_CHECK:-true}
+      SA__EVOLUTION__ACTIVE_CHAMPION_ID: ${SA__EVOLUTION__ACTIVE_CHAMPION_ID:-champion_v7_202603}
+      SA__EVOLUTION__CODE_COMMIT_ID: ${SA__EVOLUTION__CODE_COMMIT_ID:-git:release-20260301-local}
+      SCHEDULER_POLL_SEC: "30"
+    volumes:
+      - ./artifacts:/app/artifacts
+      - ./suggestions:/app/suggestions
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: stock-analyzer-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+volumes:
+  redis_data:

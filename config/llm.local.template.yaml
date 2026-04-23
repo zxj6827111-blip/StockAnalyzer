@@ -1,0 +1,11 @@
+evolution:
+  llm_semantic_enabled: true
+  m7_ai_review_enabled: true
+  llm_provider: "openai_compatible"
+  llm_base_url: "https://gmn.chuangzuoli.com/v1"
+  llm_model: "gpt-5.4"
+  llm_api_key: ""
+  llm_backup_provider: "openai_compatible"
+  llm_backup_base_url: "https://gmn.chuangzuoli.com/v1"
+  llm_backup_model: "gpt-5.2"
+  llm_backup_api_key: ""

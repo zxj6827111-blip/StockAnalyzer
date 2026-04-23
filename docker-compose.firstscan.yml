@@ -1,0 +1,38 @@
+services:
+  api:
+    environment:
+      SA__DATA_SOURCE__PRIMARY: market_warehouse
+      SA__DATA_SOURCE__LOCAL_DATA_ROOT: /app/artifacts/warehouse/package
+      SA__MARKET_WAREHOUSE__OFFLINE_BOOTSTRAP_ENABLED: "true"
+      SA__TDX_SYNC__VIPDOC_ROOT: /tdx/vipdoc
+      SA__TDX_SYNC__OUTPUT_ROOT: /app/artifacts/imports/tdx_offline_package
+      SA__NOTIFICATIONS__PRIMARY: console
+      SA__NOTIFICATIONS__BACKUP: console
+      SA__NOTIFICATIONS__PUSHPLUS_TOKEN: ""
+      SA__NOTIFICATIONS__WECOM_WEBHOOK: ""
+      SA__ACCEPTANCE__AUTO_RUN: "false"
+      SA__ACCEPTANCE__AUTO_NOTIFY: "false"
+      SA__TDX_SYNC__AUTO_RUN: "false"
+      SA__WECOM_INTERACTION__ENABLED: "false"
+    volumes:
+      - ${TDX_VIPDOC_HOST_ROOT}:/tdx/vipdoc:ro
+
+  scheduler:
+    profiles:
+      - scheduler
+    environment:
+      SA__DATA_SOURCE__PRIMARY: market_warehouse
+      SA__DATA_SOURCE__LOCAL_DATA_ROOT: /app/artifacts/warehouse/package
+      SA__MARKET_WAREHOUSE__OFFLINE_BOOTSTRAP_ENABLED: "true"
+      SA__TDX_SYNC__VIPDOC_ROOT: /tdx/vipdoc
+      SA__TDX_SYNC__OUTPUT_ROOT: /app/artifacts/imports/tdx_offline_package
+      SA__NOTIFICATIONS__PRIMARY: console
+      SA__NOTIFICATIONS__BACKUP: console
+      SA__NOTIFICATIONS__PUSHPLUS_TOKEN: ""
+      SA__NOTIFICATIONS__WECOM_WEBHOOK: ""
+      SA__ACCEPTANCE__AUTO_RUN: "false"
+      SA__ACCEPTANCE__AUTO_NOTIFY: "false"
+      SA__TDX_SYNC__AUTO_RUN: "false"
+      SA__WECOM_INTERACTION__ENABLED: "false"
+    volumes:
+      - ${TDX_VIPDOC_HOST_ROOT}:/tdx/vipdoc:ro

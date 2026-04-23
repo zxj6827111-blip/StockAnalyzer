@@ -1,0 +1,81 @@
+{
+  "task_id": "WD-REPORT",
+  "trade_date": "20260302",
+  "generated_at": "2026-03-03T08:24:00",
+  "status": "ok",
+  "sections": [
+    {
+      "task_id": "WD-P0-01",
+      "status": "ok",
+      "path": "D:\\软件开发\\谷歌反重力开发\\StockAnalyzer\\staging\\idle_soak_validation\\staging\\idle_soak_validation\\idle_cache\\20260302\\WD-P0-01\\data_quality\\report.json",
+      "fallback_trade_date": "",
+      "fallback_path": "",
+      "fallback_status": "",
+      "fallback_reason": ""
+    },
+    {
+      "task_id": "WD-P0-02",
+      "status": "ok",
+      "path": "D:\\软件开发\\谷歌反重力开发\\StockAnalyzer\\staging\\idle_soak_validation\\staging\\idle_soak_validation\\idle_cache\\20260302\\WD-P0-02\\failure_analysis\\loss_attribution.json",
+      "fallback_trade_date": "",
+      "fallback_path": "",
+      "fallback_status": "",
+      "fallback_reason": ""
+    },
+    {
+      "task_id": "WD-P0-03",
+      "status": "ok",
+      "path": "D:\\软件开发\\谷歌反重力开发\\StockAnalyzer\\staging\\idle_soak_validation\\staging\\idle_soak_validation\\idle_cache\\20260302\\WD-P0-03\\psi_monitor\\psi_report.json",
+      "fallback_trade_date": "",
+      "fallback_path": "",
+      "fallback_status": "",
+      "fallback_reason": ""
+    },
+    {
+      "task_id": "WD-P0-04",
+      "status": "ok",
+      "path": "D:\\软件开发\\谷歌反重力开发\\StockAnalyzer\\staging\\idle_soak_validation\\staging\\idle_soak_validation\\idle_cache\\20260302\\WD-P0-04\\exposure_scan\\industry_concentration.json",
+      "fallback_trade_date": "",
+      "fallback_path": "",
+      "fallback_status": "",
+      "fallback_reason": ""
+    },
+    {
+      "task_id": "WD-P1-05",
+      "status": "ok",
+      "path": "D:\\软件开发\\谷歌反重力开发\\StockAnalyzer\\staging\\idle_soak_validation\\staging\\idle_soak_validation\\idle_cache\\20260302\\WD-P1-05\\precompute\\precompute_cache.parquet",
+      "fallback_trade_date": "",
+      "fallback_path": "",
+      "fallback_status": "",
+      "fallback_reason": ""
+    },
+    {
+      "task_id": "WD-P1-06",
+      "status": "ok",
+      "path": "D:\\软件开发\\谷歌反重力开发\\StockAnalyzer\\staging\\idle_soak_validation\\staging\\idle_soak_validation\\idle_cache\\20260302\\WD-P1-06\\monte_carlo\\var_cvar_report.json",
+      "fallback_trade_date": "",
+      "fallback_path": "",
+      "fallback_status": "",
+      "fallback_reason": ""
+    },
+    {
+      "task_id": "WD-P1-07",
+      "status": "ok",
+      "path": "D:\\软件开发\\谷歌反重力开发\\StockAnalyzer\\staging\\idle_soak_validation\\staging\\idle_soak_validation\\idle_cache\\20260302\\WD-P1-07\\sector_radar\\sector_rotation.json",
+      "fallback_trade_date": "",
+      "fallback_path": "",
+      "fallback_status": "",
+      "fallback_reason": ""
+    }
+  ],
+  "effective_report_deadline": "08:23:00",
+  "trigger_time": "08:15:00",
+  "sections_total": 7,
+  "sections_ok": 7,
+  "sections_fallback_prev_day": 0,
+  "missing_sections": 0,
+  "completeness_ratio": 1.0,
+  "deadline_hit": false,
+  "fallback_provenance": [],
+  "degraded_all": false
+}

@@ -1,0 +1,19 @@
+{
+  "task_id": "WD-P1-07",
+  "trade_date": "20260302",
+  "generated_at": "2026-03-02T21:10:00",
+  "status": "degraded",
+  "mode": "industry_only",
+  "items": [
+    {
+      "sector": "SEC-000",
+      "momentum_5d": 0.004744,
+      "sample_size": 1
+    },
+    {
+      "sector": "SEC-600",
+      "momentum_5d": 0.004744,
+      "sample_size": 1
+    }
+  ]
+}

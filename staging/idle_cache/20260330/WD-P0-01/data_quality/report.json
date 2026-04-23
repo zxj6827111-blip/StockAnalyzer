@@ -1,0 +1,53 @@
+{
+  "task_id": "WD-P0-01",
+  "trade_date": "20260330",
+  "generated_at": "2026-03-31T00:40:13.749780",
+  "status": "degraded",
+  "quality_status": "no_symbols",
+  "fallback_source_trade_date": "",
+  "data_quality": {
+    "timestamp": "2026-03-31T00:40:13.729803",
+    "source": "week6_data_prewarm",
+    "watchlist_size": 0,
+    "lookback_days": 160,
+    "status": "no_symbols",
+    "overall_coverage_ratio": 0.0,
+    "success_symbols": 0,
+    "failed_symbols": 0,
+    "coverage_by_field": {
+      "financial_data_complete": 0.0,
+      "roe": 0.0,
+      "debt_ratio": 0.0,
+      "holder_count": 0.0,
+      "block_trade_net": 0.0,
+      "financing_balance": 0.0,
+      "northbound_net": 0.0,
+      "dragon_tiger_flag": 0.0,
+      "background_data_complete": 0.0
+    },
+    "core_coverage_min": 0.0,
+    "warn_fields": [
+      "financial_data_complete",
+      "roe",
+      "debt_ratio",
+      "holder_count",
+      "block_trade_net",
+      "financing_balance",
+      "northbound_net",
+      "dragon_tiger_flag",
+      "background_data_complete"
+    ],
+    "critical_fields": [
+      "financial_data_complete",
+      "roe",
+      "debt_ratio",
+      "holder_count",
+      "block_trade_net",
+      "financing_balance",
+      "northbound_net",
+      "dragon_tiger_flag",
+      "background_data_complete"
+    ],
+    "symbols": []
+  }
+}

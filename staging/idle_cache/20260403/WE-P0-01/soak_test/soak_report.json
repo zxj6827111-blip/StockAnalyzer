@@ -1,0 +1,8 @@
+{
+  "task_id": "WE-P0-01",
+  "trade_date": "20260403",
+  "generated_at": "2026-04-04T19:15:16.944001",
+  "status": "skipped",
+  "reason": "skipped: mock_unavailable",
+  "mock_root": "E:\\Software Development\\StockAnalyzer\\staging\\mock_history"
+}

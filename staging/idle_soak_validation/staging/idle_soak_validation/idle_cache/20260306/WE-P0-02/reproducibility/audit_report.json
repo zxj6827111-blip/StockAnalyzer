@@ -1,0 +1,26 @@
+{
+  "task_id": "WE-P0-02",
+  "trade_date": "20260306",
+  "generated_at": "2026-03-07T13:05:00",
+  "status": "ok",
+  "reason": "",
+  "samples": 2,
+  "consistent": 2,
+  "mismatch": 0,
+  "snapshot_expired": 0,
+  "hash_match_ratio": 1.0,
+  "checked": [
+    {
+      "path": "D:\\软件开发\\谷歌反重力开发\\StockAnalyzer\\staging\\idle_soak_validation\\suggestions\\challengers\\c1.json",
+      "status": "ok",
+      "source_hash": "bb7087fb16f35619f36ab21093c04e9417a53e6dd9e2c6fa1455755659dfc8f0",
+      "replay_hash": "bb7087fb16f35619f36ab21093c04e9417a53e6dd9e2c6fa1455755659dfc8f0"
+    },
+    {
+      "path": "D:\\软件开发\\谷歌反重力开发\\StockAnalyzer\\staging\\idle_soak_validation\\suggestions\\proposal_01.json",
+      "status": "ok",
+      "source_hash": "5c5216011e5e4c3df866eeb887c1ee57e37fc2c98a375748042d134f0dc4d5a0",
+      "replay_hash": "5c5216011e5e4c3df866eeb887c1ee57e37fc2c98a375748042d134f0dc4d5a0"
+    }
+  ]
+}

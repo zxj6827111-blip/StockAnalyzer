@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stock-analyzer"
+version = "0.1.0"
+description = "A-share quantitative analysis system scaffold based on implementation_plan v7"
+readme = "README.md"
+authors = [{ name = "Codex" }]
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.32.0",
+  "pydantic>=2.10.0",
+  "python-dotenv>=1.0.1",
+  "pyyaml>=6.0.2",
+  "redis>=5.2.0",
+  "cryptography>=43.0.0",
+  "lark-oapi>=1.5.3",
+  "pandas>=2.2.0",
+  "numpy>=2.1.0",
+  "typer>=0.16.0",
+  "akshare>=1.14.0",
+  "efinance>=0.5.5",
+  "easyquotation>=0.7.7",
+  "mootdx>=0.11.7",
+  "duckdb>=1.1.0",
+  "faiss-cpu>=1.8.0",
+  "lightgbm>=4.6.0",
+  "xgboost>=3.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.0",
+  "pytest-cov>=6.0.0",
+  "ruff>=0.8.0",
+  "mypy>=1.13.0",
+  "types-PyYAML>=6.0.12.20250915",
+  "pandas-stubs>=2.2.3.241126",
+]
+
+[project.scripts]
+stock-analyzer = "stock_analyzer.cli:app"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["tmp_*"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/stock_analyzer/main.py" = ["E501"]
+"src/stock_analyzer/runtime/service.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+namespace_packages = true
+mypy_path = "src"
+plugins = ["pydantic.mypy"]
+exclude = '^(tmp_.*|artifacts/.*|frontend/.*|staging/.*)$'

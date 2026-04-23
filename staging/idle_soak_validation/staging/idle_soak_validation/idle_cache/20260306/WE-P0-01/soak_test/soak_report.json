@@ -1,0 +1,15 @@
+{
+  "task_id": "WE-P0-01",
+  "trade_date": "20260306",
+  "generated_at": "2026-03-07T13:00:00",
+  "status": "ok",
+  "coverage": "30/30 trading_days",
+  "mock_root": "D:\\软件开发\\谷歌反重力开发\\StockAnalyzer\\staging\\idle_soak_validation\\staging\\mock_history",
+  "metrics": {
+    "mock_file_count": 1,
+    "mock_total_bytes": 1,
+    "memory_estimate_mb": 8.0,
+    "disk_bytes_in_root": 1,
+    "state_machine_events": 120
+  }
+}

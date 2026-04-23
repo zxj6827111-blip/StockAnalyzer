@@ -1,0 +1,81 @@
+{
+  "task_id": "WD-P0-01",
+  "trade_date": "20260302",
+  "generated_at": "2026-04-04T19:09:08.201622",
+  "status": "ok",
+  "quality_status": "healthy",
+  "fallback_source_trade_date": "",
+  "data_quality": {
+    "timestamp": "2026-03-02T20:40:00",
+    "source": "week6_data_prewarm",
+    "watchlist_size": 5,
+    "lookback_days": 160,
+    "status": "healthy",
+    "overall_coverage_ratio": 1.0,
+    "success_symbols": 5,
+    "failed_symbols": 0,
+    "coverage_by_field": {
+      "financial_data_complete": 1.0,
+      "roe": 1.0,
+      "debt_ratio": 1.0,
+      "holder_count": 1.0,
+      "block_trade_net": 1.0,
+      "financing_balance": 1.0,
+      "northbound_net": 1.0,
+      "dragon_tiger_flag": 1.0,
+      "background_data_complete": 1.0
+    },
+    "core_coverage_min": 1.0,
+    "warn_threshold": 0.88,
+    "critical_threshold": 0.72,
+    "warn_fields": [],
+    "critical_fields": [],
+    "symbols": [
+      {
+        "symbol": "605001",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "akshare_tx_default",
+        "financial_missing_fields": ""
+      },
+      {
+        "symbol": "605123",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "tdxgp_heuristic",
+        "background_source": "akshare_tx_default",
+        "financial_missing_fields": ""
+      },
+      {
+        "symbol": "605002",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "synthetic",
+        "background_source": "synthetic",
+        "financial_missing_fields": ""
+      },
+      {
+        "symbol": "605888",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "synthetic",
+        "background_source": "synthetic",
+        "financial_missing_fields": ""
+      },
+      {
+        "symbol": "600991",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "synthetic",
+        "background_source": "synthetic",
+        "financial_missing_fields": ""
+      }
+    ]
+  }
+}

@@ -1,0 +1,185 @@
+{
+  "global_market_snapshot": {
+    "us_index_change_pct": 0.0059,
+    "a50_change_pct": 0.0501,
+    "usd_cnh_change_pct": -0.0085,
+    "commodity_change_pct": 0.0086,
+    "a_share_correlation": -0.2066
+  },
+  "global_market_history": [
+    {
+      "timestamp": "2026-03-14T09:28:10.504625",
+      "source_trace_id": "premarket",
+      "snapshot": {
+        "us_index_change_pct": 0.001,
+        "a50_change_pct": 0.001,
+        "usd_cnh_change_pct": 0.001,
+        "commodity_change_pct": 0.001,
+        "a_share_correlation": 1.0
+      }
+    },
+    {
+      "timestamp": "2026-03-14T09:29:29.221625",
+      "source_trace_id": "premarket",
+      "snapshot": {
+        "us_index_change_pct": 0.001,
+        "a50_change_pct": 0.001,
+        "usd_cnh_change_pct": 0.001,
+        "commodity_change_pct": 0.001,
+        "a_share_correlation": 1.0
+      }
+    },
+    {
+      "timestamp": "2026-03-14T16:07:00.764310",
+      "source_trace_id": "premarket",
+      "snapshot": {
+        "us_index_change_pct": 0.0059,
+        "a50_change_pct": 0.0501,
+        "usd_cnh_change_pct": -0.0085,
+        "commodity_change_pct": 0.0086,
+        "a_share_correlation": -0.2066
+      }
+    }
+  ],
+  "regulatory_watchlist": {},
+  "week6_data_quality_latest": {
+    "timestamp": "2026-03-14T16:07:03.596542",
+    "source": "week6_data_prewarm",
+    "watchlist_size": 2,
+    "lookback_days": 160,
+    "status": "healthy",
+    "overall_coverage_ratio": 1.0,
+    "success_symbols": 2,
+    "failed_symbols": 0,
+    "coverage_by_field": {
+      "financial_data_complete": 1.0,
+      "roe": 1.0,
+      "debt_ratio": 1.0,
+      "holder_count": 1.0,
+      "block_trade_net": 1.0,
+      "financing_balance": 1.0,
+      "northbound_net": 1.0,
+      "dragon_tiger_flag": 1.0,
+      "background_data_complete": 1.0
+    },
+    "core_coverage_min": 1.0,
+    "warn_threshold": 0.88,
+    "critical_threshold": 0.72,
+    "warn_fields": [],
+    "critical_fields": [],
+    "symbols": [
+      {
+        "symbol": "600000",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "synthetic",
+        "background_source": "synthetic",
+        "financial_missing_fields": ""
+      },
+      {
+        "symbol": "000001",
+        "ok": true,
+        "missing_fields": [],
+        "coverage_ratio": 1.0,
+        "financial_source": "synthetic",
+        "background_source": "synthetic",
+        "financial_missing_fields": ""
+      }
+    ]
+  },
+  "week6_data_quality_history": [
+    {
+      "timestamp": "2026-03-02T20:40:00",
+      "source": "week6_data_prewarm",
+      "watchlist_size": 2,
+      "lookback_days": 160,
+      "status": "healthy",
+      "overall_coverage_ratio": 1.0,
+      "success_symbols": 2,
+      "failed_symbols": 0,
+      "coverage_by_field": {
+        "financial_data_complete": 1.0,
+        "roe": 1.0,
+        "debt_ratio": 1.0,
+        "holder_count": 1.0,
+        "block_trade_net": 1.0,
+        "financing_balance": 1.0,
+        "northbound_net": 1.0,
+        "dragon_tiger_flag": 1.0,
+        "background_data_complete": 1.0
+      },
+      "core_coverage_min": 1.0,
+      "warn_threshold": 0.88,
+      "critical_threshold": 0.72,
+      "warn_fields": [],
+      "critical_fields": [],
+      "symbols": [
+        {
+          "symbol": "600000.SH",
+          "ok": true,
+          "missing_fields": [],
+          "coverage_ratio": 1.0,
+          "financial_source": "mock",
+          "background_source": "mock",
+          "financial_missing_fields": ""
+        },
+        {
+          "symbol": "000001.SZ",
+          "ok": true,
+          "missing_fields": [],
+          "coverage_ratio": 1.0,
+          "financial_source": "mock",
+          "background_source": "mock",
+          "financial_missing_fields": ""
+        }
+      ]
+    },
+    {
+      "timestamp": "2026-03-14T16:07:03.596542",
+      "source": "week6_data_prewarm",
+      "watchlist_size": 2,
+      "lookback_days": 160,
+      "status": "healthy",
+      "overall_coverage_ratio": 1.0,
+      "success_symbols": 2,
+      "failed_symbols": 0,
+      "coverage_by_field": {
+        "financial_data_complete": 1.0,
+        "roe": 1.0,
+        "debt_ratio": 1.0,
+        "holder_count": 1.0,
+        "block_trade_net": 1.0,
+        "financing_balance": 1.0,
+        "northbound_net": 1.0,
+        "dragon_tiger_flag": 1.0,
+        "background_data_complete": 1.0
+      },
+      "core_coverage_min": 1.0,
+      "warn_threshold": 0.88,
+      "critical_threshold": 0.72,
+      "warn_fields": [],
+      "critical_fields": [],
+      "symbols": [
+        {
+          "symbol": "600000",
+          "ok": true,
+          "missing_fields": [],
+          "coverage_ratio": 1.0,
+          "financial_source": "synthetic",
+          "background_source": "synthetic",
+          "financial_missing_fields": ""
+        },
+        {
+          "symbol": "000001",
+          "ok": true,
+          "missing_fields": [],
+          "coverage_ratio": 1.0,
+          "financial_source": "synthetic",
+          "background_source": "synthetic",
+          "financial_missing_fields": ""
+        }
+      ]
+    }
+  ]
+}
