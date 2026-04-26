@@ -9,7 +9,7 @@ __pycache__
 artifacts/*
 !artifacts/model_v1.json
 suggestions
-data
+/data
 .env
 .env.*
 !.env.example

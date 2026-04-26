@@ -35,7 +35,7 @@ htmlcov/
 .tmp-py/
 .tmp_codex_pytest/
 .tmp_pytest_run2/
-data/
+/data/
 suggestions/
 artifacts/*
 !artifacts/model_v1.json
