@@ -2215,10 +2215,19 @@ def dashboard_portfolio(
 @app.command("runtime-sla")
 def runtime_sla(
     recent_runs: int = typer.Option(50, help="How many latest runs to inspect"),
+    session_scope: str = typer.Option("all", help="Session scope: all or intraday"),
+    job_scope: str = typer.Option(
+        "all",
+        help="Job scope: all, live_runtime, scheduled, or job name",
+    ),
 ) -> None:
     config = get_config()
     service = StockAnalyzerService(config=config)
-    report = service.sla_report(recent_runs=recent_runs)
+    report = service.sla_report(
+        recent_runs=recent_runs,
+        session_scope=session_scope,
+        job_scope=job_scope,
+    )
     typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
 
 

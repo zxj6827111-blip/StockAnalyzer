@@ -9825,17 +9825,36 @@ class StockAnalyzerService:
     def runtime_stage_snapshot(self, now: datetime | None = None) -> dict[str, object]:
         return self._runtime_ops_service.runtime_stage_snapshot(now=now)
 
-    def sla_report(self, recent_runs: int = 50, session_scope: str = "all") -> dict[str, object]:
+    def sla_report(
+        self,
+        recent_runs: int = 50,
+        session_scope: str = "all",
+        job_scope: str = "all",
+    ) -> dict[str, object]:
         capped_runs = max(1, recent_runs)
         recent = self._latency_history_ms[-capped_runs:]
         scope = session_scope.strip().lower() or "all"
+        normalized_job_scope = job_scope.strip().lower() or "all"
+        observed_runs = len(recent)
         if scope != "all":
             recent = [item for item in recent if _sla_entry_matches_scope(item, scope)]
+        session_scoped_runs = len(recent)
+        if normalized_job_scope != "all":
+            recent = [
+                item for item in recent if _sla_entry_matches_job_scope(item, normalized_job_scope)
+            ]
+        job_scoped_runs = len(recent)
         latencies = [_as_int(item.get("duration_ms"), default=0) for item in recent]
         if not latencies:
             return {
                 "scope": scope,
+                "job_scope": normalized_job_scope,
                 "recent_runs": 0,
+                "observed_runs": observed_runs,
+                "session_scoped_runs": session_scoped_runs,
+                "job_scoped_runs": job_scoped_runs,
+                "excluded_by_session_scope": observed_runs - session_scoped_runs,
+                "excluded_by_job_scope": session_scoped_runs - job_scoped_runs,
                 "target_ms": 60000,
                 "alert_target_ms": 30000,
                 "avg_ms": 0.0,
@@ -9857,7 +9876,13 @@ class StockAnalyzerService:
 
         return {
             "scope": scope,
+            "job_scope": normalized_job_scope,
             "recent_runs": len(latencies),
+            "observed_runs": observed_runs,
+            "session_scoped_runs": session_scoped_runs,
+            "job_scoped_runs": job_scoped_runs,
+            "excluded_by_session_scope": observed_runs - session_scoped_runs,
+            "excluded_by_job_scope": session_scoped_runs - job_scoped_runs,
             "target_ms": target_ms,
             "alert_target_ms": alert_target_ms,
             "avg_ms": round(sum(latencies) / len(latencies), 2),
@@ -16309,6 +16334,21 @@ def _sla_entry_matches_scope(entry: dict[str, object], scope: str) -> bool:
         current_time = parsed.time()
         return dt_time(hour=9, minute=15) <= current_time <= dt_time(hour=15, minute=30)
     return True
+
+
+def _sla_entry_matches_job_scope(entry: dict[str, object], job_scope: str) -> bool:
+    normalized_scope = job_scope.strip().lower()
+    if normalized_scope in {"", "all"}:
+        return True
+    job_name = str(entry.get("job_name", "")).strip().lower()
+    use_live_runtime = bool(entry.get("use_live_runtime", False))
+    if normalized_scope == "live_runtime":
+        return use_live_runtime or job_name == "week5_live_runtime" or job_name.startswith(
+            "week5_live_runtime_"
+        )
+    if normalized_scope == "scheduled":
+        return bool(job_name)
+    return job_name == normalized_scope
 
 
 def _slowest_latency_entries(

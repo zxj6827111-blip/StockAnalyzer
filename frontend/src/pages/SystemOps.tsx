@@ -45,7 +45,6 @@ export default function SystemOps() {
       ]);
       return { ops, audit, suppressed };
     },
-    [],
     15000,
   );
 

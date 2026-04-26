@@ -40,7 +40,6 @@ interface PortfolioResponse {
 export default function Portfolio() {
   const { data, error, loading, refresh, lastUpdated } = useAutoRefresh<PortfolioResponse>(
     () => apiGet<PortfolioResponse>('/dashboard/portfolio?days=7&trade_limit=30'),
-    [],
     15000,
   );
 

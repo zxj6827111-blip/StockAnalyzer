@@ -98,7 +98,12 @@ def test_service_week4_acceptance_marks_invalid_close_time_as_fail() -> None:
 def test_service_week4_acceptance_uses_intraday_runtime_sla_and_keeps_all_window_sla() -> None:
     service = _new_service(_load_test_config())
     service._latency_history_ms = [
-        {"timestamp": "2026-03-16T10:05:00", "duration_ms": 42_000},
+        {
+            "timestamp": "2026-03-16T10:05:00",
+            "duration_ms": 42_000,
+            "job_name": "week5_live_runtime",
+            "use_live_runtime": True,
+        },
         {"timestamp": "2026-03-16T20:40:00", "duration_ms": 180_000},
         {"timestamp": "2026-03-16T21:10:00", "duration_ms": 210_000},
     ]
@@ -108,12 +113,59 @@ def test_service_week4_acceptance_uses_intraday_runtime_sla_and_keeps_all_window
     window_sla = _as_mapping(report["sla"])
 
     assert runtime_sla["scope"] == "intraday"
+    assert runtime_sla["job_scope"] == "live_runtime"
     assert _as_int(runtime_sla["recent_runs"]) == 1
     assert runtime_sla["status"] == "pass"
+    assert _as_int(runtime_sla["excluded_by_session_scope"]) == 2
+    assert _as_int(runtime_sla["excluded_by_job_scope"]) == 0
     assert window_sla["scope"] == "all"
     assert _as_int(window_sla["recent_runs"]) == 3
     assert window_sla["status"] == "degraded"
     assert report["overall"] in {"pass", "pass_with_warnings"}
+
+
+def test_service_week4_acceptance_ignores_unscoped_intraday_latency_for_runtime_sla() -> None:
+    service = _new_service(_load_test_config())
+    service._latency_history_ms = [
+        {"timestamp": "2026-03-16T10:05:00", "duration_ms": 600_000},
+        {"timestamp": "2026-03-16T11:15:00", "duration_ms": 720_000},
+    ]
+
+    report = _as_mapping(service.run_week4_acceptance(sla_recent_runs=10, notify_enabled=False))
+    runtime_sla = _as_mapping(report["runtime_sla"])
+    check = next(
+        item
+        for item in _as_mapping_list(report["checks"])
+        if str(item.get("name", "")) == "sla_compliance"
+    )
+
+    assert runtime_sla["scope"] == "intraday"
+    assert runtime_sla["job_scope"] == "live_runtime"
+    assert _as_int(runtime_sla["recent_runs"]) == 0
+    assert _as_int(runtime_sla["excluded_by_job_scope"]) == 2
+    assert runtime_sla["status"] == "warn"
+    assert "excluded_unscoped_runs=2" in str(runtime_sla["detail"])
+    assert check["status"] == "warn"
+    assert report["overall"] == "pass_with_warnings"
+
+
+def test_service_week4_acceptance_fails_slow_live_runtime_sla() -> None:
+    service = _new_service(_load_test_config())
+    service._latency_history_ms = [
+        {
+            "timestamp": "2026-03-16T10:05:00",
+            "duration_ms": 120_000,
+            "job_name": "week5_live_runtime",
+            "use_live_runtime": True,
+        }
+    ]
+
+    report = _as_mapping(service.run_week4_acceptance(sla_recent_runs=10, notify_enabled=False))
+    runtime_sla = _as_mapping(report["runtime_sla"])
+
+    assert _as_int(runtime_sla["recent_runs"]) == 1
+    assert runtime_sla["status"] == "fail"
+    assert report["overall"] == "fail"
 
 
 def test_service_runtime_sla_reports_slowest_run_context() -> None:

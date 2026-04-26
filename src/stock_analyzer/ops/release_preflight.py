@@ -412,6 +412,7 @@ def _path_checks(config: StockAnalyzerConfig, root: Path) -> list[ReleasePreflig
             level="error" if config.tdx_sync.enabled else "info",
         ),
     ]
+    tdx_requires_vipdoc = bool(config.tdx_sync.enabled and config.tdx_sync.auto_run)
     vipdoc_root = config.tdx_sync.vipdoc_root.strip()
     if vipdoc_root:
         checks.append(
@@ -424,7 +425,7 @@ def _path_checks(config: StockAnalyzerConfig, root: Path) -> list[ReleasePreflig
                 level="warn",
             )
         )
-    else:
+    elif tdx_requires_vipdoc:
         checks.append(
             ReleasePreflightCheck(
                 category="paths",

@@ -407,7 +407,7 @@ function DetailRow(props: { label: string; value: string }) {
 }
 
 export default function LearningOverviewPage() {
-  const [cachedData, setCachedData] = useState<TrainingOverviewResponse | null>(() =>
+  const [cachedData] = useState<TrainingOverviewResponse | null>(() =>
     loadTrainingOverviewCache<TrainingOverviewResponse>(),
   );
   const {
@@ -418,7 +418,6 @@ export default function LearningOverviewPage() {
     lastUpdated,
   } = useAutoRefresh<TrainingOverviewResponse>(
     () => apiGet<TrainingOverviewResponse>('/dashboard/training-overview?history_limit=6'),
-    [],
     30000,
   );
   useEffect(() => {
@@ -426,7 +425,6 @@ export default function LearningOverviewPage() {
       return;
     }
     saveTrainingOverviewCache(liveData);
-    setCachedData(liveData);
   }, [liveData]);
 
   const data = liveData ?? cachedData;

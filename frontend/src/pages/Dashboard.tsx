@@ -161,19 +161,23 @@ function toneClass(tone: 'good' | 'warn' | 'accent' | 'bad' | 'muted'): string {
 }
 
 export default function Dashboard() {
-  const healthState = useAutoRefresh<HealthResponse>(() => apiGet<HealthResponse>('/health'), [], 15000);
+  const healthState = useAutoRefresh<HealthResponse>(() => apiGet<HealthResponse>('/health'), 15000);
   const portfolioState = useAutoRefresh<DashboardPortfolioResponse>(
     () => apiGet<DashboardPortfolioResponse>('/dashboard/portfolio?days=7&trade_limit=20'),
-    [],
     20000,
   );
-  const week5State = useAutoRefresh<Week5ReportResponse>(() => apiGet<Week5ReportResponse>('/week5/scan/latest'), [], 15000);
+  const week5State = useAutoRefresh<Week5ReportResponse>(
+    () => apiGet<Week5ReportResponse>('/week5/scan/latest'),
+    15000,
+  );
   const newsState = useAutoRefresh<NewsBriefResponse>(
     () => apiGet<NewsBriefResponse>('/news/briefing/latest?phase=premarket&limit=5'),
-    [],
     60000,
   );
-  const opsState = useAutoRefresh<OpsStateResponse>(() => apiGet<OpsStateResponse>('/dashboard/ops/state'), [], 15000);
+  const opsState = useAutoRefresh<OpsStateResponse>(
+    () => apiGet<OpsStateResponse>('/dashboard/ops/state'),
+    15000,
+  );
 
   const equity =
     portfolioState.data?.summary?.current_equity ??

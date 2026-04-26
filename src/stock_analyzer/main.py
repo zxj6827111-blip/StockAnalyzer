@@ -3952,8 +3952,16 @@ def dashboard_training_overview(
 
 
 @app.get("/runtime/sla")
-def runtime_sla(recent_runs: int = Query(default=50, ge=1, le=1000)) -> dict[str, object]:
-    return _service.sla_report(recent_runs=recent_runs)
+def runtime_sla(
+    recent_runs: int = Query(default=50, ge=1, le=1000),
+    session_scope: str = Query(default="all"),
+    job_scope: str = Query(default="all"),
+) -> dict[str, object]:
+    return _service.sla_report(
+        recent_runs=recent_runs,
+        session_scope=session_scope,
+        job_scope=job_scope,
+    )
 
 
 @app.get("/runtime/stage")

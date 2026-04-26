@@ -1,6 +1,7 @@
 .env
 .env.*
 !.env.example
+config/llm.local.yaml
 .venv/
 .venv-codex312*/
 __pycache__/

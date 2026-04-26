@@ -232,7 +232,6 @@ export default function ObservationPoolPage() {
       ]);
       return { report: scanResponse.report ?? null, live: liveResponse ?? null };
     },
-    [],
     15000,
   );
 

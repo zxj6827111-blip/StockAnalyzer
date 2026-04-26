@@ -52,6 +52,26 @@ def test_release_preflight_ready_for_tmp_project(tmp_path: Path) -> None:
         report.frontend_dist.endswith("frontend\\dist")
         or report.frontend_dist.endswith("frontend/dist")
     )
+    assert "paths:tdx_vipdoc_root" not in report.warnings
+
+
+def test_release_preflight_warns_for_missing_vipdoc_when_tdx_auto_sync_enabled(
+    tmp_path: Path,
+) -> None:
+    config = _load_base_config()
+    _prepare_project_root(tmp_path, config)
+    config.tdx_sync.enabled = True
+    config.tdx_sync.auto_run = True
+    config.tdx_sync.vipdoc_root = ""
+
+    report = run_release_preflight(
+        config,
+        project_root=tmp_path,
+        config_path=tmp_path / "config" / "default.yaml",
+        bind_port=None,
+    )
+
+    assert report.ready is True
     assert "paths:tdx_vipdoc_root" in report.warnings
 
 

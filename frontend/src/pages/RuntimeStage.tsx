@@ -338,7 +338,6 @@ function describeResumeReason(reason: string | undefined): string {
 export default function RuntimeStagePage() {
   const { data, error, loading, refresh, lastUpdated } = useAutoRefresh<RuntimeStageResponse>(
     () => apiGet<RuntimeStageResponse>('/runtime/stage'),
-    [],
     15000,
   );
   const [resumeSubmitting, setResumeSubmitting] = useState(false);

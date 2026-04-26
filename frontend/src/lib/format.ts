@@ -61,7 +61,7 @@ export function formatTimeShort(value: unknown): string {
 }
 
 export function formatBoolZh(value: unknown): string {
-  return Boolean(value) ? '是' : '否';
+  return value ? '是' : '否';
 }
 
 export function truncateText(value: unknown, limit = 42): string {

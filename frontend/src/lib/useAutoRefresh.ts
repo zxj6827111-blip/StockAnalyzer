@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 interface AutoRefreshState<T> {
   data: T | null;
@@ -10,19 +10,23 @@ interface AutoRefreshState<T> {
 
 export function useAutoRefresh<T>(
   loader: () => Promise<T>,
-  deps: readonly unknown[] = [],
   intervalMs = 15000,
 ): AutoRefreshState<T> {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
   const [lastUpdated, setLastUpdated] = useState('');
+  const loaderRef = useRef(loader);
+
+  useEffect(() => {
+    loaderRef.current = loader;
+  });
 
   const refresh = useCallback(async () => {
     setLoading(true);
     setError('');
     try {
-      const next = await loader();
+      const next = await loaderRef.current();
       setData(next);
       setLastUpdated(new Date().toISOString());
     } catch (err) {
@@ -31,7 +35,7 @@ export function useAutoRefresh<T>(
     } finally {
       setLoading(false);
     }
-  }, deps);
+  }, []);
 
   useEffect(() => {
     void refresh();

@@ -139,12 +139,24 @@ class RuntimeAcceptanceService:
         )
 
         sla = service.sla_report(recent_runs=sla_recent_runs, session_scope="all")
-        runtime_sla = service.sla_report(recent_runs=sla_recent_runs, session_scope="intraday")
+        runtime_sla = service.sla_report(
+            recent_runs=sla_recent_runs,
+            session_scope="intraday",
+            job_scope="live_runtime",
+        )
         recent_runs = _as_int(runtime_sla.get("recent_runs"), default=0)
         compliance_rate = _as_float(runtime_sla.get("compliance_rate"), default=0.0)
         if recent_runs == 0:
             sla_status = "warn"
-            sla_detail = "no runtime runs in SLA window"
+            excluded_by_job_scope = _as_int(runtime_sla.get("excluded_by_job_scope"), default=0)
+            sla_detail = (
+                "no live runtime runs in SLA window"
+                if excluded_by_job_scope == 0
+                else (
+                    "no live runtime runs in SLA window; "
+                    f"excluded_unscoped_runs={excluded_by_job_scope}"
+                )
+            )
         elif compliance_rate >= 0.95:
             sla_status = "pass"
             sla_detail = f"compliance_rate={compliance_rate:.4f}"

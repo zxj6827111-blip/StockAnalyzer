@@ -122,7 +122,6 @@ export default function News() {
       ]);
       return { premarket, midday, watchlist };
     },
-    [],
     30000,
   );
 
