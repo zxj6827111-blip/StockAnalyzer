@@ -14,8 +14,8 @@ RUN npm run build
 
 FROM python:3.11-slim
 
-ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
-ARG PIP_EXTRA_INDEX_URL=
+ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
+ARG PIP_EXTRA_INDEX_URL=https://pypi.org/simple
 ARG PIP_TIMEOUT=600
 ARG PIP_RETRIES=10
 
