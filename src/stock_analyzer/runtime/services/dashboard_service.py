@@ -693,8 +693,10 @@ def _summarize_active_warehouse_sync(
 ) -> dict[str, object]:
     active_progress = _as_dict(lock.get("active_progress")) or dict(progress)
     lock_running = bool(lock.get("running", False))
-    progress_running = str(active_progress.get("status", "")).strip().lower() == "running"
-    if not lock_running and not progress_running:
+    progress_status = str(active_progress.get("status", "")).strip().lower()
+    if not lock_running:
+        return {"running": False}
+    if progress_status and progress_status != "running":
         return {"running": False}
 
     trace_id = str(active_progress.get("trace_id", "")).strip() or str(

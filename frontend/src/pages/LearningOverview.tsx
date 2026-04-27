@@ -590,7 +590,7 @@ export default function LearningOverviewPage() {
               <div className="rounded-full border border-panelBorder bg-[rgba(12,33,48,0.55)] px-3 py-1.5">全量覆盖：{formatPercent(coverageRatio, 2)}</div>
               {activeSyncRunning ? (
                 <div className="rounded-full border border-[rgba(255,184,77,0.26)] bg-[rgba(255,184,77,0.10)] px-3 py-1.5 text-warn">
-                  局部同步中：{formatNumber(activeSync.symbols_completed, 0)} / {formatNumber(activeSync.symbols_total, 0)}
+                  数据同步中：{formatNumber(activeSync.symbols_completed, 0)} / {formatNumber(activeSync.symbols_total, 0)}
                 </div>
               ) : null}
               {backgroundSource === 'stable_completed_sync' ? (

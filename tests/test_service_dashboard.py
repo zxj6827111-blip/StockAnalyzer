@@ -8,6 +8,7 @@ from typing import cast
 
 from stock_analyzer.command.channel import CommandEnvelope, SignedCommandProcessor
 from stock_analyzer.config import StockAnalyzerConfig, load_config
+from stock_analyzer.runtime.services.dashboard_service import _resolve_training_overview_warehouse_context
 from stock_analyzer.runtime.service import StockAnalyzerService
 
 
@@ -825,3 +826,34 @@ def test_service_training_overview_uses_stable_coverage_after_partial_focus_sync
     assert latest_completed_sync["failed_symbols_total"] == 33
     assert stable_completed_sync["latest_trade_date"] == "2026-04-24"
     assert stable_completed_sync["latest_trade_date_coverage_ratio"] == 0.970158
+
+
+def test_training_overview_ignores_stale_running_progress_without_lock() -> None:
+    context = _resolve_training_overview_warehouse_context(
+        current_background={
+            "latest_trade_date": "2026-04-27",
+            "symbols_total": 5194,
+            "symbols_on_latest_trade_date": 5173,
+            "symbols_stale": 21,
+            "latest_trade_date_coverage_ratio": 0.996,
+        },
+        latest_report={},
+        history_items=[],
+        progress={
+            "trace_id": "old-sync",
+            "status": "running",
+            "phase": "syncing",
+            "symbols_total": 5190,
+            "symbols_completed": 37,
+            "updated_at": "2026-04-27T20:30:00",
+        },
+        lock={
+            "exists": False,
+            "running": False,
+            "is_stale": False,
+        },
+    )
+
+    active_sync = _as_mapping(context["active_sync"])
+    assert active_sync["running"] is False
+    assert context["background_source"] == "current_snapshot"
