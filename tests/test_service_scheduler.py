@@ -3,7 +3,7 @@ from __future__ import annotations
 import tempfile
 import time
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Event
 from typing import Any, cast
@@ -356,7 +356,8 @@ def test_evening_jobs_run_in_trigger_time_order_after_late_restart() -> None:
     sync_called = Event()
     followup_called = Event()
 
-    def _fake_evolution_job() -> dict[str, object]:
+    def _fake_evolution_job(now: datetime | None = None) -> dict[str, object]:
+        _ = now
         call_order.append("evolution_offhours")
         return {"report": {"status": "ok"}}
 
@@ -691,11 +692,46 @@ def test_week7_cloud_backup_watchdog_interval_job_runs() -> None:
     first_job = _job_result(first, "week7_cloud_backup_watchdog")
     assert _as_bool(first_job["ran"]) is True
     assert _as_bool(first_job["success"]) is True
-    assert "status" in _as_mapping(first_job["payload"])
+    first_payload = _as_mapping(first_job["payload"])
+    first_status = _as_mapping(first_payload["status"])
+    assert first_payload["alerted"] is False
+    assert first_status["is_offline"] is False
+    assert first_status["armed"] is False
 
     duplicate = service.run_due_jobs(now=datetime.fromisoformat("2026-03-01T08:20:30"))
     duplicate_job = _job_result(duplicate, "week7_cloud_backup_watchdog")
     assert _as_bool(duplicate_job["ran"]) is False
+
+
+def test_week7_cloud_backup_watchdog_reads_shared_runtime_state() -> None:
+    config = _load_test_config()
+    config.command_channel.state_persist_enabled = True
+    config.scheduler.premarket_time = "23:59"
+    config.scheduler.auction_report_time = "23:59"
+    config.scheduler.close_reconcile_time = "23:59"
+    config.scheduler.week4_acceptance_time = "23:59"
+    config.week5.auto_run = False
+    config.week6.auto_run = False
+    config.cloud_backup.enabled = True
+    config.cloud_backup.ping_interval_min = 10
+    config.cloud_backup.alert_after_offline_min = 120
+
+    scheduler_service = _new_service(config)
+    api_service = _new_service(config)
+    base = datetime.now() - timedelta(minutes=5)
+    _ = api_service.cloud_backup_ping(source="api", timestamp=base)
+
+    results = scheduler_service.run_due_jobs(now=datetime.fromisoformat("2026-03-01T08:20:00"))
+    job = _job_result(results, "week7_cloud_backup_watchdog")
+    payload = _as_mapping(job["payload"])
+    status = _as_mapping(payload["status"])
+
+    assert _as_bool(job["ran"]) is True
+    assert payload["alerted"] is False
+    assert status["last_ping_at"] == base.isoformat()
+    assert status["last_ping_source"] == "api"
+    assert status["armed"] is True
+    assert status["is_offline"] is False
 
 
 def test_scheduler_blocked_when_bootstrap_required_and_incomplete(tmp_path: Path) -> None:
@@ -1167,6 +1203,15 @@ def test_market_warehouse_scheduler_job_retries_after_lock_conflict_without_cons
         )
 
     launched_results = service.run_due_jobs(now=datetime.fromisoformat("2026-03-02T18:21:00"))
+    launched_job = _job_result(launched_results, "market_warehouse_sync")
+    launched_payload = _as_mapping(launched_job["payload"])
+
+    assert _as_bool(launched_job["ran"]) is True
+    assert _as_bool(launched_job["success"]) is True
+    assert launched_job["detail"] == "launched"
+    assert launched_payload["status"] == "launched"
+    assert followup_called.wait(timeout=1.0)
+    assert len(sync_calls) == 1
 
 
 def test_weekend_keeps_offhours_learning_but_skips_trading_jobs() -> None:
@@ -1187,7 +1232,8 @@ def test_weekend_keeps_offhours_learning_but_skips_trading_jobs() -> None:
 
     evolution_calls: list[str] = []
 
-    def _fake_evolution_job() -> dict[str, object]:
+    def _fake_evolution_job(now: datetime | None = None) -> dict[str, object]:
+        _ = now
         evolution_calls.append("ok")
         return {"report": {"status": "ok"}}
 
@@ -1204,15 +1250,6 @@ def test_weekend_keeps_offhours_learning_but_skips_trading_jobs() -> None:
     assert _job_result(evening, "week6_daily")["detail"] == "not_scheduled_today"
     assert _as_bool(_job_result(evening, "evolution_offhours")["ran"]) is True
     assert evolution_calls == ["ok"]
-    launched_job = _job_result(launched_results, "market_warehouse_sync")
-    launched_payload = _as_mapping(launched_job["payload"])
-
-    assert _as_bool(launched_job["ran"]) is True
-    assert _as_bool(launched_job["success"]) is True
-    assert launched_job["detail"] == "launched"
-    assert launched_payload["status"] == "launched"
-    assert followup_called.wait(timeout=1.0)
-    assert len(sync_calls) == 1
 
 
 def test_post_market_warehouse_followup_skips_when_coverage_gate_fails() -> None:

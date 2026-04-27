@@ -386,6 +386,7 @@ class CloudBackupConfig(_StrictModel):
     ping_interval_min: int = 10
     alert_after_offline_min: int = 15
     notify_recovery: bool = True
+    require_first_ping_before_alert: bool = True
 
 
 class FactorLifecycleConfig(_StrictModel):

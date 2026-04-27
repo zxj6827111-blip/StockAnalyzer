@@ -1351,6 +1351,7 @@ class RuntimeMarketSyncService:
         payload["age_sec"] = round(age_sec, 3)
         payload["stale_after_sec"] = stale_after_sec
         payload["is_stale"] = age_sec >= stale_after_sec
+        payload["running"] = not bool(payload["is_stale"])
         return payload
 
     def _touch_market_warehouse_sync_lock(self, *, lock_path: Path, owner_token: str) -> bool:

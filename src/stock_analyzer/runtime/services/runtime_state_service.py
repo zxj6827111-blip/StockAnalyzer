@@ -36,7 +36,7 @@ class RuntimeStateService:
         market_warehouse_limit = max(1, service._config.market_warehouse.history_limit)
         evolution_limit = max(1, service._config.evolution.history_limit)
         return {
-            "state_version": 5,
+            "state_version": 6,
             "updated_at": datetime.now().isoformat(),
             "scheduler_state": service._scheduler.export_state(),
             "current_equity": service._state.current_equity,
@@ -98,6 +98,7 @@ class RuntimeStateService:
             "market_warehouse_progress": service._runtime_state_optional_dict(
                 service._last_market_warehouse_progress
             ),
+            "cloud_backup": self._runtime_state_cloud_backup_payload(),
             "evolution_latest": service._runtime_state_optional_dict(
                 service._last_evolution_report
             ),
@@ -196,6 +197,34 @@ class RuntimeStateService:
         if not history:
             return None
         return deepcopy(history[-1])
+
+    def _runtime_state_cloud_backup_payload(self) -> dict[str, object]:
+        service = self._service
+        armed = bool(service._cloud_backup_armed or service._cloud_backup_last_ping_at is not None)
+        require_first_ping = bool(service._config.cloud_backup.require_first_ping_before_alert)
+        return {
+            "last_ping_at": (
+                service._cloud_backup_last_ping_at.isoformat()
+                if service._cloud_backup_last_ping_at is not None
+                else ""
+            ),
+            "last_ping_source": str(service._cloud_backup_last_ping_source).strip(),
+            "alert_active": bool(
+                service._cloud_backup_alert_active and (armed or not require_first_ping)
+            ),
+            "last_alert_at": (
+                service._cloud_backup_last_alert_at.isoformat()
+                if service._cloud_backup_last_alert_at is not None
+                else ""
+            ),
+            "last_recovery_at": (
+                service._cloud_backup_last_recovery_at.isoformat()
+                if service._cloud_backup_last_recovery_at is not None
+                else ""
+            ),
+            "armed": armed,
+            "has_ping_history": armed,
+        }
 
     def _persist_runtime_state_to_disk(self) -> None:
         service = self._service
@@ -335,6 +364,7 @@ class RuntimeStateService:
         service._last_market_warehouse_progress = service._runtime_state_optional_dict(
             raw.get("market_warehouse_progress")
         )
+        self._load_runtime_state_cloud_backup(raw.get("cloud_backup"))
         service._evolution_history = service._runtime_state_dict_list(
             raw.get("evolution_history"),
             limit=max(1, service._config.evolution.history_limit),
@@ -424,6 +454,46 @@ class RuntimeStateService:
         if mtime_ns <= service._runtime_state_loaded_mtime_ns:
             return
         service._load_runtime_state_from_disk()
+
+    def _refresh_cloud_backup_state_from_disk(self) -> None:
+        service = self._service
+        if not bool(service._config.command_channel.state_persist_enabled):
+            return
+        path = service._runtime_state_path
+        if not path.exists():
+            return
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(raw, dict):
+            return
+        self._load_runtime_state_cloud_backup(raw.get("cloud_backup"))
+
+    def _load_runtime_state_cloud_backup(self, raw: object) -> None:
+        if not isinstance(raw, Mapping):
+            return
+        service = self._service
+        normalized = self._merge_runtime_state_cloud_backup(raw, {})
+        last_ping_at = _parse_runtime_state_datetime(normalized.get("last_ping_at"))
+        last_alert_at = _parse_runtime_state_datetime(normalized.get("last_alert_at"))
+        last_recovery_at = _parse_runtime_state_datetime(normalized.get("last_recovery_at"))
+        armed = (
+            _as_bool(normalized.get("armed"), default=False)
+            or _as_bool(normalized.get("has_ping_history"), default=False)
+            or last_ping_at is not None
+        )
+        service._cloud_backup_last_ping_at = last_ping_at
+        service._cloud_backup_last_ping_source = str(
+            normalized.get("last_ping_source", "")
+        ).strip()
+        service._cloud_backup_last_alert_at = last_alert_at
+        service._cloud_backup_last_recovery_at = last_recovery_at
+        service._cloud_backup_armed = armed
+        require_first_ping = bool(service._config.cloud_backup.require_first_ping_before_alert)
+        service._cloud_backup_alert_active = bool(
+            normalized.get("alert_active", False) and (armed or not require_first_ping)
+        )
 
     def _merge_runtime_state_payload(
         self,
@@ -573,6 +643,10 @@ class RuntimeStateService:
             existing.get("market_warehouse_progress"),
             current_raw.get("market_warehouse_progress"),
         )
+        merged["cloud_backup"] = self._merge_runtime_state_cloud_backup(
+            existing.get("cloud_backup"),
+            current_raw.get("cloud_backup"),
+        )
         evolution_history = service._merge_runtime_state_history(
             existing.get("evolution_history"),
             current_raw.get("evolution_history"),
@@ -718,6 +792,80 @@ class RuntimeStateService:
             execution_aware_history,
         )
         return merged
+
+    def _merge_runtime_state_cloud_backup(
+        self,
+        existing_raw: object,
+        current_raw: object,
+    ) -> dict[str, object]:
+        states = [
+            state
+            for state in (
+                self._runtime_state_optional_dict(existing_raw),
+                self._runtime_state_optional_dict(current_raw),
+            )
+            if state is not None
+        ]
+        if not states:
+            return {
+                "last_ping_at": "",
+                "last_ping_source": "",
+                "alert_active": False,
+                "last_alert_at": "",
+                "last_recovery_at": "",
+                "armed": False,
+                "has_ping_history": False,
+            }
+
+        last_ping_at = _latest_runtime_state_datetime(states, "last_ping_at")
+        last_alert_at = _latest_runtime_state_datetime(states, "last_alert_at")
+        last_recovery_at = _latest_runtime_state_datetime(states, "last_recovery_at")
+        last_ping_source = ""
+        source_timestamp: datetime | None = None
+        for state in states:
+            candidate_timestamp = _parse_runtime_state_datetime(state.get("last_ping_at"))
+            candidate_source = str(state.get("last_ping_source", "")).strip()
+            if candidate_timestamp is None:
+                if not last_ping_source and candidate_source:
+                    last_ping_source = candidate_source
+                continue
+            if source_timestamp is None or candidate_timestamp >= source_timestamp:
+                source_timestamp = candidate_timestamp
+                last_ping_source = candidate_source
+
+        armed = any(
+            _as_bool(state.get("armed"), default=False)
+            or _as_bool(state.get("has_ping_history"), default=False)
+            for state in states
+        ) or last_ping_at is not None
+        inactive_candidates = [
+            timestamp
+            for timestamp in (last_ping_at, last_recovery_at)
+            if timestamp is not None
+        ]
+        inactive_at = max(inactive_candidates) if inactive_candidates else None
+        if last_alert_at is not None:
+            alert_active = inactive_at is None or last_alert_at > inactive_at
+        else:
+            alert_active = (
+                any(_as_bool(state.get("alert_active"), default=False) for state in states)
+                and inactive_at is None
+            )
+
+        require_first_ping = bool(
+            self._service._config.cloud_backup.require_first_ping_before_alert
+        )
+        return {
+            "last_ping_at": last_ping_at.isoformat() if last_ping_at is not None else "",
+            "last_ping_source": last_ping_source,
+            "alert_active": bool(alert_active and (armed or not require_first_ping)),
+            "last_alert_at": last_alert_at.isoformat() if last_alert_at is not None else "",
+            "last_recovery_at": (
+                last_recovery_at.isoformat() if last_recovery_at is not None else ""
+            ),
+            "armed": armed,
+            "has_ping_history": armed,
+        }
 
     def _merge_runtime_state_scheduler(
         self,
@@ -938,6 +1086,52 @@ def _as_int(value: object, default: int) -> int:
         except ValueError:
             return default
     return default
+
+
+def _as_bool(value: object, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    return default
+
+
+def _parse_runtime_state_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        normalized = value.strip()
+        if not normalized:
+            return None
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is not None:
+        return parsed.astimezone().replace(tzinfo=None)
+    return parsed
+
+
+def _latest_runtime_state_datetime(
+    states: list[dict[str, object]],
+    key: str,
+) -> datetime | None:
+    timestamps = [
+        timestamp
+        for timestamp in (_parse_runtime_state_datetime(state.get(key)) for state in states)
+        if timestamp is not None
+    ]
+    return max(timestamps) if timestamps else None
 
 
 def _report_timestamp(report: dict[str, object]) -> float:

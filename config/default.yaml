@@ -353,6 +353,7 @@ cloud_backup:
   ping_interval_min: 5
   alert_after_offline_min: 10
   notify_recovery: true
+  require_first_ping_before_alert: true
 
 factor_lifecycle:
   enabled: true

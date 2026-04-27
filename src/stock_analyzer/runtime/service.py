@@ -244,6 +244,7 @@ class StockAnalyzerService:
         self._cloud_backup_alert_active = False
         self._cloud_backup_last_alert_at: datetime | None = None
         self._cloud_backup_last_recovery_at: datetime | None = None
+        self._cloud_backup_armed = False
         self._provider_degraded_alert_active = False
         self._risk_circuit_breaker_alert_active = False
         self._risk_capital_protection_level = ""
@@ -3896,6 +3897,10 @@ class StockAnalyzerService:
     def _refresh_runtime_state_from_disk_if_changed(self) -> None:
         with self._runtime_state_io_lock:
             self._runtime_state_service._refresh_runtime_state_from_disk_if_changed()
+
+    def _refresh_cloud_backup_state_from_disk(self) -> None:
+        with self._runtime_state_io_lock:
+            self._runtime_state_service._refresh_cloud_backup_state_from_disk()
 
     def _merge_runtime_state_payload(
         self,
@@ -12487,13 +12492,16 @@ class StockAnalyzerService:
         source_trace_id: str = "",
         timestamp: datetime | None = None,
     ) -> dict[str, object]:
+        self._refresh_cloud_backup_state_from_disk()
         now = timestamp or datetime.now()
         recovered = self._cloud_backup_alert_active
         self._cloud_backup_last_ping_at = now
         self._cloud_backup_last_ping_source = source.strip() or "manual"
+        self._cloud_backup_armed = True
         self._cloud_backup_alert_active = False
         if recovered:
             self._cloud_backup_last_recovery_at = now
+            self._persist_runtime_state_to_disk()
             if self._config.cloud_backup.notify_recovery:
                 recovery_status = self.cloud_backup_status(now=now)
                 self.notify(
@@ -12526,6 +12534,7 @@ class StockAnalyzerService:
                 "recovered": recovered,
             },
         )
+        self._persist_runtime_state_to_disk()
         status = self.cloud_backup_status(now=now)
         status["accepted"] = True
         status["source"] = self._cloud_backup_last_ping_source
@@ -12533,7 +12542,10 @@ class StockAnalyzerService:
         return status
 
     def cloud_backup_status(self, now: datetime | None = None) -> dict[str, object]:
+        self._refresh_cloud_backup_state_from_disk()
         current = now or datetime.now()
+        armed = bool(self._cloud_backup_armed or self._cloud_backup_last_ping_at is not None)
+        require_first_ping = bool(self._config.cloud_backup.require_first_ping_before_alert)
         if not self._config.cloud_backup.enabled:
             return {
                 "enabled": False,
@@ -12541,30 +12553,38 @@ class StockAnalyzerService:
                 "offline_seconds": 0.0,
                 "offline_minutes": 0.0,
                 "alert_after_offline_min": self._config.cloud_backup.alert_after_offline_min,
+                "require_first_ping_before_alert": require_first_ping,
                 "last_ping_at": "",
                 "last_ping_source": self._cloud_backup_last_ping_source,
-                "alert_active": self._cloud_backup_alert_active,
+                "alert_active": False,
                 "last_alert_at": "",
                 "last_recovery_at": "",
+                "armed": armed,
+                "has_ping_history": armed,
             }
 
-        reference = self._cloud_backup_last_ping_at or self._service_started_at
-        offline_seconds = max(0.0, (current - reference).total_seconds())
+        if not armed and require_first_ping:
+            offline_seconds = 0.0
+        else:
+            reference = self._cloud_backup_last_ping_at or self._service_started_at
+            offline_seconds = max(0.0, (current - reference).total_seconds())
         threshold_sec = max(1, self._config.cloud_backup.alert_after_offline_min * 60)
-        is_offline = offline_seconds >= threshold_sec
+        is_offline = (armed or not require_first_ping) and offline_seconds >= threshold_sec
+        alert_active = bool(self._cloud_backup_alert_active and (armed or not require_first_ping))
         return {
             "enabled": True,
             "is_offline": is_offline,
             "offline_seconds": round(offline_seconds, 2),
             "offline_minutes": round(offline_seconds / 60.0, 4),
             "alert_after_offline_min": self._config.cloud_backup.alert_after_offline_min,
+            "require_first_ping_before_alert": require_first_ping,
             "last_ping_at": (
                 self._cloud_backup_last_ping_at.isoformat()
                 if self._cloud_backup_last_ping_at is not None
                 else ""
             ),
             "last_ping_source": self._cloud_backup_last_ping_source,
-            "alert_active": self._cloud_backup_alert_active,
+            "alert_active": alert_active,
             "last_alert_at": (
                 self._cloud_backup_last_alert_at.isoformat()
                 if self._cloud_backup_last_alert_at is not None
@@ -12575,6 +12595,8 @@ class StockAnalyzerService:
                 if self._cloud_backup_last_recovery_at is not None
                 else ""
             ),
+            "armed": armed,
+            "has_ping_history": armed,
         }
 
     def run_cloud_backup_check(
@@ -12590,6 +12612,19 @@ class StockAnalyzerService:
                 "alerted": False,
                 "snapshot": {},
             }
+        if (
+            bool(status.get("require_first_ping_before_alert", True))
+            and not bool(status.get("armed", False))
+        ):
+            if self._cloud_backup_alert_active:
+                self._cloud_backup_alert_active = False
+                self._persist_runtime_state_to_disk()
+                status = self.cloud_backup_status(now=current)
+            return {
+                "status": status,
+                "alerted": False,
+                "snapshot": {},
+            }
 
         alerted = False
         snapshot: dict[str, object] = {}
@@ -12597,6 +12632,7 @@ class StockAnalyzerService:
             self._cloud_backup_alert_active = True
             self._cloud_backup_last_alert_at = current
             alerted = True
+            self._persist_runtime_state_to_disk()
             snapshot = self._cloud_backup_snapshot(now=current)
             self.notify(
                 title=_push_title(priority="P0", category="system", summary="cloud backup offline"),
@@ -12627,6 +12663,7 @@ class StockAnalyzerService:
                     "snapshot": snapshot,
                 },
             )
+            self._persist_runtime_state_to_disk()
             status = self.cloud_backup_status(now=current)
         return {
             "status": status,

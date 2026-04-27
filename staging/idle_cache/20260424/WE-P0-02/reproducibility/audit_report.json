@@ -1,0 +1,314 @@
+{
+  "task_id": "WE-P0-02",
+  "trade_date": "20260424",
+  "generated_at": "2026-04-26T19:05:01.749309",
+  "status": "degraded",
+  "reason": "hash_mismatch_detected",
+  "samples": 30,
+  "consistent": 29,
+  "mismatch": 1,
+  "snapshot_expired": 0,
+  "hash_match_ratio": 0.966667,
+  "checked": [
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260301_204000_267dacd4.json",
+      "status": "ok",
+      "source_hash": "602a204402afd1bc6746401b3e48696f6d66222f2a004ae4a6e8e3463ce6db0b",
+      "replay_hash": "724e8c4b3e3b88c4cccc4de6d294a0b63a3a7cc63c842941394bb85d45f3d360",
+      "source_fused_score": 69.39023238,
+      "replay_fused_score": 69.39023238,
+      "score_diff": 0.0,
+      "artifact_missing": 0
+    },
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260301_204000_d2e8edb4.json",
+      "status": "ok",
+      "source_hash": "2e5b2e1c1342a2bf243a7f9d4738c4f8a590b9979f9e62aa90d37358b86cb0ac",
+      "replay_hash": "106f8fad89919834d9e1036aae026836ec18ca0f2efe5046b212a38ddbe5f2d3",
+      "source_fused_score": 36.5,
+      "replay_fused_score": 36.5,
+      "score_diff": 0.0,
+      "artifact_missing": 0
+    },
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260301_204100_c6381e38.json",
+      "status": "ok",
+      "source_hash": "492c8a2096b4a52b3e9bcc3afe49655692d76cf3b7b4f1fe40420b35fd11ffaa",
+      "replay_hash": "f7581b7eed7a885640a44811543ed1bdc0340d67951d2bd18ec7db7d4c3604f9",
+      "source_fused_score": 36.5,
+      "replay_fused_score": 36.5,
+      "score_diff": 0.0,
+      "artifact_missing": 0
+    },
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260301_204200_571266a3.json",
+      "status": "ok",
+      "source_hash": "d580b3837fd19df25019ae4a782c8ec485e7ecc9214308d93ba4a928f21fc28c",
+      "replay_hash": "842ec2382963b546f964768643cbcb36f696f544564396379abee52d96d66c17",
+      "source_fused_score": 36.5,
+      "replay_fused_score": 36.5,
+      "score_diff": 0.0,
+      "artifact_missing": 0
+    },
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260301_204300_fd34a1e9.json",
+      "status": "ok",
+      "source_hash": "0e79cf95d223af9d30f12583d9fe98ffc570c62722ca68f96fe8abf667ef9327",
+      "replay_hash": "e8e408aabdbf26c1eaeb9cbf6a60430b7a2f444283b7f140ddd78ebd7d33ae3d",
+      "source_fused_score": 36.5,
+      "replay_fused_score": 36.5,
+      "score_diff": 0.0,
+      "artifact_missing": 0
+    },
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260301_204400_e5906a1c.json",
+      "status": "ok",
+      "source_hash": "7e28ee73ebccc5aa8456766f8839fe482c8c2968a3b2d149ba86d58e55848822",
+      "replay_hash": "3f2919bc9bc8be94b4738615e0a77e9ad669882fb1fa2da3794f8347f9200bc2",
+      "source_fused_score": 36.5,
+      "replay_fused_score": 36.5,
+      "score_diff": 0.0,
+      "artifact_missing": 0
+    },
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260301_204500_61c450a9.json",
+      "status": "ok",
+      "source_hash": "005d290f52ece620dc1e2ddaac53285d815ad1937d1ae5871fe465878b83556e",
+      "replay_hash": "37bc72f8184aac56bc4c659d3c45a3808d1948147dab90eba5e3a2aad70b1ddf",
+      "source_fused_score": 36.5,
+      "replay_fused_score": 36.5,
+      "score_diff": 0.0,
+      "artifact_missing": 0
+    },
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260301_233446_3ff11b3d.json",
+      "status": "ok",
+      "source_hash": "6ed7f960e1a815e5dca21672aa2c47518a465341ba0d36a404c2fd75c0d7a361",
+      "replay_hash": "f89b957c116768c514abbf7969b992e7fadb41f4887c7a31972df61ca435b61c",
+      "source_fused_score": 58.39143849,
+      "replay_fused_score": 58.39143849,
+      "score_diff": 0.0,
+      "artifact_missing": 0
+    },
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260302_204000_0111d2b7.json",
+      "status": "ok",
+      "source_hash": "4e911826f45bb4e4bc174ce15336b624e21a573043f7aef08ee0c545aab3d0d3",
+      "replay_hash": "a7226242d0b3d1b7969015a034c23c79dbc76356ad5711b5ed6dca5ff8f7d1ca",
+      "source_fused_score": 74.44913839,
+      "replay_fused_score": 74.44913839,
+      "score_diff": 0.0,
+      "artifact_missing": 0
+    },
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260302_204000_016b2798.json",
+      "status": "ok",
+      "source_hash": "872186b9b5b2eff52eeb8bb274c8d5ef8e774a2cb26fee443656f83520cdeda6",
+      "replay_hash": "39de3342a9f91ddab7fe19eb074e96521252778f0211e36cf25ba0b2e656b24b",
+      "source_fused_score": 76.05849246,
+      "replay_fused_score": 76.05849246,
+      "score_diff": 0.0,
+      "artifact_missing": 0
+    },
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260302_204000_065c7a17.json",
+      "status": "ok",
+      "source_hash": "1242dd475ba57cae08981408f6f4f00c00ebb9710e958c3f27e0130c91d9ace4",
+      "replay_hash": "3e8107cb5eeeda7ce0c1efb6283f7741bc0bd3a9d4fc281146bbb14fd4ae7eb5",
+      "source_fused_score": 72.16124179,
+      "replay_fused_score": 72.16124179,
+      "score_diff": 0.0,
+      "artifact_missing": 0
+    },
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260302_204000_089c5d45.json",
+      "status": "ok",
+      "source_hash": "5e5bda02a928e56e90f8b1917802e1de0e24f581b3483081357e2c0899c6ebc5",
+      "replay_hash": "5b085a1327d22bc89f3253cdfa7e41ee8d4e8de2f3e458a1eeabdd7ecca73d40",
+      "source_fused_score": 61.3944761,
+      "replay_fused_score": 61.3944761,
+      "score_diff": 0.0,
+      "artifact_missing": 0
+    },
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260302_204000_099f4db3.json",
+      "status": "ok",
+      "source_hash": "f6ec5bb7077780f620df8d24fdf4d8804c0d7f0f3ef01bea351b5812097ec6b6",
+      "replay_hash": "d3b5cd5855b81f7b0d18771ce1f552073d6a35634be6fa50670e24781b1cde64",
+      "source_fused_score": 61.07575232,
+      "replay_fused_score": 61.07575232,
+      "score_diff": 0.0,
+      "artifact_missing": 0
+    },
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260302_204000_0b8574b7.json",
+      "status": "ok",
+      "source_hash": "10569b8bf5708da80765baacd2b0d8e434bb08832297ae2cc0b578776735b183",
+      "replay_hash": "4650c459306ce9398887f91253ac7ff4966690917809d2ae0d10013583c0dca0",
+      "source_fused_score": 73.58449049,
+      "replay_fused_score": 73.58449049,
+      "score_diff": 0.0,
+      "artifact_missing": 0
+    },
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260302_204000_0becc11c.json",
+      "status": "ok",
+      "source_hash": "dc2b4522856315c213ae8ab764b73626ca4ad19350ee5965f07c22482c21fa7f",
+      "replay_hash": "1985a41c250fb28f1e272d12ba9839d36898a6e584df73c70ffcf0a62fa9da9b",
+      "source_fused_score": 82.85121394,
+      "replay_fused_score": 82.85121394,
+      "score_diff": 0.0,
+      "artifact_missing": 0
+    },
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260302_204000_0d469ab4.json",
+      "status": "ok",
+      "source_hash": "d49b5c5238c9be450ec4870aa6a6ec1b4889d3f6486c9dc3d3af129ff1e6b731",
+      "replay_hash": "aab9ec2c6e269ba9ed97b0b7a784d8d9b15484fa35e145bbd8fba4404005e55a",
+      "source_fused_score": 65.43246117,
+      "replay_fused_score": 65.43246117,
+      "score_diff": 0.0,
+      "artifact_missing": 0
+    },
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260302_204000_0db20760.json",
+      "status": "ok",
+      "source_hash": "16cd7efa474d34ddc0d0be80b20c0ad0364204ce6887be34dc29ef658d16f526",
+      "replay_hash": "9b8c5fc40db6093efb3cb5d8e38c54a4f337d22223bc88d289f24d0d0d4cc05a",
+      "source_fused_score": 76.05849246,
+      "replay_fused_score": 76.05849246,
+      "score_diff": 0.0,
+      "artifact_missing": 0
+    },
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260302_204000_0e15c3d4.json",
+      "status": "ok",
+      "source_hash": "14059fdda7dec0a18e11557e1f13ca946eab8957846febdbff63f26529b908a1",
+      "replay_hash": "85d71bd635f68ebd45281671f0e248f1449a3f94263de25bf51632c2623d9687",
+      "source_fused_score": 68.89231816,
+      "replay_fused_score": 68.89231816,
+      "score_diff": 0.0,
+      "artifact_missing": 0
+    },
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260302_204000_0f843b09.json",
+      "status": "ok",
+      "source_hash": "f2a43ef4abcdc086ec976327fa04e2bfbe411d885fe29b8715ca280b777aa185",
+      "replay_hash": "87605e1bc50447dbb58335307ebb602e6a648471f4cc89090c3ef56487c509cf",
+      "source_fused_score": 76.05849246,
+      "replay_fused_score": 76.05849246,
+      "score_diff": 0.0,
+      "artifact_missing": 0
+    },
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260302_204000_119c24c9.json",
+      "status": "ok",
+      "source_hash": "ea3179990dcc3350be81615c22e4b1dfd99b23fcb53eeca81dabb1d112e68af7",
+      "replay_hash": "04e8ad41d458fc155fc6e75dccadf396c62546e140b61f660a6bb5c63a0d5acb",
+      "source_fused_score": 74.49205485,
+      "replay_fused_score": 74.49205485,
+      "score_diff": 0.0,
+      "artifact_missing": 0
+    },
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260302_204000_12476e88.json",
+      "status": "ok",
+      "source_hash": "974691b02efe828d6a91c968737871140c07a6492b4e2c764746d2c07c74fb19",
+      "replay_hash": "b6ddf910c424869fba4253e483b40858f096e06021d0fb4f7363009590c59203",
+      "source_fused_score": 76.05849246,
+      "replay_fused_score": 76.05849246,
+      "score_diff": 0.0,
+      "artifact_missing": 0
+    },
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260302_204000_14e2baf4.json",
+      "status": "ok",
+      "source_hash": "9ce6113933543508eb5d2d76480e0d328b789f5f15948d05631925c8e9e0e8b4",
+      "replay_hash": "1cbbed9e4c658c3465f715ba19f9f8956bfa938ca45faaf89cc6a345b1a83a5e",
+      "source_fused_score": 79.58263549,
+      "replay_fused_score": 79.58263549,
+      "score_diff": 0.0,
+      "artifact_missing": 0
+    },
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260302_204000_163dcaf6.json",
+      "status": "ok",
+      "source_hash": "910efca44fa3fe3364e04dc1d82d81b16c537e2011ab4ca64b54a0f528ded680",
+      "replay_hash": "c86d7c7b4f028708f4fd195e3444505cddf389d75027788d9760ca310649f4b8",
+      "source_fused_score": 73.00293144,
+      "replay_fused_score": 73.00293144,
+      "score_diff": 0.0,
+      "artifact_missing": 0
+    },
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260302_204000_16b26313.json",
+      "status": "ok",
+      "source_hash": "678586dc3120ddc37efefc189b3aaf21ade104df62c1bafc599794d836c69c55",
+      "replay_hash": "52d61e2e825588bb699aa42228f553bed6384cf2133f267f193b955125d6393b",
+      "source_fused_score": 68.60017408,
+      "replay_fused_score": 68.60017408,
+      "score_diff": 0.0,
+      "artifact_missing": 0
+    },
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260302_204000_192ca1c8.json",
+      "status": "mismatch",
+      "source_hash": "5473e9324ca84e7e4253b0e8cec788c7dd95672f8f5546a5411df38e9b8a8e7c",
+      "replay_hash": "2efb41b2a407368bf37919a6c210960b29d30e7acc255645a13a95aa8992e862",
+      "source_fused_score": 65.0,
+      "replay_fused_score": 78.99589198,
+      "score_diff": 13.9958919753,
+      "artifact_missing": 0
+    },
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260302_204000_1971c7fd.json",
+      "status": "ok",
+      "source_hash": "72f57427f8a840f276ee4f6b307f0e8f3aba1377a83a5c22ddba358a7c0015d1",
+      "replay_hash": "4e2034794a40386021c85097a65ec2314e67dc21f8cac9cce7924b6d40c403d3",
+      "source_fused_score": 69.25377747,
+      "replay_fused_score": 69.25377747,
+      "score_diff": 0.0,
+      "artifact_missing": 0
+    },
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260302_204000_19e8d1eb.json",
+      "status": "ok",
+      "source_hash": "b2607f60b30ed5f2fb8ed30de4241e667ef2d9b762c1536cd33320601361001b",
+      "replay_hash": "8780ebc9faaa86071277ac9d1df6e55bd6f2253d20ee28bd050c6744d13eec8a",
+      "source_fused_score": 62.50929084,
+      "replay_fused_score": 62.50929084,
+      "score_diff": 0.0,
+      "artifact_missing": 0
+    },
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260302_204000_1b8f4577.json",
+      "status": "ok",
+      "source_hash": "9916869638e4c1aa2be0905ed9fac0cddd164dd61f56296b04feca38464fbc97",
+      "replay_hash": "52fa60e670db8c63dda3558da3deb7c3d63e6d3ec8f69d220b187effecbebbca",
+      "source_fused_score": 66.31008624,
+      "replay_fused_score": 66.31008624,
+      "score_diff": 0.0,
+      "artifact_missing": 0
+    },
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260302_204000_1f1bd41f.json",
+      "status": "ok",
+      "source_hash": "635ff1afc69c541bcdcd5c6b4b80c553ae3d1218a3309a60b3fcdaf68850bb25",
+      "replay_hash": "4e937c63c68c78c1e06916daafd0142243e2b875996ef5773c9bf22d9c6fde4e",
+      "source_fused_score": 83.10704634,
+      "replay_fused_score": 83.10704634,
+      "score_diff": 0.0,
+      "artifact_missing": 0
+    },
+    {
+      "path": "E:\\Software Development\\StockAnalyzer\\suggestions\\evolution\\prop_20260302_204000_206c54f6.json",
+      "status": "ok",
+      "source_hash": "e029970388260732a6ac3a708e7ea6d1a03fa75a5d3fc475e76bb4b7af7f87d9",
+      "replay_hash": "ab4230c36aef349edb7dc07ace44be6cb8f9c780bddc3814567d477a231a8c04",
+      "source_fused_score": 78.93659727,
+      "replay_fused_score": 78.93659727,
+      "score_diff": 0.0,
+      "artifact_missing": 0
+    }
+  ]
+}
