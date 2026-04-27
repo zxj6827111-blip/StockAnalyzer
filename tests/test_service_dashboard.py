@@ -578,3 +578,114 @@ def test_service_training_overview_uses_short_cache(tmp_path: Path, monkeypatch)
     assert second_payload["generated_at"] != "mutated"
     assert window_call_count["count"] == 1
     assert direct_background_call_count["count"] == 0
+
+
+def test_service_training_overview_keeps_completed_coverage_during_active_sync(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = _load_test_config()
+    service = StockAnalyzerService(config=config)
+    service._evolution_project_root = tmp_path
+
+    monkeypatch.setattr(
+        service,
+        "training_bootstrap_status",
+        lambda: {"completed": True, "last_bootstrap_at": "2026-04-14T18:49:59"},
+    )
+    monkeypatch.setattr(service, "latest_evolution_report", lambda: {})
+    monkeypatch.setattr(service, "evolution_history", lambda limit=6: {"items": []})
+    monkeypatch.setattr(
+        service,
+        "evolution_window_report",
+        lambda days, min_runs: {
+            "overall": "pass",
+            "summary": {"fail_count": 0, "warn_count": 0},
+            "checks": [],
+        },
+    )
+    monkeypatch.setattr(service, "latest_week4_acceptance_report", lambda: None)
+    monkeypatch.setattr(
+        service,
+        "latest_market_warehouse_report",
+        lambda: {
+            "timestamp": "2026-04-26T20:30:18",
+            "trace_id": "scheduler-evolution",
+            "status": "ok",
+            "symbol_source": "explicit_symbols",
+            "target_trade_date": "2026-04-24",
+            "symbols_total": 34,
+            "symbols_completed": 34,
+            "failed_symbols_total": 0,
+            "background_data": {
+                "latest_trade_date": "2026-04-24",
+                "symbols_total": 5194,
+                "symbols_on_latest_trade_date": 5039,
+                "symbols_stale": 155,
+                "latest_trade_date_coverage_ratio": 0.970158,
+                "fields": {},
+            },
+        },
+    )
+    monkeypatch.setattr(
+        service,
+        "runtime_stage_snapshot",
+        lambda: {
+            "as_of": "2026-04-27T20:38:18",
+            "summary": {"mode": "learning", "pending_next": {}},
+            "runtime_phase": {"label": "night"},
+            "health": {"label": "healthy", "detail": ""},
+            "latest_activity": {},
+            "market_warehouse_background_data": {
+                "latest_trade_date": "2026-04-27",
+                "symbols_total": 5194,
+                "symbols_on_latest_trade_date": 2,
+                "symbols_stale": 5192,
+                "latest_trade_date_coverage_ratio": 0.000385,
+                "fields": {},
+            },
+            "market_warehouse_progress": {
+                "trace_id": "scheduler-evolution",
+                "status": "running",
+                "phase": "syncing",
+                "current_symbol": "002756",
+                "current_stage": "daily",
+                "target_trade_date": "2026-04-27",
+                "symbols_total": 34,
+                "symbols_completed": 18,
+                "progress_ratio": 0.5294,
+                "failed_symbols_total": 17,
+                "started_at": "2026-04-27T20:30:12",
+                "updated_at": "2026-04-27T20:38:18",
+            },
+            "market_warehouse_lock": {
+                "running": True,
+                "trace_id": "scheduler-evolution",
+                "last_heartbeat_at": "2026-04-27T20:38:18",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        service,
+        "market_warehouse_background_data_status",
+        lambda: {
+            "latest_trade_date": "should-not-be-used",
+            "latest_trade_date_coverage_ratio": 0.0,
+        },
+    )
+
+    payload = service.training_overview(history_limit=6)
+    warehouse = _as_mapping(payload["warehouse"])
+    background = _as_mapping(warehouse["background"])
+    raw_background = _as_mapping(warehouse["raw_background"])
+    active_sync = _as_mapping(warehouse["active_sync"])
+
+    assert warehouse["background_source"] == "latest_completed_sync"
+    assert background["latest_trade_date"] == "2026-04-24"
+    assert background["latest_trade_date_coverage_ratio"] == 0.970158
+    assert background["display_reason"] == "active_market_warehouse_sync_in_progress"
+    assert raw_background["latest_trade_date"] == "2026-04-27"
+    assert raw_background["latest_trade_date_coverage_ratio"] == 0.000385
+    assert active_sync["running"] is True
+    assert active_sync["symbols_total"] == 34
+    assert active_sync["symbols_completed"] == 18

@@ -146,6 +146,13 @@ class RuntimeDashboardService:
         warehouse_background = _as_dict(runtime_stage.get("market_warehouse_background_data"))
         if not warehouse_background:
             warehouse_background = service.market_warehouse_background_data_status()
+        warehouse_context = _resolve_training_overview_warehouse_context(
+            current_background=warehouse_background,
+            latest_report=service.latest_market_warehouse_report(),
+            progress=_as_dict(runtime_stage.get("market_warehouse_progress")),
+            lock=_as_dict(runtime_stage.get("market_warehouse_lock")),
+        )
+        warehouse_background = _as_dict(warehouse_context.get("background"))
 
         project_root = service._evolution_project_root
         model_artifact_path = service._resolve_evolution_path(str(service._config.training.artifact_path))
@@ -269,6 +276,12 @@ class RuntimeDashboardService:
             },
             "warehouse": {
                 "background": warehouse_background,
+                "background_source": str(warehouse_context.get("background_source", "")),
+                "active_sync": _as_dict(warehouse_context.get("active_sync")),
+                "latest_completed_sync": _as_dict(
+                    warehouse_context.get("latest_completed_sync")
+                ),
+                "raw_background": _as_dict(warehouse_context.get("raw_background")),
             },
             "runtime": runtime_summary,
         }
@@ -617,6 +630,101 @@ def _pick_mapping_fields(
         if name in payload:
             picked[name] = payload[name]
     return picked
+
+
+def _resolve_training_overview_warehouse_context(
+    *,
+    current_background: dict[str, object],
+    latest_report: object,
+    progress: dict[str, object],
+    lock: dict[str, object],
+) -> dict[str, object]:
+    active_sync = _summarize_active_warehouse_sync(progress=progress, lock=lock)
+    latest_report_payload = _as_dict(latest_report)
+    latest_background = _as_dict(latest_report_payload.get("background_data"))
+    latest_completed_sync = _summarize_latest_completed_warehouse_sync(latest_report_payload)
+
+    background_source = "current_snapshot"
+    display_background = dict(current_background)
+    if bool(active_sync.get("running", False)) and latest_background:
+        background_source = "latest_completed_sync"
+        display_background = dict(latest_background)
+        display_background["display_source"] = background_source
+        display_background["display_reason"] = "active_market_warehouse_sync_in_progress"
+        display_background["active_sync_target_trade_date"] = str(
+            active_sync.get("target_trade_date", "")
+        )
+    elif display_background:
+        display_background.setdefault("display_source", background_source)
+
+    return {
+        "background": display_background,
+        "background_source": background_source,
+        "active_sync": active_sync,
+        "latest_completed_sync": latest_completed_sync,
+        "raw_background": dict(current_background),
+    }
+
+
+def _summarize_active_warehouse_sync(
+    *,
+    progress: dict[str, object],
+    lock: dict[str, object],
+) -> dict[str, object]:
+    active_progress = _as_dict(lock.get("active_progress")) or dict(progress)
+    lock_running = bool(lock.get("running", False))
+    progress_running = str(active_progress.get("status", "")).strip().lower() == "running"
+    if not lock_running and not progress_running:
+        return {"running": False}
+
+    trace_id = str(active_progress.get("trace_id", "")).strip() or str(
+        lock.get("trace_id", "")
+    ).strip()
+    return {
+        "running": True,
+        "trace_id": trace_id,
+        "status": str(active_progress.get("status", "")).strip() or "running",
+        "phase": str(active_progress.get("phase", "")).strip(),
+        "current_symbol": str(active_progress.get("current_symbol", "")).strip(),
+        "current_stage": str(active_progress.get("current_stage", "")).strip(),
+        "target_trade_date": str(active_progress.get("target_trade_date", "")).strip(),
+        "symbols_completed": _as_int(active_progress.get("symbols_completed"), default=0),
+        "symbols_total": _as_int(active_progress.get("symbols_total"), default=0),
+        "progress_ratio": _as_float(active_progress.get("progress_ratio"), default=0.0),
+        "failed_symbols_total": _as_int(
+            active_progress.get("failed_symbols_total"),
+            default=0,
+        ),
+        "started_at": str(active_progress.get("started_at", "")).strip(),
+        "updated_at": str(active_progress.get("updated_at", "")).strip()
+        or str(lock.get("last_heartbeat_at", "")).strip(),
+    }
+
+
+def _summarize_latest_completed_warehouse_sync(
+    latest_report: dict[str, object],
+) -> dict[str, object]:
+    if not latest_report:
+        return {}
+    background = _as_dict(latest_report.get("background_data"))
+    return {
+        "timestamp": str(latest_report.get("timestamp", "")).strip(),
+        "trace_id": str(latest_report.get("trace_id", "")).strip(),
+        "status": str(latest_report.get("status", "")).strip(),
+        "symbol_source": str(latest_report.get("symbol_source", "")).strip(),
+        "target_trade_date": str(latest_report.get("target_trade_date", "")).strip()
+        or str(background.get("latest_trade_date", "")).strip(),
+        "symbols_total": _as_int(latest_report.get("symbols_total"), default=0),
+        "symbols_completed": _as_int(latest_report.get("symbols_completed"), default=0),
+        "failed_symbols_total": _as_int(
+            latest_report.get("failed_symbols_total"),
+            default=0,
+        ),
+        "latest_trade_date_coverage_ratio": _as_float(
+            background.get("latest_trade_date_coverage_ratio"),
+            default=0.0,
+        ),
+    }
 
 
 def _load_training_overview_cache(

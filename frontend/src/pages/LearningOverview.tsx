@@ -511,6 +511,8 @@ export default function LearningOverviewPage() {
   const recentRuns = arr(evolution.recent_runs);
   const warehouse = obj(data?.warehouse);
   const background = obj(warehouse.background);
+  const activeSync = obj(warehouse.active_sync);
+  const latestCompletedSync = obj(warehouse.latest_completed_sync);
   const backgroundFields = Object.entries(obj(background.fields));
   const runtime = obj(data?.runtime);
   const runtimePhase = obj(runtime.phase);
@@ -521,6 +523,8 @@ export default function LearningOverviewPage() {
 
   const coverageRatio = asNumber(background.latest_trade_date_coverage_ratio);
   const staleSymbols = asNumber(background.symbols_stale);
+  const backgroundSource = text(warehouse.background_source, 'current_snapshot');
+  const activeSyncRunning = Boolean(activeSync.running);
   const bootstrapAgeHours = asNumber(bootstrap.last_bootstrap_age_hours, -1);
   const latestEvolutionAgeHours = asNumber(latestEvolution.age_hours, -1);
   const windowOverall = text(evolutionWindow.overall, '');
@@ -583,6 +587,16 @@ export default function LearningOverviewPage() {
               <div className="rounded-full border border-panelBorder bg-[rgba(12,33,48,0.55)] px-3 py-1.5">接口生成：{formatDateTime(data?.generated_at)}</div>
               <div className="rounded-full border border-panelBorder bg-[rgba(12,33,48,0.55)] px-3 py-1.5">当前阶段：{text(runtimePhase.label)}</div>
               <div className="rounded-full border border-panelBorder bg-[rgba(12,33,48,0.55)] px-3 py-1.5">全量覆盖：{formatPercent(coverageRatio, 2)}</div>
+              {activeSyncRunning ? (
+                <div className="rounded-full border border-[rgba(255,184,77,0.26)] bg-[rgba(255,184,77,0.10)] px-3 py-1.5 text-warn">
+                  局部同步中：{formatNumber(activeSync.symbols_completed, 0)} / {formatNumber(activeSync.symbols_total, 0)}
+                </div>
+              ) : null}
+              {backgroundSource === 'latest_completed_sync' ? (
+                <div className="rounded-full border border-[rgba(65,214,179,0.22)] bg-[rgba(65,214,179,0.08)] px-3 py-1.5 text-accent">
+                  覆盖口径：最近完成同步
+                </div>
+              ) : null}
             </div>
 
             <div className={`mt-6 rounded-3xl border p-5 shadow-[0_0_24px_rgba(8,27,44,0.22)] ${summaryToneClass(readiness.tone)}`}>
@@ -649,6 +663,14 @@ export default function LearningOverviewPage() {
             <div>覆盖率：{formatPercent(coverageRatio, 2)}</div>
             <div className="mt-2">最新交易日股票数：{formatNumber(background.symbols_on_latest_trade_date, 0)} / {formatNumber(background.symbols_total, 0)}</div>
             <div className="mt-2">仍需补齐：{formatNumber(staleSymbols, 0)} 只股票</div>
+            {activeSyncRunning ? (
+              <div className="mt-2 text-xs leading-5 text-muted">
+                当前另有 {formatNumber(activeSync.symbols_total, 0)} 只股票的同步任务在跑，
+                {backgroundSource === 'latest_completed_sync'
+                  ? '覆盖率暂按最近完成的全市场快照计算。'
+                  : '覆盖率是同步中的实时快照，完成后会自动稳定。'}
+              </div>
+            ) : null}
           </div>
         </div>
       </div>
@@ -782,6 +804,9 @@ export default function LearningOverviewPage() {
               <DetailRow label="覆盖率" value={formatPercent(coverageRatio, 2)} />
               <DetailRow label="最新交易日覆盖" value={`${formatNumber(background.symbols_on_latest_trade_date, 0)} / ${formatNumber(background.symbols_total, 0)}`} />
               <DetailRow label="仍落后股票" value={`${formatNumber(staleSymbols, 0)} 只`} />
+              <DetailRow label="覆盖口径" value={backgroundSource === 'latest_completed_sync' ? '最近完成同步' : '当前快照'} />
+              <DetailRow label="当前同步" value={activeSyncRunning ? `${formatNumber(activeSync.symbols_completed, 0)} / ${formatNumber(activeSync.symbols_total, 0)}，${text(activeSync.current_symbol)}，${text(activeSync.current_stage)}` : '未运行'} />
+              <DetailRow label="最近完成同步" value={`${text(latestCompletedSync.status)} / ${formatDateTime(latestCompletedSync.timestamp)} / ${formatPercent(latestCompletedSync.latest_trade_date_coverage_ratio, 2)}`} />
               <DetailRow label="非阻塞原因" value={joinList(background.nonblocking_reasons)} />
             </div>
 
