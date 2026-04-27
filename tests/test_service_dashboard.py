@@ -627,6 +627,7 @@ def test_service_training_overview_keeps_completed_coverage_during_active_sync(
             },
         },
     )
+    monkeypatch.setattr(service, "market_warehouse_history", lambda limit=20: {"items": []})
     monkeypatch.setattr(
         service,
         "runtime_stage_snapshot",
@@ -679,13 +680,148 @@ def test_service_training_overview_keeps_completed_coverage_during_active_sync(
     background = _as_mapping(warehouse["background"])
     raw_background = _as_mapping(warehouse["raw_background"])
     active_sync = _as_mapping(warehouse["active_sync"])
+    stable_completed_sync = _as_mapping(warehouse["stable_completed_sync"])
 
-    assert warehouse["background_source"] == "latest_completed_sync"
+    assert warehouse["background_source"] == "stable_completed_sync"
     assert background["latest_trade_date"] == "2026-04-24"
     assert background["latest_trade_date_coverage_ratio"] == 0.970158
     assert background["display_reason"] == "active_market_warehouse_sync_in_progress"
+    assert stable_completed_sync["latest_trade_date"] == "2026-04-24"
+    assert stable_completed_sync["latest_trade_date_coverage_ratio"] == 0.970158
     assert raw_background["latest_trade_date"] == "2026-04-27"
     assert raw_background["latest_trade_date_coverage_ratio"] == 0.000385
     assert active_sync["running"] is True
     assert active_sync["symbols_total"] == 34
     assert active_sync["symbols_completed"] == 18
+
+
+def test_service_training_overview_uses_stable_coverage_after_partial_focus_sync(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = _load_test_config()
+    service = StockAnalyzerService(config=config)
+    service._evolution_project_root = tmp_path
+
+    stable_background = {
+        "latest_trade_date": "2026-04-24",
+        "symbols_total": 5194,
+        "symbols_on_latest_trade_date": 5039,
+        "symbols_stale": 155,
+        "latest_trade_date_coverage_ratio": 0.970158,
+        "fields": {},
+    }
+    partial_background = {
+        "latest_trade_date": "2026-04-27",
+        "symbols_total": 5194,
+        "symbols_on_latest_trade_date": 2,
+        "symbols_stale": 5192,
+        "latest_trade_date_coverage_ratio": 0.000385,
+        "fields": {},
+    }
+
+    monkeypatch.setattr(
+        service,
+        "training_bootstrap_status",
+        lambda: {"completed": True, "last_bootstrap_at": "2026-04-14T18:49:59"},
+    )
+    monkeypatch.setattr(service, "latest_evolution_report", lambda: {})
+    monkeypatch.setattr(service, "evolution_history", lambda limit=6: {"items": []})
+    monkeypatch.setattr(
+        service,
+        "evolution_window_report",
+        lambda days, min_runs: {
+            "overall": "pass",
+            "summary": {"fail_count": 0, "warn_count": 0},
+            "checks": [],
+        },
+    )
+    monkeypatch.setattr(service, "latest_week4_acceptance_report", lambda: None)
+    monkeypatch.setattr(
+        service,
+        "latest_market_warehouse_report",
+        lambda: {
+            "timestamp": "2026-04-27T20:30:12",
+            "trace_id": "scheduler-evolution",
+            "status": "partial",
+            "symbol_source": "explicit_symbols",
+            "target_trade_date": "2026-04-27",
+            "symbols_total": 34,
+            "symbols_completed": 34,
+            "failed_symbols_total": 33,
+            "background_data": partial_background,
+        },
+    )
+    monkeypatch.setattr(
+        service,
+        "market_warehouse_history",
+        lambda limit=20: {
+            "items": [
+                {
+                    "timestamp": "2026-04-26T20:30:18",
+                    "trace_id": "scheduler-evolution-prev",
+                    "status": "ok",
+                    "symbol_source": "explicit_symbols",
+                    "target_trade_date": "2026-04-24",
+                    "failed_symbols_total": 0,
+                    "background_data": stable_background,
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        service,
+        "runtime_stage_snapshot",
+        lambda: {
+            "as_of": "2026-04-27T20:45:00",
+            "summary": {"mode": "learning", "pending_next": {}},
+            "runtime_phase": {"label": "night"},
+            "health": {"label": "healthy", "detail": ""},
+            "latest_activity": {},
+            "market_warehouse_background_data": partial_background,
+            "market_warehouse_progress": {
+                "trace_id": "scheduler-evolution",
+                "status": "partial",
+                "phase": "completed",
+                "current_stage": "finalize",
+                "target_trade_date": "2026-04-27",
+                "symbols_total": 34,
+                "symbols_completed": 34,
+                "progress_ratio": 1.0,
+                "failed_symbols_total": 33,
+            },
+            "market_warehouse_lock": {
+                "exists": False,
+                "running": False,
+                "is_stale": False,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        service,
+        "market_warehouse_background_data_status",
+        lambda: {
+            "latest_trade_date": "should-not-be-used",
+            "latest_trade_date_coverage_ratio": 0.0,
+        },
+    )
+
+    payload = service.training_overview(history_limit=6)
+    warehouse = _as_mapping(payload["warehouse"])
+    background = _as_mapping(warehouse["background"])
+    raw_background = _as_mapping(warehouse["raw_background"])
+    active_sync = _as_mapping(warehouse["active_sync"])
+    latest_completed_sync = _as_mapping(warehouse["latest_completed_sync"])
+    stable_completed_sync = _as_mapping(warehouse["stable_completed_sync"])
+
+    assert warehouse["background_source"] == "stable_completed_sync"
+    assert background["latest_trade_date"] == "2026-04-24"
+    assert background["latest_trade_date_coverage_ratio"] == 0.970158
+    assert background["display_reason"] == "partial_focus_sync_completed_with_low_coverage"
+    assert raw_background["latest_trade_date"] == "2026-04-27"
+    assert raw_background["latest_trade_date_coverage_ratio"] == 0.000385
+    assert active_sync["running"] is False
+    assert latest_completed_sync["status"] == "partial"
+    assert latest_completed_sync["failed_symbols_total"] == 33
+    assert stable_completed_sync["latest_trade_date"] == "2026-04-24"
+    assert stable_completed_sync["latest_trade_date_coverage_ratio"] == 0.970158

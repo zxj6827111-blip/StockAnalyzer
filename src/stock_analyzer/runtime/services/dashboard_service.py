@@ -146,9 +146,11 @@ class RuntimeDashboardService:
         warehouse_background = _as_dict(runtime_stage.get("market_warehouse_background_data"))
         if not warehouse_background:
             warehouse_background = service.market_warehouse_background_data_status()
+        warehouse_history = service.market_warehouse_history(limit=20)
         warehouse_context = _resolve_training_overview_warehouse_context(
             current_background=warehouse_background,
             latest_report=service.latest_market_warehouse_report(),
+            history_items=warehouse_history.get("items"),
             progress=_as_dict(runtime_stage.get("market_warehouse_progress")),
             lock=_as_dict(runtime_stage.get("market_warehouse_lock")),
         )
@@ -280,6 +282,9 @@ class RuntimeDashboardService:
                 "active_sync": _as_dict(warehouse_context.get("active_sync")),
                 "latest_completed_sync": _as_dict(
                     warehouse_context.get("latest_completed_sync")
+                ),
+                "stable_completed_sync": _as_dict(
+                    warehouse_context.get("stable_completed_sync")
                 ),
                 "raw_background": _as_dict(warehouse_context.get("raw_background")),
             },
@@ -636,24 +641,38 @@ def _resolve_training_overview_warehouse_context(
     *,
     current_background: dict[str, object],
     latest_report: object,
+    history_items: object,
     progress: dict[str, object],
     lock: dict[str, object],
 ) -> dict[str, object]:
     active_sync = _summarize_active_warehouse_sync(progress=progress, lock=lock)
     latest_report_payload = _as_dict(latest_report)
-    latest_background = _as_dict(latest_report_payload.get("background_data"))
     latest_completed_sync = _summarize_latest_completed_warehouse_sync(latest_report_payload)
+    stable_background = _resolve_stable_warehouse_background(
+        current_background=current_background,
+        latest_report=latest_report_payload,
+        history_items=history_items,
+    )
 
     background_source = "current_snapshot"
     display_background = dict(current_background)
-    if bool(active_sync.get("running", False)) and latest_background:
-        background_source = "latest_completed_sync"
-        display_background = dict(latest_background)
+    if bool(active_sync.get("running", False)) and stable_background:
+        background_source = "stable_completed_sync"
+        display_background = dict(stable_background)
         display_background["display_source"] = background_source
         display_background["display_reason"] = "active_market_warehouse_sync_in_progress"
         display_background["active_sync_target_trade_date"] = str(
             active_sync.get("target_trade_date", "")
         )
+    elif _should_use_stable_warehouse_background(
+        current_background=current_background,
+        latest_report=latest_report_payload,
+        stable_background=stable_background,
+    ):
+        background_source = "stable_completed_sync"
+        display_background = dict(stable_background)
+        display_background["display_source"] = background_source
+        display_background["display_reason"] = "partial_focus_sync_completed_with_low_coverage"
     elif display_background:
         display_background.setdefault("display_source", background_source)
 
@@ -662,6 +681,7 @@ def _resolve_training_overview_warehouse_context(
         "background_source": background_source,
         "active_sync": active_sync,
         "latest_completed_sync": latest_completed_sync,
+        "stable_completed_sync": _summarize_stable_warehouse_background(stable_background),
         "raw_background": dict(current_background),
     }
 
@@ -699,6 +719,82 @@ def _summarize_active_warehouse_sync(
         "updated_at": str(active_progress.get("updated_at", "")).strip()
         or str(lock.get("last_heartbeat_at", "")).strip(),
     }
+
+
+def _resolve_stable_warehouse_background(
+    *,
+    current_background: dict[str, object],
+    latest_report: dict[str, object],
+    history_items: object,
+) -> dict[str, object]:
+    candidates: list[dict[str, object]] = []
+    latest_background = _as_dict(latest_report.get("background_data"))
+    if latest_background:
+        candidates.append(latest_background)
+    if isinstance(history_items, list):
+        for raw_item in reversed(history_items):
+            item = _as_dict(raw_item)
+            background = _as_dict(item.get("background_data"))
+            if background:
+                candidates.append(background)
+    if current_background:
+        candidates.append(dict(current_background))
+
+    usable = [item for item in candidates if _warehouse_background_coverage(item) > 0.0]
+    if not usable:
+        return {}
+    return max(usable, key=_warehouse_background_score)
+
+
+def _should_use_stable_warehouse_background(
+    *,
+    current_background: dict[str, object],
+    latest_report: dict[str, object],
+    stable_background: dict[str, object],
+) -> bool:
+    if not current_background or not stable_background:
+        return False
+    if _as_int(latest_report.get("failed_symbols_total"), default=0) <= 0:
+        return False
+    symbol_source = str(latest_report.get("symbol_source", "")).strip()
+    if symbol_source not in {"explicit_symbols", "preferred_symbols", "focus"}:
+        return False
+    current_coverage = _warehouse_background_coverage(current_background)
+    stable_coverage = _warehouse_background_coverage(stable_background)
+    if stable_coverage < 0.50:
+        return False
+    return stable_coverage >= current_coverage + 0.10
+
+
+def _summarize_stable_warehouse_background(
+    background: dict[str, object],
+) -> dict[str, object]:
+    if not background:
+        return {}
+    return {
+        "latest_trade_date": str(background.get("latest_trade_date", "")).strip(),
+        "symbols_total": _as_int(background.get("symbols_total"), default=0),
+        "symbols_on_latest_trade_date": _as_int(
+            background.get("symbols_on_latest_trade_date"),
+            default=0,
+        ),
+        "symbols_stale": _as_int(background.get("symbols_stale"), default=0),
+        "latest_trade_date_coverage_ratio": _warehouse_background_coverage(background),
+    }
+
+
+def _warehouse_background_coverage(background: dict[str, object]) -> float:
+    return _as_float(
+        background.get("latest_trade_date_coverage_ratio"),
+        default=0.0,
+    )
+
+
+def _warehouse_background_score(background: dict[str, object]) -> tuple[float, str]:
+    return (
+        _warehouse_background_coverage(background),
+        str(background.get("latest_trade_date", "")).strip(),
+    )
 
 
 def _summarize_latest_completed_warehouse_sync(
