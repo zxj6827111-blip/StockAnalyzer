@@ -9835,11 +9835,15 @@ class StockAnalyzerService:
         recent_runs: int = 50,
         session_scope: str = "all",
         job_scope: str = "all",
+        target_ms: int = 60000,
+        alert_target_ms: int = 30000,
     ) -> dict[str, object]:
         capped_runs = max(1, recent_runs)
         recent = self._latency_history_ms[-capped_runs:]
         scope = session_scope.strip().lower() or "all"
         normalized_job_scope = job_scope.strip().lower() or "all"
+        resolved_target_ms = max(1, _as_int(target_ms, default=60000))
+        resolved_alert_target_ms = max(1, _as_int(alert_target_ms, default=30000))
         observed_runs = len(recent)
         if scope != "all":
             recent = [item for item in recent if _sla_entry_matches_scope(item, scope)]
@@ -9860,8 +9864,8 @@ class StockAnalyzerService:
                 "job_scoped_runs": job_scoped_runs,
                 "excluded_by_session_scope": observed_runs - session_scoped_runs,
                 "excluded_by_job_scope": session_scoped_runs - job_scoped_runs,
-                "target_ms": 60000,
-                "alert_target_ms": 30000,
+                "target_ms": resolved_target_ms,
+                "alert_target_ms": resolved_alert_target_ms,
                 "avg_ms": 0.0,
                 "p50_ms": 0.0,
                 "p95_ms": 0.0,
@@ -9872,10 +9876,8 @@ class StockAnalyzerService:
                 "slowest_runs": [],
             }
 
-        target_ms = 60000
-        alert_target_ms = 30000
-        compliance_count = sum(1 for item in latencies if item <= target_ms)
-        alert_compliance_count = sum(1 for item in latencies if item <= alert_target_ms)
+        compliance_count = sum(1 for item in latencies if item <= resolved_target_ms)
+        alert_compliance_count = sum(1 for item in latencies if item <= resolved_alert_target_ms)
         compliance_rate = compliance_count / len(latencies)
         alert_compliance_rate = alert_compliance_count / len(latencies)
 
@@ -9888,8 +9890,8 @@ class StockAnalyzerService:
             "job_scoped_runs": job_scoped_runs,
             "excluded_by_session_scope": observed_runs - session_scoped_runs,
             "excluded_by_job_scope": session_scoped_runs - job_scoped_runs,
-            "target_ms": target_ms,
-            "alert_target_ms": alert_target_ms,
+            "target_ms": resolved_target_ms,
+            "alert_target_ms": resolved_alert_target_ms,
             "avg_ms": round(sum(latencies) / len(latencies), 2),
             "p50_ms": round(_percentile(latencies, 0.50), 2),
             "p95_ms": round(_percentile(latencies, 0.95), 2),
@@ -15646,6 +15648,10 @@ class StockAnalyzerService:
             or str(report.get("strategy", "")).strip()
             or week6_strategy
         )
+        runtime_role = _runtime_role_for_run(
+            job_name=normalized_job,
+            use_live_runtime=bool(use_live_runtime or report.get("use_live_runtime", False)),
+        )
         resolved_symbol_count = (
             max(0, int(symbol_count))
             if symbol_count is not None
@@ -15655,6 +15661,7 @@ class StockAnalyzerService:
             "timestamp": timestamp,
             "trace_id": str(report.get("trace_id", "")),
             "job_name": normalized_job,
+            "runtime_role": runtime_role,
             "strategy": normalized_strategy,
             "symbol_count": resolved_symbol_count,
             "use_live_runtime": bool(use_live_runtime or report.get("use_live_runtime", False)),
@@ -15671,6 +15678,7 @@ class StockAnalyzerService:
                 "timestamp": timestamp,
                 "trace_id": entry["trace_id"],
                 "job_name": normalized_job,
+                "runtime_role": runtime_role,
                 "strategy": normalized_strategy,
                 "symbol_count": resolved_symbol_count,
                 "use_live_runtime": entry["use_live_runtime"],
@@ -16378,14 +16386,27 @@ def _sla_entry_matches_job_scope(entry: dict[str, object], job_scope: str) -> bo
     if normalized_scope in {"", "all"}:
         return True
     job_name = str(entry.get("job_name", "")).strip().lower()
-    use_live_runtime = bool(entry.get("use_live_runtime", False))
+    runtime_role = str(entry.get("runtime_role", "")).strip().lower()
     if normalized_scope == "live_runtime":
-        return use_live_runtime or job_name == "week5_live_runtime" or job_name.startswith(
-            "week5_live_runtime_"
-        )
+        if runtime_role:
+            return runtime_role == "live_runtime"
+        return job_name == "week5_live_runtime" or job_name.startswith("week5_live_runtime_")
     if normalized_scope == "scheduled":
         return bool(job_name)
+    if normalized_scope in {"live_data_scan", "live_data_job", "batch_job"}:
+        return runtime_role == normalized_scope
     return job_name == normalized_scope
+
+
+def _runtime_role_for_run(*, job_name: str, use_live_runtime: bool) -> str:
+    normalized_job = job_name.strip().lower()
+    if normalized_job == "week5_live_runtime" or normalized_job.startswith("week5_live_runtime_"):
+        return "live_runtime"
+    if normalized_job == "week5_scan_monster":
+        return "live_data_scan" if use_live_runtime else "batch_job"
+    if use_live_runtime:
+        return "live_data_job"
+    return "batch_job"
 
 
 def _slowest_latency_entries(
@@ -16406,6 +16427,7 @@ def _slowest_latency_entries(
                 "timestamp": str(item.get("timestamp", "")).strip(),
                 "duration_ms": _as_int(item.get("duration_ms"), default=0),
                 "job_name": str(item.get("job_name", "")).strip(),
+                "runtime_role": str(item.get("runtime_role", "")).strip(),
                 "strategy": str(item.get("strategy", "")).strip(),
                 "symbol_count": _as_int(item.get("symbol_count"), default=0),
                 "use_live_runtime": bool(item.get("use_live_runtime", False)),

@@ -228,6 +228,10 @@ week5:
   universe_prefilter_lookback_days: 240
   universe_prefilter_top_k: 500
   universe_prefilter_shortlist_top_n: 50
+  monster_scan_intraday_max_symbols: 15
+  monster_scan_max_symbols: 120
+  monster_scan_sla_target_ms: 900000
+  monster_scan_sla_alert_target_ms: 600000
   offhours_universe_refresh_enabled: true
   offhours_weekday_universe_max_symbols: 300
   offhours_research_pool_top_k: 200

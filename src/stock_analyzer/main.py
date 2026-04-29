@@ -3956,11 +3956,15 @@ def runtime_sla(
     recent_runs: int = Query(default=50, ge=1, le=1000),
     session_scope: str = Query(default="all"),
     job_scope: str = Query(default="all"),
+    target_ms: int = Query(default=60000, ge=1),
+    alert_target_ms: int = Query(default=30000, ge=1),
 ) -> dict[str, object]:
     return _service.sla_report(
         recent_runs=recent_runs,
         session_scope=session_scope,
         job_scope=job_scope,
+        target_ms=target_ms,
+        alert_target_ms=alert_target_ms,
     )
 
 

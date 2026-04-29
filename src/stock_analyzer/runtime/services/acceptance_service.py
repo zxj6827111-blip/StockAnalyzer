@@ -144,6 +144,19 @@ class RuntimeAcceptanceService:
             session_scope="intraday",
             job_scope="live_runtime",
         )
+        monster_scan_sla = service.sla_report(
+            recent_runs=sla_recent_runs,
+            session_scope="all",
+            job_scope="week5_scan_monster",
+            target_ms=max(
+                1,
+                _as_int(service._config.week5.monster_scan_sla_target_ms, default=900000),
+            ),
+            alert_target_ms=max(
+                1,
+                _as_int(service._config.week5.monster_scan_sla_alert_target_ms, default=600000),
+            ),
+        )
         recent_runs = _as_int(runtime_sla.get("recent_runs"), default=0)
         compliance_rate = _as_float(runtime_sla.get("compliance_rate"), default=0.0)
         if recent_runs == 0:
@@ -240,12 +253,17 @@ class RuntimeAcceptanceService:
             "stress_summary": stress_summary if isinstance(stress_summary, dict) else {},
             "sla": sla,
             "runtime_sla_slowest_runs": runtime_sla.get("slowest_runs", []),
+            "monster_scan_sla_slowest_runs": monster_scan_sla.get("slowest_runs", []),
             "runtime_sla": {
                 **runtime_sla,
                 "status": sla_status,
                 "detail": sla_detail,
                 "recent_runs": recent_runs,
                 "check_name": "sla_compliance",
+            },
+            "monster_scan_sla": {
+                **monster_scan_sla,
+                "check_name": "monster_scan_sla_observability",
             },
         }
         use_export = service._config.acceptance.export_enabled

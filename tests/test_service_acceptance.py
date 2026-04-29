@@ -149,6 +149,40 @@ def test_service_week4_acceptance_ignores_unscoped_intraday_latency_for_runtime_
     assert report["overall"] == "pass_with_warnings"
 
 
+def test_service_week4_acceptance_excludes_week5_monster_scan_from_live_runtime_sla() -> None:
+    service = _new_service(_load_test_config())
+    service._latency_history_ms = [
+        {
+            "timestamp": "2026-03-16T10:05:00",
+            "duration_ms": 480_000,
+            "job_name": "week5_scan_monster",
+            "strategy": "monster",
+            "symbol_count": 34,
+            "use_live_runtime": True,
+        },
+        {
+            "timestamp": "2026-03-16T10:10:00",
+            "duration_ms": 42_000,
+            "job_name": "week5_live_runtime",
+            "runtime_role": "live_runtime",
+            "strategy": "trend",
+            "symbol_count": 8,
+            "use_live_runtime": True,
+        },
+    ]
+
+    report = _as_mapping(service.run_week4_acceptance(sla_recent_runs=10, notify_enabled=False))
+    runtime_sla = _as_mapping(report["runtime_sla"])
+    monster_scan_sla = _as_mapping(report["monster_scan_sla"])
+
+    assert _as_int(runtime_sla["recent_runs"]) == 1
+    assert _as_int(runtime_sla["excluded_by_job_scope"]) == 1
+    assert runtime_sla["status"] == "pass"
+    assert _as_int(monster_scan_sla["recent_runs"]) == 1
+    assert monster_scan_sla["status"] == "ok"
+    assert report["overall"] in {"pass", "pass_with_warnings"}
+
+
 def test_service_week4_acceptance_fails_slow_live_runtime_sla() -> None:
     service = _new_service(_load_test_config())
     service._latency_history_ms = [
@@ -175,6 +209,7 @@ def test_service_runtime_sla_reports_slowest_run_context() -> None:
             "timestamp": "2026-03-16T10:05:00",
             "duration_ms": 42_000,
             "job_name": "week5_live_runtime",
+            "runtime_role": "live_runtime",
             "strategy": "trend",
             "symbol_count": 12,
             "use_live_runtime": True,
@@ -184,6 +219,7 @@ def test_service_runtime_sla_reports_slowest_run_context() -> None:
             "timestamp": "2026-03-16T10:10:00",
             "duration_ms": 120_000,
             "job_name": "week5_live_runtime",
+            "runtime_role": "live_runtime",
             "strategy": "trend",
             "symbol_count": 15,
             "use_live_runtime": True,
@@ -196,6 +232,7 @@ def test_service_runtime_sla_reports_slowest_run_context() -> None:
 
     assert slowest[0]["trace_id"] == "slow-run"
     assert slowest[0]["job_name"] == "week5_live_runtime"
+    assert slowest[0]["runtime_role"] == "live_runtime"
     assert _as_int(slowest[0]["duration_ms"]) == 120_000
     assert _as_int(slowest[0]["symbol_count"]) == 15
 

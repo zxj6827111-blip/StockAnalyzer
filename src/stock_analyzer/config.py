@@ -234,6 +234,10 @@ class Week5Config(_StrictModel):
     universe_prefilter_lookback_days: int = 240
     universe_prefilter_top_k: int = 500
     universe_prefilter_shortlist_top_n: int = 50
+    monster_scan_intraday_max_symbols: int = 15
+    monster_scan_max_symbols: int = 120
+    monster_scan_sla_target_ms: int = 900_000
+    monster_scan_sla_alert_target_ms: int = 600_000
     offhours_universe_refresh_enabled: bool = True
     offhours_weekday_universe_max_symbols: int = 300
     offhours_research_pool_top_k: int = 200

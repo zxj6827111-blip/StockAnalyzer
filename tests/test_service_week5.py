@@ -638,6 +638,34 @@ def _seed_lightweight_week5_pipeline_with_provider(
     )
 
 
+def test_week5_scan_caps_intraday_monster_scan_symbols() -> None:
+    config = _load_test_config()
+    config.week5.monster_scan_intraday_max_symbols = 3
+    provider = RecordingSyntheticProvider(seed_offset=2027)
+    service = _new_service(config, provider=provider)
+    _seed_lightweight_week5_pipeline_with_provider(service, provider)
+
+    report = _as_mapping(
+        service.run_week5_scan(
+            symbols=["600000", "000001", "600519", "300750", "002594"],
+            timestamp=datetime(2026, 3, 16, 9, 30),
+            notify_enabled=False,
+            sync_reason="scheduler_week5",
+        )
+    )
+    controls = _as_mapping(report["monster_scan_controls"])
+    prefilter = _as_mapping(report["prefilter"])
+    summary = _as_mapping(report["summary"])
+
+    assert _as_int(report["watchlist_size"]) == 3
+    assert controls["cap_applied"] is True
+    assert _as_int(controls["input_count"]) == 5
+    assert _as_int(controls["selected_count"]) == 3
+    assert _as_int(controls["dropped_count"]) == 2
+    assert _as_int(prefilter["selected_count"]) == 3
+    assert summary["monster_scan_cap_applied"] is True
+
+
 def _reset_shared_week5_service(service: StockAnalyzerService) -> None:
     service.state.watchlist = []
     service.state.current_equity = 1.0

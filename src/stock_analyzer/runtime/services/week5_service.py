@@ -1176,6 +1176,45 @@ class RuntimeWeek5Service:
         prefilter_report["pinned_symbols"] = list(normalized_pinned_symbols)
         prefilter_report["pinned_count"] = len(pinned_added_symbols)
         prefilter_report["selected_count"] = len(symbol_list)
+        original_monster_scan_count = len(symbol_list)
+        monster_scan_cap = (
+            max(
+                1,
+                _as_int(
+                    service._config.week5.monster_scan_intraday_max_symbols,
+                    default=_as_int(service._config.week5.live_runtime_max_symbols, default=15),
+                ),
+            )
+            if intraday_scheduler_mode
+            else max(0, _as_int(service._config.week5.monster_scan_max_symbols, default=120))
+        )
+        monster_scan_cap_applied = bool(
+            monster_scan_cap > 0 and len(symbol_list) > monster_scan_cap
+        )
+        if monster_scan_cap_applied:
+            pinned_set = set(normalized_pinned_symbols)
+            pinned_first = [
+                symbol
+                for symbol in symbol_list
+                if (_normalize_a_share_symbol(symbol) or symbol) in pinned_set
+            ]
+            non_pinned = [
+                symbol
+                for symbol in symbol_list
+                if (_normalize_a_share_symbol(symbol) or symbol) not in pinned_set
+            ]
+            symbol_list = _dedupe_preserve_order([*pinned_first, *non_pinned])[:monster_scan_cap]
+            symbol_source = f"{symbol_source}:monster_cap"
+            prefilter_report["selected_count"] = len(symbol_list)
+        monster_scan_controls: dict[str, object] = {
+            "cap": monster_scan_cap,
+            "cap_applied": monster_scan_cap_applied,
+            "intraday_scheduler_mode": intraday_scheduler_mode,
+            "input_count": original_monster_scan_count,
+            "selected_count": len(symbol_list),
+            "dropped_count": max(0, original_monster_scan_count - len(symbol_list)),
+        }
+        prefilter_report["monster_scan_controls"] = monster_scan_controls
 
         if not symbol_list:
             empty_report = {
@@ -1421,6 +1460,7 @@ class RuntimeWeek5Service:
                 "provider": str(service._config.data_source.runtime_live_provider).strip()
                 or "offline",
             },
+            "monster_scan_controls": dict(monster_scan_controls),
             "first_board": {
                 "interval_minutes": max(1, service._config.week5.first_board_interval_min),
                 "window_intervals": list(service._config.week5.first_board_window_intervals),
@@ -1463,6 +1503,11 @@ class RuntimeWeek5Service:
                 "prefilter_shortlisted": _as_int(
                     prefilter_report.get("shortlisted_count"),
                     default=len(symbol_list),
+                ),
+                "monster_scan_cap_applied": monster_scan_cap_applied,
+                "monster_scan_dropped_count": max(
+                    0,
+                    original_monster_scan_count - len(symbol_list),
                 ),
                 "execution_rerank_applied": bool(execution_rerank.get("applied", False)),
             },

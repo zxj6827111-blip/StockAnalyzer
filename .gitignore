@@ -35,6 +35,7 @@ htmlcov/
 .tmp-py/
 .tmp_codex_pytest/
 .tmp_pytest_run2/
+.tmp_pytest*/
 /data/
 suggestions/
 artifacts/*

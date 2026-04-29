@@ -2220,6 +2220,8 @@ def runtime_sla(
         "all",
         help="Job scope: all, live_runtime, scheduled, or job name",
     ),
+    target_ms: int = typer.Option(60000, help="SLA target in milliseconds"),
+    alert_target_ms: int = typer.Option(30000, help="Stricter alert target in milliseconds"),
 ) -> None:
     config = get_config()
     service = StockAnalyzerService(config=config)
@@ -2227,6 +2229,8 @@ def runtime_sla(
         recent_runs=recent_runs,
         session_scope=session_scope,
         job_scope=job_scope,
+        target_ms=target_ms,
+        alert_target_ms=alert_target_ms,
     )
     typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
 

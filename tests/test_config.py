@@ -86,6 +86,10 @@ def test_load_default_config_values(monkeypatch: MonkeyPatch) -> None:
     assert config.week5.universe_prefilter_lookback_days == 240
     assert config.week5.universe_prefilter_top_k == 500
     assert config.week5.universe_prefilter_shortlist_top_n == 50
+    assert config.week5.monster_scan_intraday_max_symbols == 15
+    assert config.week5.monster_scan_max_symbols == 120
+    assert config.week5.monster_scan_sla_target_ms == 900_000
+    assert config.week5.monster_scan_sla_alert_target_ms == 600_000
     assert config.week5.offhours_universe_refresh_enabled is True
     assert config.week5.offhours_weekday_universe_max_symbols == 300
     assert config.week5.offhours_research_pool_top_k == 200
