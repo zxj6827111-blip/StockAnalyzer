@@ -9837,6 +9837,7 @@ class StockAnalyzerService:
         job_scope: str = "all",
         target_ms: int = 60000,
         alert_target_ms: int = 30000,
+        max_symbol_count: int | None = None,
     ) -> dict[str, object]:
         capped_runs = max(1, recent_runs)
         recent = self._latency_history_ms[-capped_runs:]
@@ -9844,6 +9845,11 @@ class StockAnalyzerService:
         normalized_job_scope = job_scope.strip().lower() or "all"
         resolved_target_ms = max(1, _as_int(target_ms, default=60000))
         resolved_alert_target_ms = max(1, _as_int(alert_target_ms, default=30000))
+        resolved_max_symbol_count = (
+            max(1, _as_int(max_symbol_count, default=0))
+            if max_symbol_count is not None
+            else None
+        )
         observed_runs = len(recent)
         if scope != "all":
             recent = [item for item in recent if _sla_entry_matches_scope(item, scope)]
@@ -9853,6 +9859,14 @@ class StockAnalyzerService:
                 item for item in recent if _sla_entry_matches_job_scope(item, normalized_job_scope)
             ]
         job_scoped_runs = len(recent)
+        if resolved_max_symbol_count is not None:
+            recent = [
+                item
+                for item in recent
+                if _as_int(item.get("symbol_count"), default=0) <= 0
+                or _as_int(item.get("symbol_count"), default=0) <= resolved_max_symbol_count
+            ]
+        symbol_scoped_runs = len(recent)
         latencies = [_as_int(item.get("duration_ms"), default=0) for item in recent]
         if not latencies:
             return {
@@ -9864,8 +9878,10 @@ class StockAnalyzerService:
                 "job_scoped_runs": job_scoped_runs,
                 "excluded_by_session_scope": observed_runs - session_scoped_runs,
                 "excluded_by_job_scope": session_scoped_runs - job_scoped_runs,
+                "excluded_by_symbol_count": job_scoped_runs - symbol_scoped_runs,
                 "target_ms": resolved_target_ms,
                 "alert_target_ms": resolved_alert_target_ms,
+                "max_symbol_count": resolved_max_symbol_count,
                 "avg_ms": 0.0,
                 "p50_ms": 0.0,
                 "p95_ms": 0.0,
@@ -9890,8 +9906,10 @@ class StockAnalyzerService:
             "job_scoped_runs": job_scoped_runs,
             "excluded_by_session_scope": observed_runs - session_scoped_runs,
             "excluded_by_job_scope": session_scoped_runs - job_scoped_runs,
+            "excluded_by_symbol_count": job_scoped_runs - symbol_scoped_runs,
             "target_ms": resolved_target_ms,
             "alert_target_ms": resolved_alert_target_ms,
+            "max_symbol_count": resolved_max_symbol_count,
             "avg_ms": round(sum(latencies) / len(latencies), 2),
             "p50_ms": round(_percentile(latencies, 0.50), 2),
             "p95_ms": round(_percentile(latencies, 0.95), 2),
@@ -14480,7 +14498,13 @@ class StockAnalyzerService:
         return None
 
     def _week5_live_runtime_symbols(self) -> tuple[list[str], dict[str, object]]:
-        limit = max(1, _as_int(self._config.week5.live_runtime_max_symbols, default=15))
+        configured_limit = max(
+            1,
+            _as_int(self._config.week5.live_runtime_max_symbols, default=8),
+        )
+        limit, cap_status = self._week5_live_runtime_effective_symbol_limit(
+            configured_limit=configured_limit,
+        )
         watchlist = [
             symbol
             for symbol in (_normalize_a_share_symbol(item) for item in self._state.watchlist)
@@ -14528,10 +14552,93 @@ class StockAnalyzerService:
 
         return selected, {
             "limit": limit,
+            "configured_limit": configured_limit,
             "selected_count": len(selected),
             "watchlist_count": len(watchlist),
             "source_counts": source_counts,
+            "auto_cap": cap_status,
         }
+
+    def _week5_live_runtime_effective_symbol_limit(
+        self,
+        *,
+        configured_limit: int,
+    ) -> tuple[int, dict[str, object]]:
+        base_limit = max(1, configured_limit)
+        min_symbols = min(
+            base_limit,
+            max(
+                1,
+                _as_int(self._config.week5.live_runtime_auto_cap_min_symbols, default=6),
+            ),
+        )
+        cap_status: dict[str, object] = {
+            "enabled": bool(self._config.week5.live_runtime_auto_cap_enabled),
+            "applied": False,
+            "configured_limit": base_limit,
+            "effective_limit": base_limit,
+            "min_symbols": min_symbols,
+            "observed_runs": 0,
+        }
+        if not bool(self._config.week5.live_runtime_auto_cap_enabled):
+            return base_limit, cap_status
+        if base_limit <= min_symbols:
+            return base_limit, cap_status
+
+        window_runs = max(
+            1,
+            _as_int(self._config.week5.live_runtime_auto_cap_window_runs, default=5),
+        )
+        recent_runs: list[dict[str, object]] = []
+        for item in reversed(self._latency_history_ms):
+            if not isinstance(item, dict):
+                continue
+            if not _sla_entry_matches_job_scope(item, "live_runtime"):
+                continue
+            symbol_count = _as_int(item.get("symbol_count"), default=0)
+            duration_ms = _as_int(item.get("duration_ms"), default=0)
+            if symbol_count <= 0 or duration_ms <= 0:
+                continue
+            recent_runs.append(item)
+            if len(recent_runs) >= window_runs:
+                break
+        cap_status["observed_runs"] = len(recent_runs)
+        if not recent_runs:
+            return base_limit, cap_status
+
+        per_symbol_ms = sorted(
+            _as_int(item.get("duration_ms"), default=0)
+            / max(1, _as_int(item.get("symbol_count"), default=1))
+            for item in recent_runs
+        )
+        observed_per_symbol_ms = per_symbol_ms[int((len(per_symbol_ms) - 1) * 0.8)]
+        threshold_ms = max(
+            1,
+            _as_int(self._config.week5.live_runtime_backpressure_threshold_ms, default=60000),
+        )
+        safety_ratio = min(
+            1.0,
+            max(
+                0.1,
+                _as_float(self._config.week5.live_runtime_auto_cap_safety_ratio, default=0.75),
+            ),
+        )
+        budget_ms = threshold_ms * safety_ratio
+        recommended_limit = max(
+            min_symbols,
+            min(base_limit, int(budget_ms // max(1.0, observed_per_symbol_ms))),
+        )
+        cap_status.update(
+            {
+                "applied": recommended_limit < base_limit,
+                "effective_limit": recommended_limit,
+                "observed_per_symbol_ms": round(observed_per_symbol_ms, 2),
+                "budget_ms": round(budget_ms, 2),
+                "threshold_ms": threshold_ms,
+                "safety_ratio": safety_ratio,
+            }
+        )
+        return recommended_limit, cap_status
 
     def _add_symbols_from_week5_report(
         self,

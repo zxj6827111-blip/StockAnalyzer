@@ -39,6 +39,7 @@ def test_load_default_config_values(monkeypatch: MonkeyPatch) -> None:
     assert config.backtest_matcher.max_dynamic_slippage_ratio == 0.012
     assert config.scheduler.week4_acceptance_time == "20:35"
     assert config.acceptance.auto_run is True
+    assert config.acceptance.runtime_sla_recent_runs == 10
     assert config.acceptance.export_enabled is True
     assert config.tdx_sync.enabled is False
     assert config.tdx_sync.auto_run is False
@@ -124,7 +125,11 @@ def test_load_default_config_values(monkeypatch: MonkeyPatch) -> None:
         "13:00-14:00@5",
         "14:00-14:57@5",
     ]
-    assert config.week5.live_runtime_max_symbols == 15
+    assert config.week5.live_runtime_max_symbols == 8
+    assert config.week5.live_runtime_auto_cap_enabled is True
+    assert config.week5.live_runtime_auto_cap_min_symbols == 6
+    assert config.week5.live_runtime_auto_cap_window_runs == 5
+    assert config.week5.live_runtime_auto_cap_safety_ratio == 0.75
     assert config.week5.live_runtime_backpressure_enabled is True
     assert config.week5.live_runtime_backpressure_threshold_ms == 60_000
     assert config.week5.live_runtime_backpressure_cooldown_min == 5

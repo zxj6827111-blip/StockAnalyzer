@@ -202,6 +202,39 @@ def test_service_week4_acceptance_fails_slow_live_runtime_sla() -> None:
     assert report["overall"] == "fail"
 
 
+def test_service_week4_acceptance_uses_bounded_runtime_sla_window() -> None:
+    config = _load_test_config()
+    config.acceptance.runtime_sla_recent_runs = 10
+    config.week5.live_runtime_max_symbols = 8
+    service = _new_service(config)
+    service._latency_history_ms = [
+        {
+            "timestamp": "2026-03-16T10:05:00",
+            "duration_ms": 120_000,
+            "job_name": "week5_live_runtime",
+            "runtime_role": "live_runtime",
+            "symbol_count": 15,
+            "use_live_runtime": True,
+        },
+        {
+            "timestamp": "2026-03-16T10:10:00",
+            "duration_ms": 42_000,
+            "job_name": "week5_live_runtime",
+            "runtime_role": "live_runtime",
+            "symbol_count": 4,
+            "use_live_runtime": True,
+        },
+    ]
+
+    report = _as_mapping(service.run_week4_acceptance(sla_recent_runs=100, notify_enabled=False))
+    runtime_sla = _as_mapping(report["runtime_sla"])
+
+    assert _as_int(runtime_sla["recent_runs"]) == 1
+    assert _as_int(runtime_sla["excluded_by_symbol_count"]) == 1
+    assert runtime_sla["status"] == "pass"
+    assert report["overall"] in {"pass", "pass_with_warnings"}
+
+
 def test_service_runtime_sla_reports_slowest_run_context() -> None:
     service = _new_service(_load_test_config())
     service._latency_history_ms = [

@@ -535,6 +535,43 @@ def test_week5_live_runtime_limits_symbols_and_prioritizes_active_pools() -> Non
     assert _as_int(selection["selected_count"]) == 3
 
 
+def test_week5_live_runtime_auto_caps_symbols_after_slow_runs() -> None:
+    config = _load_test_config()
+    config.week5.live_runtime_max_symbols = 8
+    config.week5.live_runtime_auto_cap_min_symbols = 6
+    config.week5.live_runtime_auto_cap_window_runs = 5
+    config.week5.live_runtime_auto_cap_safety_ratio = 0.75
+    service = _new_service(config)
+    service.state.watchlist = [
+        "600000",
+        "000001",
+        "600519",
+        "300750",
+        "002594",
+        "000333",
+        "601318",
+        "600036",
+    ]
+    service._latency_history_ms = [  # noqa: SLF001
+        {
+            "timestamp": "2026-03-02T10:05:00",
+            "duration_ms": 105_000,
+            "job_name": "week5_live_runtime",
+            "symbol_count": 15,
+            "use_live_runtime": True,
+        }
+    ]
+
+    symbols, selection = service._week5_live_runtime_symbols()  # noqa: SLF001
+    auto_cap = _as_mapping(selection["auto_cap"])
+
+    assert len(symbols) == 6
+    assert _as_int(selection["configured_limit"]) == 8
+    assert _as_int(selection["limit"]) == 6
+    assert auto_cap["applied"] is True
+    assert _as_int(auto_cap["effective_limit"]) == 6
+
+
 def test_week5_live_runtime_skips_next_slot_after_sla_backpressure() -> None:
     config = _load_test_config()
     config.scheduler.premarket_time = "23:59"

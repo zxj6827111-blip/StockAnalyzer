@@ -2222,6 +2222,10 @@ def runtime_sla(
     ),
     target_ms: int = typer.Option(60000, help="SLA target in milliseconds"),
     alert_target_ms: int = typer.Option(30000, help="Stricter alert target in milliseconds"),
+    max_symbol_count: int | None = typer.Option(
+        None,
+        help="Exclude runs above this symbol count",
+    ),
 ) -> None:
     config = get_config()
     service = StockAnalyzerService(config=config)
@@ -2231,6 +2235,7 @@ def runtime_sla(
         job_scope=job_scope,
         target_ms=target_ms,
         alert_target_ms=alert_target_ms,
+        max_symbol_count=max_symbol_count,
     )
     typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
 

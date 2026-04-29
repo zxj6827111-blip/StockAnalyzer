@@ -268,7 +268,11 @@ class Week5Config(_StrictModel):
             "14:00-14:57@5",
         ]
     )
-    live_runtime_max_symbols: int = 15
+    live_runtime_max_symbols: int = 8
+    live_runtime_auto_cap_enabled: bool = True
+    live_runtime_auto_cap_min_symbols: int = 6
+    live_runtime_auto_cap_window_runs: int = 5
+    live_runtime_auto_cap_safety_ratio: float = 0.75
     live_runtime_backpressure_enabled: bool = True
     live_runtime_backpressure_threshold_ms: int = 60_000
     live_runtime_backpressure_cooldown_min: int = 5
@@ -672,6 +676,7 @@ class AcceptanceConfig(_StrictModel):
     auto_notify: bool = True
     notify_on_pass: bool = False
     sla_recent_runs: int = 100
+    runtime_sla_recent_runs: int = 10
     export_enabled: bool = True
     export_dir: str = "artifacts/acceptance"
     history_limit: int = 500

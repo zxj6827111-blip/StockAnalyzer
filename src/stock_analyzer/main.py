@@ -3958,6 +3958,7 @@ def runtime_sla(
     job_scope: str = Query(default="all"),
     target_ms: int = Query(default=60000, ge=1),
     alert_target_ms: int = Query(default=30000, ge=1),
+    max_symbol_count: int | None = Query(default=None, ge=1),
 ) -> dict[str, object]:
     return _service.sla_report(
         recent_runs=recent_runs,
@@ -3965,6 +3966,7 @@ def runtime_sla(
         job_scope=job_scope,
         target_ms=target_ms,
         alert_target_ms=alert_target_ms,
+        max_symbol_count=max_symbol_count,
     )
 
 

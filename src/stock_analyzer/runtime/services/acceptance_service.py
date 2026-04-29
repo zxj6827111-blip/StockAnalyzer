@@ -139,10 +139,21 @@ class RuntimeAcceptanceService:
         )
 
         sla = service.sla_report(recent_runs=sla_recent_runs, session_scope="all")
+        runtime_sla_recent_runs = max(
+            1,
+            min(
+                sla_recent_runs,
+                _as_int(service._config.acceptance.runtime_sla_recent_runs, default=10),
+            ),
+        )
         runtime_sla = service.sla_report(
-            recent_runs=sla_recent_runs,
+            recent_runs=runtime_sla_recent_runs,
             session_scope="intraday",
             job_scope="live_runtime",
+            max_symbol_count=max(
+                1,
+                _as_int(service._config.week5.live_runtime_max_symbols, default=8),
+            ),
         )
         monster_scan_sla = service.sla_report(
             recent_runs=sla_recent_runs,

@@ -260,7 +260,11 @@ week5:
     - "10:30-11:30@5"
     - "13:00-14:00@5"
     - "14:00-14:57@5"
-  live_runtime_max_symbols: 15
+  live_runtime_max_symbols: 8
+  live_runtime_auto_cap_enabled: true
+  live_runtime_auto_cap_min_symbols: 6
+  live_runtime_auto_cap_window_runs: 5
+  live_runtime_auto_cap_safety_ratio: 0.75
   live_runtime_backpressure_enabled: true
   live_runtime_backpressure_threshold_ms: 60000
   live_runtime_backpressure_cooldown_min: 5
@@ -559,6 +563,7 @@ acceptance:
   auto_notify: true
   notify_on_pass: false
   sla_recent_runs: 100
+  runtime_sla_recent_runs: 10
   export_enabled: true
   export_dir: "artifacts/acceptance"
   history_limit: 500
