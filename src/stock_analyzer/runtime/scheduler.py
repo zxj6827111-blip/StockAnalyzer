@@ -9,6 +9,7 @@ from datetime import date, datetime, time
 from stock_analyzer.config import SchedulerConfig
 
 JobCallback = Callable[[], dict[str, object]]
+DatePredicate = Callable[[date], bool]
 _SCHEDULER_RAN_KEY = "_scheduler_ran"
 _SCHEDULER_SUCCESS_KEY = "_scheduler_success"
 _SCHEDULER_DETAIL_KEY = "_scheduler_detail"
@@ -33,6 +34,7 @@ class _ScheduledJob:
     latest_time: time | None
     callback: JobCallback
     weekdays: frozenset[int] | None = None
+    date_predicate: DatePredicate | None = None
 
 
 @dataclass(slots=True)
@@ -43,6 +45,7 @@ class _IntervalJob:
     interval_minutes: int
     callback: JobCallback
     weekdays: frozenset[int] | None = None
+    date_predicate: DatePredicate | None = None
 
 
 class DailyScheduler:
@@ -62,6 +65,7 @@ class DailyScheduler:
         callback: JobCallback,
         latest_hhmm: str = "",
         weekdays: Collection[int] | None = None,
+        date_predicate: DatePredicate | None = None,
     ) -> None:
         self._jobs[name] = _ScheduledJob(
             name=name,
@@ -69,6 +73,7 @@ class DailyScheduler:
             latest_time=_parse_hhmm(latest_hhmm) if latest_hhmm.strip() else None,
             callback=callback,
             weekdays=_normalize_weekdays(weekdays),
+            date_predicate=date_predicate,
         )
 
     def register_interval(
@@ -79,6 +84,7 @@ class DailyScheduler:
         interval_minutes: int,
         callback: JobCallback,
         weekdays: Collection[int] | None = None,
+        date_predicate: DatePredicate | None = None,
     ) -> None:
         if interval_minutes <= 0:
             raise ValueError("interval_minutes must be > 0")
@@ -93,6 +99,7 @@ class DailyScheduler:
             interval_minutes=interval_minutes,
             callback=callback,
             weekdays=_normalize_weekdays(weekdays),
+            date_predicate=date_predicate,
         )
 
     def run_due(self, now: datetime | None = None) -> list[ScheduledTaskResult]:
@@ -104,7 +111,12 @@ class DailyScheduler:
         results: list[ScheduledTaskResult] = []
         ordered_jobs = sorted(self._jobs.items(), key=lambda item: item[1].trigger_time)
         for name, job in ordered_jobs:
-            if not _weekday_matches(current_weekday, job.weekdays):
+            if not _date_matches(
+                current.date(),
+                current_weekday=current_weekday,
+                weekdays=job.weekdays,
+                date_predicate=job.date_predicate,
+            ):
                 results.append(
                     ScheduledTaskResult(
                         job=name,
@@ -167,7 +179,12 @@ class DailyScheduler:
                 )
 
         for name, interval_job in self._interval_jobs.items():
-            if not _weekday_matches(current_weekday, interval_job.weekdays):
+            if not _date_matches(
+                current.date(),
+                current_weekday=current_weekday,
+                weekdays=interval_job.weekdays,
+                date_predicate=interval_job.date_predicate,
+            ):
                 results.append(
                     ScheduledTaskResult(
                         job=name,
@@ -300,6 +317,18 @@ def _normalize_weekdays(weekdays: Collection[int] | None) -> frozenset[int] | No
 
 def _weekday_matches(current_weekday: int, weekdays: frozenset[int] | None) -> bool:
     return weekdays is None or current_weekday in weekdays
+
+
+def _date_matches(
+    current_date: date,
+    *,
+    current_weekday: int,
+    weekdays: frozenset[int] | None,
+    date_predicate: DatePredicate | None,
+) -> bool:
+    if not _weekday_matches(current_weekday, weekdays):
+        return False
+    return date_predicate is None or bool(date_predicate(current_date))
 
 
 def _normalize_callback_result(

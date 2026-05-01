@@ -56,6 +56,7 @@ from stock_analyzer.learning.feature_schema_registry import FeatureSchemaRegistr
 from stock_analyzer.learning.label_policy_registry import LabelPolicyRegistry
 from stock_analyzer.learning.sample_schema import MaturityStatus, OutcomeRecord, SignalSnapshot
 from stock_analyzer.learning.sample_store import SampleStore
+from stock_analyzer.market_calendar import is_a_share_trading_day
 from stock_analyzer.models.artifact import ModelArtifact
 from stock_analyzer.models.registry import ModelLifecycleState, ModelRegistry, ModelRole
 from stock_analyzer.models.adapters import inspect_model_backend_dependencies
@@ -12709,12 +12710,14 @@ class StockAnalyzerService:
 
     def _register_default_jobs(self) -> None:
         trading_weekdays = (0, 1, 2, 3, 4)
+        trading_day_filter = is_a_share_trading_day
         self._scheduler.register(
             name="premarket_scan",
             trigger_hhmm=self._config.scheduler.premarket_time,
             callback=self._job_premarket_scan,
             latest_hhmm=self._config.scheduler.auction_report_time,
             weekdays=trading_weekdays,
+            date_predicate=trading_day_filter,
         )
         self._scheduler.register(
             name="midday_news_brief",
@@ -12722,6 +12725,7 @@ class StockAnalyzerService:
             callback=self._job_midday_news_brief,
             latest_hhmm="13:00",
             weekdays=trading_weekdays,
+            date_predicate=trading_day_filter,
         )
         self._scheduler.register(
             name="auction_report",
@@ -12729,6 +12733,7 @@ class StockAnalyzerService:
             callback=self._job_auction_report,
             latest_hhmm="09:35",
             weekdays=trading_weekdays,
+            date_predicate=trading_day_filter,
         )
         self._scheduler.register(
             name="close_reconcile",
@@ -12736,6 +12741,7 @@ class StockAnalyzerService:
             callback=self._job_close_reconcile,
             latest_hhmm="15:40",
             weekdays=trading_weekdays,
+            date_predicate=trading_day_filter,
         )
         if self._config.market_warehouse.enabled and self._config.market_warehouse.auto_run:
             self._scheduler.register(
@@ -12743,6 +12749,7 @@ class StockAnalyzerService:
                 trigger_hhmm=self._config.market_warehouse.run_time,
                 callback=self._job_market_warehouse_sync,
                 weekdays=trading_weekdays,
+                date_predicate=trading_day_filter,
             )
         elif (
             self._config.tdx_sync.enabled
@@ -12754,6 +12761,7 @@ class StockAnalyzerService:
                 trigger_hhmm=self._config.tdx_sync.run_time,
                 callback=self._job_tdx_offline_sync,
                 weekdays=trading_weekdays,
+                date_predicate=trading_day_filter,
             )
         if self._config.acceptance.enabled and self._config.acceptance.auto_run:
             self._scheduler.register(
@@ -12762,6 +12770,7 @@ class StockAnalyzerService:
                 callback=self._job_week4_acceptance,
                 latest_hhmm="23:59",
                 weekdays=trading_weekdays,
+                date_predicate=trading_day_filter,
             )
         if self._config.week5.enabled and self._config.week5.auto_run:
             interval_profiles: list[tuple[str, str, int]] = []
@@ -12803,6 +12812,7 @@ class StockAnalyzerService:
                         interval_minutes=interval_minutes,
                         callback=self._job_week5_scan,
                         weekdays=trading_weekdays,
+                        date_predicate=trading_day_filter,
                     )
                 except ValueError as exc:
                     self._record_audit_event(
@@ -12844,6 +12854,7 @@ class StockAnalyzerService:
                         interval_minutes=interval_minutes,
                         callback=self._job_week5_live_runtime,
                         weekdays=trading_weekdays,
+                        date_predicate=trading_day_filter,
                     )
                 except ValueError as exc:
                     self._record_audit_event(
@@ -12881,6 +12892,7 @@ class StockAnalyzerService:
                             interval_minutes=interval_minutes,
                             callback=self._job_week5_market_radar,
                             weekdays=trading_weekdays,
+                            date_predicate=trading_day_filter,
                         )
                     except ValueError as exc:
                         self._record_audit_event(
@@ -12898,6 +12910,7 @@ class StockAnalyzerService:
                     trigger_hhmm=self._config.week6.data_prewarm_time,
                     callback=self._job_week6_data_prewarm,
                     weekdays=trading_weekdays,
+                    date_predicate=trading_day_filter,
                 )
             daily_time = (
                 self._config.week6.run_time.strip() or self._config.scheduler.week6_daily_time
@@ -12908,6 +12921,7 @@ class StockAnalyzerService:
                 callback=self._job_week6_daily,
                 latest_hhmm="16:00",
                 weekdays=trading_weekdays,
+                date_predicate=trading_day_filter,
             )
         if self._config.evolution.enabled and self._config.evolution.auto_run:
             self._scheduler.register(
@@ -16481,7 +16495,7 @@ def _sla_entry_matches_scope(entry: dict[str, object], scope: str) -> bool:
     except ValueError:
         return False
     if normalized_scope == "intraday":
-        if parsed.weekday() >= 5:
+        if not is_a_share_trading_day(parsed):
             return False
         current_time = parsed.time()
         return dt_time(hour=9, minute=15) <= current_time <= dt_time(hour=15, minute=30)

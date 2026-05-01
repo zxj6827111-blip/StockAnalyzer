@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import time
+import uuid
 from collections.abc import Mapping
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -43,7 +44,7 @@ def _load_test_config() -> StockAnalyzerConfig:
     config.training.bootstrap_require_completion_for_runtime = False
     config.training.bootstrap_auto_seed_watchlist = False
     config.training.bootstrap_retry_enabled = False
-    temp_root = Path(tempfile.mkdtemp(prefix="stock_analyzer_tests_"))
+    temp_root = _make_test_temp_root()
     offline_root = temp_root / "missing_offline_package"
     offline_root.mkdir(parents=True, exist_ok=True)
     config.data_source.local_data_root = str(offline_root)
@@ -64,6 +65,45 @@ def _load_test_config() -> StockAnalyzerConfig:
     config.idle_queue.universe_cache_path = str(temp_root / "universe_cache.json")
     config.evolution.auto_run = False
     config.evolution.dry_run = True
+    return config
+
+
+def _make_test_temp_root() -> Path:
+    try:
+        candidate = Path(tempfile.mkdtemp(prefix="stock_analyzer_tests_"))
+        probe = candidate / ".write_probe"
+        probe.mkdir(parents=True, exist_ok=True)
+        return candidate
+    except PermissionError:
+        root = Path(__file__).resolve().parents[1]
+        candidate = root / "manual_test_tmp" / f"stock_analyzer_tests_{uuid.uuid4().hex}"
+        probe = candidate / ".write_probe"
+        probe.mkdir(parents=True, exist_ok=True)
+        return candidate
+
+
+def _load_test_config_with_workspace_temp() -> StockAnalyzerConfig:
+    config = _load_test_config()
+    root = Path(__file__).resolve().parents[1]
+    temp_root = root / "manual_test_tmp" / f"stock_analyzer_holiday_{uuid.uuid4().hex}"
+    offline_root = temp_root / "missing_offline_package"
+    offline_root.mkdir(parents=True, exist_ok=True)
+    config.data_source.local_data_root = str(offline_root)
+    config.tdx_sync.vipdoc_root = str(offline_root)
+    config.command_channel.state_persist_path = str(temp_root / "runtime_state.json")
+    config.command_channel.history_archive_dir = str(temp_root / "runtime_history")
+    config.market_warehouse.db_path = str(temp_root / "market_warehouse.duckdb")
+    config.market_warehouse.package_root = str(temp_root / "market_warehouse_package")
+    config.market_warehouse.bootstrap_source_root = str(offline_root)
+    config.training.artifact_path = str(temp_root / "test_model_scheduler.json")
+    config.training.bootstrap_state_path = str(temp_root / "test_bootstrap_state_scheduler.json")
+    config.acceptance.export_dir = str(temp_root / "acceptance")
+    config.evolution.m3_store_dir = str(temp_root / "evolution_m3")
+    config.evolution.report_dir = str(temp_root / "evolution_history")
+    config.evolution.suggestions_dir = str(temp_root / "suggestions")
+    config.evolution.compliance_db_path = str(temp_root / "evolution_compliance.duckdb")
+    config.idle_queue.history_persist_path = str(temp_root / "idle_history.jsonl")
+    config.idle_queue.universe_cache_path = str(temp_root / "universe_cache.json")
     return config
 
 
@@ -1287,6 +1327,84 @@ def test_weekend_keeps_offhours_learning_but_skips_trading_jobs() -> None:
     assert _job_result(evening, "week6_daily")["detail"] == "not_scheduled_today"
     assert _as_bool(_job_result(evening, "evolution_offhours")["ran"]) is True
     assert evolution_calls == ["ok"]
+
+
+def test_exchange_holiday_keeps_offhours_learning_but_skips_trading_jobs() -> None:
+    config = _load_test_config_with_workspace_temp()
+    config.scheduler.premarket_time = "08:30"
+    config.scheduler.close_reconcile_time = "15:30"
+    config.scheduler.week4_acceptance_time = "20:35"
+    config.market_warehouse.enabled = True
+    config.market_warehouse.auto_run = True
+    config.market_warehouse.run_time = "18:20"
+    config.week5.auto_run = True
+    config.week5.first_board_windows = ["09:30-09:31"]
+    config.week5.live_runtime_window_intervals = ["09:30-09:31@1"]
+    config.week6.auto_run = True
+    config.week6.run_time = "20:35"
+    config.evolution.auto_run = True
+    config.evolution.offhours_time = "20:30"
+    service = _new_service(config)
+
+    evolution_calls: list[str] = []
+
+    def _fake_evolution_job(now: datetime | None = None) -> dict[str, object]:
+        _ = now
+        evolution_calls.append("ok")
+        return {"report": {"status": "ok"}}
+
+    _patch_attr(service._evolution_core_service, "_job_evolution_offhours", _fake_evolution_job)
+
+    morning = service.run_due_jobs(now=datetime.fromisoformat("2026-05-01T08:30:00"))
+    intraday = service.run_due_jobs(now=datetime.fromisoformat("2026-05-01T09:30:00"))
+    evening = service.run_due_jobs(now=datetime.fromisoformat("2026-05-01T20:35:00"))
+
+    assert _job_result(morning, "premarket_scan")["detail"] == "not_scheduled_today"
+    assert _job_result(intraday, "week5_first_board_1")["detail"] == "not_scheduled_today"
+    assert _job_result(intraday, "week5_live_runtime_1")["detail"] == "not_scheduled_today"
+    assert _job_result(evening, "market_warehouse_sync")["detail"] == "not_scheduled_today"
+    assert _job_result(evening, "week4_acceptance")["detail"] == "not_scheduled_today"
+    assert _job_result(evening, "week6_daily")["detail"] == "not_scheduled_today"
+    assert _as_bool(_job_result(evening, "evolution_offhours")["ran"]) is True
+    assert evolution_calls == ["ok"]
+
+
+def test_intraday_sla_excludes_exchange_holiday_latency() -> None:
+    config = _load_test_config_with_workspace_temp()
+    service = _new_service(config)
+    _patch_attr(
+        service,
+        "_latency_history_ms",
+        [
+            {
+                "timestamp": "2026-05-01T14:22:49",
+                "duration_ms": 120000,
+                "job_name": "week5_live_runtime",
+                "runtime_role": "live_runtime",
+                "symbol_count": 6,
+                "use_live_runtime": True,
+            },
+            {
+                "timestamp": "2026-05-06T14:22:49",
+                "duration_ms": 30000,
+                "job_name": "week5_live_runtime",
+                "runtime_role": "live_runtime",
+                "symbol_count": 6,
+                "use_live_runtime": True,
+            },
+        ],
+    )
+
+    report = service.sla_report(
+        recent_runs=10,
+        session_scope="intraday",
+        job_scope="live_runtime",
+        max_symbol_count=8,
+    )
+
+    assert report["recent_runs"] == 1
+    assert report["excluded_by_session_scope"] == 1
+    assert report["compliance_rate"] == 1.0
 
 
 def test_post_market_warehouse_followup_skips_when_coverage_gate_fails() -> None:

@@ -93,13 +93,16 @@ def test_scheduler_retries_daily_job_when_callback_does_not_claim_execution_righ
     scheduler.register("test_job", "08:30", callback=_callback)
 
     first_due = scheduler.run_due(datetime.fromisoformat("2026-03-01T08:30:00"))
+    state_after_first_due = scheduler.export_state()
     second_due = scheduler.run_due(datetime.fromisoformat("2026-03-01T08:31:00"))
+    state_after_second_due = scheduler.export_state()
 
     assert first_due[0].ran is False
     assert first_due[0].detail == "already_running"
-    assert scheduler.export_state()["last_run"] == {}
+    assert state_after_first_due["last_run"] == {}
     assert second_due[0].ran is True
     assert second_due[0].detail == "ok"
+    assert state_after_second_due["last_run"] == {"test_job": "2026-03-01"}
     assert attempts == ["called", "called"]
 
 
@@ -140,5 +143,48 @@ def test_scheduler_respects_weekday_filters_for_daily_and_interval_jobs() -> Non
     assert weekend_interval[1].detail == "not_scheduled_today"
     assert weekday_daily[0].ran is True
     assert weekday_interval[1].ran is True
+    assert daily_runs == ["ok"]
+    assert interval_runs == ["ok"]
+
+
+def test_scheduler_respects_date_predicate_for_daily_and_interval_jobs() -> None:
+    config = SchedulerConfig(
+        enabled=True,
+        premarket_time="08:30",
+        auction_report_time="09:26",
+        close_reconcile_time="15:30",
+    )
+    scheduler = DailyScheduler(config=config)
+    daily_runs: list[str] = []
+    interval_runs: list[str] = []
+
+    scheduler.register(
+        "trading_daily",
+        "08:30",
+        callback=lambda: _record_run(daily_runs),
+        weekdays=(0, 1, 2, 3, 4),
+        date_predicate=lambda current: current.isoformat() != "2026-05-01",
+    )
+    scheduler.register_interval(
+        name="trading_interval",
+        window_start_hhmm="09:30",
+        window_end_hhmm="09:32",
+        interval_minutes=1,
+        callback=lambda: _record_run(interval_runs),
+        weekdays=(0, 1, 2, 3, 4),
+        date_predicate=lambda current: current.isoformat() != "2026-05-01",
+    )
+
+    holiday_daily = scheduler.run_due(datetime.fromisoformat("2026-05-01T08:30:00"))
+    holiday_interval = scheduler.run_due(datetime.fromisoformat("2026-05-01T09:30:00"))
+    trading_daily = scheduler.run_due(datetime.fromisoformat("2026-05-06T08:30:00"))
+    trading_interval = scheduler.run_due(datetime.fromisoformat("2026-05-06T09:30:00"))
+
+    assert holiday_daily[0].ran is False
+    assert holiday_daily[0].detail == "not_scheduled_today"
+    assert holiday_interval[1].ran is False
+    assert holiday_interval[1].detail == "not_scheduled_today"
+    assert trading_daily[0].ran is True
+    assert trading_interval[1].ran is True
     assert daily_runs == ["ok"]
     assert interval_runs == ["ok"]
