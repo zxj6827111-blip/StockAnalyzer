@@ -471,6 +471,7 @@ class RuntimeOpsService:
                 "history_records": len(service._idle_history),
                 "latest_report": service._last_idle_report,
             },
+            "notification_filter_diagnostics": service.latest_notification_filter_diagnostics(),
             "training_bootstrap": service.training_bootstrap_status(),
             "sla": service.sla_report(),
             "latest_report": latest,

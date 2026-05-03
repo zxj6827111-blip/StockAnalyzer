@@ -145,15 +145,15 @@ score:
     completion: 0.10
   thresholds:
     s: 78
-    a: 65
-    b: 55
+    a: 60
+    b: 50
 
 strategy_scores:
   trend:
     thresholds:
       s: 78
-      a: 65
-      b: 55
+      a: 60
+      b: 50
     weights:
       lgbm: 0.35
       xgb: 0.30
@@ -164,8 +164,8 @@ strategy_scores:
   monster:
     thresholds:
       s: 76
-      a: 64
-      b: 54
+      a: 60
+      b: 50
     weights:
       lgbm: 0.25
       xgb: 0.25
@@ -423,9 +423,9 @@ feishu_interaction:
 notification_filter:
   enabled: true
   cooldown_sec: 300
-  min_score: 65
+  min_score: 60
   allowed_actions: [buy, watch]
-  max_signals_per_run: 3
+  max_signals_per_run: 5
   quiet_windows: []
   dedup_by_symbol_action: true
   t_day_entry_silence_enabled: true

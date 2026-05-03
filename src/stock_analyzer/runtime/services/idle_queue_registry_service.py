@@ -26,7 +26,14 @@ class RuntimeIdleQueueRegistryService:
         if not trade_date or trade_date == service._idle_last_weekend_trade_date:
             return
         previous_trade_date = service._idle_last_weekend_trade_date
-        p1_tasks = ["WE-P1-03", "WE-P1-04", "WE-P1-05", "WE-P1-06", "WE-P1-07"]
+        p1_tasks = [
+            "WE-LEARN-01",
+            "WE-P1-03",
+            "WE-P1-04",
+            "WE-P1-05",
+            "WE-P1-06",
+            "WE-P1-07",
+        ]
         if previous_trade_date:
             for task_id in p1_tasks:
                 if service._idle_already_ran(task_id=task_id, trade_date=previous_trade_date):
@@ -79,8 +86,10 @@ class RuntimeIdleQueueRegistryService:
                             continue
 
             max_wall_time = _as_int(manifest.get("max_wall_time_minutes"), default=0)
+            min_remaining_minutes = _as_int(manifest.get("min_remaining_minutes"), default=0)
             must_run = bool(manifest.get("must_run", False))
-            if not must_run and max_wall_time > 0 and remaining_minutes < max_wall_time:
+            required_minutes = max(max_wall_time, min_remaining_minutes)
+            if not must_run and required_minutes > 0 and remaining_minutes < required_minutes:
                 service._idle_record_weekend_defer(task_id=task_id, trade_date=trade_date)
                 continue
             due.append(task_id)
@@ -102,7 +111,14 @@ class RuntimeIdleQueueRegistryService:
 
     def idle_weekend_sorted_p1_tasks(self) -> list[str]:
         service = self._service
-        p1_tasks = ["WE-P1-03", "WE-P1-04", "WE-P1-05", "WE-P1-06", "WE-P1-07"]
+        p1_tasks = [
+            "WE-LEARN-01",
+            "WE-P1-03",
+            "WE-P1-04",
+            "WE-P1-05",
+            "WE-P1-06",
+            "WE-P1-07",
+        ]
         return sorted(
             p1_tasks,
             key=lambda task_id: (
@@ -280,6 +296,8 @@ class RuntimeIdleQueueRegistryService:
             return cast(dict[str, object], service._idle_task_we_p0_01(context=context))
         if task_id == "WE-P0-02":
             return cast(dict[str, object], service._idle_task_we_p0_02(context=context))
+        if task_id == "WE-LEARN-01":
+            return cast(dict[str, object], service._idle_task_we_learn_01(context=context))
         if task_id == "WE-P1-03":
             return cast(dict[str, object], service._idle_task_we_p1_03(context=context))
         if task_id == "WE-P1-04":

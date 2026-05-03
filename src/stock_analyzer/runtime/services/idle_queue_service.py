@@ -339,6 +339,9 @@ class RuntimeIdleQueueService:
     def _idle_task_we_p0_02(self, context: dict[str, object]) -> dict[str, object]:
         return self._weekend_service._idle_task_we_p0_02(context)
 
+    def _idle_task_we_learn_01(self, context: dict[str, object]) -> dict[str, object]:
+        return self._weekend_service._idle_task_we_learn_01(context)
+
     def _idle_task_we_p1_03(self, context: dict[str, object]) -> dict[str, object]:
         return self._weekend_service._idle_task_we_p1_03(context)
 

@@ -325,6 +325,399 @@ class RuntimeIdleQueueWeekendService:
             "samples": len(proposals),
         }
 
+    def _idle_task_we_learn_01(self, context: dict[str, object]) -> dict[str, object]:
+        service = self._service
+        task_id = "WE-LEARN-01"
+        trade_date = str(context.get("trade_date", "")).strip()
+        now = _parse_iso_datetime(str(context.get("now", ""))) or datetime.now()
+        started = perf_counter()
+        manifest = service._idle_task_manifests.get(task_id, {})
+        output_path = service._idle_output_path(
+            trade_date=trade_date,
+            task_id=task_id,
+            subdir="model_learning",
+            filename="learning_report.json",
+        )
+        trace_trade_date = trade_date or now.strftime("%Y%m%d")
+        trace_id = f"we-learn-01-{trace_trade_date}"
+        remaining_minutes = service._idle_weekend_remaining_minutes(now)
+        min_remaining_minutes = _as_int(manifest.get("min_remaining_minutes"), default=0)
+        min_interval_days = _as_int(manifest.get("min_interval_days"), default=7)
+        symbol_cap = max(1, _as_int(manifest.get("symbol_cap"), default=80))
+        auto_promotion_enabled = bool(service._config.auto_promotion.enabled)
+
+        report: dict[str, object] = {
+            "task_id": task_id,
+            "trade_date": trade_date,
+            "generated_at": now.isoformat(),
+            "trace_id": trace_id,
+            "status": "running",
+            "reason": "",
+            "elapsed_seconds": 0.0,
+            "remaining_minutes_at_start": remaining_minutes,
+            "min_remaining_minutes": min_remaining_minutes,
+            "min_interval_days": min_interval_days,
+            "symbol_cap": symbol_cap,
+            "manifest_symbol_count": 0,
+            "auto_promotion_enabled": auto_promotion_enabled,
+            "online_effect": "none",
+            "blocked_after_run": False,
+            "dataset_manifest_id": "",
+            "manifest_included_snapshot_count": 0,
+            "manifest_included_outcome_count": 0,
+            "shadow_model_id": "",
+            "champion_model_id": "",
+            "proposal_id": "",
+            "proposal_status": "",
+            "promotion_gate_status": "",
+            "ticket_id": "",
+            "gates": {},
+            "symbol_universe": {},
+            "manifest": {},
+            "proposal": {},
+            "summary_notification": {"sent": False, "reason": "not_attempted"},
+        }
+
+        def finish(status: str, reason: str) -> dict[str, object]:
+            report["status"] = status
+            report["reason"] = reason
+            report["elapsed_seconds"] = round(perf_counter() - started, 6)
+            if bool(service._config.auto_promotion.notify_on_training_summary):
+                report["summary_notification"] = self._notify_we_learn_01_summary(
+                    report=report,
+                    trace_id=trace_id,
+                )
+            service._idle_write_json(output_path, report)
+            return {
+                "status": status,
+                "reason": reason,
+                "output_files": [str(output_path)],
+                "dataset_manifest_id": str(report.get("dataset_manifest_id", "")),
+                "proposal_id": str(report.get("proposal_id", "")),
+                "online_effect": str(report.get("online_effect", "none")),
+            }
+
+        if min_remaining_minutes > 0 and remaining_minutes < min_remaining_minutes:
+            return finish("skipped", "skipped: insufficient_weekend_time_budget")
+
+        last_trade_date = service._idle_latest_trade_date_for_task(task_id=task_id)
+        current_trade_date_dt = _parse_trade_date(trade_date)
+        if last_trade_date and current_trade_date_dt is not None:
+            last_trade_date_dt = _parse_trade_date(last_trade_date)
+            if last_trade_date_dt is not None:
+                delta_days = (current_trade_date_dt - last_trade_date_dt).days
+                if delta_days < min_interval_days:
+                    report["last_trade_date"] = last_trade_date
+                    report["days_since_last_run"] = delta_days
+                    return finish("skipped", "skipped: min_interval_not_reached")
+
+        market_gate = self._we_learn_01_market_warehouse_gate(trade_date=trade_date)
+        maturity_gate = self._we_learn_01_sample_maturity_gate()
+        existing_gate = self._we_learn_01_existing_proposal_gate(
+            trade_date=trade_date,
+            now=now,
+        )
+        report["gates"] = {
+            "market_warehouse": market_gate,
+            "sample_maturity": maturity_gate,
+            "existing_proposal": existing_gate,
+        }
+        report["maturity_breakdown"] = maturity_gate.get("maturity_breakdown", {})
+
+        if not bool(market_gate.get("ok", False)):
+            report["blocked_after_run"] = True
+            return finish("skipped", "skipped: market_warehouse_gate_failed")
+        if bool(existing_gate.get("skip", False)):
+            return finish("skipped", str(existing_gate.get("reason", "existing_proposal")))
+
+        try:
+            universe = service._idle_symbol_universe(
+                task_id=task_id,
+                max_symbols=symbol_cap,
+                min_symbols=1,
+            )
+        except Exception as exc:
+            universe = {
+                "source": "error",
+                "symbols": [],
+                "count": 0,
+                "errors": [f"idle_{task_id}_symbol_universe_failed:{exc.__class__.__name__}:{exc}"],
+            }
+        symbol_list = _string_list(universe.get("symbols", []))[:symbol_cap]
+        universe_payload = dict(universe)
+        universe_payload["symbols"] = symbol_list
+        universe_payload["count"] = len(symbol_list)
+        report["symbol_universe"] = universe_payload
+        report["manifest_symbol_count"] = len(symbol_list)
+        if not symbol_list:
+            report["blocked_after_run"] = False
+            return finish("skipped", "skipped: symbol_universe_unavailable")
+
+        try:
+            manifest_payload = service.build_learning_trainable_manifest(symbols=symbol_list)
+        except Exception as exc:
+            manifest_payload = {
+                "ok": False,
+                "mode": "build_trainable_manifest",
+                "dataset_manifest_id": "",
+                "included_snapshot_count": 0,
+                "included_outcome_count": 0,
+                "errors": [f"manifest_build_failed:{exc.__class__.__name__}:{exc}"],
+            }
+        report["manifest"] = manifest_payload
+        manifest_id = str(manifest_payload.get("dataset_manifest_id", "")).strip()
+        report["dataset_manifest_id"] = manifest_id
+        report["manifest_included_snapshot_count"] = _as_int(
+            manifest_payload.get("included_snapshot_count"),
+            default=0,
+        )
+        report["manifest_included_outcome_count"] = _as_int(
+            manifest_payload.get("included_outcome_count"),
+            default=0,
+        )
+
+        if not bool(manifest_payload.get("ok", False)) or not manifest_id:
+            report["blocked_after_run"] = False
+            return finish("skipped", "skipped: trainable_manifest_unavailable")
+
+        try:
+            proposal_payload = service.run_learning_manifest_shadow_proposal(
+                dataset_manifest_id=manifest_id,
+                load_predictor=not auto_promotion_enabled,
+                approve_if_passed=True,
+                auto_approve=auto_promotion_enabled,
+                auto_release=auto_promotion_enabled,
+                auto_reload_predictor=bool(service._config.auto_promotion.auto_load_predictor),
+                notify_on_rejection=bool(service._config.auto_promotion.notify_on_rejection),
+                source_trace_id=trace_id,
+            )
+        except Exception as exc:
+            proposal_payload = {
+                "ok": False,
+                "mode": "learning_manifest_shadow_proposal",
+                "status": "error",
+                "accepted": False,
+                "dataset_manifest_id": manifest_id,
+                "shadow_model_id": "",
+                "champion_model_id": "",
+                "proposal": {},
+                "workflow": {},
+                "auto_promotion": {},
+                "errors": [f"shadow_proposal_failed:{exc.__class__.__name__}:{exc}"],
+            }
+
+        report["proposal"] = proposal_payload
+        workflow_payload = _dict_payload(proposal_payload.get("workflow", {}))
+        promotion_gate = _dict_payload(workflow_payload.get("promotion_gate", {}))
+        shadow_validation = _dict_payload(workflow_payload.get("shadow_validation", {}))
+        training_payload = _dict_payload(shadow_validation.get("training", {}))
+        proposal = _dict_payload(proposal_payload.get("proposal", {}))
+        auto_promotion = _dict_payload(proposal_payload.get("auto_promotion", {}))
+
+        report["shadow_model_id"] = str(proposal_payload.get("shadow_model_id", "")).strip()
+        report["champion_model_id"] = str(proposal_payload.get("champion_model_id", "")).strip()
+        report["proposal_id"] = str(proposal.get("proposal_id", "")).strip()
+        report["proposal_status"] = str(
+            proposal.get("status", "") or proposal_payload.get("status", "")
+        ).strip()
+        report["promotion_gate_status"] = str(
+            proposal.get("gate_status", "")
+            or promotion_gate.get("status", "")
+            or workflow_payload.get("status", "")
+        ).strip()
+        report["ticket_id"] = str(auto_promotion.get("ticket_id", "")).strip()
+        predictor_loaded = (
+            bool(auto_promotion.get("predictor_loaded", False))
+            or bool(training_payload.get("predictor_loaded", False))
+        )
+        report["online_effect"] = "predictor_reloaded" if predictor_loaded else "none"
+        report["blocked_after_run"] = not bool(proposal_payload.get("ok", False))
+
+        if bool(proposal_payload.get("ok", False)):
+            return finish("ok", "learning_shadow_proposal_completed")
+        return finish("degraded", "learning_shadow_proposal_not_accepted")
+
+    def _we_learn_01_market_warehouse_gate(self, *, trade_date: str) -> dict[str, object]:
+        service = self._service
+        enabled = bool(service._config.market_warehouse.enabled)
+        if not enabled:
+            return {"ok": True, "status": "disabled", "reason": "market_warehouse_disabled"}
+        try:
+            latest = service.latest_market_warehouse_report()
+        except Exception as exc:
+            return {
+                "ok": False,
+                "status": "error",
+                "reason": "market_warehouse_report_unavailable",
+                "error": f"{exc.__class__.__name__}:{exc}",
+            }
+        if not isinstance(latest, dict) or not latest:
+            return {
+                "ok": True,
+                "status": "unknown",
+                "reason": "no_recent_market_warehouse_report",
+                "warning": "gate_is_advisory_until_first_report",
+            }
+        latest_status = str(latest.get("status", "")).strip().lower()
+        timestamp_text = str(latest.get("timestamp", latest.get("generated_at", ""))).strip()
+        report_trade_date_text = str(latest.get("trade_date", "")).strip()
+        target_trade_date = _parse_trade_date(trade_date)
+        report_trade_date = _parse_trade_date(report_trade_date_text)
+        report_timestamp = _parse_iso_datetime(timestamp_text)
+        payload: dict[str, object] = {
+            "ok": False,
+            "status": latest_status or "unknown",
+            "reason": "latest_market_warehouse_report_not_ok",
+            "timestamp": timestamp_text,
+            "trade_date": report_trade_date_text,
+            "expected_trade_date": trade_date,
+        }
+        ok = latest_status in {"ok", "success", "completed", "healthy"}
+        if not ok:
+            return payload
+        if target_trade_date is None:
+            payload["ok"] = True
+            payload["reason"] = "target_trade_date_unavailable"
+            return payload
+        if report_trade_date is not None:
+            if report_trade_date < target_trade_date:
+                payload["reason"] = "stale_market_warehouse_report"
+                return payload
+            payload["ok"] = True
+            payload["reason"] = ""
+            return payload
+        if report_timestamp is not None:
+            if report_timestamp.date() < target_trade_date:
+                payload["reason"] = "stale_market_warehouse_report"
+                return payload
+            payload["ok"] = True
+            payload["reason"] = ""
+            return payload
+        payload["reason"] = "market_warehouse_report_freshness_unknown"
+        return payload
+
+    def _we_learn_01_sample_maturity_gate(self) -> dict[str, object]:
+        service = self._service
+        try:
+            counts = service._sample_store.counts()
+            outcomes = service._sample_store.list_outcomes()
+        except Exception as exc:
+            return {
+                "ok": True,
+                "status": "unknown",
+                "reason": "sample_store_status_unavailable",
+                "error": f"{exc.__class__.__name__}:{exc}",
+                "maturity_breakdown": {},
+            }
+        maturity_breakdown: dict[str, int] = {}
+        for outcome in outcomes:
+            key = str(outcome.maturity_status.value)
+            maturity_breakdown[key] = maturity_breakdown.get(key, 0) + 1
+        trainable_outcomes = sum(
+            maturity_breakdown.get(key, 0)
+            for key in ("label_matured", "reconciled", "fully_matured")
+        )
+        status = "ready" if trainable_outcomes > 0 else "warming"
+        return {
+            "ok": True,
+            "status": status,
+            "sample_store": dict(counts),
+            "maturity_breakdown": maturity_breakdown,
+            "trainable_outcome_count": trainable_outcomes,
+        }
+
+    def _we_learn_01_existing_proposal_gate(
+        self,
+        *,
+        trade_date: str,
+        now: datetime,
+    ) -> dict[str, object]:
+        service = self._service
+        proposal = service.latest_learning_model_proposal()
+        if not isinstance(proposal, dict) or not proposal:
+            return {"skip": False, "reason": "no_existing_proposal"}
+        proposal_id = str(proposal.get("proposal_id", "")).strip()
+        status = str(proposal.get("status", "")).strip().lower()
+        if not proposal_id or status in {"rejected", "revoked", "rolled_back"}:
+            return {
+                "skip": False,
+                "reason": "existing_proposal_not_active",
+                "proposal_id": proposal_id,
+                "status": status,
+            }
+
+        timestamp = _parse_iso_datetime(
+            proposal.get("timestamp")
+            or proposal.get("created_at")
+            or proposal.get("generated_at")
+            or "",
+        )
+        trade_date_dt = _parse_trade_date(trade_date)
+        is_current_weekend = False
+        if timestamp is not None and trade_date_dt is not None:
+            is_current_weekend = timestamp.date() >= trade_date_dt
+        elif timestamp is not None:
+            is_current_weekend = (now.date() - timestamp.date()).days <= 2
+        return {
+            "skip": bool(is_current_weekend),
+            "reason": (
+                "skipped: existing_valid_learning_proposal"
+                if is_current_weekend
+                else "existing_proposal_is_not_current_weekend"
+            ),
+            "proposal_id": proposal_id,
+            "status": status,
+            "timestamp": timestamp.isoformat() if timestamp is not None else "",
+        }
+
+    def _notify_we_learn_01_summary(
+        self,
+        *,
+        report: dict[str, object],
+        trace_id: str,
+    ) -> dict[str, object]:
+        service = self._service
+        proposal_payload = _dict_payload(report.get("proposal", {}))
+        if proposal_payload and str(report.get("status", "")).strip().lower() in {
+            "ok",
+            "degraded",
+        }:
+            return service._notify_learning_workflow_summary(
+                proposal_payload=proposal_payload,
+                trace_id=trace_id,
+            )
+
+        trade_date = str(report.get("trade_date", "")).strip()
+        status = str(report.get("status", "")).strip() or "unknown"
+        reason = str(report.get("reason", "")).strip() or "-"
+        manifest_id = str(report.get("dataset_manifest_id", "")).strip() or "-"
+        try:
+            delivery = service._notify_if_changed(
+                dedup_key=f"idle-we-learn-01:{trade_date}:{status}:{reason}",
+                title=f"[Idle Queue][Learning] WE-LEARN-01 {status}",
+                content=(
+                    f"task_id=WE-LEARN-01\n"
+                    f"trade_date={trade_date or '-'}\n"
+                    f"status={status}\n"
+                    f"reason={reason}\n"
+                    f"dataset_manifest_id={manifest_id}"
+                ),
+                level="info" if status in {"ok", "skipped"} else "warn",
+                trace_id=trace_id,
+                ttl_sec=20 * 3600,
+            )
+        except Exception as exc:
+            return {
+                "sent": False,
+                "reason": "summary_notification_failed",
+                "error": f"{exc.__class__.__name__}:{exc}",
+            }
+        return {
+            "sent": delivery is not None,
+            "reason": "dedup" if delivery is None else "sent",
+            "delivery": delivery or {},
+        }
+
     def _idle_task_we_p1_03(self, context: dict[str, object]) -> dict[str, object]:
         service = self._service
         trade_date = str(context.get("trade_date", "")).strip()
@@ -1111,6 +1504,10 @@ def _as_float(value: object, default: float) -> float:
 
 def _as_int(value: object, default: int) -> int:
     return cast(int, _runtime_service_module()._as_int(value, default))
+
+
+def _dict_payload(value: object) -> dict[str, object]:
+    return dict(value) if isinstance(value, dict) else {}
 
 
 def _normalize_a_share_symbol(value: object) -> str:

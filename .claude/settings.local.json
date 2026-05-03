@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git checkout *)",
+      "Bash(python -m py_compile src/stock_analyzer/runtime/services/idle_queue_registry_service.py)",
+      "Bash(python -m py_compile src/stock_analyzer/runtime/services/idle_queue_weekend_service.py)",
+      "Bash(python -m py_compile tests/test_service_idle_queue.py)",
+      "Bash(python -c ' *)",
+      "Bash(python -m pytest tests/test_notification_filter.py tests/test_service_idle_queue.py tests/test_config.py -v --tb=short)",
+      "Bash(python -m pytest tests/test_service_signal_notify_news.py -v --tb=short)"
+    ]
+  }
+}

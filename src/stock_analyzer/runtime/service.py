@@ -210,6 +210,7 @@ class StockAnalyzerService:
         self._recommendation_latest_id_by_symbol: dict[str, str] = {}
         self._last_signal_payload: list[dict[str, object]] = []
         self._last_signal_trace_id: str = ""
+        self._last_notification_filter_diagnostics: dict[str, object] | None = None
         self._scheduler_now_context: datetime | None = None
         self._last_reconcile_report: dict[str, object] | None = None
         self._reconcile_history: list[dict[str, object]] = []
@@ -1715,6 +1716,11 @@ class StockAnalyzerService:
             "signals": [dict(item) for item in self._last_signal_payload],
         }
 
+    def latest_notification_filter_diagnostics(self) -> dict[str, object] | None:
+        if self._last_notification_filter_diagnostics is None:
+            return None
+        return deepcopy(self._last_notification_filter_diagnostics)
+
     def _select_provider(self, *, use_live_runtime: bool) -> MarketDataProvider:
         if use_live_runtime and self._realtime_provider is not None:
             return self._realtime_provider
@@ -3195,7 +3201,11 @@ class StockAnalyzerService:
             signals,
             now=timestamp,
             entry_day_symbols=entry_day_symbols,
+            trace_id=trace_id,
         )
+        notification_filter_diagnostics = self._notification_filter.latest_diagnostics()
+        if notification_filter_diagnostics is not None:
+            self._last_notification_filter_diagnostics = dict(notification_filter_diagnostics)
         recommendation_update = self._sync_recommendation_lifecycle_from_signals(
             signals=signals,
             timestamp=timestamp,
@@ -3242,6 +3252,8 @@ class StockAnalyzerService:
         }
         payload["portfolio_update"] = portfolio_update
         payload["actionable_signals"] = actionable_signals
+        if notification_filter_diagnostics is not None:
+            payload["notification_filter_diagnostics"] = notification_filter_diagnostics
         payload["job_name"] = job_name.strip() or "pipeline_run"
         payload["symbol_count"] = len(symbol_list)
         payload["use_live_runtime"] = bool(use_live_runtime)
@@ -3299,6 +3311,7 @@ class StockAnalyzerService:
                 "use_live_runtime": bool(use_live_runtime),
                 "signals": _signals_count(payload),
                 "actionable": len(actionable_signals),
+                "notification_filter_diagnostics": notification_filter_diagnostics or {},
                 "duration_ms": duration_ms,
                 "execution_mode": execution_mode,
                 "week6_execution": payload["week6_execution"],
@@ -3725,6 +3738,9 @@ class StockAnalyzerService:
 
     def _idle_task_we_p0_02(self, context: dict[str, object]) -> dict[str, object]:
         return self._idle_queue_service._idle_task_we_p0_02(context)
+
+    def _idle_task_we_learn_01(self, context: dict[str, object]) -> dict[str, object]:
+        return self._idle_queue_service._idle_task_we_learn_01(context)
 
     def _idle_task_we_p1_03(self, context: dict[str, object]) -> dict[str, object]:
         return self._idle_queue_service._idle_task_we_p1_03(context)

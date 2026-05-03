@@ -167,8 +167,8 @@ class ModelsConfig(_StrictModel):
 
 class ScoreThresholdConfig(_StrictModel):
     s: float = 78.0
-    a: float = 65.0
-    b: float = 55.0
+    a: float = 60.0
+    b: float = 50.0
 
 
 class ScoreConfig(_StrictModel):
@@ -518,7 +518,7 @@ class FeishuInteractionConfig(_StrictModel):
 class NotificationFilterConfig(_StrictModel):
     enabled: bool = True
     cooldown_sec: int = 300
-    min_score: float = 65.0
+    min_score: float = 60.0
     allowed_actions: list[str] = Field(default_factory=lambda: ["buy", "watch"])
     max_signals_per_run: int = 5
     quiet_windows: list[str] = Field(default_factory=list)

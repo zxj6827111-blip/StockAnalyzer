@@ -34,7 +34,8 @@ def test_load_default_config_values(monkeypatch: MonkeyPatch) -> None:
     assert config.liquidity_filter_trend.min_daily_turnover == 80_000_000
     assert config.command_channel.dedup_ttl_sec == 86_400
     assert config.notification_filter.cooldown_sec == 300
-    assert config.notification_filter.max_signals_per_run == 3
+    assert config.notification_filter.min_score == 60.0
+    assert config.notification_filter.max_signals_per_run == 5
     assert config.backtest_matcher.dynamic_slippage_enabled is True
     assert config.backtest_matcher.max_dynamic_slippage_ratio == 0.012
     assert config.scheduler.week4_acceptance_time == "20:35"
@@ -218,6 +219,14 @@ def test_load_default_config_values(monkeypatch: MonkeyPatch) -> None:
     assert config.evolution.llm_model == "gpt-5.4"
     assert config.evolution.llm_backup_base_url == "https://gmn.chuangzuoli.com/v1"
     assert config.evolution.llm_backup_model == "gpt-5.2"
+    assert config.score.thresholds.a == 60.0
+    assert config.score.thresholds.b == 50.0
+    assert config.strategy_scores["trend"].thresholds.a == 60.0
+    assert config.strategy_scores["trend"].thresholds.b == 50.0
+    assert config.strategy_scores["monster"].thresholds.a == 60.0
+    assert config.strategy_scores["monster"].thresholds.b == 50.0
+    assert config.notification_filter.min_score == 60.0
+    assert config.notification_filter.max_signals_per_run == 5
     assert config.idle_queue.manual_ack_required is True
     assert config.idle_queue.enabled_policy == "auto"
     assert config.idle_queue.auto_run_policy == "auto"

@@ -115,6 +115,47 @@ def test_notify_actionable_buy_uses_strategy_a_threshold() -> None:
     assert len(captured) == 1
 
 
+def test_notify_actionable_buy_uses_lowered_monster_strategy_threshold() -> None:
+    service = StockAnalyzerService(config=_load_test_config())
+    captured: list[dict[str, object]] = []
+
+    def _fake_notify(
+        title: str,
+        content: str,
+        level: str = "info",
+        trace_id: str = "",
+    ) -> dict[str, object]:
+        captured.append(
+            {
+                "title": title,
+                "content": content,
+                "level": level,
+                "trace_id": trace_id,
+            }
+        )
+        return {"accepted": True}
+
+    service.notify = _fake_notify  # type: ignore[method-assign]
+    service._notify_actionable_signals(
+        report={
+            "actionable_signals": [
+                {
+                    "symbol": "600000",
+                    "action": "buy",
+                    "target_position": 0.2,
+                    "strategy": "monster",
+                    "reasons": ["soup_entry"],
+                    "score": 60.0,
+                    "grade": "A",
+                }
+            ]
+        },
+        trace_id="trace-buy-monster-threshold",
+        title_prefix="intraday",
+    )
+    assert len(captured) == 1
+
+
 def test_notify_actionable_sell_message_contains_news_component_line() -> None:
     service = StockAnalyzerService(config=_load_test_config())
     captured: list[dict[str, object]] = []

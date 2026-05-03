@@ -292,12 +292,13 @@ def test_idle_queue_weekend_task_sequence_progresses(tmp_path: Path) -> None:
         service.run_idle_queue_cycle(
             now=datetime.fromisoformat("2026-03-07T13:00:00") + timedelta(minutes=step * 5)
         )
-        for step in range(7)
+        for step in range(8)
     ]
     task_ids = [str(item.get("task_id", "")) for item in reports]
     assert task_ids == [
         "WE-P0-01",
         "WE-P0-02",
+        "WE-LEARN-01",
         "WE-P1-03",
         "WE-P1-04",
         "WE-P1-05",
@@ -308,6 +309,7 @@ def test_idle_queue_weekend_task_sequence_progresses(tmp_path: Path) -> None:
     output_root = Path(config.idle_queue.output_root) / "20260306"
     assert (output_root / "WE-P0-01" / "soak_test" / "soak_report.json").exists()
     assert (output_root / "WE-P0-02" / "reproducibility" / "audit_report.json").exists()
+    assert (output_root / "WE-LEARN-01" / "model_learning" / "learning_report.json").exists()
     assert (output_root / "WE-P1-03" / "rolling_backtest" / "rolling_ir_drift.json").exists()
     assert (output_root / "WE-P1-04" / "counterfactual" / "counterfactual_report.json").exists()
     assert (output_root / "WE-P1-05" / "multi_seed" / "seed_stability_report.json").exists()
@@ -327,9 +329,14 @@ def test_idle_queue_weekend_rotation_prioritizes_unfinished_p1_tasks(tmp_path: P
         service.run_idle_queue_cycle(
             now=datetime.fromisoformat("2026-03-07T13:00:00") + timedelta(minutes=step * 5)
         )
-        for step in range(3)
+        for step in range(4)
     ]
-    assert [item.get("task_id") for item in first_weekend] == ["WE-P0-01", "WE-P0-02", "WE-P1-03"]
+    assert [item.get("task_id") for item in first_weekend] == [
+        "WE-P0-01",
+        "WE-P0-02",
+        "WE-LEARN-01",
+        "WE-P1-03",
+    ]
 
     second_weekend = [
         service.run_idle_queue_cycle(
@@ -341,6 +348,213 @@ def test_idle_queue_weekend_rotation_prioritizes_unfinished_p1_tasks(tmp_path: P
     assert second_weekend[2].get("task_id") == "WE-P1-04"
 
 
+def test_idle_queue_we_learn_01_dispatch_uses_learning_governance_chain(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config(tmp_path)
+    config.auto_promotion.notify_on_training_summary = False
+    service = StockAnalyzerService(config=config)
+    service._evolution_project_root = tmp_path
+    service.state.watchlist = ["600000.SH", "000001.SZ"]
+    service._idle_task_manifests["WE-LEARN-01"]["symbol_cap"] = 1
+    _patch_attr(service, "_provider", _MockProvider())
+    _patch_attr(
+        service,
+        "latest_market_warehouse_report",
+        lambda: {
+            "status": "ok",
+            "timestamp": "2026-03-06T21:45:00",
+            "trade_date": "20260306",
+        },
+    )
+
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def _fake_build_learning_trainable_manifest(**kwargs: object) -> dict[str, object]:
+        calls.append(("build", dict(kwargs)))
+        return {
+            "ok": True,
+            "mode": "build_trainable_manifest",
+            "dataset_manifest_id": "manifest-01",
+            "included_snapshot_count": 8,
+            "included_outcome_count": 6,
+            "errors": [],
+        }
+
+    def _fake_run_learning_manifest_shadow_proposal(**kwargs: object) -> dict[str, object]:
+        calls.append(("proposal", dict(kwargs)))
+        return {
+            "ok": True,
+            "mode": "learning_manifest_shadow_proposal",
+            "status": "generated",
+            "accepted": True,
+            "dataset_manifest_id": "manifest-01",
+            "shadow_model_id": "shadow-01",
+            "champion_model_id": "champion-01",
+            "workflow": {
+                "ok": True,
+                "status": "pass",
+                "promotion_gate": {"status": "pass"},
+                "shadow_validation": {
+                    "ok": True,
+                    "training": {
+                        "ok": True,
+                        "predictor_loaded": True,
+                        "artifact_path": "artifacts/evolution/shadow.json",
+                    },
+                },
+            },
+            "proposal": {
+                "proposal_id": "LRN-PROP-01",
+                "status": "generated",
+                "gate_status": "pass",
+            },
+            "auto_promotion": {
+                "enabled": False,
+                "predictor_loaded": True,
+                "ticket_id": "",
+            },
+            "errors": [],
+        }
+
+    _patch_attr(service, "build_learning_trainable_manifest", _fake_build_learning_trainable_manifest)
+    _patch_attr(
+        service,
+        "run_learning_manifest_shadow_proposal",
+        _fake_run_learning_manifest_shadow_proposal,
+    )
+
+    result = service._idle_task_we_learn_01(
+        context={
+            "trade_date": "20260306",
+            "now": "2026-03-07T13:00:00",
+        }
+    )
+
+    output = (
+        Path(config.idle_queue.output_root)
+        / "20260306"
+        / "WE-LEARN-01"
+        / "model_learning"
+        / "learning_report.json"
+    )
+    payload = _as_mapping(json.loads(output.read_text(encoding="utf-8")))
+
+    assert result["status"] == "ok"
+    assert result["reason"] == "learning_shadow_proposal_completed"
+    assert [name for name, _ in calls] == ["build", "proposal"]
+    build_symbols = _as_text_list(calls[0][1].get("symbols"))
+    assert len(build_symbols) == 1
+    assert build_symbols[0]
+    assert payload["dataset_manifest_id"] == "manifest-01"
+    assert payload["proposal_id"] == "LRN-PROP-01"
+    assert payload["symbol_cap"] == 1
+    assert payload["manifest_symbol_count"] == 1
+    assert payload["online_effect"] == "predictor_reloaded"
+    assert payload["blocked_after_run"] is False
+    assert _as_mapping(payload["gates"])["market_warehouse"]["ok"] is True
+    assert _as_mapping(payload["gates"])["sample_maturity"]["ok"] is True
+
+
+def test_idle_queue_we_learn_01_blocks_stale_market_warehouse_report(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config(tmp_path)
+    config.auto_promotion.notify_on_training_summary = False
+    service = StockAnalyzerService(config=config)
+    service._evolution_project_root = tmp_path
+    service.state.watchlist = ["600000.SH"]
+    _patch_attr(
+        service,
+        "latest_market_warehouse_report",
+        lambda: {
+            "status": "ok",
+            "timestamp": "2026-03-05T21:45:00",
+            "trade_date": "20260305",
+        },
+    )
+
+    def _unexpected_build_learning_trainable_manifest(**kwargs: object) -> dict[str, object]:
+        _ = kwargs
+        pytest.fail("stale market warehouse report should block manifest build")
+
+    def _unexpected_run_learning_manifest_shadow_proposal(**kwargs: object) -> dict[str, object]:
+        _ = kwargs
+        pytest.fail("stale market warehouse report should block proposal generation")
+
+    _patch_attr(
+        service,
+        "build_learning_trainable_manifest",
+        _unexpected_build_learning_trainable_manifest,
+    )
+    _patch_attr(
+        service,
+        "run_learning_manifest_shadow_proposal",
+        _unexpected_run_learning_manifest_shadow_proposal,
+    )
+
+    result = service._idle_task_we_learn_01(
+        context={
+            "trade_date": "20260306",
+            "now": "2026-03-07T13:00:00",
+        }
+    )
+
+    output = (
+        Path(config.idle_queue.output_root)
+        / "20260306"
+        / "WE-LEARN-01"
+        / "model_learning"
+        / "learning_report.json"
+    )
+    payload = _as_mapping(json.loads(output.read_text(encoding="utf-8")))
+    gates = _as_mapping(payload["gates"])
+    market_gate = _as_mapping(gates["market_warehouse"])
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "skipped: market_warehouse_gate_failed"
+    assert payload["blocked_after_run"] is True
+    assert market_gate["ok"] is False
+    assert market_gate["reason"] == "stale_market_warehouse_report"
+    assert market_gate["trade_date"] == "20260305"
+    assert market_gate["expected_trade_date"] == "20260306"
+
+
+def test_idle_queue_we_learn_01_respects_min_interval_and_min_remaining_budget(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config(tmp_path)
+    service = StockAnalyzerService(config=config)
+    service._evolution_project_root = tmp_path
+    _patch_attr(service, "_provider", _MockProvider())
+
+    service._idle_mark_ran(task_id="WE-LEARN-01", trade_date="20260310")
+
+    skipped_interval = service._idle_task_we_learn_01(
+        context={
+            "trade_date": "20260313",
+            "now": "2026-03-14T13:00:00",
+        }
+    )
+
+    assert skipped_interval["status"] == "skipped"
+    assert skipped_interval["reason"] == "skipped: min_interval_not_reached"
+
+    budget_service = StockAnalyzerService(config=_load_test_config(tmp_path))
+    budget_service._evolution_project_root = tmp_path
+    _patch_attr(budget_service, "_provider", _MockProvider())
+
+    skipped_budget = budget_service._idle_task_we_learn_01(
+        context={
+            "trade_date": "20260313",
+            "now": "2026-03-13T23:30:00",
+        }
+    )
+
+    assert skipped_budget["status"] == "skipped"
+    assert skipped_budget["reason"] == "skipped: insufficient_weekend_time_budget"
+
+
 def test_idle_queue_weekend_p2_defer_then_force_run(tmp_path: Path) -> None:
     config = _load_test_config(tmp_path)
     service = StockAnalyzerService(config=config)
@@ -350,6 +564,7 @@ def test_idle_queue_weekend_p2_defer_then_force_run(tmp_path: Path) -> None:
     for task_id in [
         "WE-P0-01",
         "WE-P0-02",
+        "WE-LEARN-01",
         "WE-P1-03",
         "WE-P1-04",
         "WE-P1-05",
