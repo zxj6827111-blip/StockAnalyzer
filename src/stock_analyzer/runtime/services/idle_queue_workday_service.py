@@ -624,22 +624,34 @@ class RuntimeIdleQueueWorkdayService:
             filename="precompute_cache.json",
         )
         frame = pd.DataFrame(rows)
+        fallback_reason = ""
         try:
             frame.to_parquet(parquet_path, index=False)
             status = "ok"
             outputs = [str(parquet_path)]
-        except Exception:
-            service._idle_write_json(json_fallback_path, {"rows": rows})
+        except Exception as exc:
+            fallback_reason = f"parquet_write_failed:{exc.__class__.__name__}"
+            service._idle_write_json(
+                json_fallback_path,
+                {
+                    "status": "fallback",
+                    "reason": fallback_reason,
+                    "rows": rows,
+                },
+            )
             status = "fallback"
             outputs = [str(json_fallback_path)]
 
-        return {
+        result = {
             "status": status,
             "output_files": outputs,
             "rows": len(rows),
             "symbols_processed": len(symbol_list),
             "universe_source": str(universe.get("source", "")),
         }
+        if fallback_reason:
+            result["reason"] = fallback_reason
+        return result
 
     def _idle_task_wd_p1_06(self, context: dict[str, object]) -> dict[str, object]:
         service = self._service
