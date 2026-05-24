@@ -307,6 +307,39 @@ def test_service_c3_portfolio_constraints_limit_sector_and_correlation() -> None
     )
 
 
+def test_service_c3_portfolio_constraints_skip_model_disagreement_probe() -> None:
+    config = _load_test_config()
+    config.soup_strategy.max_same_sector = 1
+    service = StockAnalyzerService(config=config)
+    now = datetime.fromisoformat("2026-03-11T09:30:00")
+    _ = service._portfolio.set_manual_position(
+        symbol="600000",
+        strategy="manual",
+        target_position=0.2,
+        timestamp=now,
+        trace_id="seed-position",
+        manual_fill={"entry_price": 10.0, "quantity": 1000},
+        sector_tag="SEC-600",
+    )
+    signal = PipelineSignal(
+        symbol="600001",
+        strategy="trend",
+        score=45.0,
+        grade="C",
+        action="buy",
+        target_position=0.01,
+        probabilities={"lgbm": 1.0, "xgb": 0.26, "meta": 0.49},
+        reasons=["model_disagreement_probe"],
+    )
+
+    summary = service._apply_c3_portfolio_constraints(signals=[signal], strategy="trend")
+
+    assert summary["evaluated"] == 0
+    assert summary["sector_blocked"] == 0
+    assert signal.action == "buy"
+    assert signal.target_position == 0.01
+
+
 def test_service_holding_alerts_emit_staged_take_profit_and_trailing_stop() -> None:
     config = _load_test_config()
     config.soup_strategy.max_holdings = 5
@@ -809,6 +842,39 @@ def test_service_recommendation_lifecycle_adds_trade_plan_summary_and_sell_alert
     )
     assert alert_item["exit_alert_reason"] == "stop_loss_threshold_reached"
     assert _as_float(alert_item["current_return_pct"]) == pytest.approx(-0.07)
+
+
+def test_service_recommendation_lifecycle_tracks_probe_watch_signal() -> None:
+    config = _load_test_config()
+    service = StockAnalyzerService(config=config)
+    _patch_attr(
+        service,
+        "_resolve_latest_close_price",
+        lambda *, symbol, bars_cache: 10.0,
+    )
+    signal = PipelineSignal(
+        symbol="300483",
+        strategy="monster",
+        score=46.71,
+        grade="C",
+        action="watch",
+        target_position=0.0,
+        probabilities={"lgbm": 1.0, "xgb": 0.2694, "meta": 0.4970},
+        reasons=["model_disagreement_probe"],
+    )
+
+    update = service._sync_recommendation_lifecycle_from_signals(
+        signals=[signal],
+        timestamp=datetime.fromisoformat("2026-03-11T09:35:00"),
+        trace_id="probe-watch-lifecycle",
+    )
+
+    assert update["updated"] == 1
+    lifecycle = service.recommendation_lifecycle(status="watching")
+    item = next(row for row in _as_mapping_list(lifecycle["items"]) if row["symbol"] == "300483")
+    assert item["status"] == "watching"
+    assert item["last_signal_action"] == "watch"
+    assert _as_mapping(item["trade_plan"])["status"] == "ready"
 
 
 def test_service_recommendation_lifecycle_closes_with_realized_return() -> None:

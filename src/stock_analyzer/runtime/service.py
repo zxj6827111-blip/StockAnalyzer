@@ -8070,7 +8070,12 @@ class StockAnalyzerService:
                 continue
             action_value = str(signal.action).strip().lower()
             existing = self._recommendation_lifecycle.get(symbol, {})
-            if action_value != "buy" or signal.target_position <= 0:
+            is_watch_recommendation = action_value == "watch" and (
+                "model_disagreement_probe" in {str(reason) for reason in signal.reasons}
+                or "recovery_degraded_consensus" in {str(reason) for reason in signal.reasons}
+                or signal.target_position > 0
+            )
+            if (action_value != "buy" or signal.target_position <= 0) and not is_watch_recommendation:
                 if symbol not in open_symbols and symbol not in self._recommendation_lifecycle:
                     continue
                 alert_reason = self._recommendation_exit_reason_from_signal(signal)
@@ -8146,6 +8151,8 @@ class StockAnalyzerService:
                 status_value = "holding" if existing_status != "bought" else "bought"
             elif existing_status in _RECOMMENDATION_TERMINAL_STATUSES:
                 status_value = "recommended"
+            elif is_watch_recommendation:
+                status_value = "watching"
             else:
                 status_value = "recommended"
             first_recommended_at = str(existing.get("first_recommended_at", "")).strip() or now_iso
@@ -10729,6 +10736,7 @@ class StockAnalyzerService:
                 signal
                 for signal in signals
                 if str(signal.action).strip().lower() == "buy" and float(signal.target_position) > 0
+                and "model_disagreement_probe" not in {str(reason) for reason in signal.reasons}
             ],
             key=lambda item: (-float(item.score), str(item.symbol)),
         )
