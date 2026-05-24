@@ -154,6 +154,9 @@ class RuntimeWeek6ControlsService:
             before_action = signal.action
             before_position = signal.target_position
             before_score = signal.score
+            is_model_disagreement_probe = "model_disagreement_probe" in {
+                str(reason) for reason in signal.reasons
+            }
             action_info = action_map.get(signal.symbol, {})
             regulatory_action = str(action_info.get("action", "normal")).strip().lower()
 
@@ -175,14 +178,18 @@ class RuntimeWeek6ControlsService:
 
                 if signal.action == "buy":
                     if signal.score < buy_min:
-                        threshold_downgraded += 1
-                        if signal.score >= watch_min:
-                            signal.action = "watch"
+                        if is_model_disagreement_probe:
+                            if "week6_threshold_probe_override" not in signal.reasons:
+                                signal.reasons.append("week6_threshold_probe_override")
                         else:
-                            signal.action = "hold"
-                        signal.target_position = 0.0
-                        if "week6_threshold_gate" not in signal.reasons:
-                            signal.reasons.append("week6_threshold_gate")
+                            threshold_downgraded += 1
+                            if signal.score >= watch_min:
+                                signal.action = "watch"
+                            else:
+                                signal.action = "hold"
+                            signal.target_position = 0.0
+                            if "week6_threshold_gate" not in signal.reasons:
+                                signal.reasons.append("week6_threshold_gate")
                 elif signal.action == "watch" and signal.score < watch_min:
                     threshold_downgraded += 1
                     signal.action = "hold"
@@ -190,7 +197,7 @@ class RuntimeWeek6ControlsService:
                     if "week6_threshold_gate" not in signal.reasons:
                         signal.reasons.append("week6_threshold_gate")
 
-                if signal.action == "buy":
+                if signal.action == "buy" and not is_model_disagreement_probe:
                     scaled_position = _clamp(signal.target_position * position_multiplier, 0.0, 1.0)
                     if abs(scaled_position - signal.target_position) > 1e-9:
                         scaled += 1

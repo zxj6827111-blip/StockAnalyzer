@@ -334,6 +334,45 @@ def test_week6_execution_position_multiplier_scales_buy_position() -> None:
     assert _as_int(scaled_summary["scaled"]) >= 1
 
 
+def test_week6_execution_keeps_model_disagreement_probe_buy_position() -> None:
+    config = _load_test_config()
+    service = _new_service(config)
+    _reset_shared_week6_execution_service(service)
+    config.strategy_scores["trend"].thresholds.a = 65.0
+    config.strategy_scores["trend"].thresholds.b = 45.0
+    signal = PipelineSignal(
+        symbol="300483",
+        strategy="trend",
+        score=46.71,
+        grade="C",
+        action="buy",
+        target_position=0.01,
+        probabilities={"lgbm": 1.0, "xgb": 0.2694, "meta": 0.4970},
+        reasons=["model_disagreement_probe"],
+    )
+
+    summary = _as_mapping(
+        service._apply_week6_execution_controls(
+            signals=[signal],
+            strategy="trend",
+            controls={
+                "threshold_shift": 0.0,
+                "position_multiplier": 0.2,
+                "regulatory_action_map": {},
+                "evolution": {},
+            },
+        )
+    )
+
+    assert signal.action == "buy"
+    assert signal.target_position == 0.01
+    assert "week6_threshold_probe_override" in list(signal.reasons)
+    assert "week6_threshold_gate" not in list(signal.reasons)
+    assert "week6_position_scaled" not in list(signal.reasons)
+    assert _as_int(summary["threshold_downgraded"]) == 0
+    assert _as_int(summary["scaled"]) == 0
+
+
 def test_week6_execution_applies_evolution_runtime_controls() -> None:
     service = _SHARED_DEFAULT_WEEK6_EXECUTION_SERVICE
     _reset_shared_week6_execution_service(service)
