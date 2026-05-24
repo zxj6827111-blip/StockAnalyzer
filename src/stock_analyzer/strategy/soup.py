@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import pandas as pd
 
 from stock_analyzer.config import SoupStrategyConfig
@@ -21,6 +23,7 @@ class SoupStrategy:
         can_open_new_position: bool,
         liquidity_pass: bool,
         cross_review_pass: bool,
+        cross_review_reasons: Sequence[str] | None = None,
     ) -> TradeDecision:
         if not can_open_new_position:
             return TradeDecision(action="hold", target_position=0.0, reason="risk_gate")
@@ -35,6 +38,20 @@ class SoupStrategy:
                 )
             return TradeDecision(action="hold", target_position=0.0, reason="cross_review")
 
+        if self._is_recovery_buy(scored=scored, cross_review_reasons=cross_review_reasons):
+            atr_ratio = float(latest_features.get("atr_ratio", 0.02))
+            position = self._dynamic_position(
+                atr_ratio,
+                signal_score=float(scored.total_score),
+                grade=scored.grade,
+            )
+            position = min(position, float(self._config.recovery_max_position))
+            return TradeDecision(
+                action="buy",
+                target_position=max(0.01, position),
+                reason="recovery_degraded_consensus",
+            )
+
         if scored.grade in {"S", "A"}:
             atr_ratio = float(latest_features.get("atr_ratio", 0.02))
             position = self._dynamic_position(
@@ -46,6 +63,21 @@ class SoupStrategy:
         if scored.grade == "B":
             return TradeDecision(action="watch", target_position=0.0, reason="watchlist")
         return TradeDecision(action="hold", target_position=0.0, reason="score_too_low")
+
+    def _is_recovery_buy(
+        self,
+        *,
+        scored: ScoredSignal,
+        cross_review_reasons: Sequence[str] | None,
+    ) -> bool:
+        if not bool(self._config.recovery_buy_enabled):
+            return False
+        reasons = {str(reason) for reason in (cross_review_reasons or [])}
+        if "degraded_consensus_lgbm_saturated" not in reasons:
+            return False
+        if str(scored.grade) not in set(self._config.recovery_allowed_grades):
+            return False
+        return float(scored.total_score) >= float(self._config.recovery_min_score)
 
     def _dynamic_position(self, atr_ratio: float, *, signal_score: float, grade: str) -> float:
         safe_atr = max(atr_ratio, 1e-6)

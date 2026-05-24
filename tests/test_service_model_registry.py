@@ -235,6 +235,43 @@ def test_service_train_learning_manifest_can_register_protocol_bound_model(
     assert int(registered_events["records"]) >= 1
 
 
+def test_service_bootstrap_active_champion_from_existing_artifact(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config(tmp_path)
+    service = _new_service(config, provider=FailingBarsProvider())
+    _seed_learning_protocol_samples(
+        service,
+        symbols=["600000", "000001"],
+        rows_per_symbol=30,
+    )
+    training = _as_mapping(
+        service.train_models(
+            full_market=True,
+            lookback_days=240,
+            preferred_symbols=["600000", "000001"],
+            artifact_path=str(tmp_path / "protocol_model.json"),
+        )
+    )
+    registry_payload = _as_mapping(training["model_registry"])
+
+    payload = _as_mapping(
+        service.bootstrap_active_champion_from_artifact(
+            artifact_path=str(tmp_path / "protocol_model.json"),
+            source="test_bootstrap",
+        )
+    )
+    active = _as_mapping(service.model_registry_entries(limit=10)["active_champion"])
+
+    assert payload["accepted"] is True
+    assert payload["reason"] == "existing_registry_record_promoted"
+    assert payload["model_id"] == registry_payload["model_id"]
+    assert payload["role"] == "champion"
+    assert payload["lifecycle_state"] == "approved"
+    assert active["model_id"] == registry_payload["model_id"]
+    assert service._config.evolution.active_champion_id == registry_payload["model_id"]
+
+
 def test_service_run_learning_manifest_shadow_validation_builds_standard_bundle(
     tmp_path: Path,
 ) -> None:

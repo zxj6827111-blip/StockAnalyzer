@@ -155,6 +155,11 @@ class CrossReviewConfig(_StrictModel):
     relax_max_diff_delta: float = 0.03
     tighten_threshold_delta: float = 0.01
     tighten_max_diff_delta: float = 0.02
+    degraded_consensus_enabled: bool = True
+    degraded_lgbm_saturation_min: float = 0.995
+    degraded_xgb_min: float = 0.36
+    degraded_meta_min: float = 0.56
+    degraded_merged_min: float = 0.62
 
 
 class ModelsConfig(_StrictModel):
@@ -191,6 +196,10 @@ class SoupStrategyConfig(_StrictModel):
     max_holdings: int = 3
     max_same_sector: int = 2
     dynamic_position: str = "min(0.15, 0.02/(ATR14/close))"
+    recovery_buy_enabled: bool = True
+    recovery_min_score: float = 50.0
+    recovery_max_position: float = 0.03
+    recovery_allowed_grades: list[str] = Field(default_factory=lambda: ["S", "A", "B"])
 
 
 class CapitalCurveConfig(_StrictModel):
@@ -519,6 +528,7 @@ class NotificationFilterConfig(_StrictModel):
     enabled: bool = True
     cooldown_sec: int = 300
     min_score: float = 60.0
+    min_score_by_action: dict[str, float] = Field(default_factory=dict)
     allowed_actions: list[str] = Field(default_factory=lambda: ["buy", "watch"])
     max_signals_per_run: int = 5
     quiet_windows: list[str] = Field(default_factory=list)

@@ -727,7 +727,7 @@ def test_service_recommendation_lifecycle_tracks_manual_transitions() -> None:
     second = next(
         item for item in _as_mapping_list(after_close["items"]) if item["symbol"] == "600000"
     )
-    assert second["status"] == "watching"
+    assert second["status"] == "closed"
 
     drop_cmd = _sign(
         action="SET_RECOMMENDATION_STATUS",
@@ -746,6 +746,130 @@ def test_service_recommendation_lifecycle_tracks_manual_transitions() -> None:
     )
     assert final_item["status"] == "dropped"
     assert final_item["note"] == "manual drop"
+
+
+def test_service_recommendation_lifecycle_adds_trade_plan_summary_and_sell_alert() -> None:
+    config = _load_test_config()
+    service = StockAnalyzerService(config=config)
+    _patch_attr(
+        service,
+        "_resolve_latest_close_price",
+        lambda *, symbol, bars_cache: 10.0,
+    )
+    signal = PipelineSignal(
+        symbol="600000",
+        strategy="trend",
+        score=88.0,
+        grade="S",
+        action="buy",
+        target_position=0.12,
+        probabilities={"lgbm": 0.8, "xgb": 0.78, "meta": 0.76},
+        reasons=["soup_entry"],
+    )
+
+    update = service._sync_recommendation_lifecycle_from_signals(
+        signals=[signal],
+        timestamp=datetime.fromisoformat("2026-03-11T09:35:00"),
+        trace_id="trade-plan-test",
+    )
+    assert update["updated"] == 1
+    lifecycle = service.recommendation_lifecycle()
+    item = next(row for row in _as_mapping_list(lifecycle["items"]) if row["symbol"] == "600000")
+    assert item["status"] == "recommended"
+    plan = _as_mapping(item["trade_plan"])
+    assert plan["status"] == "ready"
+    assert _as_float(plan["entry_low"]) == pytest.approx(9.85)
+    assert _as_float(plan["entry_high"]) == pytest.approx(10.05)
+    assert _as_float(plan["stop_loss_price"]) > 0
+
+    alert_update = service._sync_recommendation_lifecycle_from_holding_alerts(
+        holding_alerts={
+            "items": [
+                {
+                    "symbol": "600000",
+                    "strategy": "trend",
+                    "severity": "warn",
+                    "reason": "stop_loss_threshold_reached",
+                    "exit_action": "exit_full",
+                    "entry_price": 10.0,
+                    "latest_price": 9.3,
+                    "pnl_pct": -0.07,
+                    "quantity": 1000,
+                    "hold_days": 3,
+                }
+            ]
+        },
+        timestamp=datetime.fromisoformat("2026-03-14T15:00:00"),
+        trace_id="holding-alert-test",
+    )
+    assert alert_update["updated"] == 1
+    after_alert = service.recommendation_lifecycle(status="sell_alert")
+    alert_item = next(
+        row for row in _as_mapping_list(after_alert["items"]) if row["symbol"] == "600000"
+    )
+    assert alert_item["exit_alert_reason"] == "stop_loss_threshold_reached"
+    assert _as_float(alert_item["current_return_pct"]) == pytest.approx(-0.07)
+
+
+def test_service_recommendation_lifecycle_closes_with_realized_return() -> None:
+    config = _load_test_config()
+    service = StockAnalyzerService(config=config)
+    timestamp = datetime.fromisoformat("2026-03-11T09:35:00")
+
+    buy_update = service._sync_recommendation_lifecycle_from_auto_execution(
+        portfolio_update={
+            "executions": [
+                {
+                    "trade_id": "TRD-BUY-1",
+                    "symbol": "600000",
+                    "side": "buy",
+                    "status": "opened",
+                    "strategy": "trend",
+                    "price": 10.0,
+                    "quantity": 1000,
+                    "trade_time": timestamp.isoformat(),
+                }
+            ]
+        },
+        timestamp=timestamp,
+        trace_id="auto-buy-test",
+    )
+    assert buy_update["updated"] == 1
+    holding = service.recommendation_lifecycle(status="holding")
+    holding_item = next(
+        row for row in _as_mapping_list(holding["items"]) if row["symbol"] == "600000"
+    )
+    assert _as_float(holding_item["entry_price"]) == pytest.approx(10.0)
+
+    sell_update = service._sync_recommendation_lifecycle_from_auto_execution(
+        portfolio_update={
+            "executions": [
+                {
+                    "trade_id": "TRD-SELL-1",
+                    "symbol": "600000",
+                    "side": "sell",
+                    "status": "closed",
+                    "strategy": "trend",
+                    "price": 10.8,
+                    "quantity": 1000,
+                    "trade_time": "2026-03-15T14:55:00",
+                    "reason": "take_profit_stage_2_reached",
+                }
+            ]
+        },
+        timestamp=datetime.fromisoformat("2026-03-15T14:55:00"),
+        trace_id="auto-sell-test",
+    )
+    assert sell_update["updated"] == 1
+    closed = service.recommendation_lifecycle(status="closed")
+    closed_item = next(
+        row for row in _as_mapping_list(closed["items"]) if row["symbol"] == "600000"
+    )
+    assert _as_float(closed_item["realized_return_pct"]) == pytest.approx(0.08)
+    assert closed_item["outcome_status"] == "win"
+    summary = _as_mapping(closed["summary"])
+    assert summary["closed_records"] == 1
+    assert summary["win_rate"] == pytest.approx(1.0)
 
 
 def test_service_pipeline_includes_manual_cost_holding_alerts() -> None:
@@ -888,7 +1012,7 @@ def test_service_expired_position_exit_notification_emits_sell_instruction() -> 
 
     assert len(notifications) == 1
     assert "卖出指令 600000" in notifications[0]["title"]
-    assert "达到最长持仓上限 5 天" in notifications[0]["content"]
+    assert str(config.soup_strategy.max_hold_days) in notifications[0]["content"]
     assert "处理类型：到期卖出" in notifications[0]["content"]
 
 

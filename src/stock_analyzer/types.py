@@ -14,6 +14,9 @@ class CrossReviewResult:
     passed: bool
     merged_probability: float
     reasons: list[str] = field(default_factory=list)
+    mode: str = "strict"
+    degraded_consensus: bool = False
+    thresholds: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

@@ -158,6 +158,34 @@ def test_notification_filter_accepts_score_equal_to_min_score_and_reports_limit(
     assert diagnostics["min_score"] == 60.0
 
 
+def test_notification_filter_uses_action_specific_min_score() -> None:
+    config = NotificationFilterConfig(
+        enabled=True,
+        cooldown_sec=300,
+        min_score=65.0,
+        min_score_by_action={"watch": 50.0},
+        allowed_actions=["buy", "watch"],
+        max_signals_per_run=5,
+    )
+    filterer = NotificationFilter(config=config, cache=InMemoryCache())
+
+    accepted = filterer.filter(
+        [
+            _scored_signal("600010", 57.0, action="watch"),
+            _scored_signal("600011", 64.0, action="buy"),
+        ],
+        trace_id="trace-action-threshold",
+    )
+    diagnostics = filterer.latest_diagnostics()
+
+    assert [item["symbol"] for item in accepted] == ["600010"]
+    assert diagnostics is not None
+    assert diagnostics["rejected_by_score"] == 1
+    assert diagnostics["min_score"] == 65.0
+    assert diagnostics["min_score_by_action"] == {"watch": 50.0}
+    assert diagnostics["effective_min_score_by_action"] == {"buy": 65.0, "watch": 50.0}
+
+
 def test_notification_filter_diagnostics_counts_action_score_and_t_day_rejections() -> None:
     config = NotificationFilterConfig(
         enabled=True,

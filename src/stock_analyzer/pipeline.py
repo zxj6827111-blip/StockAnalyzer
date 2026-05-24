@@ -678,6 +678,7 @@ class AnalyzerPipeline:
             can_open_new_position=risk_status.can_open_new_position,
             liquidity_pass=liquidity_pass,
             cross_review_pass=cross_review.passed,
+            cross_review_reasons=cross_review.reasons,
         )
         strategy_decision_action = decision.action
         strategy_decision_reason = decision.reason
@@ -744,6 +745,9 @@ class AnalyzerPipeline:
                 "merged_probability": round(cross_review.merged_probability, 4),
                 "champion_auc": round(champion_auc, 4) if champion_auc is not None else None,
                 "reasons": list(cross_review.reasons),
+                "mode": str(cross_review.mode),
+                "degraded_consensus": bool(cross_review.degraded_consensus),
+                "thresholds": dict(cross_review.thresholds),
             },
             "financial_gate": {
                 "allowed": bool(financial_decision.allowed),

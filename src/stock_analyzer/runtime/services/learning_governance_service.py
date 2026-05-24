@@ -1457,6 +1457,7 @@ class RuntimeLearningGovernanceService:
         blocked_records: list[object] = []
         revoked_records: list[object] = []
         active_champion = None
+        configured_active_champion = None
         try:
             blocked_records = cast(
                 list[object],
@@ -1473,6 +1474,12 @@ class RuntimeLearningGovernanceService:
                 ),
             )
             active_champion = service._model_registry.active_champion()
+            configured_champion_id = str(service._config.evolution.active_champion_id).strip()
+            if configured_champion_id:
+                configured_active_champion = service._model_registry.get_by_id(
+                    configured_champion_id,
+                    suppress_read_errors=True,
+                )
         except ModelRegistryReadError:
             governance_status = "degraded"
             governance_reason = "model_registry_unavailable"
@@ -1481,6 +1488,11 @@ class RuntimeLearningGovernanceService:
                 "learning governance status degraded because the model registry is unavailable",
                 exc_info=True,
             )
+        active_champion_repair = self._active_champion_repair_payload(
+            active_champion=active_champion,
+            configured_active_champion=configured_active_champion,
+            governance_status=governance_status,
+        )
         recent_release_audit = service.audit_events(
             limit=10,
             event_type="learning_model_release_ticket_execute",
@@ -1496,6 +1508,7 @@ class RuntimeLearningGovernanceService:
             "active_champion": (
                 active_champion.model_dump(mode="json") if active_champion is not None else None
             ),
+            "active_champion_repair": active_champion_repair,
             "model_registry": {
                 "status": governance_status,
                 "reason": governance_reason,
@@ -1545,6 +1558,50 @@ class RuntimeLearningGovernanceService:
                     service._resolve_evolution_path(service._config.evolution.compliance_db_path)
                 ),
                 "active_champion_id": str(service._config.evolution.active_champion_id),
+            },
+        }
+
+    def _active_champion_repair_payload(
+        self,
+        *,
+        active_champion: object | None,
+        configured_active_champion: object | None,
+        governance_status: str,
+    ) -> dict[str, object]:
+        service = self._service
+        configured_id = str(service._config.evolution.active_champion_id).strip()
+        artifact_path = str(
+            service._resolve_evolution_path(str(service._config.training.artifact_path))
+        )
+        if governance_status != "ok":
+            return {
+                "required": False,
+                "reason": "model_registry_unavailable",
+                "configured_active_champion_id": configured_id,
+                "artifact_path": artifact_path,
+            }
+        if active_champion is not None:
+            return {
+                "required": False,
+                "reason": "active_champion_present",
+                "configured_active_champion_id": configured_id,
+                "artifact_path": artifact_path,
+            }
+        configured_payload = (
+            configured_active_champion.model_dump(mode="json")
+            if configured_active_champion is not None
+            else None
+        )
+        return {
+            "required": True,
+            "reason": "active champion not found",
+            "configured_active_champion_id": configured_id,
+            "configured_entry": configured_payload,
+            "artifact_path": artifact_path,
+            "manual_repair_endpoint": "POST /models/registry/bootstrap-active-champion",
+            "manual_repair_payload": {
+                "artifact_path": artifact_path,
+                "source": "manual_bootstrap_active_champion",
             },
         }
 

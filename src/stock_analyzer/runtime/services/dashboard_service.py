@@ -75,7 +75,7 @@ class RuntimeDashboardService:
             limit=10,
             record_audit=False,
         )
-        recommendation_panel = service.recommendation_lifecycle(limit=60)
+        recommendation_panel = service.recommendation_lifecycle(limit=300)
         holding_alerts = service.holding_alerts(now=now)
         execution_bias = service.execution_bias_report(days=min(30, capped_days * 3), limit=60)
         return {
@@ -91,6 +91,7 @@ class RuntimeDashboardService:
             },
             "positions_panel": positions_panel,
             "recommendation_panel": recommendation_panel,
+            "recommendation_summary": recommendation_panel.get("summary", {}),
             "holding_alerts": holding_alerts,
             "execution_bias": execution_bias,
             "recent_trades": trades,

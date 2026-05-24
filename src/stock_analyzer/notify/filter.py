@@ -74,12 +74,14 @@ class NotificationFilter:
                     reason="action",
                 )
                 continue
-            if signal.score < self._config.min_score:
+            min_score = self._min_score_for_action(signal.action)
+            if signal.score < min_score:
                 self._increment_diagnostics(diagnostics, "rejected_by_score")
                 self._append_rejected_example(
                     diagnostics,
                     signal=signal,
                     reason="score",
+                    detail=f"min_score:{min_score:.2f}",
                 )
                 continue
             if self._is_t_day_silenced(signal=signal, entry_day_symbols=entry_day_symbols):
@@ -133,6 +135,15 @@ class NotificationFilter:
     def _is_quiet_time(self, now: datetime | None) -> bool:
         return is_quiet_time(self._config.quiet_windows, now=now)
 
+    def _min_score_for_action(self, action: str) -> float:
+        action_key = action.strip().lower()
+        overrides = {
+            key.strip().lower(): float(value)
+            for key, value in self._config.min_score_by_action.items()
+            if key.strip()
+        }
+        return overrides.get(action_key, float(self._config.min_score))
+
     def _is_t_day_silenced(
         self,
         signal: PipelineSignal,
@@ -172,6 +183,16 @@ class NotificationFilter:
             "rejected_by_max_signals_per_run": 0,
             "quiet_window_hit": quiet_window_hit,
             "min_score": float(self._config.min_score),
+            "min_score_by_action": {
+                key.strip().lower(): float(value)
+                for key, value in self._config.min_score_by_action.items()
+                if key.strip()
+            },
+            "effective_min_score_by_action": {
+                action.strip().lower(): self._min_score_for_action(action)
+                for action in self._config.allowed_actions
+                if action.strip()
+            },
             "allowed_actions": list(self._config.allowed_actions),
             "max_signals_per_run": int(self._config.max_signals_per_run),
             "cooldown_sec": int(self._config.cooldown_sec),

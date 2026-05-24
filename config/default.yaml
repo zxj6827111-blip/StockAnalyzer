@@ -131,6 +131,11 @@ models:
     relax_max_diff_delta: 0.03
     tighten_threshold_delta: 0.01
     tighten_max_diff_delta: 0.02
+    degraded_consensus_enabled: true
+    degraded_lgbm_saturation_min: 0.995
+    degraded_xgb_min: 0.36
+    degraded_meta_min: 0.56
+    degraded_merged_min: 0.62
   overfit_gap_threshold: 0.15
   include_random_feature_baseline: true
   recent_data_weight_years: 3
@@ -189,6 +194,10 @@ soup_strategy:
   max_holdings: 3
   max_same_sector: 2
   dynamic_position: "min(0.15, 0.02/(ATR14/close))"
+  recovery_buy_enabled: true
+  recovery_min_score: 50
+  recovery_max_position: 0.03
+  recovery_allowed_grades: [S, A, B]
 
 capital_curve:
   drawdown_alert: 5
@@ -424,6 +433,9 @@ notification_filter:
   enabled: true
   cooldown_sec: 300
   min_score: 60
+  min_score_by_action:
+    buy: 50
+    watch: 50
   allowed_actions: [buy, watch]
   max_signals_per_run: 5
   quiet_windows: []

@@ -1562,6 +1562,39 @@ def test_service_week5_scan_triggers_empty_signal_on_drawdown(
     assert "drawdown_threshold" in _as_text_list(empty_signal["reasons"])
 
 
+def test_service_monster_isolation_treats_no_buy_streak_as_soft_warning() -> None:
+    config = _load_test_config()
+    service = _new_service(config)
+    service._run_summaries = [  # noqa: SLF001
+        {"actionable": 0},
+        {"actionable": 0},
+        {"actionable": 0},
+        {"actionable": 0},
+        {"actionable": 0},
+    ]
+    monster_report = {
+        "signals": [
+            {"score": 40.0, "action": "hold"},
+            {"score": 42.0, "action": "hold"},
+        ],
+        "risk": {"action": "degraded", "drawdown_pct": 0.0},
+    }
+
+    empty_signal = _as_mapping(service._evaluate_empty_signal(monster_report=monster_report))  # noqa: SLF001
+    isolation = _as_mapping(
+        service._monster_isolation_gate(  # noqa: SLF001
+            monster_report=monster_report,
+            empty_signal=empty_signal,
+        )
+    )
+
+    assert empty_signal["triggered"] is True
+    assert isolation["can_open_new_position"] is True
+    assert isolation["reasons"] == []
+    assert "empty_signal_soft" in _as_text_list(isolation["soft_reasons"])
+    assert "low_sentiment_recovery_soft" in _as_text_list(isolation["soft_reasons"])
+
+
 def test_service_week5_scan_auto_syncs_watchlist() -> None:
     config = _load_test_config()
     config.week5.auto_sync_watchlist = True

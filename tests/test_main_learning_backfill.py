@@ -148,6 +148,22 @@ class _FakeLearningBackfillService:
             "parent_model_id": parent_model_id,
         }
 
+    def bootstrap_active_champion_from_artifact(
+        self,
+        *,
+        artifact_path: str,
+        source: str,
+    ) -> dict[str, object]:
+        return {
+            "accepted": True,
+            "reason": "artifact_registered_as_active_champion",
+            "model_id": "model_champion_test",
+            "artifact_uri": artifact_path or "tmp/registered_model.json",
+            "role": "champion",
+            "lifecycle_state": "approved",
+            "source": source,
+        }
+
     def update_model_registry_lifecycle(
         self,
         *,
@@ -1167,6 +1183,28 @@ def test_register_model_artifact_endpoint_returns_registry_payload(
     assert payload["role"] == "shadow"
     assert payload["source"] == "api_test"
     assert payload["parent_model_id"] == "champion_a"
+
+
+def test_bootstrap_active_champion_endpoint_returns_repair_payload(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(main_module, "_service", _FakeLearningBackfillService())
+    client = TestClient(main_module.app)
+
+    response = client.post(
+        "/models/registry/bootstrap-active-champion",
+        json={
+            "artifact_path": "tmp/registered_model.json",
+            "source": "api_bootstrap_test",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["accepted"] is True
+    assert payload["role"] == "champion"
+    assert payload["lifecycle_state"] == "approved"
+    assert payload["source"] == "api_bootstrap_test"
 
 
 def test_update_model_registry_lifecycle_endpoint_accepts_timestamp(

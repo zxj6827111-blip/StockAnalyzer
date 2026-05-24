@@ -33,7 +33,54 @@ def evaluate_cross_review(
         reasons.append(f"meta<{thresholds['p_meta_min']:.2f}")
 
     merged = (lgbm + xgb + meta) / 3.0
-    return CrossReviewResult(passed=not reasons, merged_probability=merged, reasons=reasons)
+    degraded_consensus = _passes_degraded_consensus(
+        lgbm=lgbm,
+        xgb=xgb,
+        meta=meta,
+        merged=merged,
+        reasons=reasons,
+        config=config,
+    )
+    if degraded_consensus:
+        reasons.append("degraded_consensus_lgbm_saturated")
+    mode = "degraded_consensus" if degraded_consensus else "strict"
+    return CrossReviewResult(
+        passed=(not reasons) or degraded_consensus,
+        merged_probability=merged,
+        reasons=reasons,
+        mode=mode,
+        degraded_consensus=degraded_consensus,
+        thresholds={key: round(value, 4) for key, value in thresholds.items()},
+    )
+
+
+def _passes_degraded_consensus(
+    *,
+    lgbm: float,
+    xgb: float,
+    meta: float,
+    merged: float,
+    reasons: list[str],
+    config: CrossReviewConfig,
+) -> bool:
+    if not bool(config.degraded_consensus_enabled):
+        return False
+    if not reasons:
+        return False
+    if lgbm < float(config.degraded_lgbm_saturation_min):
+        return False
+    if xgb < float(config.degraded_xgb_min):
+        return False
+    if meta < float(config.degraded_meta_min):
+        return False
+    if merged < float(config.degraded_merged_min):
+        return False
+    hard_failures = [
+        reason
+        for reason in reasons
+        if reason.startswith("lgbm<") or reason.startswith("meta<")
+    ]
+    return not hard_failures
 
 
 def _effective_thresholds(

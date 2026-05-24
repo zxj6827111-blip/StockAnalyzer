@@ -85,6 +85,7 @@ from stock_analyzer.research import (
     run_tabular_deep_shadow,
     run_tft_sidecar,
 )
+from stock_analyzer.research.signal_quality_auditor import SignalQualityAuditor
 from stock_analyzer.runtime.news_provider_factory import build_news_provider
 from stock_analyzer.runtime.notifier_factory import build_notifier
 from stock_analyzer.runtime.scheduler import DailyScheduler
@@ -117,7 +118,54 @@ from stock_analyzer.week6.engines import (
     StrategyAllocationEngine,
 )
 
-_RECOMMENDATION_STATUSES = {"recommended", "bought", "watching", "dropped"}
+_RECOMMENDATION_STATUSES = {
+    "recommended",
+    "entry_triggered",
+    "bought",
+    "holding",
+    "sell_alert",
+    "sold",
+    "closed",
+    "watching",
+    "dropped",
+    "expired",
+}
+_RECOMMENDATION_ACTIVE_STATUSES = {
+    "recommended",
+    "entry_triggered",
+    "bought",
+    "holding",
+    "sell_alert",
+}
+_RECOMMENDATION_TERMINAL_STATUSES = {"sold", "closed", "dropped", "expired"}
+_RECOMMENDATION_EXTRA_FIELDS = {
+    "recommendation_id",
+    "trade_plan",
+    "entry_triggered_at",
+    "entry_price",
+    "entry_quantity",
+    "entry_trade_id",
+    "exit_alert_at",
+    "exit_alert_reason",
+    "exit_price",
+    "exit_quantity",
+    "exit_trade_id",
+    "closed_at",
+    "closed_reason",
+    "last_price",
+    "last_exit_action",
+    "realized_return_pct",
+    "realized_pnl_amount",
+    "unrealized_return_pct",
+    "current_return_pct",
+    "holding_days",
+    "outcome_status",
+}
+_RECOMMENDATION_SIGNAL_EXIT_REASONS = {
+    "model_sell_signal",
+    "model_signal_invalidated",
+    "risk_degraded_exit_review",
+}
 
 
 class StockAnalyzerService:
@@ -211,6 +259,9 @@ class StockAnalyzerService:
         self._last_signal_payload: list[dict[str, object]] = []
         self._last_signal_trace_id: str = ""
         self._last_notification_filter_diagnostics: dict[str, object] | None = None
+        self._signal_quality_auditor = SignalQualityAuditor(config)
+        self._signal_quality_audit_history: list[dict[str, object]] = []
+        self._last_signal_quality_audit: dict[str, object] | None = None
         self._scheduler_now_context: datetime | None = None
         self._last_reconcile_report: dict[str, object] | None = None
         self._reconcile_history: list[dict[str, object]] = []
@@ -646,6 +697,131 @@ class StockAnalyzerService:
             source=source,
             parent_model_id=parent_model_id,
         )
+
+    def bootstrap_active_champion_from_artifact(
+        self,
+        *,
+        artifact_path: str = "",
+        source: str = "manual_bootstrap_active_champion",
+    ) -> dict[str, object]:
+        active = self._model_registry.active_champion()
+        if active is not None:
+            return {
+                "accepted": False,
+                "reason": "active_champion_exists",
+                "active_champion": active.model_dump(mode="json"),
+            }
+        normalized_path = str(artifact_path).strip() or str(self._config.training.artifact_path)
+        resolved_path = str(self._resolve_evolution_path(normalized_path))
+        existing = self._find_model_registry_record_by_artifact_uri(resolved_path)
+        if existing is not None:
+            try:
+                record = self._approve_existing_registry_record_for_champion_bootstrap(existing)
+            except Exception as exc:
+                return {
+                    "accepted": False,
+                    "reason": f"existing_registry_record_not_bootstrappable:{exc}",
+                    "artifact_path": resolved_path,
+                    "model_id": existing.model_id,
+                    "role": existing.role.value,
+                    "lifecycle_state": existing.lifecycle_state.value,
+                }
+            if record.role != ModelRole.CHAMPION:
+                record = self._model_registry.update_role(
+                    model_id=record.model_id,
+                    role=ModelRole.CHAMPION,
+                    now=datetime.now(UTC),
+                )
+            self._config.evolution.active_champion_id = record.model_id
+            payload = {
+                "accepted": True,
+                "reason": "existing_registry_record_promoted",
+                "model_id": record.model_id,
+                "artifact_uri": record.artifact_uri,
+                "role": record.role.value,
+                "lifecycle_state": record.lifecycle_state.value,
+                "source": source.strip(),
+            }
+            self._record_audit_event(
+                event_type="model_registry_active_champion_bootstrap",
+                level="warn",
+                message="active champion bootstrapped from existing registry record",
+                payload=payload,
+            )
+            return payload
+
+        registered = self._register_model_artifact_if_supported(
+            artifact_path=resolved_path,
+            role=ModelRole.CHAMPION,
+            lifecycle_state=ModelLifecycleState.APPROVED,
+            source=source,
+            parent_model_id="",
+        )
+        if not bool(registered.get("registered", False)):
+            return {
+                "accepted": False,
+                "reason": "register_artifact_failed",
+                "artifact_path": resolved_path,
+                "registration": registered,
+            }
+        payload = {
+            "accepted": True,
+            "reason": "artifact_registered_as_active_champion",
+            "model_id": str(registered.get("model_id", "")),
+            "artifact_uri": str(registered.get("artifact_uri", resolved_path)),
+            "role": str(registered.get("role", "")),
+            "lifecycle_state": str(registered.get("lifecycle_state", "")),
+            "source": source.strip(),
+            "registration": registered,
+        }
+        self._config.evolution.active_champion_id = str(registered.get("model_id", ""))
+        self._record_audit_event(
+            event_type="model_registry_active_champion_bootstrap",
+            level="warn",
+            message="active champion bootstrapped from artifact",
+            payload=payload,
+        )
+        return payload
+
+    def _find_model_registry_record_by_artifact_uri(self, artifact_uri: str):
+        normalized = str(Path(artifact_uri).expanduser().resolve())
+        for record in self._model_registry.list_records(limit=500, suppress_read_errors=True):
+            candidate = str(record.artifact_uri).strip()
+            try:
+                candidate = str(Path(candidate).expanduser().resolve())
+            except Exception:
+                candidate = str(record.artifact_uri).strip()
+            if candidate == normalized:
+                return record
+        return None
+
+    def _approve_existing_registry_record_for_champion_bootstrap(self, record):
+        current = record
+        if current.lifecycle_state == ModelLifecycleState.REVOKED:
+            raise ValueError("revoked_model_cannot_be_bootstrapped")
+        if current.lifecycle_state == ModelLifecycleState.BLOCKED:
+            raise ValueError("blocked_model_cannot_be_bootstrapped")
+        if current.lifecycle_state == ModelLifecycleState.REGISTERED:
+            current = self._model_registry.update_lifecycle(
+                model_id=current.model_id,
+                lifecycle_state=ModelLifecycleState.TRAINED,
+                now=datetime.now(UTC),
+            )
+        if current.lifecycle_state == ModelLifecycleState.TRAINED:
+            current = self._model_registry.update_lifecycle(
+                model_id=current.model_id,
+                lifecycle_state=ModelLifecycleState.SHADOW_VALIDATED,
+                now=datetime.now(UTC),
+            )
+        if current.lifecycle_state == ModelLifecycleState.SHADOW_VALIDATED:
+            current = self._model_registry.update_lifecycle(
+                model_id=current.model_id,
+                lifecycle_state=ModelLifecycleState.APPROVED,
+                now=datetime.now(UTC),
+            )
+        if current.lifecycle_state != ModelLifecycleState.APPROVED:
+            raise ValueError(f"unsupported_lifecycle:{current.lifecycle_state.value}")
+        return current
 
     def update_model_registry_lifecycle(
         self,
@@ -1720,6 +1896,68 @@ class StockAnalyzerService:
         if self._last_notification_filter_diagnostics is None:
             return None
         return deepcopy(self._last_notification_filter_diagnostics)
+
+    def run_signal_quality_audit(
+        self,
+        *,
+        limit: int = 200,
+        include_audit_events: bool = True,
+    ) -> dict[str, object]:
+        snapshot = self.latest_signals_snapshot()
+        audit_events: list[dict[str, object]] = []
+        if include_audit_events:
+            raw_audit = self.audit_events(limit=limit)
+            raw_events = raw_audit.get("events")
+            if isinstance(raw_events, list):
+                audit_events = [dict(item) for item in raw_events if isinstance(item, dict)]
+        try:
+            provider_status = self.provider_status()
+        except Exception as exc:  # pragma: no cover - defensive status surface
+            provider_status = {"status": "error", "error": str(exc)}
+        try:
+            learning_governance = self.learning_model_governance_status()
+        except Exception as exc:  # pragma: no cover - defensive status surface
+            learning_governance = {"status": "error", "error": str(exc)}
+        report = self._signal_quality_auditor.build_report(
+            latest_signals=[
+                dict(item) for item in snapshot.get("signals", []) if isinstance(item, dict)
+            ],
+            audit_events=audit_events,
+            notification_filter_diagnostics=self.latest_notification_filter_diagnostics(),
+            provider_status=provider_status,
+            week5_report=deepcopy(self._last_week5_scan_report) or {},
+            learning_governance=learning_governance,
+        )
+        report["trace_id"] = str(snapshot.get("trace_id", "")).strip()
+        self._last_signal_quality_audit = deepcopy(report)
+        self._signal_quality_audit_history.append(deepcopy(report))
+        if len(self._signal_quality_audit_history) > 200:
+            self._signal_quality_audit_history = self._signal_quality_audit_history[-200:]
+        self._record_audit_event(
+            "signal_quality_audit",
+            trace_id=str(report.get("trace_id", "")),
+            message="signal quality audit completed",
+            payload={
+                "status": str(report.get("status", "")),
+                "summary": dict(report.get("summary", {}))
+                if isinstance(report.get("summary"), dict)
+                else {},
+            },
+        )
+        return deepcopy(report)
+
+    def latest_signal_quality_audit(self) -> dict[str, object]:
+        if self._last_signal_quality_audit is None:
+            return {"status": "no_audit"}
+        return deepcopy(self._last_signal_quality_audit)
+
+    def signal_quality_audit_history(self, limit: int = 20) -> dict[str, object]:
+        normalized_limit = max(1, min(int(limit), 200))
+        items = self._signal_quality_audit_history[-normalized_limit:]
+        return {
+            "records": len(items),
+            "items": [deepcopy(item) for item in reversed(items)],
+        }
 
     def _select_provider(self, *, use_live_runtime: bool) -> MarketDataProvider:
         if use_live_runtime and self._realtime_provider is not None:
@@ -3217,6 +3455,11 @@ class StockAnalyzerService:
             timestamp=timestamp,
         )
         holding_alerts = self.holding_alerts(now=timestamp)
+        holding_recommendation_update = self._sync_recommendation_lifecycle_from_holding_alerts(
+            holding_alerts=holding_alerts,
+            timestamp=timestamp,
+            trace_id=trace_id,
+        )
         signal_payload = self._build_signal_payload_with_recommendation_ids(
             signals=signals,
             trace_id=trace_id,
@@ -3240,6 +3483,8 @@ class StockAnalyzerService:
             self._persist_runtime_state_to_disk()
         if _as_int(execution_recommendation_update.get("updated"), default=0) > 0:
             self._persist_runtime_state_to_disk()
+        if _as_int(holding_recommendation_update.get("updated"), default=0) > 0:
+            self._persist_runtime_state_to_disk()
         if portfolio_changed:
             self._persist_runtime_state_to_disk()
 
@@ -3259,6 +3504,7 @@ class StockAnalyzerService:
         payload["use_live_runtime"] = bool(use_live_runtime)
         payload["recommendation_update"] = recommendation_update
         payload["execution_recommendation_update"] = execution_recommendation_update
+        payload["holding_recommendation_update"] = holding_recommendation_update
         if _as_int(learning_outcome_update.get("updated"), default=0) > 0:
             payload["learning_outcome_update"] = learning_outcome_update
         payload["holding_alerts"] = holding_alerts
@@ -7353,6 +7599,7 @@ class StockAnalyzerService:
     ) -> list[dict[str, object]]:
         timestamp_iso = timestamp.isoformat()
         payload: list[dict[str, object]] = []
+        bars_cache: dict[str, pd.DataFrame] = {}
         for idx, signal in enumerate(signals):
             row = asdict(signal)
             normalized_symbol = (
@@ -7369,6 +7616,14 @@ class StockAnalyzerService:
             row["recommendation_time"] = timestamp_iso
             if snapshot_id:
                 row["snapshot_id"] = snapshot_id
+            trade_plan = self._build_trade_plan_for_signal(
+                signal=signal,
+                timestamp=timestamp,
+                recommendation_id=recommendation_id,
+                bars_cache=bars_cache,
+            )
+            if trade_plan:
+                row["trade_plan"] = trade_plan
             payload.append(row)
             snapshot = {
                 "recommendation_id": recommendation_id,
@@ -7382,6 +7637,8 @@ class StockAnalyzerService:
             }
             if snapshot_id:
                 snapshot["snapshot_id"] = snapshot_id
+            if trade_plan:
+                snapshot["trade_plan"] = trade_plan
             self._recommendation_snapshot_by_id[recommendation_id] = snapshot
             normalized = _normalize_a_share_symbol(normalized_symbol)
             if normalized:
@@ -7391,6 +7648,263 @@ class StockAnalyzerService:
             self._recommendation_snapshot_by_id.pop(oldest, None)
         return payload
 
+    def _build_trade_plan_for_signal(
+        self,
+        *,
+        signal: PipelineSignal,
+        timestamp: datetime,
+        recommendation_id: str = "",
+        bars_cache: dict[str, pd.DataFrame] | None = None,
+    ) -> dict[str, object]:
+        symbol = _normalize_a_share_symbol(signal.symbol)
+        if not symbol:
+            return {}
+        normalized_action = str(signal.action).strip().lower()
+        if normalized_action not in {"buy", "watch"}:
+            return {}
+
+        cache = bars_cache if bars_cache is not None else {}
+        reference_price = self._resolve_latest_close_price(symbol=symbol, bars_cache=cache)
+        stop_loss_pct = max(
+            0.0,
+            _as_float(self._config.soup_strategy.stop_loss, default=5.0),
+        )
+        take_profit_levels = sorted(
+            {
+                round(_as_float(item, default=0.0), 4)
+                for item in self._config.soup_strategy.take_profit
+                if _as_float(item, default=0.0) > 0
+            }
+        )
+        if not take_profit_levels:
+            take_profit_levels = [max(stop_loss_pct, 5.0)]
+        max_hold_days = max(1, _as_int(self._config.soup_strategy.max_hold_days, default=10))
+        invalid_after = timestamp + timedelta(days=max_hold_days)
+
+        plan: dict[str, object] = {
+            "version": "trade_plan_v1",
+            "symbol": symbol,
+            "strategy": str(signal.strategy).strip().lower() or "trend",
+            "action": normalized_action,
+            "recommendation_id": recommendation_id.strip(),
+            "generated_at": timestamp.isoformat(),
+            "max_hold_days": max_hold_days,
+            "invalid_after": invalid_after.isoformat(),
+            "stop_loss_pct": round(stop_loss_pct, 4),
+            "take_profit_pct": take_profit_levels,
+            "invalid_conditions": [
+                "price_breaks_stop_loss",
+                "recommendation_not_triggered_before_invalid_after",
+                "model_or_risk_degrades_to_sell_alert",
+                "position_exceeds_max_hold_days",
+            ],
+        }
+        if reference_price is None or reference_price <= 0:
+            plan["status"] = "price_unavailable"
+            return plan
+
+        ref = round(float(reference_price), 6)
+        entry_low = round(ref * 0.985, 6)
+        entry_high = round(ref * 1.005, 6)
+        stop_price = round(ref * (1.0 - stop_loss_pct / 100.0), 6)
+        take_prices = [round(ref * (1.0 + pct / 100.0), 6) for pct in take_profit_levels]
+        plan.update(
+            {
+                "status": "ready",
+                "reference_price": ref,
+                "entry_low": entry_low,
+                "entry_high": entry_high,
+                "entry_range": [entry_low, entry_high],
+                "stop_loss_price": stop_price,
+                "take_profit_prices": take_prices,
+            }
+        )
+        for idx, price in enumerate(take_prices[:3], start=1):
+            plan[f"take_profit_{idx}"] = price
+        return plan
+
+    def _extract_recommendation_trade_plan(
+        self,
+        *,
+        signal: PipelineSignal,
+        timestamp: datetime,
+        bars_cache: dict[str, pd.DataFrame],
+    ) -> dict[str, object]:
+        symbol = _normalize_a_share_symbol(signal.symbol)
+        recommendation_id = ""
+        if symbol:
+            recommendation_id = str(
+                self._recommendation_latest_id_by_symbol.get(symbol, "")
+            ).strip()
+        return self._build_trade_plan_for_signal(
+            signal=signal,
+            timestamp=timestamp,
+            recommendation_id=recommendation_id,
+            bars_cache=bars_cache,
+        )
+
+    def _append_recommendation_event(
+        self,
+        record: dict[str, object],
+        *,
+        timestamp: datetime,
+        event: str,
+        source: str,
+        trace_id: str,
+        details: Mapping[str, object] | None = None,
+    ) -> None:
+        raw_events = record.get("events")
+        events = list(raw_events) if isinstance(raw_events, list) else []
+        payload: dict[str, object] = {
+            "timestamp": timestamp.isoformat(),
+            "event": event,
+            "source": source,
+            "trace_id": trace_id,
+        }
+        if details:
+            for key, value in details.items():
+                if value not in (None, ""):
+                    payload[str(key)] = value
+        events.append(payload)
+        record["events"] = events[-40:]
+
+    def _merge_recommendation_extra_fields(
+        self,
+        record: dict[str, object],
+        existing: Mapping[str, object],
+        *,
+        extra: Mapping[str, object] | None = None,
+    ) -> None:
+        for key in _RECOMMENDATION_EXTRA_FIELDS:
+            value = existing.get(key)
+            if value not in (None, "", [], {}):
+                record[key] = value
+        raw_events = existing.get("events")
+        if isinstance(raw_events, list):
+            record["events"] = list(raw_events)[-40:]
+        if not extra:
+            return
+        for key, value in extra.items():
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
+            if isinstance(value, float):
+                if math.isnan(value) or math.isinf(value):
+                    continue
+            record[str(key)] = value
+
+    def _sync_recommendation_position_metrics(
+        self,
+        record: dict[str, object],
+        *,
+        timestamp: datetime,
+    ) -> None:
+        symbol = str(record.get("symbol", "")).strip()
+        if not symbol:
+            return
+        position = self._portfolio.position_map().get(symbol)
+        if not isinstance(position, dict):
+            return
+        if _as_float(record.get("entry_price"), default=0.0) <= 0:
+            trade_reference = self._trade_reference_for_open_position(symbol)
+            if trade_reference:
+                self._merge_recommendation_extra_fields(record, {}, extra=trade_reference)
+        entry_price = _as_float(position.get("entry_price"), default=0.0)
+        if entry_price > 0:
+            record.setdefault("entry_price", round(entry_price, 6))
+            record.setdefault("entry_triggered_at", str(position.get("opened_at", "")))
+        quantity = _as_int(position.get("quantity"), default=0)
+        if quantity > 0:
+            record.setdefault("entry_quantity", quantity)
+        bars_cache: dict[str, pd.DataFrame] = {}
+        latest_price = self._resolve_latest_close_price(symbol=symbol, bars_cache=bars_cache)
+        if latest_price is not None and latest_price > 0:
+            record["last_price"] = round(latest_price, 6)
+            if entry_price > 0:
+                record["unrealized_return_pct"] = round(latest_price / entry_price - 1.0, 6)
+                record["current_return_pct"] = record["unrealized_return_pct"]
+        opened_at = _parse_iso_datetime(position.get("opened_at"))
+        if opened_at is not None:
+            record["holding_days"] = max(0, (timestamp.date() - opened_at.date()).days)
+
+    def _trade_reference_for_open_position(self, symbol: str) -> dict[str, object]:
+        normalized = _normalize_a_share_symbol(symbol)
+        if not normalized:
+            return {}
+        for trade in reversed(self._portfolio.trades(limit=2000)):
+            if not isinstance(trade, dict) or str(trade.get("symbol", "")).strip() != normalized:
+                continue
+            if str(trade.get("side", "")).strip().lower() != "buy":
+                continue
+            entry_price = _as_float(trade.get("entry_price"), default=0.0)
+            return {
+                "entry_price": round(entry_price, 6) if entry_price > 0 else None,
+                "entry_quantity": _as_int(trade.get("quantity"), default=0),
+                "entry_trade_id": str(trade.get("trade_id", "")).strip(),
+                "entry_triggered_at": str(trade.get("timestamp", "")).strip(),
+                "outcome_status": "open",
+            }
+        return {}
+
+    def _close_recommendation_record_metrics(
+        self,
+        record: dict[str, object],
+        *,
+        exit_price: float,
+        timestamp: datetime,
+        reason: str,
+    ) -> None:
+        entry_price = _as_float(record.get("entry_price"), default=0.0)
+        if entry_price > 0 and exit_price > 0:
+            realized = round(exit_price / entry_price - 1.0, 6)
+            record["realized_return_pct"] = realized
+            record["current_return_pct"] = realized
+            record["outcome_status"] = "win" if realized > 0 else "loss"
+        elif exit_price > 0:
+            record["exit_price"] = round(exit_price, 6)
+            record.setdefault("outcome_status", "unknown")
+        record["closed_at"] = timestamp.isoformat()
+        record["closed_reason"] = reason
+        opened_at = _parse_iso_datetime(record.get("entry_triggered_at")) or _parse_iso_datetime(
+            record.get("first_recommended_at")
+        )
+        if opened_at is not None:
+            record["holding_days"] = max(0, (timestamp.date() - opened_at.date()).days)
+
+    def _trade_reference_for_closed_position(self, symbol: str) -> dict[str, object]:
+        normalized = _normalize_a_share_symbol(symbol)
+        if not normalized:
+            return {}
+        latest_buy: dict[str, object] = {}
+        latest_sell: dict[str, object] = {}
+        for trade in reversed(self._portfolio.trades(limit=2000)):
+            if not isinstance(trade, dict) or str(trade.get("symbol", "")).strip() != normalized:
+                continue
+            side = str(trade.get("side", "")).strip().lower()
+            if side == "sell" and not latest_sell:
+                latest_sell = trade
+                continue
+            if side == "buy" and not latest_buy:
+                latest_buy = trade
+                if latest_sell:
+                    break
+        entry_price = _as_float(latest_buy.get("entry_price"), default=0.0)
+        exit_price = _as_float(latest_sell.get("exit_price"), default=0.0)
+        if entry_price <= 0 and exit_price <= 0:
+            return {}
+        return {
+            "entry_price": round(entry_price, 6) if entry_price > 0 else None,
+            "entry_quantity": _as_int(latest_buy.get("quantity"), default=0),
+            "entry_trade_id": str(latest_buy.get("trade_id", "")).strip(),
+            "entry_triggered_at": str(latest_buy.get("timestamp", "")).strip(),
+            "exit_price": round(exit_price, 6) if exit_price > 0 else None,
+            "exit_quantity": _as_int(latest_sell.get("exit_quantity"), default=0),
+            "exit_trade_id": str(latest_sell.get("trade_id", "")).strip(),
+            "closed_at": str(latest_sell.get("timestamp", "")).strip(),
+            "closed_reason": str(latest_sell.get("reason", "")).strip(),
+        }
+
     def recommendation_lifecycle(self, status: str = "", limit: int = 120) -> dict[str, object]:
         self._refresh_runtime_state_from_disk_if_changed()
         capped_limit = max(1, min(limit, 1000))
@@ -7398,15 +7912,20 @@ class StockAnalyzerService:
         if status_filter and status_filter not in _RECOMMENDATION_STATUSES:
             status_filter = ""
 
-        open_symbols = {str(symbol).strip() for symbol in self._portfolio.position_map().keys()}
+        position_map = self._portfolio.position_map()
+        open_symbols = {str(symbol).strip() for symbol in position_map.keys()}
         rows: list[dict[str, object]] = []
         for symbol, item in self._recommendation_lifecycle.items():
             normalized_status = _normalize_recommendation_status(
                 item.get("status"),
                 default="watching",
             )
+            if symbol in open_symbols and normalized_status in {"watching", "recommended"}:
+                normalized_status = "holding"
             if status_filter and normalized_status != status_filter:
                 continue
+            trade_plan = item.get("trade_plan") if isinstance(item.get("trade_plan"), dict) else {}
+            raw_events = item.get("events")
             row = {
                 "symbol": symbol,
                 "strategy": str(item.get("strategy", "manual")).strip() or "manual",
@@ -7421,6 +7940,31 @@ class StockAnalyzerService:
                 "last_trace_id": str(item.get("last_trace_id", "")),
                 "note": str(item.get("note", "")),
                 "is_open_position": symbol in open_symbols,
+                "recommendation_id": str(item.get("recommendation_id", "")),
+                "trade_plan": dict(trade_plan) if isinstance(trade_plan, dict) else {},
+                "entry_triggered_at": str(item.get("entry_triggered_at", "")),
+                "entry_price": _as_float(item.get("entry_price"), default=0.0),
+                "entry_quantity": _as_int(item.get("entry_quantity"), default=0),
+                "entry_trade_id": str(item.get("entry_trade_id", "")),
+                "exit_alert_at": str(item.get("exit_alert_at", "")),
+                "exit_alert_reason": str(item.get("exit_alert_reason", "")),
+                "exit_price": _as_float(item.get("exit_price"), default=0.0),
+                "exit_quantity": _as_int(item.get("exit_quantity"), default=0),
+                "exit_trade_id": str(item.get("exit_trade_id", "")),
+                "closed_at": str(item.get("closed_at", "")),
+                "closed_reason": str(item.get("closed_reason", "")),
+                "last_price": _as_float(item.get("last_price"), default=0.0),
+                "last_exit_action": str(item.get("last_exit_action", "")),
+                "realized_return_pct": _as_float(item.get("realized_return_pct"), default=0.0),
+                "realized_pnl_amount": _as_float(item.get("realized_pnl_amount"), default=0.0),
+                "unrealized_return_pct": _as_float(
+                    item.get("unrealized_return_pct"),
+                    default=0.0,
+                ),
+                "current_return_pct": _as_float(item.get("current_return_pct"), default=0.0),
+                "holding_days": _as_int(item.get("holding_days"), default=0),
+                "outcome_status": str(item.get("outcome_status", "")),
+                "events": list(raw_events)[-12:] if isinstance(raw_events, list) else [],
             }
             rows.append(row)
 
@@ -7432,11 +7976,48 @@ class StockAnalyzerService:
 
         status_breakdown: dict[str, int] = {}
         open_linked = 0
+        active_records = 0
+        terminal_records = 0
+        closed_records = 0
+        win_records = 0
+        realized_returns: list[float] = []
+        open_returns: list[float] = []
+        holding_days_values: list[int] = []
         for item in rows:
             item_status = str(item.get("status", "")).strip().lower() or "watching"
             status_breakdown[item_status] = status_breakdown.get(item_status, 0) + 1
             if bool(item.get("is_open_position", False)):
                 open_linked += 1
+            if item_status in _RECOMMENDATION_ACTIVE_STATUSES or bool(
+                item.get("is_open_position", False)
+            ):
+                active_records += 1
+            if item_status in _RECOMMENDATION_TERMINAL_STATUSES:
+                terminal_records += 1
+            if item_status in {"sold", "closed"}:
+                closed_records += 1
+                realized = _as_float(item.get("realized_return_pct"), default=0.0)
+                realized_returns.append(realized)
+                if str(item.get("outcome_status", "")).strip().lower() == "win" or realized > 0:
+                    win_records += 1
+            if bool(item.get("is_open_position", False)):
+                open_returns.append(_as_float(item.get("current_return_pct"), default=0.0))
+            holding_days = _as_int(item.get("holding_days"), default=0)
+            if holding_days > 0:
+                holding_days_values.append(holding_days)
+
+        total_realized = round(sum(realized_returns), 6) if realized_returns else 0.0
+        avg_realized = (
+            round(total_realized / len(realized_returns), 6) if realized_returns else 0.0
+        )
+        avg_open_return = (
+            round(sum(open_returns) / len(open_returns), 6) if open_returns else 0.0
+        )
+        avg_holding_days = (
+            round(sum(holding_days_values) / len(holding_days_values), 2)
+            if holding_days_values
+            else 0.0
+        )
 
         return {
             "records": len(rows),
@@ -7445,6 +8026,25 @@ class StockAnalyzerService:
                 "records": len(rows),
                 "status_breakdown": status_breakdown,
                 "open_position_linked": open_linked,
+                "active_records": active_records,
+                "terminal_records": terminal_records,
+                "closed_records": closed_records,
+                "open_records": active_records,
+                "win_records": win_records,
+                "loss_records": max(0, closed_records - win_records),
+                "win_rate": round(win_records / closed_records, 4)
+                if closed_records > 0
+                else 0.0,
+                "total_realized_return_pct": total_realized,
+                "avg_realized_return_pct": avg_realized,
+                "avg_open_return_pct": avg_open_return,
+                "avg_holding_days": avg_holding_days,
+                "best_realized_return_pct": round(max(realized_returns), 6)
+                if realized_returns
+                else 0.0,
+                "worst_realized_return_pct": round(min(realized_returns), 6)
+                if realized_returns
+                else 0.0,
             },
             "items": rows,
         }
@@ -7458,13 +8058,80 @@ class StockAnalyzerService:
         updated = 0
         touched_symbols: list[str] = []
         now_iso = timestamp.isoformat()
+        bars_cache: dict[str, pd.DataFrame] = {}
+        open_symbols = {
+            str(symbol).strip()
+            for symbol in self._portfolio.position_map().keys()
+            if str(symbol).strip()
+        }
         for signal in signals:
-            if signal.action != "buy" or signal.target_position <= 0:
-                continue
             symbol = _normalize_a_share_symbol(signal.symbol)
             if not symbol:
                 continue
+            action_value = str(signal.action).strip().lower()
             existing = self._recommendation_lifecycle.get(symbol, {})
+            if action_value != "buy" or signal.target_position <= 0:
+                if symbol not in open_symbols and symbol not in self._recommendation_lifecycle:
+                    continue
+                alert_reason = self._recommendation_exit_reason_from_signal(signal)
+                if not alert_reason:
+                    continue
+                previous = dict(existing)
+                strategy_value = (
+                    str(signal.strategy).strip().lower()
+                    or str(existing.get("strategy", "trend")).strip().lower()
+                    or "trend"
+                )
+                first_recommended_at = (
+                    str(existing.get("first_recommended_at", "")).strip() or now_iso
+                )
+                record = {
+                    "symbol": symbol,
+                    "strategy": strategy_value,
+                    "status": "sell_alert",
+                    "first_recommended_at": first_recommended_at,
+                    "last_signal_at": now_iso,
+                    "last_signal_score": round(float(signal.score), 4),
+                    "last_signal_action": action_value,
+                    "last_manual_update_at": str(existing.get("last_manual_update_at", "")),
+                    "updated_at": now_iso,
+                    "last_source": "pipeline_signal_exit_review",
+                    "last_trace_id": trace_id,
+                    "note": str(existing.get("note", "")),
+                }
+                self._merge_recommendation_extra_fields(
+                    record,
+                    existing,
+                    extra={
+                        "exit_alert_at": now_iso,
+                        "exit_alert_reason": alert_reason,
+                        "last_exit_action": "review",
+                    },
+                )
+                latest_price = self._resolve_latest_close_price(
+                    symbol=symbol,
+                    bars_cache=bars_cache,
+                )
+                if latest_price is not None and latest_price > 0:
+                    record["last_price"] = round(latest_price, 6)
+                    entry_price = _as_float(record.get("entry_price"), default=0.0)
+                    if entry_price > 0:
+                        record["current_return_pct"] = round(latest_price / entry_price - 1.0, 6)
+                self._sync_recommendation_position_metrics(record, timestamp=timestamp)
+                self._append_recommendation_event(
+                    record,
+                    timestamp=timestamp,
+                    event="sell_alert",
+                    source="pipeline_signal_exit_review",
+                    trace_id=trace_id,
+                    details={"reason": alert_reason, "score": round(float(signal.score), 4)},
+                )
+                self._recommendation_lifecycle[symbol] = record
+                if record != previous:
+                    updated += 1
+                    touched_symbols.append(symbol)
+                continue
+
             previous = dict(existing)
             existing_status = _normalize_recommendation_status(
                 existing.get("status"),
@@ -7475,8 +8142,18 @@ class StockAnalyzerService:
                 or str(existing.get("strategy", "trend")).strip().lower()
                 or "trend"
             )
-            status_value = "bought" if existing_status == "bought" else "recommended"
+            if existing_status in {"bought", "holding", "sell_alert"} or symbol in open_symbols:
+                status_value = "holding" if existing_status != "bought" else "bought"
+            elif existing_status in _RECOMMENDATION_TERMINAL_STATUSES:
+                status_value = "recommended"
+            else:
+                status_value = "recommended"
             first_recommended_at = str(existing.get("first_recommended_at", "")).strip() or now_iso
+            trade_plan = self._extract_recommendation_trade_plan(
+                signal=signal,
+                timestamp=timestamp,
+                bars_cache=bars_cache,
+            )
 
             record = {
                 "symbol": symbol,
@@ -7492,6 +8169,20 @@ class StockAnalyzerService:
                 "last_trace_id": trace_id,
                 "note": str(existing.get("note", "")),
             }
+            self._merge_recommendation_extra_fields(
+                record,
+                existing,
+                extra={"trade_plan": trade_plan} if trade_plan else None,
+            )
+            self._sync_recommendation_position_metrics(record, timestamp=timestamp)
+            self._append_recommendation_event(
+                record,
+                timestamp=timestamp,
+                event="recommended" if status_value == "recommended" else "signal_refresh",
+                source="pipeline_signal",
+                trace_id=trace_id,
+                details={"score": round(float(signal.score), 4), "action": action_value},
+            )
             self._recommendation_lifecycle[symbol] = record
             if record != previous:
                 updated += 1
@@ -7501,6 +8192,37 @@ class StockAnalyzerService:
             "tracked": len(self._recommendation_lifecycle),
             "symbols": sorted(touched_symbols),
         }
+
+    def _recommendation_exit_reason_from_signal(self, signal: PipelineSignal) -> str:
+        action_value = str(signal.action).strip().lower()
+        if action_value == "sell":
+            return "model_sell_signal"
+        if action_value not in {"hold", "watch"}:
+            return ""
+        trace = signal.decision_trace if isinstance(signal.decision_trace, dict) else {}
+        provider = trace.get("provider")
+        risk = trace.get("risk") or trace.get("risk_gate")
+        cross_review = trace.get("cross_review") or trace.get("cross_review_gate")
+        soft_degraded = False
+        hard_degraded = False
+        risk_blocked = False
+        if isinstance(provider, dict):
+            soft_degraded = bool(provider.get("soft_degraded_mode", False))
+            hard_degraded = bool(provider.get("hard_degraded_mode", False))
+        if isinstance(risk, dict):
+            risk_action = str(risk.get("action", "")).strip().lower()
+            risk_blocked = risk_action in {"freeze", "degraded", "reduce"} or bool(
+                risk.get("hard_degraded_mode", False)
+            )
+        cross_failed = isinstance(cross_review, dict) and not bool(
+            cross_review.get("passed", True)
+        )
+        reasons = {str(item).strip().lower() for item in signal.reasons}
+        if hard_degraded or risk_blocked:
+            return "risk_degraded_exit_review"
+        if soft_degraded or cross_failed or "cross_review" in reasons:
+            return "model_signal_invalidated"
+        return ""
 
     def _set_recommendation_status(
         self,
@@ -7512,6 +8234,7 @@ class StockAnalyzerService:
         source: str,
         trace_id: str,
         note: str = "",
+        extra: Mapping[str, object] | None = None,
     ) -> dict[str, object] | None:
         normalized_symbol = _normalize_a_share_symbol(symbol)
         normalized_status = _normalize_recommendation_status(status, default="")
@@ -7540,6 +8263,35 @@ class StockAnalyzerService:
             "last_trace_id": trace_id,
             "note": note_value,
         }
+        self._merge_recommendation_extra_fields(record, existing, extra=extra)
+        if normalized_status in {"bought", "holding", "entry_triggered"}:
+            record.setdefault("entry_triggered_at", now_iso)
+            record.setdefault("outcome_status", "open")
+            self._sync_recommendation_position_metrics(record, timestamp=timestamp)
+            event_name = "entry_triggered" if normalized_status == "entry_triggered" else "bought"
+        elif normalized_status in {"sold", "closed"}:
+            exit_price = _as_float(record.get("exit_price"), default=0.0)
+            self._close_recommendation_record_metrics(
+                record,
+                exit_price=exit_price,
+                timestamp=timestamp,
+                reason=str(record.get("closed_reason", "")) or source,
+            )
+            event_name = "closed"
+        elif normalized_status == "sell_alert":
+            record.setdefault("exit_alert_at", now_iso)
+            record.setdefault("outcome_status", "open")
+            event_name = "sell_alert"
+        else:
+            event_name = normalized_status
+        self._append_recommendation_event(
+            record,
+            timestamp=timestamp,
+            event=event_name,
+            source=source,
+            trace_id=trace_id,
+            details={"status": normalized_status, "note": note_value},
+        )
         self._recommendation_lifecycle[normalized_symbol] = record
         return dict(record)
 
@@ -7568,6 +8320,17 @@ class StockAnalyzerService:
                 "last_trace_id": str(item.get("last_trace_id", "")),
                 "note": str(item.get("note", "")),
             }
+            extra_payload: dict[str, object] = {}
+            for key in _RECOMMENDATION_EXTRA_FIELDS:
+                if key in item:
+                    extra_payload[key] = item.get(key)
+            if "events" in item and isinstance(item.get("events"), list):
+                extra_payload["events"] = list(item.get("events", []))[-40:]
+            self._merge_recommendation_extra_fields(
+                normalized[normalized_symbol],
+                {},
+                extra=extra_payload,
+            )
         self._recommendation_lifecycle = normalized
 
     def _ensure_symbol_tracked_in_watchlist(
@@ -10389,6 +11152,98 @@ class StockAnalyzerService:
             "items": items,
         }
 
+    def _sync_recommendation_lifecycle_from_holding_alerts(
+        self,
+        *,
+        holding_alerts: Mapping[str, object],
+        timestamp: datetime,
+        trace_id: str,
+    ) -> dict[str, object]:
+        raw_items = holding_alerts.get("items")
+        if not isinstance(raw_items, list):
+            return {"updated": 0, "symbols": []}
+        updated = 0
+        symbols: list[str] = []
+        now_iso = timestamp.isoformat()
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            symbol = _normalize_a_share_symbol(item.get("symbol"))
+            if not symbol:
+                continue
+            reason = str(item.get("reason", "")).strip() or "holding_alert"
+            severity = str(item.get("severity", "")).strip().lower()
+            exit_action = str(item.get("exit_action", "")).strip().lower()
+            should_mark_alert = severity == "warn" or exit_action in {"trim", "exit_full"}
+            if not should_mark_alert:
+                continue
+            existing = self._recommendation_lifecycle.get(symbol, {})
+            previous = dict(existing)
+            current_status = _normalize_recommendation_status(
+                existing.get("status"),
+                default="watching",
+            )
+            if current_status in _RECOMMENDATION_TERMINAL_STATUSES:
+                continue
+            strategy_value = (
+                str(item.get("strategy", "")).strip().lower()
+                or str(existing.get("strategy", "manual")).strip().lower()
+                or "manual"
+            )
+            first_recommended_at = str(existing.get("first_recommended_at", "")).strip() or now_iso
+            latest_price = _as_float(item.get("latest_price"), default=0.0)
+            entry_price = _as_float(item.get("entry_price"), default=0.0)
+            current_return = _as_float(item.get("pnl_pct"), default=0.0)
+            record = {
+                "symbol": symbol,
+                "strategy": strategy_value,
+                "status": "sell_alert",
+                "first_recommended_at": first_recommended_at,
+                "last_signal_at": str(existing.get("last_signal_at", "")),
+                "last_signal_score": _as_float(existing.get("last_signal_score"), default=0.0),
+                "last_signal_action": str(existing.get("last_signal_action", "")),
+                "last_manual_update_at": str(existing.get("last_manual_update_at", "")),
+                "updated_at": now_iso,
+                "last_source": "holding_alert",
+                "last_trace_id": trace_id,
+                "note": str(existing.get("note", "")),
+            }
+            self._merge_recommendation_extra_fields(
+                record,
+                existing,
+                extra={
+                    "entry_price": round(entry_price, 6) if entry_price > 0 else None,
+                    "entry_quantity": _as_int(item.get("quantity"), default=0),
+                    "exit_alert_at": now_iso,
+                    "exit_alert_reason": reason,
+                    "exit_price": round(latest_price, 6) if latest_price > 0 else None,
+                    "last_price": round(latest_price, 6) if latest_price > 0 else None,
+                    "last_exit_action": exit_action,
+                    "unrealized_return_pct": round(current_return, 6),
+                    "current_return_pct": round(current_return, 6),
+                    "holding_days": _as_int(item.get("hold_days"), default=0),
+                    "outcome_status": "open",
+                },
+            )
+            self._append_recommendation_event(
+                record,
+                timestamp=timestamp,
+                event="sell_alert",
+                source="holding_alert",
+                trace_id=trace_id,
+                details={
+                    "reason": reason,
+                    "severity": severity,
+                    "exit_action": exit_action,
+                    "current_return_pct": round(current_return, 6),
+                },
+            )
+            self._recommendation_lifecycle[symbol] = record
+            if record != previous:
+                updated += 1
+                symbols.append(symbol)
+        return {"updated": updated, "symbols": sorted({symbol for symbol in symbols if symbol})}
+
     def _resolve_latest_close_price(
         self,
         *,
@@ -10992,25 +11847,58 @@ class StockAnalyzerService:
             strategy = str(item.get("strategy", "trend")).strip() or "trend"
             side = str(item.get("side", "")).strip().lower()
             status = str(item.get("status", "")).strip().lower()
+            trade_price = _as_float(item.get("price"), default=0.0)
             if side == "buy" and status in {"opened", "adjusted"}:
                 record = self._set_recommendation_status(
                     symbol=symbol,
-                    status="bought",
+                    status="holding",
                     strategy=strategy,
                     timestamp=timestamp,
                     source="auto_simulated_buy",
                     trace_id=trace_id,
-                    note="模拟盘自动建仓",
+                    note="auto simulated buy",
+                    extra={
+                        "entry_triggered_at": str(item.get("trade_time", ""))
+                        or timestamp.isoformat(),
+                        "entry_price": round(trade_price, 6) if trade_price > 0 else None,
+                        "entry_quantity": _as_int(item.get("quantity"), default=0),
+                        "entry_trade_id": str(item.get("trade_id", "")).strip(),
+                        "last_price": round(trade_price, 6) if trade_price > 0 else None,
+                        "outcome_status": "open",
+                    },
                 )
             elif side == "sell" and status == "closed":
+                normalized_symbol = _normalize_a_share_symbol(symbol) or symbol
+                existing = self._recommendation_lifecycle.get(normalized_symbol, {})
+                entry_price = _as_float(existing.get("entry_price"), default=0.0)
+                realized = (
+                    round(trade_price / entry_price - 1.0, 6)
+                    if trade_price > 0 and entry_price > 0
+                    else None
+                )
                 record = self._set_recommendation_status(
                     symbol=symbol,
-                    status="watching",
+                    status="closed",
                     strategy=strategy,
                     timestamp=timestamp,
                     source="auto_simulated_sell",
                     trace_id=trace_id,
-                    note="模拟盘自动卖出",
+                    note="auto simulated sell",
+                    extra={
+                        "exit_price": round(trade_price, 6) if trade_price > 0 else None,
+                        "exit_quantity": _as_int(item.get("quantity"), default=0),
+                        "exit_trade_id": str(item.get("trade_id", "")).strip(),
+                        "closed_at": str(item.get("trade_time", "")) or timestamp.isoformat(),
+                        "closed_reason": str(item.get("reason", "")).strip()
+                        or "auto_simulated_sell",
+                        "realized_return_pct": realized,
+                        "current_return_pct": realized,
+                        "outcome_status": "win"
+                        if realized is not None and realized > 0
+                        else "loss"
+                        if realized is not None
+                        else "unknown",
+                    },
                 )
             else:
                 record = None
@@ -15099,18 +15987,31 @@ class StockAnalyzerService:
         sentiment_score = self._estimate_sentiment(monster_report=monster_report)
 
         reasons: list[str] = []
+        soft_reasons: list[str] = []
         if total_monster_position >= self._config.monster_risk.max_total_position:
             reasons.append("max_total_position")
         if max_monster_position >= self._config.monster_risk.max_stock_position:
             reasons.append("max_stock_position")
         if sentiment_score < self._config.monster_risk.disable_if_sentiment_below:
-            reasons.append("low_sentiment")
+            if total_monster_position <= 0 and _as_int(
+                empty_signal.get("no_buy_streak"), default=0
+            ) >= max(1, self._config.week5.empty_signal_no_buy_runs):
+                soft_reasons.append("low_sentiment_recovery_soft")
+            else:
+                reasons.append("low_sentiment")
+        empty_signal_reasons = empty_signal.get("reasons", [])
+        if not isinstance(empty_signal_reasons, list):
+            empty_signal_reasons = []
         if bool(empty_signal.get("triggered", False)):
-            reasons.append("empty_signal")
+            if "drawdown_threshold" in {str(reason) for reason in empty_signal_reasons}:
+                reasons.append("empty_signal_drawdown")
+            else:
+                soft_reasons.append("empty_signal_soft")
 
         return {
             "can_open_new_position": len(reasons) == 0,
             "reasons": reasons,
+            "soft_reasons": soft_reasons,
             "total_monster_position": round(total_monster_position, 4),
             "max_monster_position": round(max_monster_position, 4),
             "sentiment_score": round(sentiment_score, 2),
@@ -15164,13 +16065,31 @@ class StockAnalyzerService:
                 manual_fill=close_fill,
             )
             if closed:
+                trade_reference = self._trade_reference_for_closed_position(symbol)
+                exit_price = _as_float(trade_reference.get("exit_price"), default=0.0)
+                entry_price = _as_float(trade_reference.get("entry_price"), default=0.0)
+                realized = (
+                    round(exit_price / entry_price - 1.0, 6)
+                    if exit_price > 0 and entry_price > 0
+                    else None
+                )
                 self._set_recommendation_status(
                     symbol=symbol,
-                    status="watching",
+                    status="closed",
                     strategy="manual",
                     timestamp=timestamp,
                     source="manual_close_command",
                     trace_id=trace_id,
+                    extra={
+                        **trade_reference,
+                        "realized_return_pct": realized,
+                        "current_return_pct": realized,
+                        "outcome_status": "win"
+                        if realized is not None and realized > 0
+                        else "loss"
+                        if realized is not None
+                        else "unknown",
+                    },
                 )
             response = {"action": action, "symbol": symbol, "closed": closed}
             if close_fill is not None:
@@ -15189,13 +16108,31 @@ class StockAnalyzerService:
                 )
                 if closed:
                     closed_symbols.append(symbol)
+                    trade_reference = self._trade_reference_for_closed_position(symbol)
+                    exit_price = _as_float(trade_reference.get("exit_price"), default=0.0)
+                    entry_price = _as_float(trade_reference.get("entry_price"), default=0.0)
+                    realized = (
+                        round(exit_price / entry_price - 1.0, 6)
+                        if exit_price > 0 and entry_price > 0
+                        else None
+                    )
                     self._set_recommendation_status(
                         symbol=symbol,
-                        status="watching",
+                        status="closed",
                         strategy="manual",
                         timestamp=timestamp,
                         source="manual_close_all_positions_command",
                         trace_id=trace_id,
+                        extra={
+                            **trade_reference,
+                            "realized_return_pct": realized,
+                            "current_return_pct": realized,
+                            "outcome_status": "win"
+                            if realized is not None and realized > 0
+                            else "loss"
+                            if realized is not None
+                            else "unknown",
+                        },
                     )
             return {
                 "action": action,
@@ -15242,6 +16179,19 @@ class StockAnalyzerService:
                     trace_id=trace_id,
                 )
                 raw_note = command_payload.get("note")
+                recommendation_extra: dict[str, object] = {}
+                if manual_fill is not None:
+                    entry_price = _as_float(manual_fill.get("entry_price"), default=0.0)
+                    if entry_price > 0:
+                        recommendation_extra["entry_price"] = round(entry_price, 6)
+                        recommendation_extra["last_price"] = round(entry_price, 6)
+                    quantity = _as_int(manual_fill.get("quantity"), default=0)
+                    if quantity > 0:
+                        recommendation_extra["entry_quantity"] = quantity
+                    trade_time = str(manual_fill.get("manual_trade_time", "")).strip()
+                    if trade_time:
+                        recommendation_extra["entry_triggered_at"] = trade_time
+                    recommendation_extra["outcome_status"] = "open"
                 recommendation = self._set_recommendation_status(
                     symbol=symbol,
                     status="bought",
@@ -15250,6 +16200,7 @@ class StockAnalyzerService:
                     source="manual_set_position_command",
                     trace_id=trace_id,
                     note=raw_note.strip() if isinstance(raw_note, str) else "",
+                    extra=recommendation_extra,
                 )
                 if recommendation is not None:
                     response["recommendation"] = recommendation

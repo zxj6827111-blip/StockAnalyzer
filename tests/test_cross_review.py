@@ -19,6 +19,17 @@ def test_cross_review_fails_when_diff_or_meta_not_met() -> None:
     assert "meta<0.58" in result.reasons
 
 
+def test_cross_review_allows_degraded_consensus_when_lgbm_saturates() -> None:
+    config = CrossReviewConfig(p_lgbm_min=0.60, p_xgb_min=0.55, max_diff=0.18, p_meta_min=0.54)
+    result = evaluate_cross_review(1.0, 0.39, 0.58, config)
+    assert result.passed is True
+    assert result.mode == "degraded_consensus"
+    assert result.degraded_consensus is True
+    assert "xgb<0.55" in result.reasons
+    assert "model_diff>0.18" in result.reasons
+    assert "degraded_consensus_lgbm_saturated" in result.reasons
+
+
 def test_cross_review_relaxes_thresholds_when_active_champion_is_weak() -> None:
     config = CrossReviewConfig(
         p_lgbm_min=0.62,

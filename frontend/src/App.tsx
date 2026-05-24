@@ -5,6 +5,7 @@ import {
   Eye,
   LayoutDashboard,
   Newspaper,
+  Target,
   Settings,
 } from 'lucide-react';
 import { useEffect } from 'react';
@@ -16,6 +17,7 @@ import LearningOverviewPage from './pages/LearningOverview';
 import NewsPage from './pages/News';
 import ObservationPoolPage from './pages/ObservationPoolPage';
 import PortfolioPage from './pages/Portfolio';
+import RecommendationsPage from './pages/Recommendations';
 import RuntimeStagePage from './pages/RuntimeStage';
 import SystemOpsPage from './pages/SystemOps';
 
@@ -27,6 +29,7 @@ function Sidebar(props: { onWarmLearningOverview: () => void }) {
     { path: '/learning-overview', label: '训练总览', icon: Brain },
     { path: '/observation-pool', label: '观察池', icon: Eye },
     { path: '/portfolio', label: '持仓与实盘', icon: Briefcase },
+    { path: '/recommendations', label: '推荐汇总', icon: Target },
     { path: '/news', label: '新闻与因子', icon: Newspaper },
     { path: '/ops', label: '系统与日志', icon: Settings },
   ];
@@ -118,6 +121,7 @@ function MainLayout() {
           <Route path="/learning-overview" element={<LearningOverviewPage />} />
           <Route path="/observation-pool" element={<ObservationPoolPage />} />
           <Route path="/portfolio" element={<PortfolioPage />} />
+          <Route path="/recommendations" element={<RecommendationsPage />} />
           <Route path="/news" element={<NewsPage />} />
           <Route path="/ops" element={<SystemOpsPage />} />
         </Routes>

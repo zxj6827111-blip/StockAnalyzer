@@ -394,6 +394,7 @@ _DASHBOARD_HTML = """<!doctype html>
         <span class="status" id="ops-status">操作: 检查中</span>
         <span class="status" id="execution-mode-status">执行模式: 检查中</span>
         <a class="btn" id="stage-page-link" href="/dashboard/stage">🧭 当前阶段</a>
+        <a class="btn" href="/dashboard/recommendations">推荐汇总</a>
         <button class="btn" id="ops-toggle-btn">切换操作权限</button>
       </div>
     </section>
@@ -422,6 +423,9 @@ _DASHBOARD_HTML = """<!doctype html>
           <select id="rec-status-input" class="trace-input" style="width:140px;">
             <option value="recommended">标记推荐</option>
             <option value="bought">标记已买入</option>
+            <option value="holding">标记持有</option>
+            <option value="sell_alert">标记卖出提醒</option>
+            <option value="closed">标记已结束</option>
             <option value="watching">标记观察</option>
             <option value="dropped">标记放弃</option>
           </select>
@@ -463,6 +467,10 @@ _DASHBOARD_HTML = """<!doctype html>
             <option value="">全部状态</option>
             <option value="recommended">recommended</option>
             <option value="bought">bought</option>
+            <option value="holding">holding</option>
+            <option value="sell_alert">sell_alert</option>
+            <option value="closed">closed</option>
+            <option value="expired">expired</option>
             <option value="watching">watching</option>
             <option value="dropped">dropped</option>
           </select>
@@ -475,8 +483,9 @@ _DASHBOARD_HTML = """<!doctype html>
           <button class="btn" id="rec-prev-btn">上一页</button>
           <button class="btn" id="rec-next-btn">下一页</button>
         </div>
+        <div class="item" id="rec-performance-summary" style="margin-top:10px;">暂无推荐收益汇总</div>
         <table>
-          <thead><tr><th>代码</th><th>状态</th><th>策略</th><th>最新评分</th><th>更新时间</th><th>备注</th></tr></thead>
+          <thead><tr><th>代码</th><th>状态</th><th>买入区间</th><th>止损</th><th>止盈</th><th>进入/退出</th><th>收益</th><th>更新时间</th></tr></thead>
           <tbody id="recommendation-body"></tbody>
         </table>
       </article>
@@ -609,7 +618,36 @@ _DASHBOARD_HTML = """<!doctype html>
       recPage = Math.max(1, Math.min(recPage, pages));
       const slice = rows.slice((recPage - 1) * REC_PAGE_SIZE, recPage * REC_PAGE_SIZE);
       setText("rec-page-info", `第 ${recPage}/${pages} 页 (${rows.length}条)`);
-      setHtml("recommendation-body", slice.length ? slice.map(r => `<tr><td>${esc(r.symbol)}</td><td>${esc(r.status)}</td><td>${esc(r.strategy)}</td><td>${Number(r.last_signal_score || 0).toFixed(2)}</td><td>${esc(r.updated_at || "")}</td><td>${esc(r.note || "")}</td></tr>`).join("") : "<tr><td colspan='6'>暂无推荐跟踪记录</td></tr>");
+      setHtml("recommendation-body", slice.length ? slice.map(r => {
+        const plan = r.trade_plan || {};
+        const range = plan.entry_range || [plan.entry_low, plan.entry_high];
+        const entryRange = Number(range[0] || 0) > 0 && Number(range[1] || 0) > 0
+          ? `${Number(range[0]).toFixed(2)}-${Number(range[1]).toFixed(2)}`
+          : "-";
+        const stop = Number(plan.stop_loss_price || 0) > 0 ? Number(plan.stop_loss_price).toFixed(2) : "-";
+        const takePrices = Array.isArray(plan.take_profit_prices) ? plan.take_profit_prices : [];
+        const take = takePrices.length ? takePrices.slice(0, 3).map(v => Number(v).toFixed(2)).join("/") : "-";
+        const entryExit = `${Number(r.entry_price || 0) > 0 ? Number(r.entry_price).toFixed(2) : "-"} / ${Number(r.exit_price || 0) > 0 ? Number(r.exit_price).toFixed(2) : "-"}`;
+        const pnl = Number(r.realized_return_pct || 0) !== 0
+          ? Number(r.realized_return_pct * 100).toFixed(2) + "%"
+          : Number(r.current_return_pct || 0) !== 0
+          ? Number(r.current_return_pct * 100).toFixed(2) + "%"
+          : "-";
+        return `<tr><td>${esc(r.symbol)}</td><td>${esc(r.status)}</td><td>${esc(entryRange)}</td><td>${esc(stop)}</td><td>${esc(take)}</td><td>${esc(entryExit)}</td><td>${esc(pnl)}</td><td>${esc(r.updated_at || "")}</td></tr>`;
+      }).join("") : "<tr><td colspan='8'>暂无推荐跟踪记录</td></tr>");
+    }
+
+    function renderRecommendationSummary(summary) {
+      const s = summary || {};
+      const winRate = Number((s.win_rate || 0) * 100).toFixed(2);
+      const avgReturn = Number((s.avg_realized_return_pct || 0) * 100).toFixed(2);
+      const totalReturn = Number((s.total_realized_return_pct || 0) * 100).toFixed(2);
+      const openReturn = Number((s.avg_open_return_pct || 0) * 100).toFixed(2);
+      setHtml(
+        "rec-performance-summary",
+        `<div><strong>记录:</strong> ${Number(s.records || 0)} | <strong>未结束:</strong> ${Number(s.open_records || 0)} | <strong>已结束:</strong> ${Number(s.closed_records || 0)} | <strong>胜率:</strong> ${winRate}%</div>
+         <div class="meta">平均已实现 ${avgReturn}% | 累计已实现 ${totalReturn}% | 未结束平均 ${openReturn}% | 平均持有 ${Number(s.avg_holding_days || 0).toFixed(1)} 天</div>`
+      );
     }
 
     function renderHoldingAlerts() {
@@ -684,6 +722,7 @@ _DASHBOARD_HTML = """<!doctype html>
         // Recommendation lifecycle
         const recPanel = db.recommendation_panel || {};
         recRows = recPanel.items || [];
+        renderRecommendationSummary(recPanel.summary || {});
         renderRecommendationTable();
         holdingRows = (db.holding_alerts || {}).items || [];
         renderHoldingAlerts();
@@ -896,6 +935,11 @@ _DASHBOARD_HTML = """<!doctype html>
         {key: "status", label: "status"},
         {key: "strategy", label: "strategy"},
         {key: "last_signal_score", label: "last_signal_score"},
+        {key: "entry_price", label: "entry_price"},
+        {key: "exit_price", label: "exit_price"},
+        {key: "realized_return_pct", label: "realized_return_pct"},
+        {key: "current_return_pct", label: "current_return_pct"},
+        {key: "exit_alert_reason", label: "exit_alert_reason"},
         {key: "updated_at", label: "updated_at"},
         {key: "note", label: "note"}
       ]
@@ -1191,6 +1235,11 @@ class NotificationRequest(BaseModel):
     trace_id: str = ""
 
 
+class SignalQualityAuditRequest(BaseModel):
+    limit: int = Field(default=200, ge=1, le=2000)
+    include_audit_events: bool = True
+
+
 class CommandRequest(BaseModel):
     command_id: str
     timestamp: int
@@ -1394,6 +1443,11 @@ class RegisterModelArtifactRequest(BaseModel):
     lifecycle_state: str = "trained"
     source: str = "manual_register_model_artifact"
     parent_model_id: str = ""
+
+
+class BootstrapActiveChampionRequest(BaseModel):
+    artifact_path: str = ""
+    source: str = "manual_bootstrap_active_champion"
 
 
 class ModelRegistryLifecycleRequest(BaseModel):
@@ -1851,6 +1905,11 @@ def dashboard_page() -> RedirectResponse:
     return RedirectResponse(url="/ui", status_code=307)
 
 
+@app.get("/dashboard/recommendations", include_in_schema=False)
+def dashboard_recommendations_page() -> RedirectResponse:
+    return RedirectResponse(url="/ui/recommendations", status_code=307)
+
+
 @app.get("/dashboard/stage", include_in_schema=False)
 def dashboard_stage_page() -> RedirectResponse:
     return RedirectResponse(url="/ui/runtime-stage", status_code=307)
@@ -1993,6 +2052,26 @@ def latest_signals() -> dict[str, object]:
     if not payload.get("trace_id"):
         return {"signals": []}
     return payload
+
+
+@app.post("/research/signal-quality/run")
+def run_signal_quality_audit(request: SignalQualityAuditRequest) -> dict[str, object]:
+    return _service.run_signal_quality_audit(
+        limit=request.limit,
+        include_audit_events=request.include_audit_events,
+    )
+
+
+@app.get("/research/signal-quality/latest")
+def latest_signal_quality_audit() -> dict[str, object]:
+    return _service.latest_signal_quality_audit()
+
+
+@app.get("/research/signal-quality/history")
+def signal_quality_audit_history(
+    limit: int = Query(default=20, ge=1, le=200),
+) -> dict[str, object]:
+    return _service.signal_quality_audit_history(limit=limit)
 
 
 @app.post("/notify/test")
@@ -3571,6 +3650,16 @@ def register_model_artifact(request: RegisterModelArtifactRequest) -> dict[str, 
         lifecycle_state=request.lifecycle_state,
         source=request.source,
         parent_model_id=request.parent_model_id,
+    )
+
+
+@app.post("/models/registry/bootstrap-active-champion")
+def bootstrap_active_champion(
+    request: BootstrapActiveChampionRequest,
+) -> dict[str, object]:
+    return _service.bootstrap_active_champion_from_artifact(
+        artifact_path=request.artifact_path,
+        source=request.source,
     )
 
 

@@ -618,6 +618,24 @@ def test_service_learning_governance_status_degrades_when_model_registry_is_lock
     assert monitoring["revoked_model_count"] == 0
 
 
+def test_service_learning_governance_status_reports_active_champion_repair_hint(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config(tmp_path)
+    config.evolution.active_champion_id = "champion_v7_202603"
+    service = _new_service(config, provider=FailingBarsProvider())
+
+    status = _as_mapping(service.learning_model_governance_status())
+    repair = _as_mapping(status["active_champion_repair"])
+
+    assert status["active_champion"] is None
+    assert repair["required"] is True
+    assert repair["reason"] == "active champion not found"
+    assert repair["configured_active_champion_id"] == "champion_v7_202603"
+    assert repair["manual_repair_endpoint"] == "POST /models/registry/bootstrap-active-champion"
+    assert str(repair["artifact_path"]).endswith("protocol_model.json")
+
+
 def test_service_revoke_learning_model_proposal_revokes_model_and_blocks_ticket_issue(
     tmp_path: Path,
 ) -> None:

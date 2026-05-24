@@ -171,6 +171,10 @@ def test_dashboard_quick_command_set_recommendation_status() -> None:
     assert bias.status_code == 200
     assert "items" in bias.json()
 
+    recommendation_page = client.get("/dashboard/recommendations", follow_redirects=False)
+    assert recommendation_page.status_code == 307
+    assert recommendation_page.headers["location"] == "/ui/recommendations"
+
 
 def test_dashboard_quick_command_close_all_positions() -> None:
     client = TestClient(app)
