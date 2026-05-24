@@ -74,3 +74,39 @@ def test_signal_quality_auditor_handles_empty_latest_signals() -> None:
     assert report["status"] == "empty"
     assert report["summary"]["signal_count"] == 0
     assert report["recommended_next_actions"][0]["code"] == "restore_signal_materialization"
+
+
+def test_signal_quality_auditor_does_not_count_probe_as_cross_review_block() -> None:
+    auditor = SignalQualityAuditor(config=_load_config())
+
+    report = auditor.build_report(
+        latest_signals=[
+            {
+                "symbol": "301369",
+                "strategy": "trend",
+                "score": 47.3,
+                "grade": "C",
+                "action": "buy",
+                "probabilities": {"lgbm": 1.0, "xgb": 0.2694, "meta": 0.4970},
+                "reasons": [
+                    "xgb<0.55",
+                    "model_diff>0.18",
+                    "meta<0.54",
+                    "financial_penalty:low_roe",
+                    "model_disagreement_probe",
+                ],
+                "decision_trace": {
+                    "cross_review_gate": {
+                        "passed": False,
+                        "mode": "strict",
+                    },
+                    "provider": {"soft_degraded_mode": True, "degrade_reason": "m2_extreme"},
+                    "financial_gate": {"passed": True},
+                },
+            }
+        ],
+    )
+
+    assert report["status"] == "ok"
+    assert "cross_review" not in report["gate_attribution"]["counts"]
+    assert report["gate_attribution"]["counts"]["provider_degraded"] == 1

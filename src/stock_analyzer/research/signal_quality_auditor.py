@@ -96,7 +96,7 @@ class SignalQualityAuditor:
             cross_review_gate.get("passed") is False
             or "cross_review" in reasons
             or _cross_review_threshold_miss(signal, self._config)
-        ):
+        ) and "model_disagreement_probe" not in reasons:
             blocked.append("cross_review")
         for gate_name in ("risk_gate", "financial_gate", "liquidity_gate", "execution_risk_gate"):
             gate = _mapping(decision_trace.get(gate_name))

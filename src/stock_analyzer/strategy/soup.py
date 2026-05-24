@@ -24,12 +24,20 @@ class SoupStrategy:
         liquidity_pass: bool,
         cross_review_pass: bool,
         cross_review_reasons: Sequence[str] | None = None,
+        raw_score: float | None = None,
+        probabilities: dict[str, float] | None = None,
     ) -> TradeDecision:
         if not can_open_new_position:
             return TradeDecision(action="hold", target_position=0.0, reason="risk_gate")
         if not liquidity_pass:
             return TradeDecision(action="hold", target_position=0.0, reason="liquidity_filter")
         if not cross_review_pass:
+            if self._is_disagreement_probe(raw_score=raw_score, probabilities=probabilities):
+                return TradeDecision(
+                    action="buy",
+                    target_position=float(self._config.disagreement_probe_max_position),
+                    reason="model_disagreement_probe",
+                )
             if scored.grade in {"S", "A", "B"}:
                 return TradeDecision(
                     action="watch",
@@ -78,6 +86,30 @@ class SoupStrategy:
         if str(scored.grade) not in set(self._config.recovery_allowed_grades):
             return False
         return float(scored.total_score) >= float(self._config.recovery_min_score)
+
+    def _is_disagreement_probe(
+        self,
+        *,
+        raw_score: float | None,
+        probabilities: dict[str, float] | None,
+    ) -> bool:
+        if not bool(self._config.disagreement_probe_enabled):
+            return False
+        if raw_score is None or float(raw_score) < float(
+            self._config.disagreement_probe_min_raw_score
+        ):
+            return False
+        probs = probabilities or {}
+        lgbm = float(probs.get("lgbm", 0.0))
+        xgb = float(probs.get("xgb", 0.0))
+        meta = float(probs.get("meta", 0.0))
+        merged = (lgbm + xgb + meta) / 3.0
+        return (
+            lgbm >= float(self._config.disagreement_probe_lgbm_min)
+            and xgb >= float(self._config.disagreement_probe_xgb_min)
+            and meta >= float(self._config.disagreement_probe_meta_min)
+            and merged >= float(self._config.disagreement_probe_merged_min)
+        )
 
     def _dynamic_position(self, atr_ratio: float, *, signal_score: float, grade: str) -> float:
         safe_atr = max(atr_ratio, 1e-6)

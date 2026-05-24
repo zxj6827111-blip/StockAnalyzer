@@ -198,6 +198,13 @@ soup_strategy:
   recovery_min_score: 50
   recovery_max_position: 0.03
   recovery_allowed_grades: [S, A, B]
+  disagreement_probe_enabled: true
+  disagreement_probe_min_raw_score: 60
+  disagreement_probe_lgbm_min: 0.995
+  disagreement_probe_xgb_min: 0.25
+  disagreement_probe_meta_min: 0.48
+  disagreement_probe_merged_min: 0.58
+  disagreement_probe_max_position: 0.01
 
 capital_curve:
   drawdown_alert: 5
@@ -434,7 +441,7 @@ notification_filter:
   cooldown_sec: 300
   min_score: 60
   min_score_by_action:
-    buy: 50
+    buy: 45
     watch: 50
   allowed_actions: [buy, watch]
   max_signals_per_run: 5

@@ -200,6 +200,13 @@ class SoupStrategyConfig(_StrictModel):
     recovery_min_score: float = 50.0
     recovery_max_position: float = 0.03
     recovery_allowed_grades: list[str] = Field(default_factory=lambda: ["S", "A", "B"])
+    disagreement_probe_enabled: bool = True
+    disagreement_probe_min_raw_score: float = 60.0
+    disagreement_probe_lgbm_min: float = 0.995
+    disagreement_probe_xgb_min: float = 0.25
+    disagreement_probe_meta_min: float = 0.48
+    disagreement_probe_merged_min: float = 0.58
+    disagreement_probe_max_position: float = 0.01
 
 
 class CapitalCurveConfig(_StrictModel):

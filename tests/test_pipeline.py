@@ -110,6 +110,15 @@ class ConstantNewsProvider:
         return self._value
 
 
+class FixedProbabilityPredictor:
+    def __init__(self, probabilities: dict[str, float]) -> None:
+        self._probabilities = probabilities
+
+    def predict_row(self, feature_row: pd.Series) -> dict[str, float]:
+        _ = feature_row
+        return dict(self._probabilities)
+
+
 class ErrorNewsProvider:
     def score(
         self,
@@ -290,6 +299,43 @@ def test_pipeline_penalizes_trend_instead_of_blocking_under_score_penalty_mode()
     assert penalized_signal.score < baseline_signal.score
     assert any(reason.startswith("financial_penalty:") for reason in penalized_signal.reasons)
     assert "financial_filter_block" not in penalized_signal.reasons
+
+
+def test_pipeline_opens_model_disagreement_probe_from_raw_score() -> None:
+    config = _load_default_config()
+    config.financial_filter.enabled = True
+    config.financial_filter.apply_to = ["trend"]
+    config.financial_filter.trend_mode = "score_penalty"
+    config.financial_filter.trend_penalty = 15.0
+    config.liquidity_filter_trend.min_daily_turnover = 0.0
+    config.liquidity_filter_trend.min_float_market_cap = 0.0
+    config.liquidity_filter_trend.max_turnover_rate = 1.0
+    config.strategy_scores["trend"].weights = {
+        "lgbm": 0.50,
+        "xgb": 0.15,
+        "meta": 0.20,
+        "news": 0.05,
+        "board": 0.05,
+        "completion": 0.05,
+    }
+    pipeline = AnalyzerPipeline(
+        config=config,
+        provider=WeakFundamentalsBarsProvider(),
+        news_provider=ConstantNewsProvider(0.5),
+    )
+    pipeline._predictor = FixedProbabilityPredictor(  # noqa: SLF001
+        {"lgbm": 1.0, "xgb": 0.2694, "meta": 0.4970}
+    )
+    pipeline._predictor_status = {"predictor_mode": "artifact_loaded"}  # noqa: SLF001
+
+    report = pipeline.run_once(symbols=["600000"], strategy="trend", current_equity=1.0)
+    signal = report.signals[0]
+
+    assert signal.action == "buy"
+    assert signal.target_position == 0.01
+    assert "model_disagreement_probe" in signal.reasons
+    assert signal.score < signal.decision_trace["score"]["raw_score"]
+    assert signal.decision_trace["cross_review_gate"]["passed"] is False
 
 
 def test_pipeline_blocks_symbol_with_future_available_time() -> None:

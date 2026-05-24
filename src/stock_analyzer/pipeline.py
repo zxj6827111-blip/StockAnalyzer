@@ -641,6 +641,8 @@ class AnalyzerPipeline:
         }
         bar_t1 = bars.iloc[-2] if len(bars) >= 2 else bars.iloc[-1]
         scored = self._score_engine.score(components=components, strategy=strategy)
+        raw_score = scored.total_score
+        raw_grade = scored.grade
         financial_decision = self._financial_filter.evaluate(
             symbol=symbol,
             strategy=strategy,
@@ -679,6 +681,8 @@ class AnalyzerPipeline:
             liquidity_pass=liquidity_pass,
             cross_review_pass=cross_review.passed,
             cross_review_reasons=cross_review.reasons,
+            raw_score=raw_score,
+            probabilities=probabilities,
         )
         strategy_decision_action = decision.action
         strategy_decision_reason = decision.reason
@@ -724,6 +728,8 @@ class AnalyzerPipeline:
             "score": {
                 "score": round(scored.total_score, 2),
                 "grade": scored.grade,
+                "raw_score": round(raw_score, 2),
+                "raw_grade": raw_grade,
                 "components": {key: round(value, 4) for key, value in components.items()},
                 "probabilities": {key: round(value, 4) for key, value in probabilities.items()},
             },

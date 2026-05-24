@@ -72,3 +72,43 @@ def test_soup_strategy_opens_small_recovery_buy_for_degraded_consensus() -> None
     assert decision.action == "buy"
     assert decision.reason == "recovery_degraded_consensus"
     assert 0.0 < decision.target_position <= 0.03
+
+
+def test_soup_strategy_opens_probe_for_high_raw_score_model_disagreement() -> None:
+    strategy = SoupStrategy(SoupStrategyConfig())
+    features = pd.Series({"atr_ratio": 0.2})
+    scored = ScoredSignal(total_score=47.0, grade="C", components={})
+
+    decision = strategy.recommend(
+        scored=scored,
+        latest_features=features,
+        can_open_new_position=True,
+        liquidity_pass=True,
+        cross_review_pass=False,
+        cross_review_reasons=["xgb<0.55", "model_diff>0.18", "meta<0.54"],
+        raw_score=62.0,
+        probabilities={"lgbm": 1.0, "xgb": 0.2694, "meta": 0.4970},
+    )
+
+    assert decision.action == "buy"
+    assert decision.reason == "model_disagreement_probe"
+    assert decision.target_position == 0.01
+
+
+def test_soup_strategy_rejects_probe_when_raw_score_is_too_low() -> None:
+    strategy = SoupStrategy(SoupStrategyConfig())
+    features = pd.Series({"atr_ratio": 0.2})
+    scored = ScoredSignal(total_score=47.0, grade="C", components={})
+
+    decision = strategy.recommend(
+        scored=scored,
+        latest_features=features,
+        can_open_new_position=True,
+        liquidity_pass=True,
+        cross_review_pass=False,
+        raw_score=59.9,
+        probabilities={"lgbm": 1.0, "xgb": 0.2694, "meta": 0.4970},
+    )
+
+    assert decision.action == "hold"
+    assert decision.reason == "cross_review"
