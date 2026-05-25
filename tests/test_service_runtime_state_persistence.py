@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
@@ -483,6 +484,128 @@ def test_runtime_state_persists_sla_audit_and_week_views(tmp_path: Path) -> None
     assert _as_int(_as_mapping(restored.week4_acceptance_history(limit=10))["records"]) >= 1
     assert _as_int(_as_mapping(restored.week5_scan_history(limit=10))["records"]) >= 1
     assert _as_int(_as_mapping(restored.week6_history(limit=10))["records"]) >= 1
+
+
+def test_runtime_state_persists_compact_json(tmp_path: Path) -> None:
+    config = _load_test_config(tmp_path)
+    service = _new_service(config)
+    _seed_runtime_run(service, trace_id="runtime-state-compact")
+    state_path = Path(config.command_channel.state_persist_path)
+    raw = state_path.read_text(encoding="utf-8")
+    payload = _as_mapping(json.loads(raw))
+
+    assert "\n  " not in raw
+    assert payload["state_version"] == 7
+
+
+def test_runtime_state_writes_large_histories_to_sidecars(tmp_path: Path) -> None:
+    config = _load_test_config(tmp_path)
+    service = _new_service(config)
+    trace_id = "runtime-state-sidecar"
+    _seed_runtime_run(service, trace_id=trace_id)
+    _seed_persisted_week_views(service)
+
+    state_path = Path(config.command_channel.state_persist_path)
+    payload = _as_mapping(json.loads(state_path.read_text(encoding="utf-8")))
+    sidecar_dir = state_path.with_name("runtime_state_history")
+
+    assert "reconcile_history" not in payload
+    assert "run_summaries" not in payload
+    assert "latency_history_ms" not in payload
+    assert "audit_events" not in payload
+    assert "week5_scan_history" not in payload
+    assert _as_mapping(payload["runtime_history_sidecars"])["format"] == "jsonl"
+
+    run_lines = (sidecar_dir / "run_summaries.jsonl").read_text(encoding="utf-8").splitlines()
+    latency_lines = (
+        sidecar_dir / "latency_history_ms.jsonl"
+    ).read_text(encoding="utf-8").splitlines()
+    audit_lines = (sidecar_dir / "audit_events.jsonl").read_text(encoding="utf-8").splitlines()
+    week5_lines = (
+        sidecar_dir / "week5_scan_history.jsonl"
+    ).read_text(encoding="utf-8").splitlines()
+
+    assert any(trace_id in line for line in run_lines)
+    assert any(trace_id in line for line in latency_lines)
+    assert any(trace_id in line for line in audit_lines)
+    assert any("runtime-state-week5" in line for line in week5_lines)
+
+
+def test_runtime_state_loads_legacy_embedded_histories_and_migrates_sidecars(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config(tmp_path)
+    state_path = Path(config.command_channel.state_persist_path)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_payload = {
+        "state_version": 6,
+        "updated_at": "2026-03-01T20:25:00",
+        "scheduler_state": {},
+        "current_equity": 1.0,
+        "watchlist": ["600000"],
+        "pause_new_buy": False,
+        "reconcile_required": False,
+        "portfolio": {},
+        "recommendation_lifecycle": {},
+        "audit_seq": 1,
+        "run_summaries": [
+            {
+                "timestamp": "2026-03-01T20:25:00",
+                "trace_id": "legacy-history",
+                "duration_ms": 12,
+            }
+        ],
+        "latency_history_ms": [
+            {
+                "timestamp": "2026-03-01T20:25:00",
+                "trace_id": "legacy-history",
+                "duration_ms": 12,
+            }
+        ],
+        "audit_events": [
+            {
+                "event_id": "AUD-00000001",
+                "timestamp": "2026-03-01T20:25:01",
+                "event_type": "pipeline_run",
+                "trace_id": "legacy-history",
+                "level": "info",
+                "payload": {},
+            }
+        ],
+        "week5_scan_latest": {
+            "timestamp": "2026-03-01T20:30:00",
+            "trace_id": "legacy-week5",
+            "status": "ok",
+        },
+        "week5_scan_history": [
+            {
+                "timestamp": "2026-03-01T20:30:00",
+                "trace_id": "legacy-week5",
+                "status": "ok",
+            }
+        ],
+    }
+    state_path.write_text(json.dumps(legacy_payload, ensure_ascii=False), encoding="utf-8")
+
+    service = _new_service(config)
+    assert _as_int(_as_mapping(service.sla_report(recent_runs=10))["recent_runs"]) >= 1
+    events = _as_mapping(service.audit_events(limit=10, trace_id="legacy-history"))
+    assert _as_int(events["records"]) == 1
+    assert _as_int(_as_mapping(service.week5_scan_history(limit=10))["records"]) == 1
+
+    service._persist_runtime_state_to_disk()  # noqa: SLF001
+    migrated = _as_mapping(json.loads(state_path.read_text(encoding="utf-8")))
+    assert "run_summaries" not in migrated
+    assert "latency_history_ms" not in migrated
+    assert "audit_events" not in migrated
+    assert "week5_scan_history" not in migrated
+    sidecar_dir = state_path.with_name("runtime_state_history")
+    assert "legacy-history" in (sidecar_dir / "run_summaries.jsonl").read_text(
+        encoding="utf-8"
+    )
+    assert "legacy-week5" in (sidecar_dir / "week5_scan_history.jsonl").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_runtime_state_persists_evolution_release_views(tmp_path: Path) -> None:

@@ -3323,6 +3323,7 @@ class StockAnalyzerService:
         multi_run_summary: dict[str, object] | None = None
         week6_execution: dict[str, object]
 
+        pipeline_started = perf_counter()
         if normalized_strategy == "multi":
             multi_payload = self._run_multi_strategy_pipeline(
                 symbols=symbol_list,
@@ -3361,6 +3362,9 @@ class StockAnalyzerService:
             risk_payload = asdict(report.risk)
             signals = report.signals
             drawdown_pct = report.risk.drawdown_pct
+
+        pipeline_ms = int((perf_counter() - pipeline_started) * 1000)
+        post_pipeline_started = perf_counter()
 
         m1_negative_case = self._apply_m1_negative_case_constraints(
             signals=signals,
@@ -3444,6 +3448,7 @@ class StockAnalyzerService:
         notification_filter_diagnostics = self._notification_filter.latest_diagnostics()
         if notification_filter_diagnostics is not None:
             self._last_notification_filter_diagnostics = dict(notification_filter_diagnostics)
+        recommendation_sync_started = perf_counter()
         recommendation_update = self._sync_recommendation_lifecycle_from_signals(
             signals=signals,
             timestamp=timestamp,
@@ -3472,6 +3477,7 @@ class StockAnalyzerService:
             timestamp=timestamp,
             trace_id=trace_id,
         )
+        recommendation_sync_ms = int((perf_counter() - recommendation_sync_started) * 1000)
         portfolio_changed = (
             _as_int(portfolio_update.get("opened"), default=0) > 0
             or _as_int(portfolio_update.get("adjusted"), default=0) > 0
@@ -3479,14 +3485,27 @@ class StockAnalyzerService:
             or _as_int(portfolio_update.get("closed_expired"), default=0) > 0
             or _as_int(portfolio_update.get("closed_signals"), default=0) > 0
         )
+        runtime_state_persist_reasons: list[str] = []
         if _as_int(recommendation_update.get("updated"), default=0) > 0:
-            self._persist_runtime_state_to_disk()
+            runtime_state_persist_reasons.append("recommendation_update")
         if _as_int(execution_recommendation_update.get("updated"), default=0) > 0:
-            self._persist_runtime_state_to_disk()
+            runtime_state_persist_reasons.append("execution_recommendation_update")
         if _as_int(holding_recommendation_update.get("updated"), default=0) > 0:
-            self._persist_runtime_state_to_disk()
+            runtime_state_persist_reasons.append("holding_recommendation_update")
         if portfolio_changed:
-            self._persist_runtime_state_to_disk()
+            runtime_state_persist_reasons.append("portfolio_changed")
+
+        runtime_state_persist_ms = 0
+        runtime_state_persist_bytes = 0
+        if runtime_state_persist_reasons:
+            persist_started = perf_counter()
+            self._persist_runtime_state_to_disk(include_history_sidecars=False)
+            runtime_state_persist_ms = int((perf_counter() - persist_started) * 1000)
+            try:
+                runtime_state_persist_bytes = self._runtime_state_path.stat().st_size
+            except OSError:
+                runtime_state_persist_bytes = 0
+        post_pipeline_ms = int((perf_counter() - post_pipeline_started) * 1000)
 
         payload: dict[str, object] = {
             "trace_id": trace_id,
@@ -3535,7 +3554,19 @@ class StockAnalyzerService:
         payload["week6_execution"] = week6_payload
         payload["strategy_kill_switch"] = kill_switch_summary
         duration_ms = int((perf_counter() - started) * 1000)
-        payload["runtime"] = {"duration_ms": duration_ms}
+        payload["runtime"] = {
+            "duration_ms": duration_ms,
+            "pipeline_ms": pipeline_ms,
+            "post_pipeline_ms": post_pipeline_ms,
+            "recommendation_sync_ms": recommendation_sync_ms,
+            "runtime_state_persist_ms": runtime_state_persist_ms,
+            "runtime_state_persist_count": 1 if runtime_state_persist_reasons else 0,
+            "runtime_state_persist_reasons": runtime_state_persist_reasons,
+            "runtime_state_persist_bytes": runtime_state_persist_bytes,
+            "runtime_state_persist_enabled": bool(
+                self._config.command_channel.state_persist_enabled
+            ),
+        }
         self._record_run_summary(
             report=payload,
             current_equity=equity,
@@ -3546,6 +3577,22 @@ class StockAnalyzerService:
             symbol_count=len(symbol_list),
             use_live_runtime=use_live_runtime,
         )
+        notify_started = perf_counter()
+        self._notify_expired_position_exits_if_needed(
+            timestamp=timestamp,
+            closed_expired=_as_int(portfolio_update.get("closed_expired"), default=0),
+            trace_id=trace_id,
+        )
+        self._notify_risk_status_if_needed(risk_payload, trace_id=trace_id)
+        self._notify_holding_alerts_if_needed(holding_alerts=holding_alerts, trace_id=trace_id)
+        self._notify_provider_health_if_needed(trace_id=trace_id)
+        self._notify_simulated_trade_updates_if_needed(
+            portfolio_update=portfolio_update,
+            trace_id=trace_id,
+        )
+        runtime_payload = payload.get("runtime")
+        if isinstance(runtime_payload, dict):
+            runtime_payload["notify_ms"] = int((perf_counter() - notify_started) * 1000)
         self._record_audit_event(
             event_type="pipeline_run",
             trace_id=str(payload.get("trace_id", "")),
@@ -3559,22 +3606,11 @@ class StockAnalyzerService:
                 "actionable": len(actionable_signals),
                 "notification_filter_diagnostics": notification_filter_diagnostics or {},
                 "duration_ms": duration_ms,
+                "runtime": payload["runtime"],
                 "execution_mode": execution_mode,
                 "week6_execution": payload["week6_execution"],
                 "strategy_kill_switch": payload["strategy_kill_switch"],
             },
-        )
-        self._notify_expired_position_exits_if_needed(
-            timestamp=timestamp,
-            closed_expired=_as_int(portfolio_update.get("closed_expired"), default=0),
-            trace_id=trace_id,
-        )
-        self._notify_risk_status_if_needed(risk_payload, trace_id=trace_id)
-        self._notify_holding_alerts_if_needed(holding_alerts=holding_alerts, trace_id=trace_id)
-        self._notify_provider_health_if_needed(trace_id=trace_id)
-        self._notify_simulated_trade_updates_if_needed(
-            portfolio_update=portfolio_update,
-            trace_id=trace_id,
         )
         return payload
 
@@ -4149,9 +4185,11 @@ class StockAnalyzerService:
             history,
         )
 
-    def _persist_runtime_state_to_disk(self) -> None:
+    def _persist_runtime_state_to_disk(self, *, include_history_sidecars: bool = True) -> None:
         with self._runtime_state_io_lock:
-            self._runtime_state_service._persist_runtime_state_to_disk()
+            self._runtime_state_service._persist_runtime_state_to_disk(
+                include_history_sidecars=include_history_sidecars,
+            )
 
     def _load_runtime_state_from_disk(self) -> None:
         with self._runtime_state_io_lock:

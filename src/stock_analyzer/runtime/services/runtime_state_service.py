@@ -6,6 +6,7 @@ import json
 from collections.abc import Mapping
 from copy import deepcopy
 from datetime import datetime
+from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
 
@@ -25,9 +26,7 @@ class RuntimeStateService:
                 key=lambda row: row[0],
             )
         }
-        reconcile_limit = max(1, service._config.reconcile.history_limit)
         acceptance_limit = max(1, service._config.acceptance.history_limit)
-        week5_limit = max(1, service._config.week5.history_limit)
         market_radar_review_pool_limit = max(
             1,
             service._config.week5.market_radar_review_pool_max_symbols,
@@ -36,7 +35,7 @@ class RuntimeStateService:
         market_warehouse_limit = max(1, service._config.market_warehouse.history_limit)
         evolution_limit = max(1, service._config.evolution.history_limit)
         return {
-            "state_version": 6,
+            "state_version": 7,
             "updated_at": datetime.now().isoformat(),
             "scheduler_state": service._scheduler.export_state(),
             "current_equity": service._state.current_equity,
@@ -51,17 +50,8 @@ class RuntimeStateService:
             "last_reconcile_report": service._runtime_state_optional_dict(
                 service._last_reconcile_report
             ),
-            "reconcile_history": service._runtime_state_dict_list(
-                service._reconcile_history,
-                limit=reconcile_limit,
-            ),
-            "run_summaries": service._runtime_state_dict_list(service._run_summaries, limit=2000),
-            "latency_history_ms": service._runtime_state_dict_list(
-                service._latency_history_ms,
-                limit=5000,
-            ),
             "audit_seq": service._audit_seq,
-            "audit_events": service._runtime_state_dict_list(service._audit_events, limit=5000),
+            "runtime_history_sidecars": self._runtime_state_history_sidecar_metadata(),
             "week4_acceptance_latest": service._runtime_state_optional_dict(
                 service._last_week4_acceptance_report
             ),
@@ -71,10 +61,6 @@ class RuntimeStateService:
             ),
             "week5_scan_latest": service._runtime_state_optional_dict(
                 service._last_week5_scan_report
-            ),
-            "week5_scan_history": service._runtime_state_dict_list(
-                service._week5_scan_history,
-                limit=week5_limit,
             ),
             "week5_market_radar_latest": service._runtime_state_optional_dict(
                 service._last_week5_market_radar_report
@@ -226,7 +212,127 @@ class RuntimeStateService:
             "has_ping_history": armed,
         }
 
-    def _persist_runtime_state_to_disk(self) -> None:
+    def _runtime_state_history_sidecar_metadata(self) -> dict[str, object]:
+        service = self._service
+        return {
+            "format": "jsonl",
+            "base_dir": str(self._runtime_state_sidecar_dir()),
+            "records": {
+                name: {
+                    "path": str(path),
+                    "limit": limit,
+                    "records": len(records),
+                }
+                for name, records, limit, path, _identity_keys in self._runtime_state_sidecar_specs()
+            },
+        }
+
+    def _runtime_state_sidecar_dir(self) -> Path:
+        service = self._service
+        return service._runtime_state_path.with_name("runtime_state_history")
+
+    def _runtime_state_sidecar_specs(
+        self,
+    ) -> list[tuple[str, list[dict[str, object]], int, Path, tuple[str, ...]]]:
+        service = self._service
+        base_dir = self._runtime_state_sidecar_dir()
+        return [
+            (
+                "reconcile_history",
+                service._reconcile_history,
+                max(1, service._config.reconcile.history_limit),
+                base_dir / "reconcile_history.jsonl",
+                ("timestamp", "status", "trace_id"),
+            ),
+            (
+                "run_summaries",
+                service._run_summaries,
+                2000,
+                base_dir / "run_summaries.jsonl",
+                ("timestamp", "trace_id"),
+            ),
+            (
+                "latency_history_ms",
+                service._latency_history_ms,
+                5000,
+                base_dir / "latency_history_ms.jsonl",
+                ("timestamp", "duration_ms"),
+            ),
+            (
+                "audit_events",
+                service._audit_events,
+                5000,
+                base_dir / "audit_events.jsonl",
+                ("event_id", "timestamp", "trace_id", "event_type"),
+            ),
+            (
+                "week5_scan_history",
+                service._week5_scan_history,
+                max(1, service._config.week5.history_limit),
+                base_dir / "week5_scan_history.jsonl",
+                ("timestamp", "trace_id"),
+            ),
+        ]
+
+    def _persist_runtime_state_history_sidecars(self, existing_raw: object) -> None:
+        service = self._service
+        existing = existing_raw if isinstance(existing_raw, dict) else {}
+        base_dir = self._runtime_state_sidecar_dir()
+        base_dir.mkdir(parents=True, exist_ok=True)
+        for name, records, limit, path, identity_keys in self._runtime_state_sidecar_specs():
+            existing_rows = service._merge_runtime_state_history(
+                self._load_runtime_state_history_sidecar(name, limit=limit * 2),
+                existing.get(name),
+                limit=max(1, limit) * 2,
+                identity_keys=identity_keys,
+            )
+            rows = service._merge_runtime_state_history(
+                existing_rows,
+                records,
+                limit=max(1, limit),
+                identity_keys=identity_keys,
+            )
+            temp_path = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
+            with temp_path.open("w", encoding="utf-8") as fp:
+                for row in rows:
+                    fp.write(
+                        json.dumps(
+                            row,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                            default=str,
+                        )
+                    )
+                    fp.write("\n")
+            temp_path.replace(path)
+
+    def _load_runtime_state_history_sidecar(
+        self,
+        name: str,
+        *,
+        limit: int,
+    ) -> list[dict[str, object]]:
+        path = self._runtime_state_sidecar_dir() / f"{name}.jsonl"
+        rows: list[dict[str, object]] = []
+        try:
+            with path.open("r", encoding="utf-8") as fp:
+                for line in fp:
+                    raw = line.strip()
+                    if not raw:
+                        continue
+                    try:
+                        item = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(item, dict):
+                        rows.append(cast(dict[str, object], item))
+        except OSError:
+            return []
+        if len(rows) > limit:
+            rows = rows[-limit:]
+        return rows
+
+    def _persist_runtime_state_to_disk(self, *, include_history_sidecars: bool = True) -> None:
         service = self._service
         if not bool(service._config.command_channel.state_persist_enabled):
             return
@@ -240,11 +346,11 @@ class RuntimeStateService:
                 existing_raw = {}
         payload = service._merge_runtime_state_payload(existing_raw, payload)
         path.parent.mkdir(parents=True, exist_ok=True)
+        if include_history_sidecars:
+            self._persist_runtime_state_history_sidecars(existing_raw)
         temp_path = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
-        temp_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, default=str),
-            encoding="utf-8",
-        )
+        with temp_path.open("w", encoding="utf-8") as fp:
+            json.dump(payload, fp, ensure_ascii=False, separators=(",", ":"), default=str)
         temp_path.replace(path)
         try:
             service._runtime_state_loaded_mtime_ns = path.stat().st_mtime_ns
@@ -298,25 +404,36 @@ class RuntimeStateService:
         if isinstance(raw_watchlist, list):
             service._state.watchlist = service._merge_runtime_state_watchlist([], raw_watchlist)
         service._load_recommendation_lifecycle_from_raw(raw.get("recommendation_lifecycle"))
-        service._reconcile_history = service._runtime_state_dict_list(
+        service._reconcile_history = service._merge_runtime_state_history(
+            self._load_runtime_state_history_sidecar(
+                "reconcile_history",
+                limit=max(1, service._config.reconcile.history_limit),
+            ),
             raw.get("reconcile_history"),
             limit=max(1, service._config.reconcile.history_limit),
+            identity_keys=("timestamp", "status", "trace_id"),
         )
         service._last_reconcile_report = service._runtime_state_latest_from_raw(
             raw.get("last_reconcile_report"),
             service._reconcile_history,
         )
-        service._run_summaries = service._runtime_state_dict_list(
+        service._run_summaries = service._merge_runtime_state_history(
+            self._load_runtime_state_history_sidecar("run_summaries", limit=2000),
             raw.get("run_summaries"),
             limit=2000,
+            identity_keys=("timestamp", "trace_id"),
         )
-        service._latency_history_ms = service._runtime_state_dict_list(
+        service._latency_history_ms = service._merge_runtime_state_history(
+            self._load_runtime_state_history_sidecar("latency_history_ms", limit=5000),
             raw.get("latency_history_ms"),
             limit=5000,
+            identity_keys=("timestamp", "duration_ms"),
         )
-        service._audit_events = service._runtime_state_dict_list(
+        service._audit_events = service._merge_runtime_state_history(
+            self._load_runtime_state_history_sidecar("audit_events", limit=5000),
             raw.get("audit_events"),
             limit=5000,
+            identity_keys=("event_id", "timestamp", "trace_id", "event_type"),
         )
         service._audit_seq = max(
             _as_int(raw.get("audit_seq"), default=0),
@@ -330,9 +447,14 @@ class RuntimeStateService:
             raw.get("week4_acceptance_latest"),
             service._week4_acceptance_history,
         )
-        service._week5_scan_history = service._runtime_state_dict_list(
+        service._week5_scan_history = service._merge_runtime_state_history(
+            self._load_runtime_state_history_sidecar(
+                "week5_scan_history",
+                limit=max(1, service._config.week5.history_limit),
+            ),
             raw.get("week5_scan_history"),
             limit=max(1, service._config.week5.history_limit),
+            identity_keys=("timestamp", "trace_id"),
         )
         service._last_week5_scan_report = service._runtime_state_latest_from_raw(
             raw.get("week5_scan_latest"),
@@ -527,43 +649,18 @@ class RuntimeStateService:
             existing.get("recommendation_lifecycle"),
             current_raw.get("recommendation_lifecycle"),
         )
-        reconcile_history = service._merge_runtime_state_history(
-            existing.get("reconcile_history"),
-            current_raw.get("reconcile_history"),
-            limit=max(1, service._config.reconcile.history_limit),
-            identity_keys=("timestamp", "status", "trace_id"),
-        )
-        merged["reconcile_history"] = reconcile_history
         merged["last_reconcile_report"] = service._runtime_state_latest_from_raw(
             None
-            if reconcile_history
+            if service._reconcile_history
             else service._merge_runtime_state_latest(
                 existing.get("last_reconcile_report"),
                 current_raw.get("last_reconcile_report"),
             ),
-            reconcile_history,
-        )
-        merged["run_summaries"] = service._merge_runtime_state_history(
-            existing.get("run_summaries"),
-            current_raw.get("run_summaries"),
-            limit=2000,
-            identity_keys=("timestamp", "trace_id"),
-        )
-        merged["latency_history_ms"] = service._merge_runtime_state_history(
-            existing.get("latency_history_ms"),
-            current_raw.get("latency_history_ms"),
-            limit=5000,
-            identity_keys=("timestamp", "duration_ms"),
+            service._reconcile_history,
         )
         merged["audit_seq"] = max(
             _as_int(existing.get("audit_seq"), default=0),
             _as_int(current_raw.get("audit_seq"), default=0),
-        )
-        merged["audit_events"] = service._merge_runtime_state_history(
-            existing.get("audit_events"),
-            current_raw.get("audit_events"),
-            limit=5000,
-            identity_keys=("event_id", "timestamp", "trace_id", "event_type"),
         )
         week4_history = service._merge_runtime_state_history(
             existing.get("week4_acceptance_history"),
@@ -581,21 +678,14 @@ class RuntimeStateService:
             ),
             week4_history,
         )
-        week5_history = service._merge_runtime_state_history(
-            existing.get("week5_scan_history"),
-            current_raw.get("week5_scan_history"),
-            limit=max(1, service._config.week5.history_limit),
-            identity_keys=("timestamp", "trace_id"),
-        )
-        merged["week5_scan_history"] = week5_history
         merged["week5_scan_latest"] = service._runtime_state_latest_from_raw(
             None
-            if week5_history
+            if service._week5_scan_history
             else service._merge_runtime_state_latest(
                 existing.get("week5_scan_latest"),
                 current_raw.get("week5_scan_latest"),
             ),
-            week5_history,
+            service._week5_scan_history,
         )
         merged["week5_market_radar_latest"] = service._merge_runtime_state_latest(
             existing.get("week5_market_radar_latest"),

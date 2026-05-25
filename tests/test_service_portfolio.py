@@ -101,6 +101,12 @@ def _as_float(value: object) -> float:
     raise AssertionError(f"Expected numeric value, got {value!r}")
 
 
+def _as_int(value: object) -> int:
+    if isinstance(value, (int, float)):
+        return int(value)
+    raise AssertionError(f"Expected numeric value, got {value!r}")
+
+
 def _as_path(value: object) -> Path:
     if isinstance(value, Path):
         return value
@@ -124,6 +130,81 @@ def test_service_pipeline_returns_portfolio_and_actionable_fields() -> None:
     assert "actionable_signals" in payload
     assert payload["execution_mode"] == "portfolio_auto_apply"
     assert len(service.portfolio_positions()) <= 1
+
+
+def test_service_pipeline_exposes_runtime_stage_metrics() -> None:
+    service = StockAnalyzerService(config=_load_test_config())
+    payload = service.run_pipeline(
+        symbols=["600000"],
+        strategy="trend",
+        current_equity=1.0,
+    )
+    runtime = _as_mapping(payload["runtime"])
+
+    assert _as_int(runtime["duration_ms"]) >= 0
+    assert _as_int(runtime["pipeline_ms"]) >= 0
+    assert _as_int(runtime["post_pipeline_ms"]) >= 0
+    assert _as_int(runtime["recommendation_sync_ms"]) >= 0
+    assert _as_int(runtime["runtime_state_persist_ms"]) >= 0
+    assert _as_int(runtime["runtime_state_persist_count"]) in {0, 1}
+    assert isinstance(runtime["runtime_state_persist_reasons"], list)
+    assert _as_int(runtime["runtime_state_persist_bytes"]) >= 0
+    assert runtime["runtime_state_persist_enabled"] is False
+
+    events = _as_mapping_list(service.audit_events(limit=5)["events"])
+    pipeline_events = [
+        item for item in events if str(item.get("event_type", "")) == "pipeline_run"
+    ]
+    assert pipeline_events
+    audit_payload = _as_mapping(pipeline_events[-1]["payload"])
+    audit_runtime = _as_mapping(audit_payload["runtime"])
+    assert "pipeline_ms" in audit_runtime
+    assert "runtime_state_persist_ms" in audit_runtime
+
+
+def test_service_pipeline_coalesces_runtime_state_persist_reasons() -> None:
+    service = StockAnalyzerService(config=_load_test_config())
+    persist_calls: list[dict[str, object]] = []
+
+    def _fake_persist(*, include_history_sidecars: bool = True) -> None:
+        persist_calls.append({"include_history_sidecars": include_history_sidecars})
+
+    _patch_attr(service, "_persist_runtime_state_to_disk", _fake_persist)
+    _patch_attr(
+        service,
+        "_record_audit_event",
+        lambda *args, **kwargs: None,
+    )
+    _patch_attr(
+        service,
+        "_sync_recommendation_lifecycle_from_signals",
+        lambda **kwargs: {"updated": 1, "symbols": ["600000"]},
+    )
+    _patch_attr(
+        service,
+        "_sync_recommendation_lifecycle_from_holding_alerts",
+        lambda **kwargs: {"updated": 1, "symbols": ["600000"]},
+    )
+    _patch_attr(
+        service,
+        "_sync_recommendation_lifecycle_from_auto_execution",
+        lambda **kwargs: {"updated": 1, "symbols": ["600000"]},
+    )
+
+    payload = service.run_pipeline(
+        symbols=["600000"],
+        strategy="trend",
+        current_equity=1.0,
+    )
+    runtime = _as_mapping(payload["runtime"])
+
+    assert persist_calls == [{"include_history_sidecars": False}]
+    assert _as_int(runtime["runtime_state_persist_count"]) == 1
+    assert runtime["runtime_state_persist_reasons"] == [
+        "recommendation_update",
+        "execution_recommendation_update",
+        "holding_recommendation_update",
+    ]
 
 
 def test_service_live_auto_execution_opens_simulated_position() -> None:
