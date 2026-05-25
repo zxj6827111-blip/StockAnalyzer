@@ -232,6 +232,8 @@ class PortfolioBook:
         record = self._positions.get(symbol)
         if record is None:
             return False
+        if abs(float(record.target_position) - float(target_position)) <= 1e-9:
+            return False
         record.target_position = target_position
         record.updated_at = timestamp
         record.open_reason = reason

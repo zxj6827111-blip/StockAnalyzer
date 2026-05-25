@@ -111,6 +111,33 @@ def test_portfolio_book_manual_set_accepts_fill_payload() -> None:
     assert pos["note"] == "first buy"
 
 
+def test_portfolio_book_update_target_position_ignores_unchanged_target() -> None:
+    book = PortfolioBook(max_holdings=2, max_hold_days=5)
+    opened_at = datetime.fromisoformat("2026-03-01T10:00:00")
+    updated_at = datetime.fromisoformat("2026-03-01T10:10:00")
+    status = book.set_manual_position(
+        symbol="600000",
+        strategy="manual",
+        target_position=0.01,
+        timestamp=opened_at,
+        trace_id="cmd-open",
+    )
+
+    changed = book.update_target_position(
+        symbol="600000",
+        target_position=0.01,
+        timestamp=updated_at,
+        reason="auto_simulated_adjust",
+    )
+
+    assert status == "opened"
+    assert changed is False
+    position = book.positions()[0]
+    assert position["target_position"] == 0.01
+    assert position["updated_at"] == opened_at.isoformat()
+    assert position["open_reason"] == "manual_set_position"
+
+
 def test_portfolio_book_reduce_position_records_partial_sell() -> None:
     book = PortfolioBook(max_holdings=2, max_hold_days=5)
     now = datetime.fromisoformat("2026-03-01T10:00:00")

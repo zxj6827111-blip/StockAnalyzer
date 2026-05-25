@@ -173,6 +173,46 @@ def test_service_live_auto_execution_opens_simulated_position() -> None:
     assert service.state.current_equity > 0
 
 
+def test_service_live_auto_execution_skips_unchanged_adjustment() -> None:
+    config = _load_test_config()
+    config.soup_strategy.max_holdings = 5
+    service = StockAnalyzerService(config=config)
+    opened_at = datetime.fromisoformat("2026-03-11T09:35:00")
+    _ = service._portfolio.set_manual_position(
+        symbol="600956",
+        strategy="trend",
+        target_position=0.01,
+        timestamp=opened_at,
+        trace_id="seed-position",
+        reason="auto_simulated_buy",
+        manual_fill={"entry_price": 8.45, "quantity": 100},
+    )
+    signal = PipelineSignal(
+        symbol="600956",
+        strategy="trend",
+        score=45.48,
+        grade="C",
+        action="buy",
+        target_position=0.01,
+        probabilities={"lgbm": 1.0, "xgb": 0.2578, "meta": 0.4891},
+        reasons=["model_disagreement_probe"],
+    )
+
+    update = service._apply_live_auto_portfolio_signals(
+        trace_id="trace-same-target",
+        timestamp=datetime.fromisoformat("2026-03-11T09:40:00"),
+        signals=[signal],
+        use_live_runtime=False,
+    )
+
+    assert update["adjusted"] == 0
+    assert update["executions"] == []
+    position = service.portfolio_positions()[0]
+    assert position["target_position"] == 0.01
+    assert position["open_reason"] == "auto_simulated_buy"
+    assert len(service.portfolio_trades(limit=10)) == 1
+
+
 def test_service_live_auto_execution_closes_position_on_sell_signal() -> None:
     config = _load_test_config()
     service = StockAnalyzerService(config=config)

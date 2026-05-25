@@ -11940,9 +11940,12 @@ class StockAnalyzerService:
             if not symbol or not trade_id:
                 continue
             if side == "buy":
-                title = _push_title(priority="P1", category="signal", summary=f"sim buy {symbol}")
+                is_adjusted = status == "adjusted" or str(item.get("reason", "")).strip() == "auto_simulated_adjust"
+                title_summary = f"sim adjust {symbol}" if is_adjusted else f"sim buy {symbol}"
+                title = _push_title(priority="P1", category="signal", summary=title_summary)
+                trigger_action = "调整模拟仓位" if is_adjusted else "执行模拟买入"
                 content = _notification_message_zh(
-                    trigger=f"系统已对标的【{symbol}】执行模拟买入。",
+                    trigger=f"系统已对标的【{symbol}】{trigger_action}。",
                     impact=(
                         f"成交价 {price:.2f}，数量 {quantity} 股，成交金额 {amount:.2f} 元，"
                         f"目标仓位 {target_position:.0%}。"
