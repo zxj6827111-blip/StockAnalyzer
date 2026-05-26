@@ -178,11 +178,13 @@ class RuntimeStateService:
     ) -> dict[str, object] | None:
         service = self._service
         latest = service._runtime_state_optional_dict(raw_latest)
+        candidates: list[dict[str, object]] = []
         if latest is not None:
-            return cast(dict[str, object], latest)
-        if not history:
+            candidates.append(cast(dict[str, object], latest))
+        candidates.extend(history)
+        if not candidates:
             return None
-        return deepcopy(history[-1])
+        return deepcopy(max(candidates, key=_report_timestamp))
 
     def _runtime_state_cloud_backup_payload(self) -> dict[str, object]:
         service = self._service

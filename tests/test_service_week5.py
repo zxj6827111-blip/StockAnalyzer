@@ -1709,6 +1709,35 @@ def test_service_week5_auto_sync_reports_empty_keep_diagnostics() -> None:
     assert execution_reasons["execution_risk_artifact_unavailable"] == 2
 
 
+def test_service_week5_scan_store_persists_latest_report(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config()
+    config.command_channel.state_persist_enabled = True
+    config.command_channel.state_persist_path = str(tmp_path / "runtime_state.json")
+    service = _new_service(config)
+
+    report = {
+        "timestamp": "2026-05-27T02:33:58.553322",
+        "trace_id": "latest-persisted",
+        "watchlist_sync": {
+            "enabled": False,
+            "updated": False,
+            "reason": "disabled",
+            "symbols": [],
+        },
+    }
+    service._week5_service._state_service.store_week5_scan_report(report)
+
+    reloaded = _new_service(config)
+    latest = _as_mapping(reloaded.latest_week5_scan_report())
+    history = _as_mapping(reloaded.week5_scan_history(limit=5))
+
+    assert latest["trace_id"] == "latest-persisted"
+    assert latest["timestamp"] == "2026-05-27T02:33:58.553322"
+    assert _as_int(history["records"]) >= 1
+
+
 def test_signal_quality_audit_falls_back_to_week5_candidates_when_latest_signals_empty() -> None:
     config = _load_test_config()
     service = _new_service(config)
@@ -1918,6 +1947,78 @@ def test_service_week5_scan_scheduler_intraday_preserves_existing_watchlist() ->
     assert sync["updated"] is False
     assert sync["reason"] == "intraday_preserve_existing"
     assert service.state.watchlist == ["600000", "000001"]
+
+
+def test_service_week5_scan_disabled_sync_includes_readonly_diagnostics() -> None:
+    config = _load_test_config()
+    config.week5.auto_sync_watchlist = True
+    config.week5.auto_sync_watchlist_min_score = 65.0
+    service = _new_service(config)
+    service.state.watchlist = ["001258"]
+
+    def _fake_run_pipeline(**_: object) -> dict[str, object]:
+        return {
+            "trace_id": "disabled-sync-diagnostics",
+            "signals": [
+                {
+                    "symbol": "001258",
+                    "strategy": "week5",
+                    "score": 46.0,
+                    "grade": "C",
+                    "action": "buy",
+                    "reasons": [],
+                    "execution_rerank_reason": "execution_risk_artifact_unavailable",
+                    "decision_trace": {
+                        "risk_gate": {"passed": True},
+                        "cross_review_gate": {"passed": True},
+                        "financial_gate": {"allowed": True},
+                    },
+                }
+            ],
+            "risk": {
+                "action": "monitor",
+                "drawdown_pct": 0.0,
+            },
+        }
+
+    _patch_attr(service, "run_pipeline", _fake_run_pipeline)
+    _patch_attr(service, "_build_first_board_candidate", lambda **_: None)
+    _patch_attr(service, "_detect_symbol_anomaly", lambda **_: None)
+    _patch_attr(
+        service,
+        "_monster_isolation_gate",
+        lambda **_: {
+            "can_open_new_position": True,
+            "reasons": [],
+            "total_monster_position": 0.0,
+            "max_monster_position": 0.0,
+            "sentiment_score": 0.0,
+        },
+    )
+
+    report = _as_mapping(
+        service.run_week5_scan(
+            symbols=["001258"],
+            timestamp=datetime(2026, 5, 27, 2, 33),
+            notify_enabled=False,
+            sync_watchlist=False,
+            sync_reason="diagnostics_validation_no_sync",
+        )
+    )
+
+    sync = _as_mapping(report["watchlist_sync"])
+    diagnostics = _as_mapping(sync["diagnostics"])
+    reject_counts = _as_mapping(diagnostics["reject_counts"])
+    execution_reasons = _as_mapping(diagnostics["execution_rerank_reason_counts"])
+
+    assert sync["enabled"] is False
+    assert sync["updated"] is False
+    assert sync["reason"] == "disabled"
+    assert service.state.watchlist == ["001258"]
+    assert diagnostics["candidate_count"] == 1
+    assert diagnostics["eligible_candidate_count"] == 0
+    assert reject_counts["score_below_min"] == 1
+    assert execution_reasons["execution_risk_artifact_unavailable"] == 1
 
 
 def test_service_week5_scan_scheduler_intraday_reuses_previous_watchlist_snapshot() -> None:

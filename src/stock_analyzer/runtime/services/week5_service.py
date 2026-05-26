@@ -1538,6 +1538,16 @@ class RuntimeWeek5Service:
                 top_k_override=sync_top_k_override,
                 allow_signal_pool_fallback=True,
             )
+        else:
+            watchlist_sync["diagnostics"] = (
+                self._state_service.build_watchlist_sync_diagnostics(
+                    report=report,
+                    top_k_override=sync_top_k_override,
+                    selected=[],
+                    fallback_applied=False,
+                    allow_signal_pool_fallback=False,
+                )
+            )
         report["watchlist_sync"] = watchlist_sync
         summary = report.get("summary")
         if isinstance(summary, dict):

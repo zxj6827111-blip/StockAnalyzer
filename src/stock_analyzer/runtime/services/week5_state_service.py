@@ -24,6 +24,23 @@ class RuntimeWeek5StateService:
         latest = service._last_week5_scan_report
         return latest if isinstance(latest, dict) else None
 
+    def build_watchlist_sync_diagnostics(
+        self,
+        *,
+        report: dict[str, object],
+        top_k_override: int | None,
+        selected: list[str],
+        fallback_applied: bool,
+        allow_signal_pool_fallback: bool,
+    ) -> dict[str, object]:
+        return self._build_watchlist_sync_diagnostics(
+            report=report,
+            top_k_override=top_k_override,
+            selected=selected,
+            fallback_applied=fallback_applied,
+            allow_signal_pool_fallback=allow_signal_pool_fallback,
+        )
+
     def week5_scan_history(self, limit: int = 20) -> dict[str, object]:
         service = self._service
         service._refresh_runtime_state_from_disk_if_changed()
@@ -435,6 +452,7 @@ class RuntimeWeek5StateService:
             overflow = len(service._week5_scan_history) - history_limit
             if overflow > 0:
                 service._week5_scan_history = service._week5_scan_history[overflow:]
+        service._persist_runtime_state_to_disk()
 
 
 @lru_cache(maxsize=1)
