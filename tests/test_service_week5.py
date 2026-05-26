@@ -1646,6 +1646,120 @@ def test_service_week5_auto_sync_watchlist_falls_back_to_selected_symbols() -> N
     assert service.state.watchlist == ["600519", "000001", "300750"]
 
 
+def test_service_week5_auto_sync_reports_empty_keep_diagnostics() -> None:
+    config = _load_test_config()
+    config.week5.auto_sync_watchlist = True
+    config.week5.auto_sync_watchlist_top_k = 3
+    config.week5.auto_sync_watchlist_min_score = 65.0
+    service = _new_service(config)
+    service.state.watchlist = ["001258", "000159"]
+
+    sync = _as_mapping(
+        service._auto_sync_watchlist_from_week5_report(
+            {
+                "timestamp": "2026-05-26T20:43:59",
+                "signal_pool": {
+                    "candidates": [
+                        {
+                            "symbol": "001258",
+                            "action": "buy",
+                            "score": 46.76,
+                            "shortlist_score": 53.31,
+                            "execution_rerank_reason": "execution_risk_artifact_unavailable",
+                            "decision_trace": {
+                                "risk_gate": {"passed": True},
+                                "cross_review_gate": {"passed": True},
+                                "financial_gate": {"allowed": True},
+                            },
+                        },
+                        {
+                            "symbol": "000962",
+                            "action": "buy",
+                            "score": 45.34,
+                            "shortlist_score": 52.0,
+                            "execution_rerank_reason": "execution_risk_artifact_unavailable",
+                            "decision_trace": {
+                                "risk_gate": {"passed": True},
+                                "cross_review_gate": {"passed": True},
+                                "financial_gate": {"allowed": True},
+                            },
+                        },
+                    ],
+                    "ranking": {
+                        "score_key": "shortlist_score",
+                        "selected_symbols": ["001258", "000962"],
+                    },
+                },
+            },
+            reason="test_empty_keep_diagnostics",
+            allow_signal_pool_fallback=False,
+        )
+    )
+
+    diagnostics = _as_mapping(sync["diagnostics"])
+    reject_counts = _as_mapping(diagnostics["reject_counts"])
+    execution_reasons = _as_mapping(diagnostics["execution_rerank_reason_counts"])
+
+    assert sync["reason"] == "intraday_preserve_existing"
+    assert service.state.watchlist == ["001258", "000159"]
+    assert diagnostics["candidate_count"] == 2
+    assert diagnostics["eligible_candidate_count"] == 0
+    assert diagnostics["min_score"] == 65.0
+    assert reject_counts["score_below_min"] == 2
+    assert execution_reasons["execution_risk_artifact_unavailable"] == 2
+
+
+def test_signal_quality_audit_falls_back_to_week5_candidates_when_latest_signals_empty() -> None:
+    config = _load_test_config()
+    service = _new_service(config)
+    service.state.watchlist = ["001258"]
+    _patch_attr(
+        service,
+        "_last_week5_scan_report",
+        {
+            "empty_signal": {"triggered": False, "reasons": []},
+            "signal_pool": {
+                "candidate_count": 1,
+                "candidates": [
+                    {
+                        "symbol": "001258",
+                        "action": "buy",
+                        "score": 46.76,
+                        "grade": "C",
+                        "shortlist_score": 53.31,
+                        "execution_rerank_reason": "execution_risk_artifact_unavailable",
+                        "reasons": ["model_disagreement_probe"],
+                        "decision_trace": {
+                            "provider": {
+                                "soft_degraded_mode": True,
+                                "degrade_reason": "m2_extreme",
+                            },
+                            "cross_review_gate": {"passed": False},
+                            "financial_gate": {"allowed": True},
+                        },
+                        "probabilities": {"lgbm": 1.0, "xgb": 0.43, "meta": 0.49},
+                    }
+                ],
+            },
+            "watchlist_sync": {
+                "reason": "empty_candidates_keep_existing",
+                "updated": False,
+                "symbols": ["001258"],
+            },
+        },
+    )
+
+    report = _as_mapping(
+        service.run_signal_quality_audit(limit=5, include_audit_events=False)
+    )
+
+    assert report["status"] == "ok"
+    assert report["signal_source"] == "week5_latest_candidates"
+    assert report["source_signal_count"] == 1
+    assert report["summary"]["signal_count"] == 1
+    assert service.state.watchlist == ["001258"]
+
+
 def test_service_week5_auto_sync_skips_hard_blocked_candidates() -> None:
     config = _load_test_config()
     config.week5.auto_sync_watchlist = True

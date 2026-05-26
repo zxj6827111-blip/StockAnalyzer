@@ -110,3 +110,34 @@ def test_signal_quality_auditor_does_not_count_probe_as_cross_review_block() -> 
     assert report["status"] == "ok"
     assert "cross_review" not in report["gate_attribution"]["counts"]
     assert report["gate_attribution"]["counts"]["provider_degraded"] == 1
+
+
+def test_signal_quality_auditor_reports_execution_risk_artifact_gap() -> None:
+    auditor = SignalQualityAuditor(config=_load_config())
+
+    report = auditor.build_report(
+        latest_signals=[
+            {
+                "symbol": "001258",
+                "strategy": "week5",
+                "score": 46.76,
+                "grade": "C",
+                "action": "buy",
+                "execution_rerank_reason": "execution_risk_artifact_unavailable",
+                "execution_rerank_applied": False,
+                "reasons": ["model_disagreement_probe"],
+            }
+        ],
+    )
+
+    assert report["execution_risk_context"]["artifact_unavailable"] is True
+    assert (
+        report["execution_risk_context"]["reason_counts"][
+            "execution_risk_artifact_unavailable"
+        ]
+        == 1
+    )
+    assert any(
+        item["code"] == "train_execution_risk_artifact"
+        for item in report["recommended_next_actions"]
+    )

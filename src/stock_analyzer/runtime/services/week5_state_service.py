@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime
 from functools import lru_cache
 from importlib import import_module
@@ -193,6 +194,13 @@ class RuntimeWeek5StateService:
                 top_k_override=top_k_override,
             )
             fallback_applied = bool(selected)
+        diagnostics = self._build_watchlist_sync_diagnostics(
+            report=report,
+            top_k_override=top_k_override,
+            selected=selected,
+            fallback_applied=fallback_applied,
+            allow_signal_pool_fallback=allow_signal_pool_fallback,
+        )
         if not selected and not allow_signal_pool_fallback:
             return {
                 "enabled": True,
@@ -201,6 +209,7 @@ class RuntimeWeek5StateService:
                 "watchlist_before": len(previous),
                 "watchlist_after": len(previous),
                 "symbols": previous,
+                "diagnostics": diagnostics,
             }
         keep_if_empty = bool(service._config.week5.auto_sync_watchlist_keep_if_empty)
         if not selected and keep_if_empty:
@@ -239,6 +248,7 @@ class RuntimeWeek5StateService:
                     "symbols": previous,
                     "empty_keep_streak": empty_keep_streak,
                     "preserve_age_hours": preserve_age_hours,
+                    "diagnostics": diagnostics,
                 }
             expired = bool(previous)
             if expired:
@@ -253,6 +263,7 @@ class RuntimeWeek5StateService:
                 "symbols": list(service._state.watchlist),
                 "empty_keep_streak": empty_keep_streak,
                 "preserve_age_hours": preserve_age_hours,
+                "diagnostics": diagnostics,
             }
         update = service._replace_watchlist(
             symbols=selected if selected else previous,
@@ -272,6 +283,7 @@ class RuntimeWeek5StateService:
                 default=len(service._state.watchlist),
             ),
             "symbols": list(service._state.watchlist),
+            "diagnostics": diagnostics,
         }
         if bool(payload["updated"]):
             service._record_audit_event(
@@ -337,6 +349,83 @@ class RuntimeWeek5StateService:
         ]
         return _dedupe_preserve_order(fallback_symbols)[:top_k]
 
+    def _build_watchlist_sync_diagnostics(
+        self,
+        *,
+        report: dict[str, object],
+        top_k_override: int | None,
+        selected: list[str],
+        fallback_applied: bool,
+        allow_signal_pool_fallback: bool,
+    ) -> dict[str, object]:
+        service = self._service
+        min_score = _as_float(service._config.week5.auto_sync_watchlist_min_score, default=65.0)
+        if top_k_override is not None and top_k_override > 0:
+            top_k = max(1, _as_int(top_k_override, default=50))
+        else:
+            top_k = max(1, _as_int(service._config.week5.auto_sync_watchlist_top_k, default=50))
+        allowed_actions = sorted(
+            {
+                str(item).strip().lower()
+                for item in service._config.week5.auto_sync_watchlist_allowed_actions
+                if str(item).strip()
+            }
+            or {"buy", "watch"}
+        )
+        rows = _watchlist_candidate_rows(report)
+        reject_counts: Counter[str] = Counter()
+        action_counts: Counter[str] = Counter()
+        execution_reasons: Counter[str] = Counter()
+        scores: list[float] = []
+        eligible_symbols: list[str] = []
+
+        for item, score_key in rows:
+            symbol = _normalize_a_share_symbol(item.get("symbol"))
+            if not symbol:
+                reject_counts["invalid_symbol"] += 1
+                continue
+            action = str(item.get("action", "")).strip().lower() or "unknown"
+            action_counts[action] += 1
+            rerank_reason = str(item.get("execution_rerank_reason", "")).strip()
+            if rerank_reason:
+                execution_reasons[rerank_reason] += 1
+            blocked = False
+            if _candidate_has_hard_blockers(item):
+                reject_counts["hard_blocker"] += 1
+                blocked = True
+            if action not in allowed_actions:
+                reject_counts["action_not_allowed"] += 1
+                blocked = True
+            if bool(item.get("isolated", False)):
+                reject_counts["isolated"] += 1
+                blocked = True
+            score = _candidate_ranking_score(item=item, score_key=score_key)
+            scores.append(score)
+            if score < min_score:
+                reject_counts["score_below_min"] += 1
+                blocked = True
+            if not blocked:
+                eligible_symbols.append(symbol)
+
+        return {
+            "candidate_count": len(rows),
+            "eligible_candidate_count": len(_dedupe_preserve_order(eligible_symbols)),
+            "selected_count": len(selected),
+            "selected_symbols": selected[:top_k],
+            "top_k": top_k,
+            "min_score": round(min_score, 4),
+            "allowed_actions": allowed_actions,
+            "fallback_allowed": bool(allow_signal_pool_fallback),
+            "fallback_applied": bool(fallback_applied),
+            "reject_counts": dict(reject_counts),
+            "action_counts": dict(action_counts),
+            "score_range": {
+                "min": round(min(scores), 4) if scores else None,
+                "max": round(max(scores), 4) if scores else None,
+            },
+            "execution_rerank_reason_counts": dict(execution_reasons),
+        }
+
     def store_week5_scan_report(self, report: dict[str, object]) -> None:
         service = self._service
         service._last_week5_scan_report = report
@@ -401,6 +490,45 @@ def _candidate_has_hard_blockers(item: object) -> bool:
     if isinstance(financial_gate, dict) and "allowed" in financial_gate:
         return not bool(financial_gate.get("allowed", False))
     return False
+
+
+def _watchlist_candidate_rows(report: dict[str, object]) -> list[tuple[dict[str, object], str]]:
+    rows: list[tuple[dict[str, object], str]] = []
+    first_board = report.get("first_board")
+    if isinstance(first_board, dict):
+        for key in ("leaders", "candidates"):
+            raw_rows = first_board.get(key)
+            if not isinstance(raw_rows, list):
+                continue
+            for item in raw_rows:
+                if isinstance(item, dict):
+                    rows.append((item, "leader_score"))
+    signal_pool = report.get("signal_pool")
+    if isinstance(signal_pool, dict):
+        ranking = signal_pool.get("ranking")
+        score_key = (
+            str(ranking.get("score_key", "")).strip()
+            if isinstance(ranking, dict)
+            else ""
+        )
+        if not score_key:
+            score_key = "shortlist_score"
+        raw_rows = signal_pool.get("candidates")
+        if isinstance(raw_rows, list):
+            for item in raw_rows:
+                if isinstance(item, dict):
+                    rows.append((item, score_key))
+    return rows
+
+
+def _candidate_ranking_score(*, item: dict[str, object], score_key: str) -> float:
+    return _as_float(
+        item.get(score_key),
+        default=_as_float(
+            item.get("shortlist_score"),
+            default=_as_float(item.get("score"), default=0.0),
+        ),
+    )
 
 
 def _consecutive_empty_keep_streak(history: list[dict[str, object]]) -> int:

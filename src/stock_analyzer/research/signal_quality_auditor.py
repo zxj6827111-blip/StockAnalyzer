@@ -32,6 +32,7 @@ class SignalQualityAuditor:
         scores = [_float(item.get("score")) for item in signals]
         scores = [item for item in scores if item is not None]
         gate_attribution = self._gate_attribution(signals)
+        execution_risk = _execution_risk_context(signals)
         top_candidates = sorted(
             (self._candidate_summary(item) for item in signals),
             key=lambda item: float(item.get("score", 0.0)),
@@ -57,6 +58,7 @@ class SignalQualityAuditor:
                 "avg_score": round(sum(scores) / len(scores), 4) if scores else None,
             },
             "gate_attribution": gate_attribution,
+            "execution_risk_context": execution_risk,
             "top_candidates": top_candidates,
             "near_misses": near_misses,
             "notification_filter": notification_filter_diagnostics or {},
@@ -69,6 +71,7 @@ class SignalQualityAuditor:
                 notification_filter=notification_filter_diagnostics or {},
                 learning_governance=learning_governance or {},
                 provider_status=provider_status or {},
+                execution_risk=execution_risk,
             ),
         }
 
@@ -171,6 +174,7 @@ class SignalQualityAuditor:
         notification_filter: Mapping[str, object],
         learning_governance: Mapping[str, object],
         provider_status: Mapping[str, object],
+        execution_risk: Mapping[str, object],
     ) -> list[dict[str, object]]:
         counts = _mapping(gate_attribution.get("counts"))
         repair = _mapping(learning_governance.get("active_champion_repair"))
@@ -198,6 +202,15 @@ class SignalQualityAuditor:
                     "priority": "P1",
                     "code": "split_notification_threshold",
                     "reason": "通知层仍有分数拦截，需确认 buy/watch 分层阈值是否符合预期。",
+                }
+            )
+        if bool(execution_risk.get("artifact_unavailable", False)):
+            actions.append(
+                {
+                    "priority": "P1",
+                    "code": "train_execution_risk_artifact",
+                    "reason": "execution-risk artifact is unavailable; week5 falls back to shortlist order.",
+                    "endpoint": "POST /train/execution-risk/run",
                 }
             )
         if bool(provider_status.get("soft_degraded_mode", False)):
@@ -244,6 +257,30 @@ def _score_gap_to_buy(signal: Mapping[str, object], config: StockAnalyzerConfig)
     if score is None:
         return 0.0
     return round(max(0.0, float(config.score.thresholds.a) - score), 4)
+
+
+def _execution_risk_context(signals: list[dict[str, object]]) -> dict[str, object]:
+    reason_counts: Counter[str] = Counter()
+    applied = 0
+    for signal in signals:
+        if bool(signal.get("execution_rerank_applied", False)):
+            applied += 1
+        reason = str(signal.get("execution_rerank_reason", "")).strip()
+        if reason:
+            reason_counts[reason] += 1
+    artifact_unavailable = any(
+        reason in {
+            "execution_risk_artifact_unavailable",
+            "execution_risk_artifact_missing",
+        }
+        for reason in reason_counts
+    )
+    return {
+        "candidate_count": len(signals),
+        "rerank_applied_count": applied,
+        "reason_counts": dict(reason_counts),
+        "artifact_unavailable": artifact_unavailable,
+    }
 
 
 def _positive_gap(threshold: float | None, value: float | None) -> float:

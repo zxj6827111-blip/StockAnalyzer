@@ -1904,6 +1904,14 @@ class StockAnalyzerService:
         include_audit_events: bool = True,
     ) -> dict[str, object]:
         snapshot = self.latest_signals_snapshot()
+        latest_signals = [
+            dict(item) for item in snapshot.get("signals", []) if isinstance(item, dict)
+        ]
+        signal_source = "signals_latest"
+        if not latest_signals:
+            latest_signals = _extract_week5_candidate_signals(self._last_week5_scan_report)
+            if latest_signals:
+                signal_source = "week5_latest_candidates"
         audit_events: list[dict[str, object]] = []
         if include_audit_events:
             raw_audit = self.audit_events(limit=limit)
@@ -1919,9 +1927,7 @@ class StockAnalyzerService:
         except Exception as exc:  # pragma: no cover - defensive status surface
             learning_governance = {"status": "error", "error": str(exc)}
         report = self._signal_quality_auditor.build_report(
-            latest_signals=[
-                dict(item) for item in snapshot.get("signals", []) if isinstance(item, dict)
-            ],
+            latest_signals=latest_signals,
             audit_events=audit_events,
             notification_filter_diagnostics=self.latest_notification_filter_diagnostics(),
             provider_status=provider_status,
@@ -1929,6 +1935,8 @@ class StockAnalyzerService:
             learning_governance=learning_governance,
         )
         report["trace_id"] = str(snapshot.get("trace_id", "")).strip()
+        report["signal_source"] = signal_source
+        report["source_signal_count"] = len(latest_signals)
         self._last_signal_quality_audit = deepcopy(report)
         self._signal_quality_audit_history.append(deepcopy(report))
         if len(self._signal_quality_audit_history) > 200:
@@ -12646,11 +12654,13 @@ class StockAnalyzerService:
         report: dict[str, object],
         reason: str,
         top_k_override: int | None = None,
+        allow_signal_pool_fallback: bool = True,
     ) -> dict[str, object]:
         return self._week5_service._auto_sync_watchlist_from_week5_report(
             report=report,
             reason=reason,
             top_k_override=top_k_override,
+            allow_signal_pool_fallback=allow_signal_pool_fallback,
         )
 
     def _run_multi_strategy_pipeline(
@@ -18362,6 +18372,62 @@ def _coerce_mapping_list(value: object) -> list[dict[str, object]]:
     if not isinstance(value, list):
         return []
     return [_coerce_object_mapping(item) for item in value if isinstance(item, Mapping)]
+
+
+def _extract_week5_candidate_signals(report: object) -> list[dict[str, object]]:
+    payload = _coerce_object_mapping(report)
+    if not payload:
+        return []
+    rows: list[dict[str, object]] = []
+    first_board = _coerce_object_mapping(payload.get("first_board"))
+    for key in ("leaders", "candidates"):
+        rows.extend(_coerce_mapping_list(first_board.get(key)))
+    signal_pool = _coerce_object_mapping(payload.get("signal_pool"))
+    rows.extend(_coerce_mapping_list(signal_pool.get("candidates")))
+
+    signals: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for item in rows:
+        symbol = _normalize_a_share_symbol(item.get("symbol"))
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        score = _as_float(
+            item.get("score"),
+            default=_as_float(item.get("shortlist_score"), default=0.0),
+        )
+        signal = {
+            "symbol": symbol,
+            "strategy": str(item.get("strategy", "week5")).strip() or "week5",
+            "score": score,
+            "grade": str(item.get("grade", "")).strip() or _grade_by_score(score),
+            "action": str(item.get("action", "")).strip().lower() or "hold",
+            "reasons": _coerce_text_list(item.get("reasons")),
+            "probabilities": _coerce_object_mapping(item.get("probabilities")),
+            "decision_trace": _coerce_object_mapping(item.get("decision_trace")),
+            "source": "week5_latest_candidates",
+        }
+        for key in (
+            "shortlist_score",
+            "execution_reranked_score",
+            "execution_rerank_reason",
+            "execution_rerank_applied",
+            "execution_high_risk",
+        ):
+            if key in item:
+                signal[key] = item[key]
+        signals.append(signal)
+    return signals
+
+
+def _grade_by_score(score: float) -> str:
+    if score >= 78.0:
+        return "S"
+    if score >= 60.0:
+        return "A"
+    if score >= 50.0:
+        return "B"
+    return "C"
 
 
 def _coerce_text_list(value: object) -> list[str]:
