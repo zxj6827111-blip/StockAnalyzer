@@ -3511,7 +3511,10 @@ class StockAnalyzerService:
         notification_filter_diagnostics = self._notification_filter.latest_diagnostics()
         if notification_filter_diagnostics is not None:
             self._last_notification_filter_diagnostics = dict(notification_filter_diagnostics)
-        holding_alerts = self.holding_alerts(now=timestamp)
+        holding_alerts = self.holding_alerts(
+            now=timestamp,
+            persist_peak_state=not execution_dry_run,
+        )
         signal_payload = self._build_signal_payload_with_recommendation_ids(
             signals=signals,
             trace_id=trace_id,
@@ -11274,11 +11277,15 @@ class StockAnalyzerService:
             "candidates": candidate_items,
         }
 
-    def holding_alerts(self, now: datetime | None = None) -> dict[str, object]:
+    def holding_alerts(
+        self,
+        now: datetime | None = None,
+        persist_peak_state: bool = True,
+    ) -> dict[str, object]:
         current = now or datetime.now()
         items = self._build_c3_position_management_items(
             now=current,
-            persist_peak_state=True,
+            persist_peak_state=persist_peak_state,
         )
         if not items:
             return {"records": 0, "summary": {"warn": 0, "info": 0}, "items": []}

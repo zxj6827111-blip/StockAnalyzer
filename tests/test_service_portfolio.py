@@ -469,8 +469,25 @@ def test_service_live_auto_rejected_buy_updates_learning_outcome() -> None:
 def test_service_pipeline_dry_run_execution_does_not_mutate_portfolio_or_notify() -> None:
     config = _load_test_config()
     config.soup_strategy.max_holdings = 2
+    config.soup_strategy.trailing_stop = 5.0
     service = StockAnalyzerService(config=config)
     notify_calls: list[dict[str, object]] = []
+    timestamp = datetime.fromisoformat("2026-03-11T09:35:00")
+    service._portfolio.set_manual_position(
+        symbol="001258",
+        strategy="trend",
+        target_position=0.01,
+        timestamp=timestamp,
+        trace_id="seed-dry-run-position",
+        reason="seed_position",
+        manual_fill={"entry_price": 10.0, "quantity": 100},
+    )
+    service._portfolio.annotate_position_state(
+        symbol="001258",
+        timestamp=timestamp,
+        peak_price=10.21,
+        peak_pnl_pct=0.021,
+    )
 
     _patch_attr(
         service,
@@ -518,6 +535,11 @@ def test_service_pipeline_dry_run_execution_does_not_mutate_portfolio_or_notify(
                 "bid_levels": [{"level": 1, "price": 10.0, "volume": 4000}],
             }
         },
+    )
+    _patch_attr(
+        service,
+        "_resolve_latest_close_price",
+        lambda *, symbol, bars_cache: 10.26 if symbol == "001258" else 10.0,
     )
     before_positions = service.portfolio_positions()
     before_trades = service.portfolio_trades(limit=10)
