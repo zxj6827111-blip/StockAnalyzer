@@ -79,6 +79,46 @@ def test_runtime_history_archive_writes_file_and_purges_expired(tmp_path: Path) 
     assert "portfolio" in payload
 
 
+def test_runtime_history_archive_keeps_pipeline_portfolio_executions(tmp_path: Path) -> None:
+    config = _load_test_config(tmp_path)
+    service = StockAnalyzerService(config=config)
+    service._record_audit_event(  # noqa: SLF001
+        event_type="pipeline_run",
+        trace_id="trace-runtime-execution",
+        payload={
+            "portfolio_update": {
+                "opened": 0,
+                "skipped_max_holdings": 1,
+                "status": "simulated_auto_applied",
+                "executions": [
+                    {
+                        "trade_id": "SKIP-trace-000001-rejected_max_holdings",
+                        "symbol": "000001",
+                        "side": "buy",
+                        "status": "rejected_max_holdings",
+                        "quantity": 0,
+                        "price": 10.1,
+                    }
+                ],
+            }
+        },
+    )
+
+    report = service.archive_runtime_history(
+        now=datetime.fromisoformat("2026-03-05T15:30:00"),
+        force=True,
+    )
+    payload = json.loads(Path(str(report["path"])).read_text(encoding="utf-8"))
+    audit_events = payload["runtime"]["audit_events"]
+    pipeline_event = next(
+        item for item in audit_events if item["event_type"] == "pipeline_run"
+    )
+    portfolio_update = pipeline_event["payload"]["portfolio_update"]
+
+    assert portfolio_update["skipped_max_holdings"] == 1
+    assert portfolio_update["executions"][0]["status"] == "rejected_max_holdings"
+
+
 def test_runtime_history_archive_if_needed_dedups_same_day(tmp_path: Path) -> None:
     config = _load_test_config(tmp_path)
     service = StockAnalyzerService(config=config)

@@ -3660,6 +3660,7 @@ class StockAnalyzerService:
                 "duration_ms": duration_ms,
                 "runtime": payload["runtime"],
                 "execution_mode": execution_mode,
+                "portfolio_update": _audit_portfolio_update_summary(portfolio_update),
                 "week6_execution": payload["week6_execution"],
                 "strategy_kill_switch": payload["strategy_kill_switch"],
             },
@@ -17070,6 +17071,54 @@ def _signals_count(report: dict[str, object]) -> int:
     if isinstance(raw, list):
         return len(raw)
     return 0
+
+
+def _audit_portfolio_update_summary(portfolio_update: Mapping[str, object]) -> dict[str, object]:
+    scalar_fields = (
+        "opened",
+        "adjusted",
+        "trimmed",
+        "closed_expired",
+        "closed_signals",
+        "skipped_max_holdings",
+        "skipped_same_sector",
+        "skipped_no_cash",
+        "open_positions",
+        "status",
+    )
+    payload: dict[str, object] = {
+        field: portfolio_update[field] for field in scalar_fields if field in portfolio_update
+    }
+    raw_executions = portfolio_update.get("executions")
+    if isinstance(raw_executions, list):
+        payload["executions"] = [
+            _audit_portfolio_execution_summary(item)
+            for item in raw_executions
+            if isinstance(item, Mapping)
+        ]
+    return payload
+
+
+def _audit_portfolio_execution_summary(item: Mapping[str, object]) -> dict[str, object]:
+    fields = (
+        "trade_id",
+        "symbol",
+        "side",
+        "status",
+        "strategy",
+        "target_position",
+        "price",
+        "quantity",
+        "amount",
+        "fee",
+        "price_source",
+        "trade_time",
+        "reason",
+        "reference_price",
+        "recommendation_id",
+        "snapshot_id",
+    )
+    return {field: item[field] for field in fields if field in item}
 
 
 def _actionable_count(report: dict[str, object]) -> int:

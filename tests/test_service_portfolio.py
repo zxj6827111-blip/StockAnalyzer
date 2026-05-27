@@ -403,6 +403,102 @@ def test_service_live_auto_rejected_buy_updates_learning_outcome() -> None:
     assert outcome.realized_slippage_bp is None
 
 
+def test_service_pipeline_audit_keeps_portfolio_execution_summary() -> None:
+    config = _load_test_config()
+    service = StockAnalyzerService(config=config)
+    trace_id = "trace-audit-execution"
+    portfolio_update = {
+        "opened": 0,
+        "adjusted": 0,
+        "trimmed": 0,
+        "closed_expired": 0,
+        "closed_signals": 0,
+        "skipped_max_holdings": 1,
+        "skipped_same_sector": 0,
+        "skipped_no_cash": 0,
+        "open_positions": 1,
+        "status": "simulated_auto_applied",
+        "cash_available": 98765.43,
+        "executions": [
+            {
+                "trade_id": "SKIP-trace-000001-rejected_max_holdings",
+                "symbol": "000001",
+                "side": "buy",
+                "status": "rejected_max_holdings",
+                "strategy": "trend",
+                "target_position": 0.05,
+                "price": 10.1,
+                "quantity": 0,
+                "amount": 0.0,
+                "fee": 0.0,
+                "price_source": "ask1",
+                "trade_time": "2026-03-11T09:40:00",
+                "reason": "auto_simulated_buy_max_holdings",
+                "internal_debug_blob": {"large": True},
+            }
+        ],
+    }
+    _patch_attr(
+        service,
+        "_apply_live_auto_portfolio_signals",
+        lambda **kwargs: portfolio_update,
+    )
+    _patch_attr(service, "_live_auto_execution_enabled", lambda **kwargs: True)
+    _patch_attr(service, "_notify_simulated_trade_updates_if_needed", lambda **kwargs: None)
+    signal = PipelineSignal(
+        symbol="000001",
+        strategy="trend",
+        score=80.0,
+        grade="A",
+        action="buy",
+        target_position=0.05,
+        probabilities={"lgbm": 0.8, "xgb": 0.8, "meta": 0.8},
+        reasons=["audit_execution"],
+    )
+    report = type(
+        "Report",
+        (),
+        {
+            "trace_id": trace_id,
+            "timestamp": datetime.fromisoformat("2026-03-11T09:40:00"),
+            "degraded_mode": False,
+            "risk": type(
+                "Risk",
+                (),
+                {
+                    "action": "monitor",
+                    "drawdown_pct": 0.0,
+                    "degraded_mode": False,
+                    "can_open_new_position": True,
+                    "reason": "test",
+                    "hard_degraded_mode": False,
+                    "soft_degraded_mode": False,
+                },
+            )(),
+            "signals": [signal],
+        },
+    )()
+    _patch_attr(service._pipeline, "run_once", lambda **kwargs: report)
+
+    payload = service.run_pipeline(
+        symbols=["000001"],
+        strategy="trend",
+        current_equity=1.0,
+        use_live_runtime=True,
+    )
+    events = _as_mapping_list(service.audit_events(limit=20, event_type="pipeline_run")["events"])
+    audit_payload = _as_mapping(events[-1]["payload"])
+    audit_portfolio_update = _as_mapping(audit_payload["portfolio_update"])
+    audit_executions = _as_mapping_list(audit_portfolio_update["executions"])
+
+    assert payload["portfolio_update"] == portfolio_update
+    assert audit_portfolio_update["skipped_max_holdings"] == 1
+    assert audit_portfolio_update["status"] == "simulated_auto_applied"
+    assert audit_executions[0]["status"] == "rejected_max_holdings"
+    assert audit_executions[0]["quantity"] == 0
+    assert "internal_debug_blob" not in audit_executions[0]
+
+
 def test_service_live_auto_execution_closes_position_on_sell_signal() -> None:
     config = _load_test_config()
     service = StockAnalyzerService(config=config)
