@@ -11489,6 +11489,28 @@ class StockAnalyzerService:
         skipped_no_cash = 0
         available_cash = self._simulation_cash_available()
         initial_cash = self._simulation_initial_cash()
+        execution_attempts: dict[str, int] = {
+            "signals": len(signals),
+            "empty_symbol": 0,
+            "exit_plan_items": 0,
+            "exit_plan_executed": 0,
+            "managed_exit_symbols": 0,
+            "sell_signals": 0,
+            "sell_no_position": 0,
+            "sell_close_failed": 0,
+            "sell_executed": 0,
+            "buy_signals": 0,
+            "buy_zero_target": 0,
+            "buy_managed_exit_skipped": 0,
+            "buy_existing_position": 0,
+            "buy_existing_adjusted": 0,
+            "buy_existing_unchanged": 0,
+            "buy_new_candidates": 0,
+            "buy_new_attempted": 0,
+            "buy_new_rejected": 0,
+            "buy_new_filled": 0,
+            "non_buy_signals": 0,
+        }
 
         relevant_symbols = _dedupe_preserve_order(
             [
@@ -11532,6 +11554,7 @@ class StockAnalyzerService:
             price: float = 0.0,
             price_source: str = "",
         ) -> None:
+            execution_attempts["buy_new_rejected"] += 1
             executions.append(
                 {
                     "trade_id": f"SKIP-{trace_id[:8]}-{symbol}-{status}",
@@ -11559,11 +11582,13 @@ class StockAnalyzerService:
             for item in exit_plan_items
             if str(item.get("exit_action", "")).strip() in {"trim", "exit_full"}
         ]
+        execution_attempts["exit_plan_items"] = len(actionable_exit_items)
         managed_exit_symbols = {
             _normalize_a_share_symbol(str(item.get("symbol", "")))
             for item in actionable_exit_items
             if _normalize_a_share_symbol(str(item.get("symbol", "")))
         }
+        execution_attempts["managed_exit_symbols"] = len(managed_exit_symbols)
         for item in actionable_exit_items:
             symbol = _normalize_a_share_symbol(str(item.get("symbol", "")))
             if not symbol:
@@ -11678,19 +11703,23 @@ class StockAnalyzerService:
                     "reason": reason,
                 }
             )
+            execution_attempts["exit_plan_executed"] += 1
 
         for signal in signals:
             symbol = _normalize_a_share_symbol(signal.symbol)
             if not symbol:
+                execution_attempts["empty_symbol"] += 1
                 continue
             action = str(signal.action).strip().lower()
             if action == "sell":
+                execution_attempts["sell_signals"] += 1
                 open_positions = {
                     str(item.get("symbol", "")).strip(): item
                     for item in self._portfolio.positions()
                 }
                 existing = open_positions.get(symbol)
                 if not isinstance(existing, dict):
+                    execution_attempts["sell_no_position"] += 1
                     continue
                 market_payload = _market_payload_for(symbol)
                 trade_price, price_source = self._select_simulated_trade_price(
@@ -11722,8 +11751,10 @@ class StockAnalyzerService:
                     manual_fill=auto_close_fill,
                 )
                 if not closed:
+                    execution_attempts["sell_close_failed"] += 1
                     continue
                 closed_signals += 1
+                execution_attempts["sell_executed"] += 1
                 trade = self._portfolio.trades(limit=1)[0]
                 executions.append(
                     {
@@ -11746,9 +11777,17 @@ class StockAnalyzerService:
                 )
                 continue
 
-            if action == "buy" and symbol in managed_exit_symbols:
+            if action == "buy":
+                execution_attempts["buy_signals"] += 1
+            else:
+                execution_attempts["non_buy_signals"] += 1
                 continue
-            if action != "buy" or signal.target_position <= 0:
+
+            if action == "buy" and symbol in managed_exit_symbols:
+                execution_attempts["buy_managed_exit_skipped"] += 1
+                continue
+            if signal.target_position <= 0:
+                execution_attempts["buy_zero_target"] += 1
                 continue
 
             open_positions = {
@@ -11756,6 +11795,7 @@ class StockAnalyzerService:
             }
             existing = open_positions.get(symbol)
             if isinstance(existing, dict):
+                execution_attempts["buy_existing_position"] += 1
                 changed = self._portfolio.update_target_position(
                     symbol=symbol,
                     target_position=max(0.0, float(signal.target_position)),
@@ -11764,6 +11804,7 @@ class StockAnalyzerService:
                 )
                 if changed:
                     adjusted += 1
+                    execution_attempts["buy_existing_adjusted"] += 1
                     executions.append(
                         {
                             "trade_id": f"ADJ-{trace_id[:8]}-{symbol}",
@@ -11785,8 +11826,12 @@ class StockAnalyzerService:
                             "reason": "auto_simulated_adjust",
                         }
                     )
+                else:
+                    execution_attempts["buy_existing_unchanged"] += 1
                 continue
 
+            execution_attempts["buy_new_candidates"] += 1
+            execution_attempts["buy_new_attempted"] += 1
             desired_cash = min(
                 initial_cash * max(0.0, float(signal.target_position)),
                 available_cash,
@@ -11894,6 +11939,7 @@ class StockAnalyzerService:
             available_cash = round(available_cash - (notional + fee), 2)
             opened += 1 if status == "opened" else 0
             adjusted += 1 if status == "adjusted" else 0
+            execution_attempts["buy_new_filled"] += 1
             self._ensure_symbol_tracked_in_watchlist(
                 symbol=symbol,
                 source="auto_simulated_buy",
@@ -11935,6 +11981,7 @@ class StockAnalyzerService:
             "open_positions": len(self._portfolio.positions()),
             "status": "simulated_auto_applied",
             "executions": executions,
+            "execution_attempts": execution_attempts,
             "cash_available": round(
                 _as_float(equity_snapshot.get("cash_available"), default=available_cash), 2
             ),
@@ -17096,6 +17143,11 @@ def _audit_portfolio_update_summary(portfolio_update: Mapping[str, object]) -> d
             for item in raw_executions
             if isinstance(item, Mapping)
         ]
+    raw_attempts = portfolio_update.get("execution_attempts")
+    if isinstance(raw_attempts, Mapping):
+        payload["execution_attempts"] = {
+            str(key): _as_int(value, default=0) for key, value in raw_attempts.items()
+        }
     return payload
 
 

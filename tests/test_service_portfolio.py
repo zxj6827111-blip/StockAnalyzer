@@ -294,10 +294,73 @@ def test_service_live_auto_execution_skips_unchanged_adjustment() -> None:
 
     assert update["adjusted"] == 0
     assert update["executions"] == []
+    attempts = _as_mapping(update["execution_attempts"])
+    assert attempts["signals"] == 1
+    assert attempts["buy_signals"] == 1
+    assert attempts["buy_existing_position"] == 1
+    assert attempts["buy_existing_unchanged"] == 1
+    assert attempts["buy_new_attempted"] == 0
     position = service.portfolio_positions()[0]
     assert position["target_position"] == 0.01
     assert position["open_reason"] == "auto_simulated_buy"
     assert len(service.portfolio_trades(limit=10)) == 1
+
+
+def test_service_live_auto_execution_reports_attempts_when_no_execution() -> None:
+    config = _load_test_config()
+    service = StockAnalyzerService(config=config)
+    _patch_attr(service, "_build_c3_position_management_items", lambda **kwargs: [])
+    _patch_attr(service, "_fetch_market_depth_snapshots", lambda **kwargs: {})
+
+    signals = [
+        PipelineSignal(
+            symbol="600000",
+            strategy="trend",
+            score=42.0,
+            grade="C",
+            action="watch",
+            target_position=0.0,
+            probabilities={"lgbm": 0.3, "xgb": 0.3, "meta": 0.3},
+            reasons=["watch_only"],
+        ),
+        PipelineSignal(
+            symbol="000001",
+            strategy="trend",
+            score=50.0,
+            grade="B",
+            action="buy",
+            target_position=0.0,
+            probabilities={"lgbm": 0.6, "xgb": 0.6, "meta": 0.6},
+            reasons=["zero_target"],
+        ),
+        PipelineSignal(
+            symbol="600001",
+            strategy="trend",
+            score=30.0,
+            grade="C",
+            action=cast(Any, "sell"),
+            target_position=0.0,
+            probabilities={"lgbm": 0.2, "xgb": 0.2, "meta": 0.2},
+            reasons=["sell_without_position"],
+        ),
+    ]
+
+    update = service._apply_live_auto_portfolio_signals(
+        trace_id="trace-no-execution",
+        timestamp=datetime.fromisoformat("2026-03-11T09:45:00"),
+        signals=signals,
+        use_live_runtime=True,
+    )
+
+    assert update["executions"] == []
+    attempts = _as_mapping(update["execution_attempts"])
+    assert attempts["signals"] == 3
+    assert attempts["non_buy_signals"] == 1
+    assert attempts["buy_signals"] == 1
+    assert attempts["buy_zero_target"] == 1
+    assert attempts["sell_signals"] == 1
+    assert attempts["sell_no_position"] == 1
+    assert attempts["buy_new_attempted"] == 0
 
 
 def test_service_live_auto_rejected_buy_updates_learning_outcome() -> None:
@@ -419,6 +482,7 @@ def test_service_pipeline_audit_keeps_portfolio_execution_summary() -> None:
         "open_positions": 1,
         "status": "simulated_auto_applied",
         "cash_available": 98765.43,
+        "execution_attempts": {"signals": 1, "buy_new_rejected": 1, "invalid": "2.7"},
         "executions": [
             {
                 "trade_id": "SKIP-trace-000001-rejected_max_holdings",
@@ -494,6 +558,11 @@ def test_service_pipeline_audit_keeps_portfolio_execution_summary() -> None:
     assert payload["portfolio_update"] == portfolio_update
     assert audit_portfolio_update["skipped_max_holdings"] == 1
     assert audit_portfolio_update["status"] == "simulated_auto_applied"
+    assert audit_portfolio_update["execution_attempts"] == {
+        "signals": 1,
+        "buy_new_rejected": 1,
+        "invalid": 2,
+    }
     assert audit_executions[0]["status"] == "rejected_max_holdings"
     assert audit_executions[0]["quantity"] == 0
     assert "internal_debug_blob" not in audit_executions[0]
