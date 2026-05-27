@@ -623,6 +623,18 @@ def test_service_train_execution_risk_model_returns_preflight_when_targets_not_t
         "negative": 30,
         "positive": 0,
     }
+    preflight = _as_mapping(payload["preflight"])
+    outcome_coverage = _as_mapping(preflight["outcome_coverage"])
+    assert _as_mapping(outcome_coverage["requested_field_coverage"])["reconcile_status"] == 30
+    assert _as_mapping(outcome_coverage["requested_target_coverage"])[
+        "reconcile_mismatch_risk"
+    ] == 30
+    assert preflight["requested_maturity_statuses"] == [
+        "pending",
+        "label_matured",
+        "reconciled",
+        "fully_matured",
+    ]
     assert _as_mapping(status["latest"])["status"] == "blocked_no_trainable_targets"
     assert status["artifact_exists"] is False
     assert int(history["records"]) >= 1

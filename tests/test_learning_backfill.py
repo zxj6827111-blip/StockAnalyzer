@@ -535,7 +535,7 @@ def test_backfill_from_runtime_history_archive_enriches_observed_snapshot_and_ou
     assert enriched_snapshot.regime_context["runtime_regime"] == "trend"
     assert enriched_snapshot.news_context["m7_news_count"] == 3
     assert outcome is not None
-    assert outcome.maturity_status == MaturityStatus.RECONCILED
+    assert outcome.maturity_status == MaturityStatus.FULLY_MATURED
     assert outcome.execution_fill_ratio == 1.0
     assert outcome.realized_slippage_bp == 250.0
     assert outcome.reconcile_status == "ok"
@@ -604,7 +604,7 @@ def test_backfill_from_runtime_history_archive_uses_portfolio_trades_when_comman
     assert outcome.execution_fill_ratio == 1.0
     assert outcome.realized_slippage_bp == 180.0
     assert outcome.reconcile_status == "ok"
-    assert outcome.maturity_status == MaturityStatus.RECONCILED
+    assert outcome.maturity_status == MaturityStatus.FULLY_MATURED
 
 
 def test_backfill_from_runtime_history_archives_batches_directory_in_day_order(
@@ -688,8 +688,8 @@ def test_backfill_from_runtime_history_archives_batches_directory_in_day_order(
     assert result["missing_snapshot_ids"] == []
     assert first_outcome is not None
     assert second_outcome is not None
-    assert first_outcome.maturity_status == MaturityStatus.RECONCILED
-    assert second_outcome.maturity_status == MaturityStatus.RECONCILED
+    assert first_outcome.maturity_status == MaturityStatus.FULLY_MATURED
+    assert second_outcome.maturity_status == MaturityStatus.FULLY_MATURED
     assert first_outcome.realized_slippage_bp == 100.0
     assert second_outcome.realized_slippage_bp == 400.0
 
@@ -791,7 +791,7 @@ def test_service_backfill_learning_runtime_history_archive_records_audit_event(
     assert latest_payload["mode"] == "runtime_history_archive_backfill"
     assert latest_payload["archive_path"] == str(archive_path)
     assert outcome is not None
-    assert outcome.maturity_status == MaturityStatus.RECONCILED
+    assert outcome.maturity_status == MaturityStatus.FULLY_MATURED
 
 
 def test_service_backfill_learning_runtime_history_archives_uses_configured_directory(
@@ -850,7 +850,7 @@ def test_service_backfill_learning_runtime_history_archives_uses_configured_dire
     assert latest_payload["mode"] == "runtime_history_archive_batch_backfill"
     assert latest_payload["archive_dir"] == str(archive_dir)
     assert outcome is not None
-    assert outcome.maturity_status == MaturityStatus.RECONCILED
+    assert outcome.maturity_status == MaturityStatus.FULLY_MATURED
 
 
 def test_service_bootstrap_learning_from_runtime_history_builds_manifest(
@@ -968,7 +968,7 @@ def test_service_learning_protocol_status_reports_counts_and_latest_manifest(
     assert sample_store["outcome_records"] >= 1
     assert sample_store["dataset_manifests"] >= 1
     assert outcomes["records"] >= 1
-    assert _as_mapping(outcomes["maturity_breakdown"])["reconciled"] >= 1
+    assert _as_mapping(outcomes["maturity_breakdown"])["fully_matured"] >= 1
     assert manifests["records"] >= 1
     assert latest_manifest["dataset_manifest_id"] == cold_start["dataset_manifest_id"]
     assert latest_backfill["event_type"] == "learning_backfill_runtime_history_cold_start"

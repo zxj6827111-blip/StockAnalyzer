@@ -427,7 +427,7 @@ class RuntimeTrainingService:
         resolved_maturity_statuses = (
             list(maturity_statuses)
             if maturity_statuses
-            else ["reconciled", "fully_matured"]
+            else ["pending", "label_matured", "reconciled", "fully_matured"]
         )
         trainer = ExecutionRiskTrainer(
             config=ExecutionRiskTrainingConfig(
@@ -449,6 +449,8 @@ class RuntimeTrainingService:
         preflight = diagnose_execution_risk_dataset(
             dataset=dataset,
             config=trainer.config,
+            outcomes=service._sample_store.list_outcomes(),
+            labeling=trainer.labeling,
         )
         if not bool(preflight["can_train"]):
             payload = {

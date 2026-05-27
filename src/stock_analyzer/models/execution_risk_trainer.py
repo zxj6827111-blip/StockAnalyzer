@@ -15,8 +15,9 @@ from stock_analyzer.learning.execution_risk_labels import (
     ExecutionRiskLabelBuilder,
     ExecutionRiskLabelingConfig,
     ExecutionRiskTarget,
+    resolve_execution_risk_targets,
 )
-from stock_analyzer.learning.sample_schema import MaturityStatus
+from stock_analyzer.learning.sample_schema import MaturityStatus, OutcomeRecord
 from stock_analyzer.learning.sample_store import SampleStore
 from stock_analyzer.models.calibration import IsotonicCalibrator
 from stock_analyzer.models.execution_risk_artifact import ExecutionRiskArtifact
@@ -58,6 +59,8 @@ def diagnose_execution_risk_dataset(
     *,
     dataset: ExecutionRiskDataset,
     config: ExecutionRiskTrainingConfig | None = None,
+    outcomes: Sequence[OutcomeRecord] | None = None,
+    labeling: ExecutionRiskLabelingConfig | None = None,
 ) -> dict[str, object]:
     """Explain whether an execution-risk dataset can train per-target models."""
 
@@ -117,6 +120,11 @@ def diagnose_execution_risk_dataset(
         "target_coverage": dict(dataset.target_coverage),
         "target_row_counts": target_row_counts,
         "target_class_counts": target_class_counts,
+        "outcome_coverage": _diagnose_outcome_coverage(
+            outcomes=outcomes or [],
+            requested_maturity_statuses=dataset.requested_maturity_statuses,
+            labeling=labeling,
+        ),
         "trainable_targets": sorted(trainable_targets),
         "skipped_targets": skipped_targets,
         "min_samples_per_target": min_samples,
@@ -183,6 +191,10 @@ class ExecutionRiskTrainer:
     @property
     def config(self) -> ExecutionRiskTrainingConfig:
         return self._config
+
+    @property
+    def labeling(self) -> ExecutionRiskLabelingConfig:
+        return self._labeling
 
     def train(self, *, dataset: ExecutionRiskDataset) -> ExecutionRiskTrainResult:
         if not dataset.rows:
@@ -304,6 +316,102 @@ def _ordered_targets(*, dataset: ExecutionRiskDataset) -> list[str]:
     ordered = [item for item in preferred if item in present]
     extras = sorted(present.difference(ordered))
     return ordered + extras
+
+
+def _diagnose_outcome_coverage(
+    *,
+    outcomes: Sequence[OutcomeRecord],
+    requested_maturity_statuses: Sequence[str],
+    labeling: ExecutionRiskLabelingConfig | None,
+) -> dict[str, object]:
+    requested = {
+        str(item).strip().lower()
+        for item in requested_maturity_statuses
+        if str(item).strip()
+    }
+    maturity_counts: dict[str, int] = {}
+    field_coverage_by_maturity: dict[str, dict[str, int]] = {}
+    target_coverage_by_maturity: dict[str, dict[str, int]] = {}
+    requested_field_coverage: dict[str, int] = {
+        "outcomes": 0,
+        "execution_fill_ratio": 0,
+        "realized_slippage_bp": 0,
+        "reconcile_status": 0,
+        "sim_vs_broker_diff": 0,
+    }
+    requested_target_coverage: dict[str, int] = {}
+    outside_requested_target_coverage: dict[str, int] = {}
+
+    for outcome in outcomes:
+        maturity = outcome.maturity_status.value
+        maturity_counts[maturity] = maturity_counts.get(maturity, 0) + 1
+        field_counts = field_coverage_by_maturity.setdefault(
+            maturity,
+            {
+                "outcomes": 0,
+                "execution_fill_ratio": 0,
+                "realized_slippage_bp": 0,
+                "reconcile_status": 0,
+                "sim_vs_broker_diff": 0,
+            },
+        )
+        field_counts["outcomes"] += 1
+        if outcome.execution_fill_ratio is not None:
+            field_counts["execution_fill_ratio"] += 1
+        if outcome.realized_slippage_bp is not None:
+            field_counts["realized_slippage_bp"] += 1
+        if str(outcome.reconcile_status or "").strip():
+            field_counts["reconcile_status"] += 1
+        if outcome.sim_vs_broker_diff is not None:
+            field_counts["sim_vs_broker_diff"] += 1
+
+        targets = resolve_execution_risk_targets(outcome=outcome, labeling=labeling)
+        maturity_target_counts = target_coverage_by_maturity.setdefault(maturity, {})
+        for target_name in targets:
+            maturity_target_counts[target_name] = maturity_target_counts.get(target_name, 0) + 1
+
+        if maturity in requested:
+            requested_field_coverage["outcomes"] += 1
+            for field_name in (
+                "execution_fill_ratio",
+                "realized_slippage_bp",
+                "reconcile_status",
+                "sim_vs_broker_diff",
+            ):
+                if _outcome_has_field(outcome, field_name):
+                    requested_field_coverage[field_name] += 1
+            for target_name in targets:
+                requested_target_coverage[target_name] = (
+                    requested_target_coverage.get(target_name, 0) + 1
+                )
+        else:
+            for target_name in targets:
+                outside_requested_target_coverage[target_name] = (
+                    outside_requested_target_coverage.get(target_name, 0) + 1
+                )
+
+    return {
+        "total_outcomes": len(outcomes),
+        "requested_maturity_statuses": sorted(requested),
+        "maturity_counts": maturity_counts,
+        "field_coverage_by_maturity": field_coverage_by_maturity,
+        "target_coverage_by_maturity": target_coverage_by_maturity,
+        "requested_field_coverage": requested_field_coverage,
+        "requested_target_coverage": requested_target_coverage,
+        "outside_requested_target_coverage": outside_requested_target_coverage,
+    }
+
+
+def _outcome_has_field(outcome: OutcomeRecord, field_name: str) -> bool:
+    if field_name == "execution_fill_ratio":
+        return outcome.execution_fill_ratio is not None
+    if field_name == "realized_slippage_bp":
+        return outcome.realized_slippage_bp is not None
+    if field_name == "reconcile_status":
+        return bool(str(outcome.reconcile_status or "").strip())
+    if field_name == "sim_vs_broker_diff":
+        return outcome.sim_vs_broker_diff is not None
+    return False
 
 
 def _build_target_split(

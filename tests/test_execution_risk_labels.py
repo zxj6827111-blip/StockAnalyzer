@@ -175,6 +175,40 @@ def test_execution_risk_label_builder_skips_rows_without_required_maturity_or_ta
     assert reconciled_dataset.rows[0].targets[ExecutionRiskTarget.CAN_FILL.value] == 1.0
 
 
+def test_execution_risk_label_builder_can_use_pending_execution_outcomes(
+    tmp_path: Path,
+) -> None:
+    store = SampleStore(db_path=tmp_path / "pending_execution.duckdb")
+    base_time = datetime(2026, 3, 1, 14, 30, tzinfo=UTC)
+
+    _write_snapshot_and_outcome(
+        store=store,
+        snapshot=_make_snapshot(snapshot_id="snap-pending-exec", decision_time=base_time),
+        outcome=OutcomeRecord(
+            snapshot_id="snap-pending-exec",
+            maturity_status=MaturityStatus.PENDING,
+            execution_fill_ratio=1.0,
+            realized_slippage_bp=7.0,
+        ),
+    )
+
+    dataset = ExecutionRiskLabelBuilder(store=store).build_dataset(
+        maturity_statuses=[
+            MaturityStatus.PENDING,
+            MaturityStatus.LABEL_MATURED,
+            MaturityStatus.RECONCILED,
+            MaturityStatus.FULLY_MATURED,
+        ],
+    )
+
+    assert dataset.row_count == 1
+    assert dataset.rows[0].maturity_status == MaturityStatus.PENDING.value
+    assert dataset.target_coverage == {
+        ExecutionRiskTarget.CAN_FILL.value: 1,
+        ExecutionRiskTarget.LIKELY_SLIPPAGE_HIGH.value: 1,
+    }
+
+
 def _write_snapshot_and_outcome(
     *,
     store: SampleStore,

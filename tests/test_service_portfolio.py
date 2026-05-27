@@ -1469,7 +1469,7 @@ def test_service_reconciliation_promotes_learning_outcome_when_label_is_mature(
 
     outcome = service._sample_store.get_outcome(snapshot_id)  # noqa: SLF001
     assert outcome is not None
-    assert outcome.maturity_status == MaturityStatus.RECONCILED
+    assert outcome.maturity_status == MaturityStatus.FULLY_MATURED
     assert outcome.reconcile_status == "ok"
     assert outcome.sim_vs_broker_diff == pytest.approx(0.0)
 

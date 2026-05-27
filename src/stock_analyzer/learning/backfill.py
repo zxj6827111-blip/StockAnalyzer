@@ -1325,12 +1325,15 @@ class LearningBackfillEngine:
             > _backfill_fidelity_rank(current.backfill_fidelity_tier)
         ):
             candidate_source = source
+        base_status = (
+            maturity_status
+            if maturity_status is not None
+            else (current.maturity_status if current is not None else MaturityStatus.PENDING)
+        )
         candidate = (current or OutcomeRecord(snapshot_id=snapshot_id)).model_copy(
             update={
                 **{str(key): value for key, value in updates.items()},
-                "maturity_status": maturity_status
-                if maturity_status is not None
-                else (current.maturity_status if current is not None else MaturityStatus.PENDING),
+                "maturity_status": base_status,
                 "outcome_updated_at": timestamp,
                 "last_backfill_at": timestamp,
                 "backfill_fidelity_tier": preferred_fidelity,
@@ -1338,6 +1341,15 @@ class LearningBackfillEngine:
             },
             deep=True,
         )
+        resolved_status = _merge_runtime_archive_maturity_status(
+            current_status=base_status,
+            candidate_outcome=candidate,
+        )
+        if resolved_status != candidate.maturity_status:
+            candidate = candidate.model_copy(
+                update={"maturity_status": resolved_status},
+                deep=True,
+            )
         if current is not None and candidate.model_dump(mode="json") == current.model_dump(
             mode="json"
         ):
@@ -1741,6 +1753,24 @@ def _merge_label_maturity_status(
             return MaturityStatus.FULLY_MATURED
         return MaturityStatus.RECONCILED
     return MaturityStatus.LABEL_MATURED
+
+
+def _merge_runtime_archive_maturity_status(
+    *,
+    current_status: MaturityStatus,
+    candidate_outcome: OutcomeRecord,
+) -> MaturityStatus:
+    if current_status == MaturityStatus.FULLY_MATURED:
+        return MaturityStatus.FULLY_MATURED
+    has_execution = candidate_outcome.execution_fill_ratio is not None
+    has_reconcile = bool(str(candidate_outcome.reconcile_status or "").strip())
+    if (
+        current_status in {MaturityStatus.LABEL_MATURED, MaturityStatus.RECONCILED}
+        and has_execution
+        and has_reconcile
+    ):
+        return MaturityStatus.FULLY_MATURED
+    return current_status
 
 
 def _default_fidelity_tier_for_snapshot(snapshot: SignalSnapshot) -> BackfillFidelityTier:

@@ -1604,7 +1604,10 @@ def train_execution_risk(
     artifact_path: str = typer.Option("", help="Optional output artifact path"),
     maturity_statuses: str = typer.Option(
         "",
-        help="Optional comma separated maturity statuses, e.g. reconciled,fully_matured",
+        help=(
+            "Optional comma separated maturity statuses, "
+            "e.g. pending,label_matured,reconciled,fully_matured"
+        ),
     ),
     max_rows: int = typer.Option(0, help="Optional max rows; 0 uses all eligible rows"),
     min_samples_per_target: int = typer.Option(24, help="Minimum rows per target"),
@@ -1650,7 +1653,11 @@ def train_execution_risk_history(
     config = get_config()
     service = StockAnalyzerService(config=config)
     typer.echo(
-        json.dumps(service.execution_risk_training_history(limit=limit), ensure_ascii=False, indent=2)
+        json.dumps(
+            service.execution_risk_training_history(limit=limit),
+            ensure_ascii=False,
+            indent=2,
+        )
     )
 
 

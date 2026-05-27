@@ -232,40 +232,51 @@ class ExecutionRiskLabelBuilder:
         return build_execution_risk_feature_vector(snapshot=snapshot)
 
     def _resolve_targets(self, *, outcome: OutcomeRecord) -> dict[str, float]:
-        targets: dict[str, float] = {}
+        return resolve_execution_risk_targets(outcome=outcome, labeling=self._labeling)
 
-        fill_ratio = outcome.execution_fill_ratio
-        if fill_ratio is not None:
-            targets[ExecutionRiskTarget.CAN_FILL.value] = float(
-                float(fill_ratio) >= float(self._labeling.fill_ratio_threshold)
-            )
 
-        slippage_bp = outcome.realized_slippage_bp
-        if slippage_bp is not None:
-            targets[ExecutionRiskTarget.LIKELY_SLIPPAGE_HIGH.value] = float(
-                float(slippage_bp) >= float(self._labeling.slippage_bp_threshold)
-            )
+def resolve_execution_risk_targets(
+    *,
+    outcome: OutcomeRecord,
+    labeling: ExecutionRiskLabelingConfig | None = None,
+) -> dict[str, float]:
+    """Resolve execution-risk targets without applying maturity filters."""
 
-        reconcile_status = str(outcome.reconcile_status or "").strip().lower()
-        sim_vs_broker_diff = outcome.sim_vs_broker_diff
-        is_reconcile_mismatch = (
-            reconcile_status in self._labeling.reconcile_mismatch_statuses
-            if reconcile_status
-            else False
+    resolved_labeling = labeling or ExecutionRiskLabelingConfig()
+    targets: dict[str, float] = {}
+
+    fill_ratio = outcome.execution_fill_ratio
+    if fill_ratio is not None:
+        targets[ExecutionRiskTarget.CAN_FILL.value] = float(
+            float(fill_ratio) >= float(resolved_labeling.fill_ratio_threshold)
         )
-        if reconcile_status:
-            targets[ExecutionRiskTarget.RECONCILE_MISMATCH_RISK.value] = float(
-                is_reconcile_mismatch
+
+    slippage_bp = outcome.realized_slippage_bp
+    if slippage_bp is not None:
+        targets[ExecutionRiskTarget.LIKELY_SLIPPAGE_HIGH.value] = float(
+            float(slippage_bp) >= float(resolved_labeling.slippage_bp_threshold)
+        )
+
+    reconcile_status = str(outcome.reconcile_status or "").strip().lower()
+    sim_vs_broker_diff = outcome.sim_vs_broker_diff
+    is_reconcile_mismatch = (
+        reconcile_status in resolved_labeling.reconcile_mismatch_statuses
+        if reconcile_status
+        else False
+    )
+    if reconcile_status:
+        targets[ExecutionRiskTarget.RECONCILE_MISMATCH_RISK.value] = float(
+            is_reconcile_mismatch
+        )
+    if reconcile_status or sim_vs_broker_diff is not None:
+        divergence_risk = is_reconcile_mismatch
+        if sim_vs_broker_diff is not None:
+            divergence_risk = divergence_risk or (
+                abs(float(sim_vs_broker_diff))
+                >= float(resolved_labeling.sim_broker_diff_threshold)
             )
-        if reconcile_status or sim_vs_broker_diff is not None:
-            divergence_risk = is_reconcile_mismatch
-            if sim_vs_broker_diff is not None:
-                divergence_risk = divergence_risk or (
-                    abs(float(sim_vs_broker_diff))
-                    >= float(self._labeling.sim_broker_diff_threshold)
-                )
-            targets[ExecutionRiskTarget.SIM_BROKER_DIVERGENCE_RISK.value] = float(divergence_risk)
-        return targets
+        targets[ExecutionRiskTarget.SIM_BROKER_DIVERGENCE_RISK.value] = float(divergence_risk)
+    return targets
 
 
 def _build_outcome_context(outcome: OutcomeRecord) -> dict[str, object]:

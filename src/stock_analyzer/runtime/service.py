@@ -54,7 +54,12 @@ from stock_analyzer.labels.soup import build_soup_labels
 from stock_analyzer.learning.backfill import LearningBackfillEngine
 from stock_analyzer.learning.feature_schema_registry import FeatureSchemaRegistry
 from stock_analyzer.learning.label_policy_registry import LabelPolicyRegistry
-from stock_analyzer.learning.sample_schema import MaturityStatus, OutcomeRecord, SignalSnapshot
+from stock_analyzer.learning.sample_schema import (
+    BackfillFidelityTier,
+    MaturityStatus,
+    OutcomeRecord,
+    SignalSnapshot,
+)
 from stock_analyzer.learning.sample_store import SampleStore
 from stock_analyzer.market_calendar import is_a_share_trading_day
 from stock_analyzer.models.artifact import ModelArtifact
@@ -1606,10 +1611,38 @@ class StockAnalyzerService:
             outcome = OutcomeRecord(snapshot_id=normalized_snapshot_id)
         update_payload = {str(key): value for key, value in updates.items()}
         update_payload["outcome_updated_at"] = timestamp
-        if maturity_status is not None:
-            update_payload["maturity_status"] = maturity_status
-        self._sample_store.upsert_outcome(outcome.model_copy(update=update_payload, deep=True))
+        base_status = maturity_status if maturity_status is not None else outcome.maturity_status
+        update_payload["maturity_status"] = base_status
+        candidate = outcome.model_copy(update=update_payload, deep=True)
+        resolved_status = self._resolve_learning_outcome_maturity_status(
+            current_status=base_status,
+            candidate_outcome=candidate,
+        )
+        if resolved_status != candidate.maturity_status:
+            candidate = candidate.model_copy(
+                update={"maturity_status": resolved_status},
+                deep=True,
+            )
+        self._sample_store.upsert_outcome(candidate)
         return True
+
+    @staticmethod
+    def _resolve_learning_outcome_maturity_status(
+        *,
+        current_status: MaturityStatus,
+        candidate_outcome: OutcomeRecord,
+    ) -> MaturityStatus:
+        if current_status == MaturityStatus.FULLY_MATURED:
+            return MaturityStatus.FULLY_MATURED
+        has_execution = candidate_outcome.execution_fill_ratio is not None
+        has_reconcile = bool(str(candidate_outcome.reconcile_status or "").strip())
+        if (
+            current_status in {MaturityStatus.LABEL_MATURED, MaturityStatus.RECONCILED}
+            and has_execution
+            and has_reconcile
+        ):
+            return MaturityStatus.FULLY_MATURED
+        return current_status
 
     def _update_learning_execution_outcome(
         self,

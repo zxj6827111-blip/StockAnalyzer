@@ -80,7 +80,13 @@ def test_execution_risk_dataset_diagnostics_explain_single_class_targets(
         store=store,
         maturity_statuses=["reconciled"],
     )
-    diagnostics = diagnose_execution_risk_dataset(dataset=dataset, config=trainer.config)
+    diagnostics = diagnose_execution_risk_dataset(
+        dataset=dataset,
+        config=trainer.config,
+        outcomes=store.list_outcomes(),
+        labeling=trainer.labeling,
+    )
+    outcome_coverage = diagnostics["outcome_coverage"]
 
     assert diagnostics["can_train"] is False
     assert diagnostics["target_row_counts"]["reconcile_mismatch_risk"] == 30
@@ -90,6 +96,9 @@ def test_execution_risk_dataset_diagnostics_explain_single_class_targets(
     }
     assert diagnostics["skipped_targets"]["reconcile_mismatch_risk"] == "single_class_target"
     assert diagnostics["skipped_targets"]["sim_broker_divergence_risk"] == "single_class_target"
+    assert outcome_coverage["maturity_counts"]["reconciled"] == 30
+    assert outcome_coverage["requested_field_coverage"]["reconcile_status"] == 30
+    assert outcome_coverage["requested_target_coverage"]["reconcile_mismatch_risk"] == 30
 
 
 def test_execution_risk_predictor_roundtrips_saved_artifact_and_scores_rows(
@@ -139,7 +148,10 @@ def test_execution_risk_predictor_roundtrips_saved_artifact_and_scores_rows(
     assert set(low_risk.keys()) == set(result.trained_targets)
     assert all(0.0 <= value <= 1.0 for value in low_risk.values())
     assert all(0.0 <= value <= 1.0 for value in stressed.values())
-    assert low_risk[ExecutionRiskTarget.CAN_FILL.value] > stressed[ExecutionRiskTarget.CAN_FILL.value]
+    assert (
+        low_risk[ExecutionRiskTarget.CAN_FILL.value]
+        > stressed[ExecutionRiskTarget.CAN_FILL.value]
+    )
     assert (
         low_risk[ExecutionRiskTarget.LIKELY_SLIPPAGE_HIGH.value]
         < stressed[ExecutionRiskTarget.LIKELY_SLIPPAGE_HIGH.value]
