@@ -673,6 +673,68 @@ def test_backfill_from_runtime_history_archive_uses_pipeline_rejected_execution(
     assert outcome.maturity_status == MaturityStatus.FULLY_MATURED
 
 
+def test_backfill_from_runtime_history_archive_ignores_pipeline_dry_run_execution(
+    tmp_path: Path,
+) -> None:
+    config, provider, store, feature_registry, label_registry, engine = _build_engine_fixture(
+        tmp_path
+    )
+    snapshot = _seed_observed_snapshot(
+        config=config,
+        provider=provider,
+        store=store,
+        feature_registry=feature_registry,
+        label_registry=label_registry,
+        symbol="600000",
+        end_date=date(2026, 3, 31),
+        row_offset=40,
+        outcome=OutcomeRecord(
+            snapshot_id="placeholder",
+            maturity_status=MaturityStatus.LABEL_MATURED,
+            label_mature_time=datetime(2026, 3, 20, 15, 0, tzinfo=UTC),
+            outcome_updated_at=datetime(2026, 3, 20, 15, 0, tzinfo=UTC),
+        ),
+    )
+    archive_payload = _build_runtime_history_archive_payload(snapshot=snapshot)
+    archive_payload["runtime"] = {
+        "audit_events": [
+            {
+                "timestamp": "2026-03-31T10:00:00+00:00",
+                "event_type": "pipeline_run",
+                "payload": {
+                    "dry_run_execution": True,
+                    "portfolio_update": {
+                        "dry_run": True,
+                        "executions": [
+                            {
+                                "trade_id": "SKIP-trace-600000-rejected_max_holdings",
+                                "side": "buy",
+                                "symbol": snapshot.symbol,
+                                "strategy": snapshot.strategy,
+                                "status": "rejected_max_holdings",
+                                "target_position": 0.2,
+                                "price": 10.18,
+                                "quantity": 0,
+                                "trade_time": "2026-03-31T10:00:00+00:00",
+                            }
+                        ],
+                    },
+                },
+            }
+        ]
+    }
+    archive_payload["portfolio"] = {"positions": [], "trades": []}
+
+    result = engine.backfill_from_runtime_history_archive(archive_payload=archive_payload)
+    outcome = store.get_outcome(snapshot.snapshot_id)
+
+    assert result["ok"] is True
+    assert result["execution_updates"] == 0
+    assert result["portfolio_trade_events_linked"] == 0
+    assert outcome is not None
+    assert outcome.execution_fill_ratio is None
+
+
 def test_backfill_from_runtime_history_archives_batches_directory_in_day_order(
     tmp_path: Path,
 ) -> None:

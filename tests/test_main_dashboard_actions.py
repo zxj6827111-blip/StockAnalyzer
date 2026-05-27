@@ -279,6 +279,8 @@ def test_run_pipeline_api_accepts_live_runtime_flag(monkeypatch) -> None:
             "signals": [],
             "portfolio_update": {"executions": []},
             "use_live_runtime": bool(kwargs.get("use_live_runtime")),
+            "dry_run_execution": bool(kwargs.get("dry_run_execution")),
+            "notify_enabled": bool(kwargs.get("notify_enabled")),
         }
 
     monkeypatch.setattr(main_module._service, "run_pipeline", _fake_run_pipeline)
@@ -290,6 +292,8 @@ def test_run_pipeline_api_accepts_live_runtime_flag(monkeypatch) -> None:
             "strategy": "trend",
             "current_equity": 1.0,
             "use_live_runtime": True,
+            "dry_run_execution": True,
+            "notify_enabled": False,
         },
     )
 
@@ -298,7 +302,11 @@ def test_run_pipeline_api_accepts_live_runtime_flag(monkeypatch) -> None:
     assert captured["strategy"] == "trend"
     assert captured["current_equity"] == 1.0
     assert captured["use_live_runtime"] is True
+    assert captured["dry_run_execution"] is True
+    assert captured["notify_enabled"] is False
     assert response.json()["use_live_runtime"] is True
+    assert response.json()["dry_run_execution"] is True
+    assert response.json()["notify_enabled"] is False
 
 
 def test_dashboard_ops_toggle_disables_quick_command() -> None:

@@ -1126,7 +1126,23 @@ class LearningBackfillEngine:
                 "missing_snapshot_ids": [],
             }
         payload = _coerce_mapping(event.get("payload"))
+        if bool(payload.get("dry_run_execution")):
+            return {
+                "updated": 0,
+                "linked": 0,
+                "symbols": [],
+                "snapshot_ids": [],
+                "missing_snapshot_ids": [],
+            }
         portfolio_update = _coerce_mapping(payload.get("portfolio_update"))
+        if bool(portfolio_update.get("dry_run")):
+            return {
+                "updated": 0,
+                "linked": 0,
+                "symbols": [],
+                "snapshot_ids": [],
+                "missing_snapshot_ids": [],
+            }
         raw_executions = portfolio_update.get("executions")
         if not isinstance(raw_executions, list):
             return {

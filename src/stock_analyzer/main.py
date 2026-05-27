@@ -1227,6 +1227,8 @@ class PipelineRunRequest(BaseModel):
     strategy: str = "trend"
     current_equity: float = 1.0
     use_live_runtime: bool = False
+    dry_run_execution: bool = False
+    notify_enabled: bool = True
 
 
 class NotificationRequest(BaseModel):
@@ -1966,6 +1968,8 @@ def run_pipeline(request: PipelineRunRequest) -> dict[str, object]:
         strategy=request.strategy,
         current_equity=request.current_equity,
         use_live_runtime=request.use_live_runtime,
+        dry_run_execution=request.dry_run_execution,
+        notify_enabled=request.notify_enabled,
     )
 
 

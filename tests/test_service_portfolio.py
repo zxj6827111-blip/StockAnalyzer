@@ -466,6 +466,95 @@ def test_service_live_auto_rejected_buy_updates_learning_outcome() -> None:
     assert outcome.realized_slippage_bp is None
 
 
+def test_service_pipeline_dry_run_execution_does_not_mutate_portfolio_or_notify() -> None:
+    config = _load_test_config()
+    config.soup_strategy.max_holdings = 2
+    service = StockAnalyzerService(config=config)
+    notify_calls: list[dict[str, object]] = []
+
+    _patch_attr(
+        service,
+        "_notify_simulated_trade_updates_if_needed",
+        lambda **kwargs: notify_calls.append(dict(kwargs)),
+    )
+    _patch_attr(
+        service,
+        "_notify_expired_position_exits_if_needed",
+        lambda **kwargs: notify_calls.append(dict(kwargs)),
+    )
+    _patch_attr(
+        service,
+        "_notify_risk_status_if_needed",
+        lambda *args, **kwargs: notify_calls.append(dict(kwargs)),
+    )
+    _patch_attr(
+        service,
+        "_notify_holding_alerts_if_needed",
+        lambda **kwargs: notify_calls.append(dict(kwargs)),
+    )
+    _patch_attr(
+        service,
+        "_notify_provider_health_if_needed",
+        lambda **kwargs: notify_calls.append(dict(kwargs)),
+    )
+    _patch_attr(
+        service,
+        "_build_week5_symbol_market_payload",
+        lambda **kwargs: {
+            "last_price": 10.08,
+            "open_price": 10.0,
+            "prev_close": 9.9,
+            "ask_levels": [{"level": 1, "price": 10.1, "volume": 5000}],
+            "bid_levels": [{"level": 1, "price": 10.0, "volume": 4000}],
+        },
+    )
+    _patch_attr(
+        service,
+        "_fetch_market_depth_snapshots",
+        lambda **kwargs: {
+            "600000": {
+                "available": True,
+                "ask_levels": [{"level": 1, "price": 10.1, "volume": 5000}],
+                "bid_levels": [{"level": 1, "price": 10.0, "volume": 4000}],
+            }
+        },
+    )
+    before_positions = service.portfolio_positions()
+    before_trades = service.portfolio_trades(limit=10)
+    before_watchlist = list(service.state.watchlist)
+    before_equity = service.state.current_equity
+
+    payload = service.run_pipeline(
+        symbols=["600000"],
+        strategy="trend",
+        current_equity=1.0,
+        use_live_runtime=True,
+        dry_run_execution=True,
+        notify_enabled=False,
+    )
+    update = _as_mapping(payload["portfolio_update"])
+    attempts = _as_mapping(update["execution_attempts"])
+
+    assert payload["execution_mode"] == "portfolio_auto_apply_dry_run"
+    assert payload["dry_run_execution"] is True
+    assert payload["notify_enabled"] is False
+    assert update["status"] == "simulated_auto_dry_run"
+    assert update["dry_run"] is True
+    assert attempts["buy_new_attempted"] >= 1
+    assert service.portfolio_positions() == before_positions
+    assert service.portfolio_trades(limit=10) == before_trades
+    assert service.state.watchlist == before_watchlist
+    assert service.state.current_equity == before_equity
+    assert notify_calls == []
+
+    events = _as_mapping_list(service.audit_events(limit=20, event_type="pipeline_run")["events"])
+    audit_payload = _as_mapping(events[-1]["payload"])
+    audit_update = _as_mapping(audit_payload["portfolio_update"])
+    assert audit_payload["dry_run_execution"] is True
+    assert audit_payload["notify_enabled"] is False
+    assert audit_update["dry_run"] is True
+
+
 def test_service_pipeline_audit_keeps_portfolio_execution_summary() -> None:
     config = _load_test_config()
     service = StockAnalyzerService(config=config)

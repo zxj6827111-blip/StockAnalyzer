@@ -3327,10 +3327,19 @@ class StockAnalyzerService:
         strategy: str = "trend",
         current_equity: float | None = None,
         use_live_runtime: bool = False,
+        dry_run_execution: bool = False,
+        notify_enabled: bool = True,
         job_name: str = "",
     ) -> dict[str, object]:
         advisory_only_mode = bool(self._config.app.advisory_only)
-        execution_mode = "advisory_only" if advisory_only_mode else "portfolio_auto_apply"
+        execution_dry_run = bool(dry_run_execution)
+        notifications_enabled = bool(notify_enabled)
+        if advisory_only_mode:
+            execution_mode = "advisory_only"
+        elif execution_dry_run:
+            execution_mode = "portfolio_auto_apply_dry_run"
+        else:
+            execution_mode = "portfolio_auto_apply"
         live_auto_execute = self._live_auto_execution_enabled(use_live_runtime=use_live_runtime)
         if self._bootstrap_runtime_blocked():
             self._last_signal_payload = []
@@ -3444,10 +3453,11 @@ class StockAnalyzerService:
             signals=signals,
             strategy=normalized_strategy,
         )
-        self._sync_learning_snapshot_feedback(
-            signals=signals,
-            week6_execution=week6_execution,
-        )
+        if not execution_dry_run:
+            self._sync_learning_snapshot_feedback(
+                signals=signals,
+                week6_execution=week6_execution,
+            )
         hrp_shadow = self._build_c3_hrp_shadow_portfolio(
             signals=signals,
             strategy=normalized_strategy,
@@ -3472,6 +3482,7 @@ class StockAnalyzerService:
                 timestamp=timestamp,
                 signals=signals,
                 use_live_runtime=use_live_runtime,
+                dry_run=execution_dry_run,
             )
         else:
             closed_expired_update = self._portfolio.apply_signals(
@@ -3500,35 +3511,57 @@ class StockAnalyzerService:
         notification_filter_diagnostics = self._notification_filter.latest_diagnostics()
         if notification_filter_diagnostics is not None:
             self._last_notification_filter_diagnostics = dict(notification_filter_diagnostics)
-        recommendation_sync_started = perf_counter()
-        recommendation_update = self._sync_recommendation_lifecycle_from_signals(
-            signals=signals,
-            timestamp=timestamp,
-            trace_id=trace_id,
-        )
-        learning_outcome_update = self._update_learning_outcomes_from_portfolio_update(
-            signals=signals,
-            portfolio_update=portfolio_update,
-            timestamp=timestamp,
-        )
         holding_alerts = self.holding_alerts(now=timestamp)
-        holding_recommendation_update = self._sync_recommendation_lifecycle_from_holding_alerts(
-            holding_alerts=holding_alerts,
-            timestamp=timestamp,
-            trace_id=trace_id,
-        )
         signal_payload = self._build_signal_payload_with_recommendation_ids(
             signals=signals,
             trace_id=trace_id,
             timestamp=timestamp,
         )
-        self._last_signal_payload = [dict(item) for item in signal_payload]
-        self._last_signal_trace_id = trace_id
-        execution_recommendation_update = self._sync_recommendation_lifecycle_from_auto_execution(
-            portfolio_update=portfolio_update,
-            timestamp=timestamp,
-            trace_id=trace_id,
-        )
+        recommendation_sync_started = perf_counter()
+        if execution_dry_run:
+            recommendation_update = {
+                "updated": 0,
+                "symbols": [],
+                "status": "skipped_execution_dry_run",
+            }
+            learning_outcome_update = {
+                "updated": 0,
+                "snapshot_ids": [],
+                "status": "skipped_execution_dry_run",
+            }
+            holding_recommendation_update = {
+                "updated": 0,
+                "symbols": [],
+                "status": "skipped_execution_dry_run",
+            }
+            execution_recommendation_update = {
+                "updated": 0,
+                "symbols": [],
+                "status": "skipped_execution_dry_run",
+            }
+        else:
+            recommendation_update = self._sync_recommendation_lifecycle_from_signals(
+                signals=signals,
+                timestamp=timestamp,
+                trace_id=trace_id,
+            )
+            learning_outcome_update = self._update_learning_outcomes_from_portfolio_update(
+                signals=signals,
+                portfolio_update=portfolio_update,
+                timestamp=timestamp,
+            )
+            holding_recommendation_update = self._sync_recommendation_lifecycle_from_holding_alerts(
+                holding_alerts=holding_alerts,
+                timestamp=timestamp,
+                trace_id=trace_id,
+            )
+            self._last_signal_payload = [dict(item) for item in signal_payload]
+            self._last_signal_trace_id = trace_id
+            execution_recommendation_update = self._sync_recommendation_lifecycle_from_auto_execution(
+                portfolio_update=portfolio_update,
+                timestamp=timestamp,
+                trace_id=trace_id,
+            )
         recommendation_sync_ms = int((perf_counter() - recommendation_sync_started) * 1000)
         portfolio_changed = (
             _as_int(portfolio_update.get("opened"), default=0) > 0
@@ -3573,10 +3606,12 @@ class StockAnalyzerService:
         payload["job_name"] = job_name.strip() or "pipeline_run"
         payload["symbol_count"] = len(symbol_list)
         payload["use_live_runtime"] = bool(use_live_runtime)
+        payload["dry_run_execution"] = execution_dry_run
+        payload["notify_enabled"] = notifications_enabled
         payload["recommendation_update"] = recommendation_update
         payload["execution_recommendation_update"] = execution_recommendation_update
         payload["holding_recommendation_update"] = holding_recommendation_update
-        if _as_int(learning_outcome_update.get("updated"), default=0) > 0:
+        if execution_dry_run or _as_int(learning_outcome_update.get("updated"), default=0) > 0:
             payload["learning_outcome_update"] = learning_outcome_update
         payload["holding_alerts"] = holding_alerts
         payload["execution_mode"] = execution_mode
@@ -3630,21 +3665,23 @@ class StockAnalyzerService:
             use_live_runtime=use_live_runtime,
         )
         notify_started = perf_counter()
-        self._notify_expired_position_exits_if_needed(
-            timestamp=timestamp,
-            closed_expired=_as_int(portfolio_update.get("closed_expired"), default=0),
-            trace_id=trace_id,
-        )
-        self._notify_risk_status_if_needed(risk_payload, trace_id=trace_id)
-        self._notify_holding_alerts_if_needed(holding_alerts=holding_alerts, trace_id=trace_id)
-        self._notify_provider_health_if_needed(trace_id=trace_id)
-        self._notify_simulated_trade_updates_if_needed(
-            portfolio_update=portfolio_update,
-            trace_id=trace_id,
-        )
+        if notifications_enabled and not execution_dry_run:
+            self._notify_expired_position_exits_if_needed(
+                timestamp=timestamp,
+                closed_expired=_as_int(portfolio_update.get("closed_expired"), default=0),
+                trace_id=trace_id,
+            )
+            self._notify_risk_status_if_needed(risk_payload, trace_id=trace_id)
+            self._notify_holding_alerts_if_needed(holding_alerts=holding_alerts, trace_id=trace_id)
+            self._notify_provider_health_if_needed(trace_id=trace_id)
+            self._notify_simulated_trade_updates_if_needed(
+                portfolio_update=portfolio_update,
+                trace_id=trace_id,
+            )
         runtime_payload = payload.get("runtime")
         if isinstance(runtime_payload, dict):
             runtime_payload["notify_ms"] = int((perf_counter() - notify_started) * 1000)
+            runtime_payload["notify_enabled"] = notifications_enabled and not execution_dry_run
         self._record_audit_event(
             event_type="pipeline_run",
             trace_id=str(payload.get("trace_id", "")),
@@ -3654,6 +3691,8 @@ class StockAnalyzerService:
                 "job_name": payload["job_name"],
                 "symbol_count": len(symbol_list),
                 "use_live_runtime": bool(use_live_runtime),
+                "dry_run_execution": execution_dry_run,
+                "notify_enabled": notifications_enabled,
                 "signals": _signals_count(payload),
                 "actionable": len(actionable_signals),
                 "notification_filter_diagnostics": notification_filter_diagnostics or {},
@@ -11473,7 +11512,11 @@ class StockAnalyzerService:
         timestamp: datetime,
         signals: list[PipelineSignal],
         use_live_runtime: bool,
+        dry_run: bool = False,
     ) -> dict[str, object]:
+        portfolio_state_before = self._portfolio.export_state() if dry_run else None
+        watchlist_before = list(self._state.watchlist) if dry_run else []
+        current_equity_before = float(self._state.current_equity) if dry_run else 0.0
         base_update = self._portfolio.apply_signals(
             trace_id=trace_id,
             timestamp=timestamp,
@@ -11940,11 +11983,12 @@ class StockAnalyzerService:
             opened += 1 if status == "opened" else 0
             adjusted += 1 if status == "adjusted" else 0
             execution_attempts["buy_new_filled"] += 1
-            self._ensure_symbol_tracked_in_watchlist(
-                symbol=symbol,
-                source="auto_simulated_buy",
-                trace_id=trace_id,
-            )
+            if not dry_run:
+                self._ensure_symbol_tracked_in_watchlist(
+                    symbol=symbol,
+                    source="auto_simulated_buy",
+                    trace_id=trace_id,
+                )
             trade = self._portfolio.trades(limit=1)[0]
             executions.append(
                 {
@@ -11969,6 +12013,10 @@ class StockAnalyzerService:
             use_live_runtime=use_live_runtime,
             market_cache=market_cache,
         )
+        if dry_run and portfolio_state_before is not None:
+            self._portfolio.restore_state(portfolio_state_before)
+            self._state.watchlist = watchlist_before
+            self._state.current_equity = current_equity_before
         return {
             "opened": opened,
             "adjusted": adjusted,
@@ -11979,7 +12027,8 @@ class StockAnalyzerService:
             "skipped_same_sector": skipped_same_sector,
             "skipped_no_cash": skipped_no_cash,
             "open_positions": len(self._portfolio.positions()),
-            "status": "simulated_auto_applied",
+            "status": "simulated_auto_dry_run" if dry_run else "simulated_auto_applied",
+            "dry_run": bool(dry_run),
             "executions": executions,
             "execution_attempts": execution_attempts,
             "cash_available": round(
@@ -17132,6 +17181,7 @@ def _audit_portfolio_update_summary(portfolio_update: Mapping[str, object]) -> d
         "skipped_no_cash",
         "open_positions",
         "status",
+        "dry_run",
     )
     payload: dict[str, object] = {
         field: portfolio_update[field] for field in scalar_fields if field in portfolio_update
