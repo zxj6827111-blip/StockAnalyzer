@@ -464,6 +464,7 @@ class RuntimeTrainingService:
                 "skipped_targets": dict(preflight["skipped_targets"]),
                 "target_row_counts": dict(preflight["target_row_counts"]),
                 "target_class_counts": dict(preflight["target_class_counts"]),
+                "target_trainability": dict(preflight["target_trainability"]),
                 "training_summary": {
                     "row_count": int(preflight["row_count"]),
                     "source_snapshot_count": int(preflight["source_snapshot_count"]),
@@ -488,6 +489,7 @@ class RuntimeTrainingService:
                     "row_count": int(preflight["row_count"]),
                     "target_row_counts": dict(preflight["target_row_counts"]),
                     "target_class_counts": dict(preflight["target_class_counts"]),
+                    "target_trainability": dict(preflight["target_trainability"]),
                     "skipped_targets": dict(preflight["skipped_targets"]),
                 },
             )

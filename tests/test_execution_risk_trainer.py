@@ -96,9 +96,70 @@ def test_execution_risk_dataset_diagnostics_explain_single_class_targets(
     }
     assert diagnostics["skipped_targets"]["reconcile_mismatch_risk"] == "single_class_target"
     assert diagnostics["skipped_targets"]["sim_broker_divergence_risk"] == "single_class_target"
+    trainability = diagnostics["target_trainability"]
+    assert trainability["reconcile_mismatch_risk"]["positive_deficit"] == 3
+    assert trainability["reconcile_mismatch_risk"]["negative_deficit"] == 0
     assert outcome_coverage["maturity_counts"]["reconciled"] == 30
     assert outcome_coverage["requested_field_coverage"]["reconcile_status"] == 30
     assert outcome_coverage["requested_target_coverage"]["reconcile_mismatch_risk"] == 30
+
+
+def test_execution_risk_dataset_diagnostics_explain_minority_class_shortage(
+    tmp_path: Path,
+) -> None:
+    store = SampleStore(db_path=tmp_path / "minority_class.duckdb")
+    base_time = datetime(2026, 1, 1, 14, 30, tzinfo=UTC)
+    for index in range(29):
+        snapshot = SignalSnapshot(
+            snapshot_id=f"snap-minority-{index:03d}",
+            code_version="git:test",
+            symbol="600000.SH",
+            strategy="trend",
+            decision_time=base_time + timedelta(days=index),
+            feature_vector={"liquidity_score": 0.9},
+            feature_schema_id="feature_schema_exec_v1",
+            feature_schema_hash="feature_hash_exec_v1",
+            runtime_config_hash="runtime_hash_exec_v1",
+            label_policy_id="label_policy_exec_v1",
+            label_policy_hash="label_hash_exec_v1",
+        )
+        store.write_snapshot(snapshot)
+        store.upsert_outcome(
+            OutcomeRecord(
+                snapshot_id=snapshot.snapshot_id,
+                maturity_status=MaturityStatus.RECONCILED,
+                realized_slippage_bp=25.0 if index < 2 else 5.0,
+            )
+        )
+
+    trainer = ExecutionRiskTrainer(
+        config=ExecutionRiskTrainingConfig(
+            min_samples_per_target=24,
+            min_class_samples_per_target=3,
+        )
+    )
+    dataset = trainer.build_dataset_from_sample_store(
+        store=store,
+        maturity_statuses=["reconciled"],
+    )
+    diagnostics = diagnose_execution_risk_dataset(
+        dataset=dataset,
+        config=trainer.config,
+        outcomes=store.list_outcomes(),
+        labeling=trainer.labeling,
+    )
+    trainability = diagnostics["target_trainability"]["likely_slippage_high"]
+
+    assert diagnostics["can_train"] is False
+    assert diagnostics["target_class_counts"]["likely_slippage_high"] == {
+        "negative": 27,
+        "positive": 2,
+    }
+    assert diagnostics["skipped_targets"]["likely_slippage_high"] == "minority_class_too_small"
+    assert trainability["minority_count"] == 2
+    assert trainability["minority_deficit"] == 1
+    assert trainability["positive_deficit"] == 1
+    assert diagnostics["min_class_samples_per_target"] == 3
 
 
 def test_execution_risk_predictor_roundtrips_saved_artifact_and_scores_rows(

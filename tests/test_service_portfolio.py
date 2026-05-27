@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tempfile
 import time
 from collections.abc import Mapping
 from datetime import datetime
@@ -11,7 +12,7 @@ import pytest
 
 from stock_analyzer.command.channel import CommandEnvelope, SignedCommandProcessor
 from stock_analyzer.config import StockAnalyzerConfig, load_config
-from stock_analyzer.learning.sample_schema import MaturityStatus
+from stock_analyzer.learning.sample_schema import MaturityStatus, OutcomeRecord, SignalSnapshot
 from stock_analyzer.runtime.service import StockAnalyzerService
 from stock_analyzer.types import PipelineSignal
 
@@ -24,6 +25,11 @@ def _load_test_config() -> StockAnalyzerConfig:
     config.notifications.primary = "console"
     config.notifications.backup = "console"
     config.app.advisory_only = False
+    config.training.bootstrap_state_path = str(
+        Path(tempfile.gettempdir())
+        / f"stock_analyzer_service_portfolio_{time.time_ns()}"
+        / "bootstrap_state.json"
+    )
 
     # Force permissive gates so synthetic data can produce buy actions.
     config.models.cross_review.p_lgbm_min = 0.0
@@ -292,6 +298,109 @@ def test_service_live_auto_execution_skips_unchanged_adjustment() -> None:
     assert position["target_position"] == 0.01
     assert position["open_reason"] == "auto_simulated_buy"
     assert len(service.portfolio_trades(limit=10)) == 1
+
+
+def test_service_live_auto_rejected_buy_updates_learning_outcome() -> None:
+    config = _load_test_config()
+    config.soup_strategy.max_holdings = 1
+    service = StockAnalyzerService(config=config)
+    opened_at = datetime.fromisoformat("2026-03-11T09:35:00")
+    service._portfolio.set_manual_position(
+        symbol="600956",
+        strategy="trend",
+        target_position=0.01,
+        timestamp=opened_at,
+        trace_id="seed-position",
+        reason="seed_position",
+        manual_fill={"entry_price": 8.45, "quantity": 100},
+    )
+    feature_record = service._feature_schema_registry.register_feature_names(
+        feature_names=["liquidity_score"],
+        feature_schema_id="feature_schema_rejected_buy",
+        feature_engineer_version="test",
+        code_version="git:test",
+    )
+    label_record = service._label_policy_registry.register_from_config(
+        config.labels,
+        label_policy_id="label_policy_rejected_buy",
+    )
+    snapshot = SignalSnapshot(
+        snapshot_id="snapshot-rejected-buy",
+        code_version="git:test",
+        symbol="000001",
+        strategy="trend",
+        decision_time=opened_at,
+        feature_vector={"liquidity_score": 0.8},
+        feature_schema_id=feature_record.feature_schema_id,
+        feature_schema_hash=feature_record.feature_schema_hash,
+        runtime_config_hash="runtime_hash_rejected_buy",
+        label_policy_id=label_record.label_policy_id,
+        label_policy_hash=label_record.label_policy_hash,
+    )
+    service._sample_store.write_snapshot(snapshot)
+    service._sample_store.upsert_outcome(
+        OutcomeRecord(
+            snapshot_id=snapshot.snapshot_id,
+            maturity_status=MaturityStatus.LABEL_MATURED,
+        )
+    )
+    _patch_attr(
+        service,
+        "_build_week5_symbol_market_payload",
+        lambda **kwargs: {
+            "last_price": 10.08,
+            "open_price": 10.0,
+            "prev_close": 9.9,
+            "ask_levels": [{"level": 1, "price": 10.1, "volume": 5000}],
+            "bid_levels": [{"level": 1, "price": 10.0, "volume": 4000}],
+        },
+    )
+    _patch_attr(
+        service,
+        "_fetch_market_depth_snapshots",
+        lambda **kwargs: {
+            "000001": {
+                "available": True,
+                "ask_levels": [{"level": 1, "price": 10.1, "volume": 5000}],
+                "bid_levels": [{"level": 1, "price": 10.0, "volume": 4000}],
+            }
+        },
+    )
+    _patch_attr(service, "_build_c3_position_management_items", lambda **kwargs: [])
+    _patch_attr(service, "_resolve_latest_close_price", lambda **kwargs: 10.0)
+    signal = PipelineSignal(
+        symbol="000001",
+        strategy="trend",
+        score=80.0,
+        grade="A",
+        action="buy",
+        target_position=0.05,
+        probabilities={"lgbm": 0.8, "xgb": 0.8, "meta": 0.8},
+        reasons=["sample_rejected_buy"],
+        decision_trace={"learning_protocol": {"snapshot_id": snapshot.snapshot_id}},
+    )
+
+    update = service._apply_live_auto_portfolio_signals(
+        trace_id="trace-rejected-buy",
+        timestamp=datetime.fromisoformat("2026-03-11T09:40:00"),
+        signals=[signal],
+        use_live_runtime=True,
+    )
+    learning = service._update_learning_outcomes_from_portfolio_update(
+        signals=[signal],
+        portfolio_update=update,
+        timestamp=datetime.fromisoformat("2026-03-11T09:40:00"),
+    )
+    outcome = service._sample_store.get_outcome(snapshot.snapshot_id)
+
+    assert update["skipped_max_holdings"] == 1
+    executions = _as_mapping_list(update["executions"])
+    rejected = next(item for item in executions if item["status"] == "rejected_max_holdings")
+    assert rejected["quantity"] == 0
+    assert learning["updated"] == 1
+    assert outcome is not None
+    assert outcome.execution_fill_ratio == 0.0
+    assert outcome.realized_slippage_bp is None
 
 
 def test_service_live_auto_execution_closes_position_on_sell_signal() -> None:

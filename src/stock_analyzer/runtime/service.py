@@ -37,16 +37,16 @@ from stock_analyzer.data.provider_factory import (
     build_realtime_runtime_provider,
     build_runtime_provider,
 )
+from stock_analyzer.evolution.champion_shadow_report import ChampionShadowReportBuilder
 from stock_analyzer.evolution.core.fusion import ScoreFusionEngine
 from stock_analyzer.evolution.governance.compliance import (
     ComplianceState,
 )
-from stock_analyzer.evolution.champion_shadow_report import ChampionShadowReportBuilder
 from stock_analyzer.evolution.llm_semantic import OpenAICompatibleNewsJudge
-from stock_analyzer.evolution.shadow_online_v2_report import ShadowOnlineV2ReportBuilder
-from stock_analyzer.evolution.shadow_dataset_builder import ShadowDatasetBuilder
 from stock_analyzer.evolution.modules.m6_counterparty import evaluate_m6_counterparty
 from stock_analyzer.evolution.orchestrator import OffhoursEvolutionOrchestrator
+from stock_analyzer.evolution.shadow_dataset_builder import ShadowDatasetBuilder
+from stock_analyzer.evolution.shadow_online_v2_report import ShadowOnlineV2ReportBuilder
 from stock_analyzer.feature.engineer import FeatureEngineer
 from stock_analyzer.feature.market_context import build_market_relative_frame
 from stock_analyzer.infra.cache import CacheStore, InMemoryCache, RedisCache
@@ -62,9 +62,9 @@ from stock_analyzer.learning.sample_schema import (
 )
 from stock_analyzer.learning.sample_store import SampleStore
 from stock_analyzer.market_calendar import is_a_share_trading_day
+from stock_analyzer.models.adapters import inspect_model_backend_dependencies
 from stock_analyzer.models.artifact import ModelArtifact
 from stock_analyzer.models.registry import ModelLifecycleState, ModelRegistry, ModelRole
-from stock_analyzer.models.adapters import inspect_model_backend_dependencies
 from stock_analyzer.models.trainer import ModelTrainer
 from stock_analyzer.notify.channels import NotificationMessage
 from stock_analyzer.notify.filter import NotificationFilter, is_quiet_time
@@ -1656,17 +1656,28 @@ class StockAnalyzerService:
         quantity: int,
     ) -> bool:
         normalized_status = status.strip().lower()
-        if normalized_status not in {"opened", "adjusted", "trimmed", "closed"}:
+        filled_statuses = {"opened", "adjusted", "trimmed", "closed"}
+        rejected_statuses = {
+            "rejected_no_cash",
+            "rejected_max_holdings",
+            "rejected_same_sector",
+            "rejected_execution",
+            "rejected_price_unavailable",
+            "rejected_quantity",
+        }
+        if normalized_status not in filled_statuses | rejected_statuses:
             return False
         update_payload: dict[str, object] = {}
-        if quantity > 0 or normalized_status in {"opened", "adjusted", "trimmed", "closed"}:
+        if normalized_status in filled_statuses:
             update_payload["execution_fill_ratio"] = 1.0
+        elif normalized_status in rejected_statuses:
+            update_payload["execution_fill_ratio"] = 0.0
         slippage_bp = _calculate_execution_slippage_bp(
             side=side,
             execution_price=execution_price,
             reference_price=reference_price,
         )
-        if slippage_bp is not None:
+        if slippage_bp is not None and normalized_status in filled_statuses:
             update_payload["realized_slippage_bp"] = slippage_bp
         if not update_payload:
             return False
@@ -11511,6 +11522,33 @@ class StockAnalyzerService:
             market_cache[symbol] = payload
             return payload
 
+        def _append_rejected_buy_execution(
+            *,
+            signal: PipelineSignal,
+            symbol: str,
+            status: str,
+            reason: str,
+            price: float = 0.0,
+            price_source: str = "",
+        ) -> None:
+            executions.append(
+                {
+                    "trade_id": f"SKIP-{trace_id[:8]}-{symbol}-{status}",
+                    "symbol": symbol,
+                    "side": "buy",
+                    "status": status,
+                    "strategy": str(signal.strategy).strip() or "trend",
+                    "target_position": round(max(0.0, float(signal.target_position)), 4),
+                    "price": round(price, 6) if price > 0 else 0.0,
+                    "quantity": 0,
+                    "amount": 0.0,
+                    "fee": 0.0,
+                    "price_source": price_source.strip() or "no_fill",
+                    "trade_time": timestamp.isoformat(),
+                    "reason": reason,
+                }
+            )
+
         exit_plan_items = self._build_c3_position_management_items(
             now=timestamp,
             persist_peak_state=True,
@@ -11760,10 +11798,28 @@ class StockAnalyzerService:
             lot_size = self._simulation_lot_size()
             if trade_price <= 0 or desired_cash < trade_price * lot_size:
                 skipped_no_cash += 1
+                status = "rejected_price_unavailable" if trade_price <= 0 else "rejected_no_cash"
+                reason = "auto_simulated_buy_price_unavailable" if trade_price <= 0 else "auto_simulated_buy_no_cash"
+                _append_rejected_buy_execution(
+                    signal=signal,
+                    symbol=symbol,
+                    status=status,
+                    reason=reason,
+                    price=trade_price,
+                    price_source=price_source,
+                )
                 continue
             quantity = int(desired_cash // (trade_price * lot_size)) * lot_size
             if quantity <= 0:
                 skipped_no_cash += 1
+                _append_rejected_buy_execution(
+                    signal=signal,
+                    symbol=symbol,
+                    status="rejected_quantity",
+                    reason="auto_simulated_buy_quantity_zero",
+                    price=trade_price,
+                    price_source=price_source,
+                )
                 continue
             notional = trade_price * quantity
             fee = self._estimate_simulated_trade_fee(side="buy", notional=notional)
@@ -11775,6 +11831,14 @@ class StockAnalyzerService:
                 total_cost = notional + fee
             if quantity <= 0:
                 skipped_no_cash += 1
+                _append_rejected_buy_execution(
+                    signal=signal,
+                    symbol=symbol,
+                    status="rejected_no_cash",
+                    reason="auto_simulated_buy_no_cash_after_fee",
+                    price=trade_price,
+                    price_source=price_source,
+                )
                 continue
 
             status = self._portfolio.set_manual_position(
@@ -11796,11 +11860,35 @@ class StockAnalyzerService:
             )
             if status == "rejected_max_holdings":
                 skipped_max_holdings += 1
+                _append_rejected_buy_execution(
+                    signal=signal,
+                    symbol=symbol,
+                    status=status,
+                    reason="auto_simulated_buy_max_holdings",
+                    price=trade_price,
+                    price_source=price_source,
+                )
                 continue
             if status == "rejected_same_sector":
                 skipped_same_sector += 1
+                _append_rejected_buy_execution(
+                    signal=signal,
+                    symbol=symbol,
+                    status=status,
+                    reason="auto_simulated_buy_same_sector",
+                    price=trade_price,
+                    price_source=price_source,
+                )
                 continue
             if status not in {"opened", "adjusted"}:
+                _append_rejected_buy_execution(
+                    signal=signal,
+                    symbol=symbol,
+                    status="rejected_execution",
+                    reason=status or "auto_simulated_buy_rejected",
+                    price=trade_price,
+                    price_source=price_source,
+                )
                 continue
             available_cash = round(available_cash - (notional + fee), 2)
             opened += 1 if status == "opened" else 0

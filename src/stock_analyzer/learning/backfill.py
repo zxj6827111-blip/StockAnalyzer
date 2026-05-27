@@ -16,13 +16,13 @@ from stock_analyzer.data.provider import MarketDataProvider
 from stock_analyzer.feature.engineer import FeatureEngineer
 from stock_analyzer.feature.market_context import build_market_relative_frame
 from stock_analyzer.learning.dataset_manifest import DatasetManifestBuilder
-from stock_analyzer.learning.feedback_features import (
-    ensure_feedback_feature_frame,
-    merge_feedback_feature_vector,
-)
 from stock_analyzer.learning.feature_schema_registry import (
     FeatureSchemaRecord,
     FeatureSchemaRegistry,
+)
+from stock_analyzer.learning.feedback_features import (
+    ensure_feedback_feature_frame,
+    merge_feedback_feature_vector,
 )
 from stock_analyzer.learning.label_policy_registry import LabelPolicyRecord, LabelPolicyRegistry
 from stock_analyzer.learning.sample_schema import (
@@ -658,7 +658,9 @@ class LearningBackfillEngine:
         source: str = "runtime_history_archive",
     ) -> dict[str, object]:
         normalized_source = source.strip().lower() or "runtime_history_archive"
-        normalized_archive_path = Path(str(archive_path)).expanduser() if str(archive_path).strip() else None
+        normalized_archive_path = (
+            Path(str(archive_path)).expanduser() if str(archive_path).strip() else None
+        )
         if archive_payload is None and normalized_archive_path is None:
             return {
                 "ok": False,
@@ -817,6 +819,26 @@ class LearningBackfillEngine:
                 for snapshot_id in result["snapshot_ids"]:
                     touched_snapshot_ids.add(snapshot_id)
 
+                try:
+                    result = self._apply_runtime_archive_pipeline_execution_event(
+                        event=event,
+                        snapshot_ids_by_symbol=snapshot_ids_by_symbol,
+                        latest_signal_by_symbol=latest_signal_by_symbol,
+                        default_timestamp=generated_at,
+                        source=normalized_source,
+                    )
+                except Exception as exc:
+                    errors.append(f"pipeline_execution_event:{exc}")
+                    continue
+                execution_updates += result["updated"]
+                portfolio_trade_events_linked += result["linked"]
+                for symbol in result["symbols"]:
+                    touched_symbols.add(symbol)
+                for snapshot_id in result["snapshot_ids"]:
+                    touched_snapshot_ids.add(snapshot_id)
+                for snapshot_id in result["missing_snapshot_ids"]:
+                    missing_snapshot_ids.add(str(snapshot_id))
+
         try:
             result = self._apply_runtime_archive_portfolio_trades(
                 archive_payload=payload,
@@ -862,7 +884,9 @@ class LearningBackfillEngine:
         return {
             "ok": not errors,
             "mode": "runtime_history_archive_backfill",
-            "archive_path": str(normalized_archive_path) if normalized_archive_path is not None else "",
+            "archive_path": (
+                str(normalized_archive_path) if normalized_archive_path is not None else ""
+            ),
             "archive_day": archive_day,
             "generated_at": generated_at.isoformat(),
             "contexts_enriched": contexts_enriched,
@@ -1084,6 +1108,43 @@ class LearningBackfillEngine:
             "missing_snapshot_id": missing_snapshot_id,
         }
 
+    def _apply_runtime_archive_pipeline_execution_event(
+        self,
+        *,
+        event: Mapping[str, object],
+        snapshot_ids_by_symbol: Mapping[str, str],
+        latest_signal_by_symbol: Mapping[str, Mapping[str, object]],
+        default_timestamp: datetime,
+        source: str,
+    ) -> dict[str, object]:
+        if str(event.get("event_type", "")).strip().lower() != "pipeline_run":
+            return {
+                "updated": 0,
+                "linked": 0,
+                "symbols": [],
+                "snapshot_ids": [],
+                "missing_snapshot_ids": [],
+            }
+        payload = _coerce_mapping(event.get("payload"))
+        portfolio_update = _coerce_mapping(payload.get("portfolio_update"))
+        raw_executions = portfolio_update.get("executions")
+        if not isinstance(raw_executions, list):
+            return {
+                "updated": 0,
+                "linked": 0,
+                "symbols": [],
+                "snapshot_ids": [],
+                "missing_snapshot_ids": [],
+            }
+        event_time = _parse_optional_datetime(event.get("timestamp")) or default_timestamp
+        return self._apply_runtime_archive_execution_items(
+            raw_items=raw_executions,
+            snapshot_ids_by_symbol=snapshot_ids_by_symbol,
+            latest_signal_by_symbol=latest_signal_by_symbol,
+            default_timestamp=event_time,
+            source=source,
+        )
+
     def _apply_runtime_archive_portfolio_trades(
         self,
         *,
@@ -1104,6 +1165,25 @@ class LearningBackfillEngine:
                 "missing_snapshot_ids": [],
             }
 
+        return self._apply_runtime_archive_execution_items(
+            raw_items=raw_trades,
+            snapshot_ids_by_symbol=snapshot_ids_by_symbol,
+            latest_signal_by_symbol=latest_signal_by_symbol,
+            default_timestamp=default_timestamp,
+            source=source,
+            legacy_portfolio_trades=True,
+        )
+
+    def _apply_runtime_archive_execution_items(
+        self,
+        *,
+        raw_items: Sequence[object],
+        snapshot_ids_by_symbol: Mapping[str, str],
+        latest_signal_by_symbol: Mapping[str, Mapping[str, object]],
+        default_timestamp: datetime,
+        source: str,
+        legacy_portfolio_trades: bool = False,
+    ) -> dict[str, object]:
         updated = 0
         linked = 0
         touched_symbols: list[str] = []
@@ -1111,7 +1191,7 @@ class LearningBackfillEngine:
         missing_snapshot_ids: list[str] = []
         seen_snapshot_ids: set[str] = set()
 
-        for item in raw_trades:
+        for item in raw_items:
             trade = _coerce_mapping(item)
             side = str(trade.get("side", "")).strip().lower()
             if side != "buy":
@@ -1132,17 +1212,29 @@ class LearningBackfillEngine:
                 trade=trade,
                 latest_signal=latest_signal_by_symbol.get(symbol, {}),
             )
-            execution_price = _as_float(trade.get("entry_price"), default=0.0)
-            update_payload: dict[str, object] = {"execution_fill_ratio": 1.0}
+            execution_price = _runtime_archive_execution_price(trade)
+            update_payload = _runtime_archive_execution_update_payload(
+                trade=trade,
+                legacy_portfolio_trade=legacy_portfolio_trades,
+            )
+            if not update_payload:
+                continue
             slippage_bp = _calculate_archive_execution_slippage_bp(
                 side="buy",
                 execution_price=execution_price,
                 reference_price=reference_price,
             )
-            if slippage_bp is not None:
+            if (
+                slippage_bp is not None
+                and _as_float(update_payload.get("execution_fill_ratio"), default=0.0) > 0.0
+            ):
                 update_payload["realized_slippage_bp"] = slippage_bp
 
-            event_time = _parse_optional_datetime(trade.get("timestamp")) or default_timestamp
+            event_time = (
+                _parse_optional_datetime(trade.get("timestamp"))
+                or _parse_optional_datetime(trade.get("trade_time"))
+                or default_timestamp
+            )
             changed, missing_snapshot_id = self._update_outcome_from_runtime_archive(
                 snapshot_id=snapshot_id,
                 timestamp=event_time,
@@ -1555,8 +1647,10 @@ class LearningBackfillEngine:
         for feature_record in feature_records:
             if feature_record is None:
                 continue
-            compatible_records = self._feature_schema_registry.resolve_projection_compatible_records(
-                feature_record.feature_schema_id
+            compatible_records = (
+                self._feature_schema_registry.resolve_projection_compatible_records(
+                    feature_record.feature_schema_id
+                )
             )
             allowed_feature_schemas = {
                 record.feature_schema_id: record.feature_schema_hash
@@ -2053,6 +2147,37 @@ def _runtime_archive_reference_price_for_trade(
     if value > 0:
         return value
     return _as_float(latest_signal.get("reference_price"), default=0.0)
+
+
+def _runtime_archive_execution_price(trade: Mapping[str, object]) -> float:
+    for field_name in ("entry_price", "price", "execution_price"):
+        value = _as_float(trade.get(field_name), default=0.0)
+        if value > 0:
+            return value
+    return 0.0
+
+
+def _runtime_archive_execution_update_payload(
+    *,
+    trade: Mapping[str, object],
+    legacy_portfolio_trade: bool = False,
+) -> dict[str, object]:
+    normalized_status = str(trade.get("status", "")).strip().lower()
+    filled_statuses = {"opened", "adjusted", "trimmed", "closed"}
+    rejected_statuses = {
+        "rejected_no_cash",
+        "rejected_max_holdings",
+        "rejected_same_sector",
+        "rejected_execution",
+        "rejected_price_unavailable",
+        "rejected_quantity",
+    }
+    quantity = _as_float(trade.get("quantity"), default=0.0)
+    if normalized_status in rejected_statuses:
+        return {"execution_fill_ratio": 0.0}
+    if normalized_status in filled_statuses or (legacy_portfolio_trade and quantity > 0):
+        return {"execution_fill_ratio": 1.0}
+    return {}
 
 
 def _parse_optional_datetime(value: object) -> datetime | None:

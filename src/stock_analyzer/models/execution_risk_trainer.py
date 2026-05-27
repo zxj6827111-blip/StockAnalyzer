@@ -29,6 +29,7 @@ FloatArray = npt.NDArray[np.float64]
 @dataclass(frozen=True, slots=True)
 class ExecutionRiskTrainingConfig:
     min_samples_per_target: int = 24
+    min_class_samples_per_target: int = 3
     calibration_ratio: float = 0.2
     test_ratio: float = 0.2
     learning_rate: float = 0.05
@@ -66,8 +67,10 @@ def diagnose_execution_risk_dataset(
 
     resolved_config = config or ExecutionRiskTrainingConfig()
     min_samples = max(4, int(resolved_config.min_samples_per_target))
+    min_class_samples = max(1, int(resolved_config.min_class_samples_per_target))
     target_row_counts: dict[str, int] = {}
     target_class_counts: dict[str, dict[str, int]] = {}
+    target_trainability: dict[str, dict[str, object]] = {}
     skipped_targets: dict[str, str] = {}
     trainable_targets: list[str] = []
 
@@ -81,11 +84,37 @@ def diagnose_execution_risk_dataset(
             "negative": negative_count,
             "positive": positive_count,
         }
+        detail: dict[str, object] = {
+            "rows": len(rows),
+            "positive": positive_count,
+            "negative": negative_count,
+            "min_samples_per_target": min_samples,
+            "min_class_samples_per_target": min_class_samples,
+            "sample_deficit": max(0, min_samples - len(rows)),
+            "positive_deficit": max(0, min_class_samples - positive_count),
+            "negative_deficit": max(0, min_class_samples - negative_count),
+            "minority_count": min(positive_count, negative_count),
+            "minority_deficit": max(0, min_class_samples - min(positive_count, negative_count)),
+            "split_lengths": {},
+            "train_positive": 0,
+            "train_negative": 0,
+            "train_minority_count": 0,
+            "train_minority_deficit": min_class_samples,
+        }
         if len(rows) < min_samples:
             skipped_targets[target_name] = "insufficient_samples"
+            detail["skipped_reason"] = "insufficient_samples"
+            target_trainability[target_name] = detail
             continue
         if positive_count <= 0 or negative_count <= 0:
             skipped_targets[target_name] = "single_class_target"
+            detail["skipped_reason"] = "single_class_target"
+            target_trainability[target_name] = detail
+            continue
+        if min(positive_count, negative_count) < min_class_samples:
+            skipped_targets[target_name] = "minority_class_too_small"
+            detail["skipped_reason"] = "minority_class_too_small"
+            target_trainability[target_name] = detail
             continue
         split = _build_target_split(
             total_rows=len(rows),
@@ -97,15 +126,29 @@ def diagnose_execution_risk_dataset(
             "calibration": len(rows[split.calibration_slice]),
             "test": len(rows[split.test_slice]),
         }
+        detail["split_lengths"] = split_lengths
         if min(split_lengths.values()) <= 0:
             skipped_targets[target_name] = "empty_split"
+            detail["skipped_reason"] = "empty_split"
+            target_trainability[target_name] = detail
             continue
         train_labels = labels[split.train_slice]
         train_positive_count = sum(1 for value in train_labels if value >= 0.5)
         train_negative_count = len(train_labels) - train_positive_count
+        detail["train_positive"] = train_positive_count
+        detail["train_negative"] = train_negative_count
+        detail["train_minority_count"] = min(train_positive_count, train_negative_count)
+        detail["train_minority_deficit"] = max(
+            0,
+            min_class_samples - min(train_positive_count, train_negative_count),
+        )
         if train_positive_count <= 0 or train_negative_count <= 0:
             skipped_targets[target_name] = "single_class_train_split"
+            detail["skipped_reason"] = "single_class_train_split"
+            target_trainability[target_name] = detail
             continue
+        detail["skipped_reason"] = ""
+        target_trainability[target_name] = detail
         trainable_targets.append(target_name)
 
     return {
@@ -120,6 +163,7 @@ def diagnose_execution_risk_dataset(
         "target_coverage": dict(dataset.target_coverage),
         "target_row_counts": target_row_counts,
         "target_class_counts": target_class_counts,
+        "target_trainability": target_trainability,
         "outcome_coverage": _diagnose_outcome_coverage(
             outcomes=outcomes or [],
             requested_maturity_statuses=dataset.requested_maturity_statuses,
@@ -128,6 +172,7 @@ def diagnose_execution_risk_dataset(
         "trainable_targets": sorted(trainable_targets),
         "skipped_targets": skipped_targets,
         "min_samples_per_target": min_samples,
+        "min_class_samples_per_target": min_class_samples,
         "can_train": bool(dataset.rows and dataset.feature_names and trainable_targets),
     }
 
@@ -207,6 +252,7 @@ class ExecutionRiskTrainer:
         target_metrics: dict[str, dict[str, float]] = {}
         target_row_counts: dict[str, int] = {}
         skipped_targets: dict[str, str] = {}
+        min_class_samples = max(1, int(self._config.min_class_samples_per_target))
 
         for target_name in _ordered_targets(dataset=dataset):
             rows = dataset.rows_for_target(target_name)
@@ -225,6 +271,11 @@ class ExecutionRiskTrainer:
             y = np.asarray([float(row.targets[target_name]) for row in rows], dtype=float)
             if len(np.unique(y)) < 2:
                 skipped_targets[target_name] = "single_class_target"
+                continue
+            positive_count = int(np.sum(y >= 0.5))
+            negative_count = int(len(y) - positive_count)
+            if min(positive_count, negative_count) < min_class_samples:
+                skipped_targets[target_name] = "minority_class_too_small"
                 continue
 
             split = _build_target_split(
