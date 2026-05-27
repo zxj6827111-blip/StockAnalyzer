@@ -565,6 +565,70 @@ def test_service_train_execution_risk_model_persists_status_and_history(tmp_path
     assert int(audit_payload["records"]) >= 1
 
 
+def test_service_train_execution_risk_model_returns_preflight_when_targets_not_trainable(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config(tmp_path)
+    service = _new_service(config, provider=FailingBarsProvider())
+    feature_record = service._feature_schema_registry.register_feature_names(
+        feature_names=["feature_a"],
+        feature_engineer_version="test",
+        code_version="git:test",
+    )
+    label_record = service._label_policy_registry.register_from_config(service._config.labels)
+    base_time = datetime(2026, 3, 1, 14, 30, tzinfo=UTC)
+    for index in range(30):
+        snapshot = SignalSnapshot(
+            snapshot_id=f"single-class-{index:03d}",
+            code_version="git:test",
+            symbol="600000",
+            strategy="trend",
+            decision_time=base_time + timedelta(days=index),
+            feature_vector={"feature_a": float(index)},
+            feature_schema_id=feature_record.feature_schema_id,
+            feature_schema_hash=feature_record.feature_schema_hash,
+            runtime_config_hash="runtime_hash_test",
+            label_policy_id=label_record.label_policy_id,
+            label_policy_hash=label_record.label_policy_hash,
+        )
+        service._sample_store.write_snapshot(snapshot)
+        service._sample_store.upsert_outcome(
+            OutcomeRecord(
+                snapshot_id=snapshot.snapshot_id,
+                maturity_status=MaturityStatus.RECONCILED,
+                reconcile_status="ok",
+                sim_vs_broker_diff=0.0,
+                backfill_fidelity_tier=BackfillFidelityTier.GOLD,
+                backfill_source="runtime_history_archive",
+            )
+        )
+
+    payload = _as_mapping(
+        service.train_execution_risk_model(
+            artifact_path=str(tmp_path / "execution_risk.json"),
+            min_samples_per_target=24,
+        )
+    )
+    audit_payload = _as_mapping(
+        service.audit_events(limit=20, event_type="execution_risk_model_training_blocked")
+    )
+    status = _as_mapping(service.execution_risk_status())
+    history = _as_mapping(service.execution_risk_training_history(limit=5))
+
+    assert payload["ok"] is False
+    assert payload["status"] == "blocked_no_trainable_targets"
+    assert payload["trained_targets"] == []
+    assert Path(str(tmp_path / "execution_risk.json")).exists() is False
+    assert _as_mapping(payload["target_class_counts"])["reconcile_mismatch_risk"] == {
+        "negative": 30,
+        "positive": 0,
+    }
+    assert _as_mapping(status["latest"])["status"] == "blocked_no_trainable_targets"
+    assert status["artifact_exists"] is False
+    assert int(history["records"]) >= 1
+    assert int(audit_payload["records"]) >= 1
+
+
 def test_service_build_execution_aware_report_emits_execution_reranking_payload(
     tmp_path: Path,
 ) -> None:

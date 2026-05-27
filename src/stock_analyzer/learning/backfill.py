@@ -736,12 +736,14 @@ class LearningBackfillEngine:
         generated_at = _parse_optional_datetime(payload.get("generated_at")) or datetime.now(UTC)
         recommendation_snapshot_ids: dict[str, str] = {}
         snapshot_ids_by_symbol: dict[str, str] = {}
+        latest_signal_by_symbol: dict[str, dict[str, object]] = {}
         touched_symbols: set[str] = set()
         touched_snapshot_ids: set[str] = set()
         missing_snapshot_ids: set[str] = set()
         contexts_enriched = 0
         execution_updates = 0
         command_events_linked = 0
+        portfolio_trade_events_linked = 0
         reconcile_updates = 0
         reconcile_promoted = 0
         errors: list[str] = []
@@ -759,6 +761,7 @@ class LearningBackfillEngine:
                 snapshot_id = _extract_archive_snapshot_id(signal_row)
                 if symbol and snapshot_id:
                     snapshot_ids_by_symbol[symbol] = snapshot_id
+                    latest_signal_by_symbol[symbol] = signal_row
                 if recommendation_id and snapshot_id:
                     recommendation_snapshot_ids[recommendation_id] = snapshot_id
 
@@ -814,6 +817,26 @@ class LearningBackfillEngine:
                 for snapshot_id in result["snapshot_ids"]:
                     touched_snapshot_ids.add(snapshot_id)
 
+        try:
+            result = self._apply_runtime_archive_portfolio_trades(
+                archive_payload=payload,
+                snapshot_ids_by_symbol=snapshot_ids_by_symbol,
+                latest_signal_by_symbol=latest_signal_by_symbol,
+                default_timestamp=generated_at,
+                source=normalized_source,
+            )
+        except Exception as exc:
+            errors.append(f"portfolio_trades:{exc}")
+        else:
+            execution_updates += result["updated"]
+            portfolio_trade_events_linked += result["linked"]
+            for symbol in result["symbols"]:
+                touched_symbols.add(symbol)
+            for snapshot_id in result["snapshot_ids"]:
+                touched_snapshot_ids.add(snapshot_id)
+            for snapshot_id in result["missing_snapshot_ids"]:
+                missing_snapshot_ids.add(str(snapshot_id))
+
         reconcile_report = self._select_runtime_archive_reconcile_report(payload=payload)
         if reconcile_report:
             try:
@@ -845,6 +868,7 @@ class LearningBackfillEngine:
             "contexts_enriched": contexts_enriched,
             "execution_updates": execution_updates,
             "command_events_linked": command_events_linked,
+            "portfolio_trade_events_linked": portfolio_trade_events_linked,
             "reconcile_updates": reconcile_updates,
             "reconcile_promoted": reconcile_promoted,
             "symbols": sorted(touched_symbols),
@@ -878,6 +902,7 @@ class LearningBackfillEngine:
                 "contexts_enriched": 0,
                 "execution_updates": 0,
                 "command_events_linked": 0,
+                "portfolio_trade_events_linked": 0,
                 "reconcile_updates": 0,
                 "reconcile_promoted": 0,
                 "symbols": [],
@@ -889,6 +914,7 @@ class LearningBackfillEngine:
         contexts_enriched = 0
         execution_updates = 0
         command_events_linked = 0
+        portfolio_trade_events_linked = 0
         reconcile_updates = 0
         reconcile_promoted = 0
         touched_symbols: set[str] = set()
@@ -910,6 +936,9 @@ class LearningBackfillEngine:
             contexts_enriched += int(result.get("contexts_enriched", 0))
             execution_updates += int(result.get("execution_updates", 0))
             command_events_linked += int(result.get("command_events_linked", 0))
+            portfolio_trade_events_linked += int(
+                result.get("portfolio_trade_events_linked", 0)
+            )
             reconcile_updates += int(result.get("reconcile_updates", 0))
             reconcile_promoted += int(result.get("reconcile_promoted", 0))
             for item in result.get("symbols", []):
@@ -941,6 +970,7 @@ class LearningBackfillEngine:
             "contexts_enriched": contexts_enriched,
             "execution_updates": execution_updates,
             "command_events_linked": command_events_linked,
+            "portfolio_trade_events_linked": portfolio_trade_events_linked,
             "reconcile_updates": reconcile_updates,
             "reconcile_promoted": reconcile_promoted,
             "symbols": sorted(touched_symbols),
@@ -1052,6 +1082,89 @@ class LearningBackfillEngine:
             "symbols": [symbol] if updated and symbol else [],
             "snapshot_ids": [snapshot_id] if updated else [],
             "missing_snapshot_id": missing_snapshot_id,
+        }
+
+    def _apply_runtime_archive_portfolio_trades(
+        self,
+        *,
+        archive_payload: Mapping[str, object],
+        snapshot_ids_by_symbol: Mapping[str, str],
+        latest_signal_by_symbol: Mapping[str, Mapping[str, object]],
+        default_timestamp: datetime,
+        source: str,
+    ) -> dict[str, object]:
+        raw_portfolio = _coerce_mapping(archive_payload.get("portfolio"))
+        raw_trades = raw_portfolio.get("trades")
+        if not isinstance(raw_trades, list):
+            return {
+                "updated": 0,
+                "linked": 0,
+                "symbols": [],
+                "snapshot_ids": [],
+                "missing_snapshot_ids": [],
+            }
+
+        updated = 0
+        linked = 0
+        touched_symbols: list[str] = []
+        touched_snapshot_ids: list[str] = []
+        missing_snapshot_ids: list[str] = []
+        seen_snapshot_ids: set[str] = set()
+
+        for item in raw_trades:
+            trade = _coerce_mapping(item)
+            side = str(trade.get("side", "")).strip().lower()
+            if side != "buy":
+                continue
+            symbol = _normalize_symbol(trade.get("symbol"))
+            if not symbol:
+                continue
+            snapshot_id = _runtime_archive_snapshot_id_for_trade(
+                trade=trade,
+                snapshot_ids_by_symbol=snapshot_ids_by_symbol,
+                latest_signal_by_symbol=latest_signal_by_symbol,
+            )
+            if not snapshot_id or snapshot_id in seen_snapshot_ids:
+                continue
+            seen_snapshot_ids.add(snapshot_id)
+
+            reference_price = _runtime_archive_reference_price_for_trade(
+                trade=trade,
+                latest_signal=latest_signal_by_symbol.get(symbol, {}),
+            )
+            execution_price = _as_float(trade.get("entry_price"), default=0.0)
+            update_payload: dict[str, object] = {"execution_fill_ratio": 1.0}
+            slippage_bp = _calculate_archive_execution_slippage_bp(
+                side="buy",
+                execution_price=execution_price,
+                reference_price=reference_price,
+            )
+            if slippage_bp is not None:
+                update_payload["realized_slippage_bp"] = slippage_bp
+
+            event_time = _parse_optional_datetime(trade.get("timestamp")) or default_timestamp
+            changed, missing_snapshot_id = self._update_outcome_from_runtime_archive(
+                snapshot_id=snapshot_id,
+                timestamp=event_time,
+                updates=update_payload,
+                source=source,
+            )
+            linked += 1
+            if missing_snapshot_id:
+                missing_snapshot_ids.append(missing_snapshot_id)
+                continue
+            if not changed:
+                continue
+            updated += 1
+            touched_symbols.append(symbol)
+            touched_snapshot_ids.append(snapshot_id)
+
+        return {
+            "updated": updated,
+            "linked": linked,
+            "symbols": sorted(set(touched_symbols)),
+            "snapshot_ids": sorted(set(touched_snapshot_ids)),
+            "missing_snapshot_ids": sorted(set(missing_snapshot_ids)),
         }
 
     def _select_runtime_archive_reconcile_report(
@@ -1859,6 +1972,57 @@ def _extract_archive_snapshot_id(source: object) -> str:
     decision_trace = _coerce_mapping(payload.get("decision_trace"))
     protocol = _coerce_mapping(decision_trace.get("learning_protocol"))
     return str(protocol.get("snapshot_id", "")).strip()
+
+
+def _runtime_archive_snapshot_id_for_trade(
+    *,
+    trade: Mapping[str, object],
+    snapshot_ids_by_symbol: Mapping[str, str],
+    latest_signal_by_symbol: Mapping[str, Mapping[str, object]],
+) -> str:
+    snapshot_id = _extract_archive_snapshot_id(trade)
+    if snapshot_id:
+        return snapshot_id
+    recommendation_id = str(trade.get("recommendation_id", "")).strip().upper()
+    if recommendation_id:
+        raw_signals = [
+            item
+            for item in latest_signal_by_symbol.values()
+            if str(item.get("recommendation_id", "")).strip().upper() == recommendation_id
+        ]
+        for signal in raw_signals:
+            snapshot_id = _extract_archive_snapshot_id(signal)
+            if snapshot_id:
+                return snapshot_id
+    symbol = _normalize_symbol(trade.get("symbol"))
+    if not symbol:
+        return ""
+    latest_signal = latest_signal_by_symbol.get(symbol, {})
+    snapshot_id = _extract_archive_snapshot_id(latest_signal)
+    if snapshot_id:
+        return snapshot_id
+    return str(snapshot_ids_by_symbol.get(symbol, "")).strip()
+
+
+def _runtime_archive_reference_price_for_trade(
+    *,
+    trade: Mapping[str, object],
+    latest_signal: Mapping[str, object],
+) -> float:
+    candidates = (
+        trade.get("reference_price"),
+        trade.get("recommended_price"),
+        trade.get("signal_price"),
+    )
+    for item in candidates:
+        value = _as_float(item, default=0.0)
+        if value > 0:
+            return value
+    signal_trade_plan = _coerce_mapping(latest_signal.get("trade_plan"))
+    value = _as_float(signal_trade_plan.get("reference_price"), default=0.0)
+    if value > 0:
+        return value
+    return _as_float(latest_signal.get("reference_price"), default=0.0)
 
 
 def _parse_optional_datetime(value: object) -> datetime | None:

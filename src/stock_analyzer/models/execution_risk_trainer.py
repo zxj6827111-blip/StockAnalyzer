@@ -54,6 +54,76 @@ class ExecutionRiskTrainResult:
         }
 
 
+def diagnose_execution_risk_dataset(
+    *,
+    dataset: ExecutionRiskDataset,
+    config: ExecutionRiskTrainingConfig | None = None,
+) -> dict[str, object]:
+    """Explain whether an execution-risk dataset can train per-target models."""
+
+    resolved_config = config or ExecutionRiskTrainingConfig()
+    min_samples = max(4, int(resolved_config.min_samples_per_target))
+    target_row_counts: dict[str, int] = {}
+    target_class_counts: dict[str, dict[str, int]] = {}
+    skipped_targets: dict[str, str] = {}
+    trainable_targets: list[str] = []
+
+    for target_name in _ordered_targets(dataset=dataset):
+        rows = dataset.rows_for_target(target_name)
+        target_row_counts[target_name] = len(rows)
+        labels = [float(row.targets[target_name]) for row in rows]
+        positive_count = sum(1 for value in labels if value >= 0.5)
+        negative_count = len(labels) - positive_count
+        target_class_counts[target_name] = {
+            "negative": negative_count,
+            "positive": positive_count,
+        }
+        if len(rows) < min_samples:
+            skipped_targets[target_name] = "insufficient_samples"
+            continue
+        if positive_count <= 0 or negative_count <= 0:
+            skipped_targets[target_name] = "single_class_target"
+            continue
+        split = _build_target_split(
+            total_rows=len(rows),
+            calibration_ratio=float(resolved_config.calibration_ratio),
+            test_ratio=float(resolved_config.test_ratio),
+        )
+        split_lengths = {
+            "train": len(rows[split.train_slice]),
+            "calibration": len(rows[split.calibration_slice]),
+            "test": len(rows[split.test_slice]),
+        }
+        if min(split_lengths.values()) <= 0:
+            skipped_targets[target_name] = "empty_split"
+            continue
+        train_labels = labels[split.train_slice]
+        train_positive_count = sum(1 for value in train_labels if value >= 0.5)
+        train_negative_count = len(train_labels) - train_positive_count
+        if train_positive_count <= 0 or train_negative_count <= 0:
+            skipped_targets[target_name] = "single_class_train_split"
+            continue
+        trainable_targets.append(target_name)
+
+    return {
+        "dataset_id": dataset.dataset_id,
+        "row_count": dataset.row_count,
+        "source_snapshot_count": dataset.source_snapshot_count,
+        "feature_count": len(dataset.feature_names),
+        "requested_maturity_statuses": list(dataset.requested_maturity_statuses),
+        "skipped_missing_outcome": dataset.skipped_missing_outcome,
+        "skipped_by_maturity": dataset.skipped_by_maturity,
+        "skipped_missing_targets": dataset.skipped_missing_targets,
+        "target_coverage": dict(dataset.target_coverage),
+        "target_row_counts": target_row_counts,
+        "target_class_counts": target_class_counts,
+        "trainable_targets": sorted(trainable_targets),
+        "skipped_targets": skipped_targets,
+        "min_samples_per_target": min_samples,
+        "can_train": bool(dataset.rows and dataset.feature_names and trainable_targets),
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class _TargetSplit:
     train_slice: slice
@@ -82,7 +152,25 @@ class ExecutionRiskTrainer:
         max_rows: int | None = None,
         now: datetime | None = None,
     ) -> ExecutionRiskTrainResult:
-        dataset = ExecutionRiskLabelBuilder(
+        dataset = self.build_dataset_from_sample_store(
+            store=store,
+            snapshot_ids=snapshot_ids,
+            maturity_statuses=maturity_statuses,
+            max_rows=max_rows,
+            now=now,
+        )
+        return self.train(dataset=dataset)
+
+    def build_dataset_from_sample_store(
+        self,
+        *,
+        store: SampleStore,
+        snapshot_ids: Sequence[str] | None = None,
+        maturity_statuses: Sequence[MaturityStatus | str] | None = None,
+        max_rows: int | None = None,
+        now: datetime | None = None,
+    ) -> ExecutionRiskDataset:
+        return ExecutionRiskLabelBuilder(
             store=store,
             labeling=self._labeling,
         ).build_dataset(
@@ -91,7 +179,10 @@ class ExecutionRiskTrainer:
             max_rows=max_rows,
             now=now,
         )
-        return self.train(dataset=dataset)
+
+    @property
+    def config(self) -> ExecutionRiskTrainingConfig:
+        return self._config
 
     def train(self, *, dataset: ExecutionRiskDataset) -> ExecutionRiskTrainResult:
         if not dataset.rows:

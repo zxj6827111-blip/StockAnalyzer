@@ -544,6 +544,69 @@ def test_backfill_from_runtime_history_archive_enriches_observed_snapshot_and_ou
     assert outcome.backfill_source == "runtime_history_archive"
 
 
+def test_backfill_from_runtime_history_archive_uses_portfolio_trades_when_command_event_missing(
+    tmp_path: Path,
+) -> None:
+    config, provider, store, feature_registry, label_registry, engine = _build_engine_fixture(
+        tmp_path
+    )
+    snapshot = _seed_observed_snapshot(
+        config=config,
+        provider=provider,
+        store=store,
+        feature_registry=feature_registry,
+        label_registry=label_registry,
+        symbol="600000",
+        end_date=date(2026, 3, 31),
+        row_offset=40,
+        outcome=OutcomeRecord(
+            snapshot_id="placeholder",
+            maturity_status=MaturityStatus.LABEL_MATURED,
+            label_mature_time=datetime(2026, 3, 20, 15, 0, tzinfo=UTC),
+            outcome_updated_at=datetime(2026, 3, 20, 15, 0, tzinfo=UTC),
+        ),
+    )
+    archive_payload = _build_runtime_history_archive_payload(
+        snapshot=snapshot,
+        entry_price=10.18,
+        reference_price=10.0,
+    )
+    archive_payload["runtime"] = {"audit_events": []}
+    archive_payload["portfolio"] = {
+        "positions": [{"symbol": snapshot.symbol, "target_position": 0.2}],
+        "trades": [
+            {
+                "trade_id": "TRD-ARCHIVE-1",
+                "side": "buy",
+                "symbol": snapshot.symbol,
+                "strategy": snapshot.strategy,
+                "target_position": 0.2,
+                "timestamp": "2026-03-31T10:00:00+00:00",
+                "entry_price": 10.18,
+                "quantity": 1000,
+            }
+        ],
+    }
+    latest_signal = archive_payload["latest_signals"]["signals"][0]
+    latest_signal["trade_plan"] = {
+        "reference_price": 10.0,
+    }
+
+    result = engine.backfill_from_runtime_history_archive(archive_payload=archive_payload)
+    outcome = store.get_outcome(snapshot.snapshot_id)
+
+    assert result["ok"] is True
+    assert result["execution_updates"] == 1
+    assert result["command_events_linked"] == 0
+    assert result["portfolio_trade_events_linked"] == 1
+    assert result["reconcile_updates"] == 1
+    assert outcome is not None
+    assert outcome.execution_fill_ratio == 1.0
+    assert outcome.realized_slippage_bp == 180.0
+    assert outcome.reconcile_status == "ok"
+    assert outcome.maturity_status == MaturityStatus.RECONCILED
+
+
 def test_backfill_from_runtime_history_archives_batches_directory_in_day_order(
     tmp_path: Path,
 ) -> None:

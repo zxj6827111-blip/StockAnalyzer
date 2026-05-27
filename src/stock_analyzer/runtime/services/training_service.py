@@ -16,6 +16,7 @@ from stock_analyzer.models.execution_risk_artifact import ExecutionRiskArtifact
 from stock_analyzer.models.execution_risk_trainer import (
     ExecutionRiskTrainer,
     ExecutionRiskTrainingConfig,
+    diagnose_execution_risk_dataset,
 )
 from stock_analyzer.training_diagnostics import (
     build_training_evaluation_report,
@@ -439,12 +440,59 @@ class RuntimeTrainingService:
                 seed=int(seed),
             )
         )
-        result = trainer.train_from_sample_store(
+        dataset = trainer.build_dataset_from_sample_store(
             store=service._sample_store,
             maturity_statuses=resolved_maturity_statuses,
             max_rows=max_rows,
             now=run_now,
         )
+        preflight = diagnose_execution_risk_dataset(
+            dataset=dataset,
+            config=trainer.config,
+        )
+        if not bool(preflight["can_train"]):
+            payload = {
+                "ok": False,
+                "mode": "execution_risk_training",
+                "status": "blocked_no_trainable_targets",
+                "timestamp": run_now.isoformat(),
+                "artifact_path": "",
+                "dataset_id": str(preflight["dataset_id"]),
+                "trained_targets": [],
+                "skipped_targets": dict(preflight["skipped_targets"]),
+                "target_row_counts": dict(preflight["target_row_counts"]),
+                "target_class_counts": dict(preflight["target_class_counts"]),
+                "training_summary": {
+                    "row_count": int(preflight["row_count"]),
+                    "source_snapshot_count": int(preflight["source_snapshot_count"]),
+                    "skipped_missing_outcome": int(preflight["skipped_missing_outcome"]),
+                    "skipped_by_maturity": int(preflight["skipped_by_maturity"]),
+                    "skipped_missing_targets": int(preflight["skipped_missing_targets"]),
+                    "target_coverage": dict(preflight["target_coverage"]),
+                },
+                "preflight": preflight,
+            }
+            self._append_history(
+                history_attr="_execution_risk_training_history",
+                latest_attr="_last_execution_risk_training",
+                record=payload,
+            )
+            service._record_audit_event(
+                event_type="execution_risk_model_training_blocked",
+                level="warn",
+                message="execution risk sidecar training has no trainable targets",
+                payload={
+                    "dataset_id": str(preflight["dataset_id"]),
+                    "row_count": int(preflight["row_count"]),
+                    "target_row_counts": dict(preflight["target_row_counts"]),
+                    "target_class_counts": dict(preflight["target_class_counts"]),
+                    "skipped_targets": dict(preflight["skipped_targets"]),
+                },
+            )
+            service._persist_runtime_state_to_disk()
+            return payload
+
+        result = trainer.train(dataset=dataset)
         resolved_artifact_path = self._resolve_execution_risk_artifact_path(artifact_path)
         result.artifact.save(resolved_artifact_path)
         payload = {
@@ -459,6 +507,7 @@ class RuntimeTrainingService:
             "target_row_counts": dict(result.target_row_counts),
             "target_metrics": {key: dict(value) for key, value in result.target_metrics.items()},
             "training_summary": dict(result.artifact.training_summary),
+            "preflight": preflight,
             "metadata": {
                 **dict(result.artifact.metadata),
                 "dataset_id": result.artifact.dataset_id,

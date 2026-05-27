@@ -15,6 +15,7 @@ from stock_analyzer.models.execution_risk_predictor import ExecutionRiskPredicto
 from stock_analyzer.models.execution_risk_trainer import (
     ExecutionRiskTrainer,
     ExecutionRiskTrainingConfig,
+    diagnose_execution_risk_dataset,
 )
 
 
@@ -43,6 +44,52 @@ def test_execution_risk_trainer_trains_multi_target_artifact_from_sample_store(
     assert result.target_metrics[ExecutionRiskTarget.CAN_FILL.value]["samples_total"] == 72.0
     assert result.artifact.dataset_id.startswith("execution_risk_dataset_v1_")
     assert result.artifact.trained_targets == result.trained_targets
+
+
+def test_execution_risk_dataset_diagnostics_explain_single_class_targets(
+    tmp_path: Path,
+) -> None:
+    store = SampleStore(db_path=tmp_path / "single_class.duckdb")
+    base_time = datetime(2026, 1, 1, 14, 30, tzinfo=UTC)
+    for index in range(30):
+        snapshot = SignalSnapshot(
+            snapshot_id=f"snap-single-{index:03d}",
+            code_version="git:test",
+            symbol="600000.SH",
+            strategy="trend",
+            decision_time=base_time + timedelta(days=index),
+            feature_vector={"liquidity_score": 0.9},
+            feature_schema_id="feature_schema_exec_v1",
+            feature_schema_hash="feature_hash_exec_v1",
+            runtime_config_hash="runtime_hash_exec_v1",
+            label_policy_id="label_policy_exec_v1",
+            label_policy_hash="label_hash_exec_v1",
+        )
+        store.write_snapshot(snapshot)
+        store.upsert_outcome(
+            OutcomeRecord(
+                snapshot_id=snapshot.snapshot_id,
+                maturity_status=MaturityStatus.RECONCILED,
+                reconcile_status="ok",
+                sim_vs_broker_diff=0.0,
+            )
+        )
+
+    trainer = ExecutionRiskTrainer(config=ExecutionRiskTrainingConfig(min_samples_per_target=24))
+    dataset = trainer.build_dataset_from_sample_store(
+        store=store,
+        maturity_statuses=["reconciled"],
+    )
+    diagnostics = diagnose_execution_risk_dataset(dataset=dataset, config=trainer.config)
+
+    assert diagnostics["can_train"] is False
+    assert diagnostics["target_row_counts"]["reconcile_mismatch_risk"] == 30
+    assert diagnostics["target_class_counts"]["reconcile_mismatch_risk"] == {
+        "negative": 30,
+        "positive": 0,
+    }
+    assert diagnostics["skipped_targets"]["reconcile_mismatch_risk"] == "single_class_target"
+    assert diagnostics["skipped_targets"]["sim_broker_divergence_risk"] == "single_class_target"
 
 
 def test_execution_risk_predictor_roundtrips_saved_artifact_and_scores_rows(
