@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
+import stock_analyzer.main as main_module
 from stock_analyzer.main import app
 
 
@@ -266,6 +267,38 @@ def test_latest_signals_api_contains_recommendation_id() -> None:
     assert isinstance(signals, list)
     assert len(signals) >= 1
     assert "recommendation_id" in signals[0]
+
+
+def test_run_pipeline_api_accepts_live_runtime_flag(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_run_pipeline(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return {
+            "trace_id": "trace-live-api",
+            "signals": [],
+            "portfolio_update": {"executions": []},
+            "use_live_runtime": bool(kwargs.get("use_live_runtime")),
+        }
+
+    monkeypatch.setattr(main_module._service, "run_pipeline", _fake_run_pipeline)
+    client = TestClient(app)
+    response = client.post(
+        "/run/pipeline",
+        json={
+            "symbols": ["600000"],
+            "strategy": "trend",
+            "current_equity": 1.0,
+            "use_live_runtime": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["symbols"] == ["600000"]
+    assert captured["strategy"] == "trend"
+    assert captured["current_equity"] == 1.0
+    assert captured["use_live_runtime"] is True
+    assert response.json()["use_live_runtime"] is True
 
 
 def test_dashboard_ops_toggle_disables_quick_command() -> None:

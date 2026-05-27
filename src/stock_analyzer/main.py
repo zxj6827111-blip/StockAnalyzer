@@ -1226,6 +1226,7 @@ class PipelineRunRequest(BaseModel):
     symbols: list[str] = Field(min_length=1)
     strategy: str = "trend"
     current_equity: float = 1.0
+    use_live_runtime: bool = False
 
 
 class NotificationRequest(BaseModel):
@@ -1964,6 +1965,7 @@ def run_pipeline(request: PipelineRunRequest) -> dict[str, object]:
         symbols=request.symbols,
         strategy=request.strategy,
         current_equity=request.current_equity,
+        use_live_runtime=request.use_live_runtime,
     )
 
 
