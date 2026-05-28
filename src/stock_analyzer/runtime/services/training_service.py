@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from collections.abc import Mapping
 from copy import deepcopy
 from datetime import datetime, timedelta
 from functools import lru_cache
@@ -390,7 +391,7 @@ class RuntimeTrainingService:
         report["lookback_days"] = lookback_days
         target = Path(output_path or "artifacts/acceptance/training_evaluation_report.json")
         report["output_path"] = persist_diagnostic_report(report=report, output_path=target)
-        return cast(dict[str, object], report)
+        return report
 
     def _resolve_execution_risk_artifact_path(self, artifact_path: str | None = None) -> Path:
         service = self._service
@@ -452,6 +453,7 @@ class RuntimeTrainingService:
             outcomes=service._sample_store.list_outcomes(),
             labeling=trainer.labeling,
         )
+        preflight_mapping = _as_mapping(preflight)
         if not bool(preflight["can_train"]):
             payload = {
                 "ok": False,
@@ -459,19 +461,31 @@ class RuntimeTrainingService:
                 "status": "blocked_no_trainable_targets",
                 "timestamp": run_now.isoformat(),
                 "artifact_path": "",
-                "dataset_id": str(preflight["dataset_id"]),
+                "dataset_id": str(preflight_mapping["dataset_id"]),
                 "trained_targets": [],
-                "skipped_targets": dict(preflight["skipped_targets"]),
-                "target_row_counts": dict(preflight["target_row_counts"]),
-                "target_class_counts": dict(preflight["target_class_counts"]),
-                "target_trainability": dict(preflight["target_trainability"]),
+                "skipped_targets": _as_dict(preflight_mapping["skipped_targets"]),
+                "target_row_counts": _as_dict(preflight_mapping["target_row_counts"]),
+                "target_class_counts": _as_dict(preflight_mapping["target_class_counts"]),
+                "target_trainability": _as_dict(preflight_mapping["target_trainability"]),
                 "training_summary": {
-                    "row_count": int(preflight["row_count"]),
-                    "source_snapshot_count": int(preflight["source_snapshot_count"]),
-                    "skipped_missing_outcome": int(preflight["skipped_missing_outcome"]),
-                    "skipped_by_maturity": int(preflight["skipped_by_maturity"]),
-                    "skipped_missing_targets": int(preflight["skipped_missing_targets"]),
-                    "target_coverage": dict(preflight["target_coverage"]),
+                    "row_count": _as_int(preflight_mapping["row_count"], default=0),
+                    "source_snapshot_count": _as_int(
+                        preflight_mapping["source_snapshot_count"],
+                        default=0,
+                    ),
+                    "skipped_missing_outcome": _as_int(
+                        preflight_mapping["skipped_missing_outcome"],
+                        default=0,
+                    ),
+                    "skipped_by_maturity": _as_int(
+                        preflight_mapping["skipped_by_maturity"],
+                        default=0,
+                    ),
+                    "skipped_missing_targets": _as_int(
+                        preflight_mapping["skipped_missing_targets"],
+                        default=0,
+                    ),
+                    "target_coverage": _as_dict(preflight_mapping["target_coverage"]),
                 },
                 "preflight": preflight,
             }
@@ -485,12 +499,12 @@ class RuntimeTrainingService:
                 level="warn",
                 message="execution risk sidecar training has no trainable targets",
                 payload={
-                    "dataset_id": str(preflight["dataset_id"]),
-                    "row_count": int(preflight["row_count"]),
-                    "target_row_counts": dict(preflight["target_row_counts"]),
-                    "target_class_counts": dict(preflight["target_class_counts"]),
-                    "target_trainability": dict(preflight["target_trainability"]),
-                    "skipped_targets": dict(preflight["skipped_targets"]),
+                    "dataset_id": str(preflight_mapping["dataset_id"]),
+                    "row_count": _as_int(preflight_mapping["row_count"], default=0),
+                    "target_row_counts": _as_dict(preflight_mapping["target_row_counts"]),
+                    "target_class_counts": _as_dict(preflight_mapping["target_class_counts"]),
+                    "target_trainability": _as_dict(preflight_mapping["target_trainability"]),
+                    "skipped_targets": _as_dict(preflight_mapping["skipped_targets"]),
                 },
             )
             service._persist_runtime_state_to_disk()
@@ -509,6 +523,7 @@ class RuntimeTrainingService:
             "trained_targets": list(result.trained_targets),
             "skipped_targets": dict(result.skipped_targets),
             "target_row_counts": dict(result.target_row_counts),
+            "target_split_strategies": dict(result.target_split_strategies),
             "target_metrics": {key: dict(value) for key, value in result.target_metrics.items()},
             "training_summary": dict(result.artifact.training_summary),
             "preflight": preflight,
@@ -661,6 +676,16 @@ def _runtime_service_module() -> Any:
 
 def _as_int(value: object, default: int) -> int:
     return cast(int, _runtime_service_module()._as_int(value, default))
+
+
+def _as_mapping(value: object) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise TypeError("expected mapping payload")
+    return value
+
+
+def _as_dict(value: object) -> dict[str, object]:
+    return dict(_as_mapping(value))
 
 
 def _bootstrap_error_text(report: dict[str, object]) -> str:

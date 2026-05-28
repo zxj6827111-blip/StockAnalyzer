@@ -162,6 +162,152 @@ def test_execution_risk_dataset_diagnostics_explain_minority_class_shortage(
     assert diagnostics["min_class_samples_per_target"] == 3
 
 
+def test_execution_risk_trainer_stratifies_split_when_minority_lands_in_holdout(
+    tmp_path: Path,
+) -> None:
+    store = SampleStore(db_path=tmp_path / "minority_holdout.duckdb")
+    base_time = datetime(2026, 1, 1, 14, 30, tzinfo=UTC)
+    for index in range(30):
+        is_late_positive = index >= 27
+        snapshot = SignalSnapshot(
+            snapshot_id=f"snap-holdout-{index:03d}",
+            code_version="git:test",
+            symbol="600000.SH",
+            strategy="trend",
+            decision_time=base_time + timedelta(days=index),
+            feature_vector={
+                "liquidity_score": 0.15 if is_late_positive else 0.9,
+                "volatility_score": 0.86 if is_late_positive else 0.12,
+            },
+            feature_schema_id="feature_schema_exec_v1",
+            feature_schema_hash="feature_hash_exec_v1",
+            runtime_config_hash="runtime_hash_exec_v1",
+            label_policy_id="label_policy_exec_v1",
+            label_policy_hash="label_hash_exec_v1",
+        )
+        store.write_snapshot(snapshot)
+        store.upsert_outcome(
+            OutcomeRecord(
+                snapshot_id=snapshot.snapshot_id,
+                maturity_status=MaturityStatus.RECONCILED,
+                realized_slippage_bp=25.0 if is_late_positive else 5.0,
+                backfill_fidelity_tier=BackfillFidelityTier.GOLD,
+                backfill_source="runtime_observed",
+            )
+        )
+
+    trainer = ExecutionRiskTrainer(
+        config=ExecutionRiskTrainingConfig(
+            min_samples_per_target=24,
+            min_class_samples_per_target=3,
+            calibration_ratio=0.2,
+            test_ratio=0.2,
+            epochs=80,
+            seed=17,
+        )
+    )
+    dataset = trainer.build_dataset_from_sample_store(
+        store=store,
+        maturity_statuses=["reconciled"],
+    )
+    diagnostics = diagnose_execution_risk_dataset(
+        dataset=dataset,
+        config=trainer.config,
+        outcomes=store.list_outcomes(),
+        labeling=trainer.labeling,
+    )
+    trainability = diagnostics["target_trainability"]["likely_slippage_high"]
+
+    assert diagnostics["can_train"] is True
+    assert diagnostics["skipped_targets"] == {}
+    assert trainability["train_positive"] == 1
+    assert trainability["train_negative"] == 17
+    assert trainability["calibration_positive"] == 1
+    assert trainability["calibration_negative"] == 5
+    assert trainability["test_positive"] == 1
+    assert trainability["test_negative"] == 5
+    assert trainability["split_strategy"] == "stratified_class_balanced"
+
+    result = trainer.train(dataset=dataset)
+
+    assert result.trained_targets == ["likely_slippage_high"]
+    assert result.target_split_strategies["likely_slippage_high"] == "stratified_class_balanced"
+    assert result.target_metrics["likely_slippage_high"]["samples_train"] == 18.0
+
+
+def test_execution_risk_trainer_keeps_calibration_binary_after_stratified_rescue(
+    tmp_path: Path,
+) -> None:
+    store = SampleStore(db_path=tmp_path / "minority_calibration.duckdb")
+    base_time = datetime(2026, 1, 1, 14, 30, tzinfo=UTC)
+    positive_indices = {23, 28, 29}
+    for index in range(30):
+        is_positive = index in positive_indices
+        snapshot = SignalSnapshot(
+            snapshot_id=f"snap-calibration-{index:03d}",
+            code_version="git:test",
+            symbol="600000.SH",
+            strategy="trend",
+            decision_time=base_time + timedelta(days=index),
+            feature_vector={
+                "liquidity_score": 0.15 if is_positive else 0.9,
+                "volatility_score": 0.86 if is_positive else 0.12,
+            },
+            feature_schema_id="feature_schema_exec_v1",
+            feature_schema_hash="feature_hash_exec_v1",
+            runtime_config_hash="runtime_hash_exec_v1",
+            label_policy_id="label_policy_exec_v1",
+            label_policy_hash="label_hash_exec_v1",
+        )
+        store.write_snapshot(snapshot)
+        store.upsert_outcome(
+            OutcomeRecord(
+                snapshot_id=snapshot.snapshot_id,
+                maturity_status=MaturityStatus.RECONCILED,
+                realized_slippage_bp=25.0 if is_positive else 5.0,
+                backfill_fidelity_tier=BackfillFidelityTier.GOLD,
+                backfill_source="runtime_observed",
+            )
+        )
+
+    trainer = ExecutionRiskTrainer(
+        config=ExecutionRiskTrainingConfig(
+            min_samples_per_target=24,
+            min_class_samples_per_target=3,
+            calibration_ratio=0.2,
+            test_ratio=0.2,
+            epochs=80,
+            seed=19,
+        )
+    )
+    dataset = trainer.build_dataset_from_sample_store(
+        store=store,
+        maturity_statuses=["reconciled"],
+    )
+    diagnostics = diagnose_execution_risk_dataset(
+        dataset=dataset,
+        config=trainer.config,
+        outcomes=store.list_outcomes(),
+        labeling=trainer.labeling,
+    )
+    trainability = diagnostics["target_trainability"]["likely_slippage_high"]
+    split_class_counts = trainability["split_class_counts"]
+
+    assert diagnostics["can_train"] is True
+    assert diagnostics["skipped_targets"] == {}
+    assert trainability["split_strategy"] == "stratified_class_balanced"
+    assert split_class_counts == {
+        "train": {"negative": 17, "positive": 1},
+        "calibration": {"negative": 5, "positive": 1},
+        "test": {"negative": 5, "positive": 1},
+    }
+
+    result = trainer.train(dataset=dataset)
+
+    assert result.trained_targets == ["likely_slippage_high"]
+    assert result.target_split_strategies["likely_slippage_high"] == "stratified_class_balanced"
+
+
 def test_execution_risk_predictor_roundtrips_saved_artifact_and_scores_rows(
     tmp_path: Path,
 ) -> None:
