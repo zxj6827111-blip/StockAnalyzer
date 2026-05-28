@@ -12202,6 +12202,7 @@ class StockAnalyzerService:
             trade_id = str(item.get("trade_id", "")).strip()
             side = str(item.get("side", "")).strip().lower()
             status = str(item.get("status", "")).strip().lower()
+            reason = str(item.get("reason", "")).strip()
             price = _as_float(item.get("price"), default=0.0)
             quantity = _as_int(item.get("quantity"), default=0)
             amount = _as_float(item.get("amount"), default=0.0)
@@ -12210,46 +12211,90 @@ class StockAnalyzerService:
             price_source = str(item.get("price_source", "")).strip() or "最新价"
             if not symbol or not trade_id:
                 continue
+            is_rejected = status.startswith("rejected")
             if side == "buy":
-                is_adjusted = status == "adjusted" or str(item.get("reason", "")).strip() == "auto_simulated_adjust"
-                title_summary = f"sim adjust {symbol}" if is_adjusted else f"sim buy {symbol}"
+                is_adjusted = status == "adjusted" or reason == "auto_simulated_adjust"
+                if is_rejected:
+                    title_summary = f"sim buy rejected {symbol}"
+                else:
+                    title_summary = f"sim adjust {symbol}" if is_adjusted else f"sim buy {symbol}"
                 title = _push_title(priority="P1", category="signal", summary=title_summary)
-                trigger_action = "调整模拟仓位" if is_adjusted else "执行模拟买入"
-                content = _notification_message_zh(
-                    trigger=f"系统已对标的【{symbol}】{trigger_action}。",
-                    impact=(
-                        f"成交价 {price:.2f}，数量 {quantity} 股，成交金额 {amount:.2f} 元，"
-                        f"目标仓位 {target_position:.0%}。"
-                    ),
-                    action="这是模拟盘自动成交，无需券商端下单；请在控制大屏核对持仓与盈亏变化。",
-                    details=[
-                        f"执行状态：{_sim_trade_status_zh(status)}",
-                        f"价格来源：{price_source}",
-                        f"手续费：{fee:.2f} 元",
-                        f"可用资金：{_as_float(portfolio_update.get('cash_available'), default=0.0):.2f} 元",
-                    ],
-                )
+                if is_rejected:
+                    content = _notification_message_zh(
+                        trigger=f"系统对标的【{symbol}】发起模拟买入尝试，但本次未成交。",
+                        impact=(
+                            f"参考价 {price:.2f}，计划数量 {quantity} 股，实际成交金额 {amount:.2f} 元，"
+                            f"目标仓位 {target_position:.0%}；模拟持仓与可用资金未发生买入变化。"
+                        ),
+                        action="这是模拟盘拒单记录，无需券商端下单；如同一标的同一原因重复出现，系统会在当日抑制重复提醒。",
+                        details=[
+                            f"执行状态：{_sim_trade_status_zh(status)}",
+                            f"价格来源：{price_source}",
+                            f"手续费：{fee:.2f} 元",
+                            f"可用资金：{_as_float(portfolio_update.get('cash_available'), default=0.0):.2f} 元",
+                        ],
+                    )
+                else:
+                    trigger_action = "调整模拟仓位" if is_adjusted else "执行模拟买入"
+                    content = _notification_message_zh(
+                        trigger=f"系统已对标的【{symbol}】{trigger_action}。",
+                        impact=(
+                            f"成交价 {price:.2f}，数量 {quantity} 股，成交金额 {amount:.2f} 元，"
+                            f"目标仓位 {target_position:.0%}。"
+                        ),
+                        action="这是模拟盘自动成交，无需券商端下单；请在控制大屏核对持仓与盈亏变化。",
+                        details=[
+                            f"执行状态：{_sim_trade_status_zh(status)}",
+                            f"价格来源：{price_source}",
+                            f"手续费：{fee:.2f} 元",
+                            f"可用资金：{_as_float(portfolio_update.get('cash_available'), default=0.0):.2f} 元",
+                        ],
+                    )
                 level = "info"
             else:
-                title = _push_title(priority="P0", category="action", summary=f"sim sell {symbol}")
-                content = _notification_message_zh(
-                    trigger=f"系统已对标的【{symbol}】执行模拟卖出。",
-                    impact=(
-                        f"成交价 {price:.2f}，数量 {quantity} 股，成交金额 {amount:.2f} 元，"
-                        "该持仓已从模拟盘移出。"
-                    ),
-                    action="这是模拟盘自动卖出记录，请在控制大屏复核该票的退出原因与后续观察状态。",
-                    details=[
-                        f"执行状态：{_sim_trade_status_zh(status)}",
-                        f"价格来源：{price_source}",
-                        f"手续费：{fee:.2f} 元",
-                        f"当前净值：{_as_float(portfolio_update.get('current_equity'), default=self._state.current_equity):.4f}",
-                    ],
-                )
+                title_summary = f"sim sell rejected {symbol}" if is_rejected else f"sim sell {symbol}"
+                title = _push_title(priority="P0", category="action", summary=title_summary)
+                if is_rejected:
+                    content = _notification_message_zh(
+                        trigger=f"系统对标的【{symbol}】发起模拟卖出尝试，但本次未成交。",
+                        impact=(
+                            f"参考价 {price:.2f}，计划数量 {quantity} 股，实际成交金额 {amount:.2f} 元；"
+                            "模拟持仓未发生卖出变化。"
+                        ),
+                        action="这是模拟盘拒单记录，无需券商端下单；请在控制大屏复核拒单原因与持仓状态。",
+                        details=[
+                            f"执行状态：{_sim_trade_status_zh(status)}",
+                            f"价格来源：{price_source}",
+                            f"手续费：{fee:.2f} 元",
+                            f"当前净值：{_as_float(portfolio_update.get('current_equity'), default=self._state.current_equity):.4f}",
+                        ],
+                    )
+                else:
+                    content = _notification_message_zh(
+                        trigger=f"系统已对标的【{symbol}】执行模拟卖出。",
+                        impact=(
+                            f"成交价 {price:.2f}，数量 {quantity} 股，成交金额 {amount:.2f} 元，"
+                            "该持仓已从模拟盘移出。"
+                        ),
+                        action="这是模拟盘自动卖出记录，请在控制大屏复核该票的退出原因与后续观察状态。",
+                        details=[
+                            f"执行状态：{_sim_trade_status_zh(status)}",
+                            f"价格来源：{price_source}",
+                            f"手续费：{fee:.2f} 元",
+                            f"当前净值：{_as_float(portfolio_update.get('current_equity'), default=self._state.current_equity):.4f}",
+                        ],
+                    )
                 level = "warn"
+            if is_rejected:
+                trade_day = _sim_trade_notification_day(str(item.get("trade_time", "")).strip())
+                dedup_key = f"notify:sim-trade-rejected:{trade_day}:{side}:{symbol}:{status}:{reason or '-'}"
+                dedup_value = f"{trade_day}:{side}:{symbol}:{status}:{reason or '-'}"
+            else:
+                dedup_key = f"notify:sim-trade:{trade_id}"
+                dedup_value = trade_id
             self._notify_if_changed(
-                dedup_key=f"notify:sim-trade:{trade_id}",
-                dedup_value=trade_id,
+                dedup_key=dedup_key,
+                dedup_value=dedup_value,
                 title=title,
                 content=content,
                 level=level,
@@ -17662,9 +17707,25 @@ def _sim_trade_status_zh(status: str) -> str:
         "opened": "已建仓",
         "adjusted": "已调仓",
         "closed": "已卖出",
+        "rejected_no_cash": "未成交：现金或最小交易单位不足",
+        "rejected_max_holdings": "未成交：达到最大持仓数",
+        "rejected_same_sector": "未成交：同板块限制",
+        "rejected_execution": "未成交：执行器拒绝",
+        "rejected_price_unavailable": "未成交：缺少可用价格",
+        "rejected_quantity": "未成交：数量不足",
     }
     normalized = status.strip().lower()
     return mapping.get(normalized, status or "未知")
+
+
+def _sim_trade_notification_day(trade_time: str) -> str:
+    raw = trade_time.strip()
+    if raw:
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).strftime("%Y%m%d")
+        except ValueError:
+            pass
+    return date.today().strftime("%Y%m%d")
 
 
 def _week6_quality_status_zh(status: str) -> str:
@@ -18399,6 +18460,16 @@ def _notification_summary_zh(summary: str) -> str:
         return f"持仓倒计时 {raw[18:]}"
     if lowered.startswith("buy candidate "):
         return f"买入候选 {raw[14:]}"
+    if lowered.startswith("sim buy rejected "):
+        return f"模拟买入未成交 {raw[17:]}"
+    if lowered.startswith("sim buy "):
+        return f"模拟买入 {raw[8:]}"
+    if lowered.startswith("sim adjust "):
+        return f"模拟调仓 {raw[11:]}"
+    if lowered.startswith("sim sell rejected "):
+        return f"模拟卖出未成交 {raw[18:]}"
+    if lowered.startswith("sim sell "):
+        return f"模拟卖出 {raw[9:]}"
     if lowered.startswith("take profit instruction "):
         return f"止盈指令 {raw[24:]}"
     if lowered.startswith("sell instruction "):

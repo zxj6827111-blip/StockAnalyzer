@@ -679,6 +679,139 @@ def test_service_pipeline_audit_keeps_portfolio_execution_summary() -> None:
     assert "internal_debug_blob" not in audit_executions[0]
 
 
+def test_service_simulated_rejected_buy_notification_is_deduped_by_reason() -> None:
+    config = _load_test_config()
+    service = StockAnalyzerService(config=config)
+    notifications: list[dict[str, str]] = []
+
+    def _fake_notify(
+        title: str,
+        content: str,
+        level: str = "info",
+        trace_id: str = "",
+    ) -> dict[str, object]:
+        notifications.append(
+            {
+                "title": title,
+                "content": content,
+                "level": level,
+                "trace_id": trace_id,
+            }
+        )
+        return {"ok": True}
+
+    _patch_attr(service, "notify", _fake_notify)
+
+    base_execution = {
+        "symbol": "001223",
+        "side": "buy",
+        "status": "rejected_no_cash",
+        "strategy": "trend",
+        "target_position": 0.01,
+        "quantity": 0,
+        "amount": 0.0,
+        "fee": 0.0,
+        "price_source": "五档卖1",
+        "trade_time": "2026-05-28T09:35:00",
+        "reason": "auto_simulated_buy_no_cash",
+    }
+    service._notify_simulated_trade_updates_if_needed(
+        portfolio_update={
+            "cash_available": 97351.62,
+            "executions": [
+                {
+                    **base_execution,
+                    "trade_id": "SKIP-trace-001223-rejected_no_cash-1",
+                    "price": 60.34,
+                }
+            ],
+        },
+        trace_id="trace-rejected-notify-1",
+    )
+    service._notify_simulated_trade_updates_if_needed(
+        portfolio_update={
+            "cash_available": 97351.62,
+            "executions": [
+                {
+                    **base_execution,
+                    "trade_id": "SKIP-trace-001223-rejected_no_cash-2",
+                    "price": 59.79,
+                }
+            ],
+        },
+        trace_id="trace-rejected-notify-2",
+    )
+
+    assert len(notifications) == 1
+    assert "模拟买入未成交 001223" in notifications[0]["title"]
+    assert "本次未成交" in notifications[0]["content"]
+    assert "模拟盘拒单记录" in notifications[0]["content"]
+    assert "模拟盘自动成交" not in notifications[0]["content"]
+
+    suppressed = service.audit_events(limit=5, event_type="notification_suppressed")
+    suppressed_events = _as_mapping_list(suppressed["events"])
+    assert suppressed_events
+    assert "notify:sim-trade-rejected:20260528:buy:001223:rejected_no_cash" in str(
+        suppressed_events[0]["payload"]
+    )
+
+
+def test_service_simulated_filled_buy_notifications_keep_trade_level_dedup() -> None:
+    config = _load_test_config()
+    service = StockAnalyzerService(config=config)
+    notifications: list[dict[str, str]] = []
+
+    def _fake_notify(
+        title: str,
+        content: str,
+        level: str = "info",
+        trace_id: str = "",
+    ) -> dict[str, object]:
+        notifications.append(
+            {
+                "title": title,
+                "content": content,
+                "level": level,
+                "trace_id": trace_id,
+            }
+        )
+        return {"ok": True}
+
+    _patch_attr(service, "notify", _fake_notify)
+
+    base_execution = {
+        "symbol": "001223",
+        "side": "buy",
+        "status": "opened",
+        "strategy": "trend",
+        "target_position": 0.01,
+        "price": 60.0,
+        "quantity": 100,
+        "amount": 6000.0,
+        "fee": 5.0,
+        "price_source": "五档卖1",
+        "trade_time": "2026-05-28T09:35:00",
+        "reason": "auto_simulated_buy",
+    }
+    for index in range(2):
+        service._notify_simulated_trade_updates_if_needed(
+            portfolio_update={
+                "cash_available": 90000.0 - index,
+                "executions": [
+                    {
+                        **base_execution,
+                        "trade_id": f"SIM-trace-001223-opened-{index}",
+                    }
+                ],
+            },
+            trace_id=f"trace-filled-notify-{index}",
+        )
+
+    assert len(notifications) == 2
+    assert all("模拟买入 001223" in item["title"] for item in notifications)
+    assert all("模拟盘自动成交" in item["content"] for item in notifications)
+
+
 def test_service_live_auto_execution_closes_position_on_sell_signal() -> None:
     config = _load_test_config()
     service = StockAnalyzerService(config=config)
