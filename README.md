@@ -126,7 +126,10 @@ SA__NOTIFICATIONS__FEISHU_APP_SECRET=xxx
 - `GET /news/score/history?limit=50&symbol=&strategy=`
 - `GET /news/score/cache/state`
 - `POST /news/score/cache/clear`
-- `POST /notify/test` (protected when `SA__SECURITY__API_AUTH_ENABLED=true`)
+- `POST /notify/test` (protected when `SA__SECURITY__API_AUTH_ENABLED=true`; disabled
+  unless `SA__SECURITY__NOTIFY_TEST_ENABLED=true`)
+  - Bare `test` / `t` / `c` notification payloads are suppressed by default via
+    `SA__SECURITY__SUPPRESS_PLAIN_TEST_NOTIFICATIONS=true`.
 - `POST /command/execute`
 - `GET /command/state`
 - `GET /wecom/callback` (URL verification in WeCom callback plain/safe mode)

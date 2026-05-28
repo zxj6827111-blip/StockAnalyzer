@@ -442,7 +442,7 @@ class RuntimeOpsService:
                 ),
             },
             "learning_governance": learning_governance,
-            "execution_risk": service.execution_risk_status(),
+            "execution_risk": service.execution_risk_status(include_artifact_scan=False),
             "execution_aware": {
                 "latest": service.latest_execution_aware_report(),
                 "history_count": len(service._execution_aware_report_history),
@@ -1686,9 +1686,17 @@ def _resolve_market_warehouse_resume_action(
             extracted_symbols=failed_symbols,
         )
     )
-    lock_running = bool(lock_status.get("running", False)) if isinstance(lock_status, dict) else False
+    lock_running = (
+        bool(lock_status.get("running", False)) if isinstance(lock_status, dict) else False
+    )
     followup_running = _post_market_warehouse_followup_running(followup_state)
-    available = bool(trace_id) and failed_total > 0 and failed_complete and not lock_running and not followup_running
+    available = (
+        bool(trace_id)
+        and failed_total > 0
+        and failed_complete
+        and not lock_running
+        and not followup_running
+    )
     reason = ""
     if not trace_id:
         reason = "latest_report_missing"
@@ -1705,7 +1713,12 @@ def _resolve_market_warehouse_resume_action(
         "reason": reason,
         "retry_report_trace_id": trace_id,
         "latest_status": status,
-        "latest_timestamp": _extract_report_timestamp(report, "timestamp", "updated_at", "completed_at"),
+        "latest_timestamp": _extract_report_timestamp(
+            report,
+            "timestamp",
+            "updated_at",
+            "completed_at",
+        ),
         "target_trade_date": str(report.get("target_trade_date", "")).strip(),
         "failed_symbols_total": failed_total,
         "failed_symbols_complete": failed_complete,

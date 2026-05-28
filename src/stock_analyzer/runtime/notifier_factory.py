@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 
 from stock_analyzer.config import StockAnalyzerConfig
 from stock_analyzer.notify.channels import (
@@ -85,10 +86,13 @@ def build_channel(config: StockAnalyzerConfig, channel_name: str) -> Notifier:
 
 
 def _force_console_notifier() -> bool:
-    if os.getenv("PYTEST_CURRENT_TEST"):
+    if os.getenv("PYTEST_CURRENT_TEST") or "pytest" in sys.modules:
         return True
-    raw_flag = os.getenv("SA_DISABLE_EXTERNAL_NOTIFICATIONS", "").strip().lower()
-    return raw_flag in {"1", "true", "yes", "on"}
+    raw_flags = [
+        os.getenv("SA_DISABLE_EXTERNAL_NOTIFICATIONS", ""),
+        os.getenv("SA_FORCE_CONSOLE_NOTIFIER", ""),
+    ]
+    return any(item.strip().lower() in {"1", "true", "yes", "on"} for item in raw_flags)
 
 
 def _wecom_title_prefix(config: StockAnalyzerConfig) -> str:

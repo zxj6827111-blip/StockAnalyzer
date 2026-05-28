@@ -1,12 +1,23 @@
 from __future__ import annotations
 
 from fastapi.testclient import TestClient
+from pytest import MonkeyPatch
 
-from stock_analyzer.main import app
+import stock_analyzer.main as main_module
+from stock_analyzer.config import SecurityConfig
 
 
-def test_audit_endpoints_return_events_and_trace_replay() -> None:
-    client = TestClient(app)
+def test_audit_endpoints_return_events_and_trace_replay(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        main_module._config,
+        "security",
+        SecurityConfig(
+            api_auth_enabled=True,
+            api_token="audit-token-12345",
+            notify_test_enabled=True,
+        ),
+    )
+    client = TestClient(main_module.app)
     trace_id = "main-audit-trace"
 
     notify_response = client.post(
@@ -17,6 +28,7 @@ def test_audit_endpoints_return_events_and_trace_replay() -> None:
             "level": "info",
             "trace_id": trace_id,
         },
+        headers={"Authorization": "Bearer audit-token-12345"},
     )
     assert notify_response.status_code == 200
 

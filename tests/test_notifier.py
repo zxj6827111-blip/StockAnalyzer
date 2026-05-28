@@ -497,6 +497,26 @@ def test_build_notifier_forces_console_in_pytest(monkeypatch: MonkeyPatch) -> No
     assert isinstance(notifier.backup, ConsoleNotifier)
 
 
+def test_build_notifier_forces_console_during_pytest_collection(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = load_config(root / "config" / "default.yaml").model_copy(deep=True)
+    config.notifications.primary = "feishu_app"
+    config.notifications.backup = "wecom"
+    config.notifications.feishu_app_id = "cli_a"
+    config.notifications.feishu_app_secret = "cli_s"
+    config.notifications.feishu_app_receive_id = "ou_xxx"
+    config.notifications.wecom_webhook = "https://example.com/wecom"
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    notifier = build_notifier(config)
+
+    assert isinstance(notifier, FailoverNotifier)
+    assert isinstance(notifier.primary, ConsoleNotifier)
+    assert isinstance(notifier.backup, ConsoleNotifier)
+
+
 def test_build_notifier_forces_console_when_env_flag_enabled(monkeypatch: MonkeyPatch) -> None:
     root = Path(__file__).resolve().parents[1]
     config = load_config(root / "config" / "default.yaml").model_copy(deep=True)
@@ -509,6 +529,27 @@ def test_build_notifier_forces_console_when_env_flag_enabled(monkeypatch: Monkey
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.setenv("SA_DISABLE_EXTERNAL_NOTIFICATIONS", "true")
     notifier = build_notifier(config)
+    assert isinstance(notifier, FailoverNotifier)
+    assert isinstance(notifier.primary, ConsoleNotifier)
+    assert isinstance(notifier.backup, ConsoleNotifier)
+
+
+def test_build_notifier_forces_console_with_explicit_console_flag(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = load_config(root / "config" / "default.yaml").model_copy(deep=True)
+    config.notifications.primary = "feishu_app"
+    config.notifications.backup = "wecom"
+    config.notifications.feishu_app_id = "cli_a"
+    config.notifications.feishu_app_secret = "cli_s"
+    config.notifications.feishu_app_receive_id = "ou_xxx"
+    config.notifications.wecom_webhook = "https://example.com/wecom"
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("SA_FORCE_CONSOLE_NOTIFIER", "true")
+    notifier = build_notifier(config)
+
     assert isinstance(notifier, FailoverNotifier)
     assert isinstance(notifier.primary, ConsoleNotifier)
     assert isinstance(notifier.backup, ConsoleNotifier)

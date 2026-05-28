@@ -24,6 +24,7 @@ def _enable_feishu(
     monkeypatch.setattr(cfg, "subscription_mode", subscription_mode)
     monkeypatch.setattr(cfg, "verification_token", "feishu-test-token")
     monkeypatch.setattr(cfg, "allowed_users", allowed_users or [])
+    monkeypatch.setattr(cfg, "allow_all_users_for_local_dev", allowed_users is None)
     monkeypatch.setattr(cfg, "auto_reconcile_after_broker_snapshot", True)
     monkeypatch.setattr(main_module._config.notifications, "feishu_app_id", "cli_a")
     monkeypatch.setattr(main_module._config.notifications, "feishu_app_secret", "cli_s")

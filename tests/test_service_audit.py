@@ -120,6 +120,44 @@ def test_service_notify_respects_quiet_window_and_keeps_audit() -> None:
     assert "notification" in event_types
 
 
+def test_service_notify_suppresses_plain_test_messages_and_keeps_audit() -> None:
+    config = _load_test_config()
+    service = StockAnalyzerService(config=config)
+
+    payload = _as_mapping(
+        service.notify(
+            title="t",
+            content="c",
+            level="info",
+        )
+    )
+
+    assert payload["channel"] == "suppressed"
+    assert payload["error"] == "plain_test_notification_suppressed"
+    assert payload["suppressed"] is True
+
+    events_payload = _as_mapping(service.audit_events(limit=20))
+    event_types = {str(item["event_type"]) for item in _as_mapping_list(events_payload["events"])}
+    assert "notification" in event_types
+
+
+def test_service_notify_does_not_suppress_traced_plain_test_messages() -> None:
+    config = _load_test_config()
+    service = StockAnalyzerService(config=config)
+
+    payload = _as_mapping(
+        service.notify(
+            title="t",
+            content="c",
+            level="info",
+            trace_id="plain-test-trace",
+        )
+    )
+
+    assert payload["channel"] == "console"
+    assert "plain_test_notification_suppressed" not in str(payload.get("error", ""))
+
+
 def test_service_audit_records_rejected_command() -> None:
     config = _load_test_config()
     service = StockAnalyzerService(config=config)

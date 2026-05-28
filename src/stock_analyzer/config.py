@@ -1042,6 +1042,8 @@ class DashboardConfig(_StrictModel):
 class SecurityConfig(_StrictModel):
     api_auth_enabled: bool = False
     api_token: str = ""
+    notify_test_enabled: bool = False
+    suppress_plain_test_notifications: bool = True
 
 
 class StockAnalyzerConfig(_StrictModel):

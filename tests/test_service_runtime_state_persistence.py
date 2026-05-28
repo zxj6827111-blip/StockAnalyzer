@@ -7,6 +7,7 @@ from typing import Any, cast
 
 from stock_analyzer.config import StockAnalyzerConfig, load_config
 from stock_analyzer.data.provider import SyntheticProvider
+from stock_analyzer.models.execution_risk_artifact import ExecutionRiskArtifact
 from stock_analyzer.runtime import service as runtime_service_module
 from stock_analyzer.runtime.service import StockAnalyzerService
 
@@ -142,6 +143,25 @@ def _as_int(value: object) -> int:
 
 def _patch_attr(target: object, name: str, value: object) -> None:
     setattr(cast(Any, target), name, value)
+
+
+def _write_execution_risk_artifact(
+    path: Path,
+    *,
+    dataset_id: str,
+    trained_targets: list[str],
+    created_at: str,
+) -> None:
+    ExecutionRiskArtifact(
+        version="v1",
+        created_at=created_at,
+        dataset_id=dataset_id,
+        feature_names=["execution_feature"],
+        trained_targets=list(trained_targets),
+        target_models={target: {"model_type": "test"} for target in trained_targets},
+        training_summary={"row_count": 10},
+        metadata={"created_at": created_at},
+    ).save(path)
 
 
 def _seed_persisted_week_views(service: StockAnalyzerService) -> None:
@@ -929,6 +949,97 @@ def test_execution_risk_status_force_reloads_even_when_mtime_gate_is_stale(
     assert refreshed_status["artifact_path"] == str(new_artifact)
     history = _as_mapping(service_b.execution_risk_training_history(limit=10))
     assert _as_int(history["records"]) == 2
+
+
+def test_execution_risk_status_discovers_newer_artifact_when_runtime_state_missing_record(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config(tmp_path)
+    service = _new_service(config)
+    artifact_root = Path(config.training.bootstrap_state_path).parent / "execution_risk"
+    new_artifact = artifact_root / "execution_risk_20260528T152503.json"
+    _write_execution_risk_artifact(
+        new_artifact,
+        dataset_id="execution_risk_dataset_v1_scanned",
+        trained_targets=["can_fill", "likely_slippage_high"],
+        created_at="2026-05-28T15:25:03",
+    )
+
+    status = _as_mapping(service.execution_risk_status())
+
+    assert status["source"] == "artifact_scan"
+    assert status["dataset_id"] == "execution_risk_dataset_v1_scanned"
+    assert status["artifact_path"] == str(new_artifact)
+    assert status["artifact_exists"] is True
+    assert status["trained_targets"] == ["can_fill", "likely_slippage_high"]
+    assert _as_int(status["history_count"]) == 1
+    assert _as_int(status["runtime_state_history_count"]) == 0
+
+    history = _as_mapping(service.execution_risk_training_history(limit=10))
+    assert _as_int(history["records"]) == 1
+    latest = _as_mapping(cast(list[object], history["items"])[-1])
+    assert latest["source"] == "artifact_scan"
+    assert latest["dataset_id"] == "execution_risk_dataset_v1_scanned"
+
+
+def test_execution_risk_history_does_not_promote_older_scanned_artifact(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config(tmp_path)
+    service = _new_service(config)
+    artifact_root = Path(config.training.bootstrap_state_path).parent / "execution_risk"
+    old_artifact = artifact_root / "execution_risk_20260528T152503.json"
+    _write_execution_risk_artifact(
+        old_artifact,
+        dataset_id="execution_risk_dataset_v1_old_scanned",
+        trained_targets=["can_fill"],
+        created_at="2026-05-28T15:25:03",
+    )
+    blocked_record = {
+        "timestamp": "2026-05-28T16:00:00",
+        "status": "blocked_no_trainable_targets",
+        "artifact_path": "",
+        "dataset_id": "execution_risk_dataset_v1_blocked",
+        "trained_targets": [],
+    }
+    _patch_attr(service, "_last_execution_risk_training", blocked_record)
+    service._execution_risk_training_history.append(blocked_record)  # noqa: SLF001
+    service._persist_runtime_state_to_disk()  # noqa: SLF001
+
+    status = _as_mapping(service.execution_risk_status())
+    assert status["source"] == "runtime_state"
+    assert status["dataset_id"] == "execution_risk_dataset_v1_blocked"
+
+    history = _as_mapping(service.execution_risk_training_history(limit=1))
+    assert _as_int(history["records"]) == 1
+    latest = _as_mapping(cast(list[object], history["items"])[-1])
+    assert latest["status"] == "blocked_no_trainable_targets"
+    assert latest["dataset_id"] == "execution_risk_dataset_v1_blocked"
+
+
+def test_execution_risk_status_reports_latest_scanned_artifact_load_error(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config(tmp_path)
+    service = _new_service(config)
+    artifact_root = Path(config.training.bootstrap_state_path).parent / "execution_risk"
+    older_artifact = artifact_root / "execution_risk_20260528T152503.json"
+    _write_execution_risk_artifact(
+        older_artifact,
+        dataset_id="execution_risk_dataset_v1_older_valid",
+        trained_targets=["can_fill"],
+        created_at="2026-05-28T15:25:03",
+    )
+    latest_broken_artifact = artifact_root / "execution_risk_20260528T160000.json"
+    latest_broken_artifact.parent.mkdir(parents=True, exist_ok=True)
+    latest_broken_artifact.write_text("{broken", encoding="utf-8")
+
+    status = _as_mapping(service.execution_risk_status())
+
+    assert status["source"] == "artifact_scan"
+    assert status["dataset_id"] == "execution_risk_dataset_v1_older_valid"
+    assert status["artifact_scan_error_path"] == str(latest_broken_artifact)
+    assert str(status["artifact_scan_error"])
 
 
 def test_runtime_state_merge_preserves_explicit_broker_snapshot_clear(tmp_path: Path) -> None:

@@ -74,8 +74,13 @@ class _FakeAuthConfig:
         self,
         enabled: bool = True,
         token: str = "test-token-12345",
+        notify_test_enabled: bool = True,
     ) -> None:
-        self._security = SecurityConfig(api_auth_enabled=enabled, api_token=token)
+        self._security = SecurityConfig(
+            api_auth_enabled=enabled,
+            api_token=token,
+            notify_test_enabled=notify_test_enabled,
+        )
         self._orig = main_module._config.security
 
     def __enter__(self) -> _FakeAuthConfig:
@@ -127,10 +132,23 @@ def test_valid_bearer_token_passes_auth() -> None:
     with _FakeAuthConfig():
         response = client.post(
             "/notify/test",
-            json={"title": "test", "content": "test"},
+            json={"title": "auth-check", "content": "auth-check"},
             headers={"Authorization": "Bearer test-token-12345"},
         )
         assert response.status_code == 200
+
+
+def test_notify_test_disabled_even_with_valid_token_by_default() -> None:
+    """The ad-hoc test notification endpoint should be closed unless explicitly enabled."""
+    client = TestClient(app, raise_server_exceptions=False)
+    with _FakeAuthConfig(notify_test_enabled=False):
+        response = client.post(
+            "/notify/test",
+            json={"title": "test", "content": "test"},
+            headers={"Authorization": "Bearer test-token-12345"},
+        )
+        assert response.status_code == 403
+        assert response.json()["detail"] == "notify_test_disabled"
 
 
 def test_valid_x_sa_api_key_passes_auth() -> None:
@@ -139,7 +157,7 @@ def test_valid_x_sa_api_key_passes_auth() -> None:
     with _FakeAuthConfig():
         response = client.post(
             "/notify/test",
-            json={"title": "test", "content": "test"},
+            json={"title": "auth-check", "content": "auth-check"},
             headers={"X-SA-API-Key": "test-token-12345"},
         )
         assert response.status_code == 200
@@ -149,7 +167,10 @@ def test_auth_disabled_allows_all() -> None:
     """When api_auth_enabled=false, endpoints should be accessible."""
     client = TestClient(app, raise_server_exceptions=False)
     with _FakeAuthConfig(enabled=False):
-        response = client.post("/notify/test", json={"title": "t", "content": "c"})
+        response = client.post(
+            "/notify/test",
+            json={"title": "auth-disabled", "content": "auth-disabled"},
+        )
         assert response.status_code == 200
 
 
@@ -425,6 +446,27 @@ def test_docker_compose_runtime_api_auth_defaults_to_fail_closed() -> None:
     assert "${SA__SECURITY__API_TOKEN:-}" in content
 
 
+def test_env_example_defaults_runtime_api_auth_to_enabled() -> None:
+    """The sample deployment env should not invite an unprotected runtime."""
+    env_path = Path(__file__).resolve().parents[1] / ".env.example"
+    content = env_path.read_text(encoding="utf-8")
+    assert "SA__SECURITY__API_AUTH_ENABLED=true" in content
+    assert "SA__SECURITY__NOTIFY_TEST_ENABLED=false" in content
+    assert "SA__SECURITY__SUPPRESS_PLAIN_TEST_NOTIFICATIONS=true" in content
+    assert "SA__SECURITY__API_AUTH_ENABLED=false" not in content
+
+
+def test_docker_build_commit_identity_is_build_time_and_exposed_to_health() -> None:
+    """Image commit identity should be baked into the image, not read from .git at runtime."""
+    root = Path(__file__).resolve().parents[1]
+    dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
+    compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "ARG STOCK_ANALYZER_BUILD_COMMIT=unknown" in dockerfile
+    assert "LABEL org.opencontainers.image.revision=${STOCK_ANALYZER_BUILD_COMMIT}" in dockerfile
+    assert "ENV STOCK_ANALYZER_BUILD_COMMIT=${STOCK_ANALYZER_BUILD_COMMIT}" in dockerfile
+    assert "STOCK_ANALYZER_BUILD_COMMIT: ${STOCK_ANALYZER_BUILD_COMMIT:-unknown}" in compose
+
+
 # ---------------------------------------------------------------------------
 # 6. SecurityConfig integration
 # ---------------------------------------------------------------------------
@@ -435,6 +477,8 @@ def test_security_config_defaults() -> None:
     cfg = SecurityConfig()
     assert cfg.api_auth_enabled is False
     assert cfg.api_token == ""
+    assert cfg.notify_test_enabled is False
+    assert cfg.suppress_plain_test_notifications is True
 
 
 def test_config_loads_security_section(monkeypatch: MonkeyPatch) -> None:

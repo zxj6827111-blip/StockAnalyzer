@@ -1338,11 +1338,25 @@ class StockAnalyzerService:
     def latest_execution_risk_training(self) -> dict[str, object] | None:
         return self._training_service.latest_execution_risk_training()
 
-    def execution_risk_training_history(self, limit: int = 20) -> dict[str, object]:
-        return self._training_service.execution_risk_training_history(limit)
+    def execution_risk_training_history(
+        self,
+        limit: int = 20,
+        *,
+        include_artifact_scan: bool = True,
+    ) -> dict[str, object]:
+        return self._training_service.execution_risk_training_history(
+            limit,
+            include_artifact_scan=include_artifact_scan,
+        )
 
-    def execution_risk_status(self) -> dict[str, object]:
-        return self._training_service.execution_risk_status()
+    def execution_risk_status(
+        self,
+        *,
+        include_artifact_scan: bool = True,
+    ) -> dict[str, object]:
+        return self._training_service.execution_risk_status(
+            include_artifact_scan=include_artifact_scan
+        )
 
     def build_execution_aware_report(
         self,
@@ -9047,7 +9061,18 @@ class StockAnalyzerService:
         trace_id: str = "",
     ) -> dict[str, object]:
         quiet_windows = list(self._config.notification_filter.quiet_windows)
-        if is_quiet_time(quiet_windows, now=datetime.now()):
+        if self._config.security.suppress_plain_test_notifications and _is_plain_test_notification(
+            title,
+            content,
+            trace_id=trace_id,
+        ):
+            payload = {
+                "success": False,
+                "channel": "suppressed",
+                "error": "plain_test_notification_suppressed",
+                "suppressed": True,
+            }
+        elif is_quiet_time(quiet_windows, now=datetime.now()):
             payload = {
                 "success": False,
                 "channel": "quiet_window",
@@ -18315,6 +18340,17 @@ def _normalize_inline_text(value: str) -> str:
         .replace("\u3000", " ")
     )
     return " ".join(item for item in sanitized.split(" ") if item)
+
+
+def _is_plain_test_notification(title: str, content: str, *, trace_id: str = "") -> bool:
+    if _normalize_inline_text(trace_id).strip():
+        return False
+    title_text = _normalize_inline_text(title).strip().lower()
+    content_text = _normalize_inline_text(content).strip().lower()
+    plain_values = {"test", "t", "c"}
+    if not title_text and not content_text:
+        return False
+    return title_text in plain_values and content_text in plain_values
 
 
 def _news_title_preview_text(*, title: str, name: str) -> str:

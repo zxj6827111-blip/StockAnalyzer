@@ -28,6 +28,19 @@ if TYPE_CHECKING:
     from stock_analyzer.runtime.service import StockAnalyzerService
 
 
+class _ExecutionRiskArtifactScanResult:
+    def __init__(
+        self,
+        *,
+        latest: dict[str, object] | None = None,
+        error: str = "",
+        error_path: str = "",
+    ) -> None:
+        self.latest = latest
+        self.error = error
+        self.error_path = error_path
+
+
 class RuntimeTrainingService:
     """Delegated training bootstrap state, retry, and diagnostics workflows."""
 
@@ -556,16 +569,61 @@ class RuntimeTrainingService:
         report = self._service._last_execution_risk_training
         return deepcopy(report) if isinstance(report, dict) else None
 
-    def execution_risk_training_history(self, limit: int = 20) -> dict[str, object]:
+    def execution_risk_training_history(
+        self,
+        limit: int = 20,
+        *,
+        include_artifact_scan: bool = True,
+    ) -> dict[str, object]:
         service = self._service
         service._reload_runtime_state_from_disk()
         capped = max(1, min(limit, max(1, service._config.evolution.history_limit)))
-        recent = [deepcopy(item) for item in service._execution_risk_training_history[-capped:]]
+        history = [deepcopy(item) for item in service._execution_risk_training_history]
+        runtime_latest = _latest_execution_risk_record(history)
+        scan_result = (
+            self._discover_latest_execution_risk_artifact()
+            if include_artifact_scan
+            else _ExecutionRiskArtifactScanResult()
+        )
+        discovered = scan_result.latest
+        if (
+            discovered is not None
+            and _execution_risk_record_is_newer(discovered, runtime_latest)
+            and not _execution_risk_history_contains(
+                history,
+                str(discovered.get("artifact_path", "")),
+            )
+        ):
+            history.append(discovered)
+        recent = sorted(history, key=_execution_risk_record_timestamp)[-capped:]
         return {"records": len(recent), "items": recent}
 
-    def execution_risk_status(self) -> dict[str, object]:
+    def execution_risk_status(
+        self,
+        *,
+        include_artifact_scan: bool = True,
+    ) -> dict[str, object]:
         service = self._service
         latest = self.latest_execution_risk_training()
+        status_source = "runtime_state" if latest is not None else ""
+        scan_result = (
+            self._discover_latest_execution_risk_artifact()
+            if include_artifact_scan
+            else _ExecutionRiskArtifactScanResult()
+        )
+        discovered = scan_result.latest
+        runtime_state_history_count = len(service._execution_risk_training_history)
+        discovered_adds_history = bool(
+            discovered is not None
+            and _execution_risk_record_is_newer(discovered, latest)
+            and not _execution_risk_history_contains(
+                service._execution_risk_training_history,
+                str(discovered.get("artifact_path", "")),
+            )
+        )
+        if discovered is not None and _execution_risk_record_is_newer(discovered, latest):
+            latest = discovered
+            status_source = "artifact_scan"
         artifact_text = str((latest or {}).get("artifact_path", "")).strip()
         artifact_path = Path(artifact_text) if artifact_text else None
         artifact_exists = bool(artifact_path and artifact_path.exists())
@@ -580,12 +638,69 @@ class RuntimeTrainingService:
                 artifact_exists = False
         return {
             "latest": latest,
-            "history_count": len(service._execution_risk_training_history),
+            "history_count": runtime_state_history_count + int(discovered_adds_history),
             "artifact_exists": artifact_exists,
             "artifact_path": str(artifact_path) if artifact_path is not None else "",
             "trained_targets": trained_targets,
             "dataset_id": dataset_id,
+            "source": status_source,
+            "runtime_state_history_count": runtime_state_history_count,
+            "artifact_scan_error": scan_result.error,
+            "artifact_scan_error_path": scan_result.error_path,
         }
+
+    def _discover_latest_execution_risk_artifact(
+        self,
+    ) -> _ExecutionRiskArtifactScanResult:
+        root = self._service._training_bootstrap_state_path.parent / "execution_risk"
+        if not root.exists():
+            return _ExecutionRiskArtifactScanResult()
+        discovered: list[dict[str, object]] = []
+        candidates = sorted(
+            root.glob("execution_risk_*.json"),
+            key=_execution_risk_artifact_candidate_timestamp,
+            reverse=True,
+        )[:5]
+        scan_error = ""
+        scan_error_path = ""
+        for index, path in enumerate(candidates):
+            try:
+                artifact = ExecutionRiskArtifact.load(path)
+            except Exception as exc:
+                if index == 0:
+                    scan_error = str(exc)
+                    scan_error_path = str(path)
+                continue
+            created_at = str(artifact.created_at).strip()
+            filename_timestamp = _execution_risk_artifact_timestamp(path)
+            discovered.append(
+                {
+                    "ok": True,
+                    "mode": "execution_risk_training",
+                    "status": "trained",
+                    "timestamp": _newer_execution_risk_timestamp(
+                        created_at,
+                        filename_timestamp,
+                    ),
+                    "artifact_filename_timestamp": filename_timestamp,
+                    "artifact_path": str(path),
+                    "dataset_id": artifact.dataset_id,
+                    "trained_targets": list(artifact.trained_targets),
+                    "training_summary": dict(artifact.training_summary),
+                    "metadata": dict(artifact.metadata),
+                    "source": "artifact_scan",
+                }
+            )
+        if not discovered:
+            return _ExecutionRiskArtifactScanResult(
+                error=scan_error,
+                error_path=scan_error_path,
+            )
+        return _ExecutionRiskArtifactScanResult(
+            latest=deepcopy(max(discovered, key=_execution_risk_record_timestamp)),
+            error=scan_error,
+            error_path=scan_error_path,
+        )
 
     def build_execution_aware_report(
         self,
@@ -688,6 +803,100 @@ def _as_mapping(value: object) -> Mapping[str, object]:
 
 def _as_dict(value: object) -> dict[str, object]:
     return dict(_as_mapping(value))
+
+
+def _execution_risk_history_contains(
+    history: list[dict[str, object]],
+    artifact_path: str,
+) -> bool:
+    normalized = artifact_path.strip()
+    if not normalized:
+        return False
+    return any(str(item.get("artifact_path", "")).strip() == normalized for item in history)
+
+
+def _execution_risk_record_is_newer(
+    candidate: dict[str, object],
+    current: dict[str, object] | None,
+) -> bool:
+    if current is None:
+        return True
+    candidate_artifact = str(candidate.get("artifact_path", "")).strip()
+    current_artifact = str(current.get("artifact_path", "")).strip()
+    if candidate_artifact and candidate_artifact == current_artifact:
+        return False
+    return _execution_risk_record_timestamp(candidate) > _execution_risk_record_timestamp(current)
+
+
+def _latest_execution_risk_record(
+    history: list[dict[str, object]],
+) -> dict[str, object] | None:
+    if not history:
+        return None
+    return max(history, key=_execution_risk_record_timestamp)
+
+
+def _execution_risk_record_timestamp(record: dict[str, object]) -> float:
+    values = [
+        str(record.get("timestamp", "")).strip(),
+        str(record.get("created_at", "")).strip(),
+    ]
+    metadata = record.get("metadata")
+    if isinstance(metadata, Mapping):
+        values.append(str(metadata.get("created_at", "")).strip())
+    for value in values:
+        if not value:
+            continue
+        try:
+            return datetime.fromisoformat(value).timestamp()
+        except ValueError:
+            continue
+    artifact_path = str(record.get("artifact_path", "")).strip()
+    if artifact_path:
+        timestamp_text = _execution_risk_artifact_timestamp(Path(artifact_path))
+        if timestamp_text:
+            try:
+                return datetime.fromisoformat(timestamp_text).timestamp()
+            except ValueError:
+                return 0.0
+    return 0.0
+
+
+def _newer_execution_risk_timestamp(*values: str) -> str:
+    parsed: list[datetime] = []
+    for value in values:
+        if not value.strip():
+            continue
+        try:
+            parsed.append(datetime.fromisoformat(value.strip()))
+        except ValueError:
+            continue
+    return max(parsed).isoformat() if parsed else ""
+
+
+def _execution_risk_artifact_timestamp(path: Path) -> str:
+    stem = path.stem
+    prefix = "execution_risk_"
+    if not stem.startswith(prefix):
+        return ""
+    raw = stem[len(prefix) :]
+    try:
+        return datetime.strptime(raw, "%Y%m%dT%H%M%S").isoformat()
+    except ValueError:
+        return ""
+
+
+def _execution_risk_artifact_candidate_timestamp(path: Path) -> float:
+    timestamp_text = _execution_risk_artifact_timestamp(path)
+    if timestamp_text:
+        try:
+            return datetime.fromisoformat(timestamp_text).timestamp()
+        except ValueError:
+            pass
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
 
 
 def _bootstrap_error_text(report: dict[str, object]) -> str:

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -1946,6 +1947,11 @@ def health() -> dict[str, object]:
     return {
         "status": "ok",
         "mode": _config.app.mode,
+        "build": {
+            "commit": os.environ.get("STOCK_ANALYZER_BUILD_COMMIT", "").strip()
+            or "unknown",
+            "code_commit_id": _config.evolution.code_commit_id,
+        },
         "provider": _service.provider_status(),
         "runtime": _service.runtime_status(include_learning_governance=False),
     }
@@ -2143,6 +2149,10 @@ def notify_test(
     request: NotificationRequest,
     _auth: None = Depends(_verify_api_auth),
 ) -> dict[str, object]:
+    if not _config.security.notify_test_enabled:
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=403, detail="notify_test_disabled")
     return _service.notify(
         title=request.title,
         content=request.content,

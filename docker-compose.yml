@@ -1,6 +1,9 @@
 services:
   api:
-    build: .
+    build:
+      context: .
+      args:
+        STOCK_ANALYZER_BUILD_COMMIT: ${STOCK_ANALYZER_BUILD_COMMIT:-unknown}
     image: stock-analyzer:latest
     container_name: stock-analyzer-api
     command:
@@ -39,7 +42,10 @@ services:
     restart: unless-stopped
 
   scheduler:
-    build: .
+    build:
+      context: .
+      args:
+        STOCK_ANALYZER_BUILD_COMMIT: ${STOCK_ANALYZER_BUILD_COMMIT:-unknown}
     image: stock-analyzer:latest
     container_name: stock-analyzer-scheduler
     command:
