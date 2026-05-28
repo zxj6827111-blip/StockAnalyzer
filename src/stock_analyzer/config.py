@@ -502,6 +502,7 @@ class WeComInteractionConfig(_StrictModel):
     token: str = ""
     verify_signature: bool = True
     allowed_users: list[str] = Field(default_factory=list)
+    allow_all_users_for_local_dev: bool = False
     auto_reconcile_after_broker_snapshot: bool = True
     encoding_aes_key: str = ""
     receive_id: str = ""
@@ -513,6 +514,7 @@ class FeishuInteractionConfig(_StrictModel):
     subscription_mode: str = "webhook"
     verification_token: str = ""
     allowed_users: list[str] = Field(default_factory=list)
+    allow_all_users_for_local_dev: bool = False
     auto_reconcile_after_broker_snapshot: bool = True
 
     @field_validator("subscription_mode")
@@ -546,6 +548,17 @@ class NotificationFilterConfig(_StrictModel):
     )
 
 
+_WEAK_COMMAND_SECRETS = frozenset({
+    "",
+    "change-me",
+    "replace_with_strong_secret",
+    "secret",
+    "password",
+    "default",
+    "test",
+})
+
+
 class CommandChannelConfig(_StrictModel):
     enabled: bool = True
     secret_key: str = "change-me"
@@ -557,6 +570,10 @@ class CommandChannelConfig(_StrictModel):
     history_archive_dir: str = "artifacts/runtime/history"
     history_archive_retention_days: int = 30
     history_archive_max_records: int = 2000
+
+    @property
+    def is_secret_weak(self) -> bool:
+        return self.secret_key.strip().lower() in _WEAK_COMMAND_SECRETS
 
 
 class SchedulerConfig(_StrictModel):
@@ -1022,9 +1039,15 @@ class DashboardConfig(_StrictModel):
     default_total_asset: float = 0.0
 
 
+class SecurityConfig(_StrictModel):
+    api_auth_enabled: bool = False
+    api_token: str = ""
+
+
 class StockAnalyzerConfig(_StrictModel):
     app: AppConfig
     data_source: DataSourceConfig
+    security: SecurityConfig = Field(default_factory=SecurityConfig)
     market_depth: MarketDepthConfig = Field(default_factory=MarketDepthConfig)
     tdx_sync: TdxSyncConfig = Field(default_factory=TdxSyncConfig)
     market_warehouse: MarketWarehouseConfig = Field(default_factory=MarketWarehouseConfig)

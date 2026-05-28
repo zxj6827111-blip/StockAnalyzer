@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 from uuid import uuid4
 
-from fastapi import FastAPI, Query, Request
+from fastapi import Depends, FastAPI, Header, Query, Request
 from fastapi.responses import (
     FileResponse,
     JSONResponse,
@@ -74,6 +74,19 @@ _FEISHU_ACK_REPLY_TEXT = "已收到，处理中"
 
 @asynccontextmanager
 async def _app_lifespan(_app: FastAPI) -> Any:
+    import logging
+    _startup_log = logging.getLogger("stock_analyzer.startup")
+    if _config.command_channel.enabled and _config.command_channel.is_secret_weak:
+        _startup_log.critical(
+            "SECURITY: command_channel.secret_key is weak or default. "
+            "All signed commands will be rejected. Set a strong secret via "
+            "SA__COMMAND_CHANNEL__SECRET_KEY environment variable."
+        )
+    if _config.security.api_auth_enabled and not _config.security.api_token.strip():
+        _startup_log.critical(
+            "SECURITY: security.api_auth_enabled is true but api_token is empty. "
+            "API auth will not protect endpoints."
+        )
     _prewarm_feishu_app_access_token_if_needed()
     _start_feishu_long_connection_if_needed()
     try:
@@ -83,6 +96,40 @@ async def _app_lifespan(_app: FastAPI) -> Any:
 
 
 app = FastAPI(title="StockAnalyzer API", version="0.1.0", lifespan=_app_lifespan)
+
+
+def _verify_api_auth(
+    authorization: str | None = Header(default=None),
+    x_sa_api_key: str | None = Header(default=None),
+) -> None:
+    """Unified API auth dependency for dangerous POST endpoints.
+
+    Supports ``Authorization: Bearer <token>`` and ``X-SA-API-Key: <token>``.
+    Returns 401 when no credential is provided, 403 when the credential is wrong.
+    """
+    sec = _config.security
+    if not sec.api_auth_enabled:
+        return
+    expected = sec.api_token.strip()
+    if not expected:
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=500,
+            detail="api_auth_enabled is true but api_token is empty; refusing all requests",
+        )
+    provided = ""
+    if x_sa_api_key and x_sa_api_key.strip():
+        provided = x_sa_api_key.strip()
+    elif authorization:
+        parts = authorization.split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            provided = parts[1].strip()
+    if not provided:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401, detail="missing_api_token")
+    if provided != expected:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=403, detail="invalid_api_token")
 
 
 def _resolve_frontend_dist_dir(project_root: Path | None = None) -> Path | None:
@@ -1253,6 +1300,8 @@ class CommandRequest(BaseModel):
 
 class SchedulerRunRequest(BaseModel):
     now: str | None = None
+    job: str = ""
+    jobs: list[str] = Field(default_factory=list)
 
 
 class TdxSyncRunRequest(BaseModel):
@@ -1962,7 +2011,10 @@ def _build_internal_command(
 
 
 @app.post("/run/pipeline")
-def run_pipeline(request: PipelineRunRequest) -> dict[str, object]:
+def run_pipeline(
+    request: PipelineRunRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.run_pipeline(
         symbols=request.symbols,
         strategy=request.strategy,
@@ -2033,7 +2085,10 @@ def news_score_cache_state() -> dict[str, object]:
 
 
 @app.post("/news/score/cache/clear")
-def news_score_cache_clear(request: NewsScoreCacheClearRequest) -> dict[str, object]:
+def news_score_cache_clear(
+    request: NewsScoreCacheClearRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.clear_news_score_cache(
         symbol=request.symbol,
         strategy=request.strategy,
@@ -2061,7 +2116,10 @@ def latest_signals() -> dict[str, object]:
 
 
 @app.post("/research/signal-quality/run")
-def run_signal_quality_audit(request: SignalQualityAuditRequest) -> dict[str, object]:
+def run_signal_quality_audit(
+    request: SignalQualityAuditRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.run_signal_quality_audit(
         limit=request.limit,
         include_audit_events=request.include_audit_events,
@@ -2081,7 +2139,10 @@ def signal_quality_audit_history(
 
 
 @app.post("/notify/test")
-def notify_test(request: NotificationRequest) -> dict[str, object]:
+def notify_test(
+    request: NotificationRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.notify(
         title=request.title,
         content=request.content,
@@ -2119,7 +2180,7 @@ def _wecom_user_allowed(user_id: str) -> bool:
         if str(item).strip()
     }
     if not allowed:
-        return True
+        return bool(_config.wecom_interaction.allow_all_users_for_local_dev)
     return user_id in allowed
 
 
@@ -2555,7 +2616,7 @@ def _feishu_user_allowed(event: FeishuMessageEvent) -> bool:
         if str(item).strip()
     }
     if not allowed:
-        return True
+        return bool(_config.feishu_interaction.allow_all_users_for_local_dev)
     candidate_ids = {event.open_id, event.user_id, event.union_id}
     return bool({item for item in candidate_ids if item} & allowed)
 
@@ -3011,13 +3072,20 @@ def command_state() -> dict[str, object]:
 
 
 @app.post("/scheduler/run_due")
-def run_scheduler(request: SchedulerRunRequest) -> dict[str, object]:
+def run_scheduler(
+    request: SchedulerRunRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     now_dt = datetime.fromisoformat(request.now) if request.now else None
-    return {"results": _service.run_due_jobs(now=now_dt)}
+    selected_jobs = [request.job, *request.jobs]
+    return {"results": _service.run_due_jobs(now=now_dt, only_jobs=selected_jobs)}
 
 
 @app.post("/tdx/sync/run")
-def tdx_sync_run(request: TdxSyncRunRequest) -> dict[str, object]:
+def tdx_sync_run(
+    request: TdxSyncRunRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     now_dt = datetime.fromisoformat(request.now) if request.now else None
     return _service.run_tdx_offline_sync(
         timestamp=now_dt,
@@ -3038,7 +3106,10 @@ def tdx_sync_history(limit: int = Query(default=20, ge=1, le=200)) -> dict[str, 
 
 
 @app.post("/warehouse/sync/run")
-def warehouse_sync_run(request: WarehouseSyncRunRequest) -> dict[str, object]:
+def warehouse_sync_run(
+    request: WarehouseSyncRunRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     now_dt = datetime.fromisoformat(request.now) if request.now else None
     return _service.run_market_warehouse_sync(
         timestamp=now_dt,
@@ -3072,7 +3143,10 @@ def warehouse_sync_history(limit: int = Query(default=20, ge=1, le=200)) -> dict
 
 
 @app.post("/idle/run")
-def idle_run(request: IdleQueueRunRequest) -> dict[str, object]:
+def idle_run(
+    request: IdleQueueRunRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     now_dt = datetime.fromisoformat(request.now) if request.now else None
     return _service.run_idle_queue_cycle(now=now_dt, source_trace_id=request.source_trace_id)
 
@@ -3093,7 +3167,10 @@ def idle_state() -> dict[str, object]:
 
 
 @app.post("/idle/ack")
-def idle_ack(request: IdleQueueAckRequest) -> dict[str, object]:
+def idle_ack(
+    request: IdleQueueAckRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     now_dt = datetime.fromisoformat(request.now) if request.now else None
     return _service.idle_queue_ack_blocked(
         task_id=request.task_id,
@@ -3103,7 +3180,10 @@ def idle_ack(request: IdleQueueAckRequest) -> dict[str, object]:
 
 
 @app.post("/evolution/run")
-def evolution_run(request: EvolutionRunRequest) -> dict[str, object]:
+def evolution_run(
+    request: EvolutionRunRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     now_dt = datetime.fromisoformat(request.now) if request.now else None
     symbols = request.symbols if request.symbols else None
     return _service.run_evolution_offhours(
@@ -3115,7 +3195,10 @@ def evolution_run(request: EvolutionRunRequest) -> dict[str, object]:
 
 
 @app.post("/evolution/drill")
-def evolution_drill(request: EvolutionDrillRequest) -> dict[str, object]:
+def evolution_drill(
+    request: EvolutionDrillRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     now_dt = datetime.fromisoformat(request.now) if request.now else None
     return _service.run_evolution_drill(
         timestamp=now_dt,
@@ -3147,7 +3230,10 @@ def evolution_window_report(
 
 
 @app.post("/evolution/m3/maintenance")
-def evolution_m3_maintenance(request: EvolutionM3MaintenanceRequest) -> dict[str, object]:
+def evolution_m3_maintenance(
+    request: EvolutionM3MaintenanceRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     now_dt = datetime.fromisoformat(request.now) if request.now else None
     return _service.run_evolution_m3_maintenance(
         timestamp=now_dt,
@@ -3156,7 +3242,10 @@ def evolution_m3_maintenance(request: EvolutionM3MaintenanceRequest) -> dict[str
 
 
 @app.post("/evolution/m3/search")
-def evolution_m3_search(request: EvolutionM3SearchRequest) -> dict[str, object]:
+def evolution_m3_search(
+    request: EvolutionM3SearchRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.run_evolution_m3_search(
         vector=request.vector,
         top_k=request.top_k,
@@ -3165,7 +3254,10 @@ def evolution_m3_search(request: EvolutionM3SearchRequest) -> dict[str, object]:
 
 
 @app.post("/evolution/m8/suggest")
-def evolution_m8_suggest(request: EvolutionM8SuggestRequest) -> dict[str, object]:
+def evolution_m8_suggest(
+    request: EvolutionM8SuggestRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     now_dt = datetime.fromisoformat(request.now) if request.now else None
     symbols = request.symbols if request.symbols else None
     return _service.run_evolution_m8_suggest(
@@ -3177,7 +3269,10 @@ def evolution_m8_suggest(request: EvolutionM8SuggestRequest) -> dict[str, object
 
 
 @app.post("/evolution/release/attempt")
-def evolution_release_attempt(request: EvolutionReleaseAttemptRequest) -> dict[str, object]:
+def evolution_release_attempt(
+    request: EvolutionReleaseAttemptRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     now_dt = datetime.fromisoformat(request.now) if request.now else None
     return _service.attempt_evolution_release(
         days=request.days,
@@ -3201,7 +3296,10 @@ def evolution_release_history(limit: int = Query(default=20, ge=1, le=500)) -> d
 
 
 @app.post("/evolution/release/approval")
-def evolution_release_approval(request: EvolutionReleaseApprovalRequest) -> dict[str, object]:
+def evolution_release_approval(
+    request: EvolutionReleaseApprovalRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     now_dt = datetime.fromisoformat(request.now) if request.now else None
     return _service.record_evolution_release_approval(
         approver=request.approver,
@@ -3228,7 +3326,10 @@ def evolution_release_approval_history(
 
 
 @app.post("/evolution/release/ticket")
-def evolution_release_ticket(request: EvolutionReleaseTicketRequest) -> dict[str, object]:
+def evolution_release_ticket(
+    request: EvolutionReleaseTicketRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     now_dt = datetime.fromisoformat(request.now) if request.now else None
     return _service.issue_evolution_release_ticket(
         operator=request.operator,
@@ -3241,6 +3342,7 @@ def evolution_release_ticket(request: EvolutionReleaseTicketRequest) -> dict[str
 @app.post("/evolution/release/ticket/execute")
 def evolution_release_ticket_execute(
     request: EvolutionReleaseTicketExecuteRequest,
+    _auth: None = Depends(_verify_api_auth),
 ) -> dict[str, object]:
     now_dt = datetime.fromisoformat(request.now) if request.now else None
     return _service.execute_evolution_release_ticket(
@@ -3256,6 +3358,7 @@ def evolution_release_ticket_execute(
 @app.post("/evolution/release/ticket/confirm")
 def evolution_release_ticket_confirm(
     request: EvolutionReleaseTicketConfirmRequest,
+    _auth: None = Depends(_verify_api_auth),
 ) -> dict[str, object]:
     now_dt = datetime.fromisoformat(request.now) if request.now else None
     return _service.confirm_evolution_release_ticket(
@@ -3270,6 +3373,7 @@ def evolution_release_ticket_confirm(
 @app.post("/evolution/release/ticket/rollback")
 def evolution_release_ticket_rollback(
     request: EvolutionReleaseTicketRollbackRequest,
+    _auth: None = Depends(_verify_api_auth),
 ) -> dict[str, object]:
     now_dt = datetime.fromisoformat(request.now) if request.now else None
     return _service.rollback_evolution_release_ticket(
@@ -3284,6 +3388,7 @@ def evolution_release_ticket_rollback(
 @app.post("/evolution/release/confirmation/watchdog")
 def evolution_release_confirmation_watchdog(
     request: EvolutionReleaseConfirmationWatchdogRequest,
+    _auth: None = Depends(_verify_api_auth),
 ) -> dict[str, object]:
     now_dt = datetime.fromisoformat(request.now) if request.now else None
     return _service.run_evolution_release_confirmation_watchdog(
@@ -3321,7 +3426,10 @@ def evolution_release_ticket_timeline(
 
 
 @app.post("/train/models")
-def train_models(request: TrainModelsRequest) -> dict[str, object]:
+def train_models(
+    request: TrainModelsRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.train_models(
         symbol=request.symbol,
         lookback_days=request.lookback_days,
@@ -3332,7 +3440,10 @@ def train_models(request: TrainModelsRequest) -> dict[str, object]:
 
 
 @app.post("/train/learning-manifest")
-def train_learning_manifest(request: LearningManifestTrainingRequest) -> dict[str, object]:
+def train_learning_manifest(
+    request: LearningManifestTrainingRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.train_learning_manifest(
         dataset_manifest_id=request.dataset_manifest_id,
         artifact_path=request.artifact_path,
@@ -3344,6 +3455,7 @@ def train_learning_manifest(request: LearningManifestTrainingRequest) -> dict[st
 @app.post("/train/learning-manifest/shadow-validate")
 def train_learning_manifest_shadow_validate(
     request: LearningManifestShadowValidationRequest,
+    _auth: None = Depends(_verify_api_auth),
 ) -> dict[str, object]:
     return _service.run_learning_manifest_shadow_validation(
         dataset_manifest_id=request.dataset_manifest_id,
@@ -3365,6 +3477,7 @@ def train_learning_manifest_shadow_validate(
 @app.post("/train/learning-manifest/shadow-promote")
 def train_learning_manifest_shadow_promote(
     request: LearningManifestShadowPromotionGateRequest,
+    _auth: None = Depends(_verify_api_auth),
 ) -> dict[str, object]:
     return _service.run_learning_manifest_shadow_promotion_gate(
         dataset_manifest_id=request.dataset_manifest_id,
@@ -3390,7 +3503,10 @@ def train_learning_manifest_shadow_promote(
 
 
 @app.post("/learning/models/proposal")
-def learning_model_proposal_create(request: LearningModelProposalRequest) -> dict[str, object]:
+def learning_model_proposal_create(
+    request: LearningModelProposalRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.create_learning_model_proposal(
         model_id=request.model_id,
         champion_model_id=request.champion_model_id,
@@ -3415,6 +3531,7 @@ def learning_model_proposal_create(request: LearningModelProposalRequest) -> dic
 @app.post("/train/learning-manifest/shadow-proposal")
 def train_learning_manifest_shadow_proposal(
     request: LearningManifestShadowProposalRequest,
+    _auth: None = Depends(_verify_api_auth),
 ) -> dict[str, object]:
     return _service.run_learning_manifest_shadow_proposal(
         dataset_manifest_id=request.dataset_manifest_id,
@@ -3465,6 +3582,7 @@ def learning_model_proposal_history(
 @app.post("/learning/models/proposal/approval")
 def learning_model_proposal_approval(
     request: LearningModelProposalApprovalRequest,
+    _auth: None = Depends(_verify_api_auth),
 ) -> dict[str, object]:
     return _service.record_learning_model_proposal_approval(
         approver=request.approver,
@@ -3479,6 +3597,7 @@ def learning_model_proposal_approval(
 @app.post("/learning/models/proposal/revoke")
 def learning_model_proposal_revoke(
     request: LearningModelProposalRevokeRequest,
+    _auth: None = Depends(_verify_api_auth),
 ) -> dict[str, object]:
     return _service.revoke_learning_model_proposal(
         revoked_by=request.revoked_by,
@@ -3508,6 +3627,7 @@ def learning_model_proposal_approval_history(
 @app.post("/learning/models/release/ticket")
 def learning_model_release_ticket_issue(
     request: LearningModelReleaseTicketRequest,
+    _auth: None = Depends(_verify_api_auth),
 ) -> dict[str, object]:
     return _service.issue_learning_model_release_ticket(
         operator=request.operator,
@@ -3521,6 +3641,7 @@ def learning_model_release_ticket_issue(
 @app.post("/learning/models/release/ticket/execute")
 def learning_model_release_ticket_execute(
     request: LearningModelReleaseTicketExecuteRequest,
+    _auth: None = Depends(_verify_api_auth),
 ) -> dict[str, object]:
     return _service.execute_learning_model_release_ticket(
         executor=request.executor,
@@ -3535,6 +3656,7 @@ def learning_model_release_ticket_execute(
 @app.post("/learning/models/release/ticket/confirm")
 def learning_model_release_ticket_confirm(
     request: LearningModelReleaseTicketConfirmRequest,
+    _auth: None = Depends(_verify_api_auth),
 ) -> dict[str, object]:
     return _service.confirm_learning_model_release_ticket(
         confirmer=request.confirmer,
@@ -3548,6 +3670,7 @@ def learning_model_release_ticket_confirm(
 @app.post("/learning/models/release/ticket/rollback")
 def learning_model_release_ticket_rollback(
     request: LearningModelReleaseTicketRollbackRequest,
+    _auth: None = Depends(_verify_api_auth),
 ) -> dict[str, object]:
     return _service.rollback_learning_model_release_ticket(
         rollback_by=request.rollback_by,
@@ -3561,6 +3684,7 @@ def learning_model_release_ticket_rollback(
 @app.post("/learning/models/release/confirmation/watchdog")
 def learning_model_release_confirmation_watchdog(
     request: LearningModelReleaseConfirmationWatchdogRequest,
+    _auth: None = Depends(_verify_api_auth),
 ) -> dict[str, object]:
     return _service.run_learning_model_release_confirmation_watchdog(
         now=_parse_optional_datetime(request.now or ""),
@@ -3610,6 +3734,7 @@ def learning_model_governance_status(
 @app.post("/models/registry/promotion-gate")
 def model_registry_promotion_gate(
     request: LearningModelPromotionGateRequest,
+    _auth: None = Depends(_verify_api_auth),
 ) -> dict[str, object]:
     return _service.evaluate_learning_model_promotion_gate(
         model_id=request.model_id,
@@ -3649,7 +3774,10 @@ def model_registry_status(limit: int = Query(default=20, ge=1, le=200)) -> dict[
 
 
 @app.post("/models/registry/register")
-def register_model_artifact(request: RegisterModelArtifactRequest) -> dict[str, object]:
+def register_model_artifact(
+    request: RegisterModelArtifactRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.register_model_artifact(
         artifact_path=request.artifact_path,
         role=request.role,
@@ -3662,6 +3790,7 @@ def register_model_artifact(request: RegisterModelArtifactRequest) -> dict[str, 
 @app.post("/models/registry/bootstrap-active-champion")
 def bootstrap_active_champion(
     request: BootstrapActiveChampionRequest,
+    _auth: None = Depends(_verify_api_auth),
 ) -> dict[str, object]:
     return _service.bootstrap_active_champion_from_artifact(
         artifact_path=request.artifact_path,
@@ -3670,7 +3799,10 @@ def bootstrap_active_champion(
 
 
 @app.post("/models/registry/lifecycle")
-def update_model_registry_lifecycle(request: ModelRegistryLifecycleRequest) -> dict[str, object]:
+def update_model_registry_lifecycle(
+    request: ModelRegistryLifecycleRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.update_model_registry_lifecycle(
         model_id=request.model_id,
         lifecycle_state=request.lifecycle_state,
@@ -3680,7 +3812,10 @@ def update_model_registry_lifecycle(request: ModelRegistryLifecycleRequest) -> d
 
 
 @app.post("/models/registry/role")
-def update_model_registry_role(request: ModelRegistryRoleRequest) -> dict[str, object]:
+def update_model_registry_role(
+    request: ModelRegistryRoleRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.update_model_registry_role(
         model_id=request.model_id,
         role=request.role,
@@ -3694,7 +3829,10 @@ def model_registry_entry(model_id: str) -> dict[str, object] | None:
 
 
 @app.post("/models/shadow-dataset")
-def build_shadow_dataset(request: ShadowDatasetBuildRequest) -> dict[str, object]:
+def build_shadow_dataset(
+    request: ShadowDatasetBuildRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.build_shadow_dataset(
         model_id=request.model_id,
         split_names=request.split_names or None,
@@ -3705,7 +3843,10 @@ def build_shadow_dataset(request: ShadowDatasetBuildRequest) -> dict[str, object
 
 
 @app.post("/models/champion-shadow-report")
-def build_champion_shadow_report(request: ChampionShadowReportBuildRequest) -> dict[str, object]:
+def build_champion_shadow_report(
+    request: ChampionShadowReportBuildRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.build_champion_shadow_report(
         model_id=request.model_id,
         champion_model_id=request.champion_model_id,
@@ -3718,7 +3859,10 @@ def build_champion_shadow_report(request: ChampionShadowReportBuildRequest) -> d
 
 
 @app.post("/models/shadow-online-v2-report")
-def build_shadow_online_v2_report(request: ShadowOnlineV2ReportBuildRequest) -> dict[str, object]:
+def build_shadow_online_v2_report(
+    request: ShadowOnlineV2ReportBuildRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.build_shadow_online_v2_report(
         model_id=request.model_id,
         champion_model_id=request.champion_model_id,
@@ -3741,6 +3885,7 @@ def shadow_v2_status(limit: int = Query(default=20, ge=1, le=200)) -> dict[str, 
 @app.post("/research/alphalens/report")
 def build_phase_d_alphalens_report(
     request: PhaseDAlphalensReportRequest,
+    _auth: None = Depends(_verify_api_auth),
 ) -> dict[str, object]:
     return _service.build_phase_d_alphalens_report(
         model_id=request.model_id,
@@ -3754,7 +3899,10 @@ def build_phase_d_alphalens_report(
 
 
 @app.post("/research/shap/report")
-def build_phase_d_shap_report(request: PhaseDShapReportRequest) -> dict[str, object]:
+def build_phase_d_shap_report(
+    request: PhaseDShapReportRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.build_phase_d_shap_report(
         model_id=request.model_id,
         split_names=request.split_names or None,
@@ -3770,6 +3918,7 @@ def build_phase_d_shap_report(request: PhaseDShapReportRequest) -> dict[str, obj
 @app.post("/research/catboost-shadow/report")
 def build_phase_d_catboost_shadow_report(
     request: PhaseDCatBoostShadowReportRequest,
+    _auth: None = Depends(_verify_api_auth),
 ) -> dict[str, object]:
     return _service.build_phase_d_catboost_shadow_report(
         model_id=request.model_id,
@@ -3785,7 +3934,10 @@ def build_phase_d_catboost_shadow_report(
 
 
 @app.post("/research/finbert/report")
-def build_phase_d_finbert_report(request: PhaseDFinbertReportRequest) -> dict[str, object]:
+def build_phase_d_finbert_report(
+    request: PhaseDFinbertReportRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.build_phase_d_finbert_report(
         records=request.records,
         model_path=request.model_path,
@@ -3797,6 +3949,7 @@ def build_phase_d_finbert_report(request: PhaseDFinbertReportRequest) -> dict[st
 @app.post("/research/qlib-bridge/report")
 def build_phase_d_qlib_bridge_report(
     request: PhaseDQlibBridgeReportRequest,
+    _auth: None = Depends(_verify_api_auth),
 ) -> dict[str, object]:
     return _service.build_phase_d_qlib_bridge_report(
         model_id=request.model_id,
@@ -3813,6 +3966,7 @@ def build_phase_d_qlib_bridge_report(
 @app.post("/research/tabular-deep/report")
 def build_phase_d_tabular_deep_report(
     request: PhaseDTabularDeepReportRequest,
+    _auth: None = Depends(_verify_api_auth),
 ) -> dict[str, object]:
     return _service.build_phase_d_tabular_deep_report(
         model_id=request.model_id,
@@ -3828,7 +3982,10 @@ def build_phase_d_tabular_deep_report(
 
 
 @app.post("/research/tft/report")
-def build_phase_d_tft_report(request: PhaseDTftReportRequest) -> dict[str, object]:
+def build_phase_d_tft_report(
+    request: PhaseDTftReportRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.build_phase_d_tft_report(
         model_id=request.model_id,
         split_names=request.split_names or None,
@@ -3841,7 +3998,10 @@ def build_phase_d_tft_report(request: PhaseDTftReportRequest) -> dict[str, objec
 
 
 @app.post("/research/finrl/report")
-def build_phase_d_finrl_report(request: PhaseDFinrlReportRequest) -> dict[str, object]:
+def build_phase_d_finrl_report(
+    request: PhaseDFinrlReportRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.build_phase_d_finrl_report(
         model_id=request.model_id,
         split_names=request.split_names or None,
@@ -3859,6 +4019,7 @@ def build_phase_d_finrl_report(request: PhaseDFinrlReportRequest) -> dict[str, o
 @app.post("/research/heavy-ts/report")
 def build_phase_d_heavy_ts_report(
     request: PhaseDHeavyTsReportRequest,
+    _auth: None = Depends(_verify_api_auth),
 ) -> dict[str, object]:
     return _service.build_phase_d_heavy_ts_report(
         model_id=request.model_id,
@@ -3878,7 +4039,10 @@ def phase_d6_registry(output_path: str = Query(default="")) -> dict[str, object]
 
 
 @app.post("/train/execution-risk")
-def train_execution_risk(request: ExecutionRiskTrainRequest) -> dict[str, object]:
+def train_execution_risk(
+    request: ExecutionRiskTrainRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.train_execution_risk_model(
         artifact_path=request.artifact_path,
         maturity_statuses=request.maturity_statuses or None,
@@ -3909,6 +4073,7 @@ def train_execution_risk_history(
 @app.post("/models/execution-aware-report")
 def build_execution_aware_report(
     request: ExecutionAwareReportBuildRequest,
+    _auth: None = Depends(_verify_api_auth),
 ) -> dict[str, object]:
     return _service.build_execution_aware_report(
         model_id=request.model_id,
@@ -3927,7 +4092,10 @@ def train_bootstrap_status() -> dict[str, object]:
 
 
 @app.post("/backtest/walk_forward")
-def walk_forward(request: WalkForwardRequest) -> dict[str, object]:
+def walk_forward(
+    request: WalkForwardRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.run_walk_forward(
         symbol=request.symbol,
         lookback_days=request.lookback_days,
@@ -3935,7 +4103,10 @@ def walk_forward(request: WalkForwardRequest) -> dict[str, object]:
 
 
 @app.post("/acceptance/baseline")
-def acceptance_baseline(request: BaselineReportRequest) -> dict[str, object]:
+def acceptance_baseline(
+    request: BaselineReportRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.generate_baseline_report(
         symbol=request.symbol,
         lookback_days=request.lookback_days,
@@ -3944,7 +4115,10 @@ def acceptance_baseline(request: BaselineReportRequest) -> dict[str, object]:
 
 
 @app.post("/acceptance/phase_checkpoint")
-def acceptance_phase_checkpoint(request: PhaseCheckpointRequest) -> dict[str, object]:
+def acceptance_phase_checkpoint(
+    request: PhaseCheckpointRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.generate_phase_checkpoint(
         phase=request.phase,
         baseline_report_path=request.baseline_report_path,
@@ -3953,7 +4127,10 @@ def acceptance_phase_checkpoint(request: PhaseCheckpointRequest) -> dict[str, ob
 
 
 @app.post("/acceptance/v13")
-def acceptance_v13(request: V13AcceptanceRequest) -> dict[str, object]:
+def acceptance_v13(
+    request: V13AcceptanceRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.generate_v13_acceptance_report(
         baseline_report_path=request.baseline_report_path,
         output_path=request.output_path,
@@ -3961,7 +4138,10 @@ def acceptance_v13(request: V13AcceptanceRequest) -> dict[str, object]:
 
 
 @app.post("/acceptance/v13/bundle")
-def acceptance_v13_bundle(request: V13AcceptanceBundleRequest) -> dict[str, object]:
+def acceptance_v13_bundle(
+    request: V13AcceptanceBundleRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.generate_v13_acceptance_bundle(
         symbol=request.symbol,
         lookback_days=request.lookback_days,
@@ -3973,7 +4153,9 @@ def acceptance_v13_bundle(request: V13AcceptanceBundleRequest) -> dict[str, obje
 
 
 @app.post("/stress/run")
-def stress_run() -> dict[str, object]:
+def stress_run(
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.run_stress_tests()
 
 
@@ -4004,7 +4186,10 @@ def portfolio_execution_bias(
 
 
 @app.post("/portfolio/broker_snapshot")
-def portfolio_broker_snapshot(request: BrokerSnapshotRequest) -> dict[str, object]:
+def portfolio_broker_snapshot(
+    request: BrokerSnapshotRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     positions = [item.model_dump() for item in request.positions]
     return _service.update_broker_snapshot(
         positions=positions,
@@ -4013,7 +4198,10 @@ def portfolio_broker_snapshot(request: BrokerSnapshotRequest) -> dict[str, objec
 
 
 @app.post("/portfolio/reconcile/run")
-def portfolio_reconcile_run(request: ReconcileRunRequest) -> dict[str, object]:
+def portfolio_reconcile_run(
+    request: ReconcileRunRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     now_dt = datetime.fromisoformat(request.now) if request.now else None
     return {"report": _service.run_reconciliation(timestamp=now_dt)}
 
@@ -4076,7 +4264,10 @@ def runtime_history_archive_status(limit: int = Query(default=20, ge=1, le=500))
 
 
 @app.post("/runtime/history/archive/run")
-def runtime_history_archive_run(request: RuntimeArchiveRunRequest) -> dict[str, object]:
+def runtime_history_archive_run(
+    request: RuntimeArchiveRunRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     now_dt = datetime.fromisoformat(request.now) if request.now else None
     return _service.archive_runtime_history(now=now_dt, force=request.force)
 
@@ -4084,6 +4275,7 @@ def runtime_history_archive_run(request: RuntimeArchiveRunRequest) -> dict[str, 
 @app.post("/learning/runtime-history/bootstrap")
 def learning_runtime_history_bootstrap(
     request: LearningRuntimeHistoryColdStartRequest,
+    _auth: None = Depends(_verify_api_auth),
 ) -> dict[str, object]:
     symbols = request.symbols if request.symbols else None
     return _service.bootstrap_learning_from_runtime_history(
@@ -4123,7 +4315,10 @@ def m3_profile_status() -> dict[str, object]:
 
 
 @app.post("/acceptance/week4/run")
-def acceptance_week4_run(request: Week4AcceptanceRunRequest) -> dict[str, object]:
+def acceptance_week4_run(
+    request: Week4AcceptanceRunRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.run_week4_acceptance(
         sla_recent_runs=request.sla_recent_runs,
         export_enabled=request.export_enabled,
@@ -4145,7 +4340,10 @@ def acceptance_week4_history(limit: int = Query(default=20, ge=1, le=500)) -> di
 
 
 @app.post("/week5/scan/run")
-def week5_scan_run(request: Week5ScanRunRequest) -> dict[str, object]:
+def week5_scan_run(
+    request: Week5ScanRunRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     symbols = request.symbols if request.symbols else None
     return _service.run_week5_scan(
         symbols=symbols,
@@ -4185,7 +4383,10 @@ def week5_signal_pool_symbol_live(
 
 
 @app.post("/week6/run")
-def week6_run(request: Week6RunRequest) -> dict[str, object]:
+def week6_run(
+    request: Week6RunRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     symbols = request.symbols if request.symbols else None
     return _service.run_week6_analysis(symbols=symbols, notify_enabled=request.notify_enabled)
 
@@ -4204,7 +4405,10 @@ def week6_history(limit: int = Query(default=20, ge=1, le=500)) -> dict[str, obj
 
 
 @app.post("/week6/data-quality/run")
-def week6_data_quality_run(request: Week6DataQualityRunRequest) -> dict[str, object]:
+def week6_data_quality_run(
+    request: Week6DataQualityRunRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     symbols = request.symbols if request.symbols else None
     return _service.run_week6_data_prewarm(
         symbols=symbols,
@@ -4230,7 +4434,10 @@ def week6_data_quality_history(
 
 
 @app.post("/week6/global/snapshot")
-def week6_global_snapshot(request: Week6GlobalSnapshotRequest) -> dict[str, object]:
+def week6_global_snapshot(
+    request: Week6GlobalSnapshotRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.update_global_market_snapshot(
         snapshot=request.model_dump(exclude={"source_trace_id"}),
         source_trace_id=request.source_trace_id,
@@ -4248,7 +4455,10 @@ def week6_global_history(limit: int = Query(default=50, ge=1, le=500)) -> dict[s
 
 
 @app.post("/week6/regulatory/watchlist")
-def week6_regulatory_watchlist_set(request: Week6RegulatoryWatchlistRequest) -> dict[str, object]:
+def week6_regulatory_watchlist_set(
+    request: Week6RegulatoryWatchlistRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     entries = [item.model_dump() for item in request.entries]
     return _service.set_regulatory_watchlist(
         entries=entries,
@@ -4262,7 +4472,10 @@ def week6_regulatory_watchlist_get() -> dict[str, object]:
 
 
 @app.post("/week7/kill-switch/performance")
-def week7_kill_switch_performance(request: Week7StrategyPerformanceRequest) -> dict[str, object]:
+def week7_kill_switch_performance(
+    request: Week7StrategyPerformanceRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.record_strategy_performance(
         month=request.month,
         strategy=request.strategy,
@@ -4287,7 +4500,10 @@ def week7_kill_switch_status(strategy: str = Query(default="")) -> dict[str, obj
 
 
 @app.post("/week7/kill-switch/reset")
-def week7_kill_switch_reset(request: Week7KillSwitchResetRequest) -> dict[str, object]:
+def week7_kill_switch_reset(
+    request: Week7KillSwitchResetRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.reset_strategy_kill_switch(
         strategy=request.strategy,
         resume_new_buy=request.resume_new_buy,
@@ -4296,7 +4512,10 @@ def week7_kill_switch_reset(request: Week7KillSwitchResetRequest) -> dict[str, o
 
 
 @app.post("/week7/cloud-backup/ping")
-def week7_cloud_backup_ping(request: Week7CloudBackupPingRequest) -> dict[str, object]:
+def week7_cloud_backup_ping(
+    request: Week7CloudBackupPingRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.cloud_backup_ping(
         source=request.source,
         source_trace_id=request.source_trace_id,
@@ -4309,7 +4528,10 @@ def week7_cloud_backup_status() -> dict[str, object]:
 
 
 @app.post("/week7/cloud-backup/check")
-def week7_cloud_backup_check(request: Week7CloudBackupCheckRequest) -> dict[str, object]:
+def week7_cloud_backup_check(
+    request: Week7CloudBackupCheckRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     now_dt = datetime.fromisoformat(request.now) if request.now else None
     return _service.run_cloud_backup_check(
         now=now_dt,
@@ -4318,7 +4540,10 @@ def week7_cloud_backup_check(request: Week7CloudBackupCheckRequest) -> dict[str,
 
 
 @app.post("/week7/factor-lifecycle/record")
-def week7_factor_lifecycle_record(request: Week7FactorLifecycleRecordRequest) -> dict[str, object]:
+def week7_factor_lifecycle_record(
+    request: Week7FactorLifecycleRecordRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.record_factor_lifecycle(
         month=request.month,
         strategy=request.strategy,
@@ -4352,7 +4577,10 @@ def week7_factor_lifecycle_graveyard(
 
 
 @app.post("/week7/factor-lifecycle/reset")
-def week7_factor_lifecycle_reset(request: Week7FactorLifecycleResetRequest) -> dict[str, object]:
+def week7_factor_lifecycle_reset(
+    request: Week7FactorLifecycleResetRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.reset_factor_lifecycle(
         strategy=request.strategy,
         source_trace_id=request.source_trace_id,
@@ -4360,7 +4588,10 @@ def week7_factor_lifecycle_reset(request: Week7FactorLifecycleResetRequest) -> d
 
 
 @app.post("/week7/sim-broker/run")
-def week7_sim_broker_run(request: Week7SimBrokerRunRequest) -> dict[str, object]:
+def week7_sim_broker_run(
+    request: Week7SimBrokerRunRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     return _service.run_week7_sim_broker_weekly(
         days=request.days,
         export_enabled=request.export_enabled,

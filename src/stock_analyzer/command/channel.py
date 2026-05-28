@@ -76,6 +76,14 @@ class SignedCommandProcessor:
                 state=self._state,
             )
 
+        if self._config.is_secret_weak:
+            return CommandExecutionResult(
+                accepted=False,
+                code="weak_secret",
+                message="command channel secret is weak or default; set a strong secret_key",
+                state=self._state,
+            )
+
         if not self._verify_signature(command):
             return CommandExecutionResult(
                 accepted=False,

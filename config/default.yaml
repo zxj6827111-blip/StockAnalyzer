@@ -3,6 +3,10 @@ app:
   mode: simulation
   advisory_only: false
 
+security:
+  api_auth_enabled: false
+  api_token: ""
+
 data_source:
   primary: market_warehouse
   local_data_root: "artifacts/warehouse/package"

@@ -59,7 +59,7 @@ def feishu_payload_is_encrypted(payload: dict[str, Any]) -> bool:
 def verify_feishu_token(payload: dict[str, Any], expected_token: str) -> bool:
     normalized_expected = expected_token.strip()
     if not normalized_expected:
-        return True
+        return False
 
     candidates: list[str] = []
     top_level = str(payload.get("token", "")).strip()

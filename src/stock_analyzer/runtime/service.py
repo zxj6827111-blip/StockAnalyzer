@@ -3709,11 +3709,37 @@ class StockAnalyzerService:
         )
         return payload
 
-    def run_due_jobs(self, now: datetime | None = None) -> list[dict[str, object]]:
+    def run_due_jobs(
+        self,
+        now: datetime | None = None,
+        only_jobs: list[str] | None = None,
+    ) -> list[dict[str, object]]:
         self._refresh_runtime_state_from_disk_if_changed()
         current = now or datetime.now()
+        selectors = [str(item).strip() for item in (only_jobs or []) if str(item).strip()]
         retry_result: dict[str, object] | None = None
         if self._bootstrap_runtime_blocked():
+            if selectors:
+                self._record_audit_event(
+                    event_type="scheduler_blocked_bootstrap",
+                    level="warn",
+                    payload={
+                        "selected_jobs": selectors,
+                        "bootstrap": self.training_bootstrap_status(),
+                    },
+                )
+                return [
+                    {
+                        "job": "bootstrap_gate",
+                        "ran": False,
+                        "success": False,
+                        "detail": "blocked_bootstrap_required",
+                        "payload": {
+                            "selected_jobs": selectors,
+                            "bootstrap": self.training_bootstrap_status(),
+                        },
+                    }
+                ]
             retry_result = self._maybe_retry_bootstrap_when_blocked(now=current)
             if self._bootstrap_runtime_blocked():
                 self._record_audit_event(
@@ -3733,7 +3759,10 @@ class StockAnalyzerService:
         previous_scheduler_now = self._scheduler_now_context
         self._scheduler_now_context = current
         try:
-            results = [result.to_dict() for result in self._scheduler.run_due(now=current)]
+            results = [
+                result.to_dict()
+                for result in self._scheduler.run_due(now=current, only_jobs=selectors or None)
+            ]
         finally:
             self._scheduler_now_context = previous_scheduler_now
         scheduler_state_after = self._scheduler.export_state()
@@ -13872,7 +13901,6 @@ class StockAnalyzerService:
         ):
             if self._cloud_backup_alert_active:
                 self._cloud_backup_alert_active = False
-                self._persist_runtime_state_to_disk()
                 status = self.cloud_backup_status(now=current)
             return {
                 "status": status,
@@ -17212,6 +17240,11 @@ class StockAnalyzerService:
                 if overflow > 0:
                     self._audit_events = self._audit_events[overflow:]
         self._persist_runtime_state_to_disk()
+        # TODO(security): In dry-run mode, business state (portfolio/watchlist/trades)
+        # is correctly rolled back, but this persist call writes audit_events and
+        # run_summaries to runtime_state.json. Consider splitting audit persistence
+        # from business state persistence, or gating this call on a dry_run flag.
+        # See test: test_service_pipeline_dry_run_execution_does_not_mutate_portfolio_or_notify
 
 
 def _signals_count(report: dict[str, object]) -> int:
