@@ -102,15 +102,23 @@ class DailyScheduler:
             date_predicate=date_predicate,
         )
 
-    def run_due(self, now: datetime | None = None) -> list[ScheduledTaskResult]:
+    def run_due(
+        self,
+        now: datetime | None = None,
+        only_jobs: Collection[str] | None = None,
+    ) -> list[ScheduledTaskResult]:
         if not self._config.enabled:
             return []
 
         current = now or datetime.now()
         current_weekday = current.weekday()
         results: list[ScheduledTaskResult] = []
+        selectors = _normalize_job_selectors(only_jobs)
+        matched_selectors: set[str] = set()
         ordered_jobs = sorted(self._jobs.items(), key=lambda item: item[1].trigger_time)
         for name, job in ordered_jobs:
+            if selectors and not _job_matches_selectors(name, selectors, matched_selectors):
+                continue
             if not _date_matches(
                 current.date(),
                 current_weekday=current_weekday,
@@ -179,6 +187,8 @@ class DailyScheduler:
                 )
 
         for name, interval_job in self._interval_jobs.items():
+            if selectors and not _job_matches_selectors(name, selectors, matched_selectors):
+                continue
             if not _date_matches(
                 current.date(),
                 current_weekday=current_weekday,
@@ -243,6 +253,17 @@ class DailyScheduler:
                         ran=True,
                         success=False,
                         detail=str(exc),
+                        payload={},
+                    )
+                )
+        for selector in selectors:
+            if selector not in matched_selectors:
+                results.append(
+                    ScheduledTaskResult(
+                        job=selector,
+                        ran=False,
+                        success=False,
+                        detail="unknown_job",
                         payload={},
                     )
                 )
@@ -313,6 +334,46 @@ def _normalize_weekdays(weekdays: Collection[int] | None) -> frozenset[int] | No
     if invalid:
         raise ValueError(f"weekdays must be between 0 and 6: {invalid}")
     return normalized
+
+
+def _normalize_job_selectors(selectors: Collection[str] | None) -> tuple[str, ...]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in selectors or []:
+        value = str(item).strip()
+        if not value:
+            continue
+        if value in seen:
+            continue
+        seen.add(value)
+        normalized.append(value)
+    return tuple(normalized)
+
+
+def _job_matches_selectors(
+    job_name: str,
+    selectors: tuple[str, ...],
+    matched_selectors: set[str],
+) -> bool:
+    matched = False
+    for selector in selectors:
+        if job_name == selector or _job_family_matches_selector(
+            job_name=job_name,
+            selector=selector,
+        ):
+            matched_selectors.add(selector)
+            matched = True
+    return matched
+
+
+def _job_family_matches_selector(*, job_name: str, selector: str) -> bool:
+    family = {
+        "live_runtime": "week5_live_runtime",
+        "week5_live_runtime": "week5_live_runtime",
+        "week5_first_board": "week5_first_board",
+        "week5_market_radar": "week5_market_radar",
+    }.get(selector)
+    return bool(family and job_name.startswith(f"{family}_"))
 
 
 def _weekday_matches(current_weekday: int, weekdays: frozenset[int] | None) -> bool:

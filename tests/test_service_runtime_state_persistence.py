@@ -798,6 +798,71 @@ def test_runtime_state_merge_preserves_run_history_across_stale_processes(tmp_pa
     assert _as_int(events["records"]) >= 1
 
 
+def test_execution_risk_status_refreshes_runtime_state_from_disk(tmp_path: Path) -> None:
+    config = _load_test_config(tmp_path)
+    service_a = _new_service(config)
+    service_b = _new_service(config)
+
+    old_artifact = tmp_path / "execution_risk_old.json"
+    old_artifact.write_text(
+        json.dumps(
+            {
+                "artifact_type": "execution_risk",
+                "artifact_version": "execution_risk_artifact_v1",
+                "dataset_id": "execution_risk_dataset_v1_old",
+                "trained_targets": ["can_fill"],
+                "targets": {},
+                "created_at": "2026-03-04T10:00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    old_record = {
+        "timestamp": "2026-03-04T10:00:00",
+        "status": "trained",
+        "artifact_path": str(old_artifact),
+        "dataset_id": "execution_risk_dataset_v1_old",
+        "trained_targets": ["can_fill"],
+    }
+    _patch_attr(service_a, "_last_execution_risk_training", old_record)
+    service_a._execution_risk_training_history.append(old_record)  # noqa: SLF001
+    service_a._persist_runtime_state_to_disk()  # noqa: SLF001
+
+    stale_status = _as_mapping(service_b.execution_risk_status())
+    assert stale_status["dataset_id"] == "execution_risk_dataset_v1_old"
+
+    new_artifact = tmp_path / "execution_risk_new.json"
+    new_artifact.write_text(
+        json.dumps(
+            {
+                "artifact_type": "execution_risk",
+                "artifact_version": "execution_risk_artifact_v1",
+                "dataset_id": "execution_risk_dataset_v1_new",
+                "trained_targets": ["can_fill", "likely_slippage_high"],
+                "targets": {},
+                "created_at": "2026-03-04T15:25:03",
+            }
+        ),
+        encoding="utf-8",
+    )
+    new_record = {
+        "timestamp": "2026-03-04T15:25:03",
+        "status": "trained",
+        "artifact_path": str(new_artifact),
+        "dataset_id": "execution_risk_dataset_v1_new",
+        "trained_targets": ["can_fill", "likely_slippage_high"],
+    }
+    _patch_attr(service_a, "_last_execution_risk_training", new_record)
+    service_a._execution_risk_training_history.append(new_record)  # noqa: SLF001
+    service_a._persist_runtime_state_to_disk()  # noqa: SLF001
+
+    refreshed_status = _as_mapping(service_b.execution_risk_status())
+    assert refreshed_status["dataset_id"] == "execution_risk_dataset_v1_new"
+    assert refreshed_status["artifact_path"] == str(new_artifact)
+    assert refreshed_status["trained_targets"] == ["can_fill", "likely_slippage_high"]
+    assert _as_int(refreshed_status["history_count"]) == 2
+
+
 def test_runtime_state_merge_preserves_explicit_broker_snapshot_clear(tmp_path: Path) -> None:
     config = _load_test_config(tmp_path)
     service_a = _new_service(config)

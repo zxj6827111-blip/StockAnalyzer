@@ -148,9 +148,9 @@ def test_valid_x_sa_api_key_passes_auth() -> None:
 def test_auth_disabled_allows_all() -> None:
     """When api_auth_enabled=false, endpoints should be accessible."""
     client = TestClient(app, raise_server_exceptions=False)
-    # Default config has api_auth_enabled=false
-    response = client.post("/notify/test", json={"title": "t", "content": "c"})
-    assert response.status_code == 200
+    with _FakeAuthConfig(enabled=False):
+        response = client.post("/notify/test", json={"title": "t", "content": "c"})
+        assert response.status_code == 200
 
 
 def test_auth_enabled_empty_token_fails_closed() -> None:

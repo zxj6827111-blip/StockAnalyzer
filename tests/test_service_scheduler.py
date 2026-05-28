@@ -525,6 +525,122 @@ def test_week5_live_runtime_interval_job_uses_watchlist_and_live_runtime() -> No
     assert _as_int(_as_mapping(live_job["payload"])["symbol_count"]) == 2
 
 
+def test_run_due_jobs_selector_only_runs_matching_live_runtime_job() -> None:
+    config = _load_test_config()
+    config.scheduler.premarket_time = "09:30"
+    config.scheduler.auction_report_time = "23:59"
+    config.scheduler.close_reconcile_time = "23:59"
+    config.scheduler.week4_acceptance_time = "23:59"
+    config.week5.auto_run = True
+    config.week5.first_board_windows = ["09:30-09:31"]
+    config.week5.live_runtime_window_intervals = ["09:30-09:31@1"]
+    config.week5.market_radar_enabled = True
+    config.week5.market_radar_window_intervals = ["09:30-09:31@1"]
+    service = _new_service(config)
+    service.state.watchlist = ["600000", "000001"]
+
+    called: list[str] = []
+    _patch_attr(
+        service,
+        "run_week5_scan",
+        lambda **_: called.append("week5_scan") or {"status": "ok"},
+    )
+    _patch_attr(
+        service,
+        "run_week5_market_radar",
+        lambda **_: called.append("market_radar") or {"status": "ok"},
+    )
+
+    def _fake_run_pipeline(**kwargs: object) -> dict[str, object]:
+        called.append(str(kwargs.get("job_name", "")))
+        return {
+            "trace_id": "selector-live-runtime-test",
+            "actionable_signals": [],
+            "portfolio_update": {"executions": []},
+        }
+
+    _patch_attr(service, "run_pipeline", _fake_run_pipeline)
+
+    results = service.run_due_jobs(
+        now=datetime.fromisoformat("2026-03-02T09:30:00"),
+        only_jobs=["week5_live_runtime"],
+    )
+
+    assert called == ["week5_live_runtime"]
+    assert [item["job"] for item in results] == ["week5_live_runtime_1"]
+    live_job = results[0]
+    assert _as_bool(live_job["ran"]) is True
+    assert _as_bool(live_job["success"]) is True
+
+
+def test_run_due_jobs_unknown_selector_reports_error_without_running_others() -> None:
+    config = _load_test_config()
+    config.scheduler.premarket_time = "09:30"
+    config.week5.auto_run = True
+    config.week5.first_board_windows = ["09:30-09:31"]
+    service = _new_service(config)
+    called: list[str] = []
+    _patch_attr(
+        service,
+        "run_week5_scan",
+        lambda **_: called.append("week5_scan") or {"status": "ok"},
+    )
+
+    results = service.run_due_jobs(
+        now=datetime.fromisoformat("2026-03-02T09:30:00"),
+        only_jobs=["not_a_real_job"],
+    )
+
+    assert called == []
+    assert len(results) == 1
+    assert results[0]["job"] == "not_a_real_job"
+    assert _as_bool(results[0]["ran"]) is False
+    assert _as_bool(results[0]["success"]) is False
+    assert results[0]["detail"] == "unknown_job"
+
+
+def test_run_due_jobs_rejects_broad_prefix_selector_without_running_week5_jobs() -> None:
+    config = _load_test_config()
+    config.scheduler.premarket_time = "09:30"
+    config.scheduler.auction_report_time = "23:59"
+    config.scheduler.close_reconcile_time = "23:59"
+    config.scheduler.week4_acceptance_time = "23:59"
+    config.week5.auto_run = True
+    config.week5.first_board_windows = ["09:30-09:31"]
+    config.week5.live_runtime_window_intervals = ["09:30-09:31@1"]
+    config.week5.market_radar_enabled = True
+    config.week5.market_radar_window_intervals = ["09:30-09:31@1"]
+    service = _new_service(config)
+    service.state.watchlist = ["600000", "000001"]
+
+    called: list[str] = []
+    _patch_attr(
+        service,
+        "run_week5_scan",
+        lambda **_: called.append("week5_scan") or {"status": "ok"},
+    )
+    _patch_attr(
+        service,
+        "run_week5_market_radar",
+        lambda **_: called.append("market_radar") or {"status": "ok"},
+    )
+    _patch_attr(
+        service,
+        "run_pipeline",
+        lambda **kwargs: called.append(str(kwargs.get("job_name", ""))) or {},
+    )
+
+    results = service.run_due_jobs(
+        now=datetime.fromisoformat("2026-03-02T09:30:00"),
+        only_jobs=["week5"],
+    )
+
+    assert called == []
+    assert results[0]["job"] == "week5"
+    assert _as_bool(results[0]["success"]) is False
+    assert results[0]["detail"] == "unknown_job"
+
+
 def test_week5_live_runtime_limits_symbols_and_prioritizes_active_pools() -> None:
     config = _load_test_config()
     config.scheduler.premarket_time = "23:59"

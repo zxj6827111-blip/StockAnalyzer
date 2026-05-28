@@ -158,10 +158,14 @@ curl "http://127.0.0.1:${SA_API_HOST_PORT:-18001}/health"
 如需直接测试通知链路：
 
 ```bash
+test -n "${SA__SECURITY__API_TOKEN:-}" || { echo "SA__SECURITY__API_TOKEN is required"; exit 1; }
 curl -X POST "http://127.0.0.1:${SA_API_HOST_PORT:-18001}/notify/test" \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ${SA__SECURITY__API_TOKEN}" \
   -d "{\"title\":\"NAS通知测试\",\"content\":\"检查自动通知链路\"}"
 ```
+
+避免反复或未带 token 调用 `/notify/test`；该接口会真实发送通知。
 
 不要优先在 NAS 主机直接执行 `python3 scripts/export_support_bundle.py`，主机通常没有项目依赖。
 

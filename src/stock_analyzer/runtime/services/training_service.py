@@ -552,11 +552,13 @@ class RuntimeTrainingService:
         return payload
 
     def latest_execution_risk_training(self) -> dict[str, object] | None:
+        self._service._refresh_runtime_state_from_disk_if_changed()
         report = self._service._last_execution_risk_training
         return deepcopy(report) if isinstance(report, dict) else None
 
     def execution_risk_training_history(self, limit: int = 20) -> dict[str, object]:
         service = self._service
+        service._refresh_runtime_state_from_disk_if_changed()
         capped = max(1, min(limit, max(1, service._config.evolution.history_limit)))
         recent = [deepcopy(item) for item in service._execution_risk_training_history[-capped:]]
         return {"records": len(recent), "items": recent}

@@ -126,7 +126,7 @@ SA__NOTIFICATIONS__FEISHU_APP_SECRET=xxx
 - `GET /news/score/history?limit=50&symbol=&strategy=`
 - `GET /news/score/cache/state`
 - `POST /news/score/cache/clear`
-- `POST /notify/test`
+- `POST /notify/test` (protected when `SA__SECURITY__API_AUTH_ENABLED=true`)
 - `POST /command/execute`
 - `GET /command/state`
 - `GET /wecom/callback` (URL verification in WeCom callback plain/safe mode)
@@ -134,7 +134,7 @@ SA__NOTIFICATIONS__FEISHU_APP_SECRET=xxx
 - `GET /feishu/long_connection/status`
 - `POST /feishu/callback` (Feishu webhook mode only; long-connection mode does not require a public callback URL)
 - Text commands include: `help`, `positions`, `trades`, `news`, `newslist`, `newscache state`, `newscache clear [symbol] [strategy]`, `newshistory [limit] [symbol] [strategy]`, `mode`, `mode advisory on/off`, `lifecycle [status] [limit]`, `recstatus <symbol> <recommended|bought|watching|dropped> [note]`, `holdingalerts [warn|info]`, `bias [days] [limit]`
-- `POST /scheduler/run_due`
+- `POST /scheduler/run_due` (protected; accepts `job` / `jobs` selectors for targeted runs)
 - `POST /idle/run`
 - `GET /idle/latest`
 - `GET /idle/history?limit=20`
