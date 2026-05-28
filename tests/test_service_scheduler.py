@@ -9,6 +9,8 @@ from pathlib import Path
 from threading import Event
 from typing import Any, cast
 
+import pytest
+
 from stock_analyzer.command.channel import CommandEnvelope, SignedCommandProcessor
 from stock_analyzer.config import StockAnalyzerConfig, load_config
 from stock_analyzer.data.provider import SyntheticProvider
@@ -415,7 +417,14 @@ def test_evening_jobs_run_in_trigger_time_order_after_late_restart() -> None:
         scheduler_lock_path: object = None,
         scheduler_lock_owner_token: str = "",
     ) -> dict[str, object]:
-        _ = timestamp, notify_enabled, force, symbols, scheduler_lock_path, scheduler_lock_owner_token
+        _ = (
+            timestamp,
+            notify_enabled,
+            force,
+            symbols,
+            scheduler_lock_path,
+            scheduler_lock_owner_token,
+        )
         call_order.append("market_warehouse_sync")
         sync_called.set()
         return {"status": "ok", "trace_id": source_trace_id}
@@ -487,7 +496,6 @@ def test_week5_live_runtime_interval_job_uses_watchlist_and_live_runtime() -> No
     service.state.watchlist = ["600000", "000001"]
 
     captured: dict[str, object] = {}
-    notifications: list[dict[str, object]] = []
     _patch_attr(service, "run_week5_scan", lambda **_: {"status": "ok"})
 
     def _fake_run_pipeline(**kwargs: object) -> dict[str, object]:
@@ -502,13 +510,7 @@ def test_week5_live_runtime_interval_job_uses_watchlist_and_live_runtime() -> No
     _patch_attr(
         service,
         "_notify_actionable_signals",
-        lambda report, trace_id, title_prefix: notifications.append(
-            {
-                "trace_id": trace_id,
-                "title_prefix": title_prefix,
-                "report": report,
-            }
-        ),
+        lambda *args, **kwargs: pytest.fail("live runtime scheduler must stay silent"),
     )
 
     results = service.run_due_jobs(now=datetime.fromisoformat("2026-03-02T09:30:00"))
@@ -518,10 +520,9 @@ def test_week5_live_runtime_interval_job_uses_watchlist_and_live_runtime() -> No
     assert captured["symbols"] == ["600000", "000001"]
     assert captured["strategy"] == "trend"
     assert _as_bool(captured["use_live_runtime"]) is True
+    assert _as_bool(captured["notify_enabled"]) is False
     assert captured["job_name"] == "week5_live_runtime"
     assert _as_int(_as_mapping(live_job["payload"])["symbol_count"]) == 2
-    assert notifications[0]["trace_id"] == "live-runtime-test"
-    assert notifications[0]["title_prefix"] == "盘中"
 
 
 def test_week5_live_runtime_limits_symbols_and_prioritizes_active_pools() -> None:
@@ -1072,7 +1073,14 @@ def test_market_warehouse_scheduler_job_launches_background_worker_and_runs_post
         scheduler_lock_path: object = None,
         scheduler_lock_owner_token: str = "",
     ) -> dict[str, object]:
-        _ = timestamp, notify_enabled, force, symbols, scheduler_lock_path, scheduler_lock_owner_token
+        _ = (
+            timestamp,
+            notify_enabled,
+            force,
+            symbols,
+            scheduler_lock_path,
+            scheduler_lock_owner_token,
+        )
         return {
             "status": "ok",
             "trace_id": source_trace_id,
@@ -1227,7 +1235,8 @@ def test_market_warehouse_scheduler_job_does_not_launch_when_lock_is_active() ->
         )
 
 
-def test_market_warehouse_scheduler_job_retries_after_lock_conflict_without_consuming_daily_slot() -> None:
+def test_market_warehouse_scheduler_job_retries_after_lock_conflict_without_consuming_daily_slot(
+) -> None:
     config = _load_test_config()
     config.scheduler.premarket_time = "23:59"
     config.scheduler.auction_report_time = "23:59"

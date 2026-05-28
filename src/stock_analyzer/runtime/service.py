@@ -15960,10 +15960,10 @@ class StockAnalyzerService:
             strategy="trend",
             current_equity=self._state.current_equity,
             use_live_runtime=True,
+            notify_enabled=False,
             job_name="week5_live_runtime",
         )
         trace_id = str(report.get("trace_id", ""))
-        self._notify_actionable_signals(report, trace_id=trace_id, title_prefix="盘中")
         return {
             "symbol_count": len(symbols),
             "selection": selection,
