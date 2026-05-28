@@ -4323,6 +4323,10 @@ class StockAnalyzerService:
         with self._runtime_state_io_lock:
             self._runtime_state_service._refresh_runtime_state_from_disk_if_changed()
 
+    def _reload_runtime_state_from_disk(self) -> None:
+        with self._runtime_state_io_lock:
+            self._runtime_state_service._load_runtime_state_from_disk()
+
     def _refresh_cloud_backup_state_from_disk(self) -> None:
         with self._runtime_state_io_lock:
             self._runtime_state_service._refresh_cloud_backup_state_from_disk()
