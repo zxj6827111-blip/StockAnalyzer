@@ -18,9 +18,6 @@ ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
 ARG PIP_EXTRA_INDEX_URL=https://pypi.org/simple
 ARG PIP_TIMEOUT=600
 ARG PIP_RETRIES=10
-ARG STOCK_ANALYZER_BUILD_COMMIT=unknown
-
-LABEL org.opencontainers.image.revision=${STOCK_ANALYZER_BUILD_COMMIT}
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
@@ -30,7 +27,6 @@ ENV PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
 ENV PIP_DEFAULT_TIMEOUT=${PIP_TIMEOUT}
 ENV PIP_PREFER_BINARY=1
 ENV STOCK_ANALYZER_CONTAINERIZED=1
-ENV STOCK_ANALYZER_BUILD_COMMIT=${STOCK_ANALYZER_BUILD_COMMIT}
 
 WORKDIR /app
 
@@ -53,6 +49,10 @@ COPY artifacts/model_v1.json /app/bootstrap_seed/model_v1.json
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --retries ${PIP_RETRIES} --timeout ${PIP_TIMEOUT} --no-deps --no-build-isolation -e .
 RUN chmod +x /app/scripts/docker-entrypoint.sh
+
+ARG STOCK_ANALYZER_BUILD_COMMIT=unknown
+LABEL org.opencontainers.image.revision=${STOCK_ANALYZER_BUILD_COMMIT}
+ENV STOCK_ANALYZER_BUILD_COMMIT=${STOCK_ANALYZER_BUILD_COMMIT}
 
 EXPOSE 8000
 
