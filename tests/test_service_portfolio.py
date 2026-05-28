@@ -14,7 +14,7 @@ from stock_analyzer.command.channel import CommandEnvelope, SignedCommandProcess
 from stock_analyzer.config import StockAnalyzerConfig, load_config
 from stock_analyzer.learning.sample_schema import MaturityStatus, OutcomeRecord, SignalSnapshot
 from stock_analyzer.runtime.service import StockAnalyzerService
-from stock_analyzer.types import PipelineSignal
+from stock_analyzer.types import PipelineReport, PipelineSignal, RiskStatus
 
 
 def _load_test_config() -> StockAnalyzerConfig:
@@ -119,6 +119,19 @@ def _as_path(value: object) -> Path:
     if isinstance(value, str):
         return Path(value)
     raise AssertionError(f"Expected path-like value, got {value!r}")
+
+
+class _StaticPipeline:
+    def __init__(self, report: PipelineReport) -> None:
+        self._report = report
+
+    def run_once(
+        self,
+        symbols: list[str],
+        strategy: str = "trend",
+        current_equity: float = 1.0,
+    ) -> PipelineReport:
+        return self._report
 
 
 def _patch_attr(target: object, name: str, value: object) -> None:
@@ -812,6 +825,61 @@ def test_service_simulated_filled_buy_notifications_keep_trade_level_dedup() -> 
     assert all("模拟盘自动成交" in item["content"] for item in notifications)
 
 
+def test_service_simulated_trim_notification_keeps_remaining_position_context() -> None:
+    config = _load_test_config()
+    service = StockAnalyzerService(config=config)
+    notifications: list[dict[str, str]] = []
+
+    def _fake_notify(
+        title: str,
+        content: str,
+        level: str = "info",
+        trace_id: str = "",
+    ) -> dict[str, object]:
+        notifications.append(
+            {
+                "title": title,
+                "content": content,
+                "level": level,
+                "trace_id": trace_id,
+            }
+        )
+        return {"ok": True}
+
+    _patch_attr(service, "notify", _fake_notify)
+
+    service._notify_simulated_trade_updates_if_needed(
+        portfolio_update={
+            "current_equity": 1.0005,
+            "executions": [
+                {
+                    "trade_id": "TRIM-trace-600956-1",
+                    "symbol": "600956",
+                    "side": "sell",
+                    "status": "trimmed",
+                    "strategy": "trend",
+                    "target_position": 0.0067,
+                    "price": 9.13,
+                    "quantity": 33,
+                    "amount": 301.29,
+                    "fee": 5.15,
+                    "price_source": "最新价",
+                    "trade_time": "2026-05-28T20:53:23",
+                    "reason": "take_profit_stage_1_reached",
+                }
+            ],
+        },
+        trace_id="trace-trim-notify",
+    )
+
+    assert len(notifications) == 1
+    assert "模拟减仓 600956" in notifications[0]["title"]
+    assert "执行模拟减仓" in notifications[0]["content"]
+    assert "剩余仓位仍保留在模拟盘中" in notifications[0]["content"]
+    assert "已从模拟盘移出" not in notifications[0]["content"]
+    assert "第一档止盈触发" in notifications[0]["content"]
+
+
 def test_service_live_auto_execution_closes_position_on_sell_signal() -> None:
     config = _load_test_config()
     service = StockAnalyzerService(config=config)
@@ -1078,6 +1146,88 @@ def test_service_live_auto_execution_trims_position_on_take_profit_stage() -> No
     )
     position = service.portfolio_positions()[0]
     assert _as_float(position["target_position"]) < 0.18
+    assert position["take_profit_stage"] == 1
+
+
+def test_service_pipeline_suppresses_next_stage_alert_after_same_run_auto_trim() -> None:
+    config = _load_test_config()
+    config.soup_strategy.max_holdings = 5
+    service = StockAnalyzerService(config=config)
+    now = datetime.fromisoformat("2026-03-11T14:50:00")
+    _ = service._portfolio.set_manual_position(
+        symbol="600000",
+        strategy="manual",
+        target_position=0.18,
+        timestamp=now,
+        trace_id="seed-live-stage-suppress",
+        manual_fill={"entry_price": 10.0, "quantity": 900},
+        sector_tag="SEC-600",
+    )
+    report = PipelineReport(
+        trace_id="trace-stage-suppress",
+        timestamp=now,
+        degraded_mode=False,
+        risk=RiskStatus(
+            action="normal",
+            drawdown_pct=0.0,
+            degraded_mode=False,
+            can_open_new_position=True,
+            reason="ok",
+        ),
+        signals=[
+            PipelineSignal(
+                symbol="600000",
+                strategy="trend",
+                score=10.0,
+                grade="C",
+                action="watch",
+                target_position=0.0,
+                probabilities={"lgbm": 0.0, "xgb": 0.0, "meta": 0.0},
+                reasons=["synthetic_watch"],
+            )
+        ],
+    )
+    _patch_attr(service, "_resolve_latest_close_price", lambda *, symbol, bars_cache: 10.85)
+    _patch_attr(service, "_live_auto_execution_enabled", lambda **kwargs: True)
+    _patch_attr(service, "_select_pipeline", lambda **kwargs: _StaticPipeline(report))
+    _patch_attr(service, "_build_week5_symbol_market_payload", lambda **kwargs: {
+        "last_price": 10.85,
+        "open_price": 10.8,
+        "prev_close": 10.7,
+        "ask_levels": [{"level": 1, "price": 10.86, "volume": 5000}],
+        "bid_levels": [{"level": 1, "price": 10.85, "volume": 5000}],
+    })
+    _patch_attr(service, "_fetch_market_depth_snapshots", lambda **kwargs: {
+        "600000": {
+            "available": True,
+            "ask_levels": [{"level": 1, "price": 10.86, "volume": 5000}],
+            "bid_levels": [{"level": 1, "price": 10.85, "volume": 5000}],
+        }
+    })
+    _patch_attr(service, "_record_run_summary", lambda **kwargs: None)
+
+    payload = service.run_pipeline(
+        symbols=["600000"],
+        strategy="trend",
+        current_equity=1.0,
+        job_name="test-auto-trim-suppress",
+        notify_enabled=False,
+    )
+
+    executions = _as_mapping_list(_as_mapping(payload["portfolio_update"])["executions"])
+    assert any(
+        item["symbol"] == "600000"
+        and item["status"] == "trimmed"
+        and item["reason"] == "take_profit_stage_1_reached"
+        for item in executions
+    )
+    holding_alerts = _as_mapping(payload["holding_alerts"])
+    assert _as_mapping_list(holding_alerts["items"]) == []
+    assert holding_alerts["summary"] == {"warn": 0, "info": 0}
+    assert holding_alerts["suppressed_after_auto_execution"] == [
+        {"symbol": "600000", "reason": "take_profit_stage_2_reached"}
+    ]
+    position = service.portfolio_positions()[0]
     assert position["take_profit_stage"] == 1
 
 

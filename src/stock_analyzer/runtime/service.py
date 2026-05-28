@@ -3529,6 +3529,11 @@ class StockAnalyzerService:
             now=timestamp,
             persist_peak_state=not execution_dry_run,
         )
+        if live_auto_execute:
+            holding_alerts = self._suppress_holding_alerts_after_auto_exits(
+                holding_alerts=holding_alerts,
+                portfolio_update=portfolio_update,
+            )
         signal_payload = self._build_signal_payload_with_recommendation_ids(
             signals=signals,
             trace_id=trace_id,
@@ -11355,6 +11360,67 @@ class StockAnalyzerService:
             "items": items,
         }
 
+    def _suppress_holding_alerts_after_auto_exits(
+        self,
+        *,
+        holding_alerts: Mapping[str, object],
+        portfolio_update: Mapping[str, object],
+    ) -> dict[str, object]:
+        raw_executions = portfolio_update.get("executions")
+        raw_items = holding_alerts.get("items")
+        if not isinstance(raw_executions, list) or not isinstance(raw_items, list):
+            return dict(holding_alerts)
+
+        exit_symbols = {
+            _normalize_a_share_symbol(item.get("symbol"))
+            for item in raw_executions
+            if isinstance(item, Mapping)
+            and str(item.get("side", "")).strip().lower() == "sell"
+            and str(item.get("status", "")).strip().lower() in {"trimmed", "closed"}
+        }
+        exit_symbols.discard("")
+        if not exit_symbols:
+            return dict(holding_alerts)
+
+        actionable_reasons = {
+            "stop_loss_threshold_reached",
+            "take_profit_threshold_reached",
+            "take_profit_stage_1_reached",
+            "take_profit_stage_2_reached",
+            "trailing_stop_remainder_exit",
+        }
+        kept: list[object] = []
+        suppressed: list[dict[str, object]] = []
+        for item in raw_items:
+            if not isinstance(item, Mapping):
+                kept.append(item)
+                continue
+            symbol = _normalize_a_share_symbol(item.get("symbol"))
+            reason = str(item.get("reason", "")).strip()
+            if symbol in exit_symbols and reason in actionable_reasons:
+                suppressed.append({"symbol": symbol, "reason": reason})
+                continue
+            kept.append(item)
+        if not suppressed:
+            return dict(holding_alerts)
+
+        warn_count = sum(
+            1
+            for item in kept
+            if isinstance(item, Mapping) and str(item.get("severity", "")) == "warn"
+        )
+        info_count = sum(
+            1
+            for item in kept
+            if isinstance(item, Mapping) and str(item.get("severity", "")) == "info"
+        )
+        filtered = dict(holding_alerts)
+        filtered["records"] = len(kept)
+        filtered["summary"] = {"warn": warn_count, "info": info_count}
+        filtered["items"] = kept
+        filtered["suppressed_after_auto_execution"] = suppressed
+        return filtered
+
     def _sync_recommendation_lifecycle_from_holding_alerts(
         self,
         *,
@@ -12310,7 +12376,13 @@ class StockAnalyzerService:
                     )
                 level = "info"
             else:
-                title_summary = f"sim sell rejected {symbol}" if is_rejected else f"sim sell {symbol}"
+                is_trimmed = status == "trimmed"
+                if is_rejected:
+                    title_summary = f"sim sell rejected {symbol}"
+                elif is_trimmed:
+                    title_summary = f"sim trim {symbol}"
+                else:
+                    title_summary = f"sim sell {symbol}"
                 title = _push_title(priority="P0", category="action", summary=title_summary)
                 if is_rejected:
                     content = _notification_message_zh(
@@ -12328,15 +12400,27 @@ class StockAnalyzerService:
                         ],
                     )
                 else:
+                    trade_action = "模拟减仓" if is_trimmed else "模拟卖出"
+                    position_impact = (
+                        "该持仓已完成部分减仓，剩余仓位仍保留在模拟盘中。"
+                        if is_trimmed
+                        else "该持仓已从模拟盘移出。"
+                    )
+                    followup_action = (
+                        "这是模拟盘自动减仓记录，请在控制大屏复核剩余仓位、止盈阶段与 trailing stop 计划。"
+                        if is_trimmed
+                        else "这是模拟盘自动卖出记录，请在控制大屏复核该票的退出原因与后续观察状态。"
+                    )
                     content = _notification_message_zh(
-                        trigger=f"系统已对标的【{symbol}】执行模拟卖出。",
+                        trigger=f"系统已对标的【{symbol}】执行{trade_action}。",
                         impact=(
                             f"成交价 {price:.2f}，数量 {quantity} 股，成交金额 {amount:.2f} 元，"
-                            "该持仓已从模拟盘移出。"
+                            f"{position_impact}"
                         ),
-                        action="这是模拟盘自动卖出记录，请在控制大屏复核该票的退出原因与后续观察状态。",
+                        action=followup_action,
                         details=[
                             f"执行状态：{_sim_trade_status_zh(status)}",
+                            f"处理原因：{_translate_signal_reason_zh(reason)}",
                             f"价格来源：{price_source}",
                             f"手续费：{fee:.2f} 元",
                             f"当前净值：{_as_float(portfolio_update.get('current_equity'), default=self._state.current_equity):.4f}",
@@ -18541,6 +18625,8 @@ def _notification_summary_zh(summary: str) -> str:
         return f"模拟调仓 {raw[11:]}"
     if lowered.startswith("sim sell rejected "):
         return f"模拟卖出未成交 {raw[18:]}"
+    if lowered.startswith("sim trim "):
+        return f"模拟减仓 {raw[9:]}"
     if lowered.startswith("sim sell "):
         return f"模拟卖出 {raw[9:]}"
     if lowered.startswith("take profit instruction "):
