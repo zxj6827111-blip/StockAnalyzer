@@ -34,11 +34,12 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates cpulimit \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml README.md /app/
+COPY pyproject.toml /app/
 RUN python -c "import pathlib, tomllib; data = tomllib.loads(pathlib.Path('/app/pyproject.toml').read_text(encoding='utf-8')); pathlib.Path('/app/requirements.docker.txt').write_text('\n'.join(data['project']['dependencies']) + '\n', encoding='utf-8')"
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --retries ${PIP_RETRIES} --timeout ${PIP_TIMEOUT} -r /app/requirements.docker.txt
 
+COPY README.md /app/README.md
 COPY src /app/src
 COPY config /app/config
 COPY scripts /app/scripts
