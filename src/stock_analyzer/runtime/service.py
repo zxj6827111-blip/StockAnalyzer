@@ -11746,12 +11746,33 @@ class StockAnalyzerService:
             price_source: str = "",
         ) -> None:
             execution_attempts["buy_new_rejected"] += 1
+            block_category = ""
+            if reason in {
+                "auto_simulated_buy_no_cash",
+                "auto_simulated_buy_no_cash_after_fee",
+                "auto_simulated_buy_quantity_zero",
+            }:
+                execution_attempts["pre_trade_blocked"] = (
+                    _as_int(execution_attempts.get("pre_trade_blocked"), default=0) + 1
+                )
+                block_category = "pre_trade_blocked"
+            elif reason in {
+                "auto_simulated_buy_max_holdings",
+                "auto_simulated_buy_same_sector",
+                "max_position_limit_reached",
+                "max_holdings_reached",
+            }:
+                execution_attempts["risk_gate_blocked"] = (
+                    _as_int(execution_attempts.get("risk_gate_blocked"), default=0) + 1
+                )
+                block_category = "risk_gate_blocked"
             executions.append(
                 {
                     "trade_id": f"SKIP-{trace_id[:8]}-{symbol}-{status}",
                     "symbol": symbol,
                     "side": "buy",
                     "status": status,
+                    "block_category": block_category,
                     "strategy": str(signal.strategy).strip() or "trend",
                     "target_position": round(max(0.0, float(signal.target_position)), 4),
                     "price": round(price, 6) if price > 0 else 0.0,
@@ -12348,6 +12369,19 @@ class StockAnalyzerService:
         raw_executions = portfolio_update.get("executions")
         if not isinstance(raw_executions, list):
             return
+        pre_trade_block_reasons = {
+            "auto_simulated_buy_no_cash",
+            "auto_simulated_buy_no_cash_after_fee",
+            "auto_simulated_buy_quantity_zero",
+        }
+        risk_gate_block_reasons = {
+            "auto_simulated_buy_max_holdings",
+            "auto_simulated_buy_same_sector",
+            "max_position_limit_reached",
+            "max_holdings_reached",
+        }
+        pre_trade_blocked_items: list[dict[str, object]] = []
+        risk_gate_blocked_items: list[dict[str, object]] = []
         for item in raw_executions:
             if not isinstance(item, dict):
                 continue
@@ -12356,6 +12390,7 @@ class StockAnalyzerService:
             side = str(item.get("side", "")).strip().lower()
             status = str(item.get("status", "")).strip().lower()
             reason = str(item.get("reason", "")).strip()
+            block_category = str(item.get("block_category", "")).strip().lower()
             price = _as_float(item.get("price"), default=0.0)
             quantity = _as_int(item.get("quantity"), default=0)
             amount = _as_float(item.get("amount"), default=0.0)
@@ -12365,8 +12400,37 @@ class StockAnalyzerService:
             if not symbol or not trade_id:
                 continue
             is_rejected = status.startswith("rejected")
+            is_pre_trade_blocked = (
+                block_category == "pre_trade_blocked" or status == "pre_trade_blocked"
+                or (is_rejected and reason in pre_trade_block_reasons)
+            )
+            is_risk_gate_blocked = (
+                block_category == "risk_gate_blocked" or status == "risk_gate_blocked"
+                or (is_rejected and reason in risk_gate_block_reasons)
+            )
             if side == "buy":
                 is_adjusted = status == "adjusted" or reason == "auto_simulated_adjust"
+                if is_pre_trade_blocked or is_risk_gate_blocked:
+                    event_type = "pre_trade_blocked" if is_pre_trade_blocked else "risk_gate_blocked"
+                    blocked_item = {
+                        "symbol": symbol,
+                        "reason": reason,
+                        "quantity": quantity,
+                        "target_position": target_position,
+                        "status": status,
+                        "block_category": block_category or event_type,
+                    }
+                    self._record_audit_event(
+                        event_type=event_type,
+                        trace_id=trace_id,
+                        message=f"simulated buy blocked: {symbol} reason={reason} quantity={quantity}",
+                        payload=blocked_item,
+                    )
+                    if is_pre_trade_blocked:
+                        pre_trade_blocked_items.append(blocked_item)
+                    else:
+                        risk_gate_blocked_items.append(blocked_item)
+                    continue
                 if is_rejected:
                     title_summary = f"sim buy rejected {symbol}"
                 else:
@@ -12471,6 +12535,66 @@ class StockAnalyzerService:
                 level=level,
                 trace_id=trace_id,
                 ttl_sec=30 * 3600,
+            )
+        blocked_groups = [
+            (
+                "pre-trade-blocked-summary",
+                pre_trade_blocked_items,
+                "sim pre trade blocked summary",
+            ),
+            (
+                "risk-gate-blocked-summary",
+                risk_gate_blocked_items,
+                "sim risk gate blocked summary",
+            ),
+        ]
+        for key_slug, blocked_items, title_summary in blocked_groups:
+            if not blocked_items:
+                continue
+            symbols = sorted(
+                {
+                    str(entry.get("symbol", "")).strip()
+                    for entry in blocked_items
+                    if str(entry.get("symbol", "")).strip()
+                }
+            )
+            reasons = sorted(
+                {
+                    str(entry.get("reason", "")).strip()
+                    for entry in blocked_items
+                    if str(entry.get("reason", "")).strip()
+                }
+            )
+            first_trade_time = ""
+            for raw_item in raw_executions:
+                if isinstance(raw_item, dict):
+                    first_trade_time = str(raw_item.get("trade_time", "")).strip()
+                    if first_trade_time:
+                        break
+            trade_day = _sim_trade_notification_day(first_trade_time)
+            title = _push_title(priority="P2", category="summary", summary=title_summary)
+            content = _notification_message_zh(
+                trigger=f"Simulated buy blocked for {len(symbols)} symbols.",
+                impact=(
+                    f"Symbols: {', '.join(symbols[:8])}{'...' if len(symbols) > 8 else ''}; "
+                    f"reasons: {', '.join(reasons) or '-'}."
+                ),
+                action="No broker-side action is required; review cash, lot size, and portfolio gates before reenabling auto notifications.",
+                details=[
+                    f"blocked_symbols={len(symbols)}",
+                    f"blocked_events={len(blocked_items)}",
+                    f"reasons={', '.join(reasons) or '-'}",
+                ],
+            )
+            dedup_value = f"{trade_day}:{len(blocked_items)}:{'|'.join(symbols)}:{'|'.join(reasons)}"
+            self._notify_if_changed(
+                dedup_key=f"notify:{key_slug}:{trade_day}",
+                dedup_value=dedup_value,
+                title=title,
+                content=content,
+                level="info",
+                trace_id=trace_id,
+                ttl_sec=24 * 3600,
             )
 
     def _notify_holding_alerts_if_needed(
@@ -17435,6 +17559,7 @@ def _audit_portfolio_execution_summary(item: Mapping[str, object]) -> dict[str, 
         "symbol",
         "side",
         "status",
+        "block_category",
         "strategy",
         "target_position",
         "price",

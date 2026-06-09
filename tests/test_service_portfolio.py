@@ -718,7 +718,7 @@ def test_service_simulated_rejected_buy_notification_is_deduped_by_reason() -> N
     base_execution = {
         "symbol": "001223",
         "side": "buy",
-        "status": "rejected_no_cash",
+        "status": "rejected_price_unavailable",
         "strategy": "trend",
         "target_position": 0.01,
         "quantity": 0,
@@ -726,7 +726,7 @@ def test_service_simulated_rejected_buy_notification_is_deduped_by_reason() -> N
         "fee": 0.0,
         "price_source": "五档卖1",
         "trade_time": "2026-05-28T09:35:00",
-        "reason": "auto_simulated_buy_no_cash",
+        "reason": "auto_simulated_buy_price_unavailable",
     }
     service._notify_simulated_trade_updates_if_needed(
         portfolio_update={
@@ -734,7 +734,7 @@ def test_service_simulated_rejected_buy_notification_is_deduped_by_reason() -> N
             "executions": [
                 {
                     **base_execution,
-                    "trade_id": "SKIP-trace-001223-rejected_no_cash-1",
+                    "trade_id": "SKIP-trace-001223-rejected-price-unavailable-1",
                     "price": 60.34,
                 }
             ],
@@ -747,7 +747,7 @@ def test_service_simulated_rejected_buy_notification_is_deduped_by_reason() -> N
             "executions": [
                 {
                     **base_execution,
-                    "trade_id": "SKIP-trace-001223-rejected_no_cash-2",
+                    "trade_id": "SKIP-trace-001223-rejected-price-unavailable-2",
                     "price": 59.79,
                 }
             ],
@@ -764,9 +764,183 @@ def test_service_simulated_rejected_buy_notification_is_deduped_by_reason() -> N
     suppressed = service.audit_events(limit=5, event_type="notification_suppressed")
     suppressed_events = _as_mapping_list(suppressed["events"])
     assert suppressed_events
-    assert "notify:sim-trade-rejected:20260528:buy:001223:rejected_no_cash" in str(
-        suppressed_events[0]["payload"]
+    assert (
+        "notify:sim-trade-rejected:20260528:buy:001223:rejected_price_unavailable"
+        in str(suppressed_events[0]["payload"])
     )
+
+
+def test_service_simulated_blocked_buy_notifications_are_aggregated() -> None:
+    config = _load_test_config()
+    service = StockAnalyzerService(config=config)
+    notifications: list[dict[str, str]] = []
+
+    def _fake_notify(
+        title: str,
+        content: str,
+        level: str = "info",
+        trace_id: str = "",
+    ) -> dict[str, object]:
+        notifications.append(
+            {
+                "title": title,
+                "content": content,
+                "level": level,
+                "trace_id": trace_id,
+            }
+        )
+        return {"ok": True}
+
+    _patch_attr(service, "notify", _fake_notify)
+
+    service._notify_simulated_trade_updates_if_needed(
+        portfolio_update={
+            "cash_available": 100.0,
+            "executions": [
+                {
+                    "trade_id": "SKIP-trace-001331-rejected_no_cash",
+                    "symbol": "001331",
+                    "side": "buy",
+                    "status": "rejected_no_cash",
+                    "strategy": "trend",
+                    "target_position": 0.01,
+                    "price": 60.34,
+                    "quantity": 0,
+                    "amount": 0.0,
+                    "fee": 0.0,
+                    "price_source": "ask1",
+                    "trade_time": "2026-05-28T09:35:00",
+                    "reason": "auto_simulated_buy_no_cash",
+                },
+                {
+                    "trade_id": "SKIP-trace-000159-rejected_max_holdings",
+                    "symbol": "000159",
+                    "side": "buy",
+                    "status": "rejected_max_holdings",
+                    "strategy": "trend",
+                    "target_position": 0.01,
+                    "price": 12.0,
+                    "quantity": 0,
+                    "amount": 0.0,
+                    "fee": 0.0,
+                    "price_source": "ask1",
+                    "trade_time": "2026-05-28T09:35:00",
+                    "reason": "auto_simulated_buy_max_holdings",
+                },
+            ],
+        },
+        trace_id="trace-blocked-buy",
+    )
+
+    assert len(notifications) == 2
+    titles = [item["title"] for item in notifications]
+    assert any("sim pre trade blocked summary" in title for title in titles)
+    assert any("sim risk gate blocked summary" in title for title in titles)
+    assert all("sim buy rejected" not in item["title"].lower() for item in notifications)
+    assert all("blocked_events=1" in item["content"] for item in notifications)
+
+    pre_trade_events = _as_mapping_list(
+        service.audit_events(limit=10, event_type="pre_trade_blocked")["events"]
+    )
+    risk_gate_events = _as_mapping_list(
+        service.audit_events(limit=10, event_type="risk_gate_blocked")["events"]
+    )
+    assert len(pre_trade_events) == 1
+    assert len(risk_gate_events) == 1
+
+
+def test_service_simulated_blocked_buy_summary_dedup_distinguishes_symbols_and_reasons() -> None:
+    config = _load_test_config()
+    service = StockAnalyzerService(config=config)
+    notifications: list[dict[str, str]] = []
+
+    def _fake_notify(
+        title: str,
+        content: str,
+        level: str = "info",
+        trace_id: str = "",
+    ) -> dict[str, object]:
+        notifications.append(
+            {
+                "title": title,
+                "content": content,
+                "level": level,
+                "trace_id": trace_id,
+            }
+        )
+        return {"ok": True}
+
+    _patch_attr(service, "notify", _fake_notify)
+
+    def _pre_trade_execution(
+        symbol: str,
+        status: str,
+        reason: str,
+        suffix: str,
+    ) -> dict[str, object]:
+        return {
+            "trade_id": f"SKIP-trace-{symbol}-{suffix}",
+            "symbol": symbol,
+            "side": "buy",
+            "status": status,
+            "block_category": "pre_trade_blocked",
+            "strategy": "trend",
+            "target_position": 0.01,
+            "price": 10.0,
+            "quantity": 0,
+            "amount": 0.0,
+            "fee": 0.0,
+            "price_source": "ask1",
+            "trade_time": "2026-05-28T09:35:00",
+            "reason": reason,
+        }
+
+    service._notify_simulated_trade_updates_if_needed(
+        portfolio_update={
+            "cash_available": 100.0,
+            "executions": [
+                _pre_trade_execution(
+                    "001331",
+                    "rejected_no_cash",
+                    "auto_simulated_buy_no_cash",
+                    "a",
+                ),
+                _pre_trade_execution(
+                    "000962",
+                    "rejected_no_cash",
+                    "auto_simulated_buy_no_cash",
+                    "b",
+                ),
+            ],
+        },
+        trace_id="trace-blocked-buy-dedup-1",
+    )
+    service._notify_simulated_trade_updates_if_needed(
+        portfolio_update={
+            "cash_available": 100.0,
+            "executions": [
+                _pre_trade_execution(
+                    "001267",
+                    "rejected_quantity",
+                    "auto_simulated_buy_quantity_zero",
+                    "c",
+                ),
+                _pre_trade_execution(
+                    "001359",
+                    "rejected_quantity",
+                    "auto_simulated_buy_quantity_zero",
+                    "d",
+                ),
+            ],
+        },
+        trace_id="trace-blocked-buy-dedup-2",
+    )
+
+    assert len(notifications) == 2
+    assert "001331" in notifications[0]["content"]
+    assert "001267" in notifications[1]["content"]
+    assert "auto_simulated_buy_no_cash" in notifications[0]["content"]
+    assert "auto_simulated_buy_quantity_zero" in notifications[1]["content"]
 
 
 def test_service_simulated_filled_buy_notifications_keep_trade_level_dedup() -> None:
