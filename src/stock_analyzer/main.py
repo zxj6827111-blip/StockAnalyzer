@@ -4285,8 +4285,16 @@ def runtime_sla(
 
 
 @app.get("/runtime/stage")
-def runtime_stage(now: str = Query(default="")) -> dict[str, object]:
-    return _service.runtime_stage_snapshot(now=_parse_optional_datetime(now))
+def runtime_stage(
+    now: str = Query(default=""),
+    deep: bool = Query(default=False),
+) -> dict[str, object]:
+    return _service.runtime_stage_snapshot(now=_parse_optional_datetime(now), deep=deep)
+
+
+@app.get("/runtime/stage/deep")
+def runtime_stage_deep(now: str = Query(default="")) -> dict[str, object]:
+    return _service.runtime_stage_snapshot(now=_parse_optional_datetime(now), deep=True)
 
 
 @app.get("/runtime/history/archive/status")

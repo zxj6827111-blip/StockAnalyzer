@@ -10822,8 +10822,13 @@ class StockAnalyzerService:
     def _learning_pending_confirmation_count(self, now: datetime | None = None) -> int:
         return self._learning_governance_service._learning_pending_confirmation_count(now=now)
 
-    def runtime_stage_snapshot(self, now: datetime | None = None) -> dict[str, object]:
-        return self._runtime_ops_service.runtime_stage_snapshot(now=now)
+    def runtime_stage_snapshot(
+        self,
+        now: datetime | None = None,
+        *,
+        deep: bool = False,
+    ) -> dict[str, object]:
+        return self._runtime_ops_service.runtime_stage_snapshot(now=now, deep=deep)
 
     def sla_report(
         self,

@@ -143,7 +143,12 @@ class RuntimeDashboardService:
         evolution_history = service.evolution_history(limit=capped_history_limit)
         evolution_window = service.evolution_window_report(days=10, min_runs=5)
         latest_acceptance = service.latest_week4_acceptance_report()
-        runtime_stage = service.runtime_stage_snapshot()
+        try:
+            runtime_stage = service.runtime_stage_snapshot(deep=True)
+        except TypeError as exc:
+            if "deep" not in str(exc):
+                raise
+            runtime_stage = service.runtime_stage_snapshot()
         warehouse_background = _as_dict(runtime_stage.get("market_warehouse_background_data"))
         if not warehouse_background:
             warehouse_background = service.market_warehouse_background_data_status()

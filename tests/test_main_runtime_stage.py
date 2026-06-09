@@ -199,7 +199,7 @@ def test_runtime_stage_endpoint_returns_current_stage_snapshot() -> None:
     )
 
     with _patched_service(service) as client:
-        response = client.get("/runtime/stage", params={"now": "2026-03-16T19:06:47"})
+        response = client.get("/runtime/stage/deep", params={"now": "2026-03-16T19:06:47"})
         assert response.status_code == 200
         payload = response.json()
 
@@ -216,6 +216,31 @@ def test_runtime_stage_endpoint_returns_current_stage_snapshot() -> None:
     assert tasks["week6_data_prewarm"]["status"] == "done"
     assert payload["market_warehouse_progress"]["symbols_completed"] == 2600
     assert payload["latest_activity"]["label"] == "基础库增量同步"
+
+
+def test_runtime_stage_endpoint_defaults_to_lightweight_snapshot() -> None:
+    service = _new_service()
+
+    def _fail_slow_dependency(*args: object, **kwargs: object) -> object:
+        raise AssertionError("/runtime/stage must not call deep runtime dependencies")
+
+    _patch_attr(service, "provider_status", _fail_slow_dependency)
+    _patch_attr(service, "market_warehouse_history", _fail_slow_dependency)
+    _patch_attr(service, "market_warehouse_sync_lock_status", _fail_slow_dependency)
+    _patch_attr(service, "market_warehouse_background_data_status", _fail_slow_dependency)
+    _patch_attr(service, "latest_post_market_warehouse_followup_state", _fail_slow_dependency)
+    _patch_attr(service, "latest_post_market_warehouse_followup_result", _fail_slow_dependency)
+    _patch_attr(service, "cloud_backup_status", _fail_slow_dependency)
+
+    with _patched_service(service) as client:
+        response = client.get("/runtime/stage", params={"now": "2026-03-16T19:06:47"})
+        assert response.status_code == 200
+        payload = response.json()
+
+    assert payload["summary"]["stage_type"] == "lightweight"
+    assert payload["health"]["code"] == "healthy"
+    assert payload["market_warehouse_background_data"]["status"] == "skipped"
+    assert payload["market_warehouse_lock"]["running"] is False
 
 
 def test_runtime_stage_endpoint_exposes_market_warehouse_lock_and_background_status() -> None:
@@ -259,7 +284,7 @@ def test_runtime_stage_endpoint_exposes_market_warehouse_lock_and_background_sta
     )
 
     with _patched_service(service) as client:
-        response = client.get("/runtime/stage", params={"now": "2026-03-16T19:06:47"})
+        response = client.get("/runtime/stage/deep", params={"now": "2026-03-16T19:06:47"})
         assert response.status_code == 200
         payload = response.json()
 
@@ -292,7 +317,7 @@ def test_runtime_stage_endpoint_skips_weekday_jobs_on_weekend() -> None:
 
     with _patched_service(service) as client:
         _patch_attr(service, "_last_market_warehouse_progress", None)
-        response = client.get("/runtime/stage", params={"now": "2026-03-14T10:00:00"})
+        response = client.get("/runtime/stage/deep", params={"now": "2026-03-14T10:00:00"})
         assert response.status_code == 200
         payload = response.json()
 
@@ -309,7 +334,7 @@ def test_runtime_stage_endpoint_reports_exact_week4_disabled_reason() -> None:
     service._config.acceptance.auto_run = False
 
     with _patched_service(service) as client:
-        response = client.get("/runtime/stage", params={"now": "2026-03-16T20:20:00"})
+        response = client.get("/runtime/stage/deep", params={"now": "2026-03-16T20:20:00"})
         assert response.status_code == 200
         payload = response.json()
 
@@ -386,7 +411,7 @@ def test_runtime_stage_endpoint_ignores_evolution_prefetch_for_nightly_market_wa
                 "runtime_sla": {"status": "pass"},
             },
         )
-        response = client.get("/runtime/stage", params={"now": "2026-03-18T21:15:28"})
+        response = client.get("/runtime/stage/deep", params={"now": "2026-03-18T21:15:28"})
         assert response.status_code == 200
         payload = response.json()
 
@@ -429,7 +454,7 @@ def test_runtime_stage_endpoint_surfaces_degraded_health_summary() -> None:
                 "runtime_sla": {"status": "fail"},
             },
         )
-        response = client.get("/runtime/stage", params={"now": "2026-03-16T20:40:00"})
+        response = client.get("/runtime/stage/deep", params={"now": "2026-03-16T20:40:00"})
         assert response.status_code == 200
         payload = response.json()
 
@@ -471,7 +496,7 @@ def test_runtime_stage_endpoint_treats_week4_gate_failure_as_warn_when_sla_is_he
                 "runtime_sla": {"status": "pass"},
             },
         )
-        response = client.get("/runtime/stage", params={"now": "2026-03-16T20:40:00"})
+        response = client.get("/runtime/stage/deep", params={"now": "2026-03-16T20:40:00"})
         assert response.status_code == 200
         payload = response.json()
 
@@ -509,7 +534,7 @@ def test_runtime_stage_endpoint_treats_evolution_risk_downgrade_as_warn_not_prov
     )
 
     with _patched_service(service) as client:
-        response = client.get("/runtime/stage", params={"now": "2026-03-16T10:40:00"})
+        response = client.get("/runtime/stage/deep", params={"now": "2026-03-16T10:40:00"})
         assert response.status_code == 200
         payload = response.json()
 

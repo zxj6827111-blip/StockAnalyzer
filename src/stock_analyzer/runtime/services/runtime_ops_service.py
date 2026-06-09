@@ -848,36 +848,78 @@ class RuntimeOpsService:
             },
         }
 
-    def runtime_stage_snapshot(self, now: datetime | None = None) -> dict[str, object]:
+    def runtime_stage_snapshot(
+        self,
+        now: datetime | None = None,
+        *,
+        deep: bool = False,
+    ) -> dict[str, object]:
         service = self._service
         service._refresh_runtime_state_from_disk_if_changed()
         current = now or datetime.now()
         phase = _resolve_runtime_phase(current)
         scheduler_state = service._scheduler.export_state()
-        warehouse_history = service.market_warehouse_history(
-            limit=max(
-                5,
-                min(50, _as_int(service._config.market_warehouse.history_limit, default=30)),
+        if deep:
+            warehouse_history = service.market_warehouse_history(
+                limit=max(
+                    5,
+                    min(50, _as_int(service._config.market_warehouse.history_limit, default=30)),
+                )
             )
-        )
-        warehouse_lock = service.market_warehouse_sync_lock_status()
+            warehouse_lock = service.market_warehouse_sync_lock_status()
+            latest_warehouse_report = service.latest_market_warehouse_report()
+            warehouse_background_data = service.market_warehouse_background_data_status()
+            warehouse_followup_state = service.latest_post_market_warehouse_followup_state()
+            warehouse_followup_result = service.latest_post_market_warehouse_followup_result()
+            warehouse_resume_action = _resolve_market_warehouse_resume_action(
+                service=service,
+                latest_report=latest_warehouse_report,
+                lock_status=warehouse_lock,
+                followup_state=warehouse_followup_state,
+            )
+            cloud_backup = service.cloud_backup_status(now=current)
+            provider_status = service.provider_status()
+        else:
+            warehouse_history = {"records": 0, "items": []}
+            warehouse_lock = {"exists": False, "running": False, "is_stale": False}
+            latest_warehouse_report = (
+                service._last_market_warehouse_report
+                if isinstance(service._last_market_warehouse_report, dict)
+                else None
+            )
+            warehouse_background_data = {
+                "status": "skipped",
+                "reason": "omitted_for_lightweight_runtime_stage",
+            }
+            warehouse_followup_state = None
+            warehouse_followup_result = None
+            warehouse_resume_action = {
+                "available": False,
+                "reason": "omitted_for_lightweight_runtime_stage",
+            }
+            cloud_backup = {
+                "status": "skipped",
+                "reason": "omitted_for_lightweight_runtime_stage",
+            }
+            provider_status = {
+                "status": "skipped",
+                "reason": "omitted_for_lightweight_runtime_stage",
+            }
         warehouse_progress = _resolve_market_warehouse_stage_progress(
-            latest_progress=service.latest_market_warehouse_progress(),
+            latest_progress=(
+                service.latest_market_warehouse_progress()
+                if deep
+                else (
+                    service._last_market_warehouse_progress
+                    if isinstance(service._last_market_warehouse_progress, dict)
+                    else None
+                )
+            ),
             lock_status=warehouse_lock,
         )
-        latest_warehouse_report = service.latest_market_warehouse_report()
         warehouse_report = _resolve_market_warehouse_stage_report(
             latest_report=latest_warehouse_report,
             history_items=warehouse_history.get("items"),
-        )
-        warehouse_background_data = service.market_warehouse_background_data_status()
-        warehouse_followup_state = service.latest_post_market_warehouse_followup_state()
-        warehouse_followup_result = service.latest_post_market_warehouse_followup_result()
-        warehouse_resume_action = _resolve_market_warehouse_resume_action(
-            service=service,
-            latest_report=latest_warehouse_report,
-            lock_status=warehouse_lock,
-            followup_state=warehouse_followup_state,
         )
         tdx_report = service.latest_tdx_sync_report()
         reconcile_report = service.latest_reconcile_report()
@@ -890,8 +932,6 @@ class RuntimeOpsService:
         acceptance_report = service.latest_week4_acceptance_report()
         idle_state = service.idle_queue_state()
         idle_report = service.latest_idle_queue_report()
-        cloud_backup = service.cloud_backup_status(now=current)
-        provider_status = service.provider_status()
         week5_report = service.latest_week5_scan_report()
         today = current.date().isoformat()
         last_run_state = scheduler_state.get("last_run")
@@ -1157,6 +1197,7 @@ class RuntimeOpsService:
                 "counts": counts,
                 "tasks_total": len(tasks),
                 "pending_next": next_task,
+                "stage_type": "deep" if deep else "lightweight",
             },
             "tasks": tasks,
             "latest_activity": latest_activity,
