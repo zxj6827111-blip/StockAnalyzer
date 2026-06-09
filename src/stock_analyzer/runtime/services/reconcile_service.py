@@ -205,6 +205,14 @@ class RuntimeReconcileService:
             return report
 
         strategy_positions = service._portfolio.position_map()
+        snapshot_freshness = _broker_snapshot_freshness(
+            updated_at=service._broker_snapshot_updated_at,
+            now=now,
+            max_age_hours=_as_float(
+                service._config.reconcile.max_broker_snapshot_age_hours,
+                default=18.0,
+            ),
+        )
         if (
             service._config.reconcile.require_broker_snapshot_at_close
             and not service._broker_positions
@@ -249,6 +257,30 @@ class RuntimeReconcileService:
                     "account_diffs": [],
                     "note": "broker snapshot is required before reconcile",
                 }
+        elif (
+            service._config.reconcile.require_broker_snapshot_at_close
+            and not bool(snapshot_freshness.get("fresh", False))
+        ):
+            report = {
+                "timestamp": now.isoformat(),
+                "status": "stale_snapshot",
+                "matched_count": 0,
+                "mismatch_count": len(strategy_positions),
+                "missing_in_strategy": [],
+                "missing_in_broker": sorted(strategy_positions.keys()),
+                "diffs": [],
+                "strategy_positions": len(strategy_positions),
+                "broker_positions": len(service._broker_positions),
+                "quantity_matched_count": 0,
+                "account_matched_count": 0,
+                "quantity_mismatch_count": 0,
+                "account_mismatch_count": 0,
+                "detail_mismatch_count": 0,
+                "quantity_diffs": [],
+                "account_diffs": [],
+                "broker_snapshot": snapshot_freshness,
+                "note": "broker snapshot is stale; reconcile skipped to avoid learning pollution",
+            }
         else:
             report_obj = reconcile_positions(
                 strategy_positions=strategy_positions,
@@ -262,6 +294,7 @@ class RuntimeReconcileService:
                 strategy_snapshot=service._portfolio.positions(),
                 broker_snapshot=service._broker_position_details,
             )
+            report["broker_snapshot"] = snapshot_freshness
 
         service._store_reconcile_report(report)
         if (
@@ -439,6 +472,45 @@ def _parse_broker_position_details(
             "account": account,
         }
     return parsed
+
+
+def _broker_snapshot_freshness(
+    *,
+    updated_at: str,
+    now: datetime,
+    max_age_hours: float,
+) -> dict[str, object]:
+    normalized_updated_at = str(updated_at or "").strip()
+    max_age = max(0.0, float(max_age_hours))
+    if not normalized_updated_at:
+        return {
+            "updated_at": "",
+            "fresh": False,
+            "age_hours": None,
+            "max_age_hours": max_age,
+            "reason": "missing_broker_snapshot_timestamp",
+        }
+    try:
+        snapshot_time = datetime.fromisoformat(normalized_updated_at)
+    except ValueError:
+        return {
+            "updated_at": normalized_updated_at,
+            "fresh": False,
+            "age_hours": None,
+            "max_age_hours": max_age,
+            "reason": "invalid_broker_snapshot_timestamp",
+        }
+    if (snapshot_time.tzinfo is None) != (now.tzinfo is None):
+        snapshot_time = snapshot_time.replace(tzinfo=None)
+        now = now.replace(tzinfo=None)
+    age_hours = max(0.0, (now - snapshot_time).total_seconds() / 3600.0)
+    return {
+        "updated_at": normalized_updated_at,
+        "fresh": age_hours <= max_age,
+        "age_hours": round(age_hours, 4),
+        "max_age_hours": max_age,
+        "reason": "ok" if age_hours <= max_age else "stale_broker_snapshot",
+    }
 
 
 def _notification_message_zh(

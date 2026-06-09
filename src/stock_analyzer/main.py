@@ -1952,6 +1952,27 @@ def health() -> dict[str, object]:
             or "unknown",
             "code_commit_id": _config.evolution.code_commit_id,
         },
+        "runtime": {
+            "advisory_only": bool(_config.app.advisory_only),
+            "scheduler_enabled": bool(_config.scheduler.enabled),
+            "week5_enabled": bool(_config.week5.enabled),
+            "reconcile_enabled": bool(_config.reconcile.enabled),
+            "training_enabled": bool(_config.training.enabled),
+        },
+        "health_type": "lightweight",
+    }
+
+
+@app.get("/health/deep")
+def health_deep() -> dict[str, object]:
+    return {
+        "status": "ok",
+        "mode": _config.app.mode,
+        "build": {
+            "commit": os.environ.get("STOCK_ANALYZER_BUILD_COMMIT", "").strip()
+            or "unknown",
+            "code_commit_id": _config.evolution.code_commit_id,
+        },
         "provider": _service.provider_status(),
         "runtime": _service.runtime_status(include_learning_governance=False),
     }
@@ -4629,7 +4650,10 @@ def dashboard_ops_state() -> dict[str, object]:
 
 
 @app.post("/dashboard/ops/toggle")
-def dashboard_ops_toggle(request: DashboardOpsToggleRequest) -> dict[str, object]:
+def dashboard_ops_toggle(
+    request: DashboardOpsToggleRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     global _dashboard_ops_enabled
     if _config.app.mode.strip().lower() != "simulation":
         return {
@@ -4646,7 +4670,10 @@ def dashboard_ops_toggle(request: DashboardOpsToggleRequest) -> dict[str, object
 
 
 @app.post("/dashboard/command/quick")
-def dashboard_quick_command(request: DashboardQuickCommandRequest) -> dict[str, object]:
+def dashboard_quick_command(
+    request: DashboardQuickCommandRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     if not _dashboard_quick_enabled():
         return {
             "accepted": False,
@@ -4663,7 +4690,10 @@ def dashboard_quick_command(request: DashboardQuickCommandRequest) -> dict[str, 
 
 
 @app.post("/dashboard/reconcile/quick")
-def dashboard_quick_reconcile(request: DashboardQuickReconcileRequest) -> dict[str, object]:
+def dashboard_quick_reconcile(
+    request: DashboardQuickReconcileRequest,
+    _auth: None = Depends(_verify_api_auth),
+) -> dict[str, object]:
     if not _dashboard_quick_enabled():
         return {
             "accepted": False,

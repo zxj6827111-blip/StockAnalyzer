@@ -2156,7 +2156,61 @@ def test_service_reconcile_requires_snapshot_when_enabled() -> None:
 
     report = service.run_reconciliation()
     assert report["status"] == "missing_snapshot"
+    learning_outcome_update = _as_mapping(report["learning_outcome_update"])
+    assert learning_outcome_update["updated"] == 0
+    assert learning_outcome_update["status"] == "skipped_missing_snapshot"
     assert service.state.reconcile_required is True
+
+
+def test_service_reconcile_skips_learning_outcome_when_broker_snapshot_is_stale(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config()
+    config.training.bootstrap_state_path = str(tmp_path / "bootstrap_state.json")
+    service = StockAnalyzerService(config=config)
+    snapshot_id = "snap-stale-reconcile"
+    symbol = "600000"
+
+    set_cmd = _sign(
+        action="SET_POSITION",
+        command_id="cmd-set-pos-learning-reconcile-stale",
+        payload={
+            "symbol": symbol,
+            "strategy": "manual",
+            "target_position": 0.2,
+        },
+        secret=config.command_channel.secret_key,
+    )
+    set_result = service.execute_command(set_cmd)
+    assert set_result["accepted"] is True
+
+    service._sample_store.upsert_outcome(  # noqa: SLF001
+        OutcomeRecord(
+            snapshot_id=snapshot_id,
+            maturity_status=MaturityStatus.LABEL_MATURED,
+            label_mature_time=datetime.fromisoformat("2026-03-01T15:00:00"),
+        )
+    )
+
+    _ = service.update_broker_snapshot(
+        positions=[{"symbol": symbol, "target_position": 0.2}],
+        source_trace_id="learning-outcome-reconcile-stale",
+    )
+    service._broker_snapshot_updated_at = "2026-03-01T09:00:00"  # noqa: SLF001
+
+    report = service.run_reconciliation(timestamp=datetime.fromisoformat("2026-03-02T15:30:00"))
+    assert report["status"] == "stale_snapshot"
+    broker_snapshot = _as_mapping(report["broker_snapshot"])
+    assert broker_snapshot["fresh"] is False
+    assert broker_snapshot["reason"] == "stale_broker_snapshot"
+    learning_outcome_update = _as_mapping(report["learning_outcome_update"])
+    assert learning_outcome_update["updated"] == 0
+    assert learning_outcome_update["status"] == "skipped_stale_snapshot"
+
+    outcome = service._sample_store.get_outcome(snapshot_id)  # noqa: SLF001
+    assert outcome is not None
+    assert outcome.maturity_status == MaturityStatus.LABEL_MATURED
+    assert outcome.reconcile_status == ""
 
 
 def test_service_reconcile_skips_snapshot_requirement_when_no_positions() -> None:

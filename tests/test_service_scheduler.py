@@ -520,6 +520,7 @@ def test_week5_live_runtime_interval_job_uses_watchlist_and_live_runtime() -> No
     assert captured["symbols"] == ["600000", "000001"]
     assert captured["strategy"] == "trend"
     assert _as_bool(captured["use_live_runtime"]) is True
+    assert _as_bool(captured["dry_run_execution"]) is True
     assert _as_bool(captured["notify_enabled"]) is False
     assert captured["job_name"] == "week5_live_runtime"
     assert _as_int(_as_mapping(live_job["payload"])["symbol_count"]) == 2

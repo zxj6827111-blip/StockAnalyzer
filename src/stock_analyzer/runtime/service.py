@@ -1830,6 +1830,15 @@ class StockAnalyzerService:
         status = str(report.get("status", "")).strip().lower()
         if not status:
             return {"updated": 0, "promoted": 0, "symbols": [], "snapshot_ids": []}
+        if status not in {"ok", "mismatch"}:
+            return {
+                "updated": 0,
+                "promoted": 0,
+                "symbols": [],
+                "snapshot_ids": [],
+                "status": f"skipped_{status}",
+                "reason": "reconcile_status_not_label_safe",
+            }
 
         strategy_positions = {
             normalized: _as_float(target, default=0.0)
@@ -9053,7 +9062,10 @@ class StockAnalyzerService:
             report=report,
             timestamp=reconcile_time,
         )
-        if _as_int(learning_outcome_update.get("updated"), default=0) > 0:
+        if (
+            _as_int(learning_outcome_update.get("updated"), default=0) > 0
+            or str(learning_outcome_update.get("status", "")).startswith("skipped_")
+        ):
             report["learning_outcome_update"] = learning_outcome_update
         return report
 
@@ -11749,7 +11761,7 @@ class StockAnalyzerService:
 
         exit_plan_items = self._build_c3_position_management_items(
             now=timestamp,
-            persist_peak_state=True,
+            persist_peak_state=not dry_run,
         )
         actionable_exit_items = [
             item
@@ -12143,8 +12155,23 @@ class StockAnalyzerService:
             timestamp=timestamp,
             use_live_runtime=use_live_runtime,
             market_cache=market_cache,
+            persist_equity=not dry_run,
+        )
+        open_positions = len(self._portfolio.positions())
+        current_equity_value = round(
+            _as_float(
+                equity_snapshot.get("current_equity"),
+                default=self._state.current_equity,
+            ),
+            6,
         )
         if dry_run and portfolio_state_before is not None:
+            open_positions = len(
+                portfolio_state_before.get("positions", [])
+                if isinstance(portfolio_state_before, dict)
+                else []
+            )
+            current_equity_value = round(current_equity_before, 6)
             self._portfolio.restore_state(portfolio_state_before)
             self._state.watchlist = watchlist_before
             self._state.current_equity = current_equity_before
@@ -12157,7 +12184,7 @@ class StockAnalyzerService:
             "skipped_max_holdings": skipped_max_holdings,
             "skipped_same_sector": skipped_same_sector,
             "skipped_no_cash": skipped_no_cash,
-            "open_positions": len(self._portfolio.positions()),
+            "open_positions": open_positions,
             "status": "simulated_auto_dry_run" if dry_run else "simulated_auto_applied",
             "dry_run": bool(dry_run),
             "executions": executions,
@@ -12171,12 +12198,7 @@ class StockAnalyzerService:
             "net_asset_value": round(
                 _as_float(equity_snapshot.get("net_asset_value"), default=0.0), 2
             ),
-            "current_equity": round(
-                _as_float(
-                    equity_snapshot.get("current_equity"), default=self._state.current_equity
-                ),
-                6,
-            ),
+            "current_equity": current_equity_value,
         }
 
     def _refresh_simulation_equity_snapshot(
@@ -12185,6 +12207,7 @@ class StockAnalyzerService:
         timestamp: datetime,
         use_live_runtime: bool,
         market_cache: dict[str, dict[str, object]] | None = None,
+        persist_equity: bool = True,
     ) -> dict[str, object]:
         initial_cash = self._simulation_initial_cash()
         cash_available = self._simulation_cash_available()
@@ -12222,7 +12245,8 @@ class StockAnalyzerService:
             portfolio_value += mark_price * quantity
         net_asset_value = cash_available + portfolio_value
         current_equity = net_asset_value / initial_cash if initial_cash > 0 else 1.0
-        self._state.current_equity = round(current_equity, 6)
+        if persist_equity:
+            self._state.current_equity = round(current_equity, 6)
         return {
             "timestamp": timestamp.isoformat(),
             "cash_available": round(cash_available, 2),
@@ -16101,6 +16125,7 @@ class StockAnalyzerService:
             strategy="trend",
             current_equity=self._state.current_equity,
             use_live_runtime=True,
+            dry_run_execution=True,
             notify_enabled=False,
             job_name="week5_live_runtime",
         )

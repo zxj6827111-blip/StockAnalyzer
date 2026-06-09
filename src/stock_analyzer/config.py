@@ -700,6 +700,7 @@ class ReconcileConfig(_StrictModel):
     enabled: bool = True
     position_tolerance: float = 0.01
     require_broker_snapshot_at_close: bool = True
+    max_broker_snapshot_age_hours: float = 18.0
     auto_notify_on_mismatch: bool = True
     history_limit: int = 500
 

@@ -1265,6 +1265,7 @@ class RuntimeWeek5Service:
             strategy="monster",
             current_equity=service._state.current_equity,
             use_live_runtime=True,
+            dry_run_execution=True,
             job_name="week5_scan_monster",
         )
         trace_id = str(monster_report.get("trace_id", ""))

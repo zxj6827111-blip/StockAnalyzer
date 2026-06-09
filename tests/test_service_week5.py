@@ -1353,6 +1353,46 @@ def test_service_week5_force_universe_scan_preserves_pinned_symbols_after_prefil
     assert _as_text_list(prefilter["pinned_symbols"]) == ["300001"]
 
 
+def test_service_week5_scan_monster_pipeline_is_dry_run() -> None:
+    config = _load_test_config()
+    service = _new_service(config)
+    captured: dict[str, object] = {}
+
+    def _fake_run_pipeline(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return {
+            "trace_id": "week5-monster-dry-run",
+            "signals": [],
+            "risk": {"action": "monitor", "drawdown_pct": 0.0},
+        }
+
+    _patch_attr(service, "run_pipeline", _fake_run_pipeline)
+    _patch_attr(service, "_build_first_board_candidate", lambda **_: None)
+    _patch_attr(service, "_detect_symbol_anomaly", lambda **_: None)
+    _patch_attr(
+        service,
+        "_monster_isolation_gate",
+        lambda **_: {
+            "can_open_new_position": True,
+            "reasons": [],
+            "total_monster_position": 0.0,
+            "max_monster_position": 0.0,
+            "sentiment_score": 0.0,
+        },
+    )
+
+    _ = service.run_week5_scan(
+        symbols=["600000"],
+        timestamp=datetime(2026, 3, 16, 9, 31),
+        notify_enabled=False,
+        sync_reason="scheduler_week5",
+    )
+
+    assert captured["job_name"] == "week5_scan_monster"
+    assert captured["dry_run_execution"] is True
+    assert captured["use_live_runtime"] is True
+
+
 def test_week5_offhours_refresh_includes_market_radar_review_pool_and_clears_it() -> None:
     config = _load_test_config()
     config.week5.offhours_force_full_deep_scan_on_watchlist_below = 0

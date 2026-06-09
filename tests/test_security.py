@@ -47,9 +47,6 @@ _OWN_AUTH_PATHS: frozenset[str] = frozenset({
     "/wecom/callback",
     "/feishu/callback",
     "/command/execute",
-    "/dashboard/ops/toggle",
-    "/dashboard/command/quick",
-    "/dashboard/reconcile/quick",
 })
 
 
