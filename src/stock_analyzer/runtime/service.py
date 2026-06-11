@@ -5756,6 +5756,36 @@ class StockAnalyzerService:
             },
         )
 
+    def _post_market_warehouse_followup_stale_running_state(
+        self,
+        *,
+        now: datetime,
+        stale_after_hours: float = 6.0,
+    ) -> dict[str, object] | None:
+        previous = self.latest_post_market_warehouse_followup_state()
+        if not isinstance(previous, Mapping):
+            return None
+        status = str(previous.get("status", "")).strip().lower()
+        if status != "running":
+            return None
+        updated_at = _parse_iso_datetime(str(previous.get("updated_at", "")).strip())
+        if updated_at is None:
+            return {
+                "status": "stale_running_reclaimed",
+                "reason": "running_state_missing_updated_at",
+                "previous": dict(previous),
+            }
+        age_hours = max(0.0, (now.timestamp() - updated_at.timestamp()) / 3600.0)
+        if age_hours < max(0.0, float(stale_after_hours)):
+            return None
+        return {
+            "status": "stale_running_reclaimed",
+            "reason": "running_state_stale",
+            "age_hours": round(age_hours, 4),
+            "stale_after_hours": round(max(0.0, float(stale_after_hours)), 4),
+            "previous": dict(previous),
+        }
+
     def _pending_post_market_warehouse_followup_snapshot_ids(self) -> list[str]:
         return sorted(
             {
@@ -5936,6 +5966,9 @@ class StockAnalyzerService:
             if isinstance(market_warehouse_report, Mapping)
             else dict(self.latest_market_warehouse_report() or {})
         )
+        stale_running = self._post_market_warehouse_followup_stale_running_state(
+            now=run_timestamp,
+        )
         result: dict[str, object] = {
             "started_at": datetime.now(UTC).isoformat(),
             "ok": False,
@@ -5944,6 +5977,13 @@ class StockAnalyzerService:
             "source_market_warehouse_trace_id": str(source_report.get("trace_id", "")).strip(),
             "steps": {},
         }
+        if stale_running is not None:
+            result["stale_running_state"] = stale_running
+            self._record_audit_event(
+                event_type="post_market_warehouse_followup_stale_running_reclaimed",
+                level="warn",
+                payload=stale_running,
+            )
         steps = cast(dict[str, object], result["steps"])
         self._write_post_market_warehouse_followup_state(
             stage="retry_failed_only",
@@ -5951,6 +5991,7 @@ class StockAnalyzerService:
             payload={
                 "trigger": result["trigger"],
                 "source_trace_id": result["source_market_warehouse_trace_id"],
+                "stale_running_reclaimed": stale_running is not None,
             },
         )
         retry_payload = self.run_post_market_warehouse_retry_failed_sync(

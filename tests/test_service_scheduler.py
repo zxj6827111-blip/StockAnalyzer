@@ -1569,6 +1569,52 @@ def test_post_market_warehouse_followup_skips_when_coverage_gate_fails() -> None
     assert _as_bool(gate["allowed"]) is False
 
 
+def test_post_market_warehouse_followup_marks_stale_running_state_reclaimed() -> None:
+    config = _load_test_config()
+    config.market_warehouse.post_followup_enabled = True
+    config.market_warehouse.post_followup_run_week5 = False
+    config.market_warehouse.post_followup_run_learning_backfill = False
+    config.market_warehouse.post_followup_run_training = False
+    config.market_warehouse.post_followup_run_phase_d_tabular_deep = False
+    service = _new_service(config)
+    service._write_json_atomic(
+        service._post_market_warehouse_followup_state_path,  # noqa: SLF001
+        {
+            "updated_at": "2026-03-01T10:00:00+00:00",
+            "stage": "build_trainable_manifest",
+            "status": "running",
+            "payload": {"dataset_manifest_id": ""},
+        },
+    )
+
+    payload = _as_mapping(
+        service.run_post_market_warehouse_followup(
+            market_warehouse_report={
+                "status": "ok",
+                "trace_id": "manual-refresh-stale-followup",
+                "symbol_source": "full_universe",
+                "target_trade_date": "2026-03-01",
+                "failed_symbols_total": 0,
+                "failed_symbols": [],
+                "background_data": {
+                    "status": "ok",
+                    "latest_trade_date": "2026-03-01",
+                    "latest_trade_date_coverage_ratio": 0.99,
+                },
+            },
+            trigger="test",
+            timestamp=datetime.fromisoformat("2026-03-02T21:45:00+00:00"),
+        )
+    )
+
+    stale_state = _as_mapping(payload["stale_running_state"])
+    previous = _as_mapping(stale_state["previous"])
+    assert stale_state["status"] == "stale_running_reclaimed"
+    assert stale_state["reason"] == "running_state_stale"
+    assert previous["stage"] == "build_trainable_manifest"
+    assert _as_bool(payload["ok"]) is True
+
+
 def test_post_market_warehouse_followup_retries_failed_symbols_before_gate() -> None:
     config = _load_test_config()
     config.market_warehouse.post_followup_enabled = True

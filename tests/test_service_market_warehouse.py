@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import time
@@ -12,7 +13,11 @@ from typing import Any, cast
 import pandas as pd
 
 from stock_analyzer.config import StockAnalyzerConfig, load_config
-from stock_analyzer.data.market_warehouse import MarketWarehouse, load_package_daily_bars
+from stock_analyzer.data.market_warehouse import (
+    MarketWarehouse,
+    load_package_daily_bars,
+    write_package_daily_bars,
+)
 from stock_analyzer.data.provider import SyntheticProvider
 from stock_analyzer.runtime import service as runtime_service_module
 from stock_analyzer.runtime.service import StockAnalyzerService
@@ -966,6 +971,41 @@ def test_market_warehouse_background_data_quality_snapshot_reports_freshness_and
     assert _as_int(source_distribution["akshare"]) == 1
     assert _as_int(activity_counts["dragon_tiger_flag_non_zero"]) == 1
     assert snapshot["stale_symbols_sample"] == ["000001"]
+
+
+def test_market_warehouse_manifest_refresh_reports_package_file_drift(
+    tmp_path: Path,
+) -> None:
+    package_root = tmp_path / "package"
+    db_path = tmp_path / "warehouse" / "market.duckdb"
+    warehouse = MarketWarehouse(db_path=db_path, package_root=package_root)
+    frame = pd.DataFrame(
+        {
+            "open": [10.0],
+            "high": [10.1],
+            "low": [9.9],
+            "close": [10.0],
+            "volume": [1_000_000.0],
+            "turnover": [10_000_000.0],
+            "float_market_cap": [12_000_000_000.0],
+        },
+        index=pd.to_datetime(["2026-03-06"]),
+    )
+    frame.index.name = "date"
+    warehouse.replace_daily_bars(symbol="600000", frame=frame)
+    warehouse.replace_daily_bars(symbol="000001", frame=frame)
+    write_package_daily_bars(package_root=package_root, symbol="600000", frame=frame)
+
+    refresh = warehouse.refresh_package_manifests()
+    manifest = json.loads((package_root / "manifest.json").read_text(encoding="utf-8"))
+
+    assert refresh["package_consistent"] is False
+    assert _as_int(refresh["db_symbols_total"]) == 2
+    assert _as_int(refresh["package_symbol_files_total"]) == 1
+    assert _as_int(refresh["missing_symbol_files_total"]) == 1
+    assert refresh["missing_symbol_files_sample"] == ["000001"]
+    assert manifest["package_consistent"] is False
+    assert manifest["symbol_files_failed"] == 1
 
 
 def test_service_background_status_treats_clean_full_sync_staleness_as_nonblocking(

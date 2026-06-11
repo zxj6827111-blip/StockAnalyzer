@@ -770,20 +770,42 @@ class MarketWarehouse:
     def refresh_package_manifests(self) -> dict[str, object]:
         self.package_root.mkdir(parents=True, exist_ok=True)
         daily_summary = self._daily_summary()
+        daily_file_summary = _package_daily_file_summary(self.package_root)
         intraday_summary = {
             interval: self._intraday_summary(interval)
             for interval in _INTRADAY_TABLES
         }
+        intraday_file_summary = {
+            interval: _package_intraday_file_summary(self.package_root, interval)
+            for interval in _INTRADAY_TABLES
+        }
 
         existing_daily = _read_json(self.package_root / "manifest.json")
+        db_symbols_total = int(daily_summary["symbols_total"])
+        package_symbols_total = int(daily_file_summary["symbols_total"])
+        missing_daily_symbols = sorted(
+            set(daily_summary["symbols"]) - set(daily_file_summary["symbols"])
+        )
+        extra_daily_symbols = sorted(
+            set(daily_file_summary["symbols"]) - set(daily_summary["symbols"])
+        )
         daily_manifest = {
             **existing_daily,
             "generated_at": datetime.now().isoformat(timespec="seconds"),
             "output_root": str(self.package_root.resolve()),
             "package_version": str(existing_daily.get("package_version", "warehouse-v1")),
-            "symbol_files_total": daily_summary["symbols_total"],
-            "symbol_files_written": daily_summary["symbols_total"],
-            "symbol_files_failed": 0,
+            "db_symbols_total": db_symbols_total,
+            "package_symbol_files_total": package_symbols_total,
+            "symbol_files_total": db_symbols_total,
+            "symbol_files_written": package_symbols_total,
+            "symbol_files_failed": len(missing_daily_symbols),
+            "package_consistent": (
+                db_symbols_total == package_symbols_total
+                and not missing_daily_symbols
+                and not extra_daily_symbols
+            ),
+            "missing_symbol_files_sample": missing_daily_symbols[:20],
+            "extra_symbol_files_sample": extra_daily_symbols[:20],
             "date_min": daily_summary["date_min"],
             "date_max": daily_summary["date_max"],
         }
@@ -797,12 +819,23 @@ class MarketWarehouse:
             **existing_intraday,
             "generated_at": datetime.now().isoformat(timespec="seconds"),
             "output_root": str(self.package_root.resolve()),
-            "symbols_total": daily_summary["symbols_total"],
+            "db_symbols_total": db_symbols_total,
+            "package_symbol_files_total": package_symbols_total,
+            "package_consistent": bool(daily_manifest["package_consistent"]),
+            "symbols_total": db_symbols_total,
             "intervals": {
                 interval: {
+                    "db_symbols_total": summary["symbols_total"],
+                    "package_symbol_files_total": intraday_file_summary[interval][
+                        "symbols_total"
+                    ],
                     "symbols_total": summary["symbols_total"],
-                    "files_written": summary["symbols_total"],
-                    "failed": 0,
+                    "files_written": intraday_file_summary[interval]["symbols_total"],
+                    "failed": max(
+                        0,
+                        int(summary["symbols_total"])
+                        - int(intraday_file_summary[interval]["symbols_total"]),
+                    ),
                     "latest_date_max": summary["latest_date_max"],
                     "target_end_date": summary["latest_date_max"],
                 }
@@ -818,11 +851,18 @@ class MarketWarehouse:
             "intraday_manifest_path": str(
                 (self.package_root / "intraday_summary_manifest.json").resolve()
             ),
+            "db_symbols_total": db_symbols_total,
+            "package_symbol_files_total": package_symbols_total,
+            "package_consistent": bool(daily_manifest["package_consistent"]),
+            "missing_symbol_files_total": len(missing_daily_symbols),
+            "missing_symbol_files_sample": missing_daily_symbols[:20],
+            "extra_symbol_files_total": len(extra_daily_symbols),
+            "extra_symbol_files_sample": extra_daily_symbols[:20],
         }
 
     def _daily_summary(self) -> dict[str, object]:
         if not self._table_exists(_DAILY_TABLE):
-            return {"symbols_total": 0, "date_min": "", "date_max": ""}
+            return {"symbols_total": 0, "symbols": [], "date_min": "", "date_max": ""}
         with self._connect_readonly() as connection:
             row = connection.execute(
                 f"""
@@ -833,8 +873,12 @@ class MarketWarehouse:
                 FROM {_DAILY_TABLE}
                 """
             ).fetchone()
+            symbol_rows = connection.execute(
+                f"SELECT DISTINCT symbol FROM {_DAILY_TABLE} ORDER BY symbol"
+            ).fetchall()
         return {
             "symbols_total": int(row[0]) if row and row[0] is not None else 0,
+            "symbols": [str(item[0]).strip() for item in symbol_rows if str(item[0]).strip()],
             "date_min": str(row[1] or ""),
             "date_max": str(row[2] or ""),
         }
@@ -993,6 +1037,32 @@ def write_package_intraday_summary(
     payload.insert(0, "symbol", normalized_symbol)
     payload.to_csv(target_path, index=False, compression="gzip")
     return target_path
+
+
+def _package_daily_file_summary(package_root: Path) -> dict[str, object]:
+    bars_root = package_root / "bars"
+    symbols: set[str] = set()
+    if bars_root.exists() and bars_root.is_dir():
+        for pattern in ("*.csv", "*.csv.gz", "*.parquet"):
+            for path in bars_root.glob(pattern):
+                normalized = _normalize_symbol(path.name.split(".")[0])
+                if normalized:
+                    symbols.add(normalized)
+    ordered = sorted(symbols)
+    return {"symbols_total": len(ordered), "symbols": ordered}
+
+
+def _package_intraday_file_summary(package_root: Path, interval: str) -> dict[str, object]:
+    summary_root = package_root / "intraday_summary" / interval
+    symbols: set[str] = set()
+    if summary_root.exists() and summary_root.is_dir():
+        for pattern in ("*.csv", "*.csv.gz", "*.parquet"):
+            for path in summary_root.glob(pattern):
+                normalized = _normalize_symbol(path.name.split(".")[0])
+                if normalized:
+                    symbols.add(normalized)
+    ordered = sorted(symbols)
+    return {"symbols_total": len(ordered), "symbols": ordered}
 
 
 def _normalize_daily_frame(*, frame: pd.DataFrame, symbol: str) -> pd.DataFrame:
