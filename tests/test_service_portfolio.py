@@ -25,6 +25,12 @@ def _load_test_config() -> StockAnalyzerConfig:
     config.notifications.primary = "console"
     config.notifications.backup = "console"
     config.app.advisory_only = False
+    config.data_source.primary = "synthetic_test"
+    config.cache.enabled = False
+    config.training.bootstrap_auto_run_on_first_start = False
+    config.training.bootstrap_require_completion_for_runtime = False
+    config.training.bootstrap_auto_seed_watchlist = False
+    config.training.bootstrap_retry_enabled = False
     config.training.bootstrap_state_path = str(
         Path(tempfile.gettempdir())
         / f"stock_analyzer_service_portfolio_{time.time_ns()}"
@@ -277,6 +283,7 @@ def test_service_live_auto_execution_skips_unchanged_adjustment() -> None:
     config = _load_test_config()
     config.soup_strategy.max_holdings = 5
     service = StockAnalyzerService(config=config)
+    _patch_attr(service, "_build_c3_position_management_items", lambda **kwargs: [])
     opened_at = datetime.fromisoformat("2026-03-11T09:35:00")
     _ = service._portfolio.set_manual_position(
         symbol="600956",

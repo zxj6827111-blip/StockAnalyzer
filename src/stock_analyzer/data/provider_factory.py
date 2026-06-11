@@ -35,6 +35,8 @@ def build_primary_provider(config: DataSourceConfig) -> MarketDataProvider:
     """Build provider instance by `data_source.primary`."""
     primary = config.primary.strip().lower()
     socket_timeout_sec, max_attempts, _ = _runtime_provider_tuning()
+    if primary in {"synthetic", "synthetic_test"}:
+        return SyntheticProvider()
     if primary in {"akshare", "ak"}:
         return AkshareProvider(
             retry_delay_sec=config.request_interval_sec,
@@ -77,6 +79,8 @@ def build_online_backup_provider(config: DataSourceConfig) -> MarketDataProvider
     socket_timeout_sec, max_attempts, fast_failover = _runtime_provider_tuning()
     if fast_failover:
         return None
+    if primary in {"synthetic", "synthetic_test"}:
+        return None
     if primary in {"akshare", "ak"}:
         return EfinanceProvider(
             retry_delay_sec=config.request_interval_sec,
@@ -112,6 +116,8 @@ def build_runtime_provider(
     synthetic_seed: int = 2026,
 ) -> MarketDataProvider:
     """Build runtime provider chain: primary -> online backup -> synthetic."""
+    if config.primary.strip().lower() in {"synthetic", "synthetic_test"}:
+        return SyntheticProvider(seed_offset=synthetic_seed)
     primary_provider = build_primary_provider(config)
     synthetic_backup = SyntheticProvider(seed_offset=synthetic_seed)
     online_backup = build_online_backup_provider(config)
@@ -136,6 +142,8 @@ def build_realtime_runtime_provider(
     timezone: str = "Asia/Shanghai",
 ) -> MarketDataProvider:
     """Build daytime runtime provider with live intraday overlay when enabled."""
+    if config.primary.strip().lower() in {"synthetic", "synthetic_test"}:
+        return SyntheticProvider(seed_offset=synthetic_seed)
     primary_provider = build_primary_provider(config)
     primary_key = config.primary.strip().lower()
     live_provider_key = config.runtime_live_provider.strip().lower()
