@@ -1488,6 +1488,30 @@ def model_registry_register(
     typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
 
 
+@app.command("model-registry-bootstrap-active-champion")
+def model_registry_bootstrap_active_champion(
+    artifact_path: str = typer.Option("", help="Artifact path to bootstrap as champion"),
+    source: str = typer.Option(
+        "manual_bootstrap_active_champion",
+        help="Bootstrap source tag",
+    ),
+    allow_legacy_production_artifact: bool = typer.Option(
+        False,
+        help="Allow legacy production artifacts missing protocol binding metadata",
+    ),
+    model_id: str = typer.Option("", help="Optional stable repaired champion model id"),
+) -> None:
+    config = get_config()
+    service = StockAnalyzerService(config=config)
+    result = service.bootstrap_active_champion_from_artifact(
+        artifact_path=artifact_path,
+        source=source,
+        allow_legacy_production_artifact=allow_legacy_production_artifact,
+        model_id=model_id,
+    )
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
+
 @app.command("model-registry-set-lifecycle")
 def model_registry_set_lifecycle(
     model_id: str = typer.Option(..., help="Model id to update"),

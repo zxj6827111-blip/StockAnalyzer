@@ -64,7 +64,12 @@ from stock_analyzer.learning.sample_store import SampleStore
 from stock_analyzer.market_calendar import is_a_share_trading_day
 from stock_analyzer.models.adapters import inspect_model_backend_dependencies
 from stock_analyzer.models.artifact import ModelArtifact
-from stock_analyzer.models.registry import ModelLifecycleState, ModelRegistry, ModelRole
+from stock_analyzer.models.registry import (
+    ModelLifecycleState,
+    ModelRegistry,
+    ModelRegistryRecord,
+    ModelRole,
+)
 from stock_analyzer.models.trainer import ModelTrainer
 from stock_analyzer.notify.channels import NotificationMessage
 from stock_analyzer.notify.filter import NotificationFilter, is_quiet_time
@@ -708,6 +713,8 @@ class StockAnalyzerService:
         *,
         artifact_path: str = "",
         source: str = "manual_bootstrap_active_champion",
+        allow_legacy_production_artifact: bool = False,
+        model_id: str = "",
     ) -> dict[str, object]:
         active = self._model_registry.active_champion()
         if active is not None:
@@ -723,6 +730,13 @@ class StockAnalyzerService:
             try:
                 record = self._approve_existing_registry_record_for_champion_bootstrap(existing)
             except Exception as exc:
+                if allow_legacy_production_artifact:
+                    return self._bootstrap_legacy_production_active_champion(
+                        artifact_path=resolved_path,
+                        source=source,
+                        model_id=model_id,
+                        previous_failure=f"existing_registry_record_not_bootstrappable:{exc}",
+                    )
                 return {
                     "accepted": False,
                     "reason": f"existing_registry_record_not_bootstrappable:{exc}",
@@ -763,6 +777,14 @@ class StockAnalyzerService:
             parent_model_id="",
         )
         if not bool(registered.get("registered", False)):
+            if allow_legacy_production_artifact:
+                return self._bootstrap_legacy_production_active_champion(
+                    artifact_path=resolved_path,
+                    source=source,
+                    model_id=model_id,
+                    previous_failure="register_artifact_failed",
+                    registration=registered,
+                )
             return {
                 "accepted": False,
                 "reason": "register_artifact_failed",
@@ -787,6 +809,121 @@ class StockAnalyzerService:
             payload=payload,
         )
         return payload
+
+    def _bootstrap_legacy_production_active_champion(
+        self,
+        *,
+        artifact_path: str,
+        source: str,
+        model_id: str = "",
+        previous_failure: str = "",
+        registration: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        resolved_path = str(Path(artifact_path).expanduser().resolve())
+        try:
+            artifact = ModelArtifact.load(resolved_path)
+        except Exception as exc:
+            return {
+                "accepted": False,
+                "reason": f"legacy_artifact_load_failed:{exc.__class__.__name__}",
+                "artifact_path": resolved_path,
+                "previous_failure": previous_failure,
+            }
+
+        existing_active = self._model_registry.active_champion(suppress_read_errors=True)
+        if existing_active is not None:
+            return {
+                "accepted": False,
+                "reason": "active_champion_exists",
+                "active_champion": existing_active.model_dump(mode="json"),
+            }
+
+        record = self._build_legacy_production_champion_record(
+            artifact=artifact,
+            artifact_uri=resolved_path,
+            model_id=model_id,
+        )
+        try:
+            record = self._model_registry.upsert_repair_record(record)
+        except Exception as exc:
+            return {
+                "accepted": False,
+                "reason": f"legacy_champion_repair_failed:{exc}",
+                "artifact_path": resolved_path,
+                "model_id": record.model_id,
+                "previous_failure": previous_failure,
+                "registration": dict(registration or {}),
+            }
+
+        self._config.evolution.active_champion_id = record.model_id
+        payload = {
+            "accepted": True,
+            "reason": "legacy_artifact_registered_as_active_champion",
+            "model_id": record.model_id,
+            "artifact_uri": record.artifact_uri,
+            "role": record.role.value,
+            "lifecycle_state": record.lifecycle_state.value,
+            "source": source.strip(),
+            "legacy_production_artifact": True,
+            "dataset_manifest_id": record.dataset_manifest_id,
+            "feature_schema_id": record.feature_schema_id,
+            "feature_schema_hash": record.feature_schema_hash,
+            "label_policy_id": record.label_policy_id,
+            "label_policy_hash": record.label_policy_hash,
+            "previous_failure": previous_failure,
+            "registration": dict(registration or {}),
+        }
+        self._record_audit_event(
+            event_type="model_registry_active_champion_bootstrap",
+            level="warn",
+            message="active champion bootstrapped from legacy production artifact",
+            payload=payload,
+        )
+        return payload
+
+    def _build_legacy_production_champion_record(
+        self,
+        *,
+        artifact: ModelArtifact,
+        artifact_uri: str,
+        model_id: str,
+    ) -> ModelRegistryRecord:
+        now = datetime.now(UTC)
+        resolved_model_id = str(model_id).strip() or _legacy_production_model_id(artifact_uri)
+        feature_schema_id = (
+            artifact.feature_schema_id.strip()
+            or f"legacy_production_feature_schema_{_digest_text(artifact_uri, length=12)}"
+        )
+        feature_schema_hash = artifact.feature_schema_hash.strip() or _legacy_feature_schema_hash(
+            artifact=artifact
+        )
+        label_policy_id = (
+            artifact.label_policy_id.strip()
+            or f"legacy_production_label_policy_{_digest_text(artifact_uri, length=12)}"
+        )
+        label_policy_hash = artifact.label_policy_hash.strip() or _legacy_label_policy_hash(
+            artifact_uri=artifact_uri
+        )
+        dataset_manifest_id = (
+            artifact.dataset_manifest_id.strip()
+            or f"legacy_production_dataset_manifest_{_digest_text(artifact_uri, length=12)}"
+        )
+        return ModelRegistryRecord(
+            model_id=resolved_model_id,
+            role=ModelRole.CHAMPION,
+            lifecycle_state=ModelLifecycleState.APPROVED,
+            artifact_uri=artifact_uri,
+            artifact_created_at=_parse_iso_datetime(artifact.created_at),
+            dataset_manifest_id=dataset_manifest_id,
+            feature_schema_id=feature_schema_id,
+            feature_schema_hash=feature_schema_hash,
+            label_policy_id=label_policy_id,
+            label_policy_hash=label_policy_hash,
+            metrics_summary=dict(artifact.training_metrics),
+            created_at=now,
+            updated_at=now,
+            promoted_at=now,
+        )
 
     def _find_model_registry_record_by_artifact_uri(self, artifact_uri: str):
         normalized = str(Path(artifact_uri).expanduser().resolve())
@@ -17715,6 +17852,36 @@ def _parse_iso_datetime(value: object) -> datetime | None:
         return datetime.fromisoformat(value)
     except ValueError:
         return None
+
+
+def _legacy_production_model_id(artifact_uri: str) -> str:
+    stem = Path(str(artifact_uri).strip() or "model_v1").stem.strip().lower()
+    safe_stem = "".join(char if char.isalnum() else "_" for char in stem).strip("_")
+    if not safe_stem:
+        safe_stem = "model_v1"
+    return f"{safe_stem}_prod_bootstrap_existing"
+
+
+def _legacy_feature_schema_hash(*, artifact: ModelArtifact) -> str:
+    payload = {
+        "version": artifact.version,
+        "feature_columns": list(artifact.feature_columns),
+    }
+    return f"legacy_production_feature_schema_hash_{_digest_json(payload, length=16)}"
+
+
+def _legacy_label_policy_hash(*, artifact_uri: str) -> str:
+    return f"legacy_production_label_policy_hash_{_digest_text(artifact_uri, length=16)}"
+
+
+def _digest_text(value: object, *, length: int = 16) -> str:
+    digest = hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+    return digest[: max(1, int(length))]
+
+
+def _digest_json(value: object, *, length: int = 16) -> str:
+    serialized = json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return _digest_text(serialized, length=length)
 
 
 def _normalize_recommendation_status(value: object, default: str = "watching") -> str:

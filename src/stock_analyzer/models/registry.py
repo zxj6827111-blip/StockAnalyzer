@@ -197,6 +197,21 @@ class ModelRegistry:
         finally:
             conn.close()
 
+    def upsert_repair_record(self, record: ModelRegistryRecord) -> ModelRegistryRecord:
+        """Insert or replace one explicitly repaired governance record."""
+
+        _validate_lifecycle_requirements(record)
+        existing = self.get_by_id(record.model_id, suppress_read_errors=True)
+        if existing is None:
+            return self.register(record)
+        if existing.model_dump(mode="json") == record.model_dump(mode="json"):
+            return existing
+        replacement = record.model_copy(
+            update={"created_at": existing.created_at},
+            deep=True,
+        )
+        return self._replace_record(replacement)
+
     def register_artifact(
         self,
         *,
@@ -352,7 +367,10 @@ class ModelRegistry:
             },
             deep=True,
         )
-        if role == ModelRole.CHAMPION and next_record.lifecycle_state != ModelLifecycleState.APPROVED:
+        if (
+            role == ModelRole.CHAMPION
+            and next_record.lifecycle_state != ModelLifecycleState.APPROVED
+        ):
             raise ValueError("champion role requires approved lifecycle state")
         return self._replace_record(next_record)
 
@@ -431,16 +449,16 @@ class ModelRegistry:
                 return factory(db_path, read_only=True)
             except TypeError as exc:
                 if "read_only" not in str(exc):
-                    raise shared_exc
+                    raise shared_exc from exc
                 try:
                     return _default_connection_factory(db_path, read_only=True)
                 except Exception as fallback_exc:
                     if self._is_incompatible_connection_config_error(fallback_exc):
-                        raise shared_exc
+                        raise shared_exc from fallback_exc
                     raise
             except Exception as exc:
                 if self._is_incompatible_connection_config_error(exc):
-                    raise shared_exc
+                    raise shared_exc from exc
                 raise
 
     def _open_read_connection(self) -> _DuckConnection | None:

@@ -207,6 +207,27 @@ class _FakeService:
             "parent_model_id": parent_model_id,
         }
 
+    def bootstrap_active_champion_from_artifact(
+        self,
+        *,
+        artifact_path: str,
+        source: str,
+        allow_legacy_production_artifact: bool = False,
+        model_id: str = "",
+    ) -> dict[str, object]:
+        return {
+            "accepted": True,
+            "reason": "legacy_artifact_registered_as_active_champion"
+            if allow_legacy_production_artifact
+            else "artifact_registered_as_active_champion",
+            "model_id": model_id or "model_champion_test",
+            "artifact_uri": artifact_path or "tmp/model_v1.json",
+            "role": "champion",
+            "lifecycle_state": "approved",
+            "source": source,
+            "legacy_production_artifact": allow_legacy_production_artifact,
+        }
+
     def update_model_registry_lifecycle(
         self,
         *,
@@ -1246,7 +1267,15 @@ def test_cli_model_registry_list_outputs_json(monkeypatch: MonkeyPatch) -> None:
     runner = CliRunner()
     result = runner.invoke(
         cli_module.app,
-        ["model-registry-list", "--limit", "5", "--role", "challenger", "--lifecycle-state", "trained"],
+        [
+            "model-registry-list",
+            "--limit",
+            "5",
+            "--role",
+            "challenger",
+            "--lifecycle-state",
+            "trained",
+        ],
     )
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
@@ -1296,6 +1325,36 @@ def test_cli_model_registry_register_outputs_json(monkeypatch: MonkeyPatch) -> N
     assert payload["role"] == "shadow"
     assert payload["source"] == "cli_test"
     assert payload["parent_model_id"] == "champion_a"
+
+
+def test_cli_model_registry_bootstrap_active_champion_outputs_json(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli_module, "get_config", _fake_config)
+    monkeypatch.setattr(cli_module, "StockAnalyzerService", _FakeService)
+    runner = CliRunner()
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "model-registry-bootstrap-active-champion",
+            "--artifact-path",
+            "artifacts/model_v1.json",
+            "--source",
+            "cli_repair_test",
+            "--allow-legacy-production-artifact",
+            "--model-id",
+            "model_v1_prod_bootstrap_existing",
+        ],
+    )
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["accepted"] is True
+    assert payload["reason"] == "legacy_artifact_registered_as_active_champion"
+    assert payload["model_id"] == "model_v1_prod_bootstrap_existing"
+    assert payload["role"] == "champion"
+    assert payload["lifecycle_state"] == "approved"
+    assert payload["source"] == "cli_repair_test"
+    assert payload["legacy_production_artifact"] is True
 
 
 def test_cli_model_registry_set_lifecycle_outputs_json(monkeypatch: MonkeyPatch) -> None:
@@ -1543,7 +1602,10 @@ def test_cli_train_learning_manifest_shadow_validate_outputs_json(
     assert payload["evaluation_split_names"] == ["test"]
     assert payload["training"]["model_registry"]["registered"] is True
     assert payload["shadow_dataset"]["row_count"] == 10
-    assert payload["champion_shadow_report"]["comparison_report_id"] == "champion_shadow_report_test"
+    assert (
+        payload["champion_shadow_report"]["comparison_report_id"]
+        == "champion_shadow_report_test"
+    )
     assert payload["shadow_online_v2_report"]["report_id"] == "shadow_online_v2_report_test"
     assert payload["registry_lifecycle"]["updated"] is True
 

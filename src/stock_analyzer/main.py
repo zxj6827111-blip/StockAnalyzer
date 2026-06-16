@@ -1501,6 +1501,8 @@ class RegisterModelArtifactRequest(BaseModel):
 class BootstrapActiveChampionRequest(BaseModel):
     artifact_path: str = ""
     source: str = "manual_bootstrap_active_champion"
+    allow_legacy_production_artifact: bool = False
+    model_id: str = ""
 
 
 class ModelRegistryLifecycleRequest(BaseModel):
@@ -3826,6 +3828,8 @@ def bootstrap_active_champion(
     return _service.bootstrap_active_champion_from_artifact(
         artifact_path=request.artifact_path,
         source=request.source,
+        allow_legacy_production_artifact=request.allow_legacy_production_artifact,
+        model_id=request.model_id,
     )
 
 

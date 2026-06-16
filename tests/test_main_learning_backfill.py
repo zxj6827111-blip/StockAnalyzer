@@ -153,15 +153,18 @@ class _FakeLearningBackfillService:
         *,
         artifact_path: str,
         source: str,
+        allow_legacy_production_artifact: bool = False,
+        model_id: str = "",
     ) -> dict[str, object]:
         return {
             "accepted": True,
             "reason": "artifact_registered_as_active_champion",
-            "model_id": "model_champion_test",
+            "model_id": model_id or "model_champion_test",
             "artifact_uri": artifact_path or "tmp/registered_model.json",
             "role": "champion",
             "lifecycle_state": "approved",
             "source": source,
+            "legacy_production_artifact": allow_legacy_production_artifact,
         }
 
     def update_model_registry_lifecycle(
@@ -1196,6 +1199,8 @@ def test_bootstrap_active_champion_endpoint_returns_repair_payload(
         json={
             "artifact_path": "tmp/registered_model.json",
             "source": "api_bootstrap_test",
+            "allow_legacy_production_artifact": True,
+            "model_id": "model_v1_prod_bootstrap_existing",
         },
     )
 
@@ -1205,6 +1210,8 @@ def test_bootstrap_active_champion_endpoint_returns_repair_payload(
     assert payload["role"] == "champion"
     assert payload["lifecycle_state"] == "approved"
     assert payload["source"] == "api_bootstrap_test"
+    assert payload["legacy_production_artifact"] is True
+    assert payload["model_id"] == "model_v1_prod_bootstrap_existing"
 
 
 def test_update_model_registry_lifecycle_endpoint_accepts_timestamp(
@@ -1422,7 +1429,10 @@ def test_train_learning_manifest_shadow_validate_endpoint_returns_bundle_payload
     assert payload["evaluation_split_names"] == ["test"]
     assert payload["training"]["model_registry"]["registered"] is True
     assert payload["shadow_dataset"]["row_count"] == 10
-    assert payload["champion_shadow_report"]["comparison_report_id"] == "champion_shadow_report_test"
+    assert (
+        payload["champion_shadow_report"]["comparison_report_id"]
+        == "champion_shadow_report_test"
+    )
     assert payload["shadow_online_v2_report"]["report_id"] == "shadow_online_v2_report_test"
     assert payload["registry_lifecycle"]["updated"] is True
 

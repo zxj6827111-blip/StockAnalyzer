@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
@@ -16,6 +16,7 @@ from stock_analyzer.learning.sample_schema import (
     OutcomeRecord,
     SignalSnapshot,
 )
+from stock_analyzer.models.artifact import ModelArtifact
 from stock_analyzer.runtime.service import StockAnalyzerService
 
 
@@ -120,7 +121,8 @@ def _seed_learning_protocol_samples(
             outcome = OutcomeRecord(
                 snapshot_id=snapshot.snapshot_id,
                 maturity_status=MaturityStatus.RECONCILED,
-                label_mature_time=decision_time + timedelta(days=service._config.labels.horizon_days),
+                label_mature_time=decision_time
+                + timedelta(days=service._config.labels.horizon_days),
                 realized_return=0.08 if row_index % 2 == 0 else -0.05,
                 max_favorable_excursion=0.09 if row_index % 2 == 0 else 0.01,
                 max_adverse_excursion=-0.01 if row_index % 2 == 0 else -0.07,
@@ -270,6 +272,94 @@ def test_service_bootstrap_active_champion_from_existing_artifact(
     assert payload["lifecycle_state"] == "approved"
     assert active["model_id"] == registry_payload["model_id"]
     assert service._config.evolution.active_champion_id == registry_payload["model_id"]
+
+
+def test_service_bootstrap_active_champion_rejects_legacy_artifact_by_default(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config(tmp_path)
+    service = _new_service(config, provider=FailingBarsProvider())
+    artifact_path = tmp_path / "model_v1.json"
+    ModelArtifact.create(
+        feature_columns=["feature_a", "feature_b"],
+        lgbm_model={},
+        xgb_model={},
+        lgbm_calibrator={},
+        xgb_calibrator={},
+        training_metrics={"auc": 0.51},
+    ).save(artifact_path)
+
+    payload = _as_mapping(
+        service.bootstrap_active_champion_from_artifact(
+            artifact_path=str(artifact_path),
+            source="test_legacy_bootstrap_rejected",
+        )
+    )
+    active = service.model_registry_entries(limit=10)["active_champion"]
+
+    assert payload["accepted"] is False
+    assert payload["reason"] == "register_artifact_failed"
+    assert _as_mapping(payload["registration"])["reason"] == "artifact_protocol_binding_missing"
+    assert active is None
+
+
+def test_service_bootstrap_active_champion_repairs_legacy_production_artifact(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config(tmp_path)
+    service = _new_service(config, provider=FailingBarsProvider())
+    artifact_path = tmp_path / "model_v1.json"
+    artifact = ModelArtifact.create(
+        feature_columns=["feature_a", "feature_b"],
+        lgbm_model={},
+        xgb_model={},
+        lgbm_calibrator={},
+        xgb_calibrator={},
+        training_metrics={"auc": 0.51},
+    )
+    artifact.save(artifact_path)
+    artifact_hash_before = artifact_path.read_bytes()
+
+    payload = _as_mapping(
+        service.bootstrap_active_champion_from_artifact(
+            artifact_path=str(artifact_path),
+            source="test_legacy_bootstrap_repair",
+            allow_legacy_production_artifact=True,
+            model_id="model_v1_prod_bootstrap_existing",
+        )
+    )
+    active = _as_mapping(service.model_registry_entries(limit=10)["active_champion"])
+
+    assert payload["accepted"] is True
+    assert payload["reason"] == "legacy_artifact_registered_as_active_champion"
+    assert payload["legacy_production_artifact"] is True
+    assert payload["model_id"] == "model_v1_prod_bootstrap_existing"
+    assert payload["role"] == "champion"
+    assert payload["lifecycle_state"] == "approved"
+    assert str(payload["dataset_manifest_id"]).startswith("legacy_production_dataset_manifest_")
+    assert str(payload["feature_schema_id"]).startswith("legacy_production_feature_schema_")
+    assert str(payload["feature_schema_hash"]).startswith(
+        "legacy_production_feature_schema_hash_"
+    )
+    assert str(payload["label_policy_id"]).startswith("legacy_production_label_policy_")
+    assert str(payload["label_policy_hash"]).startswith("legacy_production_label_policy_hash_")
+    assert active["model_id"] == "model_v1_prod_bootstrap_existing"
+    assert active["artifact_uri"] == payload["artifact_uri"]
+    assert service._config.evolution.active_champion_id == "model_v1_prod_bootstrap_existing"
+    assert artifact_path.read_bytes() == artifact_hash_before
+
+    replay = _as_mapping(
+        service.bootstrap_active_champion_from_artifact(
+            artifact_path=str(artifact_path),
+            source="test_legacy_bootstrap_repair_replay",
+            allow_legacy_production_artifact=True,
+            model_id="model_v1_prod_bootstrap_existing",
+        )
+    )
+
+    assert replay["accepted"] is False
+    assert replay["reason"] == "active_champion_exists"
+    assert _as_mapping(replay["active_champion"])["model_id"] == "model_v1_prod_bootstrap_existing"
 
 
 def test_service_run_learning_manifest_shadow_validation_builds_standard_bundle(
@@ -929,8 +1019,14 @@ def test_service_evaluate_learning_model_promotion_gate_can_warn_without_transit
     assert gate_payload["status"] == "warn"
     assert gate_payload["accepted"] is False
     assert gate_payload["recommended_action"] == "manual_review"
-    assert "shadow_v2_brier_delta_above_threshold" in cast(list[object], gate_payload["reason_codes"])
-    assert "shadow_v2_logloss_delta_above_threshold" in cast(list[object], gate_payload["reason_codes"])
+    assert "shadow_v2_brier_delta_above_threshold" in cast(
+        list[object],
+        gate_payload["reason_codes"],
+    )
+    assert "shadow_v2_logloss_delta_above_threshold" in cast(
+        list[object],
+        gate_payload["reason_codes"],
+    )
     assert registry_transition["updated"] is False
     assert registry_transition["action"] == "noop"
     assert entry["lifecycle_state"] == "shadow_validated"
@@ -1124,7 +1220,7 @@ def test_service_run_learning_manifest_shadow_promotion_gate_can_auto_approve(
     assert latest_event_payload["accepted"] is True
 
 
-def test_service_run_learning_manifest_shadow_promotion_gate_skips_gate_when_shadow_validation_fails(
+def test_service_run_learning_manifest_shadow_promotion_gate_skips_gate_when_shadow_validation_fails(  # noqa: E501
     tmp_path: Path,
 ) -> None:
     config = _load_test_config(tmp_path)
