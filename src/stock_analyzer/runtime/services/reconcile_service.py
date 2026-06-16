@@ -243,6 +243,7 @@ class RuntimeReconcileService:
             return report
 
         strategy_positions = _normalize_position_map(service._portfolio.position_map())
+        broker_positions = _normalize_position_map(service._broker_positions)
         snapshot_freshness = _broker_snapshot_freshness(
             updated_at=service._broker_snapshot_updated_at,
             now=now,
@@ -308,7 +309,7 @@ class RuntimeReconcileService:
                 "missing_in_broker": sorted(strategy_positions.keys()),
                 "diffs": [],
                 "strategy_positions": len(strategy_positions),
-                "broker_positions": len(service._broker_positions),
+                "broker_positions": len(broker_positions),
                 "quantity_matched_count": 0,
                 "account_matched_count": 0,
                 "quantity_mismatch_count": 0,
@@ -322,7 +323,7 @@ class RuntimeReconcileService:
         else:
             report_obj = reconcile_positions(
                 strategy_positions=strategy_positions,
-                broker_positions=service._broker_positions,
+                broker_positions=broker_positions,
                 timestamp=now,
                 tolerance=service._config.reconcile.position_tolerance,
             )

@@ -2346,6 +2346,7 @@ def test_service_reconcile_normalizes_exchange_suffix_symbols() -> None:
         ],
         source_trace_id="suffix-normalized-snapshot",
     )
+    service._broker_positions = {"000159.SZ": 0.2, "600956.SH": 0.1}  # noqa: SLF001
 
     report = service.run_reconciliation(timestamp=datetime.fromisoformat("2026-03-01T15:30:00"))
 
