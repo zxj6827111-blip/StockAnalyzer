@@ -2258,6 +2258,76 @@ def test_service_reconcile_with_broker_snapshot_command() -> None:
     assert weekly["mismatch_records"] == 0
 
 
+def test_service_bootstrap_broker_snapshot_from_simulated_portfolio() -> None:
+    config = _load_test_config()
+    service = StockAnalyzerService(config=config)
+
+    set_cmd = _sign(
+        action="SET_POSITION",
+        command_id="cmd-set-pos-sim-snapshot",
+        payload={
+            "symbol": "600000",
+            "strategy": "manual",
+            "target_position": 0.2,
+            "quantity": 1000,
+            "account": "sim-main",
+        },
+        secret=config.command_channel.secret_key,
+    )
+    set_result = service.execute_command(set_cmd)
+    assert set_result["accepted"] is True
+
+    snapshot = service.bootstrap_broker_snapshot_from_portfolio(
+        source_trace_id="sim-snapshot-from-portfolio",
+    )
+
+    assert snapshot["status"] == "ok"
+    assert snapshot["source"] == "portfolio"
+    assert snapshot["portfolio_positions"] == 1
+    assert snapshot["broker_positions"] == 1
+    assert snapshot["quantity_records"] == 1
+    assert snapshot["account_records"] == 1
+    assert snapshot["symbols"] == ["600000"]
+
+    report = service.run_reconciliation(timestamp=datetime.fromisoformat("2026-03-01T15:30:00"))
+    assert report["status"] == "ok"
+    assert report["quantity_matched_count"] == 1
+    assert report["account_matched_count"] == 1
+    assert service.state.reconcile_required is False
+
+
+def test_service_bootstrap_broker_snapshot_from_portfolio_skips_empty_by_default() -> None:
+    config = _load_test_config()
+    service = StockAnalyzerService(config=config)
+
+    snapshot = service.bootstrap_broker_snapshot_from_portfolio(
+        source_trace_id="sim-snapshot-empty-default",
+    )
+
+    assert snapshot["status"] == "skipped_empty_portfolio"
+    assert snapshot["broker_positions"] == 0
+    assert snapshot["allow_empty"] is False
+    assert service._broker_snapshot_updated_at == ""  # noqa: SLF001
+
+
+def test_service_bootstrap_broker_snapshot_from_portfolio_allows_explicit_empty() -> None:
+    config = _load_test_config()
+    service = StockAnalyzerService(config=config)
+
+    snapshot = service.bootstrap_broker_snapshot_from_portfolio(
+        source_trace_id="sim-snapshot-empty-explicit",
+        allow_empty=True,
+    )
+
+    assert snapshot["status"] == "ok"
+    assert snapshot["source"] == "portfolio"
+    assert snapshot["portfolio_positions"] == 0
+    assert snapshot["broker_positions"] == 0
+    assert snapshot["symbols"] == []
+    assert snapshot["allow_empty"] is True
+    assert service._broker_snapshot_updated_at  # noqa: SLF001
+
+
 def test_service_reconciliation_promotes_learning_outcome_when_label_is_mature(
     tmp_path: Path,
 ) -> None:

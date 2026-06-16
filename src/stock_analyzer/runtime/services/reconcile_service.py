@@ -47,6 +47,44 @@ class RuntimeReconcileService:
         )
         return payload
 
+    def bootstrap_broker_snapshot_from_portfolio(
+        self,
+        *,
+        source_trace_id: str = "",
+        allow_empty: bool = False,
+    ) -> dict[str, object]:
+        service = self._service
+        portfolio_positions = service._portfolio.positions()
+        positions = _broker_snapshot_positions_from_portfolio(portfolio_positions)
+        if not positions and not allow_empty:
+            service._record_audit_event(
+                event_type="broker_snapshot_from_portfolio_skipped",
+                trace_id=source_trace_id,
+                payload={
+                    "reason": "empty_portfolio",
+                    "portfolio_positions": 0,
+                    "allow_empty": False,
+                },
+            )
+            return {
+                "status": "skipped_empty_portfolio",
+                "source_trace_id": source_trace_id,
+                "portfolio_positions": 0,
+                "broker_positions": 0,
+                "symbols": [],
+                "allow_empty": False,
+                "reason": "portfolio has no open positions; pass allow_empty to write an empty simulated broker snapshot",
+            }
+        snapshot = self.update_broker_snapshot(
+            positions=positions,
+            source_trace_id=source_trace_id,
+        )
+        snapshot["status"] = "ok"
+        snapshot["source"] = "portfolio"
+        snapshot["portfolio_positions"] = len(portfolio_positions)
+        snapshot["allow_empty"] = allow_empty
+        return snapshot
+
     def latest_reconcile_report(self) -> dict[str, object] | None:
         service = self._service
         service._refresh_runtime_state_from_disk_if_changed()
@@ -472,6 +510,29 @@ def _parse_broker_position_details(
             "account": account,
         }
     return parsed
+
+
+def _broker_snapshot_positions_from_portfolio(
+    portfolio_positions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    positions: list[dict[str, object]] = []
+    for item in portfolio_positions:
+        symbol = str(item.get("symbol", "")).strip()
+        target_position = _as_float(item.get("target_position"), default=-1.0)
+        if not symbol or target_position < 0.0:
+            continue
+        snapshot_item: dict[str, object] = {
+            "symbol": symbol,
+            "target_position": target_position,
+        }
+        quantity = _as_int(item.get("quantity"), default=0)
+        if quantity > 0:
+            snapshot_item["quantity"] = quantity
+        account = str(item.get("account", "")).strip()
+        if account:
+            snapshot_item["account"] = account
+        positions.append(snapshot_item)
+    return positions
 
 
 def _broker_snapshot_freshness(

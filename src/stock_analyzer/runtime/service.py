@@ -9053,6 +9053,17 @@ class StockAnalyzerService:
             source_trace_id=source_trace_id,
         )
 
+    def bootstrap_broker_snapshot_from_portfolio(
+        self,
+        *,
+        source_trace_id: str = "",
+        allow_empty: bool = False,
+    ) -> dict[str, object]:
+        return self._reconcile_service.bootstrap_broker_snapshot_from_portfolio(
+            source_trace_id=source_trace_id,
+            allow_empty=allow_empty,
+        )
+
 
     def latest_reconcile_report(self) -> dict[str, object] | None:
         return self._reconcile_service.latest_reconcile_report()

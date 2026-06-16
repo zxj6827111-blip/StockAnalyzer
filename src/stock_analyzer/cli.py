@@ -2183,6 +2183,23 @@ def broker_snapshot(
     typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
 
 
+@app.command("sim-broker-snapshot-from-portfolio")
+def sim_broker_snapshot_from_portfolio(
+    source_trace_id: str = typer.Option("", help="Optional source trace id"),
+    allow_empty: bool = typer.Option(
+        False,
+        help="Write an empty broker snapshot when the simulated portfolio has no open positions",
+    ),
+) -> None:
+    config = get_config()
+    service = StockAnalyzerService(config=config)
+    result = service.bootstrap_broker_snapshot_from_portfolio(
+        source_trace_id=source_trace_id,
+        allow_empty=allow_empty,
+    )
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
+
 @app.command("reconcile-run")
 def reconcile_run(now: str = typer.Option("", help="Optional ISO datetime")) -> None:
     config = get_config()
