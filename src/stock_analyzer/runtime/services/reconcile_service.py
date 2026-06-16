@@ -242,7 +242,7 @@ class RuntimeReconcileService:
             service._store_reconcile_report(report)
             return report
 
-        strategy_positions = service._portfolio.position_map()
+        strategy_positions = _normalize_position_map(service._portfolio.position_map())
         snapshot_freshness = _broker_snapshot_freshness(
             updated_at=service._broker_snapshot_updated_at,
             now=now,
@@ -385,7 +385,7 @@ class RuntimeReconcileService:
     ) -> dict[str, object]:
         strategy_map: dict[str, dict[str, object]] = {}
         for item in strategy_snapshot:
-            symbol = str(item.get("symbol", "")).strip()
+            symbol = _normalize_a_share_symbol(item.get("symbol")) or str(item.get("symbol", "")).strip()
             if not symbol:
                 continue
             quantity = _as_int(item.get("quantity"), default=0)
@@ -398,8 +398,11 @@ class RuntimeReconcileService:
         for symbol, item in broker_snapshot.items():
             if not isinstance(item, dict):
                 continue
+            normalized_symbol = _normalize_a_share_symbol(symbol) or str(symbol).strip()
+            if not normalized_symbol:
+                continue
             quantity = _as_int(item.get("quantity"), default=0)
-            broker_map[symbol] = {
+            broker_map[normalized_symbol] = {
                 "quantity": quantity if quantity > 0 else None,
                 "account": str(item.get("account", "")).strip(),
             }
@@ -482,7 +485,7 @@ class RuntimeReconcileService:
 def _parse_broker_positions(positions: list[dict[str, object]]) -> dict[str, float]:
     parsed: dict[str, float] = {}
     for item in positions:
-        symbol = str(item.get("symbol", "")).strip()
+        symbol = _normalize_a_share_symbol(item.get("symbol")) or str(item.get("symbol", "")).strip()
         if not symbol:
             continue
         target = _as_float(item.get("target_position"), default=0.0)
@@ -496,7 +499,7 @@ def _parse_broker_position_details(
 ) -> dict[str, dict[str, object]]:
     parsed: dict[str, dict[str, object]] = {}
     for item in positions:
-        symbol = str(item.get("symbol", "")).strip()
+        symbol = _normalize_a_share_symbol(item.get("symbol")) or str(item.get("symbol", "")).strip()
         if not symbol:
             continue
         target = _as_float(item.get("target_position"), default=0.0)
@@ -517,7 +520,7 @@ def _broker_snapshot_positions_from_portfolio(
 ) -> list[dict[str, object]]:
     positions: list[dict[str, object]] = []
     for item in portfolio_positions:
-        symbol = str(item.get("symbol", "")).strip()
+        symbol = _normalize_a_share_symbol(item.get("symbol")) or str(item.get("symbol", "")).strip()
         target_position = _as_float(item.get("target_position"), default=-1.0)
         if not symbol or target_position < 0.0:
             continue
@@ -533,6 +536,33 @@ def _broker_snapshot_positions_from_portfolio(
             snapshot_item["account"] = account
         positions.append(snapshot_item)
     return positions
+
+
+def _normalize_position_map(position_map: dict[str, float]) -> dict[str, float]:
+    normalized: dict[str, float] = {}
+    for raw_symbol, raw_position in position_map.items():
+        symbol = _normalize_a_share_symbol(raw_symbol) or str(raw_symbol).strip()
+        if not symbol:
+            continue
+        normalized[symbol] = _as_float(raw_position, default=0.0)
+    return normalized
+
+
+def _normalize_a_share_symbol(value: object) -> str:
+    text = str(value).strip().upper()
+    if not text:
+        return ""
+    primary = text.split(".", maxsplit=1)[0]
+    digits = "".join(ch for ch in primary if ch.isdigit())
+    if len(digits) != 6:
+        digits = "".join(ch for ch in text if ch.isdigit())
+    if len(digits) > 6:
+        digits = digits[-6:]
+    if len(digits) != 6:
+        return ""
+    if digits[0] not in {"0", "3", "4", "6", "8"}:
+        return ""
+    return digits
 
 
 def _broker_snapshot_freshness(

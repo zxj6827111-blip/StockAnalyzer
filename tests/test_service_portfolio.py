@@ -2296,6 +2296,72 @@ def test_service_bootstrap_broker_snapshot_from_simulated_portfolio() -> None:
     assert service.state.reconcile_required is False
 
 
+def test_service_reconcile_normalizes_exchange_suffix_symbols() -> None:
+    config = _load_test_config()
+    config.soup_strategy.max_holdings = 2
+    service = StockAnalyzerService(config=config)
+
+    first_set = _sign(
+        action="SET_POSITION",
+        command_id="cmd-set-pos-suffix-a",
+        payload={
+            "symbol": "000159",
+            "strategy": "manual",
+            "target_position": 0.2,
+            "quantity": 1000,
+            "account": "sim-main",
+        },
+        secret=config.command_channel.secret_key,
+    )
+    second_set = _sign(
+        action="SET_POSITION",
+        command_id="cmd-set-pos-suffix-b",
+        payload={
+            "symbol": "600956",
+            "strategy": "manual",
+            "target_position": 0.1,
+            "quantity": 500,
+            "account": "sim-main",
+        },
+        secret=config.command_channel.secret_key,
+    )
+    assert service.execute_command(first_set)["accepted"] is True
+    assert service.execute_command(second_set)["accepted"] is True
+    assert len(service.portfolio_positions()) == 2
+
+    _ = service.update_broker_snapshot(
+        positions=[
+            {
+                "symbol": "000159.SZ",
+                "target_position": 0.2,
+                "quantity": 1000,
+                "account": "sim-main",
+            },
+            {
+                "symbol": "600956.SH",
+                "target_position": 0.1,
+                "quantity": 500,
+                "account": "sim-main",
+            },
+        ],
+        source_trace_id="suffix-normalized-snapshot",
+    )
+
+    report = service.run_reconciliation(timestamp=datetime.fromisoformat("2026-03-01T15:30:00"))
+
+    assert report["status"] == "ok"
+    assert report["matched_count"] == 2
+    assert report["mismatch_count"] == 0
+    assert report["missing_in_strategy"] == []
+    assert report["missing_in_broker"] == []
+    assert report["strategy_positions"] == 2
+    assert report["broker_positions"] == 2
+    assert report["quantity_matched_count"] == 2
+    assert report["account_matched_count"] == 2
+    assert report["quantity_mismatch_count"] == 0
+    assert report["account_mismatch_count"] == 0
+
+
 def test_service_bootstrap_broker_snapshot_from_portfolio_skips_empty_by_default() -> None:
     config = _load_test_config()
     service = StockAnalyzerService(config=config)
