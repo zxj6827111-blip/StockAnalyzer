@@ -148,6 +148,8 @@ def test_run_nas_advisory_probe_captures_and_validates_evidence(tmp_path: Path) 
     assert (analysis_dir / "p0_shadow_experiment_plan_v1.json").exists()
     assert result["goal_completion_status"] == "complete"
     assert (tmp_path / "out" / "p0_goal_completion_audit.json").exists()
+    assert (tmp_path / "out" / "p0_goal_completion_audit.md").exists()
+    assert str(result["goal_completion_markdown"]).endswith("p0_goal_completion_audit.md")
     pipeline_call = [item for item in calls if item[1] == "/run/pipeline"][0]
     assert pipeline_call[2] == {
         "symbols": ["600000"],

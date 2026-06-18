@@ -38,7 +38,18 @@ def main() -> None:
     report = build_goal_completion_audit(probe_dir)
     output = _path(args.output) if args.output else probe_dir / "p0_goal_completion_audit.json"
     _write_json(output, report)
-    print(json.dumps({"status": report["status"], "output": str(output)}, ensure_ascii=False))
+    markdown_output = output.with_suffix(".md")
+    markdown_output.write_text(render_markdown_report(report), encoding="utf-8")
+    print(
+        json.dumps(
+            {
+                "status": report["status"],
+                "output": str(output),
+                "markdown": str(markdown_output),
+            },
+            ensure_ascii=False,
+        )
+    )
 
 
 def build_goal_completion_audit(probe_dir: Path) -> dict[str, object]:
@@ -65,6 +76,38 @@ def build_goal_completion_audit(probe_dir: Path) -> dict[str, object]:
         "checks": checks,
         "next_actions": _next_actions(checks),
     }
+
+
+def render_markdown_report(report: Mapping[str, object]) -> str:
+    checks = [
+        item
+        for item in _list(report.get("checks"))
+        if isinstance(item, Mapping)
+    ]
+    lines = [
+        "# P0 Goal Completion Audit",
+        "",
+        f"- status: `{report.get('status', 'unknown')}`",
+        f"- production_change_allowed: `{report.get('production_change_allowed', False)}`",
+        f"- probe_output_dir: `{report.get('probe_output_dir', '')}`",
+        "",
+        "## Checks",
+        "",
+    ]
+    for item in checks:
+        status = "PASS" if item.get("passed") else "FAIL"
+        lines.append(f"- `{status}` `{item.get('code', '')}`: {item.get('detail', '')}")
+        evidence = _mapping(item.get("evidence"))
+        if evidence:
+            lines.extend(_markdown_evidence_lines(evidence))
+    actions = [str(item) for item in _list(report.get("next_actions"))]
+    lines.extend(["", "## Next Actions", ""])
+    if actions:
+        lines.extend(f"- {item}" for item in actions)
+    else:
+        lines.append("- None")
+    lines.append("")
+    return "\n".join(lines)
 
 
 def _check_research_inputs_complete(
@@ -241,6 +284,59 @@ def _next_actions(checks: Sequence[Mapping[str, object]]) -> list[str]:
             "Rerun NAS probe only after advisory_only=true and inspect validation report."
         )
     return actions
+
+
+def _markdown_evidence_lines(evidence: Mapping[str, object]) -> list[str]:
+    keys = (
+        "remaining_expected_inputs",
+        "shadow_plan_status",
+        "result_count",
+        "has_return_fields",
+        "can_rank_by_profitability",
+        "status",
+        "has_loss_path_fields",
+    )
+    lines: list[str] = []
+    for key in keys:
+        if key in evidence:
+            lines.append(f"  - {key}: `{_compact_value(evidence.get(key))}`")
+    check_map = _mapping(evidence.get("check_map"))
+    if check_map:
+        passed = sum(1 for value in check_map.values() if bool(value))
+        lines.append(f"  - nas_validation_checks: `{passed}/{len(check_map)}`")
+    outcome = _mapping(evidence.get("outcome_linkage"))
+    if outcome:
+        lines.append(
+            "  - outcome_linkage: "
+            f"`symbols_with_returns={outcome.get('symbols_with_returns')}, "
+            f"can_rank={outcome.get('can_rank_by_profitability')}`"
+        )
+    low_roe = _mapping(evidence.get("low_roe_evidence"))
+    if low_roe:
+        lines.append(
+            "  - low_roe_evidence: "
+            f"`confirmed={low_roe.get('confirmed_true_low_roe_rows')}, "
+            f"inferred={low_roe.get('inferred_low_roe_rows')}, "
+            f"ambiguous={low_roe.get('ambiguous_low_roe_rows')}`"
+        )
+    loss_path = _mapping(evidence.get("loss_path_analysis"))
+    if loss_path:
+        lines.append(
+            "  - loss_path: "
+            f"`loss_symbols={loss_path.get('loss_symbol_count')}, "
+            f"reentry_after_loss={loss_path.get('reentry_after_loss_symbol_count')}`"
+        )
+    return lines
+
+
+def _compact_value(value: object) -> str:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return str(value)
+    if isinstance(value, list):
+        return f"{len(value)} item(s)"
+    if isinstance(value, Mapping):
+        return f"{len(value)} key(s)"
+    return str(value)
 
 
 def _load_json(path: Path) -> dict[str, object]:

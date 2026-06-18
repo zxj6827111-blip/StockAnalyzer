@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from scripts.p0_goal_completion_audit import build_goal_completion_audit
+from scripts.p0_goal_completion_audit import build_goal_completion_audit, render_markdown_report
 
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:
@@ -107,9 +107,13 @@ def test_goal_completion_audit_passes_complete_probe_output(tmp_path: Path) -> N
     )
 
     report = build_goal_completion_audit(probe)
+    markdown = render_markdown_report(report)
 
     assert report["status"] == "complete"
     assert all(item["passed"] for item in report["checks"])
+    assert "# P0 Goal Completion Audit" in markdown
+    assert "`PASS` `research_inputs_complete`" in markdown
+    assert "low_roe_evidence" in markdown
 
 
 def test_goal_completion_audit_flags_missing_validation_and_inputs(tmp_path: Path) -> None:
