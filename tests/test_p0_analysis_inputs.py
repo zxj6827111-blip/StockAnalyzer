@@ -249,7 +249,16 @@ def test_write_p0_analysis_inputs_writes_research_completeness_artifacts(
     _write_json(
         model_artifact,
         {
-            "feature_columns": ["financial_low_roe", "market_relative_ret", "volume_ma"],
+            "feature_columns": [
+                "financial_low_roe",
+                "market_relative_ret",
+                "volume_ma",
+                "atr14",
+                "i1m_session_return",
+                "weekday_sin",
+                "mfi14",
+                "stoch_k",
+            ],
             "training_metrics": {"positive_rate": 0.12, "test_samples": 100},
             "metadata": {"test_samples": 100},
         },
@@ -337,7 +346,20 @@ def test_write_p0_analysis_inputs_writes_research_completeness_artifacts(
         classification["recommendation"]
         == "repair_or_refresh_financial_data_before_relaxing_filter"
     )
+    assert feature_report["feature_families"]["volatility"] == 1
+    assert feature_report["feature_families"]["intraday"] == 1
+    assert feature_report["feature_families"]["calendar_time"] == 1
+    assert "expanded_feature_family_taxonomy_from_local_p4_scripts" in feature_report[
+        "local_change_review"
+    ]["applied"]
     assert position_report["production_change_allowed"] is False
+    assert "atr_bounds_position_shadow" in position_report["recommended_shadow"]
+    sizing = position_report["position_sizing_analysis"]
+    assert sizing["atr_bounds_shadow"]["status"] == "design_only_no_production_change"
+    assert len(sizing["atr_bounds_shadow"]["scenario_grid"]) == 9
+    assert "no SoupStrategy._dynamic_position production change" in position_report[
+        "local_change_review"
+    ]["not_applied"]
 
 
 def test_final_report_threshold_sweep_links_candidate_variants_to_outcomes(

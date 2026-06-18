@@ -54,6 +54,39 @@ _FEATURE_FAMILIES = {
         "float_market_cap",
         "spread",
         "depth",
+        "mfi",
+        "obv",
+        "adl",
+        "pvt",
+        "vwap",
+    ),
+    "volatility": (
+        "volatility",
+        "atr",
+        "downside_vol",
+        "upside_vol",
+        "drawdown",
+        "distance_high",
+        "distance_low",
+        "boll_width",
+        "range_pct",
+    ),
+    "calendar_time": (
+        "weekday",
+        "month",
+        "calendar",
+        "seasonality",
+    ),
+    "intraday": (
+        "i1m_",
+        "i5m_",
+        "minute_count",
+        "session_return",
+        "session_range",
+        "realized_vol",
+        "last30",
+        "positive_bar",
+        "close_position",
     ),
     "model_probability": (
         "cross_review",
@@ -81,6 +114,11 @@ _FEATURE_FAMILIES = {
         "rsi",
         "macd",
         "breakout",
+        "stoch",
+        "cci",
+        "williams",
+        "realized_skew",
+        "realized_kurt",
     ),
 }
 
@@ -384,6 +422,16 @@ def build_feature_family_ablation(
         ),
         "baseline_metrics": baseline,
         "feature_schema": feature_schema,
+        "local_change_review": {
+            "applied": [
+                "expanded_feature_family_taxonomy_from_local_p4_scripts",
+                "kept_artifact_replay_method_instead_of_walk_forward_retrain",
+            ],
+            "not_applied": [
+                "no production feature weight changes",
+                "no walk_forward exclude_features dependency",
+            ],
+        },
         "financial_data_quality": financial_quality,
         "feature_families": {
             name: len(values) for name, values in _family_feature_columns(feature_columns).items()
@@ -422,10 +470,21 @@ def build_position_framework_analysis(
         "production_change_allowed": False,
         "position_controls": _position_controls(config),
         "position_sizing_analysis": _position_sizing_analysis(config),
+        "local_change_review": {
+            "applied": [
+                "atr_bounds_position_shadow_design_from_local_p5_work",
+                "position framework remains report-only",
+            ],
+            "not_applied": [
+                "no SoupStrategy._dynamic_position production change",
+                "no max position cap change in trading logic",
+            ],
+        },
         "execution_path_summary": execution["summary"],
         "loss_path_analysis": _loss_path_analysis(symbol_paths),
         "symbol_paths": symbol_paths[:200],
         "recommended_shadow": [
+            "atr_bounds_position_shadow",
             "position_sizing_sensitivity",
             "stop_loss_cooldown_reentry_shadow",
             "take_profit_trailing_ab_test",
@@ -1820,20 +1879,76 @@ def _position_controls(config: StockAnalyzerConfig) -> dict[str, object]:
 
 
 def _position_sizing_analysis(config: StockAnalyzerConfig) -> dict[str, object]:
-    scenarios = []
-    for atr_ratio in (0.01, 0.02, 0.03, 0.05, 0.08):
+    atr_grid = (0.003, 0.005, 0.01, 0.02, 0.03, 0.05, 0.08, 0.15, 0.20)
+    current_config_scenarios = []
+    atr_bounds_shadow = []
+    for atr_ratio in atr_grid:
         position = min(0.15, 0.02 / atr_ratio)
-        scenarios.append(
+        bounded_position = _atr_bounds_shadow_position(atr_ratio)
+        current_config_scenarios.append(
             {
                 "atr_ratio": atr_ratio,
                 "calculated_position_pct": round(position * 100.0, 4),
+                "scenario": _atr_scenario(atr_ratio),
+            }
+        )
+        atr_bounds_shadow.append(
+            {
+                "atr_ratio": atr_ratio,
+                "bounded_position_pct": round(bounded_position * 100.0, 4),
+                "current_config_position_pct": round(position * 100.0, 4),
+                "delta_pct_points": round((bounded_position - position) * 100.0, 4),
+                "scenario": _atr_scenario(atr_ratio),
             }
         )
     return {
         "formula": config.soup_strategy.dynamic_position,
-        "scenario_grid": scenarios,
+        "scenario_grid": current_config_scenarios,
+        "atr_bounds_shadow": {
+            "status": "design_only_no_production_change",
+            "min_atr_ratio": 0.005,
+            "max_atr_ratio": 0.15,
+            "max_position": 0.15,
+            "min_position": 0.01,
+            "rationale": (
+                "Local P5 work proposed ATR floor/ceiling protection. Keep it as a "
+                "shadow experiment until NAS outcomes show lower drawdown without "
+                "removing profitable entries."
+            ),
+            "scenario_grid": atr_bounds_shadow,
+        },
+        "shadow_questions": [
+            "Does ATR floor protection avoid oversized low-volatility entries?",
+            "Does high-ATR scaling reduce stop-loss losses without suppressing winners?",
+            "Should the runtime cap align with the configured 15 percent cap?",
+        ],
         "status": "config_static_analysis",
     }
+
+
+def _atr_bounds_shadow_position(atr_ratio: float) -> float:
+    min_atr_ratio = 0.005
+    max_atr_ratio = 0.15
+    if atr_ratio > max_atr_ratio:
+        volatility_penalty = max_atr_ratio / atr_ratio
+        safe_atr = max_atr_ratio
+    else:
+        volatility_penalty = 1.0
+        safe_atr = max(atr_ratio, min_atr_ratio)
+    position = (0.02 / safe_atr) * volatility_penalty
+    return max(0.01, min(position, 0.15))
+
+
+def _atr_scenario(atr_ratio: float) -> str:
+    if atr_ratio < 0.005:
+        return "extreme_low_volatility"
+    if atr_ratio < 0.03:
+        return "low_volatility"
+    if atr_ratio > 0.15:
+        return "extreme_high_volatility"
+    if atr_ratio > 0.08:
+        return "high_volatility"
+    return "normal"
 
 
 def _position_symbol_paths(
