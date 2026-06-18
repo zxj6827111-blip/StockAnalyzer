@@ -294,7 +294,7 @@ def build_final_report_v3(
     rows = [item for item in rows if item.get("symbol")]
     execution = _summarize_execution_events(audit_events)
     baseline = _baseline_from_rows(rows=rows, execution=execution, config=config)
-    threshold_sweep = _threshold_grid(rows=rows)
+    threshold_sweep = _threshold_grid(rows=rows, execution=execution)
     outcome_coverage = _outcome_coverage(execution)
     source_scope = _source_scope(rows=rows, audit_events=audit_events)
     status = "ok"
@@ -1015,8 +1015,13 @@ def _baseline_from_rows(
     }
 
 
-def _threshold_grid(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
+def _threshold_grid(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    execution: Mapping[str, object],
+) -> dict[str, object]:
     total = len(rows)
+    returns_by_symbol = _returns_by_symbol(_mapping(execution.get("records_by_symbol")))
     results: list[dict[str, object]] = []
     for xgb_min in _MODEL_THRESHOLD_GRID["xgb_min"]:
         for meta_min in _MODEL_THRESHOLD_GRID["meta_min"]:
@@ -1038,6 +1043,9 @@ def _threshold_grid(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
                             and float(score) >= score_min
                         ):
                             passed.append(row)
+                    returns = _returns_for_passed_rows(passed, returns_by_symbol)
+                    trade_count = len(returns)
+                    profitable = sum(1 for item in returns if item > 0.0)
                     results.append(
                         {
                             "xgb_min": xgb_min,
@@ -1051,12 +1059,32 @@ def _threshold_grid(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
                                 for item in passed
                                 if str(item.get("action", "")).strip().lower() == "buy"
                             ),
+                            "observed_trade_count": trade_count,
+                            "win_rate": round(profitable / trade_count, 6)
+                            if trade_count
+                            else None,
+                            "avg_realized_return_pct": round(mean(returns), 6)
+                            if returns
+                            else None,
+                            "final_equity": _equity_from_returns(returns),
+                            "max_drawdown": _max_drawdown_from_returns(returns),
+                            "profitability_status": "observed"
+                            if trade_count >= 30
+                            else "insufficient_outcomes",
                             "example_symbols": sorted(
                                 {str(item.get("symbol", "")).strip() for item in passed}
                             )[:12],
                         }
                     )
-    best = sorted(results, key=lambda item: (-int(item["pass_count"]), item["xgb_min"]))[:10]
+    best = sorted(
+        results,
+        key=lambda item: (
+            item.get("final_equity") is None,
+            -float(item.get("final_equity") or 0.0),
+            -int(item["pass_count"]),
+            item["xgb_min"],
+        ),
+    )[:10]
     effective = any(int(item["pass_count"]) > 0 for item in results)
     return {
         "status": "candidate_generating" if effective else "not_effective",
@@ -1067,10 +1095,55 @@ def _threshold_grid(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
             "score_min": list(_MODEL_THRESHOLD_GRID["score_min"]),
         },
         "total_rows": total,
+        "outcome_linkage": {
+            "symbols_with_returns": len(returns_by_symbol),
+            "minimum_observed_trades_for_profitability_rank": 30,
+            "can_rank_by_profitability": any(
+                int(item["observed_trade_count"]) >= 30 for item in results
+            ),
+        },
         "top_candidate_generating_variants": best,
         "results": results,
-        "note": "Counts only; profitability requires mature outcome coverage.",
+        "note": (
+            "Profitability fields are populated only when captured execution records "
+            "can be linked back to candidate symbols."
+        ),
     }
+
+
+def _returns_by_symbol(records_by_symbol: Mapping[str, object]) -> dict[str, list[float]]:
+    results: dict[str, list[float]] = {}
+    for symbol, raw_records in records_by_symbol.items():
+        symbol_text = str(symbol).strip()
+        if not symbol_text:
+            continue
+        returns = [
+            float(value)
+            for value in (
+                _float(item.get("realized_return_pct"))
+                for item in _list(raw_records)
+                if isinstance(item, Mapping)
+            )
+            if value is not None
+        ]
+        if returns:
+            results[symbol_text] = returns
+    return results
+
+
+def _returns_for_passed_rows(
+    rows: Sequence[Mapping[str, object]],
+    returns_by_symbol: Mapping[str, Sequence[float]],
+) -> list[float]:
+    returns: list[float] = []
+    seen_symbols: set[str] = set()
+    for row in rows:
+        symbol = str(row.get("symbol", "")).strip()
+        if not symbol or symbol in seen_symbols:
+            continue
+        seen_symbols.add(symbol)
+        returns.extend(float(item) for item in returns_by_symbol.get(symbol, []))
+    return returns
 
 
 def _outcome_coverage(execution: Mapping[str, object]) -> dict[str, object]:
@@ -1268,12 +1341,19 @@ def _financial_data_quality(
 ) -> dict[str, object]:
     counter: Counter[str] = Counter()
     examples: dict[str, list[str]] = {}
+    score_by_code: dict[str, list[float]] = defaultdict(list)
+    buy_rows_by_code: Counter[str] = Counter()
     for row in rows:
         for code in _financial_data_quality_codes(row, config=config):
             counter[code] += 1
             examples.setdefault(code, [])
             if len(examples[code]) < 8:
                 examples[code].append(str(row.get("symbol", "")).strip())
+            score = _float(row.get("score"))
+            if score is not None:
+                score_by_code[code].append(score)
+            if str(row.get("action", "")).strip().lower() == "buy":
+                buy_rows_by_code[code] += 1
     unique_symbols = {
         str(row.get("symbol", "")).strip()
         for row in rows
@@ -1285,6 +1365,13 @@ def _financial_data_quality(
         "affected_symbols": len(unique_symbols),
         "reason_counts": dict(counter.most_common(20)),
         "examples": examples,
+        "classification": _financial_classification(
+            counter=counter,
+            score_by_code=score_by_code,
+            buy_rows_by_code=buy_rows_by_code,
+            rows=rows,
+            config=config,
+        ),
         "current_policy": {
             "enabled": bool(config.financial_filter.enabled),
             "missing_data_policy": str(config.financial_filter.missing_data_policy),
@@ -1313,6 +1400,14 @@ def _financial_data_quality_codes(
     codes: list[str] = []
     if "financial_data_complete_false" in text or "missing_financial" in text:
         codes.append("missing_financials")
+    if "missing_financial_data" in text:
+        codes.append("missing_financial_data_gate")
+    if "stale_financial" in text or "financial_stale" in text:
+        codes.append("stale_financials")
+    if "default_financial" in text or "default_penalty" in text:
+        codes.append("default_financial_penalty")
+    if "data_age" in text or "age_days" in text:
+        codes.append("financial_age_observed")
     if "low_roe" in text:
         codes.append("low_roe_penalty")
     if "high_debt" in text:
@@ -1321,9 +1416,95 @@ def _financial_data_quality_codes(
         codes.append("st_penalty")
     trace = _mapping(row.get("decision_trace"))
     financial_gate = _mapping(trace.get("financial_gate"))
+    for key in ("data_complete", "financial_data_complete", "complete"):
+        if financial_gate.get(key) is False:
+            codes.append("missing_financials")
+    for key in ("stale", "is_stale"):
+        if financial_gate.get(key) is True:
+            codes.append("stale_financials")
+    if financial_gate.get("default_penalty") is True:
+        codes.append("default_financial_penalty")
     if financial_gate.get("allowed") is False or financial_gate.get("passed") is False:
         codes.append("financial_gate_block")
     return _dedupe_preserve_order(codes)
+
+
+def _financial_classification(
+    *,
+    counter: Counter[str],
+    score_by_code: Mapping[str, Sequence[float]],
+    buy_rows_by_code: Mapping[str, int],
+    rows: Sequence[Mapping[str, object]],
+    config: StockAnalyzerConfig,
+) -> dict[str, object]:
+    total_rows = max(1, len(rows))
+    codes = sorted(counter)
+    buckets = []
+    for code in codes:
+        scores = [float(item) for item in score_by_code.get(code, [])]
+        buckets.append(
+            {
+                "code": code,
+                "rows": int(counter[code]),
+                "row_pct": round(int(counter[code]) / total_rows, 6),
+                "avg_score": round(mean(scores), 6) if scores else None,
+                "buy_rows": int(buy_rows_by_code.get(code, 0)),
+            }
+        )
+    true_low_roe_rows = max(
+        0,
+        counter.get("low_roe_penalty", 0) - counter.get("missing_financials", 0),
+    )
+    return {
+        "buckets": buckets,
+        "true_low_roe_evidence_rows": int(true_low_roe_rows),
+        "missing_or_default_evidence_rows": int(
+            counter.get("missing_financials", 0)
+            + counter.get("missing_financial_data_gate", 0)
+            + counter.get("default_financial_penalty", 0)
+        ),
+        "stale_evidence_rows": int(counter.get("stale_financials", 0)),
+        "short_term_strength_may_be_overblocked": _short_term_strength_overblocked(
+            rows=rows,
+            config=config,
+        ),
+        "recommendation": (
+            "repair_or_refresh_financial_data_before_relaxing_filter"
+            if counter.get("missing_financials", 0)
+            or counter.get("default_financial_penalty", 0)
+            or counter.get("stale_financials", 0)
+            else "shadow_validate_financial_filter_weight"
+        ),
+    }
+
+
+def _short_term_strength_overblocked(
+    *,
+    rows: Sequence[Mapping[str, object]],
+    config: StockAnalyzerConfig,
+) -> dict[str, object]:
+    threshold = _score_threshold(config)
+    blocked_rows = []
+    for row in rows:
+        codes = _financial_data_quality_codes(row, config=config)
+        score = _float(row.get("score"))
+        if (
+            score is not None
+            and score >= threshold
+            and any(code in codes for code in ("low_roe_penalty", "financial_gate_block"))
+        ):
+            blocked_rows.append(row)
+    return {
+        "rows": len(blocked_rows),
+        "score_threshold": threshold,
+        "symbols": sorted({str(row.get("symbol", "")).strip() for row in blocked_rows})[:20],
+        "interpretation": (
+            "high-score rows are still receiving financial penalties; verify in shadow "
+            "before changing production financial filtering"
+            if blocked_rows
+            else "no high-score financial overblock evidence in captured rows"
+        ),
+    }
 
 
 def _position_controls(config: StockAnalyzerConfig) -> dict[str, object]:
