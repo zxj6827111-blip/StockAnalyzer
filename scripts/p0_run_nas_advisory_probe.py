@@ -17,6 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from scripts.p0_goal_completion_audit import build_goal_completion_audit  # noqa: E402
 from scripts.p0_nas_advisory_validation import (  # noqa: E402
     build_validation_report,
     render_markdown_report,
@@ -187,6 +188,9 @@ def run_probe(
             config_path=config_path or _path("config/default.yaml"),
             model_artifact_path=model_artifact_path or _path("artifacts/model_v1.json"),
         )
+    goal_audit = build_goal_completion_audit(output_dir)
+    goal_audit_path = output_dir / "p0_goal_completion_audit.json"
+    _write_json(goal_audit_path, goal_audit)
     return {
         "status": report.get("status"),
         "output_dir": str(output_dir),
@@ -194,6 +198,8 @@ def run_probe(
         "validation_json": str(json_path),
         "validation_markdown": str(md_path),
         "analysis": analysis_result,
+        "goal_completion_audit": str(goal_audit_path),
+        "goal_completion_status": goal_audit.get("status"),
     }
 
 

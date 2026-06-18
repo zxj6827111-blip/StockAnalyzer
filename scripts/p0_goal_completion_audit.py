@@ -95,16 +95,37 @@ def _check_threshold_shadow(final_report: Mapping[str, object]) -> dict[str, obj
     )
     results = _list(sweep.get("results"))
     diagnostics = _mapping(sweep.get("blocking_diagnostics"))
+    outcome_linkage = _mapping(sweep.get("outcome_linkage"))
+    has_return_fields = any(
+        isinstance(item, Mapping)
+        and "observed_trade_count" in item
+        and "win_rate" in item
+        and "final_equity" in item
+        and "max_drawdown" in item
+        for item in results
+    )
+    can_rank_profitability = bool(outcome_linkage.get("can_rank_by_profitability", False))
     return {
         "code": "cross_review_shadow_grid_covered",
-        "passed": bool(sweep) and grid_matches and len(results) == 108 and bool(diagnostics),
-        "detail": "threshold sweep covers the requested 3x3x3x4 grid and explains blockers",
+        "passed": (
+            bool(sweep)
+            and grid_matches
+            and len(results) == 108
+            and bool(diagnostics)
+            and has_return_fields
+        ),
+        "detail": (
+            "threshold sweep covers the requested 3x3x3x4 grid, explains blockers, "
+            "and carries return/risk fields for outcome-linked variants"
+        ),
         "evidence": {
             "grid": grid,
             "result_count": len(results),
+            "has_return_fields": has_return_fields,
+            "can_rank_by_profitability": can_rank_profitability,
             "blocking_interpretation": diagnostics.get("interpretation"),
             "minimum_candidate_thresholds": sweep.get("minimum_candidate_thresholds"),
-            "outcome_linkage": sweep.get("outcome_linkage"),
+            "outcome_linkage": outcome_linkage,
         },
     }
 
@@ -136,16 +157,30 @@ def _check_financial_data_quality(feature_report: Mapping[str, object]) -> dict[
 
 
 def _check_position_framework(position_report: Mapping[str, object]) -> dict[str, object]:
+    loss_path = _mapping(position_report.get("loss_path_analysis"))
+    has_loss_path_fields = all(
+        key in loss_path
+        for key in (
+            "loss_symbol_count",
+            "reentry_after_loss_symbol_count",
+            "top_loss_symbols",
+        )
+    )
     return {
         "code": "position_framework_available",
         "passed": bool(position_report)
         and bool(position_report.get("position_controls"))
-        and bool(position_report.get("recommended_shadow")),
-        "detail": "position sizing, stop/take-profit and re-entry shadow plan is available",
+        and bool(position_report.get("recommended_shadow"))
+        and has_loss_path_fields,
+        "detail": (
+            "position sizing, stop/take-profit and re-entry shadow plan is available "
+            "with loss-path evidence fields"
+        ),
         "evidence": {
             "status": position_report.get("status"),
             "execution_path_summary": position_report.get("execution_path_summary"),
-            "loss_path_analysis": position_report.get("loss_path_analysis"),
+            "loss_path_analysis": loss_path,
+            "has_loss_path_fields": has_loss_path_fields,
             "recommended_shadow": position_report.get("recommended_shadow"),
         },
     }
@@ -185,7 +220,10 @@ def _next_actions(checks: Sequence[Mapping[str, object]]) -> list[str]:
     failed = [str(item.get("code", "")) for item in checks if not item.get("passed")]
     if not failed:
         return [
-            "Goal evidence is complete; review reports before considering any production change."
+            (
+                "Goal evidence is structurally complete. If can_rank_by_profitability is "
+                "false, collect more mature outcomes before changing production thresholds."
+            )
         ]
     actions: list[str] = []
     if "research_inputs_complete" in failed:
