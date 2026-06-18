@@ -14,6 +14,7 @@ EXPECTED_GRID = {
     "max_diff": [0.18, 0.25, 0.3],
     "score_min": [40.0, 45.0, 50.0, 55.0],
 }
+EXPECTED_FOCUS_SYMBOLS = {"000159", "001258", "600956"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -201,6 +202,14 @@ def _check_financial_data_quality(feature_report: Mapping[str, object]) -> dict[
 
 def _check_position_framework(position_report: Mapping[str, object]) -> dict[str, object]:
     loss_path = _mapping(position_report.get("loss_path_analysis"))
+    focus = _mapping(position_report.get("focus_symbols"))
+    focus_symbols = [
+        str(item.get("symbol", "")).strip()
+        for item in _list(focus.get("symbols"))
+        if isinstance(item, Mapping)
+    ]
+    focus_symbol_set = set(focus_symbols)
+    missing_focus_symbols = sorted(EXPECTED_FOCUS_SYMBOLS - focus_symbol_set)
     has_loss_path_fields = all(
         key in loss_path
         for key in (
@@ -214,16 +223,20 @@ def _check_position_framework(position_report: Mapping[str, object]) -> dict[str
         "passed": bool(position_report)
         and bool(position_report.get("position_controls"))
         and bool(position_report.get("recommended_shadow"))
-        and has_loss_path_fields,
+        and has_loss_path_fields
+        and not missing_focus_symbols,
         "detail": (
             "position sizing, stop/take-profit and re-entry shadow plan is available "
-            "with loss-path evidence fields"
+            "with loss-path evidence fields and focus-symbol tracking"
         ),
         "evidence": {
             "status": position_report.get("status"),
             "execution_path_summary": position_report.get("execution_path_summary"),
             "loss_path_analysis": loss_path,
             "has_loss_path_fields": has_loss_path_fields,
+            "focus_symbols": focus,
+            "focus_symbol_count": len(focus_symbols),
+            "missing_focus_symbols": missing_focus_symbols,
             "recommended_shadow": position_report.get("recommended_shadow"),
         },
     }
@@ -295,6 +308,8 @@ def _markdown_evidence_lines(evidence: Mapping[str, object]) -> list[str]:
         "can_rank_by_profitability",
         "status",
         "has_loss_path_fields",
+        "focus_symbol_count",
+        "missing_focus_symbols",
     )
     lines: list[str] = []
     for key in keys:
@@ -325,6 +340,14 @@ def _markdown_evidence_lines(evidence: Mapping[str, object]) -> list[str]:
             "  - loss_path: "
             f"`loss_symbols={loss_path.get('loss_symbol_count')}, "
             f"reentry_after_loss={loss_path.get('reentry_after_loss_symbol_count')}`"
+        )
+    focus = _mapping(evidence.get("focus_symbols"))
+    if focus:
+        lines.append(
+            "  - focus_symbols: "
+            f"`observed={focus.get('observed_count')}, "
+            f"loss_observed={focus.get('loss_observed_count')}, "
+            f"missing={focus.get('missing_evidence_symbols')}`"
         )
     return lines
 

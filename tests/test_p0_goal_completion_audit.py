@@ -82,6 +82,16 @@ def test_goal_completion_audit_passes_complete_probe_output(tmp_path: Path) -> N
                 "reentry_after_loss_symbol_count": 0,
                 "top_loss_symbols": [],
             },
+            "focus_symbols": {
+                "symbols": [
+                    {"symbol": "000159", "status": "observed", "loss_count": 0},
+                    {"symbol": "001258", "status": "missing_runtime_evidence"},
+                    {"symbol": "600956", "status": "missing_runtime_evidence"},
+                ],
+                "observed_count": 1,
+                "loss_observed_count": 0,
+                "missing_evidence_symbols": ["001258", "600956"],
+            },
             "recommended_shadow": ["position_sizing_sensitivity"],
         },
     )
@@ -114,6 +124,7 @@ def test_goal_completion_audit_passes_complete_probe_output(tmp_path: Path) -> N
     assert "# P0 Goal Completion Audit" in markdown
     assert "`PASS` `research_inputs_complete`" in markdown
     assert "low_roe_evidence" in markdown
+    assert "focus_symbols" in markdown
 
 
 def test_goal_completion_audit_flags_missing_validation_and_inputs(tmp_path: Path) -> None:
@@ -198,3 +209,6 @@ def test_goal_completion_audit_requires_return_and_loss_path_fields(tmp_path: Pa
         is False
     )
     assert check_map["position_framework_available"]["evidence"]["has_loss_path_fields"] is False
+    assert check_map["position_framework_available"]["evidence"][
+        "missing_focus_symbols"
+    ] == ["000159", "001258", "600956"]
