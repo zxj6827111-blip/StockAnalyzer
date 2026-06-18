@@ -280,6 +280,24 @@ def test_write_p0_analysis_inputs_writes_research_completeness_artifacts(
                             "financial_penalty:low_roe",
                             "financial_data_complete_false",
                         ],
+                    },
+                    {
+                        "symbol": "000159",
+                        "score": 52,
+                        "action": "buy",
+                        "probabilities": {"lgbm": 0.8, "xgb": 0.31, "meta": 0.49},
+                    },
+                    {
+                        "symbol": "000159",
+                        "score": 55,
+                        "action": "watch",
+                        "probabilities": {"lgbm": 0.75, "xgb": 0.32, "meta": 0.5},
+                    },
+                    {
+                        "symbol": "001258",
+                        "score": 61,
+                        "action": "buy",
+                        "probabilities": {"lgbm": 0.78, "xgb": 0.3, "meta": 0.48},
                     }
                 ],
             }
@@ -305,6 +323,12 @@ def test_write_p0_analysis_inputs_writes_research_completeness_artifacts(
                                         "symbol": "600000",
                                         "status": "opened",
                                         "reason": "auto_simulated_buy",
+                                    },
+                                    {
+                                        "symbol": "000159",
+                                        "status": "closed",
+                                        "reason": "stop_loss",
+                                        "realized_return_pct": -0.0623,
                                     }
                                 ],
                             },
@@ -360,6 +384,20 @@ def test_write_p0_analysis_inputs_writes_research_completeness_artifacts(
     assert "no SoupStrategy._dynamic_position production change" in position_report[
         "local_change_review"
     ]["not_applied"]
+    focus = {
+        item["symbol"]: item
+        for item in position_report["focus_symbols"]["symbols"]
+    }
+    assert set(focus) == {"000159", "001258", "600956"}
+    assert focus["000159"]["loss_count"] == 1
+    assert focus["000159"]["reentry_hint"] is True
+    assert "re-entry quality issue" in " ".join(focus["000159"]["diagnosis"])
+    assert focus["001258"]["buy_signal_count"] == 1
+    assert focus["001258"]["execution_count"] == 0
+    assert "cash/lot/risk gates" in " ".join(focus["001258"]["diagnosis"])
+    assert focus["600956"]["status"] == "missing_runtime_evidence"
+    assert position_report["focus_symbols"]["loss_observed_count"] == 1
+    assert position_report["focus_symbols"]["missing_evidence_symbols"] == ["600956"]
 
 
 def test_final_report_threshold_sweep_links_candidate_variants_to_outcomes(

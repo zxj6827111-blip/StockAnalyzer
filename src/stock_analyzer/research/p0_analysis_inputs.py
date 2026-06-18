@@ -19,6 +19,7 @@ _MODEL_THRESHOLD_GRID = {
     "max_diff": (0.18, 0.25, 0.30),
     "score_min": (40.0, 45.0, 50.0, 55.0),
 }
+_FOCUS_LOSS_SYMBOLS = ("000159", "001258", "600956")
 _FEATURE_FAMILIES = {
     "financial_background": (
         "financial",
@@ -482,6 +483,10 @@ def build_position_framework_analysis(
         },
         "execution_path_summary": execution["summary"],
         "loss_path_analysis": _loss_path_analysis(symbol_paths),
+        "focus_symbols": _focus_symbol_paths(
+            symbol_paths=symbol_paths,
+            focus_symbols=_FOCUS_LOSS_SYMBOLS,
+        ),
         "symbol_paths": symbol_paths[:200],
         "recommended_shadow": [
             "atr_bounds_position_shadow",
@@ -2009,6 +2014,95 @@ def _loss_path_analysis(symbol_paths: Sequence[Mapping[str, object]]) -> dict[st
             for item in loss_paths[:12]
         ],
     }
+
+
+def _focus_symbol_paths(
+    *,
+    symbol_paths: Sequence[Mapping[str, object]],
+    focus_symbols: Sequence[str],
+) -> dict[str, object]:
+    by_symbol = {
+        str(item.get("symbol", "")).strip(): item
+        for item in symbol_paths
+        if str(item.get("symbol", "")).strip()
+    }
+    symbols = []
+    for symbol in focus_symbols:
+        path = _mapping(by_symbol.get(symbol))
+        if path:
+            symbols.append(
+                {
+                    "symbol": symbol,
+                    "status": "observed",
+                    "signal_count": _int(path.get("signal_count")),
+                    "buy_signal_count": _int(path.get("buy_signal_count")),
+                    "execution_count": _int(path.get("execution_count")),
+                    "loss_count": _int(path.get("loss_count")),
+                    "avg_realized_return_pct": path.get("avg_realized_return_pct"),
+                    "execution_reasons": path.get("execution_reasons"),
+                    "reentry_hint": bool(path.get("reentry_hint", False)),
+                    "diagnosis": _focus_symbol_diagnosis(path),
+                }
+            )
+        else:
+            symbols.append(
+                {
+                    "symbol": symbol,
+                    "status": "missing_runtime_evidence",
+                    "signal_count": 0,
+                    "buy_signal_count": 0,
+                    "execution_count": 0,
+                    "loss_count": 0,
+                    "avg_realized_return_pct": None,
+                    "execution_reasons": {},
+                    "reentry_hint": False,
+                    "diagnosis": [
+                        (
+                            "No signal or execution evidence for this focus symbol in "
+                            "captured artifacts."
+                        )
+                    ],
+                }
+            )
+    return {
+        "symbols": symbols,
+        "observed_count": sum(1 for item in symbols if item["status"] == "observed"),
+        "loss_observed_count": sum(1 for item in symbols if _int(item.get("loss_count")) > 0),
+        "missing_evidence_symbols": [
+            str(item["symbol"])
+            for item in symbols
+            if item["status"] == "missing_runtime_evidence"
+        ],
+        "interpretation": (
+            "Focus symbols are explicitly tracked because prior NAS evidence showed losses "
+            "for 000159, 001258 and 600956. Missing entries mean the current probe did not "
+            "capture enough runtime history to re-evaluate those paths."
+        ),
+    }
+
+
+def _focus_symbol_diagnosis(path: Mapping[str, object]) -> list[str]:
+    diagnosis: list[str] = []
+    loss_count = _int(path.get("loss_count"))
+    execution_count = _int(path.get("execution_count"))
+    buy_signal_count = _int(path.get("buy_signal_count"))
+    if loss_count > 0:
+        diagnosis.append("Loss outcome observed; inspect stop-loss/take-profit and re-entry path.")
+    if bool(path.get("reentry_hint", False)):
+        diagnosis.append(
+            "Multiple signals after a losing outcome suggest a re-entry quality issue."
+        )
+    if execution_count <= 0 and buy_signal_count > 0:
+        diagnosis.append(
+            "Buy signals observed without execution records; inspect cash/lot/risk gates."
+        )
+    if execution_count <= 0 and buy_signal_count <= 0:
+        diagnosis.append(
+            "No buy/execution path captured; current artifact can only confirm signal presence."
+        )
+    if not diagnosis:
+        diagnosis.append("Runtime path observed without loss evidence in current artifact window.")
+    return diagnosis
 
 
 def _row_reason_text(row: Mapping[str, object]) -> str:
