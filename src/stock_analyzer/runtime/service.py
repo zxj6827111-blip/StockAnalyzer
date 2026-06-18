@@ -269,6 +269,10 @@ class StockAnalyzerService:
         self._recommendation_latest_id_by_symbol: dict[str, str] = {}
         self._last_signal_payload: list[dict[str, object]] = []
         self._last_signal_trace_id: str = ""
+        self._last_signal_timestamp: str = ""
+        self._last_signal_source: str = ""
+        self._last_signal_snapshot: dict[str, object] | None = None
+        self._latest_signal_snapshot_dirty = False
         self._last_notification_filter_diagnostics: dict[str, object] | None = None
         self._signal_quality_auditor = SignalQualityAuditor(config)
         self._signal_quality_audit_history: list[dict[str, object]] = []
@@ -2092,10 +2096,63 @@ class StockAnalyzerService:
         return None if report is None else report.to_dict()
 
     def latest_signals_snapshot(self) -> dict[str, object]:
+        self._refresh_runtime_state_from_disk_if_changed()
+        if self._last_signal_payload:
+            return {
+                "trace_id": self._last_signal_trace_id,
+                "timestamp": self._last_signal_timestamp,
+                "signals": [dict(item) for item in self._last_signal_payload],
+                "source": self._last_signal_source or "memory",
+            }
+        persisted = self._last_signal_snapshot
+        if isinstance(persisted, Mapping):
+            raw_signals = persisted.get("signals")
+            if isinstance(raw_signals, list) and raw_signals:
+                return {
+                    "trace_id": str(persisted.get("trace_id", "")).strip(),
+                    "timestamp": str(persisted.get("timestamp", "")).strip(),
+                    "signals": [dict(item) for item in raw_signals if isinstance(item, Mapping)],
+                    "source": str(persisted.get("source", "")).strip() or "runtime_state",
+                }
+        week5_signals = _extract_week5_candidate_signals(self._last_week5_scan_report)
+        if week5_signals:
+            week5_report = self._last_week5_scan_report or {}
+            return {
+                "trace_id": str(week5_report.get("trace_id", "")).strip(),
+                "timestamp": str(week5_report.get("timestamp", "")).strip(),
+                "signals": week5_signals,
+                "source": "week5_latest_candidates",
+            }
         return {
             "trace_id": self._last_signal_trace_id,
-            "signals": [dict(item) for item in self._last_signal_payload],
+            "timestamp": self._last_signal_timestamp,
+            "signals": [],
+            "source": "empty",
         }
+
+    def _update_latest_signal_snapshot(
+        self,
+        *,
+        signal_payload: list[dict[str, object]],
+        trace_id: str,
+        timestamp: datetime,
+        source: str,
+    ) -> None:
+        signals = [dict(item) for item in signal_payload if isinstance(item, Mapping)]
+        self._last_signal_payload = signals
+        self._last_signal_trace_id = trace_id
+        self._last_signal_timestamp = timestamp.isoformat()
+        self._last_signal_source = source
+        snapshot = {
+            "trace_id": trace_id,
+            "timestamp": timestamp.isoformat(),
+            "source": source,
+            "signal_count": len(signals),
+            "signals": [dict(item) for item in signals],
+        }
+        if self._last_signal_snapshot != snapshot:
+            self._latest_signal_snapshot_dirty = True
+        self._last_signal_snapshot = snapshot
 
     def latest_notification_filter_diagnostics(self) -> dict[str, object] | None:
         if self._last_notification_filter_diagnostics is None:
@@ -3505,6 +3562,10 @@ class StockAnalyzerService:
         if self._bootstrap_runtime_blocked():
             self._last_signal_payload = []
             self._last_signal_trace_id = ""
+            self._last_signal_timestamp = ""
+            self._last_signal_source = ""
+            self._last_signal_snapshot = None
+            self._latest_signal_snapshot_dirty = False
             blocked_payload = {
                 "trace_id": "",
                 "timestamp": datetime.now().isoformat(),
@@ -3636,6 +3697,18 @@ class StockAnalyzerService:
                 "skipped_no_cash": 0,
                 "open_positions": len(self._portfolio.positions()),
                 "status": "skipped_advisory_only",
+                "execution_attempts": {
+                    "signals": len(signals),
+                    "buy_signals": sum(1 for signal in signals if signal.action == "buy"),
+                    "non_buy_signals": sum(1 for signal in signals if signal.action != "buy"),
+                    "buy_new_attempted": 0,
+                    "buy_new_filled": 0,
+                    "buy_new_rejected": 0,
+                    "pre_trade_blocked": 0,
+                    "risk_gate_blocked": 0,
+                    "sell_executed": 0,
+                },
+                "executions": [],
             }
         elif live_auto_execute:
             portfolio_update = self._apply_live_auto_portfolio_signals(
@@ -3686,6 +3759,12 @@ class StockAnalyzerService:
             trace_id=trace_id,
             timestamp=timestamp,
         )
+        self._update_latest_signal_snapshot(
+            signal_payload=signal_payload,
+            trace_id=trace_id,
+            timestamp=timestamp,
+            source="pipeline_run",
+        )
         recommendation_sync_started = perf_counter()
         if execution_dry_run:
             recommendation_update = {
@@ -3724,8 +3803,6 @@ class StockAnalyzerService:
                 timestamp=timestamp,
                 trace_id=trace_id,
             )
-            self._last_signal_payload = [dict(item) for item in signal_payload]
-            self._last_signal_trace_id = trace_id
             execution_recommendation_update = self._sync_recommendation_lifecycle_from_auto_execution(
                 portfolio_update=portfolio_update,
                 timestamp=timestamp,
@@ -3740,6 +3817,8 @@ class StockAnalyzerService:
             or _as_int(portfolio_update.get("closed_signals"), default=0) > 0
         )
         runtime_state_persist_reasons: list[str] = []
+        if self._latest_signal_snapshot_dirty:
+            runtime_state_persist_reasons.append("latest_signals")
         if _as_int(recommendation_update.get("updated"), default=0) > 0:
             runtime_state_persist_reasons.append("recommendation_update")
         if _as_int(execution_recommendation_update.get("updated"), default=0) > 0:
@@ -3754,6 +3833,7 @@ class StockAnalyzerService:
         if runtime_state_persist_reasons:
             persist_started = perf_counter()
             self._persist_runtime_state_to_disk(include_history_sidecars=False)
+            self._latest_signal_snapshot_dirty = False
             runtime_state_persist_ms = int((perf_counter() - persist_started) * 1000)
             try:
                 runtime_state_persist_bytes = self._runtime_state_path.stat().st_size
