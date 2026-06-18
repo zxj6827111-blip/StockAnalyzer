@@ -8,6 +8,8 @@ import pytest
 
 from scripts.p0_run_nas_advisory_probe import ProbeError, run_probe
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
 
 def test_run_nas_advisory_probe_refuses_non_advisory_state(tmp_path: Path) -> None:
     calls: list[tuple[str, str]] = []
@@ -48,6 +50,17 @@ def test_run_nas_advisory_probe_captures_and_validates_evidence(tmp_path: Path) 
                     "source": "pipeline_run",
                     "signals": [{"symbol": "600000", "action": "watch"}],
                 }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    model_artifact = tmp_path / "model_v1.json"
+    model_artifact.write_text(
+        json.dumps(
+            {
+                "training_metrics": {"positive_rate": 0.1, "test_samples": 20},
+                "metadata": {"test_samples": 20},
             },
             ensure_ascii=False,
         ),
@@ -116,12 +129,23 @@ def test_run_nas_advisory_probe_captures_and_validates_evidence(tmp_path: Path) 
         output_dir=tmp_path / "out",
         runtime_state_path=runtime_state,
         confirm_run=True,
+        config_path=REPO_ROOT / "config" / "default.yaml",
+        model_artifact_path=model_artifact,
         http_request=_fake_request,
     )
 
     assert result["status"] == "pass"
     assert (tmp_path / "out" / "commands" / "pipeline_advisory.json").exists()
     assert (tmp_path / "out" / "nas_advisory_validation_report.md").exists()
+    analysis = result["analysis"]
+    assert isinstance(analysis, dict)
+    assert analysis["status"] == "generated"
+    assert analysis["remaining_expected_inputs"] == []
+    analysis_dir = tmp_path / "out" / "analysis"
+    assert (analysis_dir / "final_report_v3.json").exists()
+    assert (analysis_dir / "p4_feature_family_ablation_v1.json").exists()
+    assert (analysis_dir / "p5_position" / "position_framework_analysis.json").exists()
+    assert (analysis_dir / "p0_shadow_experiment_plan_v1.json").exists()
     pipeline_call = [item for item in calls if item[1] == "/run/pipeline"][0]
     assert pipeline_call[2] == {
         "symbols": ["600000"],

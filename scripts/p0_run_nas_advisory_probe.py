@@ -9,6 +9,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -19,6 +20,11 @@ if str(REPO_ROOT) not in sys.path:
 from scripts.p0_nas_advisory_validation import (  # noqa: E402
     build_validation_report,
     render_markdown_report,
+)
+from stock_analyzer.config import load_config  # noqa: E402
+from stock_analyzer.research.p0_analysis_inputs import write_p0_analysis_inputs  # noqa: E402
+from stock_analyzer.research.shadow_experiment_planner import (  # noqa: E402
+    build_shadow_experiment_plan,
 )
 
 HttpRequest = Callable[[str, str, Mapping[str, object] | None], dict[str, object]]
@@ -61,6 +67,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--audit-limit", type=int, default=200)
     parser.add_argument("--signal-quality-limit", type=int, default=200)
+    parser.add_argument(
+        "--config",
+        default="config/default.yaml",
+        help="Config YAML path used to build P0 analysis artifacts after the probe.",
+    )
+    parser.add_argument(
+        "--model-artifact",
+        default="artifacts/model_v1.json",
+        help="Model artifact path used by P0 analysis artifact generation.",
+    )
+    parser.add_argument(
+        "--skip-analysis",
+        action="store_true",
+        help="Only run/capture/validate the advisory probe; skip analysis artifact generation.",
+    )
     return parser.parse_args()
 
 
@@ -78,6 +99,9 @@ def main() -> None:
         confirm_run=bool(args.confirm_run),
         audit_limit=max(1, int(args.audit_limit)),
         signal_quality_limit=max(1, int(args.signal_quality_limit)),
+        config_path=_path(args.config),
+        model_artifact_path=_path(args.model_artifact),
+        build_analysis=not bool(args.skip_analysis),
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
@@ -94,6 +118,9 @@ def run_probe(
     confirm_run: bool,
     audit_limit: int = 200,
     signal_quality_limit: int = 200,
+    config_path: Path | None = None,
+    model_artifact_path: Path | None = None,
+    build_analysis: bool = True,
     http_request: HttpRequest | None = None,
 ) -> dict[str, object]:
     client = http_request or _http_json_request(api_base=api_base, api_token=api_token)
@@ -150,12 +177,60 @@ def run_probe(
     md_path = output_dir / "nas_advisory_validation_report.md"
     _write_json(json_path, report)
     md_path.write_text(render_markdown_report(report), encoding="utf-8")
+    analysis_result: dict[str, object] = {"status": "skipped"}
+    if build_analysis:
+        analysis_result = _build_probe_analysis(
+            output_dir=output_dir,
+            runtime_state_path=runtime_state_path,
+            signals_latest_path=commands_dir / "signals_latest_after.json",
+            audit_events_path=commands_dir / "audit_events_after.json",
+            config_path=config_path or _path("config/default.yaml"),
+            model_artifact_path=model_artifact_path or _path("artifacts/model_v1.json"),
+        )
     return {
         "status": report.get("status"),
         "output_dir": str(output_dir),
         "pipeline_trace_id": pipeline.get("trace_id"),
         "validation_json": str(json_path),
         "validation_markdown": str(md_path),
+        "analysis": analysis_result,
+    }
+
+
+def _build_probe_analysis(
+    *,
+    output_dir: Path,
+    runtime_state_path: Path,
+    signals_latest_path: Path,
+    audit_events_path: Path,
+    config_path: Path,
+    model_artifact_path: Path,
+) -> dict[str, object]:
+    analysis_dir = output_dir / "analysis"
+    config = load_config(config_path)
+    manifest = write_p0_analysis_inputs(
+        analysis_dir=analysis_dir,
+        model_artifact_path=model_artifact_path,
+        learning_manifest_paths=[],
+        signal_source_paths=[runtime_state_path, signals_latest_path],
+        audit_event_paths=[runtime_state_path, audit_events_path],
+        config=config,
+        generated_at=datetime.now(),
+    )
+    plan = build_shadow_experiment_plan(analysis_dir=analysis_dir)
+    shadow_plan_path = analysis_dir / "p0_shadow_experiment_plan_v1.json"
+    _write_json(shadow_plan_path, plan)
+    manifest["outputs"]["shadow_plan"] = str(shadow_plan_path)
+    manifest_path = analysis_dir / "p0_analysis_inputs_manifest.json"
+    _write_json(manifest_path, manifest)
+    return {
+        "status": "generated",
+        "analysis_dir": str(analysis_dir),
+        "manifest": str(manifest_path),
+        "shadow_plan": str(shadow_plan_path),
+        "remaining_expected_inputs": manifest.get("remaining_expected_inputs", []),
+        "plan_status": plan.get("status"),
+        "input_completeness": plan.get("input_completeness"),
     }
 
 
