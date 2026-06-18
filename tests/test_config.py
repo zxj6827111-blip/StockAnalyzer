@@ -147,6 +147,7 @@ def test_load_default_config_values(monkeypatch: MonkeyPatch) -> None:
     assert config.auto_promotion.notify_on_rejection is True
     assert config.auto_promotion.notify_on_training_summary is True
     assert config.auto_promotion.notify_on_manual_release_pending is True
+    assert config.reconcile.auto_refresh_simulated_snapshot_at_close is False
     assert config.evolution.universe_spec.signal_analysis_lookback_days == 240
     assert config.global_market.enabled is True
     assert config.strategy_kill_switch.enabled is True

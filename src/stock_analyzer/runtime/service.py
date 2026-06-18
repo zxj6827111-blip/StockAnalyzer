@@ -261,6 +261,7 @@ class StockAnalyzerService:
             max_same_sector=config.soup_strategy.max_same_sector,
         )
         self._broker_snapshot_updated_at: str = ""
+        self._broker_snapshot_source: str = ""
         self._broker_positions: dict[str, float] = {}
         self._broker_position_details: dict[str, dict[str, object]] = {}
         self._recommendation_lifecycle: dict[str, dict[str, object]] = {}
@@ -9184,10 +9185,12 @@ class StockAnalyzerService:
         self,
         positions: list[dict[str, object]],
         source_trace_id: str = "",
+        source: str = "manual",
     ) -> dict[str, object]:
         return self._reconcile_service.update_broker_snapshot(
             positions=positions,
             source_trace_id=source_trace_id,
+            source=source,
         )
 
     def bootstrap_broker_snapshot_from_portfolio(
@@ -15189,6 +15192,7 @@ class StockAnalyzerService:
 
     def _job_close_reconcile(self) -> dict[str, object]:
         now = datetime.now()
+        broker_snapshot_refresh = self._refresh_simulated_broker_snapshot_for_close_reconcile()
         report = self.run_reconciliation(timestamp=now)
         status = str(report.get("status", ""))
         if status == "missing_snapshot":
@@ -15228,10 +15232,43 @@ class StockAnalyzerService:
         runtime_archive = self.archive_runtime_history_if_needed(now=now)
         return {
             "reconcile_required": self._state.reconcile_required,
+            "broker_snapshot_refresh": broker_snapshot_refresh,
             "report": report,
             "daily_digest": daily_digest,
             "runtime_archive": runtime_archive,
         }
+
+    def _refresh_simulated_broker_snapshot_for_close_reconcile(self) -> dict[str, object]:
+        if not self._config.reconcile.auto_refresh_simulated_snapshot_at_close:
+            return {"status": "disabled", "reason": "config_disabled"}
+        if not self._reconcile_service.should_auto_refresh_simulated_snapshot_at_close():
+            return {
+                "status": "skipped",
+                "reason": "broker_snapshot_source_not_portfolio",
+                "broker_snapshot_source": str(self._broker_snapshot_source).strip(),
+            }
+        trace_id = f"close_reconcile_sim_snapshot_{datetime.now().strftime('%Y%m%dT%H%M%S')}"
+        snapshot = self.bootstrap_broker_snapshot_from_portfolio(
+            source_trace_id=trace_id,
+            allow_empty=True,
+        )
+        status = str(snapshot.get("status", "")).strip() or "unknown"
+        payload = {
+            "status": status,
+            "source_trace_id": trace_id,
+            "portfolio_positions": _as_int(snapshot.get("portfolio_positions"), default=0),
+            "broker_positions": _as_int(snapshot.get("broker_positions"), default=0),
+            "symbols": list(snapshot.get("symbols", []))
+            if isinstance(snapshot.get("symbols"), list)
+            else [],
+        }
+        self._record_audit_event(
+            event_type="broker_snapshot_auto_refresh",
+            trace_id=trace_id,
+            level="info" if status == "ok" else "warn",
+            payload=payload,
+        )
+        return payload
 
     def _notify_learning_workflow_summary(
         self,

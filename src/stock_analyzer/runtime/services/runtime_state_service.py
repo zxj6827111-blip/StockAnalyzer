@@ -44,6 +44,7 @@ class RuntimeStateService:
             "reconcile_required": bool(service._state.reconcile_required),
             "portfolio": service._portfolio.export_state(),
             "broker_snapshot_updated_at": str(service._broker_snapshot_updated_at).strip(),
+            "broker_snapshot_source": str(service._broker_snapshot_source).strip(),
             "broker_positions": dict(service._broker_positions),
             "broker_position_details": deepcopy(service._broker_position_details),
             "recommendation_lifecycle": recommendation_lifecycle,
@@ -215,7 +216,6 @@ class RuntimeStateService:
         }
 
     def _runtime_state_history_sidecar_metadata(self) -> dict[str, object]:
-        service = self._service
         return {
             "format": "jsonl",
             "base_dir": str(self._runtime_state_sidecar_dir()),
@@ -225,7 +225,9 @@ class RuntimeStateService:
                     "limit": limit,
                     "records": len(records),
                 }
-                for name, records, limit, path, _identity_keys in self._runtime_state_sidecar_specs()
+                for name, records, limit, path, _identity_keys in (
+                    self._runtime_state_sidecar_specs()
+                )
             },
         }
 
@@ -394,6 +396,14 @@ class RuntimeStateService:
         ):
             broker_snapshot_updated_at = str(raw.get("updated_at", "")).strip()
         service._broker_snapshot_updated_at = broker_snapshot_updated_at
+        broker_snapshot_source = str(raw.get("broker_snapshot_source", "")).strip().lower()
+        if not broker_snapshot_source and (
+            service._broker_positions or service._broker_position_details
+        ):
+            broker_snapshot_source = "manual"
+        service._broker_snapshot_source = (
+            broker_snapshot_source if broker_snapshot_source == "portfolio" else "manual"
+        ) if broker_snapshot_source else ""
         service._state.current_equity = max(
             0.01,
             _as_float(raw.get("current_equity"), default=service._state.current_equity),
@@ -641,6 +651,7 @@ class RuntimeStateService:
         )
         (
             merged["broker_snapshot_updated_at"],
+            merged["broker_snapshot_source"],
             merged["broker_positions"],
             merged["broker_position_details"],
         ) = self._merge_runtime_state_broker_snapshot(
@@ -1044,7 +1055,7 @@ class RuntimeStateService:
         *,
         existing_raw: dict[str, object],
         current_raw: dict[str, object],
-    ) -> tuple[str, dict[str, float], dict[str, dict[str, object]]]:
+    ) -> tuple[str, str, dict[str, float], dict[str, dict[str, object]]]:
         service = self._service
         existing_updated_at = str(existing_raw.get("broker_snapshot_updated_at", "")).strip()
         current_updated_at = str(current_raw.get("broker_snapshot_updated_at", "")).strip()
@@ -1062,15 +1073,23 @@ class RuntimeStateService:
             {},
             current_raw.get("broker_position_details"),
         )
+        existing_source = _normalize_broker_snapshot_source_for_runtime_state(
+            existing_raw.get("broker_snapshot_source"),
+            has_snapshot=bool(existing_positions or existing_details),
+        )
+        current_source = _normalize_broker_snapshot_source_for_runtime_state(
+            current_raw.get("broker_snapshot_source"),
+            has_snapshot=bool(current_positions or current_details),
+        )
         if current_updated_at and (
             not existing_updated_at or current_updated_at >= existing_updated_at
         ):
-            return current_updated_at, current_positions, current_details
+            return current_updated_at, current_source, current_positions, current_details
         if existing_updated_at:
-            return existing_updated_at, existing_positions, existing_details
+            return existing_updated_at, existing_source, existing_positions, existing_details
         if current_positions or current_details:
-            return "", current_positions, current_details
-        return "", existing_positions, existing_details
+            return "", current_source, current_positions, current_details
+        return "", existing_source, existing_positions, existing_details
 
     def _load_runtime_state_numeric_mapping(
         self,
@@ -1194,6 +1213,21 @@ def _as_bool(value: object, default: bool) -> bool:
         if normalized in {"0", "false", "no", "n", "off"}:
             return False
     return default
+
+
+def _normalize_broker_snapshot_source_for_runtime_state(
+    value: object,
+    *,
+    has_snapshot: bool = False,
+) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"portfolio", "simulated", "simulated_portfolio"}:
+        return "portfolio"
+    if normalized:
+        return "manual"
+    if has_snapshot:
+        return "manual"
+    return ""
 
 
 def _parse_runtime_state_datetime(value: object) -> datetime | None:

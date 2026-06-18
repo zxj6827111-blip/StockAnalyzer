@@ -1072,3 +1072,68 @@ def test_runtime_state_merge_preserves_explicit_broker_snapshot_clear(tmp_path: 
     reloaded = _new_service(config)
     assert reloaded._broker_positions == {}  # noqa: SLF001
     assert reloaded._broker_position_details == {}  # noqa: SLF001
+
+
+def test_runtime_state_preserves_portfolio_broker_snapshot_source(tmp_path: Path) -> None:
+    config = _load_test_config(tmp_path)
+    service = _new_service(config)
+    service._portfolio.restore_state(  # noqa: SLF001
+        {
+            "positions": [
+                {
+                    "symbol": "600000",
+                    "strategy": "manual",
+                    "target_position": 0.2,
+                    "opened_at": "2026-03-01T09:30:00",
+                    "updated_at": "2026-03-01T09:30:00",
+                    "open_trace_id": "runtime-state-sim-snapshot-source",
+                    "open_reason": "manual",
+                    "quantity": 1000,
+                    "account": "sim-main",
+                }
+            ],
+            "trades": [],
+        }
+    )
+
+    snapshot = service.bootstrap_broker_snapshot_from_portfolio(
+        source_trace_id="runtime-state-sim-snapshot-source",
+    )
+    assert snapshot["status"] == "ok"
+
+    reloaded = _new_service(config)
+    assert reloaded._broker_positions == {"600000.SH": 0.2}  # noqa: SLF001
+    assert reloaded._broker_snapshot_source == "portfolio"  # noqa: SLF001
+
+
+def test_runtime_state_treats_legacy_broker_snapshot_source_as_manual(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config(tmp_path)
+    runtime_state_path = Path(config.command_channel.state_persist_path)
+    runtime_state_path.parent.mkdir(parents=True, exist_ok=True)
+    runtime_state_path.write_text(
+        json.dumps(
+            {
+                "state_version": 7,
+                "updated_at": "2026-03-01T15:30:00",
+                "broker_snapshot_updated_at": "2026-03-01T15:30:00",
+                "broker_positions": {"600000": 0.2},
+                "broker_position_details": {
+                    "600000": {
+                        "target_position": 0.2,
+                        "quantity": 1000,
+                        "account": "manual",
+                    }
+                },
+                "portfolio": {},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    service = _new_service(config)
+
+    assert service._broker_positions == {"600000.SH": 0.2}  # noqa: SLF001
+    assert service._broker_snapshot_source == "manual"  # noqa: SLF001

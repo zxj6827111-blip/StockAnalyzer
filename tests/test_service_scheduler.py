@@ -281,6 +281,101 @@ def test_close_reconcile_job_reports_position_mismatch() -> None:
     assert service.state.reconcile_required is True
 
 
+def test_close_reconcile_job_refreshes_simulated_snapshot_when_enabled() -> None:
+    config = _load_test_config()
+    config.reconcile.auto_refresh_simulated_snapshot_at_close = True
+    service = _new_service(config)
+
+    set_cmd = _sign(
+        action="SET_POSITION",
+        command_id="cmd-close-job-sim-refresh",
+        payload={
+            "symbol": "600000",
+            "strategy": "manual",
+            "target_position": 0.2,
+            "quantity": 1000,
+            "account": "sim-main",
+        },
+        secret=config.command_channel.secret_key,
+    )
+    set_result = service.execute_command(set_cmd)
+    assert set_result["accepted"] is True
+
+    _ = service.bootstrap_broker_snapshot_from_portfolio(
+        source_trace_id="stale-snapshot-before-sim-refresh",
+    )
+    service._broker_snapshot_updated_at = (  # noqa: SLF001
+        datetime.now() - timedelta(hours=36)
+    ).isoformat()
+
+    results = service.run_due_jobs(now=datetime.fromisoformat("2026-03-02T15:30:00"))
+    close_result = _job_result(results, "close_reconcile")
+    assert _as_bool(close_result["ran"]) is True
+    assert _as_bool(close_result["success"]) is True
+
+    payload = _as_mapping(close_result["payload"])
+    refresh = _as_mapping(payload["broker_snapshot_refresh"])
+    report = _as_mapping(payload["report"])
+    daily_digest = _as_mapping(payload["daily_digest"])
+    digest_summary = _as_mapping(daily_digest["summary"])
+    broker_snapshot = _as_mapping(report["broker_snapshot"])
+
+    assert refresh["status"] == "ok"
+    assert refresh["broker_positions"] == 1
+    assert refresh["symbols"] == ["600000"]
+    assert report["status"] == "ok"
+    assert report["matched_count"] == 1
+    assert report["mismatch_count"] == 0
+    assert report["missing_in_broker"] == []
+    assert report["quantity_matched_count"] == 1
+    assert report["account_matched_count"] == 1
+    assert broker_snapshot["fresh"] is True
+    assert digest_summary["reconcile_status"] == "ok"
+    assert service.state.reconcile_required is False
+
+
+def test_close_reconcile_job_does_not_overwrite_manual_broker_snapshot() -> None:
+    config = _load_test_config()
+    config.reconcile.auto_refresh_simulated_snapshot_at_close = True
+    service = _new_service(config)
+
+    set_cmd = _sign(
+        action="SET_POSITION",
+        command_id="cmd-close-job-manual-snapshot",
+        payload={
+            "symbol": "600000",
+            "strategy": "manual",
+            "target_position": 0.2,
+            "quantity": 1000,
+            "account": "sim-main",
+        },
+        secret=config.command_channel.secret_key,
+    )
+    set_result = service.execute_command(set_cmd)
+    assert set_result["accepted"] is True
+
+    _ = service.update_broker_snapshot(
+        positions=[{"symbol": "600000", "target_position": 0.05}],
+        source_trace_id="manual-snapshot-before-sim-refresh",
+    )
+
+    results = service.run_due_jobs(now=datetime.fromisoformat("2026-03-02T15:30:00"))
+    close_result = _job_result(results, "close_reconcile")
+    assert _as_bool(close_result["ran"]) is True
+    assert _as_bool(close_result["success"]) is True
+
+    payload = _as_mapping(close_result["payload"])
+    refresh = _as_mapping(payload["broker_snapshot_refresh"])
+    report = _as_mapping(payload["report"])
+
+    assert refresh["status"] == "skipped"
+    assert refresh["reason"] == "broker_snapshot_source_not_portfolio"
+    assert report["status"] == "mismatch"
+    assert report["mismatch_count"] == 1
+    assert service._broker_positions == {"600000": 0.05}  # noqa: SLF001
+    assert service._broker_snapshot_source == "manual"  # noqa: SLF001
+
+
 def test_close_reconcile_daily_digest_is_deduplicated_same_day() -> None:
     config = _load_test_config()
     service = _new_service(config)

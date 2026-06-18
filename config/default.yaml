@@ -578,6 +578,7 @@ reconcile:
   position_tolerance: 0.01
   require_broker_snapshot_at_close: true
   max_broker_snapshot_age_hours: 18
+  auto_refresh_simulated_snapshot_at_close: false
   auto_notify_on_mismatch: true
   history_limit: 500
 

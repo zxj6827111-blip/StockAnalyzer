@@ -18,11 +18,13 @@ class RuntimeReconcileService:
         self,
         positions: list[dict[str, object]],
         source_trace_id: str = "",
+        source: str = "manual",
     ) -> dict[str, object]:
         service = self._service
         parsed = _parse_broker_positions(positions)
         parsed_details = _parse_broker_position_details(positions)
         service._broker_snapshot_updated_at = datetime.now().isoformat()
+        service._broker_snapshot_source = _normalize_broker_snapshot_source(source)
         service._broker_positions = parsed
         service._broker_position_details = parsed_details
         service._state.reconcile_required = False
@@ -39,6 +41,7 @@ class RuntimeReconcileService:
             "symbols": sorted(parsed.keys()),
             "quantity_records": quantity_records,
             "account_records": account_records,
+            "source": service._broker_snapshot_source,
         }
         service._record_audit_event(
             event_type="broker_snapshot",
@@ -73,17 +76,30 @@ class RuntimeReconcileService:
                 "broker_positions": 0,
                 "symbols": [],
                 "allow_empty": False,
-                "reason": "portfolio has no open positions; pass allow_empty to write an empty simulated broker snapshot",
+                "reason": (
+                    "portfolio has no open positions; pass allow_empty to write an "
+                    "empty simulated broker snapshot"
+                ),
             }
         snapshot = self.update_broker_snapshot(
             positions=positions,
             source_trace_id=source_trace_id,
+            source="portfolio",
         )
         snapshot["status"] = "ok"
         snapshot["source"] = "portfolio"
         snapshot["portfolio_positions"] = len(portfolio_positions)
         snapshot["allow_empty"] = allow_empty
         return snapshot
+
+    def should_auto_refresh_simulated_snapshot_at_close(self) -> bool:
+        service = self._service
+        if not service._config.reconcile.auto_refresh_simulated_snapshot_at_close:
+            return False
+        source = str(getattr(service, "_broker_snapshot_source", "")).strip().lower()
+        if not source:
+            return not bool(service._broker_positions or service._broker_position_details)
+        return source == "portfolio"
 
     def latest_reconcile_report(self) -> dict[str, object] | None:
         service = self._service
@@ -386,7 +402,9 @@ class RuntimeReconcileService:
     ) -> dict[str, object]:
         strategy_map: dict[str, dict[str, object]] = {}
         for item in strategy_snapshot:
-            symbol = _normalize_a_share_symbol(item.get("symbol")) or str(item.get("symbol", "")).strip()
+            symbol = _normalize_a_share_symbol(item.get("symbol")) or str(
+                item.get("symbol", "")
+            ).strip()
             if not symbol:
                 continue
             quantity = _as_int(item.get("quantity"), default=0)
@@ -486,7 +504,9 @@ class RuntimeReconcileService:
 def _parse_broker_positions(positions: list[dict[str, object]]) -> dict[str, float]:
     parsed: dict[str, float] = {}
     for item in positions:
-        symbol = _normalize_a_share_symbol(item.get("symbol")) or str(item.get("symbol", "")).strip()
+        symbol = _normalize_a_share_symbol(item.get("symbol")) or str(
+            item.get("symbol", "")
+        ).strip()
         if not symbol:
             continue
         target = _as_float(item.get("target_position"), default=0.0)
@@ -500,7 +520,9 @@ def _parse_broker_position_details(
 ) -> dict[str, dict[str, object]]:
     parsed: dict[str, dict[str, object]] = {}
     for item in positions:
-        symbol = _normalize_a_share_symbol(item.get("symbol")) or str(item.get("symbol", "")).strip()
+        symbol = _normalize_a_share_symbol(item.get("symbol")) or str(
+            item.get("symbol", "")
+        ).strip()
         if not symbol:
             continue
         target = _as_float(item.get("target_position"), default=0.0)
@@ -521,7 +543,9 @@ def _broker_snapshot_positions_from_portfolio(
 ) -> list[dict[str, object]]:
     positions: list[dict[str, object]] = []
     for item in portfolio_positions:
-        symbol = _normalize_a_share_symbol(item.get("symbol")) or str(item.get("symbol", "")).strip()
+        symbol = _normalize_a_share_symbol(item.get("symbol")) or str(
+            item.get("symbol", "")
+        ).strip()
         target_position = _as_float(item.get("target_position"), default=-1.0)
         if not symbol or target_position < 0.0:
             continue
@@ -537,6 +561,13 @@ def _broker_snapshot_positions_from_portfolio(
             snapshot_item["account"] = account
         positions.append(snapshot_item)
     return positions
+
+
+def _normalize_broker_snapshot_source(source: object) -> str:
+    normalized = str(source).strip().lower()
+    if normalized in {"portfolio", "simulated_portfolio", "simulated"}:
+        return "portfolio"
+    return "manual"
 
 
 def _normalize_position_map(position_map: dict[str, float]) -> dict[str, float]:
