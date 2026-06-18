@@ -140,6 +140,9 @@ def run_probe(
         raise ProbeError(
             "Refusing to run pipeline because /dashboard/ops/state advisory_only is not true."
         )
+    effective_config_path = config_path or _path("config/default.yaml")
+    config_snapshot = _config_safety_snapshot(effective_config_path)
+    _write_json(commands_dir / "config_safety_snapshot.json", config_snapshot)
     if not confirm_run:
         return {
             "status": "state_checked_no_pipeline_run",
@@ -178,6 +181,8 @@ def run_probe(
         signals_latest=signals_latest,
         audit_events=_extract_events(audit_events),
         signal_quality=signal_quality,
+        ops_state=ops_state,
+        config_snapshot=config_snapshot,
     )
     json_path = output_dir / "nas_advisory_validation_report.json"
     md_path = output_dir / "nas_advisory_validation_report.md"
@@ -190,7 +195,7 @@ def run_probe(
             runtime_state_path=runtime_state_path,
             signals_latest_path=commands_dir / "signals_latest_after.json",
             audit_events_path=commands_dir / "audit_events_after.json",
-            config_path=config_path or _path("config/default.yaml"),
+            config_path=effective_config_path,
             model_artifact_path=model_artifact_path or _path("artifacts/model_v1.json"),
         )
     goal_audit = build_goal_completion_audit(output_dir)
@@ -248,6 +253,72 @@ def _build_probe_analysis(
         "remaining_expected_inputs": manifest.get("remaining_expected_inputs", []),
         "plan_status": plan.get("status"),
         "input_completeness": plan.get("input_completeness"),
+    }
+
+
+def _config_safety_snapshot(config_path: Path) -> dict[str, object]:
+    config = load_config(config_path)
+    return {
+        "config_path": str(config_path),
+        "auto_promotion": {
+            "enabled": bool(config.auto_promotion.enabled),
+            "auto_load_predictor": bool(config.auto_promotion.auto_load_predictor),
+        },
+        "financial_filter": {
+            "enabled": bool(config.financial_filter.enabled),
+            "exclude_st": bool(config.financial_filter.exclude_st),
+            "exclude_delisting_risk": bool(config.financial_filter.exclude_delisting_risk),
+            "min_roe": float(config.financial_filter.min_roe),
+            "max_debt_ratio": float(config.financial_filter.max_debt_ratio),
+            "missing_data_policy": str(config.financial_filter.missing_data_policy),
+        },
+        "monster_risk": {
+            "max_total_position": float(config.monster_risk.max_total_position),
+            "max_stock_position": float(config.monster_risk.max_stock_position),
+            "disable_if_sentiment_below": float(
+                config.monster_risk.disable_if_sentiment_below
+            ),
+        },
+        "circuit_breaker": {
+            "intraday_stop_after_losses": int(
+                config.circuit_breaker.intraday_stop_after_losses
+            ),
+            "portfolio_daily_drawdown_stop": float(
+                config.circuit_breaker.portfolio_daily_drawdown_stop
+            ),
+            "portfolio_weekly_drawdown_reduce": float(
+                config.circuit_breaker.portfolio_weekly_drawdown_reduce
+            ),
+        },
+        "capital_curve": {
+            "drawdown_alert": float(config.capital_curve.drawdown_alert),
+            "drawdown_reduce": float(config.capital_curve.drawdown_reduce),
+            "drawdown_freeze": float(config.capital_curve.drawdown_freeze),
+            "protect_line": float(config.capital_curve.protect_line),
+        },
+        "models": {
+            "cross_review": {
+                "degraded_consensus_enabled": bool(
+                    config.models.cross_review.degraded_consensus_enabled
+                ),
+                "p_xgb_min": float(config.models.cross_review.p_xgb_min),
+                "p_lgbm_min": float(config.models.cross_review.p_lgbm_min),
+                "p_meta_min": float(config.models.cross_review.p_meta_min),
+                "max_diff": float(config.models.cross_review.max_diff),
+            }
+        },
+        "soup_strategy": {
+            "recovery_buy_enabled": bool(config.soup_strategy.recovery_buy_enabled),
+            "recovery_max_position": float(config.soup_strategy.recovery_max_position),
+            "disagreement_probe_enabled": bool(
+                config.soup_strategy.disagreement_probe_enabled
+            ),
+            "disagreement_probe_max_position": float(
+                config.soup_strategy.disagreement_probe_max_position
+            ),
+            "dynamic_position": str(config.soup_strategy.dynamic_position),
+            "max_holdings": int(config.soup_strategy.max_holdings),
+        },
     }
 
 

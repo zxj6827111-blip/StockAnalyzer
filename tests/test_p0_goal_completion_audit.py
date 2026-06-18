@@ -102,6 +102,9 @@ def test_goal_completion_audit_passes_complete_probe_output(tmp_path: Path) -> N
             "latest_signals": {"source": "pipeline_run"},
             "latest_pipeline_run": {"execution_mode": "advisory_only"},
             "checks": [
+                {"code": "ops_state_confirms_advisory_only", "passed": True},
+                {"code": "auto_promotion_disabled", "passed": True},
+                {"code": "risk_guardrails_not_relaxed", "passed": True},
                 {"code": "runtime_state_latest_signals_persisted", "passed": True},
                 {
                     "code": "runtime_state_latest_signals_source_is_pipeline_run",

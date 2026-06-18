@@ -136,6 +136,7 @@ def test_run_nas_advisory_probe_captures_and_validates_evidence(tmp_path: Path) 
 
     assert result["status"] == "pass"
     assert (tmp_path / "out" / "commands" / "pipeline_advisory.json").exists()
+    assert (tmp_path / "out" / "commands" / "config_safety_snapshot.json").exists()
     assert (tmp_path / "out" / "nas_advisory_validation_report.md").exists()
     analysis = result["analysis"]
     assert isinstance(analysis, dict)

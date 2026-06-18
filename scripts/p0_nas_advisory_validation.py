@@ -36,6 +36,16 @@ def parse_args() -> argparse.Namespace:
         help="Optional JSON captured from POST /research/signal-quality/run.",
     )
     parser.add_argument(
+        "--ops-state",
+        default="",
+        help="Optional JSON captured from GET /dashboard/ops/state.",
+    )
+    parser.add_argument(
+        "--config-snapshot",
+        default="",
+        help="Optional JSON snapshot of safety-relevant config values.",
+    )
+    parser.add_argument(
         "--output-dir",
         default="artifacts/research/p0_nas_advisory_validation",
         help="Directory for nas_advisory_validation_report.md/json.",
@@ -53,6 +63,8 @@ def main() -> None:
         signals_latest=_load_json(_path(args.signals_latest)) if args.signals_latest else {},
         audit_events=_collect_audit_events([_path(item) for item in args.audit_events]),
         signal_quality=_load_json(_path(args.signal_quality)) if args.signal_quality else {},
+        ops_state=_load_json(_path(args.ops_state)) if args.ops_state else {},
+        config_snapshot=_load_json(_path(args.config_snapshot)) if args.config_snapshot else {},
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     json_path = output_dir / "nas_advisory_validation_report.json"
@@ -69,19 +81,27 @@ def build_validation_report(
     signals_latest: Mapping[str, object],
     audit_events: Sequence[Mapping[str, object]],
     signal_quality: Mapping[str, object],
+    ops_state: Mapping[str, object] | None = None,
+    config_snapshot: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     latest_signals = _latest_signals_summary(runtime_state, signals_latest)
     pipeline = _latest_pipeline_summary(audit_events)
     signal_quality_summary = _signal_quality_summary(signal_quality)
+    ops_summary = _ops_state_summary(ops_state or {})
+    safety_config = _safety_config_summary(config_snapshot or {})
     checks = _checks(
         latest_signals=latest_signals,
         pipeline=pipeline,
         signal_quality=signal_quality_summary,
+        ops_state=ops_summary,
+        safety_config=safety_config,
     )
     return {
         "report_type": "p0_nas_advisory_validation",
         "production_change_allowed": False,
         "runtime_state_path": str(runtime_state_path),
+        "ops_state": ops_summary,
+        "safety_config": safety_config,
         "latest_signals": latest_signals,
         "latest_pipeline_run": pipeline,
         "signal_quality": signal_quality_summary,
@@ -96,11 +116,19 @@ def render_markdown_report(report: Mapping[str, object]) -> str:
     latest = _mapping(report.get("latest_signals"))
     pipeline = _mapping(report.get("latest_pipeline_run"))
     quality = _mapping(report.get("signal_quality"))
+    ops = _mapping(report.get("ops_state"))
+    safety = _mapping(report.get("safety_config"))
     lines = [
         "# NAS Advisory Validation Report",
         "",
         f"- status: {report.get('status')}",
         f"- production_change_allowed: {str(report.get('production_change_allowed')).lower()}",
+        f"- ops_advisory_only: {ops.get('advisory_only')}",
+        f"- ops_execution_mode: {ops.get('execution_mode')}",
+        f"- auto_promotion_enabled: {safety.get('auto_promotion_enabled')}",
+        f"- risk_guardrails_status: {safety.get('risk_guardrails_status')}",
+        "- enabled_experimental_entry_flags: "
+        f"{safety.get('enabled_experimental_entry_flags')}",
         f"- latest_signals_source: {latest.get('source')}",
         f"- latest_signals_storage_source: {latest.get('storage_source')}",
         f"- latest_signals_count: {latest.get('signal_count')}",
@@ -185,13 +213,111 @@ def _signal_quality_summary(signal_quality: Mapping[str, object]) -> dict[str, o
     }
 
 
+def _ops_state_summary(ops_state: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "present": bool(ops_state),
+        "mode": str(ops_state.get("mode", "")).strip(),
+        "simulation_mode": _as_bool(ops_state.get("simulation_mode")),
+        "enabled": _as_bool(ops_state.get("enabled")),
+        "toggle_enabled": _as_bool(ops_state.get("toggle_enabled")),
+        "advisory_only": _as_bool(ops_state.get("advisory_only")),
+        "execution_mode": str(ops_state.get("execution_mode", "")).strip(),
+    }
+
+
+def _safety_config_summary(config_snapshot: Mapping[str, object]) -> dict[str, object]:
+    auto_promotion = _mapping(config_snapshot.get("auto_promotion"))
+    financial = _mapping(config_snapshot.get("financial_filter"))
+    monster = _mapping(config_snapshot.get("monster_risk"))
+    circuit = _mapping(config_snapshot.get("circuit_breaker"))
+    capital_curve = _mapping(config_snapshot.get("capital_curve"))
+    models = _mapping(config_snapshot.get("models"))
+    cross_review = _mapping(models.get("cross_review"))
+    soup_strategy = _mapping(config_snapshot.get("soup_strategy"))
+
+    failed_guardrails: list[str] = []
+    if not _as_bool(financial.get("enabled")):
+        failed_guardrails.append("financial_filter.enabled")
+    if not _as_bool(financial.get("exclude_st")):
+        failed_guardrails.append("financial_filter.exclude_st")
+    if not _as_bool(financial.get("exclude_delisting_risk")):
+        failed_guardrails.append("financial_filter.exclude_delisting_risk")
+    if _as_float(financial.get("min_roe")) < 0.03:
+        failed_guardrails.append("financial_filter.min_roe")
+    if _as_float(financial.get("max_debt_ratio")) > 0.75:
+        failed_guardrails.append("financial_filter.max_debt_ratio")
+    if _as_float(monster.get("max_total_position")) > 0.25:
+        failed_guardrails.append("monster_risk.max_total_position")
+    if _as_float(monster.get("max_stock_position")) > 0.08:
+        failed_guardrails.append("monster_risk.max_stock_position")
+    if _as_float(monster.get("disable_if_sentiment_below")) < 45.0:
+        failed_guardrails.append("monster_risk.disable_if_sentiment_below")
+    if _int(circuit.get("intraday_stop_after_losses")) > 2:
+        failed_guardrails.append("circuit_breaker.intraday_stop_after_losses")
+    if _as_float(circuit.get("portfolio_daily_drawdown_stop")) > 2.5:
+        failed_guardrails.append("circuit_breaker.portfolio_daily_drawdown_stop")
+    if _as_float(circuit.get("portfolio_weekly_drawdown_reduce")) > 4.0:
+        failed_guardrails.append("circuit_breaker.portfolio_weekly_drawdown_reduce")
+    if _as_float(capital_curve.get("drawdown_freeze")) > 15.0:
+        failed_guardrails.append("capital_curve.drawdown_freeze")
+
+    experimental_flags = {
+        "degraded_consensus_enabled": _as_bool(
+            cross_review.get("degraded_consensus_enabled")
+        ),
+        "recovery_buy_enabled": _as_bool(soup_strategy.get("recovery_buy_enabled")),
+        "disagreement_probe_enabled": _as_bool(
+            soup_strategy.get("disagreement_probe_enabled")
+        ),
+    }
+    enabled_experimental_flags = [
+        key for key, value in experimental_flags.items() if bool(value)
+    ]
+    return {
+        "present": bool(config_snapshot),
+        "config_path": str(config_snapshot.get("config_path", "")).strip(),
+        "auto_promotion_enabled": _as_bool(auto_promotion.get("enabled")),
+        "financial_filter": financial,
+        "monster_risk": monster,
+        "circuit_breaker": circuit,
+        "capital_curve": capital_curve,
+        "risk_guardrails_failed": failed_guardrails,
+        "risk_guardrails_status": (
+            "pass" if bool(config_snapshot) and not failed_guardrails else "review"
+        ),
+        "experimental_entry_flags": experimental_flags,
+        "enabled_experimental_entry_flags": enabled_experimental_flags,
+    }
+
+
 def _checks(
     *,
     latest_signals: Mapping[str, object],
     pipeline: Mapping[str, object],
     signal_quality: Mapping[str, object],
+    ops_state: Mapping[str, object],
+    safety_config: Mapping[str, object],
 ) -> list[dict[str, object]]:
     return [
+        {
+            "code": "ops_state_confirms_advisory_only",
+            "passed": bool(ops_state.get("present"))
+            and bool(ops_state.get("advisory_only"))
+            and str(ops_state.get("execution_mode", "")).strip() == "advisory_only",
+            "detail": "/dashboard/ops/state confirms advisory_only before the probe",
+        },
+        {
+            "code": "auto_promotion_disabled",
+            "passed": bool(safety_config.get("present"))
+            and not bool(safety_config.get("auto_promotion_enabled")),
+            "detail": "auto_promotion.enabled is false in the captured config snapshot",
+        },
+        {
+            "code": "risk_guardrails_not_relaxed",
+            "passed": bool(safety_config.get("present"))
+            and not bool(safety_config.get("risk_guardrails_failed")),
+            "detail": "core financial, position and circuit-breaker guardrails remain conservative",
+        },
         {
             "code": "runtime_state_latest_signals_persisted",
             "passed": bool(latest_signals.get("runtime_present"))
@@ -246,6 +372,12 @@ def _next_actions(checks: Sequence[Mapping[str, object]]) -> list[str]:
     actions: list[str] = []
     if "runtime_state_latest_signals_persisted" in failed:
         actions.append("Run one controlled advisory pipeline and confirm runtime_state write.")
+    if "ops_state_confirms_advisory_only" in failed:
+        actions.append("Enable advisory_only and recapture /dashboard/ops/state before rerun.")
+    if "auto_promotion_disabled" in failed:
+        actions.append("Disable auto_promotion before using this probe as P0 evidence.")
+    if "risk_guardrails_not_relaxed" in failed:
+        actions.append("Restore core financial, position and circuit-breaker guardrails.")
     if "runtime_state_latest_signals_source_is_pipeline_run" in failed:
         actions.append(
             "Confirm latest_signals was refreshed by the new pipeline_run, "
@@ -346,6 +478,29 @@ def _int(value: object) -> int:
         except ValueError:
             return 0
     return 0
+
+
+def _as_float(value: object) -> float:
+    if isinstance(value, bool):
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _as_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return False
 
 
 if __name__ == "__main__":

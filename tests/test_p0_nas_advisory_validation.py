@@ -11,6 +11,46 @@ def _check_map(report: dict[str, object]) -> dict[str, bool]:
     return {str(item["code"]): bool(item["passed"]) for item in checks}
 
 
+def _ops_state() -> dict[str, object]:
+    return {
+        "mode": "simulation",
+        "simulation_mode": True,
+        "enabled": True,
+        "toggle_enabled": True,
+        "advisory_only": True,
+        "execution_mode": "advisory_only",
+    }
+
+
+def _safe_config_snapshot() -> dict[str, object]:
+    return {
+        "auto_promotion": {"enabled": False},
+        "financial_filter": {
+            "enabled": True,
+            "exclude_st": True,
+            "exclude_delisting_risk": True,
+            "min_roe": 0.04,
+            "max_debt_ratio": 0.72,
+        },
+        "monster_risk": {
+            "max_total_position": 0.25,
+            "max_stock_position": 0.08,
+            "disable_if_sentiment_below": 45,
+        },
+        "circuit_breaker": {
+            "intraday_stop_after_losses": 2,
+            "portfolio_daily_drawdown_stop": 2.5,
+            "portfolio_weekly_drawdown_reduce": 4.0,
+        },
+        "capital_curve": {"drawdown_freeze": 15.0},
+        "models": {"cross_review": {"degraded_consensus_enabled": False}},
+        "soup_strategy": {
+            "recovery_buy_enabled": False,
+            "disagreement_probe_enabled": False,
+        },
+    }
+
+
 def test_nas_advisory_validation_passes_controlled_advisory_evidence() -> None:
     report = build_validation_report(
         runtime_state={
@@ -66,6 +106,8 @@ def test_nas_advisory_validation_passes_controlled_advisory_evidence() -> None:
                 "data_gaps": [],
             },
         },
+        ops_state=_ops_state(),
+        config_snapshot=_safe_config_snapshot(),
     )
 
     assert report["status"] == "pass"
@@ -75,6 +117,9 @@ def test_nas_advisory_validation_passes_controlled_advisory_evidence() -> None:
     assert "PASS: runtime_state_latest_signals_source_is_pipeline_run" in markdown
     assert "latest_pipeline_execution_mode: advisory_only" in markdown
     assert "PASS: pipeline_has_advisory_attempt_fields" in markdown
+    assert "PASS: auto_promotion_disabled" in markdown
+    assert "risk_guardrails_status: pass" in markdown
+    assert "enabled_experimental_entry_flags" in markdown
 
 
 def test_nas_advisory_validation_flags_week5_fallback_and_execution_mix() -> None:
@@ -116,6 +161,21 @@ def test_nas_advisory_validation_flags_week5_fallback_and_execution_mix() -> Non
                 "dry_run_attempts": {},
             },
         },
+        ops_state={
+            "advisory_only": False,
+            "execution_mode": "portfolio_auto_apply",
+        },
+        config_snapshot={
+            **_safe_config_snapshot(),
+            "auto_promotion": {"enabled": True},
+            "financial_filter": {
+                "enabled": True,
+                "exclude_st": False,
+                "exclude_delisting_risk": True,
+                "min_roe": 0.01,
+                "max_debt_ratio": 0.9,
+            },
+        },
     )
 
     assert report["status"] == "needs_review"
@@ -126,3 +186,6 @@ def test_nas_advisory_validation_flags_week5_fallback_and_execution_mix() -> Non
     assert checks["latest_pipeline_is_advisory_only"] is False
     assert checks["pipeline_has_empty_executions"] is False
     assert checks["signal_quality_keeps_advisory_out_of_execution"] is False
+    assert checks["ops_state_confirms_advisory_only"] is False
+    assert checks["auto_promotion_disabled"] is False
+    assert checks["risk_guardrails_not_relaxed"] is False

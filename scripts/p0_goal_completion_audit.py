@@ -250,6 +250,9 @@ def _check_nas_advisory(nas_validation: Mapping[str, object]) -> dict[str, objec
         if isinstance(item, Mapping)
     }
     required = {
+        "ops_state_confirms_advisory_only",
+        "auto_promotion_disabled",
+        "risk_guardrails_not_relaxed",
         "runtime_state_latest_signals_persisted",
         "runtime_state_latest_signals_source_is_pipeline_run",
         "signals_latest_uses_latest_not_week5_fallback",
