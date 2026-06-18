@@ -432,13 +432,17 @@ class RuntimeStateService:
             service._last_signal_timestamp = str(
                 latest_signal_snapshot.get("timestamp", "")
             ).strip()
-            service._last_signal_source = "runtime_state"
+            service._last_signal_source = str(
+                latest_signal_snapshot.get("source", "")
+            ).strip() or "pipeline_run"
+            service._last_signal_storage_source = "runtime_state"
             service._latest_signal_snapshot_dirty = False
         else:
             service._last_signal_payload = []
             service._last_signal_trace_id = ""
             service._last_signal_timestamp = ""
             service._last_signal_source = ""
+            service._last_signal_storage_source = ""
             service._latest_signal_snapshot_dirty = False
         service._reconcile_history = service._merge_runtime_state_history(
             self._load_runtime_state_history_sidecar(

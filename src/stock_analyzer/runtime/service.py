@@ -271,6 +271,7 @@ class StockAnalyzerService:
         self._last_signal_trace_id: str = ""
         self._last_signal_timestamp: str = ""
         self._last_signal_source: str = ""
+        self._last_signal_storage_source: str = ""
         self._last_signal_snapshot: dict[str, object] | None = None
         self._latest_signal_snapshot_dirty = False
         self._last_notification_filter_diagnostics: dict[str, object] | None = None
@@ -2103,6 +2104,7 @@ class StockAnalyzerService:
                 "timestamp": self._last_signal_timestamp,
                 "signals": [dict(item) for item in self._last_signal_payload],
                 "source": self._last_signal_source or "memory",
+                "storage_source": self._last_signal_storage_source or "memory",
             }
         persisted = self._last_signal_snapshot
         if isinstance(persisted, Mapping):
@@ -2113,6 +2115,7 @@ class StockAnalyzerService:
                     "timestamp": str(persisted.get("timestamp", "")).strip(),
                     "signals": [dict(item) for item in raw_signals if isinstance(item, Mapping)],
                     "source": str(persisted.get("source", "")).strip() or "runtime_state",
+                    "storage_source": "runtime_state",
                 }
         week5_signals = _extract_week5_candidate_signals(self._last_week5_scan_report)
         if week5_signals:
@@ -2122,12 +2125,14 @@ class StockAnalyzerService:
                 "timestamp": str(week5_report.get("timestamp", "")).strip(),
                 "signals": week5_signals,
                 "source": "week5_latest_candidates",
+                "storage_source": "runtime_state",
             }
         return {
             "trace_id": self._last_signal_trace_id,
             "timestamp": self._last_signal_timestamp,
             "signals": [],
             "source": "empty",
+            "storage_source": "",
         }
 
     def _update_latest_signal_snapshot(
@@ -2143,6 +2148,7 @@ class StockAnalyzerService:
         self._last_signal_trace_id = trace_id
         self._last_signal_timestamp = timestamp.isoformat()
         self._last_signal_source = source
+        self._last_signal_storage_source = "memory"
         snapshot = {
             "trace_id": trace_id,
             "timestamp": timestamp.isoformat(),
@@ -3564,6 +3570,7 @@ class StockAnalyzerService:
             self._last_signal_trace_id = ""
             self._last_signal_timestamp = ""
             self._last_signal_source = ""
+            self._last_signal_storage_source = ""
             self._last_signal_snapshot = None
             self._latest_signal_snapshot_dirty = False
             blocked_payload = {

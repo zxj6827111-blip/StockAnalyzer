@@ -190,6 +190,7 @@ class SignalQualityAuditor:
             "loss_examples": examples,
             "execution_stages": execution["stages"],
             "execution_attempts": execution["attempts"],
+            "advisory_attempts": execution["advisory_attempts"],
             "execution_status_breakdown": execution["status_breakdown"],
             "execution_reason_breakdown": execution["reason_breakdown"],
             "outcome_observation": execution["outcome_observation"],
@@ -423,6 +424,7 @@ def _execution_risk_context(signals: list[dict[str, object]]) -> dict[str, objec
 
 def _execution_funnel_from_events(events: list[dict[str, object]]) -> dict[str, object]:
     attempts: Counter[str] = Counter()
+    advisory_attempts: Counter[str] = Counter()
     status_breakdown: Counter[str] = Counter()
     reason_breakdown: Counter[str] = Counter()
     realized_returns: list[float] = []
@@ -438,13 +440,18 @@ def _execution_funnel_from_events(events: list[dict[str, object]]) -> dict[str, 
         payload = _mapping(event.get("payload"))
         if event_type == "pipeline_run":
             event_count += 1
+            execution_mode = _lower_str(payload.get("execution_mode"))
             portfolio_update = _mapping(payload.get("portfolio_update"))
             raw_attempts = _mapping(portfolio_update.get("execution_attempts"))
+            target_attempts = advisory_attempts if execution_mode == "advisory_only" else attempts
             for key, value in raw_attempts.items():
                 normalized_key = str(key)
                 count = _int(value)
-                attempts[normalized_key] += count
-                if normalized_key in {"pre_trade_blocked", "risk_gate_blocked"}:
+                target_attempts[normalized_key] += count
+                if (
+                    execution_mode != "advisory_only"
+                    and normalized_key in {"pre_trade_blocked", "risk_gate_blocked"}
+                ):
                     blocked_attempt_totals[normalized_key] += count
             raw_executions = portfolio_update.get("executions")
             if isinstance(raw_executions, list):
@@ -560,6 +567,7 @@ def _execution_funnel_from_events(events: list[dict[str, object]]) -> dict[str, 
     return {
         "event_count": event_count,
         "attempts": dict(attempts),
+        "advisory_attempts": dict(advisory_attempts),
         "status_breakdown": dict(status_breakdown),
         "reason_breakdown": dict(reason_breakdown.most_common(12)),
         "loss_counts": dict(loss_counts),

@@ -172,7 +172,8 @@ def test_runtime_state_persists_latest_signals_after_advisory_pipeline(
     reloaded = _new_service(config)
     latest = reloaded.latest_signals_snapshot()
     assert latest["trace_id"] == "trace-latest-signals"
-    assert latest["source"] == "runtime_state"
+    assert latest["source"] == "pipeline_run"
+    assert latest["storage_source"] == "runtime_state"
     signals = _as_mapping_list(latest["signals"])
     assert signals[0]["symbol"] == "600000"
     assert "recommendation_id" in signals[0]

@@ -230,6 +230,38 @@ def test_signal_quality_auditor_builds_signal_loss_funnel_from_signals_and_event
     assert "pre_trade_blocked" in by_symbol["000001"]["blockers"]
 
 
+def test_signal_quality_auditor_keeps_advisory_attempts_out_of_execution_stages() -> None:
+    auditor = SignalQualityAuditor(config=_load_config())
+
+    report = auditor.build_report(
+        latest_signals=[],
+        audit_events=[
+            {
+                "event_type": "pipeline_run",
+                "payload": {
+                    "execution_mode": "advisory_only",
+                    "portfolio_update": {
+                        "execution_attempts": {
+                            "signals": 3,
+                            "buy_signals": 2,
+                            "buy_new_attempted": 0,
+                            "pre_trade_blocked": 0,
+                        },
+                        "executions": [],
+                    },
+                },
+            }
+        ],
+    )
+
+    funnel = report["signal_loss_funnel"]
+    assert funnel["execution_attempts"] == {}
+    assert funnel["execution_stages"]["buy_signals"] == 0
+    assert funnel["execution_stages"]["buy_new_attempted"] == 0
+    assert funnel["advisory_attempts"]["signals"] == 3
+    assert funnel["advisory_attempts"]["buy_signals"] == 2
+
+
 def test_signal_quality_auditor_symbol_ledger_uses_block_category_for_risk_gate() -> None:
     auditor = SignalQualityAuditor(config=_load_config())
 

@@ -151,3 +151,43 @@ def test_write_p0_analysis_inputs_collects_runtime_and_week5_rows(tmp_path: Path
     assert (
         tmp_path / "analysis" / "p4_cross_review_failure_analysis_v1.json"
     ).exists()
+
+
+def test_write_p0_analysis_inputs_does_not_mutate_runtime_state(tmp_path: Path) -> None:
+    config = _load_test_config()
+    model_artifact = tmp_path / "model_v1.json"
+    runtime_state = tmp_path / "runtime_state.json"
+    _write_json(
+        model_artifact,
+        {
+            "training_metrics": {"positive_rate": 0.0, "test_samples": 10},
+            "metadata": {"test_samples": 10},
+        },
+    )
+    original_runtime_state = {
+        "latest_signals": {
+            "timestamp": "2026-06-18T10:00:00",
+            "signals": [
+                {
+                    "symbol": "600000",
+                    "score": 80,
+                    "action": "buy",
+                    "probabilities": {"lgbm": 0.7, "xgb": 0.65, "meta": 0.62},
+                }
+            ],
+        }
+    }
+    _write_json(runtime_state, original_runtime_state)
+    before = runtime_state.read_text(encoding="utf-8")
+
+    write_p0_analysis_inputs(
+        analysis_dir=tmp_path / "analysis",
+        model_artifact_path=model_artifact,
+        learning_manifest_paths=[],
+        signal_source_paths=[runtime_state],
+        config=config,
+        generated_at=datetime.fromisoformat("2026-06-18T12:00:00"),
+    )
+
+    assert runtime_state.read_text(encoding="utf-8") == before
+    assert (tmp_path / "analysis" / "p0_analysis_inputs_manifest.json").exists()
