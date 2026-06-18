@@ -46,7 +46,8 @@ def test_nas_advisory_validation_passes_controlled_advisory_evidence() -> None:
                     "execution_mode": "advisory_only",
                     "portfolio_update": {
                         "status": "simulated_auto_applied",
-                        "execution_attempts": {"signals": 1, "buy_signals": 0},
+                        "execution_attempts": {},
+                        "advisory_attempts": {"signals": 1, "buy_signals": 0},
                         "executions": [],
                     },
                 },
@@ -73,6 +74,7 @@ def test_nas_advisory_validation_passes_controlled_advisory_evidence() -> None:
     markdown = render_markdown_report(report)
     assert "PASS: runtime_state_latest_signals_source_is_pipeline_run" in markdown
     assert "latest_pipeline_execution_mode: advisory_only" in markdown
+    assert "PASS: pipeline_has_advisory_attempt_fields" in markdown
 
 
 def test_nas_advisory_validation_flags_week5_fallback_and_execution_mix() -> None:

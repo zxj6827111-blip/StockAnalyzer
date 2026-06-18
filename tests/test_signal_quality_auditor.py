@@ -239,7 +239,8 @@ def test_signal_quality_auditor_keeps_advisory_attempts_out_of_execution_stages(
                 "payload": {
                     "execution_mode": "advisory_only",
                     "portfolio_update": {
-                        "execution_attempts": {
+                        "execution_attempts": {},
+                        "advisory_attempts": {
                             "signals": 3,
                             "buy_signals": 2,
                             "buy_new_attempted": 0,
@@ -258,6 +259,34 @@ def test_signal_quality_auditor_keeps_advisory_attempts_out_of_execution_stages(
     assert funnel["execution_stages"]["buy_new_attempted"] == 0
     assert funnel["advisory_attempts"]["signals"] == 3
     assert funnel["advisory_attempts"]["buy_signals"] == 2
+
+
+def test_signal_quality_auditor_reads_legacy_advisory_execution_attempts() -> None:
+    auditor = SignalQualityAuditor(config=_load_config())
+
+    report = auditor.build_report(
+        latest_signals=[],
+        audit_events=[
+            {
+                "event_type": "pipeline_run",
+                "payload": {
+                    "execution_mode": "advisory_only",
+                    "portfolio_update": {
+                        "execution_attempts": {
+                            "signals": 2,
+                            "buy_signals": 1,
+                        },
+                        "executions": [],
+                    },
+                },
+            }
+        ],
+    )
+
+    funnel = report["signal_loss_funnel"]
+    assert funnel["execution_attempts"] == {}
+    assert funnel["advisory_attempts"]["signals"] == 2
+    assert funnel["advisory_attempts"]["buy_signals"] == 1
 
 
 def test_signal_quality_auditor_keeps_dry_run_attempts_out_of_execution_stages() -> None:

@@ -3697,6 +3697,17 @@ class StockAnalyzerService:
 
         portfolio_update: Mapping[str, object]
         if advisory_only_mode:
+            advisory_attempts = {
+                "signals": len(signals),
+                "buy_signals": sum(1 for signal in signals if signal.action == "buy"),
+                "non_buy_signals": sum(1 for signal in signals if signal.action != "buy"),
+                "buy_new_attempted": 0,
+                "buy_new_filled": 0,
+                "buy_new_rejected": 0,
+                "pre_trade_blocked": 0,
+                "risk_gate_blocked": 0,
+                "sell_executed": 0,
+            }
             portfolio_update = {
                 "opened": 0,
                 "adjusted": 0,
@@ -3707,17 +3718,8 @@ class StockAnalyzerService:
                 "skipped_no_cash": 0,
                 "open_positions": len(self._portfolio.positions()),
                 "status": "skipped_advisory_only",
-                "execution_attempts": {
-                    "signals": len(signals),
-                    "buy_signals": sum(1 for signal in signals if signal.action == "buy"),
-                    "non_buy_signals": sum(1 for signal in signals if signal.action != "buy"),
-                    "buy_new_attempted": 0,
-                    "buy_new_filled": 0,
-                    "buy_new_rejected": 0,
-                    "pre_trade_blocked": 0,
-                    "risk_gate_blocked": 0,
-                    "sell_executed": 0,
-                },
+                "execution_attempts": {},
+                "advisory_attempts": advisory_attempts,
                 "executions": [],
             }
         elif live_auto_execute:
@@ -17865,6 +17867,16 @@ def _audit_portfolio_update_summary(portfolio_update: Mapping[str, object]) -> d
     if isinstance(raw_attempts, Mapping):
         payload["execution_attempts"] = {
             str(key): _as_int(value, default=0) for key, value in raw_attempts.items()
+        }
+    raw_advisory_attempts = portfolio_update.get("advisory_attempts")
+    if isinstance(raw_advisory_attempts, Mapping):
+        payload["advisory_attempts"] = {
+            str(key): _as_int(value, default=0) for key, value in raw_advisory_attempts.items()
+        }
+    raw_dry_run_attempts = portfolio_update.get("dry_run_attempts")
+    if isinstance(raw_dry_run_attempts, Mapping):
+        payload["dry_run_attempts"] = {
+            str(key): _as_int(value, default=0) for key, value in raw_dry_run_attempts.items()
         }
     return payload
 

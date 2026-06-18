@@ -908,7 +908,6 @@ def _summarize_execution_events(events: Sequence[Mapping[str, object]]) -> dict[
             or bool(portfolio_update.get("dry_run", False))
             or "dry_run" in mode
         )
-        raw_attempts = _mapping(portfolio_update.get("execution_attempts"))
         target = (
             advisory_attempts
             if mode == "advisory_only"
@@ -916,6 +915,16 @@ def _summarize_execution_events(events: Sequence[Mapping[str, object]]) -> dict[
             if is_dry_run
             else attempts
         )
+        if mode == "advisory_only":
+            raw_attempts = _mapping(portfolio_update.get("advisory_attempts")) or _mapping(
+                portfolio_update.get("execution_attempts")
+            )
+        elif is_dry_run:
+            raw_attempts = _mapping(portfolio_update.get("dry_run_attempts")) or _mapping(
+                portfolio_update.get("execution_attempts")
+            )
+        else:
+            raw_attempts = _mapping(portfolio_update.get("execution_attempts"))
         for key, value in raw_attempts.items():
             target[str(key)] += _int(value)
         raw_executions = portfolio_update.get("executions")
@@ -1086,6 +1095,7 @@ def _threshold_grid(
         ),
     )[:10]
     effective = any(int(item["pass_count"]) > 0 for item in results)
+    blocking_diagnostics = _threshold_blocking_diagnostics(rows)
     return {
         "status": "candidate_generating" if effective else "not_effective",
         "grid": {
@@ -1095,6 +1105,8 @@ def _threshold_grid(
             "score_min": list(_MODEL_THRESHOLD_GRID["score_min"]),
         },
         "total_rows": total,
+        "blocking_diagnostics": blocking_diagnostics,
+        "minimum_candidate_thresholds": _minimum_candidate_thresholds(blocking_diagnostics),
         "outcome_linkage": {
             "symbols_with_returns": len(returns_by_symbol),
             "minimum_observed_trades_for_profitability_rank": 30,
@@ -1109,6 +1121,161 @@ def _threshold_grid(
             "can be linked back to candidate symbols."
         ),
     }
+
+
+def _threshold_blocking_diagnostics(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    minimum = {
+        "xgb_min": float(_MODEL_THRESHOLD_GRID["xgb_min"][0]),
+        "meta_min": float(_MODEL_THRESHOLD_GRID["meta_min"][0]),
+        "max_diff": float(_MODEL_THRESHOLD_GRID["max_diff"][-1]),
+        "score_min": float(_MODEL_THRESHOLD_GRID["score_min"][0]),
+    }
+    values: dict[str, list[float]] = {
+        "lgbm": [],
+        "xgb": [],
+        "meta": [],
+        "model_diff": [],
+        "score": [],
+    }
+    missing_rows = 0
+    minimum_grid_pass = 0
+    blockers: Counter[str] = Counter()
+    examples: list[dict[str, object]] = []
+    for row in rows:
+        probabilities = _mapping(row.get("probabilities"))
+        lgbm = _float(probabilities.get("lgbm"))
+        xgb = _float(probabilities.get("xgb"))
+        meta = _float(probabilities.get("meta"))
+        score = _float(row.get("score"))
+        if any(value is None for value in (lgbm, xgb, meta, score)):
+            missing_rows += 1
+            blockers["missing_probability_or_score"] += 1
+            continue
+        lgbm_f = float(lgbm)
+        xgb_f = float(xgb)
+        meta_f = float(meta)
+        score_f = float(score)
+        diff = abs(lgbm_f - xgb_f)
+        values["lgbm"].append(lgbm_f)
+        values["xgb"].append(xgb_f)
+        values["meta"].append(meta_f)
+        values["model_diff"].append(diff)
+        values["score"].append(score_f)
+        row_blockers: list[str] = []
+        if xgb_f < minimum["xgb_min"]:
+            row_blockers.append("xgb_below_min_grid")
+        if meta_f < minimum["meta_min"]:
+            row_blockers.append("meta_below_min_grid")
+        if diff > minimum["max_diff"]:
+            row_blockers.append("model_diff_above_max_grid")
+        if score_f < minimum["score_min"]:
+            row_blockers.append("score_below_min_grid")
+        if row_blockers:
+            blockers.update(row_blockers)
+        else:
+            minimum_grid_pass += 1
+        if len(examples) < 12:
+            examples.append(
+                {
+                    "symbol": str(row.get("symbol", "")).strip(),
+                    "action": str(row.get("action", "")).strip(),
+                    "score": round(score_f, 6),
+                    "probabilities": {
+                        "lgbm": round(lgbm_f, 6),
+                        "xgb": round(xgb_f, 6),
+                        "meta": round(meta_f, 6),
+                    },
+                    "model_diff": round(diff, 6),
+                    "blockers": row_blockers,
+                }
+            )
+    complete_rows = len(values["score"])
+    return {
+        "minimum_grid": minimum,
+        "total_rows": len(rows),
+        "complete_probability_score_rows": complete_rows,
+        "missing_probability_or_score_rows": missing_rows,
+        "minimum_grid_pass_count": minimum_grid_pass,
+        "minimum_grid_pass_rate": round(minimum_grid_pass / len(rows), 6) if rows else 0.0,
+        "blocker_counts": dict(blockers.most_common()),
+        "distributions": {
+            "lgbm": _distribution(values["lgbm"], pass_threshold=0.0),
+            "xgb": _distribution(values["xgb"], pass_threshold=minimum["xgb_min"]),
+            "meta": _distribution(values["meta"], pass_threshold=minimum["meta_min"]),
+            "model_diff": _max_threshold_distribution(
+                values["model_diff"],
+                pass_threshold=minimum["max_diff"],
+            ),
+            "score": _distribution(values["score"], pass_threshold=minimum["score_min"]),
+        },
+        "example_complete_rows": examples,
+        "interpretation": _threshold_blocking_interpretation(
+            complete_rows=complete_rows,
+            minimum_grid_pass=minimum_grid_pass,
+            blockers=blockers,
+        ),
+    }
+
+
+def _minimum_candidate_thresholds(
+    blocking_diagnostics: Mapping[str, object],
+) -> dict[str, object]:
+    distributions = _mapping(blocking_diagnostics.get("distributions"))
+    if not distributions:
+        return {"status": "unavailable"}
+    xgb = _mapping(distributions.get("xgb"))
+    meta = _mapping(distributions.get("meta"))
+    diff = _mapping(distributions.get("model_diff"))
+    score = _mapping(distributions.get("score"))
+    return {
+        "status": "suggested_from_complete_rows",
+        "note": (
+            "These are descriptive sample-scale thresholds, not production relaxations. "
+            "Use them only for the next shadow grid when current grid produces zero candidates."
+        ),
+        "xgb_min_p75": xgb.get("p75"),
+        "xgb_min_p90": xgb.get("p90"),
+        "meta_min_p75": meta.get("p75"),
+        "meta_min_p90": meta.get("p90"),
+        "max_diff_p75": diff.get("p75"),
+        "max_diff_p90": diff.get("p90"),
+        "score_min_p75": score.get("p75"),
+        "score_min_p90": score.get("p90"),
+    }
+
+
+def _max_threshold_distribution(
+    values: Sequence[float],
+    *,
+    pass_threshold: float,
+) -> dict[str, object]:
+    distribution = _distribution(values, pass_threshold=0.0)
+    if not values:
+        return distribution
+    distribution["pass"] = sum(1 for value in values if value <= pass_threshold)
+    distribution["pass_threshold"] = pass_threshold
+    distribution["pass_direction"] = "lte"
+    return distribution
+
+
+def _threshold_blocking_interpretation(
+    *,
+    complete_rows: int,
+    minimum_grid_pass: int,
+    blockers: Counter[str],
+) -> str:
+    if complete_rows == 0:
+        return "all rows are missing probability or score fields; fix signal persistence first"
+    if minimum_grid_pass > 0:
+        return "current grid generates candidates; rank only after mature outcomes are linked"
+    dominant = [key for key, _ in blockers.most_common(3)]
+    if "xgb_below_min_grid" in dominant or "meta_below_min_grid" in dominant:
+        return "current shadow grid is still above captured model probability scale"
+    if "score_below_min_grid" in dominant:
+        return "score floor is above captured candidate score scale"
+    if "model_diff_above_max_grid" in dominant:
+        return "model disagreement is the dominant blocker"
+    return "current grid does not generate candidates; inspect blocker_counts before tuning"
 
 
 def _returns_by_symbol(records_by_symbol: Mapping[str, object]) -> dict[str, list[float]]:
@@ -1429,6 +1596,104 @@ def _financial_data_quality_codes(
     return _dedupe_preserve_order(codes)
 
 
+def _financial_low_roe_evidence(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    config: StockAnalyzerConfig,
+) -> dict[str, object]:
+    confirmed = 0
+    inferred = 0
+    ambiguous = 0
+    confirmed_symbols: set[str] = set()
+    inferred_symbols: set[str] = set()
+    ambiguous_symbols: set[str] = set()
+    examples: list[dict[str, object]] = []
+    min_roe = float(config.financial_filter.min_roe)
+    for row in rows:
+        codes = set(_financial_data_quality_codes(row, config=config))
+        if "low_roe_penalty" not in codes:
+            continue
+        roe = _financial_roe_value(row)
+        has_data_issue = bool(
+            codes.intersection(
+                {
+                    "missing_financials",
+                    "missing_financial_data_gate",
+                    "default_financial_penalty",
+                    "stale_financials",
+                }
+            )
+        )
+        symbol = str(row.get("symbol", "")).strip()
+        if roe is not None and not has_data_issue:
+            if roe < min_roe:
+                confirmed += 1
+                if symbol:
+                    confirmed_symbols.add(symbol)
+                bucket = "confirmed_true_low_roe"
+            else:
+                ambiguous += 1
+                if symbol:
+                    ambiguous_symbols.add(symbol)
+                bucket = "ambiguous_low_roe_flag_value_not_below_policy"
+        elif has_data_issue:
+            ambiguous += 1
+            if symbol:
+                ambiguous_symbols.add(symbol)
+            bucket = "ambiguous_low_roe_with_data_quality_issue"
+        else:
+            inferred += 1
+            if symbol:
+                inferred_symbols.add(symbol)
+            bucket = "inferred_low_roe_without_raw_value"
+        if len(examples) < 12:
+            examples.append(
+                {
+                    "symbol": symbol,
+                    "bucket": bucket,
+                    "roe_value": roe,
+                    "codes": sorted(codes),
+                }
+            )
+    return {
+        "policy_min_roe": min_roe,
+        "confirmed_true_low_roe_rows": confirmed,
+        "inferred_low_roe_rows": inferred,
+        "ambiguous_low_roe_rows": ambiguous,
+        "confirmed_symbols": sorted(confirmed_symbols)[:20],
+        "inferred_symbols": sorted(inferred_symbols)[:20],
+        "ambiguous_symbols": sorted(ambiguous_symbols)[:20],
+        "examples": examples,
+        "evidence_strength": "strong" if confirmed else "weak_without_raw_financial_fields",
+    }
+
+
+def _financial_roe_value(row: Mapping[str, object]) -> float | None:
+    direct_keys = (
+        "roe",
+        "roe_ttm",
+        "return_on_equity",
+        "financial_roe",
+        "latest_roe",
+    )
+    for key in direct_keys:
+        value = _float(row.get(key))
+        if value is not None:
+            return value
+    trace = _mapping(row.get("decision_trace"))
+    financial_gate = _mapping(trace.get("financial_gate"))
+    for key in direct_keys:
+        value = _float(financial_gate.get(key))
+        if value is not None:
+            return value
+    metrics = _mapping(row.get("financial_metrics"))
+    for key in direct_keys:
+        value = _float(metrics.get(key))
+        if value is not None:
+            return value
+    return None
+
+
 def _financial_classification(
     *,
     counter: Counter[str],
@@ -1451,13 +1716,13 @@ def _financial_classification(
                 "buy_rows": int(buy_rows_by_code.get(code, 0)),
             }
         )
-    true_low_roe_rows = max(
-        0,
-        counter.get("low_roe_penalty", 0) - counter.get("missing_financials", 0),
-    )
+    low_roe_evidence = _financial_low_roe_evidence(rows=rows, config=config)
     return {
         "buckets": buckets,
-        "true_low_roe_evidence_rows": int(true_low_roe_rows),
+        "true_low_roe_evidence_rows": int(
+            low_roe_evidence["confirmed_true_low_roe_rows"]
+        ),
+        "low_roe_evidence": low_roe_evidence,
         "missing_or_default_evidence_rows": int(
             counter.get("missing_financials", 0)
             + counter.get("missing_financial_data_gate", 0)
@@ -1485,6 +1750,9 @@ def _short_term_strength_overblocked(
 ) -> dict[str, object]:
     threshold = _score_threshold(config)
     blocked_rows = []
+    data_quality_issue_rows = 0
+    confirmed_low_roe_rows = 0
+    inferred_low_roe_rows = 0
     for row in rows:
         codes = _financial_data_quality_codes(row, config=config)
         score = _float(row.get("score"))
@@ -1494,9 +1762,26 @@ def _short_term_strength_overblocked(
             and any(code in codes for code in ("low_roe_penalty", "financial_gate_block"))
         ):
             blocked_rows.append(row)
+            code_set = set(codes)
+            if code_set.intersection(
+                {
+                    "missing_financials",
+                    "missing_financial_data_gate",
+                    "default_financial_penalty",
+                    "stale_financials",
+                }
+            ):
+                data_quality_issue_rows += 1
+            elif _financial_roe_value(row) is not None and "low_roe_penalty" in code_set:
+                confirmed_low_roe_rows += 1
+            else:
+                inferred_low_roe_rows += 1
     return {
         "rows": len(blocked_rows),
         "score_threshold": threshold,
+        "data_quality_issue_rows": data_quality_issue_rows,
+        "confirmed_low_roe_rows": confirmed_low_roe_rows,
+        "inferred_low_roe_rows": inferred_low_roe_rows,
         "symbols": sorted({str(row.get("symbol", "")).strip() for row in blocked_rows})[:20],
         "interpretation": (
             "high-score rows are still receiving financial penalties; verify in shadow "

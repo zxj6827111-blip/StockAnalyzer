@@ -452,13 +452,19 @@ def _execution_funnel_from_events(events: list[dict[str, object]]) -> dict[str, 
                 or bool(payload.get("dry_run_execution", False))
                 or bool(portfolio_update.get("dry_run", False))
             )
-            raw_attempts = _mapping(portfolio_update.get("execution_attempts"))
             if execution_mode == "advisory_only":
                 target_attempts = advisory_attempts
+                raw_attempts = _mapping(portfolio_update.get("advisory_attempts")) or _mapping(
+                    portfolio_update.get("execution_attempts")
+                )
             elif is_dry_run:
                 target_attempts = dry_run_attempts
+                raw_attempts = _mapping(portfolio_update.get("dry_run_attempts")) or _mapping(
+                    portfolio_update.get("execution_attempts")
+                )
             else:
                 target_attempts = attempts
+                raw_attempts = _mapping(portfolio_update.get("execution_attempts"))
             for key, value in raw_attempts.items():
                 normalized_key = str(key)
                 count = _int(value)

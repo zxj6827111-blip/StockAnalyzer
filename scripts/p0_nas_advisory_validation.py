@@ -221,9 +221,13 @@ def _checks(
             "detail": "portfolio_update.executions exists and is empty",
         },
         {
-            "code": "pipeline_has_attempt_fields",
-            "passed": bool(pipeline.get("has_execution_attempts")),
-            "detail": "pipeline_run contains raw portfolio_update.execution_attempts",
+            "code": "pipeline_has_advisory_attempt_fields",
+            "passed": bool(pipeline.get("has_advisory_attempts"))
+            and not bool(pipeline.get("execution_attempts")),
+            "detail": (
+                "advisory pipeline_run contains advisory_attempts and keeps "
+                "execution_attempts empty"
+            ),
         },
         {
             "code": "signal_quality_keeps_advisory_out_of_execution",
@@ -251,7 +255,10 @@ def _next_actions(checks: Sequence[Mapping[str, object]]) -> list[str]:
         actions.append("Capture GET /signals/latest after advisory pipeline and inspect source.")
     if "latest_pipeline_is_advisory_only" in failed:
         actions.append("Do not interpret this run; rerun with config app.advisory_only=true.")
-    if "pipeline_has_empty_executions" in failed or "pipeline_has_attempt_fields" in failed:
+    if (
+        "pipeline_has_empty_executions" in failed
+        or "pipeline_has_advisory_attempt_fields" in failed
+    ):
         actions.append(
             "Inspect latest pipeline_run audit payload shape before using funnel results."
         )

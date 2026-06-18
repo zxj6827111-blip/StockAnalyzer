@@ -429,6 +429,71 @@ def test_final_report_threshold_sweep_links_candidate_variants_to_outcomes(
     assert best["final_equity"] is not None
     assert "win_rate" in best
     assert "max_drawdown" in best
+    diagnostics = final_report["threshold_sweep"]["blocking_diagnostics"]
+    assert diagnostics["complete_probability_score_rows"] == 2
+    assert diagnostics["minimum_grid_pass_count"] >= 1
+    assert diagnostics["distributions"]["xgb"]["pass_threshold"] == 0.25
+
+
+def test_final_report_threshold_sweep_explains_zero_candidate_grid(tmp_path: Path) -> None:
+    config = _load_test_config()
+    model_artifact = tmp_path / "model_v1.json"
+    runtime_state = tmp_path / "runtime_state.json"
+    _write_json(
+        model_artifact,
+        {
+            "training_metrics": {"positive_rate": 0.12, "test_samples": 100},
+            "metadata": {"test_samples": 100},
+        },
+    )
+    _write_json(
+        runtime_state,
+        {
+            "latest_signals": {
+                "timestamp": "2026-06-18T10:00:00",
+                "source": "pipeline_run",
+                "signals": [
+                    {
+                        "symbol": "600000",
+                        "score": 39.5,
+                        "action": "watch",
+                        "probabilities": {"lgbm": 0.36, "xgb": 0.18, "meta": 0.26},
+                    },
+                    {
+                        "symbol": "000001",
+                        "score": 20.0,
+                        "action": "watch",
+                    },
+                ],
+            }
+        },
+    )
+
+    write_p0_analysis_inputs(
+        analysis_dir=tmp_path / "analysis",
+        model_artifact_path=model_artifact,
+        learning_manifest_paths=[],
+        signal_source_paths=[runtime_state],
+        config=config,
+        generated_at=datetime.fromisoformat("2026-06-18T12:00:00"),
+    )
+
+    final_report = json.loads(
+        (tmp_path / "analysis" / "final_report_v3.json").read_text("utf-8")
+    )
+    sweep = final_report["threshold_sweep"]
+    diagnostics = sweep["blocking_diagnostics"]
+    suggested = sweep["minimum_candidate_thresholds"]
+
+    assert sweep["status"] == "not_effective"
+    assert diagnostics["complete_probability_score_rows"] == 1
+    assert diagnostics["missing_probability_or_score_rows"] == 1
+    assert diagnostics["minimum_grid_pass_count"] == 0
+    assert diagnostics["blocker_counts"]["xgb_below_min_grid"] == 1
+    assert diagnostics["blocker_counts"]["meta_below_min_grid"] == 1
+    assert diagnostics["blocker_counts"]["score_below_min_grid"] == 1
+    assert "probability scale" in diagnostics["interpretation"]
+    assert suggested["status"] == "suggested_from_complete_rows"
 
 
 def test_financial_data_quality_classifies_missing_stale_default_and_low_roe(
@@ -463,7 +528,20 @@ def test_financial_data_quality_classifies_missing_stale_default_and_low_roe(
                                 "stale": True,
                             }
                         },
-                    }
+                    },
+                    {
+                        "symbol": "000001",
+                        "score": 62,
+                        "action": "watch",
+                        "reasons": ["financial_penalty:low_roe"],
+                        "decision_trace": {
+                            "financial_gate": {
+                                "allowed": False,
+                                "data_complete": True,
+                                "roe": -0.01,
+                            }
+                        },
+                    },
                 ],
             }
         },
@@ -483,8 +561,16 @@ def test_financial_data_quality_classifies_missing_stale_default_and_low_roe(
     )
     quality = feature_report["financial_data_quality"]
 
-    assert quality["reason_counts"]["low_roe_penalty"] == 1
+    assert quality["reason_counts"]["low_roe_penalty"] == 2
     assert quality["reason_counts"]["missing_financials"] == 1
     assert quality["reason_counts"]["default_financial_penalty"] == 1
     assert quality["reason_counts"]["stale_financials"] == 1
-    assert quality["classification"]["short_term_strength_may_be_overblocked"]["rows"] == 1
+    overblock = quality["classification"]["short_term_strength_may_be_overblocked"]
+    assert overblock["rows"] == 2
+    assert overblock["data_quality_issue_rows"] == 1
+    assert overblock["confirmed_low_roe_rows"] == 1
+    low_roe = quality["classification"]["low_roe_evidence"]
+    assert low_roe["confirmed_true_low_roe_rows"] == 1
+    assert low_roe["ambiguous_low_roe_rows"] == 1
+    assert low_roe["inferred_low_roe_rows"] == 0
+    assert quality["classification"]["true_low_roe_evidence_rows"] == 1
