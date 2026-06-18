@@ -55,9 +55,29 @@ def parse_args() -> argparse.Namespace:
         help="Glob for signal source JSON/JSONL files. Can be repeated.",
     )
     parser.add_argument(
+        "--audit-event-source",
+        action="append",
+        default=[],
+        help="Audit event JSON/JSONL path. Can be repeated.",
+    )
+    parser.add_argument(
+        "--audit-event-glob",
+        action="append",
+        default=[],
+        help="Glob for audit event JSON/JSONL files. Can be repeated.",
+    )
+    parser.add_argument(
         "--shadow-plan-output",
         default="",
         help="Optional output path for p0_shadow_experiment_plan_v1.json.",
+    )
+    parser.add_argument(
+        "--skip-research-completeness-artifacts",
+        action="store_true",
+        help=(
+            "Only write model diagnosis and cross-review artifacts; skip "
+            "final_report_v3, feature family ablation and position framework."
+        ),
     )
     parser.add_argument(
         "--skip-shadow-plan",
@@ -76,12 +96,18 @@ def main() -> None:
         explicit_paths=args.signal_source,
         globs=args.signal_glob,
     )
+    audit_event_paths = _expand_audit_event_paths(
+        explicit_paths=args.audit_event_source,
+        globs=args.audit_event_glob,
+    )
     manifest = write_p0_analysis_inputs(
         analysis_dir=analysis_dir,
         model_artifact_path=_path(args.model_artifact),
         learning_manifest_paths=learning_manifest_paths,
         signal_source_paths=signal_paths,
         config=config,
+        audit_event_paths=audit_event_paths,
+        include_research_completeness_artifacts=not args.skip_research_completeness_artifacts,
     )
     if not args.skip_shadow_plan:
         output = (
@@ -113,6 +139,28 @@ def _expand_signal_paths(
                 _path("artifacts/runtime/runtime_state_history/week5_scan_history.jsonl"),
                 _path("artifacts/runtime/week5_scan_latest.json"),
                 _path("artifacts/week5_scan_latest.json"),
+            )
+            if candidate.exists()
+        )
+    return _dedupe_existing(paths)
+
+
+def _expand_audit_event_paths(
+    *,
+    explicit_paths: list[str],
+    globs: list[str],
+) -> list[Path]:
+    paths = [_path(item) for item in explicit_paths if str(item).strip()]
+    if globs:
+        paths.extend(_expand_paths(globs))
+    if not paths:
+        paths.extend(
+            candidate
+            for candidate in (
+                _path("artifacts/runtime/runtime_state.json"),
+                _path("artifacts/runtime/audit_events.jsonl"),
+                _path("artifacts/runtime/runtime_state_history/audit_events.jsonl"),
+                _path("artifacts/runtime/runtime_state_history/pipeline_audit_events.jsonl"),
             )
             if candidate.exists()
         )

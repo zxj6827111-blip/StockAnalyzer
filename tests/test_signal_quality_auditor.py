@@ -132,9 +132,7 @@ def test_signal_quality_auditor_reports_execution_risk_artifact_gap() -> None:
 
     assert report["execution_risk_context"]["artifact_unavailable"] is True
     assert (
-        report["execution_risk_context"]["reason_counts"][
-            "execution_risk_artifact_unavailable"
-        ]
+        report["execution_risk_context"]["reason_counts"]["execution_risk_artifact_unavailable"]
         == 1
     )
     assert any(
@@ -260,6 +258,49 @@ def test_signal_quality_auditor_keeps_advisory_attempts_out_of_execution_stages(
     assert funnel["execution_stages"]["buy_new_attempted"] == 0
     assert funnel["advisory_attempts"]["signals"] == 3
     assert funnel["advisory_attempts"]["buy_signals"] == 2
+
+
+def test_signal_quality_auditor_keeps_dry_run_attempts_out_of_execution_stages() -> None:
+    auditor = SignalQualityAuditor(config=_load_config())
+
+    report = auditor.build_report(
+        latest_signals=[],
+        audit_events=[
+            {
+                "event_type": "pipeline_run",
+                "payload": {
+                    "execution_mode": "portfolio_auto_apply_dry_run",
+                    "dry_run_execution": True,
+                    "portfolio_update": {
+                        "dry_run": True,
+                        "execution_attempts": {
+                            "buy_signals": 2,
+                            "buy_new_attempted": 2,
+                            "buy_new_filled": 1,
+                        },
+                        "executions": [
+                            {
+                                "symbol": "600000",
+                                "status": "opened",
+                                "reason": "auto_simulated_buy",
+                                "realized_return_pct": 0.03,
+                            }
+                        ],
+                    },
+                },
+            }
+        ],
+    )
+
+    funnel = report["signal_loss_funnel"]
+    assert funnel["execution_attempts"] == {}
+    assert funnel["execution_stages"]["buy_signals"] == 0
+    assert funnel["execution_stages"]["buy_new_attempted"] == 0
+    assert funnel["execution_stages"]["buy_new_filled"] == 0
+    assert funnel["dry_run_attempts"]["buy_signals"] == 2
+    assert funnel["dry_run_attempts"]["buy_new_filled"] == 1
+    assert funnel["execution_status_breakdown"] == {}
+    assert "portfolio_execution_records_missing" in funnel["data_gaps"]
 
 
 def test_signal_quality_auditor_symbol_ledger_uses_block_category_for_risk_gate() -> None:

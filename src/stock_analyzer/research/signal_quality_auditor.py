@@ -191,6 +191,7 @@ class SignalQualityAuditor:
             "execution_stages": execution["stages"],
             "execution_attempts": execution["attempts"],
             "advisory_attempts": execution["advisory_attempts"],
+            "dry_run_attempts": execution["dry_run_attempts"],
             "execution_status_breakdown": execution["status_breakdown"],
             "execution_reason_breakdown": execution["reason_breakdown"],
             "outcome_observation": execution["outcome_observation"],
@@ -424,7 +425,10 @@ def _execution_risk_context(signals: list[dict[str, object]]) -> dict[str, objec
 
 def _execution_funnel_from_events(events: list[dict[str, object]]) -> dict[str, object]:
     attempts: Counter[str] = Counter()
+    dry_run_attempts: Counter[str] = Counter()
     advisory_attempts: Counter[str] = Counter()
+    dry_run_status_breakdown: Counter[str] = Counter()
+    dry_run_reason_breakdown: Counter[str] = Counter()
     status_breakdown: Counter[str] = Counter()
     reason_breakdown: Counter[str] = Counter()
     realized_returns: list[float] = []
@@ -442,14 +446,26 @@ def _execution_funnel_from_events(events: list[dict[str, object]]) -> dict[str, 
             event_count += 1
             execution_mode = _lower_str(payload.get("execution_mode"))
             portfolio_update = _mapping(payload.get("portfolio_update"))
+            is_dry_run = (
+                execution_mode == "portfolio_auto_apply_dry_run"
+                or "dry_run" in execution_mode
+                or bool(payload.get("dry_run_execution", False))
+                or bool(portfolio_update.get("dry_run", False))
+            )
             raw_attempts = _mapping(portfolio_update.get("execution_attempts"))
-            target_attempts = advisory_attempts if execution_mode == "advisory_only" else attempts
+            if execution_mode == "advisory_only":
+                target_attempts = advisory_attempts
+            elif is_dry_run:
+                target_attempts = dry_run_attempts
+            else:
+                target_attempts = attempts
             for key, value in raw_attempts.items():
                 normalized_key = str(key)
                 count = _int(value)
                 target_attempts[normalized_key] += count
                 if (
                     execution_mode != "advisory_only"
+                    and not is_dry_run
                     and normalized_key in {"pre_trade_blocked", "risk_gate_blocked"}
                 ):
                     blocked_attempt_totals[normalized_key] += count
@@ -457,6 +473,13 @@ def _execution_funnel_from_events(events: list[dict[str, object]]) -> dict[str, 
             if isinstance(raw_executions, list):
                 for item in raw_executions:
                     if not isinstance(item, Mapping):
+                        continue
+                    if is_dry_run or execution_mode == "advisory_only":
+                        status = _lower_str(item.get("status")) or "unknown"
+                        reason = str(item.get("reason", "")).strip() or "unknown"
+                        if is_dry_run:
+                            dry_run_status_breakdown[status] += 1
+                            dry_run_reason_breakdown[reason] += 1
                         continue
                     execution_records += 1
                     status = _lower_str(item.get("status")) or "unknown"
@@ -567,9 +590,12 @@ def _execution_funnel_from_events(events: list[dict[str, object]]) -> dict[str, 
     return {
         "event_count": event_count,
         "attempts": dict(attempts),
+        "dry_run_attempts": dict(dry_run_attempts),
         "advisory_attempts": dict(advisory_attempts),
         "status_breakdown": dict(status_breakdown),
         "reason_breakdown": dict(reason_breakdown.most_common(12)),
+        "dry_run_status_breakdown": dict(dry_run_status_breakdown),
+        "dry_run_reason_breakdown": dict(dry_run_reason_breakdown.most_common(12)),
         "loss_counts": dict(loss_counts),
         "stages": {
             "buy_signals": buy_signals,

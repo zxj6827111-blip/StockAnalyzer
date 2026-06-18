@@ -2175,11 +2175,13 @@ class StockAnalyzerService:
         latest_signals = [
             dict(item) for item in snapshot.get("signals", []) if isinstance(item, dict)
         ]
-        signal_source = "signals_latest"
+        signal_source = str(snapshot.get("source", "")).strip() or "signals_latest"
+        signal_storage_source = str(snapshot.get("storage_source", "")).strip()
         if not latest_signals:
             latest_signals = _extract_week5_candidate_signals(self._last_week5_scan_report)
             if latest_signals:
                 signal_source = "week5_latest_candidates"
+                signal_storage_source = "runtime_state"
         audit_events: list[dict[str, object]] = []
         if include_audit_events:
             raw_audit = self.audit_events(limit=limit)
@@ -2204,6 +2206,7 @@ class StockAnalyzerService:
         )
         report["trace_id"] = str(snapshot.get("trace_id", "")).strip()
         report["signal_source"] = signal_source
+        report["signal_storage_source"] = signal_storage_source
         report["source_signal_count"] = len(latest_signals)
         self._last_signal_quality_audit = deepcopy(report)
         self._signal_quality_audit_history.append(deepcopy(report))

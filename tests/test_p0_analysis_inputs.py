@@ -148,9 +148,55 @@ def test_write_p0_analysis_inputs_collects_runtime_and_week5_rows(tmp_path: Path
 
     assert manifest["inputs"]["signal_rows"] == 2
     assert (tmp_path / "analysis" / "model_diagnosis_final.json").exists()
-    assert (
-        tmp_path / "analysis" / "p4_cross_review_failure_analysis_v1.json"
-    ).exists()
+    assert (tmp_path / "analysis" / "p4_cross_review_failure_analysis_v1.json").exists()
+    assert (tmp_path / "analysis" / "final_report_v3.json").exists()
+    assert (tmp_path / "analysis" / "p4_feature_family_ablation_v1.json").exists()
+    assert (tmp_path / "analysis" / "p5_position" / "position_framework_analysis.json").exists()
+    assert manifest["remaining_expected_inputs"] == []
+
+
+def test_collect_signal_rows_preserves_same_symbol_from_distinct_sources(
+    tmp_path: Path,
+) -> None:
+    runtime_state = tmp_path / "runtime_state.json"
+    _write_json(
+        runtime_state,
+        {
+            "latest_signals": {
+                "timestamp": "2026-06-18T10:00:00",
+                "source": "latest_signals",
+                "signals": [
+                    {
+                        "symbol": "600000",
+                        "score": 61,
+                        "action": "watch",
+                        "probabilities": {"lgbm": 0.7, "xgb": 0.31, "meta": 0.49},
+                    }
+                ],
+            },
+            "week5_scan_latest": {
+                "timestamp": "2026-06-18T10:00:00",
+                "signal_pool": {
+                    "candidates": [
+                        {
+                            "symbol": "600000",
+                            "shortlist_score": 55,
+                            "action": "hold",
+                            "probabilities": {"lgbm": 0.8, "xgb": 0.2, "meta": 0.41},
+                        }
+                    ]
+                },
+            },
+        },
+    )
+
+    rows = collect_signal_rows([runtime_state])
+
+    assert len(rows) == 2
+    assert {row["source_container"] for row in rows} == {
+        "latest_signals",
+        "week5_candidates",
+    }
 
 
 def test_write_p0_analysis_inputs_does_not_mutate_runtime_state(tmp_path: Path) -> None:
@@ -191,3 +237,98 @@ def test_write_p0_analysis_inputs_does_not_mutate_runtime_state(tmp_path: Path) 
 
     assert runtime_state.read_text(encoding="utf-8") == before
     assert (tmp_path / "analysis" / "p0_analysis_inputs_manifest.json").exists()
+
+
+def test_write_p0_analysis_inputs_writes_research_completeness_artifacts(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config()
+    model_artifact = tmp_path / "model_v1.json"
+    runtime_state = tmp_path / "runtime_state.json"
+    audit_events = tmp_path / "audit_events.jsonl"
+    _write_json(
+        model_artifact,
+        {
+            "feature_columns": ["financial_low_roe", "market_relative_ret", "volume_ma"],
+            "training_metrics": {"positive_rate": 0.12, "test_samples": 100},
+            "metadata": {"test_samples": 100},
+        },
+    )
+    _write_json(
+        runtime_state,
+        {
+            "latest_signals": {
+                "timestamp": "2026-06-18T10:00:00",
+                "signals": [
+                    {
+                        "symbol": "600000",
+                        "score": 48,
+                        "action": "watch",
+                        "probabilities": {"lgbm": 1.0, "xgb": 0.3, "meta": 0.48},
+                        "reasons": [
+                            "xgb<0.55",
+                            "meta<0.54",
+                            "financial_penalty:low_roe",
+                            "financial_data_complete_false",
+                        ],
+                    }
+                ],
+            }
+        },
+    )
+    audit_events.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "event_type": "pipeline_run",
+                        "payload": {
+                            "execution_mode": "portfolio_auto_apply_dry_run",
+                            "dry_run_execution": True,
+                            "portfolio_update": {
+                                "dry_run": True,
+                                "execution_attempts": {
+                                    "buy_signals": 1,
+                                    "buy_new_attempted": 1,
+                                },
+                                "executions": [
+                                    {
+                                        "symbol": "600000",
+                                        "status": "opened",
+                                        "reason": "auto_simulated_buy",
+                                    }
+                                ],
+                            },
+                        },
+                    },
+                    ensure_ascii=False,
+                )
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    manifest = write_p0_analysis_inputs(
+        analysis_dir=tmp_path / "analysis",
+        model_artifact_path=model_artifact,
+        learning_manifest_paths=[],
+        signal_source_paths=[runtime_state],
+        audit_event_paths=[audit_events],
+        config=config,
+        generated_at=datetime.fromisoformat("2026-06-18T12:00:00"),
+    )
+
+    analysis_dir = tmp_path / "analysis"
+    final_report = json.loads((analysis_dir / "final_report_v3.json").read_text("utf-8"))
+    feature_report = json.loads(
+        (analysis_dir / "p4_feature_family_ablation_v1.json").read_text("utf-8")
+    )
+    position_report = json.loads(
+        (analysis_dir / "p5_position" / "position_framework_analysis.json").read_text("utf-8")
+    )
+    assert manifest["remaining_expected_inputs"] == []
+    assert final_report["production_change_allowed"] is False
+    assert final_report["threshold_sweep"]["grid"]["xgb_min"] == [0.25, 0.3, 0.33]
+    assert final_report["source_scope"]["dry_run_events"] == 1
+    assert feature_report["financial_data_quality"]["reason_counts"]["missing_financials"] == 1
+    assert position_report["production_change_allowed"] is False

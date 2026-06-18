@@ -35,11 +35,7 @@ def test_shadow_experiment_planner_recommends_p0_research_without_production_cha
     )
     _write_json(
         analysis_dir / "model_diagnosis_final.json",
-        {
-            "label_distribution": {
-                "test": {"samples": 59, "positive": 1, "positive_rate": 0.0169}
-            }
-        },
+        {"label_distribution": {"test": {"samples": 59, "positive": 1, "positive_rate": 0.0169}}},
     )
     _write_json(
         analysis_dir / "p4_cross_review_failure_analysis_v1.json",
@@ -142,3 +138,75 @@ def test_shadow_experiment_planner_does_not_infer_threshold_result_from_partial_
     assert threshold["status"] == "missing_threshold_sweep_input"
     assert threshold["threshold_sweep_effective"] is None
     assert threshold["available_cross_review_rows"] == 540
+
+
+def test_shadow_experiment_planner_requires_source_review_for_mixed_runtime_inputs(
+    tmp_path: Path,
+) -> None:
+    analysis_dir = tmp_path / "analysis"
+    _write_json(
+        analysis_dir / "final_report_v3.json",
+        {
+            "source_scope": {
+                "row_count": 100,
+                "fallback_signal_rows": 100,
+                "dry_run_events": 1,
+                "requires_runtime_source_review": True,
+                "is_production_pure": False,
+            },
+            "threshold_sweep": {
+                "status": "candidate_generating",
+                "top_candidate_generating_variants": [
+                    {
+                        "xgb_min": 0.25,
+                        "meta_min": 0.45,
+                        "max_diff": 0.3,
+                        "score_min": 40.0,
+                        "pass_count": 12,
+                    }
+                ],
+            },
+            "multisymbol_multiwindow": {
+                "summaries": {
+                    "baseline": {
+                        "avg_final_equity": None,
+                        "median_final_equity": None,
+                        "avg_max_drawdown": None,
+                        "total_trades": 0,
+                        "overall_win_rate": None,
+                        "losing_ratio": None,
+                    }
+                }
+            },
+        },
+    )
+    _write_json(
+        analysis_dir / "model_diagnosis_final.json",
+        {"label_distribution": {"test": {"samples": 100, "positive": 13, "positive_rate": 0.13}}},
+    )
+    _write_json(
+        analysis_dir / "p4_cross_review_failure_analysis_v1.json",
+        {
+            "cross_review_analysis": {
+                "gate_statistics": {
+                    "total_evaluated_rows": 100,
+                    "total_decision_threshold_pass": 0,
+                    "total_cross_review_pass": 0,
+                    "total_incremental_cross_review_rejection": 0,
+                }
+            }
+        },
+    )
+    _write_json(analysis_dir / "p4_feature_family_ablation_v1.json", {"ablation_results": []})
+    _write_json(
+        analysis_dir / "p5_position" / "position_framework_analysis.json",
+        {"recommended_shadow": ["stop_loss_cooldown_reentry_shadow"]},
+    )
+
+    plan = build_shadow_experiment_plan(analysis_dir=analysis_dir)
+
+    assert plan["status"] == "research_only"
+    assert plan["threshold_assessment"]["status"] == "needs_runtime_source_review"
+    assert plan["threshold_assessment"]["source_scope"]["fallback_signal_rows"] == 100
+    assert plan["source_scope"]["dry_run_events"] == 1
+    assert plan["production_change_allowed"] is False

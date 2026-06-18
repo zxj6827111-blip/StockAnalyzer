@@ -22,7 +22,8 @@ def build_shadow_experiment_plan(
 
     baseline = _baseline_summary(final_report)
     label_health = _label_health(model_diagnosis)
-    threshold = _threshold_assessment(final_report, cross_review)
+    source_scope = _combined_source_scope(final_report, cross_review)
+    threshold = _threshold_assessment(final_report, cross_review, source_scope)
     feature_plan = _feature_family_plan(feature_ablation)
     position_plan = _position_plan(p5_position)
     experiments = _recommended_experiments(
@@ -42,6 +43,7 @@ def build_shadow_experiment_plan(
         ),
         "production_change_allowed": False,
         "input_completeness": input_completeness,
+        "source_scope": source_scope,
         "baseline": baseline,
         "label_health": label_health,
         "threshold_assessment": threshold,
@@ -113,6 +115,7 @@ def _label_health(report: Mapping[str, object]) -> dict[str, object]:
 def _threshold_assessment(
     final_report: Mapping[str, object],
     cross_review_report: Mapping[str, object],
+    source_scope: Mapping[str, object],
 ) -> dict[str, object]:
     threshold_sweep = _mapping(final_report.get("threshold_sweep"))
     cross_review = _mapping(cross_review_report.get("cross_review_analysis"))
@@ -127,20 +130,30 @@ def _threshold_assessment(
             "cross_review_pass": 0,
             "incremental_cross_review_rejection": 0,
             "available_cross_review_rows": _int(gate_stats.get("total_evaluated_rows")),
+            "source_scope": dict(source_scope),
         }
+    threshold_status = str(threshold_sweep.get("status", "")).strip()
+    needs_source_review = bool(source_scope.get("requires_runtime_source_review", False))
+    if needs_source_review:
+        status = "needs_runtime_source_review"
+    elif threshold_status == "not_effective":
+        status = "do_not_prioritize_threshold_tuning"
+    else:
+        status = "needs_review"
     return {
         "source": "final_report_v3.threshold_sweep + p4_cross_review_failure_analysis_v1",
-        "status": "do_not_prioritize_threshold_tuning"
-        if str(threshold_sweep.get("status", "")).strip() == "not_effective"
-        else "needs_review",
-        "threshold_sweep_effective": str(threshold_sweep.get("status", "")).strip()
-        != "not_effective",
+        "status": status,
+        "threshold_sweep_effective": threshold_status != "not_effective",
         "total_evaluated_rows": _int(gate_stats.get("total_evaluated_rows")),
         "decision_threshold_pass": _int(gate_stats.get("total_decision_threshold_pass")),
         "cross_review_pass": _int(gate_stats.get("total_cross_review_pass")),
         "incremental_cross_review_rejection": _int(
             gate_stats.get("total_incremental_cross_review_rejection")
         ),
+        "source_scope": dict(source_scope),
+        "top_candidate_generating_variants": _list(
+            threshold_sweep.get("top_candidate_generating_variants")
+        )[:10],
     }
 
 
@@ -278,7 +291,11 @@ def _recommended_experiments(
             },
         }
     )
-    if threshold.get("status") == "do_not_prioritize_threshold_tuning":
+    if threshold.get("status") in {
+        "do_not_prioritize_threshold_tuning",
+        "needs_runtime_source_review",
+        "needs_review",
+    }:
         experiments.append(
             {
                 "priority": "P1",
@@ -330,6 +347,24 @@ def _load_json(path: Path) -> dict[str, object]:
     except (OSError, json.JSONDecodeError):
         return {}
     return dict(data) if isinstance(data, Mapping) else {}
+
+
+def _combined_source_scope(
+    final_report: Mapping[str, object],
+    cross_review_report: Mapping[str, object],
+) -> dict[str, object]:
+    final_scope = _mapping(final_report.get("source_scope"))
+    cross_review_scope = _mapping(cross_review_report.get("source_scope"))
+    if final_scope:
+        return dict(final_scope)
+    if cross_review_scope:
+        return dict(cross_review_scope)
+    return {
+        "row_count": 0,
+        "audit_event_count": 0,
+        "is_production_pure": False,
+        "requires_runtime_source_review": False,
+    }
 
 
 def _input_completeness(analysis_dir: Path) -> dict[str, object]:
