@@ -1,0 +1,130 @@
+# P1 Shadow Calibration NAS Handoff
+
+## Purpose
+
+Validate branch `codex/p1-shadow-calibration-data-quality` on NAS in
+`advisory_only` mode. This handoff is research-only. Do not place real orders,
+do not enable auto promotion, and do not relax production risk controls.
+
+Expected local branch and commit:
+
+- Branch: `codex/p1-shadow-calibration-data-quality`
+- Commit: `272e4eb feat(research): add P1 shadow calibration reports`
+
+## Required Safety Gates
+
+Before running any pipeline or research command, verify:
+
+- Git checkout is the real repo: `/vol1/docker/StockAnalyzer_repo`
+- `HEAD` equals `272e4eb`
+- Runtime mode is `advisory_only`
+- `auto_promotion.enabled=false`
+- Core production guardrails are unchanged
+- No production config is edited
+- No live order execution is enabled
+
+If any safety check fails, stop and write a failed validation report.
+
+## Required Runtime Probe
+
+Run one controlled advisory-only pipeline probe using the same container/service
+entrypoint used for the previous P0 NAS advisory validation.
+
+After the probe, verify:
+
+- Latest `pipeline_run.execution_mode` is `advisory_only`
+- Latest `portfolio_update.executions` exists and is empty
+- Latest `portfolio_update.status` is advisory-only / skipped advisory-only
+- `execution_attempts` is empty or absent for real execution
+- `advisory_attempts` is present
+- `/signals/latest` uses `latest_signals` from the controlled `pipeline_run`
+- `/signals/latest` is not `empty` and not only `week5_latest_candidates`
+
+## Required Research Artifacts
+
+Generate P0/P1 research artifacts into:
+
+`artifacts/research/p1_shadow_calibration_nas_<timestamp>/`
+
+Required files:
+
+- `nas_validation_report.md`
+- `nas_validation_report.json`
+- `analysis/final_report_v3.json`
+- `analysis/p4_feature_family_ablation_v1.json`
+- `analysis/p5_position/position_framework_analysis.json`
+- `analysis/p0_shadow_experiment_plan_v1.json`
+- `commands/pipeline_advisory.json`
+- `commands/signals_latest_after.json`
+- `commands/signal_quality_after.json`
+- `commands/config_safety_snapshot.json`
+
+## P1 Report Checks
+
+In `analysis/final_report_v3.json`, verify:
+
+- `production_change_allowed=false`
+- `p1_probability_scale_shadow_grid` exists
+- `p1_probability_scale_shadow_grid.production_change_allowed=false`
+- `p1_probability_scale_shadow_grid.grid.xgb_min` includes values near
+  `0.18, 0.20, 0.23, 0.25, 0.27`
+- `p1_probability_scale_shadow_grid.grid.meta_min` includes values near
+  `0.20, 0.22, 0.24, 0.26, 0.27`
+- `p1_probability_scale_shadow_grid.grid.score_min` includes values near
+  `18, 20, 22, 24, 25`
+- `candidate_variant_count`, `max_pass_count`, and
+  `top_candidate_generating_variants` are present
+- `guardrails.do_not_relax_production_cross_review=true`
+- `outcome_linkage.can_claim_profitability=false` unless at least 100 mature
+  return samples are linked
+
+In `analysis/p4_feature_family_ablation_v1.json`, verify:
+
+- `financial_data_quality.raw_field_coverage` exists
+- It reports `roe_present_rows`, `debt_ratio_present_rows`,
+  `both_gate_fields_present_rows`, `financial_source_present_rows`,
+  `financial_report_date_present_rows`, and `financial_missing_fields_present_rows`
+- `same_period_confirmed` is `unknown` unless same-period evidence is explicit
+- `same_source_confirmed` is `unknown` unless same-source evidence is explicit
+- `financial_data_complete` is treated as `gate_required_fields_present_only`,
+  not as proof of a full same-period financial statement
+
+In `analysis/p5_position/position_framework_analysis.json`, verify:
+
+- `reentry_cooldown_shadow` exists
+- `reentry_cooldown_shadow.production_change_allowed=false`
+- Focus symbols include `000159`, `001258`, and `600956`
+- Variants include stop-loss re-entry cooldown and trailing take-profit shadow
+- Guardrails include `do_not_write_week6_controls=true`
+- No `week6_controls`, `position_multiplier`, stop-loss config, or take-profit
+  config is changed by this report
+
+In `analysis/p0_shadow_experiment_plan_v1.json`, verify:
+
+- `status=research_only`
+- `production_change_allowed=false`
+- `threshold_assessment.p1_probability_scale_shadow_grid` exists
+- `feature_family_plan.financial_raw_field_coverage` exists
+- `position_plan.reentry_cooldown_shadow` exists
+- Recommended experiments still require shadow/advisory validation before any
+  production threshold change
+
+## Final NAS Report Must State
+
+The final `nas_validation_report.md` must explicitly answer:
+
+- Was any real order placed?
+- Was `auto_promotion` enabled?
+- Were production risk controls relaxed?
+- Did `/signals/latest` use the controlled latest pipeline signals?
+- Did the P1 probability-scale shadow grid generate candidates?
+- Are mature return samples sufficient to rank by profitability?
+- Can the current evidence justify production threshold changes?
+- Can financial penalties distinguish true low ROE from missing/default/stale
+  source evidence?
+- What did the focus-symbol re-entry/stop-loss/trailing shadow show for
+  `000159`, `001258`, and `600956`?
+
+If mature return samples are fewer than 50, the report must recommend continuing
+`advisory_only` collection. If mature return samples are fewer than 100, the
+report must not recommend production threshold changes.
