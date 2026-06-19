@@ -101,9 +101,15 @@ run_collection() {
     --runs "$runs" \
     --interval-sec "$interval_sec" \
     --confirm-run
+  log "building collection acceptance report"
+  python scripts/p1_accept_nas_advisory_collection.py \
+    --collection-dir "$output_dir" \
+    --min-completed-runs "$runs"
   log "collection report:"
   log "${output_dir}/p1_advisory_collection_report.md"
   log "${output_dir}/p1_advisory_collection_report.json"
+  log "${output_dir}/p1_advisory_collection_acceptance.md"
+  log "${output_dir}/p1_advisory_collection_acceptance.json"
 }
 
 check_repo

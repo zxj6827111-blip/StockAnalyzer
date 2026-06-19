@@ -204,6 +204,10 @@ def test_p1_advisory_collection_runs_multiple_advisory_probes(
     assert report["completed_runs"] == 2
     assert report["summary"]["passed_runs"] == 2
     assert report["summary"]["financial_raw_fields_observed_runs"] == 2
+    assert report["summary"]["roe_present_rows"] == 2
+    assert report["summary"]["debt_ratio_present_rows"] == 2
+    assert report["summary"]["financial_source_present_rows"] == 2
+    assert report["summary"]["financial_report_date_present_rows"] == 2
     assert (tmp_path / "collection" / "run_001" / "nas_validation_report.md").exists()
     assert (tmp_path / "collection" / "run_002" / "nas_validation_report.json").exists()
     assert (tmp_path / "collection" / "p1_advisory_collection_report.json").exists()

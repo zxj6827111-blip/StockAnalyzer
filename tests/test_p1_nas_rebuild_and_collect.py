@@ -14,6 +14,7 @@ def test_p1_nas_rebuild_wrapper_forces_advisory_compose_override() -> None:
     assert "docker-compose.advisory.yml" in script
     assert "compose up -d --build api scheduler" in script
     assert "p1_run_nas_advisory_collection.py" in script
+    assert "p1_accept_nas_advisory_collection.py" in script
     assert "--confirm-run" in script
     assert "runtime.get(\"advisory_only\") is not True" in script
     assert "runtime.get(\"training_enabled\") is not False" in script

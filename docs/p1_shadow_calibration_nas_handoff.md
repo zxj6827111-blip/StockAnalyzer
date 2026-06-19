@@ -13,6 +13,7 @@ Expected local branch and commit:
   `git fetch origin`
 - Expected files include `docker-compose.advisory.yml`,
   `scripts/p1_nas_rebuild_and_collect.sh`,
+  `scripts/p1_accept_nas_advisory_collection.py`,
   `scripts/p1_nas_shadow_validation.py`,
   `scripts/p1_run_nas_advisory_collection.py`, and the P1 research changes from
   `272e4eb`
@@ -46,6 +47,8 @@ The wrapper fetches the latest branch, checks out
 `scheduler` with the advisory override, waits for `/health` to prove
 `advisory_only=true` and `training_enabled=false`, then starts the P1 collection.
 If either health value is unsafe, the wrapper stops before any collection run.
+After collection, it also writes an acceptance report from the generated
+collection summary.
 
 Optional overrides:
 
@@ -152,6 +155,8 @@ and writes:
 
 - `p1_advisory_collection_report.md`
 - `p1_advisory_collection_report.json`
+- `p1_advisory_collection_acceptance.md`
+- `p1_advisory_collection_acceptance.json`
 
 The collection report must show:
 
@@ -159,9 +164,22 @@ The collection report must show:
 - `failed_runs=0` for evidence used as pass
 - no `safety_failure` block for evidence used as pass
 - `financial_raw_fields_observed_runs > 0`
+- `roe_present_rows > 0`
+- `debt_ratio_present_rows > 0`
+- `financial_source_present_rows > 0`
+- `financial_report_date_present_rows > 0`
 - `max_candidate_variant_count > 0`
 - `max_mature_return_samples`
 - No recommendation to change production thresholds before 100 mature samples
+
+The acceptance report must show:
+
+- `status=pass`
+- `collection_status=pass`
+- `minimum_completed_runs` passed
+- `no_safety_failure` passed
+- `financial_raw_fields_observed` passed
+- `mature_samples_not_enough_for_production_threshold_change` passed
 
 ## P1 Report Checks
 

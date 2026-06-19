@@ -172,6 +172,26 @@ def run_collection(
                         p1_report,
                         "financial_raw_fields_observed",
                     ),
+                    "roe_present_rows": _nested_int(
+                        p1_report,
+                        "financial_raw_field_coverage",
+                        "roe_present_rows",
+                    ),
+                    "debt_ratio_present_rows": _nested_int(
+                        p1_report,
+                        "financial_raw_field_coverage",
+                        "debt_ratio_present_rows",
+                    ),
+                    "financial_source_present_rows": _nested_int(
+                        p1_report,
+                        "financial_raw_field_coverage",
+                        "financial_source_present_rows",
+                    ),
+                    "financial_report_date_present_rows": _nested_int(
+                        p1_report,
+                        "financial_raw_field_coverage",
+                        "financial_report_date_present_rows",
+                    ),
                     "mature_return_samples": _nested_int(
                         p1_report,
                         "maturity",
@@ -267,6 +287,19 @@ def _collection_summary(run_items: list[Mapping[str, object]]) -> dict[str, obje
         "financial_raw_fields_observed_runs": sum(
             1 for item in run_items if bool(item.get("financial_raw_fields_observed"))
         ),
+        "roe_present_rows": max(
+            [_int(item.get("roe_present_rows")) for item in run_items] or [0]
+        ),
+        "debt_ratio_present_rows": max(
+            [_int(item.get("debt_ratio_present_rows")) for item in run_items] or [0]
+        ),
+        "financial_source_present_rows": max(
+            [_int(item.get("financial_source_present_rows")) for item in run_items] or [0]
+        ),
+        "financial_report_date_present_rows": max(
+            [_int(item.get("financial_report_date_present_rows")) for item in run_items]
+            or [0]
+        ),
         "max_mature_return_samples": max(
             [_int(item.get("mature_return_samples")) for item in run_items] or [0]
         ),
@@ -310,6 +343,10 @@ def _render_collection_markdown(report: Mapping[str, object]) -> str:
         f"- failed_runs: {summary.get('failed_runs', 0)}",
         f"- max_candidate_variant_count: {summary.get('max_candidate_variant_count', 0)}",
         f"- financial_raw_fields_observed_runs: {summary.get('financial_raw_fields_observed_runs', 0)}",
+        f"- roe_present_rows: {summary.get('roe_present_rows', 0)}",
+        f"- debt_ratio_present_rows: {summary.get('debt_ratio_present_rows', 0)}",
+        f"- financial_source_present_rows: {summary.get('financial_source_present_rows', 0)}",
+        f"- financial_report_date_present_rows: {summary.get('financial_report_date_present_rows', 0)}",
         f"- max_mature_return_samples: {summary.get('max_mature_return_samples', 0)}",
         "",
     ]
