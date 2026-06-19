@@ -11,8 +11,11 @@ Expected local branch and commit:
 - Branch: `codex/p1-shadow-calibration-data-quality`
 - Commit: latest `origin/codex/p1-shadow-calibration-data-quality` after
   `git fetch origin`
-- Expected files include `scripts/p1_nas_shadow_validation.py` and the P1
-  research changes from `272e4eb`
+- Expected files include `scripts/p1_nas_shadow_validation.py`,
+  `scripts/p1_run_nas_advisory_collection.py`, and the P1 research changes from
+  `272e4eb`
+- Current expected tip includes `2d67162 feat(research): add P1 NAS advisory
+  collection runner` or a newer commit on the same branch
 
 ## Required Safety Gates
 
@@ -71,6 +74,45 @@ python scripts/p1_nas_shadow_validation.py --probe-dir <artifact_dir>
 
 This command writes the final `nas_validation_report.md` and
 `nas_validation_report.json` from the P1 checks.
+
+## Continuous Advisory Collection
+
+Use the collection runner for repeated advisory-only evidence gathering. First
+write a dry plan; this must not call the API or trigger a pipeline run:
+
+```bash
+python scripts/p1_run_nas_advisory_collection.py \
+  --output-dir artifacts/research/p1_advisory_collection_test \
+  --runs 2
+```
+
+Then run repeated advisory-only probes. From inside the API container, use
+`http://127.0.0.1:8000`; from the NAS host, use `http://127.0.0.1:18001`.
+
+```bash
+python scripts/p1_run_nas_advisory_collection.py \
+  --api-base http://127.0.0.1:8000 \
+  --output-dir artifacts/research/p1_advisory_collection_$(date +%Y%m%dT%H%M%S%z) \
+  --symbols 600000,000001 \
+  --runs 6 \
+  --interval-sec 1800 \
+  --confirm-run
+```
+
+The collection runner writes per-run reports under `run_001`, `run_002`, etc.,
+and writes:
+
+- `p1_advisory_collection_report.md`
+- `p1_advisory_collection_report.json`
+
+The collection report must show:
+
+- `production_change_allowed=false`
+- `failed_runs=0` for evidence used as pass
+- `financial_raw_fields_observed_runs > 0`
+- `max_candidate_variant_count > 0`
+- `max_mature_return_samples`
+- No recommendation to change production thresholds before 100 mature samples
 
 ## P1 Report Checks
 
