@@ -6,6 +6,7 @@ log() {
 }
 
 branch="${BRANCH:-codex/p1-shadow-calibration-data-quality}"
+required_head="${REQUIRED_HEAD:-6e5bd3b}"
 repo_dir="${REPO_DIR:-/vol1/docker/StockAnalyzer_repo}"
 runtime_dir="${RUNTIME_DIR:-/vol1/docker/StockAnalyzer}"
 runtime_artifacts_dir="${RUNTIME_ARTIFACTS_DIR:-/vol1/docker/volumes/stock_analyzer_runtime_artifacts/_data}"
@@ -48,10 +49,20 @@ check_repo() {
 
 checkout_branch() {
   cd "$repo_dir"
-  log "fetching latest origin refs"
-  git fetch origin
-  log "checking out origin/${branch}"
-  git checkout -B "${branch}" "origin/${branch}"
+  if [ "${SKIP_GIT_FETCH:-0}" = "1" ]; then
+    log "SKIP_GIT_FETCH=1; using local ${branch} without contacting origin"
+    git checkout "${branch}"
+  else
+    log "fetching latest origin refs"
+    git fetch origin
+    log "checking out origin/${branch}"
+    git checkout -B "${branch}" "origin/${branch}"
+  fi
+  current_head="$(git rev-parse HEAD)"
+  if ! git merge-base --is-ancestor "$required_head" "$current_head"; then
+    log "required commit ${required_head} is not an ancestor of current HEAD ${current_head}"
+    exit 1
+  fi
   git rev-parse HEAD > .build_commit
   log "current tip:"
   git log --oneline -5
