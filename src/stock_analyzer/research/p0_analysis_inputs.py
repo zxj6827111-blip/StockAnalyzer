@@ -19,6 +19,12 @@ _MODEL_THRESHOLD_GRID = {
     "max_diff": (0.18, 0.25, 0.30),
     "score_min": (40.0, 45.0, 50.0, 55.0),
 }
+_P1_PROBABILITY_SCALE_GRID = {
+    "xgb_min": (0.18, 0.20, 0.23, 0.25, 0.27),
+    "meta_min": (0.20, 0.22, 0.24, 0.26, 0.27),
+    "max_diff": (0.06, 0.12, 0.18, 0.25, 0.30),
+    "score_min": (18.0, 20.0, 22.0, 24.0, 25.0),
+}
 _FOCUS_LOSS_SYMBOLS = ("000159", "001258", "600956")
 _FEATURE_FAMILIES = {
     "financial_background": (
@@ -334,6 +340,7 @@ def build_final_report_v3(
     execution = _summarize_execution_events(audit_events)
     baseline = _baseline_from_rows(rows=rows, execution=execution, config=config)
     threshold_sweep = _threshold_grid(rows=rows, execution=execution)
+    p1_shadow_grid = _p1_probability_scale_shadow_grid(rows=rows, execution=execution)
     outcome_coverage = _outcome_coverage(execution)
     source_scope = _source_scope(rows=rows, audit_events=audit_events)
     status = "ok"
@@ -356,6 +363,7 @@ def build_final_report_v3(
             },
         },
         "threshold_sweep": threshold_sweep,
+        "p1_probability_scale_shadow_grid": p1_shadow_grid,
         "outcome_coverage": outcome_coverage,
         "recommended_next_actions": _final_report_actions(
             threshold_sweep=threshold_sweep,
@@ -464,6 +472,10 @@ def build_position_framework_analysis(
     rows = [_normalize_signal(item) for item in signals]
     execution = _summarize_execution_events(audit_events)
     symbol_paths = _position_symbol_paths(rows=rows, execution=execution)
+    focus_paths = _focus_symbol_paths(
+        symbol_paths=symbol_paths,
+        focus_symbols=_FOCUS_LOSS_SYMBOLS,
+    )
     return {
         "report_type": "position_framework_analysis",
         "generated_at": (generated_at or datetime.now()).isoformat(),
@@ -483,10 +495,8 @@ def build_position_framework_analysis(
         },
         "execution_path_summary": execution["summary"],
         "loss_path_analysis": _loss_path_analysis(symbol_paths),
-        "focus_symbols": _focus_symbol_paths(
-            symbol_paths=symbol_paths,
-            focus_symbols=_FOCUS_LOSS_SYMBOLS,
-        ),
+        "focus_symbols": focus_paths,
+        "reentry_cooldown_shadow": _reentry_cooldown_shadow(focus_paths),
         "symbol_paths": symbol_paths[:200],
         "recommended_shadow": [
             "atr_bounds_position_shadow",
@@ -1280,6 +1290,139 @@ def _threshold_grid(
     }
 
 
+def _p1_probability_scale_shadow_grid(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    execution: Mapping[str, object],
+) -> dict[str, object]:
+    """Run a report-only grid near the observed NAS probability scale."""
+    total = len(rows)
+    returns_by_symbol = _returns_by_symbol(_mapping(execution.get("records_by_symbol")))
+    results: list[dict[str, object]] = []
+    for xgb_min in _P1_PROBABILITY_SCALE_GRID["xgb_min"]:
+        for meta_min in _P1_PROBABILITY_SCALE_GRID["meta_min"]:
+            for max_diff in _P1_PROBABILITY_SCALE_GRID["max_diff"]:
+                for score_min in _P1_PROBABILITY_SCALE_GRID["score_min"]:
+                    passed = _threshold_passed_rows(
+                        rows=rows,
+                        xgb_min=xgb_min,
+                        meta_min=meta_min,
+                        max_diff=max_diff,
+                        score_min=score_min,
+                    )
+                    returns = _returns_for_passed_rows(passed, returns_by_symbol)
+                    trade_count = len(returns)
+                    profitable = sum(1 for item in returns if item > 0.0)
+                    results.append(
+                        {
+                            "xgb_min": xgb_min,
+                            "meta_min": meta_min,
+                            "max_diff": max_diff,
+                            "score_min": score_min,
+                            "pass_count": len(passed),
+                            "pass_rate": round(len(passed) / total, 6) if total else 0.0,
+                            "buy_count": sum(
+                                1
+                                for item in passed
+                                if str(item.get("action", "")).strip().lower() == "buy"
+                            ),
+                            "observed_trade_count": trade_count,
+                            "win_rate": round(profitable / trade_count, 6)
+                            if trade_count
+                            else None,
+                            "avg_realized_return_pct": round(mean(returns), 6)
+                            if returns
+                            else None,
+                            "final_equity": _equity_from_returns(returns),
+                            "max_drawdown": _max_drawdown_from_returns(returns),
+                            "profitability_status": "observed"
+                            if trade_count >= 30
+                            else "insufficient_outcomes",
+                            "example_symbols": sorted(
+                                {str(item.get("symbol", "")).strip() for item in passed}
+                            )[:12],
+                        }
+                    )
+    candidate_variants = [item for item in results if int(item["pass_count"]) > 0]
+    best = sorted(
+        candidate_variants or results,
+        key=lambda item: (
+            item.get("final_equity") is None,
+            -float(item.get("final_equity") or 0.0),
+            -int(item["observed_trade_count"]),
+            -int(item["pass_count"]),
+            item["xgb_min"],
+            item["meta_min"],
+            item["score_min"],
+        ),
+    )[:10]
+    max_observed_trades = max(
+        (int(item["observed_trade_count"]) for item in results),
+        default=0,
+    )
+    candidate_pass_counts = [int(item["pass_count"]) for item in candidate_variants]
+    return {
+        "status": "candidate_generating" if candidate_variants else "not_effective",
+        "production_change_allowed": False,
+        "purpose": (
+            "Second-stage shadow grid around observed xgb/meta/score distributions. "
+            "This is descriptive research only and must not be copied into production gates."
+        ),
+        "grid": {
+            "xgb_min": list(_P1_PROBABILITY_SCALE_GRID["xgb_min"]),
+            "meta_min": list(_P1_PROBABILITY_SCALE_GRID["meta_min"]),
+            "max_diff": list(_P1_PROBABILITY_SCALE_GRID["max_diff"]),
+            "score_min": list(_P1_PROBABILITY_SCALE_GRID["score_min"]),
+        },
+        "total_rows": total,
+        "result_count": len(results),
+        "candidate_variant_count": len(candidate_variants),
+        "max_pass_count": max(candidate_pass_counts, default=0),
+        "min_nonzero_pass_count": min(candidate_pass_counts, default=0),
+        "outcome_linkage": {
+            "max_observed_trades_in_variant": max_observed_trades,
+            "minimum_observed_trades_for_profitability_rank": 30,
+            "minimum_return_samples_for_production_claim": 100,
+            "can_rank_by_profitability": max_observed_trades >= 30,
+            "can_claim_profitability": max_observed_trades >= 100,
+        },
+        "top_candidate_generating_variants": best,
+        "results": results,
+        "guardrails": {
+            "do_not_relax_production_cross_review": True,
+            "do_not_enable_auto_promotion": True,
+            "requires_advisory_only_nas_replay": True,
+        },
+    }
+
+
+def _threshold_passed_rows(
+    *,
+    rows: Sequence[Mapping[str, object]],
+    xgb_min: float,
+    meta_min: float,
+    max_diff: float,
+    score_min: float,
+) -> list[Mapping[str, object]]:
+    passed: list[Mapping[str, object]] = []
+    for row in rows:
+        probabilities = _mapping(row.get("probabilities"))
+        lgbm = _float(probabilities.get("lgbm"))
+        xgb = _float(probabilities.get("xgb"))
+        meta = _float(probabilities.get("meta"))
+        score = _float(row.get("score"))
+        if any(value is None for value in (lgbm, xgb, meta, score)):
+            continue
+        if (
+            float(xgb) >= xgb_min
+            and float(meta) >= meta_min
+            and abs(float(lgbm) - float(xgb)) <= max_diff
+            and float(score) >= score_min
+        ):
+            passed.append(row)
+    return passed
+
+
 def _threshold_blocking_diagnostics(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
     minimum = {
         "xgb_min": float(_MODEL_THRESHOLD_GRID["xgb_min"][0]),
@@ -1689,6 +1832,7 @@ def _financial_data_quality(
         "affected_symbols": len(unique_symbols),
         "reason_counts": dict(counter.most_common(20)),
         "examples": examples,
+        "raw_field_coverage": _financial_raw_field_coverage(rows),
         "classification": _financial_classification(
             counter=counter,
             score_by_code=score_by_code,
@@ -1708,6 +1852,10 @@ def _financial_data_quality(
             "true_low_roe_vs_missing_data": (
                 "requires source financial fields; rows currently classify observed "
                 "penalties and missing flags"
+            ),
+            "financial_data_complete_semantics": (
+                "financial_data_complete only means gate-required fields are present; "
+                "it does not prove same-period or same-source full financial statements"
             ),
             "should_relax_filter": "not from this artifact alone; run shadow after data repair",
         },
@@ -1751,6 +1899,174 @@ def _financial_data_quality_codes(
     if financial_gate.get("allowed") is False or financial_gate.get("passed") is False:
         codes.append("financial_gate_block")
     return _dedupe_preserve_order(codes)
+
+
+def _financial_raw_field_coverage(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    total = len(rows)
+    source_counts: Counter[str] = Counter()
+    missing_field_counts: Counter[str] = Counter()
+    report_date_counts: Counter[str] = Counter()
+    default_source_rows = 0
+    complete_true_rows = 0
+    complete_false_rows = 0
+    examples: list[dict[str, object]] = []
+    roe_present = 0
+    debt_present = 0
+    source_present = 0
+    report_date_present = 0
+    missing_fields_present = 0
+    for row in rows:
+        raw = _financial_raw_snapshot(row)
+        if raw["roe"] is not None:
+            roe_present += 1
+        if raw["debt_ratio"] is not None:
+            debt_present += 1
+        source = str(raw.get("financial_source", "")).strip()
+        if source:
+            source_present += 1
+            source_counts[source] += 1
+            if "default" in source.lower() or source.lower() in {"synthetic", "fallback"}:
+                default_source_rows += 1
+        report_date = str(raw.get("financial_report_date", "")).strip()
+        if report_date:
+            report_date_present += 1
+            report_date_counts[report_date] += 1
+        missing_fields = _financial_missing_fields(raw.get("financial_missing_fields"))
+        if missing_fields:
+            missing_fields_present += 1
+            missing_field_counts.update(missing_fields)
+        complete = raw.get("financial_data_complete")
+        if complete is True:
+            complete_true_rows += 1
+        elif complete is False:
+            complete_false_rows += 1
+        if len(examples) < 12 and (
+            raw["roe"] is not None
+            or raw["debt_ratio"] is not None
+            or source
+            or report_date
+            or missing_fields
+            or complete is not None
+        ):
+            examples.append(
+                {
+                    "symbol": str(row.get("symbol", "")).strip(),
+                    "roe": raw["roe"],
+                    "debt_ratio": raw["debt_ratio"],
+                    "financial_data_complete": complete,
+                    "financial_missing_fields": missing_fields,
+                    "financial_source": source,
+                    "financial_report_date": report_date,
+                }
+            )
+    return {
+        "status": "raw_fields_observed" if any(
+            (roe_present, debt_present, source_present, report_date_present)
+        ) else "raw_fields_missing",
+        "total_rows": total,
+        "roe_present_rows": roe_present,
+        "debt_ratio_present_rows": debt_present,
+        "both_gate_fields_present_rows": sum(
+            1
+            for row in rows
+            if _financial_raw_snapshot(row)["roe"] is not None
+            and _financial_raw_snapshot(row)["debt_ratio"] is not None
+        ),
+        "financial_data_complete_true_rows": complete_true_rows,
+        "financial_data_complete_false_rows": complete_false_rows,
+        "financial_source_present_rows": source_present,
+        "financial_report_date_present_rows": report_date_present,
+        "financial_missing_fields_present_rows": missing_fields_present,
+        "default_or_fallback_source_rows": default_source_rows,
+        "source_counts": dict(source_counts.most_common(12)),
+        "missing_field_counts": dict(missing_field_counts.most_common(12)),
+        "report_date_counts": dict(report_date_counts.most_common(12)),
+        "same_period_confirmed": "unknown",
+        "same_source_confirmed": "unknown",
+        "semantics": {
+            "financial_data_complete": "gate_required_fields_present_only",
+            "same_period_full_statement": "not_proven_by_current_fields",
+            "production_gate_fields": [
+                "roe",
+                "debt_ratio",
+                "is_st",
+                "is_delisting_risk",
+            ],
+        },
+        "examples": examples,
+    }
+
+
+def _financial_raw_snapshot(row: Mapping[str, object]) -> dict[str, object]:
+    trace = _mapping(row.get("decision_trace"))
+    financial_gate = _mapping(trace.get("financial_gate"))
+    metrics = _mapping(row.get("financial_metrics"))
+    return {
+        "roe": _first_float(
+            row.get("roe"),
+            row.get("roe_ttm"),
+            row.get("return_on_equity"),
+            row.get("financial_roe"),
+            row.get("latest_roe"),
+            financial_gate.get("roe"),
+            financial_gate.get("roe_ttm"),
+            metrics.get("roe"),
+            metrics.get("roe_ttm"),
+        ),
+        "debt_ratio": _first_float(
+            row.get("debt_ratio"),
+            row.get("debt"),
+            row.get("asset_liability_ratio"),
+            row.get("financial_debt_ratio"),
+            financial_gate.get("debt_ratio"),
+            financial_gate.get("debt"),
+            financial_gate.get("asset_liability_ratio"),
+            metrics.get("debt_ratio"),
+            metrics.get("asset_liability_ratio"),
+        ),
+        "financial_data_complete": _first_bool(
+            row.get("financial_data_complete"),
+            row.get("data_complete"),
+            financial_gate.get("financial_data_complete"),
+            financial_gate.get("data_complete"),
+            financial_gate.get("complete"),
+            metrics.get("financial_data_complete"),
+        ),
+        "financial_missing_fields": _first_text(
+            row.get("financial_missing_fields"),
+            financial_gate.get("financial_missing_fields"),
+            financial_gate.get("missing_fields"),
+            metrics.get("financial_missing_fields"),
+            metrics.get("missing_fields"),
+        ),
+        "financial_source": _first_text(
+            row.get("financial_source"),
+            row.get("financial_data_source"),
+            financial_gate.get("financial_source"),
+            financial_gate.get("source"),
+            metrics.get("financial_source"),
+            metrics.get("source"),
+        ),
+        "financial_report_date": _first_text(
+            row.get("financial_report_date"),
+            row.get("latest_report_date"),
+            financial_gate.get("financial_report_date"),
+            financial_gate.get("latest_report_date"),
+            financial_gate.get("report_date"),
+            metrics.get("financial_report_date"),
+            metrics.get("latest_report_date"),
+        ),
+    }
+
+
+def _financial_missing_fields(value: object) -> list[str]:
+    if isinstance(value, list):
+        return _dedupe_preserve_order([str(item) for item in value])
+    text = str(value or "").strip()
+    if not text:
+        return []
+    normalized = text.replace(";", ",").replace("|", ",")
+    return _dedupe_preserve_order([part.strip() for part in normalized.split(",")])
 
 
 def _financial_low_roe_evidence(
@@ -2198,6 +2514,71 @@ def _focus_symbol_diagnosis(path: Mapping[str, object]) -> list[str]:
     return diagnosis
 
 
+def _reentry_cooldown_shadow(focus_paths: Mapping[str, object]) -> dict[str, object]:
+    symbols = [
+        _mapping(item)
+        for item in _list(focus_paths.get("symbols"))
+        if isinstance(item, Mapping)
+    ]
+    loss_symbols = [
+        str(item.get("symbol", "")).strip()
+        for item in symbols
+        if _int(item.get("loss_count")) > 0
+    ]
+    reentry_symbols = [
+        str(item.get("symbol", "")).strip()
+        for item in symbols
+        if bool(item.get("reentry_hint", False))
+    ]
+    stop_loss_symbols = [
+        str(item.get("symbol", "")).strip()
+        for item in symbols
+        if _int(_mapping(item.get("execution_reasons")).get("stop_loss_threshold_reached")) > 0
+    ]
+    return {
+        "status": "shadow_design_only",
+        "production_change_allowed": False,
+        "focus_symbols": [str(item.get("symbol", "")).strip() for item in symbols],
+        "loss_symbols": loss_symbols,
+        "reentry_hint_symbols": reentry_symbols,
+        "stop_loss_symbols": stop_loss_symbols,
+        "variants": [
+            {
+                "name": "stop_loss_reentry_cooldown_3d",
+                "rule": "after stop_loss_threshold_reached, suppress new entry for 3 trading days in shadow ledger only",
+                "scope": stop_loss_symbols or loss_symbols,
+            },
+            {
+                "name": "stop_loss_reentry_cooldown_5d",
+                "rule": "after stop_loss_threshold_reached, suppress new entry for 5 trading days in shadow ledger only",
+                "scope": stop_loss_symbols or loss_symbols,
+            },
+            {
+                "name": "loss_after_signal_quality_freeze",
+                "rule": "require next signal to clear p1 probability-scale candidate grid before shadow re-entry",
+                "scope": reentry_symbols or loss_symbols,
+            },
+            {
+                "name": "take_profit_trailing_remainder_shadow",
+                "rule": "after staged take-profit, compare trailing remainder exits against max-hold exit outcomes",
+                "scope": [str(item.get("symbol", "")).strip() for item in symbols],
+            },
+        ],
+        "acceptance": {
+            "min_mature_return_samples": 50,
+            "preferred_mature_return_samples": 100,
+            "must_reduce_reentry_loss_count": True,
+            "must_not_increase_max_drawdown": True,
+        },
+        "guardrails": {
+            "report_only": True,
+            "do_not_write_week6_controls": True,
+            "do_not_change_position_multiplier": True,
+            "do_not_change_stop_loss_or_take_profit_config": True,
+        },
+    }
+
+
 def _row_reason_text(row: Mapping[str, object]) -> str:
     parts: list[str] = []
     for item in _list(row.get("reasons")):
@@ -2349,6 +2730,40 @@ def _float(value: object) -> float | None:
             return float(value)
         except ValueError:
             return None
+    return None
+
+
+def _first_float(*values: object) -> float | None:
+    for value in values:
+        parsed = _float(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _first_text(*values: object) -> str:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple)):
+            text = ",".join(str(item).strip() for item in value if str(item).strip())
+        else:
+            text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def _first_bool(*values: object) -> bool | None:
+    for value in values:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in {"true", "1", "yes", "y"}:
+                return True
+            if text in {"false", "0", "no", "n"}:
+                return False
     return None
 
 

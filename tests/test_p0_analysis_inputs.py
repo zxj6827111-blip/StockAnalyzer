@@ -452,8 +452,17 @@ def test_write_p0_analysis_inputs_writes_research_completeness_artifacts(
     assert manifest["remaining_expected_inputs"] == []
     assert final_report["production_change_allowed"] is False
     assert final_report["threshold_sweep"]["grid"]["xgb_min"] == [0.25, 0.3, 0.33]
+    p1_grid = final_report["p1_probability_scale_shadow_grid"]
+    assert p1_grid["production_change_allowed"] is False
+    assert p1_grid["grid"]["xgb_min"] == [0.18, 0.2, 0.23, 0.25, 0.27]
+    assert p1_grid["guardrails"]["do_not_relax_production_cross_review"] is True
     assert final_report["source_scope"]["dry_run_events"] == 1
     assert feature_report["financial_data_quality"]["reason_counts"]["missing_financials"] == 1
+    raw_coverage = feature_report["financial_data_quality"]["raw_field_coverage"]
+    assert raw_coverage["semantics"]["financial_data_complete"] == (
+        "gate_required_fields_present_only"
+    )
+    assert raw_coverage["same_period_confirmed"] == "unknown"
     classification = feature_report["financial_data_quality"]["classification"]
     assert classification["missing_or_default_evidence_rows"] >= 1
     assert (
@@ -488,6 +497,10 @@ def test_write_p0_analysis_inputs_writes_research_completeness_artifacts(
     assert focus["600956"]["status"] == "missing_runtime_evidence"
     assert position_report["focus_symbols"]["loss_observed_count"] == 1
     assert position_report["focus_symbols"]["missing_evidence_symbols"] == ["600956"]
+    reentry_shadow = position_report["reentry_cooldown_shadow"]
+    assert reentry_shadow["production_change_allowed"] is False
+    assert "000159" in reentry_shadow["loss_symbols"]
+    assert reentry_shadow["guardrails"]["do_not_write_week6_controls"] is True
 
 
 def test_final_report_threshold_sweep_links_candidate_variants_to_outcomes(
@@ -648,6 +661,11 @@ def test_final_report_threshold_sweep_explains_zero_candidate_grid(tmp_path: Pat
     assert diagnostics["blocker_counts"]["score_below_min_grid"] == 1
     assert "probability scale" in diagnostics["interpretation"]
     assert suggested["status"] == "suggested_from_complete_rows"
+    p1_grid = final_report["p1_probability_scale_shadow_grid"]
+    assert p1_grid["status"] == "candidate_generating"
+    assert p1_grid["candidate_variant_count"] > 0
+    assert p1_grid["max_pass_count"] == 1
+    assert p1_grid["outcome_linkage"]["can_claim_profitability"] is False
 
 
 def test_financial_data_quality_classifies_missing_stale_default_and_low_roe(
@@ -688,6 +706,11 @@ def test_financial_data_quality_classifies_missing_stale_default_and_low_roe(
                         "score": 62,
                         "action": "watch",
                         "reasons": ["financial_penalty:low_roe"],
+                        "roe": -0.01,
+                        "debt_ratio": 0.45,
+                        "financial_data_complete": True,
+                        "financial_source": "unit_test_source",
+                        "financial_report_date": "2026-03-31",
                         "decision_trace": {
                             "financial_gate": {
                                 "allowed": False,
@@ -728,3 +751,11 @@ def test_financial_data_quality_classifies_missing_stale_default_and_low_roe(
     assert low_roe["ambiguous_low_roe_rows"] == 1
     assert low_roe["inferred_low_roe_rows"] == 0
     assert quality["classification"]["true_low_roe_evidence_rows"] == 1
+    raw = quality["raw_field_coverage"]
+    assert raw["roe_present_rows"] == 1
+    assert raw["debt_ratio_present_rows"] == 1
+    assert raw["both_gate_fields_present_rows"] == 1
+    assert raw["financial_source_present_rows"] == 1
+    assert raw["financial_report_date_present_rows"] == 1
+    assert raw["source_counts"]["unit_test_source"] == 1
+    assert raw["same_source_confirmed"] == "unknown"

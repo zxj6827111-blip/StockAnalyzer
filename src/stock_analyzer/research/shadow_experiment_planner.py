@@ -144,6 +144,9 @@ def _threshold_assessment(
         "source": "final_report_v3.threshold_sweep + p4_cross_review_failure_analysis_v1",
         "status": status,
         "threshold_sweep_effective": threshold_status != "not_effective",
+        "p1_probability_scale_shadow_grid": _p1_probability_scale_summary(
+            final_report,
+        ),
         "total_evaluated_rows": _int(gate_stats.get("total_evaluated_rows")),
         "decision_threshold_pass": _int(gate_stats.get("total_decision_threshold_pass")),
         "cross_review_pass": _int(gate_stats.get("total_cross_review_pass")),
@@ -157,8 +160,34 @@ def _threshold_assessment(
     }
 
 
+def _p1_probability_scale_summary(final_report: Mapping[str, object]) -> dict[str, object]:
+    grid = _mapping(final_report.get("p1_probability_scale_shadow_grid"))
+    if not grid:
+        return {
+            "status": "missing_input",
+            "production_change_allowed": False,
+            "candidate_variant_count": 0,
+            "can_rank_by_profitability": False,
+        }
+    outcome = _mapping(grid.get("outcome_linkage"))
+    return {
+        "status": str(grid.get("status", "")).strip() or "unknown",
+        "production_change_allowed": bool(grid.get("production_change_allowed", False)),
+        "candidate_variant_count": _int(grid.get("candidate_variant_count")),
+        "max_pass_count": _int(grid.get("max_pass_count")),
+        "max_observed_trades_in_variant": _int(
+            outcome.get("max_observed_trades_in_variant")
+        ),
+        "can_rank_by_profitability": bool(outcome.get("can_rank_by_profitability", False)),
+        "can_claim_profitability": bool(outcome.get("can_claim_profitability", False)),
+        "guardrails": _mapping(grid.get("guardrails")),
+    }
+
+
 def _feature_family_plan(report: Mapping[str, object]) -> dict[str, object]:
     results = _list(report.get("ablation_results"))
+    financial_quality = _mapping(report.get("financial_data_quality"))
+    financial_raw = _mapping(financial_quality.get("raw_field_coverage"))
     if not results:
         return {
             "source": "p4_feature_family_ablation_v1",
@@ -166,6 +195,7 @@ def _feature_family_plan(report: Mapping[str, object]) -> dict[str, object]:
             "drop_shadow_candidates": [],
             "keep_shadow_candidates": [],
             "inconclusive_candidates": [],
+            "financial_raw_field_coverage": _financial_raw_field_summary(financial_raw),
             "note": "feature ablation artifact is missing; run multi-symbol shadow first",
         }
     drop_candidates: list[dict[str, object]] = []
@@ -209,7 +239,28 @@ def _feature_family_plan(report: Mapping[str, object]) -> dict[str, object]:
             key=lambda item: float(item.get("equity_change_pct") or 0.0),
         )[:8],
         "inconclusive_candidates": weak_candidates[:8],
+        "financial_raw_field_coverage": _financial_raw_field_summary(financial_raw),
         "note": "feature ablation evidence is single-symbol until rerun on multi-symbol windows",
+    }
+
+
+def _financial_raw_field_summary(raw: Mapping[str, object]) -> dict[str, object]:
+    if not raw:
+        return {
+            "status": "missing_input",
+            "same_period_confirmed": "unknown",
+            "same_source_confirmed": "unknown",
+        }
+    return {
+        "status": str(raw.get("status", "")).strip() or "unknown",
+        "total_rows": _int(raw.get("total_rows")),
+        "roe_present_rows": _int(raw.get("roe_present_rows")),
+        "debt_ratio_present_rows": _int(raw.get("debt_ratio_present_rows")),
+        "both_gate_fields_present_rows": _int(raw.get("both_gate_fields_present_rows")),
+        "default_or_fallback_source_rows": _int(raw.get("default_or_fallback_source_rows")),
+        "same_period_confirmed": str(raw.get("same_period_confirmed", "unknown")),
+        "same_source_confirmed": str(raw.get("same_source_confirmed", "unknown")),
+        "semantics": _mapping(raw.get("semantics")),
     }
 
 
@@ -227,8 +278,10 @@ def _position_plan(report: Mapping[str, object]) -> dict[str, object]:
         "source": "p5_position/position_framework_analysis.json",
         "status": "needs_execution_ab",
         "summary_keys": sorted(str(key) for key in report.keys())[:20],
+        "reentry_cooldown_shadow": _mapping(report.get("reentry_cooldown_shadow")),
         "recommended_shadow": [
             "position_sizing_sensitivity",
+            "stop_loss_cooldown_reentry_shadow",
             "take_profit_trailing_ab_test",
             "cash_fragmentation_sensitivity",
         ],
@@ -301,9 +354,21 @@ def _recommended_experiments(
                 "priority": "P1",
                 "name": "cross_review_calibration_shadow",
                 "change_type": "gate_calibration",
-                "goal": "calibrate cross-review only after label and feature evidence improves",
-                "inputs": ["cross_review gap", "near_misses"],
+                "goal": (
+                    "calibrate cross-review against the observed probability scale in "
+                    "research artifacts only"
+                ),
+                "inputs": [
+                    "cross_review gap",
+                    "near_misses",
+                    "final_report_v3.p1_probability_scale_shadow_grid",
+                ],
                 "guardrail": "do not relax production cross-review directly",
+                "acceptance": {
+                    "candidate_variant_count_gt": 0,
+                    "mature_return_samples_gte": 50,
+                    "production_change_allowed": False,
+                },
             }
         )
     feature_candidates = _list(feature_plan.get("drop_shadow_candidates"))[:5]

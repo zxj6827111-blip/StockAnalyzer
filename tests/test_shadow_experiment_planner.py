@@ -70,7 +70,22 @@ def test_shadow_experiment_planner_recommends_p0_research_without_production_cha
                         "avg_auc": {"change_pct": -9.0},
                     },
                 },
-            ]
+            ],
+            "financial_data_quality": {
+                "raw_field_coverage": {
+                    "status": "raw_fields_observed",
+                    "total_rows": 100,
+                    "roe_present_rows": 80,
+                    "debt_ratio_present_rows": 75,
+                    "both_gate_fields_present_rows": 70,
+                    "default_or_fallback_source_rows": 12,
+                    "same_period_confirmed": "unknown",
+                    "same_source_confirmed": "unknown",
+                    "semantics": {
+                        "financial_data_complete": "gate_required_fields_present_only"
+                    },
+                }
+            },
         },
     )
     _write_json(
@@ -88,6 +103,9 @@ def test_shadow_experiment_planner_recommends_p0_research_without_production_cha
     feature_plan = plan["feature_family_plan"]
     assert feature_plan["drop_shadow_candidates"][0]["family"] == "volatility"
     assert feature_plan["keep_shadow_candidates"][0]["family"] == "market_relative"
+    raw = feature_plan["financial_raw_field_coverage"]
+    assert raw["roe_present_rows"] == 80
+    assert raw["same_period_confirmed"] == "unknown"
     experiment_names = {item["name"] for item in plan["recommended_experiments"]}
     assert "signal_loss_funnel_nas_replay" in experiment_names
     assert "feature_family_multisymbol_ablation_shadow" in experiment_names
@@ -166,6 +184,20 @@ def test_shadow_experiment_planner_requires_source_review_for_mixed_runtime_inpu
                     }
                 ],
             },
+            "p1_probability_scale_shadow_grid": {
+                "status": "candidate_generating",
+                "production_change_allowed": False,
+                "candidate_variant_count": 7,
+                "max_pass_count": 12,
+                "outcome_linkage": {
+                    "max_observed_trades_in_variant": 8,
+                    "can_rank_by_profitability": False,
+                    "can_claim_profitability": False,
+                },
+                "guardrails": {
+                    "do_not_relax_production_cross_review": True,
+                },
+            },
             "multisymbol_multiwindow": {
                 "summaries": {
                     "baseline": {
@@ -200,7 +232,14 @@ def test_shadow_experiment_planner_requires_source_review_for_mixed_runtime_inpu
     _write_json(analysis_dir / "p4_feature_family_ablation_v1.json", {"ablation_results": []})
     _write_json(
         analysis_dir / "p5_position" / "position_framework_analysis.json",
-        {"recommended_shadow": ["stop_loss_cooldown_reentry_shadow"]},
+        {
+            "recommended_shadow": ["stop_loss_cooldown_reentry_shadow"],
+            "reentry_cooldown_shadow": {
+                "status": "shadow_design_only",
+                "production_change_allowed": False,
+                "guardrails": {"do_not_write_week6_controls": True},
+            },
+        },
     )
 
     plan = build_shadow_experiment_plan(analysis_dir=analysis_dir)
@@ -208,5 +247,10 @@ def test_shadow_experiment_planner_requires_source_review_for_mixed_runtime_inpu
     assert plan["status"] == "research_only"
     assert plan["threshold_assessment"]["status"] == "needs_runtime_source_review"
     assert plan["threshold_assessment"]["source_scope"]["fallback_signal_rows"] == 100
+    p1 = plan["threshold_assessment"]["p1_probability_scale_shadow_grid"]
+    assert p1["candidate_variant_count"] == 7
+    assert p1["guardrails"]["do_not_relax_production_cross_review"] is True
+    assert p1["can_claim_profitability"] is False
     assert plan["source_scope"]["dry_run_events"] == 1
     assert plan["production_change_allowed"] is False
+    assert plan["position_plan"]["reentry_cooldown_shadow"]["production_change_allowed"] is False
