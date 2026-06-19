@@ -9,14 +9,18 @@ do not enable auto promotion, and do not relax production risk controls.
 Expected local branch and commit:
 
 - Branch: `codex/p1-shadow-calibration-data-quality`
-- Commit: `272e4eb feat(research): add P1 shadow calibration reports`
+- Commit: latest `origin/codex/p1-shadow-calibration-data-quality` after
+  `git fetch origin`
+- Expected files include `scripts/p1_nas_shadow_validation.py` and the P1
+  research changes from `272e4eb`
 
 ## Required Safety Gates
 
 Before running any pipeline or research command, verify:
 
 - Git checkout is the real repo: `/vol1/docker/StockAnalyzer_repo`
-- `HEAD` equals `272e4eb`
+- `HEAD` equals the latest fetched
+  `origin/codex/p1-shadow-calibration-data-quality`
 - Runtime mode is `advisory_only`
 - `auto_promotion.enabled=false`
 - Core production guardrails are unchanged
@@ -58,6 +62,15 @@ Required files:
 - `commands/signals_latest_after.json`
 - `commands/signal_quality_after.json`
 - `commands/config_safety_snapshot.json`
+
+After the controlled probe creates the artifact directory, run:
+
+```bash
+python scripts/p1_nas_shadow_validation.py --probe-dir <artifact_dir>
+```
+
+This command writes the final `nas_validation_report.md` and
+`nas_validation_report.json` from the P1 checks.
 
 ## P1 Report Checks
 
