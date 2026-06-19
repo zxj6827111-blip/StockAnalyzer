@@ -13,7 +13,9 @@ Expected local branch and commit:
   `git fetch origin`
 - Expected files include `docker-compose.advisory.yml`,
   `scripts/p1_nas_rebuild_and_collect.sh`,
+  `scripts/p1_capture_nas_environment.py`,
   `scripts/p1_accept_nas_advisory_collection.py`,
+  `scripts/p1_audit_goal_completion.py`,
   `scripts/p1_nas_shadow_validation.py`,
   `scripts/p1_run_nas_advisory_collection.py`, and the P1 research changes from
   `272e4eb`
@@ -47,8 +49,8 @@ The wrapper fetches the latest branch, checks out
 `scheduler` with the advisory override, waits for `/health` to prove
 `advisory_only=true` and `training_enabled=false`, then starts the P1 collection.
 If either health value is unsafe, the wrapper stops before any collection run.
-After collection, it also writes an acceptance report from the generated
-collection summary.
+After collection, it writes an environment snapshot, an acceptance report, and
+a final goal-completion audit from the generated collection artifacts.
 
 Optional overrides:
 
@@ -153,10 +155,13 @@ python scripts/p1_run_nas_advisory_collection.py \
 The collection runner writes per-run reports under `run_001`, `run_002`, etc.,
 and writes:
 
+- `p1_nas_environment.json`
 - `p1_advisory_collection_report.md`
 - `p1_advisory_collection_report.json`
 - `p1_advisory_collection_acceptance.md`
 - `p1_advisory_collection_acceptance.json`
+- `p1_goal_completion_audit.md`
+- `p1_goal_completion_audit.json`
 
 The collection report must show:
 
@@ -180,6 +185,18 @@ The acceptance report must show:
 - `no_safety_failure` passed
 - `financial_raw_fields_observed` passed
 - `mature_samples_not_enough_for_production_threshold_change` passed
+
+The goal-completion audit must show:
+
+- `status=complete`
+- `nas_environment_safe_and_current` passed
+- `collection_report_passed` passed
+- `acceptance_report_passed` passed
+- `continuous_advisory_runs_completed` passed
+- `no_real_trading_or_promotion` passed
+- `latest_signals_from_controlled_pipeline` passed
+- `p1_shadow_and_financial_evidence_present` passed
+- `profitability_threshold_change_not_justified` passed
 
 ## P1 Report Checks
 

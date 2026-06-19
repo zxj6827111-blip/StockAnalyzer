@@ -93,6 +93,11 @@ PY
 }
 
 run_collection() {
+  log "capturing NAS environment evidence"
+  python scripts/p1_capture_nas_environment.py \
+    --api-base "$api_base" \
+    --output-dir "$output_dir" \
+    --expected-branch "$branch"
   log "running advisory-only collection"
   python scripts/p1_run_nas_advisory_collection.py \
     --api-base "$api_base" \
@@ -105,11 +110,18 @@ run_collection() {
   python scripts/p1_accept_nas_advisory_collection.py \
     --collection-dir "$output_dir" \
     --min-completed-runs "$runs"
+  log "building goal completion audit"
+  python scripts/p1_audit_goal_completion.py \
+    --collection-dir "$output_dir" \
+    --min-completed-runs "$runs"
   log "collection report:"
+  log "${output_dir}/p1_nas_environment.json"
   log "${output_dir}/p1_advisory_collection_report.md"
   log "${output_dir}/p1_advisory_collection_report.json"
   log "${output_dir}/p1_advisory_collection_acceptance.md"
   log "${output_dir}/p1_advisory_collection_acceptance.json"
+  log "${output_dir}/p1_goal_completion_audit.md"
+  log "${output_dir}/p1_goal_completion_audit.json"
 }
 
 check_repo
