@@ -707,6 +707,18 @@ def _extract_audit_events(
         if event:
             event["source_path"] = source_path_text
             rows.append(event)
+    portfolio = _mapping(payload.get("portfolio"))
+    trades = [_mapping(item) for item in _list(portfolio.get("trades"))]
+    if trades:
+        rows.append(
+            {
+                "event_type": "runtime_portfolio_trades",
+                "timestamp": str(payload.get("updated_at", "")).strip(),
+                "trace_id": "runtime_state_portfolio",
+                "source_path": source_path_text,
+                "payload": {"portfolio": {"trades": trades}},
+            }
+        )
     return rows
 
 
@@ -962,6 +974,20 @@ def _summarize_execution_events(events: Sequence[Mapping[str, object]]) -> dict[
             status_counts[event_type] += 1
             reason_counts[str(record["reason"])] += 1
             continue
+        if event_type == "runtime_portfolio_trades":
+            mode_counts["runtime_portfolio_trades"] += 1
+            for record in _portfolio_trade_records(payload):
+                status = str(record.get("status", "")).strip() or "unknown"
+                reason = str(record.get("reason", "")).strip() or "unknown"
+                status_counts[status] += 1
+                reason_counts[reason] += 1
+                realized = _float(record.get("realized_return_pct"))
+                if realized is not None:
+                    realized_returns.append(realized)
+                symbol = str(record.get("symbol", "")).strip()
+                if symbol:
+                    records_by_symbol[symbol].append(record)
+            continue
         if event_type != "pipeline_run":
             continue
         mode = str(payload.get("execution_mode", "")).strip().lower() or "unknown"
@@ -1053,6 +1079,56 @@ def _execution_record(
     record["execution_mode"] = mode
     record["dry_run"] = dry_run
     return record
+
+
+def _portfolio_trade_records(payload: Mapping[str, object]) -> list[dict[str, object]]:
+    portfolio = _mapping(payload.get("portfolio"))
+    raw_trades = [_mapping(item) for item in _list(portfolio.get("trades"))]
+    if not raw_trades:
+        return []
+    latest_entry_by_symbol: dict[str, Mapping[str, object]] = {}
+    records: list[dict[str, object]] = []
+    for trade in raw_trades:
+        symbol = str(trade.get("symbol", "")).strip()
+        side = str(trade.get("side", "")).strip().lower()
+        if not symbol:
+            continue
+        if side == "buy":
+            latest_entry_by_symbol[symbol] = trade
+            continue
+        if side != "sell":
+            continue
+        realized = _float(trade.get("realized_return_pct"))
+        entry = latest_entry_by_symbol.get(symbol, {})
+        entry_price = _float(trade.get("entry_price"))
+        if entry_price is None:
+            entry_price = _float(entry.get("entry_price"))
+        exit_price = _float(trade.get("exit_price"))
+        if exit_price is None:
+            exit_price = _float(trade.get("price"))
+        if realized is None and entry_price and exit_price and entry_price > 0:
+            realized = round((exit_price - entry_price) / entry_price, 6)
+        record = {
+            "symbol": symbol,
+            "status": str(trade.get("status", "")).strip() or "portfolio_trade",
+            "reason": str(trade.get("reason", "")).strip()
+            or str(trade.get("exit_note", "")).strip()
+            or "runtime_portfolio_trade",
+            "side": side,
+            "strategy": str(trade.get("strategy", "")).strip(),
+            "target_position": trade.get("target_position"),
+            "quantity": trade.get("exit_quantity", trade.get("quantity")),
+            "price": exit_price,
+            "realized_return_pct": realized,
+            "execution_mode": "runtime_portfolio_trades",
+            "dry_run": False,
+            "trade_id": str(trade.get("trade_id", "")).strip(),
+            "trace_id": str(trade.get("trace_id", "")).strip(),
+            "timestamp": str(trade.get("timestamp", "")).strip(),
+            "source": "runtime_state.portfolio.trades",
+        }
+        records.append(record)
+    return records
 
 
 def _baseline_from_rows(
@@ -1160,6 +1236,20 @@ def _threshold_grid(
     )[:10]
     effective = any(int(item["pass_count"]) > 0 for item in results)
     blocking_diagnostics = _threshold_blocking_diagnostics(rows)
+    total_return_samples = len(_list(execution.get("realized_returns")))
+    candidate_symbols = {str(row.get("symbol", "")).strip() for row in rows if row.get("symbol")}
+    linked_return_samples = sum(
+        len(returns)
+        for symbol, returns in returns_by_symbol.items()
+        if symbol in candidate_symbols
+    )
+    variants_with_observed_trades = sum(
+        1 for item in results if int(item["observed_trade_count"]) > 0
+    )
+    max_observed_trades = max(
+        (int(item["observed_trade_count"]) for item in results),
+        default=0,
+    )
     return {
         "status": "candidate_generating" if effective else "not_effective",
         "grid": {
@@ -1173,10 +1263,13 @@ def _threshold_grid(
         "minimum_candidate_thresholds": _minimum_candidate_thresholds(blocking_diagnostics),
         "outcome_linkage": {
             "symbols_with_returns": len(returns_by_symbol),
+            "total_return_samples": total_return_samples,
+            "return_samples_for_candidate_symbols": linked_return_samples,
+            "unlinked_return_samples": max(0, total_return_samples - linked_return_samples),
+            "variants_with_observed_trades": variants_with_observed_trades,
+            "max_observed_trades_in_variant": max_observed_trades,
             "minimum_observed_trades_for_profitability_rank": 30,
-            "can_rank_by_profitability": any(
-                int(item["observed_trade_count"]) >= 30 for item in results
-            ),
+            "can_rank_by_profitability": max_observed_trades >= 30,
         },
         "top_candidate_generating_variants": best,
         "results": results,

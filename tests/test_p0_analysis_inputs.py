@@ -239,6 +239,96 @@ def test_write_p0_analysis_inputs_does_not_mutate_runtime_state(tmp_path: Path) 
     assert (tmp_path / "analysis" / "p0_analysis_inputs_manifest.json").exists()
 
 
+def test_write_p0_analysis_inputs_links_runtime_portfolio_trades_to_outcomes(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config()
+    model_artifact = tmp_path / "model_v1.json"
+    runtime_state = tmp_path / "runtime_state.json"
+    _write_json(
+        model_artifact,
+        {
+            "training_metrics": {"positive_rate": 0.12, "test_samples": 100},
+            "metadata": {"test_samples": 100},
+        },
+    )
+    _write_json(
+        runtime_state,
+        {
+            "updated_at": "2026-06-18T10:00:00",
+            "latest_signals": {
+                "timestamp": "2026-06-18T10:00:00",
+                "source": "pipeline_run",
+                "signals": [
+                    {
+                        "symbol": "600000",
+                        "score": 56,
+                        "action": "watch",
+                        "probabilities": {"lgbm": 0.5, "xgb": 0.31, "meta": 0.49},
+                    }
+                ],
+            },
+            "portfolio": {
+                "trades": [
+                    {
+                        "trade_id": "TRD-1",
+                        "side": "buy",
+                        "symbol": "600000",
+                        "strategy": "trend",
+                        "timestamp": "2026-06-17T10:00:00",
+                        "entry_price": 10.0,
+                        "quantity": 100,
+                    },
+                    {
+                        "trade_id": "TRD-2",
+                        "side": "sell",
+                        "symbol": "600000",
+                        "strategy": "trend",
+                        "timestamp": "2026-06-18T10:00:00",
+                        "exit_price": 10.8,
+                        "exit_quantity": 100,
+                        "reason": "take_profit_stage_1_reached",
+                    },
+                ],
+            },
+        },
+    )
+
+    manifest = write_p0_analysis_inputs(
+        analysis_dir=tmp_path / "analysis",
+        model_artifact_path=model_artifact,
+        learning_manifest_paths=[],
+        signal_source_paths=[runtime_state],
+        audit_event_paths=[runtime_state],
+        config=config,
+        generated_at=datetime.fromisoformat("2026-06-18T12:00:00"),
+    )
+
+    final_report = json.loads(
+        (tmp_path / "analysis" / "final_report_v3.json").read_text("utf-8")
+    )
+    position_report = json.loads(
+        (tmp_path / "analysis" / "p5_position" / "position_framework_analysis.json")
+        .read_text("utf-8")
+    )
+    variants = final_report["threshold_sweep"]["results"]
+    symbol_path = {
+        item["symbol"]: item for item in position_report["symbol_paths"]
+    }["600000"]
+    linkage = final_report["threshold_sweep"]["outcome_linkage"]
+
+    assert manifest["inputs"]["audit_events"] == 1
+    baseline = final_report["multisymbol_multiwindow"]["summaries"]["baseline"]
+    assert baseline["total_trades"] == 1
+    assert linkage["symbols_with_returns"] == 1
+    assert linkage["total_return_samples"] == 1
+    assert linkage["return_samples_for_candidate_symbols"] == 1
+    assert any(item["observed_trade_count"] == 1 for item in variants)
+    assert symbol_path["execution_count"] == 1
+    assert symbol_path["avg_realized_return_pct"] == 0.08
+    assert symbol_path["execution_reasons"]["take_profit_stage_1_reached"] == 1
+
+
 def test_write_p0_analysis_inputs_writes_research_completeness_artifacts(
     tmp_path: Path,
 ) -> None:
@@ -484,7 +574,11 @@ def test_final_report_threshold_sweep_links_candidate_variants_to_outcomes(
     best = final_report["threshold_sweep"]["top_candidate_generating_variants"][0]
 
     assert manifest["inputs"]["audit_events"] == 1
-    assert final_report["threshold_sweep"]["outcome_linkage"]["symbols_with_returns"] == 2
+    linkage = final_report["threshold_sweep"]["outcome_linkage"]
+    assert linkage["symbols_with_returns"] == 2
+    assert linkage["total_return_samples"] == 2
+    assert linkage["return_samples_for_candidate_symbols"] == 2
+    assert linkage["variants_with_observed_trades"] > 0
     assert any(item["observed_trade_count"] == 2 for item in variants)
     assert best["final_equity"] is not None
     assert "win_rate" in best
