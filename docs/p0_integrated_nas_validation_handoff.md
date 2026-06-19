@@ -4,8 +4,10 @@
 
 - Local repo: `E:\Software Development\StockAnalyzer`
 - Final branch to validate on NAS: `codex/p0-pipeline-diagnostics-integrated`
-- Expected HEAD: `4ad342f feat(research): link runtime portfolio outcomes`
-- Full HEAD: `4ad342faffc59f29308b13d156258f6516a02ad0`
+- Minimum required commit included in this branch:
+  `78a4831 docs(research): add NAS advisory validation handoff`
+- Key code commit included in this branch:
+  `4ad342f feat(research): link runtime portfolio outcomes`
 
 ## Local Evidence
 
@@ -55,9 +57,11 @@ Use this prompt in the NAS Codex session.
 cd /vol1/docker/StockAnalyzer_repo
 git fetch origin
 git checkout -B codex/p0-pipeline-diagnostics-integrated origin/codex/p0-pipeline-diagnostics-integrated
-git log --oneline -1
+git log --oneline -5
 
-期望 HEAD：
+如果 HEAD 比下面两个提交更新也可以，但历史中必须包含：
+78a4831 docs(research): add NAS advisory validation handoff
+
 4ad342f feat(research): link runtime portfolio outcomes
 
 第二步，运行受控 advisory-only probe。
@@ -109,4 +113,3 @@ python scripts/p0_run_nas_advisory_probe.py \
 - outcome_linkage 是否有足够收益样本支持调参。
 - 下一步是否可以进入 shadow 参数实验。
 ```
-
