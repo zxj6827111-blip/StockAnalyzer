@@ -2139,7 +2139,8 @@ def risk_status() -> dict[str, object]:
 @app.get("/signals/latest")
 def latest_signals() -> dict[str, object]:
     payload = _service.latest_signals_snapshot()
-    if not payload.get("trace_id"):
+    signals = payload.get("signals")
+    if not isinstance(signals, list) or not signals:
         return {"signals": []}
     return payload
 

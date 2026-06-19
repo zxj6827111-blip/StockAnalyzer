@@ -226,6 +226,7 @@ def test_service_pipeline_coalesces_runtime_state_persist_reasons() -> None:
     assert persist_calls == [{"include_history_sidecars": False}]
     assert _as_int(runtime["runtime_state_persist_count"]) == 1
     assert runtime["runtime_state_persist_reasons"] == [
+        "latest_signals",
         "recommendation_update",
         "execution_recommendation_update",
         "holding_recommendation_update",
@@ -1511,7 +1512,19 @@ def test_service_advisory_only_mode_skips_portfolio_auto_apply() -> None:
     assert payload["execution_mode"] == "advisory_only"
     assert update["status"] == "skipped_advisory_only"
     assert update["opened"] == 0
+    assert update["executions"] == []
+    attempts = _as_mapping(update["execution_attempts"])
+    assert attempts == {}
+    advisory_attempts = _as_mapping(update["advisory_attempts"])
+    assert advisory_attempts["signals"] >= 1
+    assert advisory_attempts["buy_new_attempted"] == 0
     assert service.portfolio_positions() == before_positions
+    events = _as_mapping_list(service.audit_events(limit=20, event_type="pipeline_run")["events"])
+    audit_payload = _as_mapping(events[-1]["payload"])
+    audit_update = _as_mapping(audit_payload["portfolio_update"])
+    assert audit_update["executions"] == []
+    assert _as_mapping(audit_update["execution_attempts"]) == {}
+    assert _as_mapping(audit_update["advisory_attempts"])["signals"] >= 1
 
 
 def test_service_pause_new_buy_command_blocks_new_positions() -> None:

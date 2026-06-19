@@ -1104,7 +1104,9 @@ def test_service_week5_scan_falls_back_to_shortlist_order_without_execution_risk
     assert execution_rerank["applied"] is False
     assert [str(item["symbol"]) for item in candidates[:2]] == ["600000", "000001"]
     assert candidates[0]["execution_rerank_applied"] is False
-    assert float(candidates[0]["execution_reranked_score"]) == float(candidates[0]["shortlist_score"])
+    assert float(candidates[0]["execution_reranked_score"]) == float(
+        candidates[0]["shortlist_score"]
+    )
     assert service.state.watchlist == ["600000", "000001"]
 
 
@@ -1829,6 +1831,38 @@ def test_signal_quality_audit_falls_back_to_week5_candidates_when_latest_signals
     assert service.state.watchlist == ["001258"]
 
 
+def test_signal_quality_audit_preserves_week5_snapshot_source_when_present() -> None:
+    config = _load_test_config()
+    service = _new_service(config)
+    _patch_attr(
+        service,
+        "latest_signals_snapshot",
+        lambda: {
+            "trace_id": "week5-snapshot",
+            "timestamp": "2026-06-18T10:00:00",
+            "source": "week5_latest_candidates",
+            "storage_source": "runtime_state",
+            "signals": [
+                {
+                    "symbol": "001258",
+                    "action": "watch",
+                    "score": 46.76,
+                    "grade": "C",
+                    "reasons": ["model_disagreement_probe"],
+                    "probabilities": {"lgbm": 1.0, "xgb": 0.43, "meta": 0.49},
+                }
+            ],
+        },
+    )
+
+    report = _as_mapping(service.run_signal_quality_audit(limit=5, include_audit_events=False))
+
+    assert report["trace_id"] == "week5-snapshot"
+    assert report["signal_source"] == "week5_latest_candidates"
+    assert report["signal_storage_source"] == "runtime_state"
+    assert report["source_signal_count"] == 1
+
+
 def test_service_week5_auto_sync_skips_hard_blocked_candidates() -> None:
     config = _load_test_config()
     config.week5.auto_sync_watchlist = True
@@ -1842,7 +1876,12 @@ def test_service_week5_auto_sync_skips_hard_blocked_candidates() -> None:
                 "timestamp": "2026-03-19T15:00:00",
                 "signal_pool": {
                     "candidates": [
-                        {"symbol": "600519", "action": "buy", "score": 88.0, "reasons": ["liquidity_failed"]},
+                        {
+                            "symbol": "600519",
+                            "action": "buy",
+                            "score": 88.0,
+                            "reasons": ["liquidity_failed"],
+                        },
                         {
                             "symbol": "000001",
                             "action": "watch",

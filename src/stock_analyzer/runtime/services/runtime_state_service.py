@@ -35,7 +35,7 @@ class RuntimeStateService:
         market_warehouse_limit = max(1, service._config.market_warehouse.history_limit)
         evolution_limit = max(1, service._config.evolution.history_limit)
         return {
-            "state_version": 7,
+            "state_version": 8,
             "updated_at": datetime.now().isoformat(),
             "scheduler_state": service._scheduler.export_state(),
             "current_equity": service._state.current_equity,
@@ -48,6 +48,9 @@ class RuntimeStateService:
             "broker_positions": dict(service._broker_positions),
             "broker_position_details": deepcopy(service._broker_position_details),
             "recommendation_lifecycle": recommendation_lifecycle,
+            "latest_signals": service._runtime_state_optional_dict(
+                service._last_signal_snapshot
+            ),
             "last_reconcile_report": service._runtime_state_optional_dict(
                 service._last_reconcile_report
             ),
@@ -416,6 +419,31 @@ class RuntimeStateService:
         if isinstance(raw_watchlist, list):
             service._state.watchlist = service._merge_runtime_state_watchlist([], raw_watchlist)
         service._load_recommendation_lifecycle_from_raw(raw.get("recommendation_lifecycle"))
+        latest_signal_snapshot = service._runtime_state_optional_dict(raw.get("latest_signals"))
+        service._last_signal_snapshot = latest_signal_snapshot
+        if latest_signal_snapshot is not None:
+            raw_signals = latest_signal_snapshot.get("signals")
+            service._last_signal_payload = [
+                dict(item) for item in raw_signals if isinstance(item, Mapping)
+            ] if isinstance(raw_signals, list) else []
+            service._last_signal_trace_id = str(
+                latest_signal_snapshot.get("trace_id", "")
+            ).strip()
+            service._last_signal_timestamp = str(
+                latest_signal_snapshot.get("timestamp", "")
+            ).strip()
+            service._last_signal_source = str(
+                latest_signal_snapshot.get("source", "")
+            ).strip() or "pipeline_run"
+            service._last_signal_storage_source = "runtime_state"
+            service._latest_signal_snapshot_dirty = False
+        else:
+            service._last_signal_payload = []
+            service._last_signal_trace_id = ""
+            service._last_signal_timestamp = ""
+            service._last_signal_source = ""
+            service._last_signal_storage_source = ""
+            service._latest_signal_snapshot_dirty = False
         service._reconcile_history = service._merge_runtime_state_history(
             self._load_runtime_state_history_sidecar(
                 "reconcile_history",
@@ -661,6 +689,10 @@ class RuntimeStateService:
         merged["recommendation_lifecycle"] = service._merge_runtime_state_mapping(
             existing.get("recommendation_lifecycle"),
             current_raw.get("recommendation_lifecycle"),
+        )
+        merged["latest_signals"] = service._merge_runtime_state_latest(
+            existing.get("latest_signals"),
+            current_raw.get("latest_signals"),
         )
         merged["last_reconcile_report"] = service._runtime_state_latest_from_raw(
             None

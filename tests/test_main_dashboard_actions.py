@@ -269,6 +269,28 @@ def test_latest_signals_api_contains_recommendation_id() -> None:
     assert "recommendation_id" in signals[0]
 
 
+def test_latest_signals_api_returns_fallback_signals_without_trace_id() -> None:
+    client = TestClient(app)
+    original_snapshot = main_module._service.latest_signals_snapshot
+    try:
+        main_module._service.latest_signals_snapshot = lambda: {
+            "trace_id": "",
+            "timestamp": "2026-06-18T14:55:00",
+            "source": "week5_latest_candidates",
+            "storage_source": "runtime_state",
+            "signals": [{"symbol": "600000", "action": "hold"}],
+        }
+
+        latest_response = client.get("/signals/latest")
+    finally:
+        main_module._service.latest_signals_snapshot = original_snapshot
+
+    assert latest_response.status_code == 200
+    payload = latest_response.json()
+    assert payload["source"] == "week5_latest_candidates"
+    assert payload["signals"][0]["symbol"] == "600000"
+
+
 def test_run_pipeline_api_accepts_live_runtime_flag(monkeypatch) -> None:
     captured: dict[str, object] = {}
 

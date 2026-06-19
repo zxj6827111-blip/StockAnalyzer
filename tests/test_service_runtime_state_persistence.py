@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -10,6 +11,7 @@ from stock_analyzer.data.provider import SyntheticProvider
 from stock_analyzer.models.execution_risk_artifact import ExecutionRiskArtifact
 from stock_analyzer.runtime import service as runtime_service_module
 from stock_analyzer.runtime.service import StockAnalyzerService
+from stock_analyzer.types import PipelineReport, PipelineSignal, RiskStatus
 
 
 def _load_test_config(tmp_path: Path) -> StockAnalyzerConfig:
@@ -123,10 +125,175 @@ def _valid_records() -> list[dict[str, object]]:
     ]
 
 
+def test_runtime_state_persists_latest_signals_after_advisory_pipeline(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config(tmp_path)
+    config.app.advisory_only = True
+    service = _new_service(config)
+    signal = PipelineSignal(
+        symbol="600000",
+        strategy="trend",
+        score=82.0,
+        grade="A",
+        action="buy",
+        target_position=0.05,
+        probabilities={"lgbm": 0.8, "xgb": 0.7, "meta": 0.75},
+    )
+    report = PipelineReport(
+        trace_id="trace-latest-signals",
+        timestamp=datetime.fromisoformat("2026-03-18T10:00:00"),
+        degraded_mode=False,
+        signals=[signal],
+        risk=RiskStatus(
+            can_open_new_position=True,
+            drawdown_pct=0.0,
+            degraded_mode=False,
+            action="normal",
+            reason="test",
+        ),
+    )
+    _patch_attr(service._pipeline, "run_once", lambda **kwargs: report)
+
+    payload = service.run_pipeline(
+        symbols=["600000"],
+        strategy="trend",
+        current_equity=1.0,
+        notify_enabled=False,
+    )
+
+    assert "latest_signals" in _as_mapping(payload["runtime"])["runtime_state_persist_reasons"]
+    state_path = Path(config.command_channel.state_persist_path)
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    persisted = _as_mapping(state["latest_signals"])
+    assert persisted["trace_id"] == "trace-latest-signals"
+    assert persisted["signal_count"] == 1
+
+    reloaded = _new_service(config)
+    latest = reloaded.latest_signals_snapshot()
+    assert latest["trace_id"] == "trace-latest-signals"
+    assert latest["source"] == "pipeline_run"
+    assert latest["storage_source"] == "runtime_state"
+    signals = _as_mapping_list(latest["signals"])
+    assert signals[0]["symbol"] == "600000"
+    assert "recommendation_id" in signals[0]
+
+
+def test_runtime_state_latest_signals_merge_prefers_newer_timestamp(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config(tmp_path)
+    service_a = _new_service(config)
+    service_b = _new_service(config)
+
+    _patch_attr(
+        service_a,
+        "_last_signal_snapshot",
+        {
+            "trace_id": "older-trace",
+            "timestamp": "2026-03-18T09:30:00",
+            "source": "pipeline_run",
+            "signal_count": 1,
+            "signals": [{"symbol": "600000", "action": "hold"}],
+        },
+    )
+    service_a._persist_runtime_state_to_disk()  # noqa: SLF001
+
+    _patch_attr(
+        service_b,
+        "_last_signal_snapshot",
+        {
+            "trace_id": "newer-trace",
+            "timestamp": "2026-03-18T10:00:00",
+            "source": "pipeline_run",
+            "signal_count": 1,
+            "signals": [{"symbol": "000001", "action": "hold"}],
+        },
+    )
+    service_b._persist_runtime_state_to_disk()  # noqa: SLF001
+
+    service_a._persist_runtime_state_to_disk()  # noqa: SLF001
+    state = json.loads(Path(config.command_channel.state_persist_path).read_text())
+    latest = _as_mapping(state["latest_signals"])
+    assert latest["trace_id"] == "newer-trace"
+    assert _as_mapping_list(latest["signals"])[0]["symbol"] == "000001"
+
+
+def test_runtime_state_latest_signals_cleared_when_bootstrap_blocks(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config(tmp_path)
+    config.training.bootstrap_require_completion_for_runtime = True
+    service = _new_service(config)
+    _patch_attr(service, "_last_signal_payload", [{"symbol": "600000", "action": "buy"}])
+    _patch_attr(service, "_last_signal_trace_id", "stale-trace")
+    _patch_attr(service, "_last_signal_timestamp", "2026-03-18T10:00:00")
+    _patch_attr(service, "_last_signal_source", "pipeline_run")
+    _patch_attr(
+        service,
+        "_last_signal_snapshot",
+        {
+            "trace_id": "stale-trace",
+            "timestamp": "2026-03-18T10:00:00",
+            "source": "pipeline_run",
+            "signals": [{"symbol": "600000", "action": "buy"}],
+        },
+    )
+
+    payload = service.run_pipeline(
+        symbols=["600000"],
+        strategy="trend",
+        current_equity=1.0,
+        notify_enabled=False,
+    )
+
+    assert payload["status"] == "blocked_bootstrap_required"
+    latest = service.latest_signals_snapshot()
+    assert latest["signals"] == []
+    assert latest["source"] == "empty"
+
+
+def test_runtime_state_load_clears_stale_memory_when_latest_signals_missing(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config(tmp_path)
+    service = _new_service(config)
+    _patch_attr(service, "_last_signal_payload", [{"symbol": "600000", "action": "buy"}])
+    _patch_attr(service, "_last_signal_trace_id", "stale-trace")
+    _patch_attr(service, "_last_signal_timestamp", "2026-03-18T10:00:00")
+    _patch_attr(service, "_last_signal_source", "pipeline_run")
+    state_path = Path(config.command_channel.state_persist_path)
+    state_path.write_text(
+        json.dumps(
+            {
+                "state_version": 7,
+                "scheduler_state": {},
+                "portfolio": {},
+                "broker_positions": {},
+                "broker_position_details": {},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    service._load_runtime_state_from_disk()  # noqa: SLF001
+
+    latest = service.latest_signals_snapshot()
+    assert latest["signals"] == []
+    assert latest["source"] == "empty"
+
+
 def _as_mapping(value: object) -> Mapping[str, object]:
     if isinstance(value, Mapping):
         return cast(Mapping[str, object], value)
     raise AssertionError(f"Expected mapping, got {type(value).__name__}")
+
+
+def _as_mapping_list(value: object) -> list[Mapping[str, object]]:
+    if isinstance(value, list):
+        return [cast(Mapping[str, object], item) for item in value if isinstance(item, Mapping)]
+    raise AssertionError(f"Expected list, got {type(value).__name__}")
 
 
 def _as_bool(value: object) -> bool:
@@ -515,7 +682,7 @@ def test_runtime_state_persists_compact_json(tmp_path: Path) -> None:
     payload = _as_mapping(json.loads(raw))
 
     assert "\n  " not in raw
-    assert payload["state_version"] == 7
+    assert payload["state_version"] == 8
 
 
 def test_runtime_state_writes_large_histories_to_sidecars(tmp_path: Path) -> None:
