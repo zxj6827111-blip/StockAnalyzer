@@ -11,11 +11,13 @@ Expected local branch and commit:
 - Branch: `codex/p1-shadow-calibration-data-quality`
 - Commit: latest `origin/codex/p1-shadow-calibration-data-quality` after
   `git fetch origin`
-- Expected files include `scripts/p1_nas_shadow_validation.py`,
+- Expected files include `docker-compose.advisory.yml`,
+  `scripts/p1_nas_rebuild_and_collect.sh`,
+  `scripts/p1_nas_shadow_validation.py`,
   `scripts/p1_run_nas_advisory_collection.py`, and the P1 research changes from
   `272e4eb`
-- Current expected tip includes `376a22a feat(research): preflight P1 NAS
-  collection health` or a newer commit on the same branch
+- Current expected tip includes the NAS advisory compose override and the NAS
+  rebuild-and-collection wrapper, or a newer commit on the same branch
 
 ## Required Safety Gates
 
@@ -32,9 +34,32 @@ Before running any pipeline or research command, verify:
 
 If any safety check fails, stop and write a failed validation report.
 
-When rebuilding containers for this research branch, include the advisory
-override so Docker does not fall back to `config/default.yaml` defaults
-(`advisory_only=false`, `training.enabled=true`):
+Preferred NAS command:
+
+```bash
+cd /vol1/docker/StockAnalyzer_repo
+bash scripts/p1_nas_rebuild_and_collect.sh
+```
+
+The wrapper fetches the latest branch, checks out
+`origin/codex/p1-shadow-calibration-data-quality`, rebuilds `api` and
+`scheduler` with the advisory override, waits for `/health` to prove
+`advisory_only=true` and `training_enabled=false`, then starts the P1 collection.
+If either health value is unsafe, the wrapper stops before any collection run.
+
+Optional overrides:
+
+```bash
+API_BASE=http://127.0.0.1:18001 \
+OUTPUT_DIR=artifacts/research/p1_advisory_collection_$(date +%Y%m%dT%H%M%S%z) \
+RUNS=6 \
+INTERVAL_SEC=1800 \
+bash scripts/p1_nas_rebuild_and_collect.sh
+```
+
+Manual fallback: when rebuilding containers for this research branch, include
+the advisory override so Docker does not fall back to `config/default.yaml`
+defaults (`advisory_only=false`, `training.enabled=true`):
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.advisory.yml up -d --build api scheduler
