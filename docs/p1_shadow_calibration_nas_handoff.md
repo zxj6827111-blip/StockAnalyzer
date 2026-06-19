@@ -32,6 +32,27 @@ Before running any pipeline or research command, verify:
 
 If any safety check fails, stop and write a failed validation report.
 
+When rebuilding containers for this research branch, include the advisory
+override so Docker does not fall back to `config/default.yaml` defaults
+(`advisory_only=false`, `training.enabled=true`):
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.advisory.yml up -d --build api scheduler
+```
+
+If the NAS uses legacy Compose, run:
+
+```bash
+docker-compose -f docker-compose.yml -f docker-compose.advisory.yml up -d --build api scheduler
+```
+
+After rebuild, `/health` must report:
+
+- `runtime.advisory_only=true`
+- `runtime.training_enabled=false`
+
+Do not run the collection if either value is wrong.
+
 ## Required Runtime Probe
 
 Run one controlled advisory-only pipeline probe using the same container/service
@@ -88,6 +109,8 @@ python scripts/p1_run_nas_advisory_collection.py \
 
 Then run repeated advisory-only probes. From inside the API container, use
 `http://127.0.0.1:8000`; from the NAS host, use `http://127.0.0.1:18001`.
+The runner also checks `/health` before starting any run and writes
+`status=safety_check_failed` if the runtime is unsafe.
 
 ```bash
 python scripts/p1_run_nas_advisory_collection.py \

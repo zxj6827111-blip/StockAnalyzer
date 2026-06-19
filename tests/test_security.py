@@ -453,6 +453,15 @@ def test_env_example_defaults_runtime_api_auth_to_enabled() -> None:
     assert "SA__SECURITY__API_AUTH_ENABLED=false" not in content
 
 
+def test_docker_compose_advisory_override_enforces_research_safety() -> None:
+    """Advisory override should keep rebuilt NAS containers in research-only mode."""
+    compose_path = Path(__file__).resolve().parents[1] / "docker-compose.advisory.yml"
+    content = compose_path.read_text(encoding="utf-8")
+    assert content.count('SA__APP__ADVISORY_ONLY: "true"') == 2
+    assert content.count('SA__TRAINING__ENABLED: "false"') == 2
+    assert content.count('SA__AUTO_PROMOTION__ENABLED: "false"') == 2
+
+
 def test_docker_build_commit_identity_is_build_time_and_exposed_to_health() -> None:
     """Image commit identity should be baked into the image, not read from .git at runtime."""
     root = Path(__file__).resolve().parents[1]

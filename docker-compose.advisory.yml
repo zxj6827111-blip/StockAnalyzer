@@ -1,0 +1,12 @@
+services:
+  api:
+    environment:
+      SA__APP__ADVISORY_ONLY: "true"
+      SA__TRAINING__ENABLED: "false"
+      SA__AUTO_PROMOTION__ENABLED: "false"
+
+  scheduler:
+    environment:
+      SA__APP__ADVISORY_ONLY: "true"
+      SA__TRAINING__ENABLED: "false"
+      SA__AUTO_PROMOTION__ENABLED: "false"
