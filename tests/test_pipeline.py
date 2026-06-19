@@ -91,6 +91,9 @@ class WeakFundamentalsBarsProvider(MinimalBarsProvider):
         frame["roe"] = 0.01
         frame["debt_ratio"] = 0.90
         frame["financial_data_complete"] = True
+        frame["financial_missing_fields"] = ""
+        frame["financial_source"] = "unit_test_financials"
+        frame["financial_report_date"] = "2026-03-31"
         return frame
 
 
@@ -299,6 +302,13 @@ def test_pipeline_penalizes_trend_instead_of_blocking_under_score_penalty_mode()
     assert penalized_signal.score < baseline_signal.score
     assert any(reason.startswith("financial_penalty:") for reason in penalized_signal.reasons)
     assert "financial_filter_block" not in penalized_signal.reasons
+    financial_gate = _as_mapping(penalized_signal.decision_trace["financial_gate"])
+    assert financial_gate["roe"] == 0.01
+    assert financial_gate["debt_ratio"] == 0.90
+    assert financial_gate["financial_data_complete"] is True
+    assert financial_gate["financial_missing_fields"] == ""
+    assert financial_gate["financial_source"] == "unit_test_financials"
+    assert financial_gate["financial_report_date"] == "2026-03-31"
 
 
 def test_pipeline_opens_model_disagreement_probe_from_raw_score() -> None:

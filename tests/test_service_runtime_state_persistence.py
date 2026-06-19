@@ -139,6 +139,17 @@ def test_runtime_state_persists_latest_signals_after_advisory_pipeline(
         action="buy",
         target_position=0.05,
         probabilities={"lgbm": 0.8, "xgb": 0.7, "meta": 0.75},
+        decision_trace={
+            "financial_gate": {
+                "allowed": True,
+                "roe": 0.1234,
+                "debt_ratio": 0.4567,
+                "financial_data_complete": True,
+                "financial_missing_fields": "",
+                "financial_source": "unit_test_financials",
+                "financial_report_date": "2026-03-31",
+            }
+        },
     )
     report = PipelineReport(
         trace_id="trace-latest-signals",
@@ -177,6 +188,12 @@ def test_runtime_state_persists_latest_signals_after_advisory_pipeline(
     signals = _as_mapping_list(latest["signals"])
     assert signals[0]["symbol"] == "600000"
     assert "recommendation_id" in signals[0]
+    financial_gate = _as_mapping(_as_mapping(signals[0]["decision_trace"])["financial_gate"])
+    assert financial_gate["roe"] == 0.1234
+    assert financial_gate["debt_ratio"] == 0.4567
+    assert financial_gate["financial_data_complete"] is True
+    assert financial_gate["financial_source"] == "unit_test_financials"
+    assert financial_gate["financial_report_date"] == "2026-03-31"
 
 
 def test_runtime_state_latest_signals_merge_prefers_newer_timestamp(

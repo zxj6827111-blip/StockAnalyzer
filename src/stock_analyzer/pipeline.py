@@ -643,10 +643,11 @@ class AnalyzerPipeline:
         scored = self._score_engine.score(components=components, strategy=strategy)
         raw_score = scored.total_score
         raw_grade = scored.grade
+        financial_snapshot = _financial_snapshot(bar=bar_t1, symbol=symbol)
         financial_decision = self._financial_filter.evaluate(
             symbol=symbol,
             strategy=strategy,
-            snapshot=_financial_snapshot(bar=bar_t1, symbol=symbol),
+            snapshot=financial_snapshot,
         )
         if financial_decision.penalty_score > 0:
             adjusted_score = max(0.0, scored.total_score - financial_decision.penalty_score)
@@ -759,6 +760,18 @@ class AnalyzerPipeline:
                 "allowed": bool(financial_decision.allowed),
                 "penalty_score": round(float(financial_decision.penalty_score), 2),
                 "reasons": list(financial_decision.reasons),
+                "roe": financial_snapshot.get("roe"),
+                "debt_ratio": financial_snapshot.get("debt_ratio"),
+                "financial_data_complete": bool(
+                    financial_snapshot.get("financial_data_complete")
+                ),
+                "financial_missing_fields": financial_snapshot.get(
+                    "financial_missing_fields", ""
+                ),
+                "financial_source": financial_snapshot.get("financial_source", ""),
+                "financial_report_date": financial_snapshot.get(
+                    "financial_report_date", ""
+                ),
             },
             "strategy_decision": {
                 "action": strategy_decision_action,
