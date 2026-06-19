@@ -312,9 +312,22 @@ def _render_collection_markdown(report: Mapping[str, object]) -> str:
         f"- financial_raw_fields_observed_runs: {summary.get('financial_raw_fields_observed_runs', 0)}",
         f"- max_mature_return_samples: {summary.get('max_mature_return_samples', 0)}",
         "",
-        "## Runs",
-        "",
     ]
+    safety_failure = _mapping(report.get("safety_failure"))
+    if safety_failure:
+        runtime = _mapping(_mapping(safety_failure.get("health")).get("runtime"))
+        lines.extend(
+            [
+                "## Safety Failure",
+                "",
+                f"- failed_check: {safety_failure.get('failed_check', '')}",
+                f"- detail: {safety_failure.get('detail', '')}",
+                f"- health_runtime_advisory_only: {runtime.get('advisory_only', '')}",
+                f"- health_runtime_training_enabled: {runtime.get('training_enabled', '')}",
+                "",
+            ]
+        )
+    lines.extend(["## Runs", ""])
     for item in _list(report.get("runs")):
         run = _mapping(item)
         lines.append(

@@ -254,7 +254,12 @@ def test_p1_advisory_collection_stops_when_health_is_not_advisory(
     assert report["completed_runs"] == 0
     assert report["safety_failure"]["failed_check"] == "api_health_advisory_only"
     assert calls == [("GET", "/health", None)]
-    assert (tmp_path / "collection" / "p1_advisory_collection_report.md").exists()
+    markdown = (tmp_path / "collection" / "p1_advisory_collection_report.md").read_text(
+        encoding="utf-8"
+    )
+    assert "## Safety Failure" in markdown
+    assert "failed_check: api_health_advisory_only" in markdown
+    assert "health_runtime_advisory_only: False" in markdown
 
 
 def test_p1_advisory_collection_stops_when_training_is_enabled(

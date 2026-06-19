@@ -14,8 +14,8 @@ Expected local branch and commit:
 - Expected files include `scripts/p1_nas_shadow_validation.py`,
   `scripts/p1_run_nas_advisory_collection.py`, and the P1 research changes from
   `272e4eb`
-- Current expected tip includes `a734306 docs(research): document P1 NAS
-  advisory collection` or a newer commit on the same branch
+- Current expected tip includes `376a22a feat(research): preflight P1 NAS
+  collection health` or a newer commit on the same branch
 
 ## Required Safety Gates
 
@@ -109,6 +109,7 @@ The collection report must show:
 
 - `production_change_allowed=false`
 - `failed_runs=0` for evidence used as pass
+- no `safety_failure` block for evidence used as pass
 - `financial_raw_fields_observed_runs > 0`
 - `max_candidate_variant_count > 0`
 - `max_mature_return_samples`
