@@ -14,8 +14,8 @@ Expected local branch and commit:
 - Expected files include `scripts/p1_nas_shadow_validation.py`,
   `scripts/p1_run_nas_advisory_collection.py`, and the P1 research changes from
   `272e4eb`
-- Current expected tip includes `2d67162 feat(research): add P1 NAS advisory
-  collection runner` or a newer commit on the same branch
+- Current expected tip includes `a734306 docs(research): document P1 NAS
+  advisory collection` or a newer commit on the same branch
 
 ## Required Safety Gates
 
