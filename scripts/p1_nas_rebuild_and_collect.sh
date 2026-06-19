@@ -6,21 +6,32 @@ log() {
 }
 
 branch="${BRANCH:-codex/p1-shadow-calibration-data-quality}"
+repo_dir="${REPO_DIR:-/vol1/docker/StockAnalyzer_repo}"
+runtime_dir="${RUNTIME_DIR:-/vol1/docker/StockAnalyzer}"
+runtime_artifacts_dir="${RUNTIME_ARTIFACTS_DIR:-/vol1/docker/volumes/stock_analyzer_runtime_artifacts/_data}"
 api_base="${API_BASE:-http://127.0.0.1:18001}"
-output_dir="${OUTPUT_DIR:-artifacts/research/p1_advisory_collection_quick_rerun}"
+output_dir="${OUTPUT_DIR:-${runtime_artifacts_dir}/research/p1_advisory_collection_quick_rerun}"
+runtime_state="${RUNTIME_STATE:-${runtime_artifacts_dir}/runtime/runtime_state.json}"
+model_artifact="${MODEL_ARTIFACT:-${runtime_artifacts_dir}/model_v1.json}"
 symbols="${SYMBOLS:-600000,000001}"
 runs="${RUNS:-2}"
 interval_sec="${INTERVAL_SEC:-60}"
 health_attempts="${HEALTH_ATTEMPTS:-30}"
 health_sleep_sec="${HEALTH_SLEEP_SEC:-2}"
+compose_files=(
+  -f docker-compose.yml
+  -f docker-compose.runtime.yml
+  -f docker-compose.runtime.localvol.yml
+  -f docker-compose.advisory.yml
+)
 
 compose() {
   if docker compose version >/dev/null 2>&1; then
-    docker compose -f docker-compose.yml -f docker-compose.advisory.yml "$@"
+    docker compose --env-file "${runtime_dir}/.env" "${compose_files[@]}" "$@"
     return
   fi
   if command -v docker-compose >/dev/null 2>&1; then
-    docker-compose -f docker-compose.yml -f docker-compose.advisory.yml "$@"
+    docker-compose --env-file "${runtime_dir}/.env" "${compose_files[@]}" "$@"
     return
   fi
   log "docker compose is not available."
@@ -28,24 +39,46 @@ compose() {
 }
 
 check_repo() {
+  cd "$repo_dir"
   if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    log "current directory is not a Git worktree; run from /vol1/docker/StockAnalyzer_repo."
+    log "${repo_dir} is not a Git worktree."
     exit 1
   fi
 }
 
 checkout_branch() {
+  cd "$repo_dir"
   log "fetching latest origin refs"
   git fetch origin
   log "checking out origin/${branch}"
   git checkout -B "${branch}" "origin/${branch}"
+  git rev-parse HEAD > .build_commit
   log "current tip:"
   git log --oneline -5
 }
 
+sync_runtime_dir() {
+  log "syncing repo to runtime dir: ${runtime_dir}"
+  rsync -av --delete \
+    --exclude '.git' \
+    --exclude '.env' \
+    --exclude 'artifacts/' \
+    --exclude 'suggestions/' \
+    --exclude 'tdx_empty/' \
+    --exclude '.venv/' \
+    --exclude '.vscode/' \
+    --exclude 'tests/' \
+    "${repo_dir}/" "${runtime_dir}/"
+}
+
 rebuild_services() {
-  log "rebuilding api and scheduler with docker-compose.advisory.yml"
-  compose up -d --build api scheduler
+  cd "$runtime_dir"
+  export STOCK_ANALYZER_BUILD_COMMIT
+  STOCK_ANALYZER_BUILD_COMMIT="$(cat "${runtime_dir}/.build_commit")"
+  log "building api image from runtime dir with advisory compose override"
+  compose build api
+  log "recreating api and scheduler with existing rebuilt image"
+  compose up -d --no-build --force-recreate api scheduler
 }
 
 wait_for_safe_health() {
@@ -93,15 +126,21 @@ PY
 }
 
 run_collection() {
+  cd "$runtime_dir"
   log "capturing NAS environment evidence"
   python scripts/p1_capture_nas_environment.py \
     --api-base "$api_base" \
     --output-dir "$output_dir" \
-    --expected-branch "$branch"
+    --expected-branch "$branch" \
+    --repo-dir "$repo_dir" \
+    --runtime-dir "$runtime_dir"
   log "running advisory-only collection"
   python scripts/p1_run_nas_advisory_collection.py \
     --api-base "$api_base" \
     --output-dir "$output_dir" \
+    --runtime-state "$runtime_state" \
+    --config "${runtime_dir}/config/default.yaml" \
+    --model-artifact "$model_artifact" \
     --symbols "$symbols" \
     --runs "$runs" \
     --interval-sec "$interval_sec" \
@@ -126,6 +165,7 @@ run_collection() {
 
 check_repo
 checkout_branch
+sync_runtime_dir
 rebuild_services
 wait_for_safe_health
 run_collection

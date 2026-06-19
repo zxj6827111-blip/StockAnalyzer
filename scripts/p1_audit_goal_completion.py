@@ -145,7 +145,7 @@ def _checks(
         {
             "code": "nas_environment_safe_and_current",
             "passed": str(environment.get("status", "")).strip() == "pass",
-            "detail": "NAS environment report confirms branch, HEAD and /health safety",
+            "detail": "NAS environment report confirms branch, HEAD, build commit and /health safety",
         },
         {
             "code": "collection_report_passed",

@@ -12,7 +12,16 @@ def test_p1_nas_rebuild_wrapper_forces_advisory_compose_override() -> None:
     )
 
     assert "docker-compose.advisory.yml" in script
-    assert "compose up -d --build api scheduler" in script
+    assert "docker-compose.runtime.yml" in script
+    assert "docker-compose.runtime.localvol.yml" in script
+    assert "rsync -av --delete" in script
+    assert "git rev-parse HEAD > .build_commit" in script
+    assert "STOCK_ANALYZER_BUILD_COMMIT" in script
+    assert "stock_analyzer_runtime_artifacts" in script
+    assert "--runtime-state \"$runtime_state\"" in script
+    assert "--model-artifact \"$model_artifact\"" in script
+    assert "compose build api" in script
+    assert "compose up -d --no-build --force-recreate api scheduler" in script
     assert "p1_capture_nas_environment.py" in script
     assert "p1_run_nas_advisory_collection.py" in script
     assert "p1_accept_nas_advisory_collection.py" in script

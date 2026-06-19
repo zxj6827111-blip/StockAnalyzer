@@ -6,6 +6,12 @@ Validate branch `codex/p1-shadow-calibration-data-quality` on NAS in
 `advisory_only` mode. This handoff is research-only. Do not place real orders,
 do not enable auto promotion, and do not relax production risk controls.
 
+The NAS deployment uses two directories:
+
+- Git checkout: `/vol1/docker/StockAnalyzer_repo`
+- Runtime/build directory: `/vol1/docker/StockAnalyzer`
+- Runtime artifacts volume: `/vol1/docker/volumes/stock_analyzer_runtime_artifacts/_data`
+
 Expected local branch and commit:
 
 - Branch: `codex/p1-shadow-calibration-data-quality`
@@ -45,29 +51,63 @@ bash scripts/p1_nas_rebuild_and_collect.sh
 ```
 
 The wrapper fetches the latest branch, checks out
-`origin/codex/p1-shadow-calibration-data-quality`, rebuilds `api` and
-`scheduler` with the advisory override, waits for `/health` to prove
+`origin/codex/p1-shadow-calibration-data-quality` in
+`/vol1/docker/StockAnalyzer_repo`, writes `.build_commit`, rsyncs source into
+`/vol1/docker/StockAnalyzer`, builds/recreates runtime services there with the
+runtime compose files and advisory override, waits for `/health` to prove
 `advisory_only=true` and `training_enabled=false`, then starts the P1 collection.
 If either health value is unsafe, the wrapper stops before any collection run.
 After collection, it writes an environment snapshot, an acceptance report, and
-a final goal-completion audit from the generated collection artifacts.
+a final goal-completion audit under the runtime artifacts volume by default.
 
 Optional overrides:
 
 ```bash
 API_BASE=http://127.0.0.1:18001 \
-OUTPUT_DIR=artifacts/research/p1_advisory_collection_$(date +%Y%m%dT%H%M%S%z) \
+REPO_DIR=/vol1/docker/StockAnalyzer_repo \
+RUNTIME_DIR=/vol1/docker/StockAnalyzer \
+RUNTIME_ARTIFACTS_DIR=/vol1/docker/volumes/stock_analyzer_runtime_artifacts/_data \
+OUTPUT_DIR=/vol1/docker/volumes/stock_analyzer_runtime_artifacts/_data/research/p1_advisory_collection_$(date +%Y%m%dT%H%M%S%z) \
 RUNS=6 \
 INTERVAL_SEC=1800 \
 bash scripts/p1_nas_rebuild_and_collect.sh
 ```
 
-Manual fallback: when rebuilding containers for this research branch, include
-the advisory override so Docker does not fall back to `config/default.yaml`
-defaults (`advisory_only=false`, `training.enabled=true`):
+Manual fallback: when rebuilding containers for this research branch, sync from
+the Git checkout into the runtime directory, then include the advisory override
+so Docker does not fall back to `config/default.yaml` defaults
+(`advisory_only=false`, `training.enabled=true`):
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.advisory.yml up -d --build api scheduler
+cd /vol1/docker/StockAnalyzer_repo
+git rev-parse HEAD > .build_commit
+rsync -av --delete \
+  --exclude '.git' \
+  --exclude '.env' \
+  --exclude 'artifacts/' \
+  --exclude 'suggestions/' \
+  --exclude 'tdx_empty/' \
+  --exclude '.venv/' \
+  --exclude '.vscode/' \
+  --exclude 'tests/' \
+  /vol1/docker/StockAnalyzer_repo/ /vol1/docker/StockAnalyzer/
+
+cd /vol1/docker/StockAnalyzer
+export STOCK_ANALYZER_BUILD_COMMIT="$(cat /vol1/docker/StockAnalyzer/.build_commit)"
+docker compose \
+  --env-file /vol1/docker/StockAnalyzer/.env \
+  -f docker-compose.yml \
+  -f docker-compose.runtime.yml \
+  -f docker-compose.runtime.localvol.yml \
+  -f docker-compose.advisory.yml \
+  build api
+docker compose \
+  --env-file /vol1/docker/StockAnalyzer/.env \
+  -f docker-compose.yml \
+  -f docker-compose.runtime.yml \
+  -f docker-compose.runtime.localvol.yml \
+  -f docker-compose.advisory.yml \
+  up -d --no-build --force-recreate api scheduler
 ```
 
 If the NAS uses legacy Compose, run:

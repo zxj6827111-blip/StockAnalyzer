@@ -28,6 +28,16 @@ def parse_args() -> argparse.Namespace:
         "--expected-branch",
         default="codex/p1-shadow-calibration-data-quality",
     )
+    parser.add_argument(
+        "--repo-dir",
+        default="",
+        help="Git worktree directory used to verify branch and HEAD.",
+    )
+    parser.add_argument(
+        "--runtime-dir",
+        default="",
+        help="Runtime directory used to read .build_commit after rsync.",
+    )
     return parser.parse_args()
 
 
@@ -38,6 +48,8 @@ def main() -> None:
     report = build_environment_report(
         api_base=args.api_base,
         expected_branch=args.expected_branch,
+        repo_dir=_path(args.repo_dir) if args.repo_dir else REPO_ROOT,
+        runtime_dir=_path(args.runtime_dir) if args.runtime_dir else REPO_ROOT,
     )
     path = output_dir / "p1_nas_environment.json"
     path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -46,11 +58,20 @@ def main() -> None:
         sys.exit(1)
 
 
-def build_environment_report(*, api_base: str, expected_branch: str) -> dict[str, object]:
-    branch = _git(["branch", "--show-current"])
-    head = _git(["rev-parse", "HEAD"])
+def build_environment_report(
+    *,
+    api_base: str,
+    expected_branch: str,
+    repo_dir: Path | None = None,
+    runtime_dir: Path | None = None,
+) -> dict[str, object]:
+    repo_root = repo_dir or REPO_ROOT
+    runtime_root = runtime_dir or REPO_ROOT
+    branch = _git(["branch", "--show-current"], cwd=repo_root)
+    head = _git(["rev-parse", "HEAD"], cwd=repo_root)
     remote_ref = f"origin/{expected_branch}"
-    remote_head = _git(["rev-parse", remote_ref])
+    remote_head = _git(["rev-parse", remote_ref], cwd=repo_root)
+    build_commit = _read_text(runtime_root / ".build_commit")
     health = _health(api_base)
     runtime = health.get("runtime") if isinstance(health.get("runtime"), dict) else {}
     checks = [
@@ -63,6 +84,11 @@ def build_environment_report(*, api_base: str, expected_branch: str) -> dict[str
             "code": "head_matches_remote_branch",
             "passed": bool(head) and head == remote_head,
             "detail": f"head={head[:12]} remote={remote_head[:12]}",
+        },
+        {
+            "code": "runtime_build_commit_matches_repo_head",
+            "passed": bool(head) and build_commit == head,
+            "detail": f"build_commit={build_commit[:12]} head={head[:12]}",
         },
         {
             "code": "health_advisory_only",
@@ -79,10 +105,13 @@ def build_environment_report(*, api_base: str, expected_branch: str) -> dict[str
         "report_type": "p1_nas_environment",
         "status": "pass" if all(bool(item["passed"]) for item in checks) else "fail",
         "expected_branch": expected_branch,
+        "repo_dir": str(repo_root),
+        "runtime_dir": str(runtime_root),
         "branch": branch,
         "head": head,
         "remote_ref": remote_ref,
         "remote_head": remote_head,
+        "build_commit": build_commit,
         "api_base": api_base,
         "health": health,
         "checks": checks,
@@ -94,11 +123,11 @@ def _path(raw: str | Path) -> Path:
     return path if path.is_absolute() else REPO_ROOT / path
 
 
-def _git(args: list[str]) -> str:
+def _git(args: list[str], *, cwd: Path) -> str:
     try:
         completed = subprocess.run(
             ["git", *args],
-            cwd=REPO_ROOT,
+            cwd=cwd,
             check=True,
             capture_output=True,
             text=True,
@@ -106,6 +135,13 @@ def _git(args: list[str]) -> str:
     except Exception:
         return ""
     return completed.stdout.strip()
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
 
 
 def _health(api_base: str) -> dict[str, object]:
