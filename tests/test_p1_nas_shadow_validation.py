@@ -184,3 +184,43 @@ def test_p1_nas_shadow_validation_flags_missing_or_unsafe_artifacts(tmp_path: Pa
     assert checks["no_real_orders"] is False
     assert checks["latest_pipeline_advisory_only"] is False
     assert checks["p1_shadow_grid_generates_candidates"] is False
+
+
+def test_p1_nas_shadow_validation_flags_zero_financial_raw_coverage(
+    tmp_path: Path,
+) -> None:
+    probe_dir = tmp_path / "probe"
+    _write_complete_probe(probe_dir)
+    _write_json(
+        probe_dir / "analysis" / "p4_feature_family_ablation_v1.json",
+        {
+            "financial_data_quality": {
+                "raw_field_coverage": {
+                    "status": "raw_fields_missing",
+                    "total_rows": 100,
+                    "roe_present_rows": 0,
+                    "debt_ratio_present_rows": 0,
+                    "both_gate_fields_present_rows": 0,
+                    "financial_source_present_rows": 0,
+                    "financial_report_date_present_rows": 0,
+                    "financial_missing_fields_present_rows": 0,
+                    "same_period_confirmed": "unknown",
+                    "same_source_confirmed": "unknown",
+                    "semantics": {
+                        "financial_data_complete": "gate_required_fields_present_only"
+                    },
+                }
+            }
+        },
+    )
+
+    report = build_p1_validation_report(probe_dir=probe_dir)
+
+    assert report["status"] == "needs_review"
+    checks = {str(item["code"]): bool(item["passed"]) for item in report["checks"]}
+    assert checks["financial_raw_coverage_present"] is True
+    assert checks["financial_raw_fields_observed"] is False
+    assert any(
+        "financial raw fields are persisted" in str(action)
+        for action in report["next_actions"]
+    )

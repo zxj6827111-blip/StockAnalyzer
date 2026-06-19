@@ -341,6 +341,14 @@ def _checks(
             "detail": "financial raw field coverage is present with non-overstated semantics",
         },
         {
+            "code": "financial_raw_fields_observed",
+            "passed": _int(finance.get("roe_present_rows")) > 0
+            and _int(finance.get("debt_ratio_present_rows")) > 0
+            and _int(finance.get("financial_source_present_rows")) > 0
+            and _int(finance.get("financial_report_date_present_rows")) > 0,
+            "detail": "financial raw coverage includes ROE, debt ratio, source and report date evidence",
+        },
+        {
             "code": "financial_same_period_not_overclaimed",
             "passed": str(finance.get("same_period_confirmed", "")).strip() == "unknown"
             and str(finance.get("same_source_confirmed", "")).strip() == "unknown",
@@ -388,6 +396,10 @@ def _next_actions(
         actions.append("Review failed checks before using this run as P1 evidence.")
     if "p1_shadow_grid_generates_candidates" in failed:
         actions.append("Inspect p1_probability_scale_shadow_grid distributions and source rows.")
+    if "financial_raw_fields_observed" in failed:
+        actions.append(
+            "Rerun advisory_only after financial raw fields are persisted in latest signals."
+        )
     if _int(maturity.get("mature_return_samples")) < 50:
         actions.append("Continue advisory_only collection until at least 50 mature samples exist.")
     if _int(maturity.get("mature_return_samples")) < 100:
