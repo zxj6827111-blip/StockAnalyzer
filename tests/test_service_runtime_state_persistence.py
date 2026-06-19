@@ -242,6 +242,7 @@ def test_runtime_state_latest_signals_cleared_when_bootstrap_blocks(
     config = _load_test_config(tmp_path)
     config.training.bootstrap_require_completion_for_runtime = True
     service = _new_service(config)
+    service._training_bootstrap_state["completed"] = False  # noqa: SLF001
     _patch_attr(service, "_last_signal_payload", [{"symbol": "600000", "action": "buy"}])
     _patch_attr(service, "_last_signal_trace_id", "stale-trace")
     _patch_attr(service, "_last_signal_timestamp", "2026-03-18T10:00:00")
