@@ -101,6 +101,15 @@ def test_p1_advisory_collection_runs_multiple_advisory_probes(
         payload: Mapping[str, object] | None,
     ) -> dict[str, object]:
         calls.append((method, path, payload))
+        if path == "/health":
+            return {
+                "status": "ok",
+                "mode": "simulation",
+                "runtime": {
+                    "advisory_only": True,
+                    "training_enabled": False,
+                },
+            }
         if path == "/dashboard/ops/state":
             return {"advisory_only": True, "execution_mode": "advisory_only"}
         if path == "/run/pipeline":
@@ -200,3 +209,93 @@ def test_p1_advisory_collection_runs_multiple_advisory_probes(
     assert (tmp_path / "collection" / "p1_advisory_collection_report.json").exists()
     pipeline_calls = [item for item in calls if item[1] == "/run/pipeline"]
     assert len(pipeline_calls) == 2
+    assert calls[0][1] == "/health"
+
+
+def test_p1_advisory_collection_stops_when_health_is_not_advisory(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, str, Mapping[str, object] | None]] = []
+
+    def _fake_request(
+        method: str,
+        path: str,
+        payload: Mapping[str, object] | None,
+    ) -> dict[str, object]:
+        calls.append((method, path, payload))
+        if path == "/health":
+            return {
+                "status": "ok",
+                "mode": "simulation",
+                "runtime": {
+                    "advisory_only": False,
+                    "training_enabled": False,
+                },
+            }
+        raise AssertionError("unsafe health must stop before probe calls")
+
+    report = run_collection(
+        api_base="http://127.0.0.1:18001",
+        api_token="",
+        symbols=["600000"],
+        strategy="trend",
+        current_equity=1.0,
+        runs=2,
+        interval_sec=0.0,
+        output_dir=tmp_path / "collection",
+        runtime_state_path=tmp_path / "runtime_state.json",
+        config_path=REPO_ROOT / "config" / "default.yaml",
+        model_artifact_path=tmp_path / "model_v1.json",
+        confirm_run=True,
+        http_request=_fake_request,
+    )
+
+    assert report["status"] == "safety_check_failed"
+    assert report["completed_runs"] == 0
+    assert report["safety_failure"]["failed_check"] == "api_health_advisory_only"
+    assert calls == [("GET", "/health", None)]
+    assert (tmp_path / "collection" / "p1_advisory_collection_report.md").exists()
+
+
+def test_p1_advisory_collection_stops_when_training_is_enabled(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, str, Mapping[str, object] | None]] = []
+
+    def _fake_request(
+        method: str,
+        path: str,
+        payload: Mapping[str, object] | None,
+    ) -> dict[str, object]:
+        calls.append((method, path, payload))
+        if path == "/health":
+            return {
+                "status": "ok",
+                "mode": "simulation",
+                "runtime": {
+                    "advisory_only": True,
+                    "training_enabled": True,
+                },
+            }
+        raise AssertionError("unsafe health must stop before probe calls")
+
+    report = run_collection(
+        api_base="http://127.0.0.1:18001",
+        api_token="",
+        symbols=["600000"],
+        strategy="trend",
+        current_equity=1.0,
+        runs=2,
+        interval_sec=0.0,
+        output_dir=tmp_path / "collection",
+        runtime_state_path=tmp_path / "runtime_state.json",
+        config_path=REPO_ROOT / "config" / "default.yaml",
+        model_artifact_path=tmp_path / "model_v1.json",
+        confirm_run=True,
+        http_request=_fake_request,
+    )
+
+    assert report["status"] == "safety_check_failed"
+    assert report["completed_runs"] == 0
+    assert report["safety_failure"]["failed_check"] == "api_health_training_disabled"
+    assert calls == [("GET", "/health", None)]

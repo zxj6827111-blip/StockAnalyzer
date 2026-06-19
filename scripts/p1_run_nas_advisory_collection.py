@@ -108,6 +108,24 @@ def run_collection(
         _write_collection_report(output_dir=output_dir, report=report)
         return report
 
+    client = http_request
+    if client is None:
+        from scripts.p0_run_nas_advisory_probe import _http_json_request  # noqa: PLC0415
+
+        client = _http_json_request(api_base=api_base, api_token=api_token)
+    health = client("GET", "/health", None)
+    safety_failure = _health_safety_failure(health)
+    if safety_failure:
+        report = _safety_failure_report(
+            output_dir=output_dir,
+            requested_runs=max(1, int(runs)),
+            interval_sec=max(0.0, float(interval_sec)),
+            health=health,
+            safety_failure=safety_failure,
+        )
+        _write_collection_report(output_dir=output_dir, report=report)
+        return report
+
     run_items: list[dict[str, object]] = []
     failed = False
     for index in range(max(1, int(runs))):
@@ -127,7 +145,7 @@ def run_collection(
                 config_path=config_path,
                 model_artifact_path=model_artifact_path,
                 build_analysis=True,
-                http_request=http_request,
+                http_request=client,
             )
             p1_report = build_p1_validation_report(probe_dir=run_dir)
             _write_json(run_dir / "nas_validation_report.json", p1_report)
@@ -191,6 +209,51 @@ def run_collection(
     }
     _write_collection_report(output_dir=output_dir, report=report)
     return report
+
+
+def _health_safety_failure(health: Mapping[str, object]) -> str:
+    runtime = _mapping(health.get("runtime"))
+    if not bool(runtime.get("advisory_only")):
+        return "api_health_advisory_only"
+    if bool(runtime.get("training_enabled")):
+        return "api_health_training_disabled"
+    return ""
+
+
+def _safety_failure_report(
+    *,
+    output_dir: Path,
+    requested_runs: int,
+    interval_sec: float,
+    health: Mapping[str, object],
+    safety_failure: str,
+) -> dict[str, object]:
+    detail = (
+        "GET /health did not confirm advisory_only=true."
+        if safety_failure == "api_health_advisory_only"
+        else "GET /health reported training_enabled=true."
+    )
+    return {
+        "report_type": "p1_nas_advisory_collection",
+        "status": "safety_check_failed",
+        "production_change_allowed": False,
+        "output_dir": str(output_dir),
+        "requested_runs": requested_runs,
+        "completed_runs": 0,
+        "interval_sec": interval_sec,
+        "runs": [],
+        "summary": _collection_summary([]),
+        "safety_failure": {
+            "failed_check": safety_failure,
+            "detail": detail,
+            "health": dict(health),
+        },
+        "next_actions": [
+            "Treat this collection as failed and do not use it as evidence.",
+            "Verify /health reports runtime.advisory_only=true before rerun.",
+            "Verify /health reports runtime.training_enabled=false before rerun.",
+        ],
+    }
 
 
 def _collection_summary(run_items: list[Mapping[str, object]]) -> dict[str, object]:
