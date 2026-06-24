@@ -20,6 +20,20 @@ class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+_FEISHU_APP_RECEIVE_ID_TYPES = frozenset({"chat_id", "email", "open_id", "union_id", "user_id"})
+
+
+def _normalize_feishu_app_receive_id_type(value: str) -> str:
+    normalized = value.strip().lower() or "open_id"
+    if normalized not in _FEISHU_APP_RECEIVE_ID_TYPES:
+        supported_text = ",".join(sorted(_FEISHU_APP_RECEIVE_ID_TYPES))
+        raise ValueError(
+            "unsupported feishu_app_receive_id_type: "
+            f"{value} (supported: {supported_text})"
+        )
+    return normalized
+
+
 class AppConfig(_StrictModel):
     timezone: str = "Asia/Shanghai"
     mode: str = "simulation"
@@ -430,6 +444,19 @@ class SimBrokerWeeklyConfig(_StrictModel):
     auto_notify: bool = True
 
 
+class FeishuAppTargetConfig(_StrictModel):
+    name: str = ""
+    app_id: str = ""
+    app_secret: str = ""
+    receive_id: str = ""
+    receive_id_type: str = "open_id"
+
+    @field_validator("receive_id_type")
+    @classmethod
+    def _validate_receive_id_type(cls, value: str) -> str:
+        return _normalize_feishu_app_receive_id_type(value)
+
+
 class NotificationsConfig(_StrictModel):
     enabled: bool = True
     primary: str = "console"
@@ -441,6 +468,7 @@ class NotificationsConfig(_StrictModel):
     feishu_app_secret: str = ""
     feishu_app_receive_id: str = ""
     feishu_app_receive_id_type: str = "open_id"
+    feishu_apps: list[FeishuAppTargetConfig] = Field(default_factory=list)
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     telegram_message_thread_id: str = ""
@@ -468,6 +496,8 @@ class NotificationsConfig(_StrictModel):
             "lark",
             "feishu_app",
             "lark_app",
+            "feishu_app_broadcast",
+            "lark_app_broadcast",
             "telegram",
             "tg",
             "email",
@@ -486,15 +516,7 @@ class NotificationsConfig(_StrictModel):
     @field_validator("feishu_app_receive_id_type")
     @classmethod
     def _validate_feishu_app_receive_id_type(cls, value: str) -> str:
-        normalized = value.strip().lower() or "open_id"
-        supported = {"chat_id", "email", "open_id", "union_id", "user_id"}
-        if normalized not in supported:
-            supported_text = ",".join(sorted(supported))
-            raise ValueError(
-                "unsupported feishu_app_receive_id_type: "
-                f"{value} (supported: {supported_text})"
-            )
-        return normalized
+        return _normalize_feishu_app_receive_id_type(value)
 
 
 class WeComInteractionConfig(_StrictModel):

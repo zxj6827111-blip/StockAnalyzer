@@ -164,6 +164,7 @@ def test_load_default_config_values(monkeypatch: MonkeyPatch) -> None:
     assert config.notifications.feishu_app_secret == ""
     assert config.notifications.feishu_app_receive_id == ""
     assert config.notifications.feishu_app_receive_id_type == "open_id"
+    assert config.notifications.feishu_apps == []
     assert config.notifications.telegram_bot_token == ""
     assert config.notifications.email_receivers == []
     assert config.notifications.custom_webhook_url == ""
@@ -265,8 +266,17 @@ def test_env_override_is_applied(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("SA__FEISHU_INTERACTION__ENABLED", "true")
     monkeypatch.setenv("SA__FEISHU_INTERACTION__SUBSCRIPTION_MODE", "ws")
     monkeypatch.setenv("SA__FEISHU_INTERACTION__ALLOWED_USERS", "[\"ou_xxx\"]")
-    monkeypatch.setenv("SA__NOTIFICATIONS__PRIMARY", "feishu_app")
+    monkeypatch.setenv("SA__NOTIFICATIONS__PRIMARY", "feishu_app_broadcast")
     monkeypatch.setenv("SA__NOTIFICATIONS__FEISHU_APP_RECEIVE_ID_TYPE", "email")
+    monkeypatch.setenv(
+        "SA__NOTIFICATIONS__FEISHU_APPS",
+        (
+            '[{"name":"personal","app_id":"cli_xxx","app_secret":"secret_x",'
+            '"receive_id":"oc_xxx","receive_id_type":"chat_id"},'
+            '{"name":"company","app_id":"cli_yyy","app_secret":"secret_y",'
+            '"receive_id":"user@example.com","receive_id_type":"email"}]'
+        ),
+    )
     monkeypatch.setenv("SA__TDX_SYNC__RUN_TIME", "18:35")
     config = load_config(root / "config" / "default.yaml")
     assert config.data_source.switch_after_failures == 5
@@ -277,8 +287,15 @@ def test_env_override_is_applied(monkeypatch: MonkeyPatch) -> None:
     assert config.feishu_interaction.enabled is True
     assert config.feishu_interaction.subscription_mode == "long_connection"
     assert config.feishu_interaction.allowed_users == ["ou_xxx"]
-    assert config.notifications.primary == "feishu_app"
+    assert config.notifications.primary == "feishu_app_broadcast"
     assert config.notifications.feishu_app_receive_id_type == "email"
+    assert len(config.notifications.feishu_apps) == 2
+    assert config.notifications.feishu_apps[0].name == "personal"
+    assert config.notifications.feishu_apps[0].app_id == "cli_xxx"
+    assert config.notifications.feishu_apps[0].receive_id == "oc_xxx"
+    assert config.notifications.feishu_apps[0].receive_id_type == "chat_id"
+    assert config.notifications.feishu_apps[1].name == "company"
+    assert config.notifications.feishu_apps[1].receive_id_type == "email"
     assert config.tdx_sync.run_time == "18:35"
 
 
@@ -286,6 +303,21 @@ def test_invalid_notification_channel_is_rejected(monkeypatch: MonkeyPatch) -> N
     root = Path(__file__).resolve().parents[1]
     monkeypatch.setenv("SA__NOTIFICATIONS__PRIMARY", "not-a-channel")
     with pytest.raises(ValidationError, match="unsupported notification channel"):
+        _ = load_config(root / "config" / "default.yaml")
+
+
+def test_invalid_feishu_app_target_receive_id_type_is_rejected(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    monkeypatch.setenv(
+        "SA__NOTIFICATIONS__FEISHU_APPS",
+        (
+            '[{"name":"bad","app_id":"cli_xxx","app_secret":"secret_x",'
+            '"receive_id":"oc_xxx","receive_id_type":"bad_type"}]'
+        ),
+    )
+    with pytest.raises(ValidationError, match="unsupported feishu_app_receive_id_type"):
         _ = load_config(root / "config" / "default.yaml")
 
 

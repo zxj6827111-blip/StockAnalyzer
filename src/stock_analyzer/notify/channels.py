@@ -38,6 +38,56 @@ class Notifier(Protocol):
         """Send message and return delivery result."""
 
 
+@dataclass(slots=True)
+class BroadcastNotifier:
+    """Send the same message to every target and aggregate delivery results."""
+
+    targets: Sequence[tuple[str, Notifier]]
+    channel: str = "broadcast"
+    missing_targets_error: str = "missing_targets"
+
+    def send(self, message: NotificationMessage) -> NotificationResult:
+        if not self.targets:
+            return NotificationResult(
+                success=False,
+                channel=self.channel,
+                error=self.missing_targets_error,
+            )
+
+        failures: list[dict[str, str]] = []
+        for target_name, notifier in self.targets:
+            normalized_name = target_name.strip() or "unnamed"
+            try:
+                result = notifier.send(message)
+            except Exception as exc:  # pragma: no cover - defensive for custom notifiers.
+                result = NotificationResult(
+                    success=False,
+                    channel="unknown",
+                    error=str(exc),
+                )
+            if result.success:
+                continue
+            failures.append(
+                {
+                    "name": normalized_name,
+                    "channel": result.channel,
+                    "error": result.error or "send_failed",
+                }
+            )
+
+        if not failures:
+            return NotificationResult(success=True, channel=self.channel)
+        return NotificationResult(
+            success=False,
+            channel=self.channel,
+            error=json.dumps(
+                {"failures": failures},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+
+
 class ConsoleNotifier:
     """Local fallback channel that only prints to stdout."""
 

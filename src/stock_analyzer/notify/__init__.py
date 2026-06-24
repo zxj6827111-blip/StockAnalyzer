@@ -1,6 +1,7 @@
 """Notification channels."""
 
 from stock_analyzer.notify.channels import (
+    BroadcastNotifier,
     ConsoleNotifier,
     CustomWebhookNotifier,
     EmailNotifier,
@@ -17,6 +18,7 @@ from stock_analyzer.notify.channels import (
 from stock_analyzer.notify.filter import NotificationFilter
 
 __all__ = [
+    "BroadcastNotifier",
     "ConsoleNotifier",
     "CustomWebhookNotifier",
     "EmailNotifier",

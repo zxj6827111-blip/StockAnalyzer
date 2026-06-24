@@ -10,8 +10,9 @@ from urllib import request
 
 from _pytest.monkeypatch import MonkeyPatch
 
-from stock_analyzer.config import load_config
+from stock_analyzer.config import FeishuAppTargetConfig, load_config
 from stock_analyzer.notify.channels import (
+    BroadcastNotifier,
     ConsoleNotifier,
     CustomWebhookNotifier,
     EmailNotifier,
@@ -37,6 +38,21 @@ class _FakeNotifier:
             success=self.ok,
             channel=self.name,
             error="" if self.ok else "failed",
+        )
+
+
+@dataclass(slots=True)
+class _RecordingNotifier:
+    ok: bool
+    name: str
+    calls: list[str]
+
+    def send(self, message: NotificationMessage) -> NotificationResult:
+        self.calls.append(self.name)
+        return NotificationResult(
+            success=self.ok,
+            channel=self.name,
+            error="" if self.ok else f"{self.name}_failed",
         )
 
 
@@ -69,6 +85,71 @@ def test_failover_notifier_uses_backup_when_primary_fails() -> None:
     result = notifier.send(NotificationMessage(title="x", content="y"))
     assert result.success is True
     assert result.channel == "b"
+
+
+def test_broadcast_notifier_calls_all_targets_and_succeeds_when_all_successful() -> None:
+    calls: list[str] = []
+    notifier = BroadcastNotifier(
+        targets=[
+            ("personal", _RecordingNotifier(ok=True, name="first", calls=calls)),
+            ("company", _RecordingNotifier(ok=True, name="second", calls=calls)),
+        ],
+        channel="feishu_app_broadcast",
+    )
+
+    result = notifier.send(NotificationMessage(title="x", content="y"))
+
+    assert calls == ["first", "second"]
+    assert result.success is True
+    assert result.channel == "feishu_app_broadcast"
+    assert result.error == ""
+
+
+def test_broadcast_notifier_reports_failures_after_calling_every_target() -> None:
+    calls: list[str] = []
+    notifier = BroadcastNotifier(
+        targets=[
+            ("personal", _RecordingNotifier(ok=True, name="first", calls=calls)),
+            ("company", _RecordingNotifier(ok=False, name="second", calls=calls)),
+            ("backup_personal", _RecordingNotifier(ok=False, name="third", calls=calls)),
+        ],
+        channel="feishu_app_broadcast",
+    )
+
+    result = notifier.send(NotificationMessage(title="x", content="y"))
+
+    assert calls == ["first", "second", "third"]
+    assert result.success is False
+    assert result.channel == "feishu_app_broadcast"
+    error_payload = json.loads(result.error)
+    assert error_payload == {
+        "failures": [
+            {
+                "name": "company",
+                "channel": "second",
+                "error": "second_failed",
+            },
+            {
+                "name": "backup_personal",
+                "channel": "third",
+                "error": "third_failed",
+            },
+        ]
+    }
+
+
+def test_broadcast_notifier_reports_missing_targets() -> None:
+    notifier = BroadcastNotifier(
+        targets=[],
+        channel="feishu_app_broadcast",
+        missing_targets_error="missing_feishu_apps",
+    )
+
+    result = notifier.send(NotificationMessage(title="x", content="y"))
+
+    assert result.success is False
+    assert result.channel == "feishu_app_broadcast"
+    assert result.error == "missing_feishu_apps"
 
 
 def test_new_notifiers_report_missing_configuration() -> None:
@@ -480,6 +561,35 @@ def test_build_channel_supports_new_notification_types() -> None:
     assert isinstance(build_channel(config, "telegram"), TelegramNotifier)
     assert isinstance(build_channel(config, "email"), EmailNotifier)
     assert isinstance(build_channel(config, "custom_webhook"), CustomWebhookNotifier)
+
+
+def test_build_channel_supports_feishu_app_broadcast() -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = load_config(root / "config" / "default.yaml").model_copy(deep=True)
+    config.notifications.feishu_apps = [
+        FeishuAppTargetConfig(
+            name="personal",
+            app_id="cli_a",
+            app_secret="secret_a",
+            receive_id="oc_a",
+            receive_id_type="chat_id",
+        ),
+        FeishuAppTargetConfig(
+            name="company",
+            app_id="cli_b",
+            app_secret="secret_b",
+            receive_id="oc_b",
+            receive_id_type="chat_id",
+        ),
+    ]
+
+    notifier = build_channel(config, "feishu_app_broadcast")
+
+    assert isinstance(notifier, BroadcastNotifier)
+    assert notifier.channel == "feishu_app_broadcast"
+    assert len(notifier.targets) == 2
+    assert [name for name, _ in notifier.targets] == ["personal", "company"]
+    assert all(isinstance(target, FeishuAppNotifier) for _, target in notifier.targets)
 
 
 def test_build_notifier_forces_console_in_pytest(monkeypatch: MonkeyPatch) -> None:

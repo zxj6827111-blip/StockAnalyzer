@@ -7,6 +7,7 @@ import sys
 
 from stock_analyzer.config import StockAnalyzerConfig
 from stock_analyzer.notify.channels import (
+    BroadcastNotifier,
     ConsoleNotifier,
     CustomWebhookNotifier,
     EmailNotifier,
@@ -57,6 +58,25 @@ def build_channel(config: StockAnalyzerConfig, channel_name: str) -> Notifier:
             receive_id=config.notifications.feishu_app_receive_id,
             receive_id_type=config.notifications.feishu_app_receive_id_type,
             timeout_sec=config.notifications.timeout_sec,
+        )
+    if channel_name in {"feishu_app_broadcast", "lark_app_broadcast"}:
+        targets = [
+            (
+                target.name or target.app_id or f"feishu_app_{index}",
+                FeishuAppNotifier(
+                    app_id=target.app_id,
+                    app_secret=target.app_secret,
+                    receive_id=target.receive_id,
+                    receive_id_type=target.receive_id_type,
+                    timeout_sec=config.notifications.timeout_sec,
+                ),
+            )
+            for index, target in enumerate(config.notifications.feishu_apps, start=1)
+        ]
+        return BroadcastNotifier(
+            targets=targets,
+            channel=channel_name,
+            missing_targets_error="missing_feishu_apps",
         )
     if channel_name in {"telegram", "tg"}:
         return TelegramNotifier(

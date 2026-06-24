@@ -409,6 +409,7 @@ notifications:
   feishu_app_secret: ""
   feishu_app_receive_id: ""
   feishu_app_receive_id_type: "open_id"
+  feishu_apps: []
   telegram_bot_token: ""
   telegram_chat_id: ""
   telegram_message_thread_id: ""
