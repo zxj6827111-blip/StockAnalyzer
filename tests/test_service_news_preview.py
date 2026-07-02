@@ -505,6 +505,82 @@ def test_fetch_symbol_live_news_reads_real_akshare_columns(monkeypatch: MonkeyPa
     assert payload[0]["url"] == "https://example.com/news/600438"
 
 
+def test_fetch_symbol_live_news_uses_python_string_storage_for_akshare(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = _SHARED_LIVE_NEWS_BRIEFING_SERVICE
+    _reset_live_news_briefing_service(service)
+    now = datetime(2026, 3, 16, 8, 30)
+    calls: list[str] = []
+
+    class _FakeAkshare:
+        @staticmethod
+        def stock_news_em(symbol: str) -> pd.DataFrame:
+            assert symbol == "600438"
+            storage = str(pd.get_option("mode.string_storage"))
+            calls.append(storage)
+            if storage != "python":
+                raise RuntimeError("pyarrow_string_storage_regression")
+            return pd.DataFrame(
+                [
+                    {
+                        "新闻标题": "600438 新闻标题",
+                        "新闻内容": "公司披露新闻。",
+                        "发布时间": "2026-03-16 07:45:00",
+                        "文章来源": "测试来源",
+                        "新闻链接": "https://example.com/news/600438",
+                    }
+                ]
+    )
+
+    monkeypatch.setattr(service, "_import_akshare", lambda: _FakeAkshare())
+
+    with pd.option_context("mode.string_storage", "pyarrow"):
+        payload = service._fetch_symbol_live_news(
+            symbol="600438",
+            now=now,
+            max_age_hours=18.0,
+            per_symbol_limit=2,
+            force_refresh=True,
+        )
+
+    assert len(payload) == 1
+    assert payload[0]["title"] == "600438 新闻标题"
+    assert calls == ["python"]
+
+
+def test_fetch_symbol_live_news_records_audit_event_on_fetch_failure(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = _SHARED_LIVE_NEWS_BRIEFING_SERVICE
+    _reset_live_news_briefing_service(service)
+
+    class _FakeAkshare:
+        @staticmethod
+        def stock_news_em(symbol: str) -> pd.DataFrame:
+            _ = symbol
+            raise RuntimeError("akshare news failed")
+
+    monkeypatch.setattr(service, "_import_akshare", lambda: _FakeAkshare())
+
+    payload = service._fetch_symbol_live_news(
+        symbol="600438",
+        now=datetime(2026, 3, 16, 8, 30),
+        max_age_hours=18.0,
+        per_symbol_limit=2,
+        force_refresh=True,
+    )
+
+    events = _as_mapping(service.audit_events(limit=5, event_type="live_news_fetch_failed"))
+    items = _as_mapping_list(events["events"])
+
+    assert payload == []
+    assert len(items) == 1
+    event_payload = _as_mapping(items[0]["payload"])
+    assert event_payload["symbol"] == "600438"
+    assert event_payload["error_type"] == "RuntimeError"
+
+
 def test_live_news_briefing_premarket_retries_with_relaxed_lookback(
     monkeypatch: MonkeyPatch,
 ) -> None:

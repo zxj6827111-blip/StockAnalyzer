@@ -600,46 +600,58 @@ class RuntimeNewsService:
                 except json.JSONDecodeError:
                     pass
         try:
-            ak = service._import_akshare()
-            frame: pd.DataFrame = ak.stock_news_em(symbol=normalized_symbol)
-        except Exception:
-            return []
-        if frame is None or frame.empty:
-            return []
-        records: list[dict[str, object]] = []
-        max_age_sec = max(1.0, max_age_hours) * 3600.0
-        for _, row in frame.head(30).iterrows():
-            title = str(row.get("新闻标题", "")).strip()
-            content = str(row.get("新闻内容", "")).strip()
-            published_at = str(row.get("发布时间", "")).strip()
-            source = str(row.get("文章来源", "")).strip()
-            url = str(row.get("新闻链接", "")).strip()
-            title = _row_first_text(row, "新闻标题", "鏂伴椈鏍囬") or title
-            content = _row_first_text(row, "新闻内容", "鏂伴椈鍐呭") or content
-            published_at = _row_first_text(row, "发布时间", "鍙戝竷鏃堕棿") or published_at
-            source = _row_first_text(row, "文章来源", "鏂囩珷鏉ユ簮") or source
-            url = _row_first_text(row, "新闻链接", "鏂伴椈閾炬帴") or url
-            if not title:
-                continue
-            published_dt = _parse_runtime_datetime(published_at)
-            if published_dt is not None:
-                age_sec = max(0.0, (now - published_dt).total_seconds())
-                if age_sec > max_age_sec:
-                    continue
-            records.append(
-                {
+            with pd.option_context("mode.string_storage", "python"):
+                ak = service._import_akshare()
+                frame: pd.DataFrame = ak.stock_news_em(symbol=normalized_symbol)
+                if frame is None or frame.empty:
+                    return []
+                records: list[dict[str, object]] = []
+                max_age_sec = max(1.0, max_age_hours) * 3600.0
+                for _, row in frame.head(30).iterrows():
+                    title = str(row.get("新闻标题", "")).strip()
+                    content = str(row.get("新闻内容", "")).strip()
+                    published_at = str(row.get("发布时间", "")).strip()
+                    source = str(row.get("文章来源", "")).strip()
+                    url = str(row.get("新闻链接", "")).strip()
+                    title = _row_first_text(row, "新闻标题", "鏂伴椈鏍囬") or title
+                    content = _row_first_text(row, "新闻内容", "鏂伴椈鍐呭") or content
+                    published_at = _row_first_text(row, "发布时间", "鍙戝竷鏃堕棿") or published_at
+                    source = _row_first_text(row, "文章来源", "鏂囩珷鏉ユ簮") or source
+                    url = _row_first_text(row, "新闻链接", "鏂伴椈閾炬帴") or url
+                    if not title:
+                        continue
+                    published_dt = _parse_runtime_datetime(published_at)
+                    if published_dt is not None:
+                        age_sec = max(0.0, (now - published_dt).total_seconds())
+                        if age_sec > max_age_sec:
+                            continue
+                    records.append(
+                        {
+                            "symbol": normalized_symbol,
+                            "title": title,
+                            "content": content,
+                            "published_at": (
+                                published_dt.isoformat()
+                                if published_dt is not None
+                                else published_at
+                            ),
+                            "source": source,
+                            "url": url,
+                        }
+                    )
+                    if len(records) >= max(1, per_symbol_limit):
+                        break
+        except Exception as exc:
+            service._record_audit_event(
+                event_type="live_news_fetch_failed",
+                level="warn",
+                payload={
                     "symbol": normalized_symbol,
-                    "title": title,
-                    "content": content,
-                    "published_at": (
-                        published_dt.isoformat() if published_dt is not None else published_at
-                    ),
-                    "source": source,
-                    "url": url,
-                }
+                    "error_type": exc.__class__.__name__,
+                    "error": str(exc)[:300],
+                },
             )
-            if len(records) >= max(1, per_symbol_limit):
-                break
+            return []
         service._cache.set(
             cache_key,
             json.dumps(records, ensure_ascii=False),

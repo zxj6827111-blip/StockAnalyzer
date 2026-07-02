@@ -460,6 +460,52 @@ def test_close_reconcile_daily_digest_includes_top_signal_candidates() -> None:
     assert str(research_overview["conclusion"])
 
 
+def test_close_reconcile_daily_digest_includes_live_news_headlines() -> None:
+    config = _load_test_config()
+    service = _new_service(config)
+    notifications: list[dict[str, object]] = []
+    service.notify = lambda **kwargs: notifications.append(dict(kwargs))  # type: ignore[method-assign]
+    _patch_attr(service, "_refresh_simulated_broker_snapshot_for_close_reconcile", lambda: {})
+    _patch_attr(
+        service,
+        "run_reconciliation",
+        lambda timestamp=None: {"status": "ok", "mismatch_count": 0, "current_equity": 100000.0},
+    )
+    _patch_attr(
+        service,
+        "build_live_news_briefing",
+        lambda **kwargs: {
+            "phase": kwargs.get("phase", ""),
+            "focus_count": 2,
+            "records": 1,
+            "raw_records": 1,
+            "items": [
+                {
+                    "symbol": "600000",
+                    "name": "浦发银行",
+                    "title": "浦发银行披露盘后进展",
+                    "content": "浦发银行披露盘后经营改善进展。",
+                    "published_at": "2026-03-02T15:20:00",
+                    "source": "证券时报",
+                }
+            ],
+        },
+    )
+    _patch_attr(service, "archive_runtime_history_if_needed", lambda now=None: {"status": "off"})
+
+    payload = _as_mapping(service._job_close_reconcile())
+    daily_digest = _as_mapping(payload["daily_digest"])
+    news_briefing = _as_mapping(payload["news_briefing"])
+
+    assert news_briefing["phase"] == "postmarket"
+    assert _as_mapping(daily_digest["news_briefing"])["records"] == 1
+    assert len(notifications) == 2
+    digest_content = str(notifications[-1]["content"])
+    assert "盘后重点新闻=如下" in digest_content
+    assert "600000 浦发银行｜03-02 15:20｜证券时报" in digest_content
+    assert "标题：披露盘后进展" in digest_content
+
+
 def test_week4_acceptance_job_runs_at_configured_time() -> None:
     config = _load_test_config()
     config.scheduler.close_reconcile_time = "23:59"

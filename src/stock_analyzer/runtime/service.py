@@ -3171,41 +3171,51 @@ class StockAnalyzerService:
                 except json.JSONDecodeError:
                     pass
         try:
-            ak = self._import_akshare()
-            frame: pd.DataFrame = ak.stock_news_em(symbol=normalized_symbol)
-        except Exception:
-            return []
-        if frame is None or frame.empty:
-            return []
-        records: list[dict[str, object]] = []
-        max_age_sec = max(1.0, max_age_hours) * 3600.0
-        for _, row in frame.head(30).iterrows():
-            title = str(row.get("新闻标题", "")).strip()
-            content = str(row.get("新闻内容", "")).strip()
-            published_at = str(row.get("发布时间", "")).strip()
-            source = str(row.get("文章来源", "")).strip()
-            url = str(row.get("新闻链接", "")).strip()
-            if not title:
-                continue
-            published_dt = _parse_runtime_datetime(published_at)
-            if published_dt is not None:
-                age_sec = max(0.0, (now - published_dt).total_seconds())
-                if age_sec > max_age_sec:
-                    continue
-            records.append(
-                {
+            with pd.option_context("mode.string_storage", "python"):
+                ak = self._import_akshare()
+                frame: pd.DataFrame = ak.stock_news_em(symbol=normalized_symbol)
+                if frame is None or frame.empty:
+                    return []
+                records: list[dict[str, object]] = []
+                max_age_sec = max(1.0, max_age_hours) * 3600.0
+                for _, row in frame.head(30).iterrows():
+                    title = str(row.get("新闻标题", "")).strip()
+                    content = str(row.get("新闻内容", "")).strip()
+                    published_at = str(row.get("发布时间", "")).strip()
+                    source = str(row.get("文章来源", "")).strip()
+                    url = str(row.get("新闻链接", "")).strip()
+                    if not title:
+                        continue
+                    published_dt = _parse_runtime_datetime(published_at)
+                    if published_dt is not None:
+                        age_sec = max(0.0, (now - published_dt).total_seconds())
+                        if age_sec > max_age_sec:
+                            continue
+                    records.append(
+                        {
+                            "symbol": normalized_symbol,
+                            "title": title,
+                            "content": content,
+                            "published_at": published_dt.isoformat()
+                            if published_dt is not None
+                            else published_at,
+                            "source": source,
+                            "url": url,
+                        }
+                    )
+                    if len(records) >= max(1, per_symbol_limit):
+                        break
+        except Exception as exc:
+            self._record_audit_event(
+                event_type="live_news_fetch_failed",
+                level="warn",
+                payload={
                     "symbol": normalized_symbol,
-                    "title": title,
-                    "content": content,
-                    "published_at": published_dt.isoformat()
-                    if published_dt is not None
-                    else published_at,
-                    "source": source,
-                    "url": url,
-                }
+                    "error_type": exc.__class__.__name__,
+                    "error": str(exc)[:300],
+                },
             )
-            if len(records) >= max(1, per_symbol_limit):
-                break
+            return []
         self._cache.set(
             cache_key,
             json.dumps(records, ensure_ascii=False),
@@ -15320,12 +15330,25 @@ class StockAnalyzerService:
                 ),
                 level="info",
             )
-        daily_digest = self._notify_daily_digest_if_needed(now=now, reconcile_report=report)
+        news_briefing = self.build_live_news_briefing(
+            phase="postmarket",
+            strategy="trend",
+            max_symbols=6,
+            max_items=5,
+            max_age_hours=24.0,
+            record_audit=False,
+        )
+        daily_digest = self._notify_daily_digest_if_needed(
+            now=now,
+            reconcile_report=report,
+            news_briefing=news_briefing,
+        )
         runtime_archive = self.archive_runtime_history_if_needed(now=now)
         return {
             "reconcile_required": self._state.reconcile_required,
             "broker_snapshot_refresh": broker_snapshot_refresh,
             "report": report,
+            "news_briefing": news_briefing,
             "daily_digest": daily_digest,
             "runtime_archive": runtime_archive,
         }
@@ -15491,6 +15514,7 @@ class StockAnalyzerService:
         *,
         now: datetime,
         reconcile_report: dict[str, object],
+        news_briefing: dict[str, object] | None = None,
     ) -> dict[str, object]:
         day_key = now.strftime("%Y%m%d")
         dedup_key = f"daily-digest:{day_key}"
@@ -15516,6 +15540,7 @@ class StockAnalyzerService:
             summary=summary,
             research_focus=research_focus,
             research_overview=research_overview,
+            news_briefing=news_briefing,
         )
         self.notify(
             title=title,
@@ -15536,6 +15561,7 @@ class StockAnalyzerService:
             ],
             "research_focus": [dict(_coerce_object_mapping(item)) for item in research_focus],
             "research_overview": dict(research_overview),
+            "news_briefing": dict(news_briefing) if isinstance(news_briefing, dict) else {},
         }
 
     def _build_daily_digest_payload(
@@ -15952,6 +15978,7 @@ class StockAnalyzerService:
         summary: Mapping[str, object],
         research_focus: list[object],
         research_overview: Mapping[str, object],
+        news_briefing: Mapping[str, object] | None = None,
     ) -> str:
         detail_lines = [
             f"今日结论={str(research_overview.get('conclusion', '')).strip() or '-'}",
@@ -15965,6 +15992,18 @@ class StockAnalyzerService:
             f"持仓预警数={_as_int(summary.get('holding_warn_count'), default=0)}",
             "重点标的=如下",
         ]
+
+        news_blocks = self._render_news_briefing_detail_blocks(
+            news_briefing=dict(news_briefing) if isinstance(news_briefing, Mapping) else None,
+            limit=3,
+        )
+        if news_blocks:
+            detail_lines.append("盘后重点新闻=如下")
+            detail_lines.extend(news_blocks)
+        elif isinstance(news_briefing, Mapping):
+            focus_count = _as_int(news_briefing.get("focus_count"), default=0)
+            if focus_count > 0:
+                detail_lines.append(f"盘后重点新闻=覆盖{focus_count}只，暂无新的个股新闻标题")
 
         focus_rows = [dict(_coerce_object_mapping(item)) for item in research_focus]
         if focus_rows:
