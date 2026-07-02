@@ -88,6 +88,70 @@ class BroadcastNotifier:
         )
 
 
+@dataclass(slots=True)
+class RequiredSuccessBroadcastNotifier:
+    """Broadcast to all targets, but success depends only on required target names."""
+
+    targets: Sequence[tuple[str, Notifier]]
+    required_names: set[str]
+    channel: str = "broadcast"
+    missing_targets_error: str = "missing_targets"
+
+    def send(self, message: NotificationMessage) -> NotificationResult:
+        if not self.targets:
+            return NotificationResult(
+                success=False,
+                channel=self.channel,
+                error=self.missing_targets_error,
+            )
+
+        failures: list[dict[str, str]] = []
+        required_failed = False
+        for target_name, notifier in self.targets:
+            normalized_name = target_name.strip() or "unnamed"
+            try:
+                result = notifier.send(message)
+            except Exception as exc:  # pragma: no cover - defensive for custom notifiers.
+                result = NotificationResult(
+                    success=False,
+                    channel="unknown",
+                    error=str(exc),
+                )
+            if result.success:
+                continue
+            if normalized_name in self.required_names:
+                required_failed = True
+            failures.append(
+                {
+                    "name": normalized_name,
+                    "channel": result.channel,
+                    "error": result.error or "send_failed",
+                }
+            )
+
+        if required_failed:
+            return NotificationResult(
+                success=False,
+                channel=self.channel,
+                error=json.dumps(
+                    {"failures": failures},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
+        if failures:
+            return NotificationResult(
+                success=True,
+                channel=self.channel,
+                error=json.dumps(
+                    {"optional_failures": failures},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
+        return NotificationResult(success=True, channel=self.channel)
+
+
 class ConsoleNotifier:
     """Local fallback channel that only prints to stdout."""
 
@@ -355,6 +419,213 @@ class FeishuAppNotifier:
             return NotificationResult(
                 success=False,
                 channel="feishu_app",
+                error="missing_tenant_access_token",
+            )
+
+        self._tenant_access_token = token
+        ttl_sec = expire if expire > 0 else 3600
+        self._tenant_access_token_expire_at = now_ts + max(60, ttl_sec - 60)
+        self._write_shared_tenant_access_token(
+            app_id=app_id,
+            app_secret=app_secret,
+            token=token,
+            expire_at=self._tenant_access_token_expire_at,
+        )
+        return token
+
+    @classmethod
+    def _shared_tenant_access_token_value(
+        cls,
+        *,
+        app_id: str,
+        app_secret: str,
+        now_ts: float,
+    ) -> str:
+        cache_key = (app_id, app_secret)
+        with cls._shared_tenant_access_tokens_lock:
+            cached = cls._shared_tenant_access_tokens.get(cache_key)
+        if cached is None:
+            return ""
+        token, expire_at = cached
+        if not token or now_ts + 60 >= expire_at:
+            return ""
+        return token
+
+    @classmethod
+    def _write_shared_tenant_access_token(
+        cls,
+        *,
+        app_id: str,
+        app_secret: str,
+        token: str,
+        expire_at: float,
+    ) -> None:
+        cache_key = (app_id, app_secret)
+        with cls._shared_tenant_access_tokens_lock:
+            cls._shared_tenant_access_tokens[cache_key] = (token, expire_at)
+
+
+@dataclass(slots=True)
+class FeishuEnterpriseBatchNotifier:
+    app_id: str
+    app_secret: str
+    mode: str = "enterprise_department"
+    department_ids: Sequence[str] = field(default_factory=list)
+    member_ids: Sequence[str] = field(default_factory=list)
+    member_id_type: str = "open_id"
+    all_department_id: str = "0"
+    batch_url: str = "https://open.feishu.cn/open-apis/message/v4/batch_send"
+    timeout_sec: int = 5
+    _tenant_access_token: str = field(default="", init=False, repr=False)
+    _tenant_access_token_expire_at: float = field(default=0.0, init=False, repr=False)
+    _shared_tenant_access_tokens: ClassVar[dict[tuple[str, str], tuple[str, float]]] = {}
+    _shared_tenant_access_tokens_lock: ClassVar[threading.Lock] = threading.Lock()
+
+    def send(self, message: NotificationMessage) -> NotificationResult:
+        app_id = self.app_id.strip()
+        app_secret = self.app_secret.strip()
+        if not app_id or not app_secret:
+            return NotificationResult(
+                success=False,
+                channel="feishu_enterprise",
+                error="missing_app_config",
+            )
+
+        targets_or_result = self._target_payload()
+        if isinstance(targets_or_result, NotificationResult):
+            return targets_or_result
+
+        access_token_result = self._tenant_access_token_value(
+            app_id=app_id,
+            app_secret=app_secret,
+        )
+        if isinstance(access_token_result, NotificationResult):
+            return access_token_result
+
+        body = {
+            **targets_or_result,
+            "msg_type": "text",
+            "content": {"text": _format_feishu_message(message)},
+        }
+        url = self.batch_url.strip() or "https://open.feishu.cn/open-apis/message/v4/batch_send"
+        return _post_feishu_app_json(
+            channel="feishu_enterprise",
+            url=url,
+            body=body,
+            timeout_sec=self.timeout_sec,
+            tenant_access_token=access_token_result,
+        )
+
+    @classmethod
+    def clear_shared_token_cache(cls) -> None:
+        with cls._shared_tenant_access_tokens_lock:
+            cls._shared_tenant_access_tokens.clear()
+
+    def _target_payload(self) -> dict[str, object] | NotificationResult:
+        mode = self.mode.strip().lower() or "enterprise_department"
+        if mode == "enterprise_member_list":
+            member_ids = _normalize_string_list(self.member_ids)
+            if not member_ids:
+                return NotificationResult(
+                    success=False,
+                    channel="feishu_enterprise",
+                    error="missing_member_ids",
+                )
+            member_id_type = self.member_id_type.strip().lower() or "open_id"
+            field_by_type = {
+                "open_id": "open_ids",
+                "user_id": "user_ids",
+                "email": "emails",
+            }
+            field_name = field_by_type.get(member_id_type)
+            if field_name is None:
+                return NotificationResult(
+                    success=False,
+                    channel="feishu_enterprise",
+                    error=f"unsupported_member_id_type:{member_id_type}",
+                )
+            return {field_name: member_ids}
+
+        if mode == "enterprise_department":
+            department_ids = _normalize_string_list(self.department_ids)
+            if not department_ids:
+                return NotificationResult(
+                    success=False,
+                    channel="feishu_enterprise",
+                    error="missing_department_ids",
+                )
+            return {"department_ids": department_ids}
+
+        if mode == "enterprise_all":
+            department_id = self.all_department_id.strip() or "0"
+            return {"department_ids": [department_id]}
+
+        return NotificationResult(
+            success=False,
+            channel="feishu_enterprise",
+            error=f"unsupported_mode:{mode}",
+        )
+
+    def _tenant_access_token_value(
+        self,
+        *,
+        app_id: str,
+        app_secret: str,
+    ) -> str | NotificationResult:
+        now_ts = time.time()
+        shared_token = self._shared_tenant_access_token_value(
+            app_id=app_id,
+            app_secret=app_secret,
+            now_ts=now_ts,
+        )
+        if shared_token:
+            self._tenant_access_token = shared_token
+            return shared_token
+        if (
+            self._tenant_access_token
+            and now_ts + 60 < self._tenant_access_token_expire_at
+        ):
+            return self._tenant_access_token
+
+        req = request.Request(
+            url="https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            data=json.dumps(
+                {"app_id": app_id, "app_secret": app_secret},
+                ensure_ascii=False,
+            ).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with request.urlopen(req, timeout=self.timeout_sec) as resp:
+                if not (200 <= resp.status < 300):
+                    return NotificationResult(
+                        success=False,
+                        channel="feishu_enterprise",
+                        error="auth_non_2xx",
+                    )
+                payload = _read_json_mapping(resp.read())
+        except Exception as exc:  # pragma: no cover - network dependent.
+            return NotificationResult(
+                success=False,
+                channel="feishu_enterprise",
+                error=str(exc),
+            )
+
+        code = _mapping_int(payload, "code", default=0)
+        if code != 0:
+            return NotificationResult(
+                success=False,
+                channel="feishu_enterprise",
+                error=str(payload.get("msg", "auth_failed")),
+            )
+
+        token = str(payload.get("tenant_access_token", "")).strip()
+        expire = max(0, _mapping_int(payload, "expire", default=0))
+        if not token:
+            return NotificationResult(
+                success=False,
+                channel="feishu_enterprise",
                 error="missing_tenant_access_token",
             )
 
@@ -780,6 +1051,18 @@ def _normalize_feishu_content_line(line: str) -> str:
     if not key or not value:
         return normalized
     return f"{key}\uff1a{value}"
+
+
+def _normalize_string_list(values: Sequence[str]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_value in values:
+        value = str(raw_value).strip()
+        if not value or value in seen:
+            continue
+        normalized.append(value)
+        seen.add(value)
+    return normalized
 
 
 def _strip_feishu_priority_badge(title: str) -> str:

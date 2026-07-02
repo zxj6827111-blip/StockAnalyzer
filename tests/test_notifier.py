@@ -18,9 +18,11 @@ from stock_analyzer.notify.channels import (
     EmailNotifier,
     FailoverNotifier,
     FeishuAppNotifier,
+    FeishuEnterpriseBatchNotifier,
     FeishuNotifier,
     NotificationMessage,
     NotificationResult,
+    RequiredSuccessBroadcastNotifier,
     TelegramNotifier,
     WeComNotifier,
 )
@@ -163,6 +165,19 @@ def test_new_notifiers_report_missing_configuration() -> None:
     assert (
         FeishuAppNotifier(app_id="cli_a", app_secret="cli_s", receive_id="").send(message).error
         == "missing_receive_id"
+    )
+    assert (
+        FeishuEnterpriseBatchNotifier(app_id="", app_secret="").send(message).error
+        == "missing_app_config"
+    )
+    assert (
+        FeishuEnterpriseBatchNotifier(
+            app_id="cli_e",
+            app_secret="sec",
+            mode="enterprise_department",
+            department_ids=[],
+        ).send(message).error
+        == "missing_department_ids"
     )
     assert TelegramNotifier(bot_token="", chat_id="").send(message).error == "missing_bot_token"
     assert TelegramNotifier(bot_token="token", chat_id="").send(message).error == "missing_chat_id"
@@ -450,6 +465,147 @@ def test_feishu_app_notifier_prewarm_populates_shared_cache(monkeypatch: MonkeyP
     ) == 1
 
 
+def test_feishu_enterprise_batch_notifier_sends_to_departments(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    requests_seen: list[dict[str, object]] = []
+    FeishuAppNotifier.clear_shared_token_cache()
+    FeishuEnterpriseBatchNotifier.clear_shared_token_cache()
+
+    def _fake_urlopen(req: object, timeout: int) -> _FakeHttpResponse:
+        assert isinstance(req, request.Request)
+        requests_seen.append(
+            {
+                "url": req.full_url,
+                "timeout": timeout,
+                "headers": dict(req.header_items()),
+                "payload": json.loads(req.data.decode("utf-8")),
+            }
+        )
+        if req.full_url.endswith("/tenant_access_token/internal"):
+            return _FakeHttpResponse(
+                status=200,
+                payload={"code": 0, "tenant_access_token": "t-enterprise", "expire": 7200},
+            )
+        return _FakeHttpResponse(status=200, payload={"code": 0, "msg": "success"})
+
+    monkeypatch.setattr(request, "urlopen", _fake_urlopen)
+
+    notifier = FeishuEnterpriseBatchNotifier(
+        app_id="cli_e",
+        app_secret="sec_e",
+        mode="enterprise_department",
+        department_ids=["od-test", "od-test", " "],
+    )
+    result = notifier.send(NotificationMessage(title="企业通知", content="系统运行正常"))
+
+    assert result.success is True
+    assert len(requests_seen) == 2
+    assert requests_seen[0]["url"] == "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+    assert requests_seen[1]["url"] == "https://open.feishu.cn/open-apis/message/v4/batch_send"
+    send_headers = requests_seen[1]["headers"]
+    assert send_headers["Authorization"] == "Bearer t-enterprise"
+    send_payload = requests_seen[1]["payload"]
+    assert send_payload["department_ids"] == ["od-test"]
+    assert send_payload["msg_type"] == "text"
+    content_payload = send_payload["content"]
+    assert content_payload["text"] == "企业通知\n\n系统运行正常"
+
+
+def test_feishu_enterprise_batch_notifier_supports_member_list(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    requests_seen: list[dict[str, object]] = []
+    FeishuEnterpriseBatchNotifier.clear_shared_token_cache()
+
+    def _fake_urlopen(req: object, timeout: int) -> _FakeHttpResponse:
+        assert isinstance(req, request.Request)
+        _ = timeout
+        requests_seen.append(
+            {
+                "url": req.full_url,
+                "payload": json.loads(req.data.decode("utf-8")),
+            }
+        )
+        if req.full_url.endswith("/tenant_access_token/internal"):
+            return _FakeHttpResponse(
+                status=200,
+                payload={"code": 0, "tenant_access_token": "t-enterprise", "expire": 7200},
+            )
+        return _FakeHttpResponse(status=200, payload={"code": 0, "msg": "success"})
+
+    monkeypatch.setattr(request, "urlopen", _fake_urlopen)
+
+    notifier = FeishuEnterpriseBatchNotifier(
+        app_id="cli_e",
+        app_secret="sec_e",
+        mode="enterprise_member_list",
+        member_ids=["u1", "u2"],
+        member_id_type="user_id",
+    )
+    assert notifier.send(NotificationMessage(title="x", content="y")).success is True
+    assert requests_seen[1]["payload"]["user_ids"] == ["u1", "u2"]
+
+
+def test_feishu_enterprise_batch_token_cache_is_separate_from_personal_app(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    auth_payloads: list[dict[str, object]] = []
+    FeishuAppNotifier.clear_shared_token_cache()
+    FeishuEnterpriseBatchNotifier.clear_shared_token_cache()
+
+    def _fake_urlopen(req: object, timeout: int) -> _FakeHttpResponse:
+        assert isinstance(req, request.Request)
+        _ = timeout
+        payload = json.loads(req.data.decode("utf-8"))
+        if req.full_url.endswith("/tenant_access_token/internal"):
+            auth_payloads.append(payload)
+            token = "t-personal" if payload["app_id"] == "cli_a" else "t-enterprise"
+            return _FakeHttpResponse(
+                status=200,
+                payload={"code": 0, "tenant_access_token": token, "expire": 7200},
+            )
+        return _FakeHttpResponse(status=200, payload={"code": 0, "msg": "success"})
+
+    monkeypatch.setattr(request, "urlopen", _fake_urlopen)
+
+    personal = FeishuAppNotifier(
+        app_id="cli_a",
+        app_secret="sec_a",
+        receive_id="ou_xxx",
+    )
+    enterprise = FeishuEnterpriseBatchNotifier(
+        app_id="cli_e",
+        app_secret="sec_e",
+        mode="enterprise_department",
+        department_ids=["od-test"],
+    )
+    assert personal.send(NotificationMessage(title="x", content="y")).success is True
+    assert enterprise.send(NotificationMessage(title="x", content="y")).success is True
+
+    assert auth_payloads == [
+        {"app_id": "cli_a", "app_secret": "sec_a"},
+        {"app_id": "cli_e", "app_secret": "sec_e"},
+    ]
+
+
+def test_required_success_broadcast_ignores_optional_failure() -> None:
+    notifier = RequiredSuccessBroadcastNotifier(
+        targets=[
+            ("personal", _FakeNotifier(ok=True, name="personal")),
+            ("enterprise", _FakeNotifier(ok=False, name="enterprise")),
+        ],
+        required_names={"personal"},
+        channel="personal+enterprise",
+    )
+
+    result = notifier.send(NotificationMessage(title="x", content="y"))
+
+    assert result.success is True
+    assert result.channel == "personal+enterprise"
+    assert "optional_failures" in result.error
+
+
 def test_wecom_notifier_keeps_level_prefix_and_strips_duplicate_priority_badge(
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -548,6 +704,9 @@ def test_build_channel_supports_new_notification_types() -> None:
     config.notifications.feishu_app_id = "cli_a"
     config.notifications.feishu_app_secret = "cli_s"
     config.notifications.feishu_app_receive_id = "ou_xxx"
+    config.notifications.feishu_enterprise_app_id = "cli_e"
+    config.notifications.feishu_enterprise_app_secret = "sec_e"
+    config.notifications.feishu_enterprise_department_ids = ["od-test"]
     config.notifications.telegram_bot_token = "tg-token"
     config.notifications.telegram_chat_id = "10086"
     config.notifications.email_smtp_host = "smtp.test.local"
@@ -558,6 +717,7 @@ def test_build_channel_supports_new_notification_types() -> None:
 
     assert isinstance(build_channel(config, "feishu"), FeishuNotifier)
     assert isinstance(build_channel(config, "feishu_app"), FeishuAppNotifier)
+    assert isinstance(build_channel(config, "feishu_enterprise"), FeishuEnterpriseBatchNotifier)
     assert isinstance(build_channel(config, "telegram"), TelegramNotifier)
     assert isinstance(build_channel(config, "email"), EmailNotifier)
     assert isinstance(build_channel(config, "custom_webhook"), CustomWebhookNotifier)

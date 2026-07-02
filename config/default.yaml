@@ -410,6 +410,15 @@ notifications:
   feishu_app_receive_id: ""
   feishu_app_receive_id_type: "open_id"
   feishu_apps: []
+  feishu_enterprise_enabled: false
+  feishu_enterprise_app_id: ""
+  feishu_enterprise_app_secret: ""
+  feishu_enterprise_mode: "enterprise_department"
+  feishu_enterprise_department_ids: []
+  feishu_enterprise_member_ids: []
+  feishu_enterprise_member_id_type: "open_id"
+  feishu_enterprise_all_department_id: "0"
+  feishu_enterprise_batch_url: "https://open.feishu.cn/open-apis/message/v4/batch_send"
   telegram_bot_token: ""
   telegram_chat_id: ""
   telegram_message_thread_id: ""

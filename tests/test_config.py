@@ -165,6 +165,14 @@ def test_load_default_config_values(monkeypatch: MonkeyPatch) -> None:
     assert config.notifications.feishu_app_receive_id == ""
     assert config.notifications.feishu_app_receive_id_type == "open_id"
     assert config.notifications.feishu_apps == []
+    assert config.notifications.feishu_enterprise_enabled is False
+    assert config.notifications.feishu_enterprise_app_id == ""
+    assert config.notifications.feishu_enterprise_app_secret == ""
+    assert config.notifications.feishu_enterprise_mode == "enterprise_department"
+    assert config.notifications.feishu_enterprise_department_ids == []
+    assert config.notifications.feishu_enterprise_member_ids == []
+    assert config.notifications.feishu_enterprise_member_id_type == "open_id"
+    assert config.notifications.feishu_enterprise_all_department_id == "0"
     assert config.notifications.telegram_bot_token == ""
     assert config.notifications.email_receivers == []
     assert config.notifications.custom_webhook_url == ""
@@ -266,17 +274,11 @@ def test_env_override_is_applied(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("SA__FEISHU_INTERACTION__ENABLED", "true")
     monkeypatch.setenv("SA__FEISHU_INTERACTION__SUBSCRIPTION_MODE", "ws")
     monkeypatch.setenv("SA__FEISHU_INTERACTION__ALLOWED_USERS", "[\"ou_xxx\"]")
-    monkeypatch.setenv("SA__NOTIFICATIONS__PRIMARY", "feishu_app_broadcast")
+    monkeypatch.setenv("SA__NOTIFICATIONS__PRIMARY", "feishu_app")
     monkeypatch.setenv("SA__NOTIFICATIONS__FEISHU_APP_RECEIVE_ID_TYPE", "email")
-    monkeypatch.setenv(
-        "SA__NOTIFICATIONS__FEISHU_APPS",
-        (
-            '[{"name":"personal","app_id":"cli_xxx","app_secret":"secret_x",'
-            '"receive_id":"oc_xxx","receive_id_type":"chat_id"},'
-            '{"name":"company","app_id":"cli_yyy","app_secret":"secret_y",'
-            '"receive_id":"user@example.com","receive_id_type":"email"}]'
-        ),
-    )
+    monkeypatch.setenv("SA__NOTIFICATIONS__FEISHU_ENTERPRISE_ENABLED", "true")
+    monkeypatch.setenv("SA__NOTIFICATIONS__FEISHU_ENTERPRISE_MODE", "enterprise_department")
+    monkeypatch.setenv("SA__NOTIFICATIONS__FEISHU_ENTERPRISE_DEPARTMENT_IDS", "[\"od_xxx\"]")
     monkeypatch.setenv("SA__TDX_SYNC__RUN_TIME", "18:35")
     config = load_config(root / "config" / "default.yaml")
     assert config.data_source.switch_after_failures == 5
@@ -287,15 +289,11 @@ def test_env_override_is_applied(monkeypatch: MonkeyPatch) -> None:
     assert config.feishu_interaction.enabled is True
     assert config.feishu_interaction.subscription_mode == "long_connection"
     assert config.feishu_interaction.allowed_users == ["ou_xxx"]
-    assert config.notifications.primary == "feishu_app_broadcast"
+    assert config.notifications.primary == "feishu_app"
     assert config.notifications.feishu_app_receive_id_type == "email"
-    assert len(config.notifications.feishu_apps) == 2
-    assert config.notifications.feishu_apps[0].name == "personal"
-    assert config.notifications.feishu_apps[0].app_id == "cli_xxx"
-    assert config.notifications.feishu_apps[0].receive_id == "oc_xxx"
-    assert config.notifications.feishu_apps[0].receive_id_type == "chat_id"
-    assert config.notifications.feishu_apps[1].name == "company"
-    assert config.notifications.feishu_apps[1].receive_id_type == "email"
+    assert config.notifications.feishu_enterprise_enabled is True
+    assert config.notifications.feishu_enterprise_mode == "enterprise_department"
+    assert config.notifications.feishu_enterprise_department_ids == ["od_xxx"]
     assert config.tdx_sync.run_time == "18:35"
 
 

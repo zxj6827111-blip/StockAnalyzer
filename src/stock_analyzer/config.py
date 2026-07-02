@@ -21,6 +21,10 @@ class _StrictModel(BaseModel):
 
 
 _FEISHU_APP_RECEIVE_ID_TYPES = frozenset({"chat_id", "email", "open_id", "union_id", "user_id"})
+_FEISHU_ENTERPRISE_PUSH_MODES = frozenset(
+    {"enterprise_member_list", "enterprise_department", "enterprise_all"}
+)
+_FEISHU_ENTERPRISE_MEMBER_ID_TYPES = frozenset({"email", "open_id", "user_id"})
 
 
 def _normalize_feishu_app_receive_id_type(value: str) -> str:
@@ -32,6 +36,33 @@ def _normalize_feishu_app_receive_id_type(value: str) -> str:
             f"{value} (supported: {supported_text})"
         )
     return normalized
+
+
+def _normalize_feishu_enterprise_mode(value: str) -> str:
+    normalized = value.strip().lower() or "enterprise_department"
+    if normalized not in _FEISHU_ENTERPRISE_PUSH_MODES:
+        supported_text = ",".join(sorted(_FEISHU_ENTERPRISE_PUSH_MODES))
+        raise ValueError(
+            "unsupported feishu_enterprise_mode: "
+            f"{value} (supported: {supported_text})"
+        )
+    return normalized
+
+
+def _normalize_feishu_enterprise_member_id_type(value: str) -> str:
+    normalized = value.strip().lower() or "open_id"
+    if normalized not in _FEISHU_ENTERPRISE_MEMBER_ID_TYPES:
+        supported_text = ",".join(sorted(_FEISHU_ENTERPRISE_MEMBER_ID_TYPES))
+        raise ValueError(
+            "unsupported feishu_enterprise_member_id_type: "
+            f"{value} (supported: {supported_text})"
+        )
+    return normalized
+
+
+def _normalize_nonempty_string(value: object, default: str = "") -> str:
+    normalized = str(value).strip()
+    return normalized or default
 
 
 class AppConfig(_StrictModel):
@@ -469,6 +500,17 @@ class NotificationsConfig(_StrictModel):
     feishu_app_receive_id: str = ""
     feishu_app_receive_id_type: str = "open_id"
     feishu_apps: list[FeishuAppTargetConfig] = Field(default_factory=list)
+    feishu_enterprise_enabled: bool = False
+    feishu_enterprise_app_id: str = ""
+    feishu_enterprise_app_secret: str = ""
+    feishu_enterprise_mode: str = "enterprise_department"
+    feishu_enterprise_department_ids: list[str] = Field(default_factory=list)
+    feishu_enterprise_member_ids: list[str] = Field(default_factory=list)
+    feishu_enterprise_member_id_type: str = "open_id"
+    feishu_enterprise_all_department_id: str | int = "0"
+    feishu_enterprise_batch_url: str = (
+        "https://open.feishu.cn/open-apis/message/v4/batch_send"
+    )
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     telegram_message_thread_id: str = ""
@@ -498,6 +540,8 @@ class NotificationsConfig(_StrictModel):
             "lark_app",
             "feishu_app_broadcast",
             "lark_app_broadcast",
+            "feishu_enterprise",
+            "lark_enterprise",
             "telegram",
             "tg",
             "email",
@@ -517,6 +561,21 @@ class NotificationsConfig(_StrictModel):
     @classmethod
     def _validate_feishu_app_receive_id_type(cls, value: str) -> str:
         return _normalize_feishu_app_receive_id_type(value)
+
+    @field_validator("feishu_enterprise_mode")
+    @classmethod
+    def _validate_feishu_enterprise_mode(cls, value: str) -> str:
+        return _normalize_feishu_enterprise_mode(value)
+
+    @field_validator("feishu_enterprise_member_id_type")
+    @classmethod
+    def _validate_feishu_enterprise_member_id_type(cls, value: str) -> str:
+        return _normalize_feishu_enterprise_member_id_type(value)
+
+    @field_validator("feishu_enterprise_all_department_id")
+    @classmethod
+    def _validate_feishu_enterprise_all_department_id(cls, value: object) -> str:
+        return _normalize_nonempty_string(value, default="0")
 
 
 class WeComInteractionConfig(_StrictModel):

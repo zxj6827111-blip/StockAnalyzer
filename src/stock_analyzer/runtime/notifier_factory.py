@@ -13,9 +13,11 @@ from stock_analyzer.notify.channels import (
     EmailNotifier,
     FailoverNotifier,
     FeishuAppNotifier,
+    FeishuEnterpriseBatchNotifier,
     FeishuNotifier,
     Notifier,
     PushPlusNotifier,
+    RequiredSuccessBroadcastNotifier,
     TelegramNotifier,
     WeComNotifier,
 )
@@ -28,7 +30,11 @@ def build_notifier(config: StockAnalyzerConfig) -> FailoverNotifier:
         return FailoverNotifier(primary=console, backup=console)
     primary_name = config.notifications.primary.strip().lower()
     backup_name = config.notifications.backup.strip().lower()
-    primary = build_channel(config=config, channel_name=primary_name)
+    primary = _with_enterprise_feishu_if_enabled(
+        config=config,
+        channel=build_channel(config=config, channel_name=primary_name),
+        primary_name=primary_name,
+    )
     backup = build_channel(config=config, channel_name=backup_name)
     return FailoverNotifier(primary=primary, backup=backup)
 
@@ -78,6 +84,8 @@ def build_channel(config: StockAnalyzerConfig, channel_name: str) -> Notifier:
             channel=channel_name,
             missing_targets_error="missing_feishu_apps",
         )
+    if channel_name in {"feishu_enterprise", "lark_enterprise"}:
+        return _build_enterprise_feishu_channel(config)
     if channel_name in {"telegram", "tg"}:
         return TelegramNotifier(
             bot_token=config.notifications.telegram_bot_token,
@@ -103,6 +111,42 @@ def build_channel(config: StockAnalyzerConfig, channel_name: str) -> Notifier:
             timeout_sec=config.notifications.timeout_sec,
         )
     return ConsoleNotifier()
+
+
+def _with_enterprise_feishu_if_enabled(
+    *,
+    config: StockAnalyzerConfig,
+    channel: Notifier,
+    primary_name: str,
+) -> Notifier:
+    if not config.notifications.feishu_enterprise_enabled:
+        return channel
+    if primary_name in {"feishu_enterprise", "lark_enterprise"}:
+        return channel
+    required_name = primary_name or "primary"
+    return RequiredSuccessBroadcastNotifier(
+        targets=[
+            (required_name, channel),
+            ("feishu_enterprise", _build_enterprise_feishu_channel(config)),
+        ],
+        required_names={required_name},
+        channel=f"{primary_name or 'primary'}+feishu_enterprise",
+        missing_targets_error="missing_primary_or_enterprise_feishu",
+    )
+
+
+def _build_enterprise_feishu_channel(config: StockAnalyzerConfig) -> FeishuEnterpriseBatchNotifier:
+    return FeishuEnterpriseBatchNotifier(
+        app_id=config.notifications.feishu_enterprise_app_id,
+        app_secret=config.notifications.feishu_enterprise_app_secret,
+        mode=config.notifications.feishu_enterprise_mode,
+        department_ids=config.notifications.feishu_enterprise_department_ids,
+        member_ids=config.notifications.feishu_enterprise_member_ids,
+        member_id_type=config.notifications.feishu_enterprise_member_id_type,
+        all_department_id=config.notifications.feishu_enterprise_all_department_id,
+        batch_url=config.notifications.feishu_enterprise_batch_url,
+        timeout_sec=config.notifications.timeout_sec,
+    )
 
 
 def _force_console_notifier() -> bool:
