@@ -20,8 +20,8 @@ from stock_analyzer.data.provider_factory import build_runtime_provider
 from stock_analyzer.feature.engineer import FeatureEngineer
 from stock_analyzer.feature.market_context import build_market_relative_frame
 from stock_analyzer.filter.financial import FinancialRiskFilter
-from stock_analyzer.learning.feedback_features import ensure_feedback_feature_frame
 from stock_analyzer.learning.feature_schema_registry import FeatureSchemaRegistry
+from stock_analyzer.learning.feedback_features import ensure_feedback_feature_frame
 from stock_analyzer.learning.label_policy_registry import LabelPolicyRegistry
 from stock_analyzer.learning.sample_schema import (
     BackfillFidelityTier,
@@ -31,6 +31,10 @@ from stock_analyzer.learning.sample_schema import (
 )
 from stock_analyzer.learning.sample_store import SampleStore
 from stock_analyzer.models.predictor import SignalPredictor
+from stock_analyzer.models.probability_health import (
+    ProbabilityHealthMonitor,
+    sanitize_probabilities,
+)
 from stock_analyzer.models.registry import ModelRegistry
 from stock_analyzer.monitor.health import DataHealthMonitor
 from stock_analyzer.risk.controls import RiskController
@@ -100,6 +104,8 @@ class AnalyzerPipeline:
         self._feature_schema_registry = feature_schema_registry
         self._label_policy_registry = label_policy_registry
         self._model_registry: ModelRegistry | None = None
+        self._probability_health = ProbabilityHealthMonitor()
+        self._last_probability_health: dict[str, object] = {"status": "not_observed"}
         self._runtime_config_hash = _stable_config_hash(config)
         self._latest_report: PipelineReport | None = None
         self._evolution_controls: dict[str, object] = {}
@@ -610,7 +616,9 @@ class AnalyzerPipeline:
         features = ensure_feedback_feature_frame(features)
 
         latest_features = features.iloc[-1]
-        probabilities = self._infer_probabilities(latest_features)
+        raw_probabilities = self._infer_probabilities(latest_features)
+        self._last_probability_health = self._probability_health.observe(raw_probabilities)
+        probabilities = sanitize_probabilities(raw_probabilities)
         champion_auc = self._active_champion_auc()
         cross_review = evaluate_cross_review(
             lgbm_prob=probabilities["lgbm"],
@@ -691,6 +699,13 @@ class AnalyzerPipeline:
             decision.action = "hold"
             decision.target_position = 0.0
             decision.reason = "financial_filter_block"
+        if (
+            not bool(self._last_probability_health.get("promotion_allowed", True))
+            and decision.action == "buy"
+        ):
+            decision.action = "hold"
+            decision.target_position = 0.0
+            decision.reason = "model_probability_unhealthy"
 
         reasons = list(cross_review.reasons)
         dropped_rows = _as_int(time_gate.get("dropped_rows"), default=0)
@@ -702,6 +717,8 @@ class AnalyzerPipeline:
         if not liquidity_pass:
             reasons.append("liquidity_failed")
         reasons.extend(financial_decision.reasons)
+        if not bool(self._last_probability_health.get("promotion_allowed", True)):
+            reasons.append("model_probability_unhealthy")
         reasons.append(f"news_component:{news_component:.3f}")
         reasons.append(f"board_component:{board_component:.3f}")
         reasons.append(f"completion_component:{completion_component:.3f}")
@@ -756,6 +773,7 @@ class AnalyzerPipeline:
                 "degraded_consensus": bool(cross_review.degraded_consensus),
                 "thresholds": dict(cross_review.thresholds),
             },
+            "probability_health": dict(self._last_probability_health),
             "financial_gate": {
                 "allowed": bool(financial_decision.allowed),
                 "penalty_score": round(float(financial_decision.penalty_score), 2),
@@ -772,6 +790,10 @@ class AnalyzerPipeline:
                 "financial_report_date": financial_snapshot.get(
                     "financial_report_date", ""
                 ),
+                "source": financial_snapshot.get("source", ""),
+                "as_of": financial_snapshot.get("as_of", ""),
+                "trust_level": financial_snapshot.get("trust_level", "missing"),
+                "completeness": financial_snapshot.get("completeness", 0.0),
             },
             "strategy_decision": {
                 "action": strategy_decision_action,
@@ -1167,10 +1189,16 @@ def _financial_snapshot(bar: pd.Series, symbol: str) -> dict[str, object]:
     roe = _optional_float(bar.get("roe"))
     debt_ratio = _optional_float(bar.get("debt_ratio"))
     raw_complete = bar.get("financial_data_complete")
+    trust_level = str(bar.get("financial_trust_level", "")).strip().lower()
+    if not trust_level:
+        trust_level = "reported" if roe is not None and debt_ratio is not None else "missing"
     if isinstance(raw_complete, bool):
-        complete = raw_complete
+        complete = raw_complete and trust_level in {"reported", "derived"}
     else:
-        complete = roe is not None and debt_ratio is not None
+        complete = roe is not None and debt_ratio is not None and trust_level in {
+            "reported",
+            "derived",
+        }
     return {
         "symbol": symbol,
         "name": str(bar.get("name", "")),
@@ -1184,6 +1212,10 @@ def _financial_snapshot(bar: pd.Series, symbol: str) -> dict[str, object]:
         "financial_missing_fields": str(bar.get("financial_missing_fields", "")),
         "financial_source": str(bar.get("financial_source", "")),
         "financial_report_date": str(bar.get("financial_report_date", "")),
+        "source": str(bar.get("financial_source", "")),
+        "as_of": str(bar.get("financial_as_of", bar.get("financial_report_date", ""))),
+        "trust_level": trust_level,
+        "completeness": _as_float(bar.get("financial_completeness"), default=0.0),
     }
 
 

@@ -5,12 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import platform
+import shutil
 import socket
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -70,6 +72,7 @@ def export_support_bundle(
     redis_container: str = DEFAULT_REDIS_CONTAINER,
     log_tail: int = DEFAULT_LOG_TAIL,
     timeout_sec: float = DEFAULT_TIMEOUT_SEC,
+    mode: str = "host",
 ) -> Path:
     """Collect support diagnostics and write them to a JSON file."""
     root = _resolve_project_root(project_root)
@@ -86,6 +89,7 @@ def export_support_bundle(
         redis_container=redis_container,
         log_tail=log_tail,
         timeout_sec=timeout_sec,
+        mode=mode,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(bundle, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -103,6 +107,7 @@ def collect_support_bundle(
     timeout_sec: float = DEFAULT_TIMEOUT_SEC,
     command_runner: CommandRunner | None = None,
     http_getter: HttpGetter | None = None,
+    mode: str = "host",
 ) -> dict[str, Any]:
     """Collect support diagnostics as a serializable mapping."""
     root = _resolve_project_root(project_root)
@@ -111,13 +116,20 @@ def collect_support_bundle(
     base_url = base_url.rstrip("/")
     docker_version = _detect_docker_version(run_command)
     docker_available = bool(docker_version)
+    normalized_mode = mode.strip().lower()
+    if normalized_mode not in {"host", "container"}:
+        raise ValueError("mode must be host or container")
 
     bundle: dict[str, Any] = {
-        "schema_version": "nas-support-bundle.v1",
+        "schema_version": "nas-support-bundle.v2",
+        "mode": normalized_mode,
         "generated_at": datetime.now(UTC).isoformat(),
         "project_root": str(root),
         "base_url": base_url,
-        "host": _host_snapshot(),
+        "host": _host_snapshot(root),
+        "config_summary": _collect_safe_config_summary(root),
+        "build_manifest": _read_json_file(root / "build_manifest.json"),
+        "omissions": _mode_omissions(normalized_mode),
         "tracked_files": [
             _describe_file(root / relative_path) for relative_path in TRACKED_FILES
         ],
@@ -184,11 +196,18 @@ def _resolve_project_root(project_root: str | Path | None) -> Path:
     return Path(__file__).resolve().parents[3]
 
 
-def _host_snapshot() -> dict[str, str]:
+def _host_snapshot(root: Path) -> dict[str, Any]:
+    usage = shutil.disk_usage(root)
     return {
         "hostname": socket.gethostname(),
         "platform": platform.platform(),
         "python_version": sys.version.split()[0],
+        "disk": {
+            "total_bytes": usage.total,
+            "used_bytes": usage.used,
+            "free_bytes": usage.free,
+            "free_ratio": round(usage.free / max(1, usage.total), 6),
+        },
     }
 
 
@@ -220,17 +239,20 @@ def _collect_http_snapshots(
     snapshots: dict[str, Any] = {}
     for name, route in HTTP_ENDPOINTS.items():
         url = f"{base_url}{route}"
+        started = perf_counter()
         try:
             payload = fetch_json(url, timeout_sec)
             snapshots[name] = {
                 "ok": True,
                 "url": url,
+                "latency_ms": round((perf_counter() - started) * 1000, 3),
                 "payload": payload,
             }
         except Exception as exc:
             snapshots[name] = {
                 "ok": False,
                 "url": url,
+                "latency_ms": round((perf_counter() - started) * 1000, 3),
                 "error": str(exc),
             }
     return snapshots
@@ -264,7 +286,49 @@ def _collect_runtime_artifacts(
         "runtime_state": runtime_state,
         "runtime_state_source": runtime_state_source if runtime_state is not None else "missing",
         "acceptance_reports": acceptance_reports,
+        "scheduler_heartbeat": _read_json_file(
+            root / "artifacts" / "runtime" / "scheduler_heartbeat.json"
+        ),
+        "runtime_files": _describe_runtime_files(root / "artifacts" / "runtime"),
     }
+
+
+def _describe_runtime_files(runtime_dir: Path) -> list[dict[str, Any]]:
+    if not runtime_dir.exists():
+        return []
+    return [_describe_file(path) for path in sorted(runtime_dir.glob("*.json*"))[:200]]
+
+
+def _collect_safe_config_summary(root: Path) -> dict[str, Any]:
+    env_path = root / ".env"
+    env_keys: list[str] = []
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            env_keys.append(stripped.split("=", 1)[0].strip())
+    compose_files = sorted(root.glob("docker-compose*.yml"))
+    return {
+        "env": {
+            "exists": env_path.exists(),
+            "key_names": sorted(set(env_keys)),
+            "file": _describe_file(env_path),
+            "values_included": False,
+        },
+        "compose": [_describe_file(path) for path in compose_files],
+        "secrets_included": False,
+    }
+
+
+def _mode_omissions(mode: str) -> list[dict[str, str]]:
+    if mode == "host":
+        return []
+    return [
+        {"item": "host_docker_daemon", "reason": "container namespace may not expose socket"},
+        {"item": "host_mount_layout", "reason": "container sees only mounted paths"},
+        {"item": "host_disk_capacity", "reason": "reported capacity may be overlay filesystem"},
+    ]
 
 
 def _read_json_file(path: Path) -> dict[str, Any] | None:

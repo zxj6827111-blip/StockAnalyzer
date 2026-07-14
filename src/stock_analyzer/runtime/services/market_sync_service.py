@@ -42,6 +42,34 @@ from stock_analyzer.data.tdx_sync import (
 )
 
 
+def classify_market_warehouse_health(
+    *,
+    final_failed: int,
+    target_total: int,
+    core_covered: int,
+    core_total: int,
+) -> dict[str, object]:
+    failure_rate = max(0, final_failed) / max(1, target_total)
+    core_coverage = 1.0 if core_total <= 0 else max(0, core_covered) / max(1, core_total)
+    if failure_rate > 0.02 or core_coverage < 0.95:
+        grade = "critical"
+    elif failure_rate > 0.005 or core_coverage < 0.99:
+        grade = "degraded"
+    else:
+        grade = "healthy"
+    return {
+        "grade": grade,
+        "final_failure_rate": round(failure_rate, 6),
+        "core_watchlist_coverage": round(core_coverage, 6),
+        "thresholds": {
+            "healthy_failure_rate_max": 0.005,
+            "healthy_core_coverage_min": 0.99,
+            "critical_failure_rate_gt": 0.02,
+            "critical_core_coverage_lt": 0.95,
+        },
+    }
+
+
 class RuntimeMarketSyncService:
     """Delegated market-sync, TongDaXin sync, and market-warehouse workflows."""
 
@@ -1233,7 +1261,10 @@ class RuntimeMarketSyncService:
                     continue
                 if str(item.get("trace_id", "")).strip() == normalized_trace_id:
                     return item
-        if isinstance(latest, dict) and str(latest.get("trace_id", "")).strip() == normalized_trace_id:
+        if (
+            isinstance(latest, dict)
+            and str(latest.get("trace_id", "")).strip() == normalized_trace_id
+        ):
             return latest
         return None
 
@@ -1516,7 +1547,9 @@ class RuntimeMarketSyncService:
 
         def _daily_progress_summary() -> dict[str, object]:
             target_trade_date = str(report.get("target_trade_date", "")).strip()
-            default_hard_timeout_sec, _ = self._resolve_market_warehouse_daily_symbol_hard_timeout_sec()
+            default_hard_timeout_sec, _ = (
+                self._resolve_market_warehouse_daily_symbol_hard_timeout_sec()
+            )
             return {
                 "ok": daily_ok,
                 "skipped": daily_skipped,
@@ -1645,7 +1678,9 @@ class RuntimeMarketSyncService:
             return report
 
         active_lock: dict[str, object] = {}
-        preacquired_lock = bool(scheduler_lock_path is not None and scheduler_lock_owner_token.strip())
+        preacquired_lock = bool(
+            scheduler_lock_path is not None and scheduler_lock_owner_token.strip()
+        )
         if preacquired_lock:
             lock_path = scheduler_lock_path
             lock_owner_token = scheduler_lock_owner_token.strip()
@@ -2042,6 +2077,32 @@ class RuntimeMarketSyncService:
             else:
                 report["status"] = "failed"
                 report["reason"] = "all_symbols_failed"
+            final_failed = len(set(failed_symbols))
+            target_total = max(1, len(symbol_list))
+            core_watchlist = {
+                str(symbol).strip() for symbol in service._state.watchlist if str(symbol).strip()
+            }
+            resolved_set = {str(symbol).strip() for symbol in symbol_list}
+            failed_set = {str(symbol).strip() for symbol in failed_symbols}
+            covered_core = len((core_watchlist & resolved_set) - failed_set)
+            health = classify_market_warehouse_health(
+                final_failed=final_failed,
+                target_total=target_total,
+                core_covered=covered_core,
+                core_total=len(core_watchlist),
+            )
+            report["health"] = health
+            report["health_grade"] = health["grade"]
+            report["final_failure_rate"] = health["final_failure_rate"]
+            report["core_watchlist_coverage"] = health["core_watchlist_coverage"]
+            report["retry_plan"] = {
+                "mode": "retry_failed_only",
+                "symbols": sorted(failed_set),
+                "symbols_total": final_failed,
+                "source_trace_id": source_trace_id,
+                "next_action": "targeted_retry" if final_failed else "none",
+                "failure_samples": failed_samples[:50],
+            }
             _publish_progress(
                 status=str(report.get("status", "ok")),
                 phase="completed",
@@ -2079,7 +2140,6 @@ class RuntimeMarketSyncService:
             notify_enabled=notify_enabled,
         )
         return report
-
     def _notify_market_warehouse_if_needed(
         self,
         *,

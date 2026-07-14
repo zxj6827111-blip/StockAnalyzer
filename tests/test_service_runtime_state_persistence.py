@@ -700,7 +700,7 @@ def test_runtime_state_persists_compact_json(tmp_path: Path) -> None:
     payload = _as_mapping(json.loads(raw))
 
     assert "\n  " not in raw
-    assert payload["state_version"] == 8
+    assert payload["state_version"] == 9
 
 
 def test_runtime_state_writes_large_histories_to_sidecars(tmp_path: Path) -> None:

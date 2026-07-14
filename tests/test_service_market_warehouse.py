@@ -1214,7 +1214,9 @@ def test_service_market_warehouse_sync_updates_progress_snapshot(tmp_path: Path)
     progress = service.latest_market_warehouse_progress()
 
     assert report["status"] == "ok"
-    assert report["progress_path"] == str(service._market_warehouse_progress_path)
+    assert report["progress_path"] == service._to_evolution_relative(
+        service._market_warehouse_progress_path
+    )
     assert progress is not None
     progress_view = _as_mapping(progress)
     assert progress_view["status"] == "ok"

@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from collections.abc import Mapping
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
+
+from stock_analyzer.runtime.state_v9 import (
+    RUNTIME_STATE_HISTORY_FIELDS,
+    RUNTIME_STATE_VERSION,
+    migrate_runtime_state_v9,
+)
 
 
 class RuntimeStateService:
@@ -35,7 +43,7 @@ class RuntimeStateService:
         market_warehouse_limit = max(1, service._config.market_warehouse.history_limit)
         evolution_limit = max(1, service._config.evolution.history_limit)
         return {
-            "state_version": 8,
+            "state_version": RUNTIME_STATE_VERSION,
             "updated_at": datetime.now().isoformat(),
             "scheduler_state": service._scheduler.export_state(),
             "current_equity": service._state.current_equity,
@@ -219,15 +227,29 @@ class RuntimeStateService:
         }
 
     def _runtime_state_history_sidecar_metadata(self) -> dict[str, object]:
+        def _record(
+            path: Path,
+            *,
+            limit: int,
+            records: list[dict[str, object]],
+        ) -> dict[str, object]:
+            try:
+                content = path.read_bytes()
+            except OSError:
+                content = b""
+            return {
+                "path": str(path),
+                "limit": limit,
+                "records": len(records),
+                "size_bytes": len(content),
+                "sha256": hashlib.sha256(content).hexdigest() if content else "",
+            }
+
         return {
             "format": "jsonl",
             "base_dir": str(self._runtime_state_sidecar_dir()),
             "records": {
-                name: {
-                    "path": str(path),
-                    "limit": limit,
-                    "records": len(records),
-                }
+                name: _record(path, limit=limit, records=records)
                 for name, records, limit, path, _identity_keys in (
                     self._runtime_state_sidecar_specs()
                 )
@@ -279,6 +301,90 @@ class RuntimeStateService:
                 base_dir / "week5_scan_history.jsonl",
                 ("timestamp", "trace_id"),
             ),
+            (
+                "week4_acceptance_history",
+                service._week4_acceptance_history,
+                max(1, service._config.acceptance.history_limit),
+                base_dir / "week4_acceptance_history.jsonl",
+                ("timestamp", "overall"),
+            ),
+            (
+                "week6_history",
+                service._week6_history,
+                max(1, service._config.week6.history_limit),
+                base_dir / "week6_history.jsonl",
+                ("timestamp", "trace_id"),
+            ),
+            (
+                "market_warehouse_history",
+                service._market_warehouse_history,
+                max(1, service._config.market_warehouse.history_limit),
+                base_dir / "market_warehouse_history.jsonl",
+                ("timestamp", "trace_id"),
+            ),
+            (
+                "evolution_history",
+                service._evolution_history,
+                max(1, service._config.evolution.history_limit),
+                base_dir / "evolution_history.jsonl",
+                ("timestamp", "run_id", "trace_id"),
+            ),
+            (
+                "evolution_release_gate_history",
+                service._evolution_release_gate_history,
+                max(1, service._config.evolution.history_limit),
+                base_dir / "evolution_release_gate_history.jsonl",
+                ("timestamp", "status"),
+            ),
+            (
+                "evolution_release_approval_history",
+                service._evolution_release_approval_history,
+                max(1, service._config.evolution.history_limit),
+                base_dir / "evolution_release_approval_history.jsonl",
+                ("approval_id", "timestamp"),
+            ),
+            (
+                "evolution_release_ticket_history",
+                service._evolution_release_ticket_history,
+                max(1, service._config.evolution.history_limit),
+                base_dir / "evolution_release_ticket_history.jsonl",
+                (),
+            ),
+            (
+                "learning_model_proposal_history",
+                service._learning_model_proposal_history,
+                max(1, service._config.evolution.history_limit),
+                base_dir / "learning_model_proposal_history.jsonl",
+                ("proposal_id", "timestamp", "status"),
+            ),
+            (
+                "learning_model_approval_history",
+                service._learning_model_approval_history,
+                max(1, service._config.evolution.history_limit),
+                base_dir / "learning_model_approval_history.jsonl",
+                ("approval_id", "timestamp"),
+            ),
+            (
+                "learning_model_release_ticket_history",
+                service._learning_model_release_ticket_history,
+                max(1, service._config.evolution.history_limit),
+                base_dir / "learning_model_release_ticket_history.jsonl",
+                (),
+            ),
+            (
+                "execution_risk_training_history",
+                service._execution_risk_training_history,
+                max(1, service._config.evolution.history_limit),
+                base_dir / "execution_risk_training_history.jsonl",
+                ("timestamp", "dataset_id", "artifact_path"),
+            ),
+            (
+                "execution_aware_report_history",
+                service._execution_aware_report_history,
+                max(1, service._config.evolution.history_limit),
+                base_dir / "execution_aware_report_history.jsonl",
+                ("report_id", "shadow_model_id", "champion_model_id"),
+            ),
         ]
 
     def _persist_runtime_state_history_sidecars(self, existing_raw: object) -> None:
@@ -311,7 +417,9 @@ class RuntimeStateService:
                         )
                     )
                     fp.write("\n")
-            temp_path.replace(path)
+                fp.flush()
+                os.fsync(fp.fileno())
+            os.replace(temp_path, path)
 
     def _load_runtime_state_history_sidecar(
         self,
@@ -352,13 +460,20 @@ class RuntimeStateService:
             except (OSError, json.JSONDecodeError):
                 existing_raw = {}
         payload = service._merge_runtime_state_payload(existing_raw, payload)
+        if isinstance(existing_raw, dict) and isinstance(existing_raw.get("state_migration"), dict):
+            payload["state_migration"] = deepcopy(existing_raw["state_migration"])
         path.parent.mkdir(parents=True, exist_ok=True)
         if include_history_sidecars:
             self._persist_runtime_state_history_sidecars(existing_raw)
+        for history_name in RUNTIME_STATE_HISTORY_FIELDS:
+            payload.pop(history_name, None)
+        payload["runtime_history_sidecars"] = self._runtime_state_history_sidecar_metadata()
         temp_path = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
         with temp_path.open("w", encoding="utf-8") as fp:
             json.dump(payload, fp, ensure_ascii=False, separators=(",", ":"), default=str)
-        temp_path.replace(path)
+            fp.flush()
+            os.fsync(fp.fileno())
+        os.replace(temp_path, path)
         try:
             service._runtime_state_loaded_mtime_ns = path.stat().st_mtime_ns
         except OSError:
@@ -372,6 +487,7 @@ class RuntimeStateService:
         if not path.exists():
             service._persist_runtime_state_to_disk()
             return
+        migrate_runtime_state_v9(path)
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -479,9 +595,14 @@ class RuntimeStateService:
             _as_int(raw.get("audit_seq"), default=0),
             len(service._audit_events),
         )
-        service._week4_acceptance_history = service._runtime_state_dict_list(
+        service._week4_acceptance_history = service._merge_runtime_state_history(
+            self._load_runtime_state_history_sidecar(
+                "week4_acceptance_history",
+                limit=max(1, service._config.acceptance.history_limit),
+            ),
             raw.get("week4_acceptance_history"),
             limit=max(1, service._config.acceptance.history_limit),
+            identity_keys=("timestamp", "overall"),
         )
         service._last_week4_acceptance_report = service._runtime_state_latest_from_raw(
             raw.get("week4_acceptance_latest"),
@@ -507,17 +628,27 @@ class RuntimeStateService:
             raw.get("week5_market_radar_review_pool"),
             limit=max(1, service._config.week5.market_radar_review_pool_max_symbols),
         )
-        service._week6_history = service._runtime_state_dict_list(
+        service._week6_history = service._merge_runtime_state_history(
+            self._load_runtime_state_history_sidecar(
+                "week6_history",
+                limit=max(1, service._config.week6.history_limit),
+            ),
             raw.get("week6_history"),
             limit=max(1, service._config.week6.history_limit),
+            identity_keys=("timestamp", "trace_id"),
         )
         service._last_week6_report = service._runtime_state_latest_from_raw(
             raw.get("week6_latest"),
             service._week6_history,
         )
-        service._market_warehouse_history = service._runtime_state_dict_list(
+        service._market_warehouse_history = service._merge_runtime_state_history(
+            self._load_runtime_state_history_sidecar(
+                "market_warehouse_history",
+                limit=max(1, service._config.market_warehouse.history_limit),
+            ),
             raw.get("market_warehouse_history"),
             limit=max(1, service._config.market_warehouse.history_limit),
+            identity_keys=("timestamp", "trace_id"),
         )
         service._last_market_warehouse_report = service._runtime_state_latest_from_raw(
             raw.get("market_warehouse_latest"),
@@ -527,73 +658,118 @@ class RuntimeStateService:
             raw.get("market_warehouse_progress")
         )
         self._load_runtime_state_cloud_backup(raw.get("cloud_backup"))
-        service._evolution_history = service._runtime_state_dict_list(
+        service._evolution_history = service._merge_runtime_state_history(
+            self._load_runtime_state_history_sidecar(
+                "evolution_history",
+                limit=max(1, service._config.evolution.history_limit),
+            ),
             raw.get("evolution_history"),
             limit=max(1, service._config.evolution.history_limit),
+            identity_keys=("timestamp", "run_id", "trace_id"),
         )
         service._last_evolution_report = service._runtime_state_latest_from_raw(
             raw.get("evolution_latest"),
             service._evolution_history,
         )
-        service._evolution_release_gate_history = service._runtime_state_dict_list(
+        service._evolution_release_gate_history = service._merge_runtime_state_history(
+            self._load_runtime_state_history_sidecar(
+                "evolution_release_gate_history",
+                limit=max(1, service._config.evolution.history_limit),
+            ),
             raw.get("evolution_release_gate_history"),
             limit=max(1, service._config.evolution.history_limit),
+            identity_keys=("timestamp", "status"),
         )
         service._last_evolution_release_gate = service._runtime_state_latest_from_raw(
             raw.get("evolution_release_gate_latest"),
             service._evolution_release_gate_history,
         )
-        service._evolution_release_approval_history = service._runtime_state_dict_list(
+        service._evolution_release_approval_history = service._merge_runtime_state_history(
+            self._load_runtime_state_history_sidecar(
+                "evolution_release_approval_history",
+                limit=max(1, service._config.evolution.history_limit),
+            ),
             raw.get("evolution_release_approval_history"),
             limit=max(1, service._config.evolution.history_limit),
+            identity_keys=("approval_id", "timestamp"),
         )
         service._last_evolution_release_approval = service._runtime_state_latest_from_raw(
             raw.get("evolution_release_approval_latest"),
             service._evolution_release_approval_history,
         )
-        service._evolution_release_ticket_history = service._runtime_state_dict_list(
+        service._evolution_release_ticket_history = service._merge_runtime_state_history(
+            self._load_runtime_state_history_sidecar(
+                "evolution_release_ticket_history",
+                limit=max(1, service._config.evolution.history_limit),
+            ),
             raw.get("evolution_release_ticket_history"),
             limit=max(1, service._config.evolution.history_limit),
+            identity_keys=(),
         )
         service._last_evolution_release_ticket = service._runtime_state_latest_from_raw(
             raw.get("evolution_release_ticket_latest"),
             service._evolution_release_ticket_history,
         )
-        service._learning_model_proposal_history = service._runtime_state_dict_list(
+        service._learning_model_proposal_history = service._merge_runtime_state_history(
+            self._load_runtime_state_history_sidecar(
+                "learning_model_proposal_history",
+                limit=max(1, service._config.evolution.history_limit),
+            ),
             raw.get("learning_model_proposal_history"),
             limit=max(1, service._config.evolution.history_limit),
+            identity_keys=("proposal_id", "timestamp", "status"),
         )
         service._last_learning_model_proposal = service._runtime_state_latest_from_raw(
             raw.get("learning_model_proposal_latest"),
             service._learning_model_proposal_history,
         )
-        service._learning_model_approval_history = service._runtime_state_dict_list(
+        service._learning_model_approval_history = service._merge_runtime_state_history(
+            self._load_runtime_state_history_sidecar(
+                "learning_model_approval_history",
+                limit=max(1, service._config.evolution.history_limit),
+            ),
             raw.get("learning_model_approval_history"),
             limit=max(1, service._config.evolution.history_limit),
+            identity_keys=("approval_id", "timestamp"),
         )
         service._last_learning_model_approval = service._runtime_state_latest_from_raw(
             raw.get("learning_model_approval_latest"),
             service._learning_model_approval_history,
         )
-        service._learning_model_release_ticket_history = service._runtime_state_dict_list(
+        service._learning_model_release_ticket_history = service._merge_runtime_state_history(
+            self._load_runtime_state_history_sidecar(
+                "learning_model_release_ticket_history",
+                limit=max(1, service._config.evolution.history_limit),
+            ),
             raw.get("learning_model_release_ticket_history"),
             limit=max(1, service._config.evolution.history_limit),
+            identity_keys=(),
         )
         service._last_learning_model_release_ticket = service._runtime_state_latest_from_raw(
             raw.get("learning_model_release_ticket_latest"),
             service._learning_model_release_ticket_history,
         )
-        service._execution_risk_training_history = service._runtime_state_dict_list(
+        service._execution_risk_training_history = service._merge_runtime_state_history(
+            self._load_runtime_state_history_sidecar(
+                "execution_risk_training_history",
+                limit=max(1, service._config.evolution.history_limit),
+            ),
             raw.get("execution_risk_training_history"),
             limit=max(1, service._config.evolution.history_limit),
+            identity_keys=("timestamp", "dataset_id", "artifact_path"),
         )
         service._last_execution_risk_training = service._runtime_state_latest_from_raw(
             raw.get("execution_risk_training_latest"),
             service._execution_risk_training_history,
         )
-        service._execution_aware_report_history = service._runtime_state_dict_list(
+        service._execution_aware_report_history = service._merge_runtime_state_history(
+            self._load_runtime_state_history_sidecar(
+                "execution_aware_report_history",
+                limit=max(1, service._config.evolution.history_limit),
+            ),
             raw.get("execution_aware_report_history"),
             limit=max(1, service._config.evolution.history_limit),
+            identity_keys=("report_id", "shadow_model_id", "champion_model_id"),
         )
         service._last_execution_aware_report = service._runtime_state_latest_from_raw(
             raw.get("execution_aware_report_latest"),

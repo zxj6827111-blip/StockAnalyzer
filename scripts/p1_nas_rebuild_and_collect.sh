@@ -19,6 +19,7 @@ runs="${RUNS:-2}"
 interval_sec="${INTERVAL_SEC:-60}"
 health_attempts="${HEALTH_ATTEMPTS:-30}"
 health_sleep_sec="${HEALTH_SLEEP_SEC:-2}"
+release_stage="${RELEASE_STAGE:-stage-a-consistency}"
 compose_files=(
   -f docker-compose.yml
   -f docker-compose.runtime.yml
@@ -86,10 +87,40 @@ rebuild_services() {
   cd "$runtime_dir"
   export STOCK_ANALYZER_BUILD_COMMIT
   STOCK_ANALYZER_BUILD_COMMIT="$(cat "${runtime_dir}/.build_commit")"
+  export STOCK_ANALYZER_BUILD_SHORT_COMMIT
+  STOCK_ANALYZER_BUILD_SHORT_COMMIT="$(printf '%s' "$STOCK_ANALYZER_BUILD_COMMIT" | cut -c1-12)"
+  export STOCK_ANALYZER_BUILD_DIRTY=false
+  export STOCK_ANALYZER_BUILD_TIME_UTC
+  STOCK_ANALYZER_BUILD_TIME_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  previous_image="$(docker image inspect stock-analyzer:latest --format '{{.Id}}' 2>/dev/null || true)"
+  if [ -n "$previous_image" ]; then
+    rollback_tag="stock-analyzer:rollback-pre-$(date -u +%Y%m%d%H%M%S)"
+    docker tag "$previous_image" "$rollback_tag"
+    printf '%s\n' "$rollback_tag" > "${runtime_dir}/.rollback_image"
+    log "previous image preserved as ${rollback_tag}"
+  fi
   log "building api image from runtime dir with advisory compose override"
   compose build api
+  stage_tag="stock-analyzer:${release_stage}-${STOCK_ANALYZER_BUILD_SHORT_COMMIT}"
+  docker tag stock-analyzer:latest "$stage_tag"
+  printf '%s\n' "$stage_tag" > "${runtime_dir}/.release_image"
   log "recreating api and scheduler with existing rebuilt image"
   compose up -d --no-build --force-recreate api scheduler
+}
+
+migrate_runtime_state() {
+  cd "$runtime_dir"
+  log "stopping scheduler writes before runtime-state migration"
+  compose stop scheduler >/dev/null 2>&1 || true
+  if [ ! -f "$runtime_state" ]; then
+    log "runtime state is missing: ${runtime_state}"
+    exit 1
+  fi
+  PYTHONPATH="${runtime_dir}/src" python scripts/migrate_runtime_state_v9.py \
+    "$runtime_state" --dry-run > "${runtime_state}.v9-dry-run.json"
+  PYTHONPATH="${runtime_dir}/src" python scripts/migrate_runtime_state_v9.py \
+    "$runtime_state" > "${runtime_state}.v9-migration.json"
+  log "runtime state migrated; backup checksum and sidecar counts captured"
 }
 
 wait_for_safe_health() {
@@ -110,11 +141,17 @@ except Exception as exc:  # pragma: no cover - executed on NAS
     sys.exit(2)
 
 runtime = health.get("runtime") or {}
-print(json.dumps({"mode": health.get("mode"), "runtime": runtime}, ensure_ascii=False))
+build = health.get("build") or {}
+expected = open(".build_commit", encoding="utf-8").read().strip()
+print(json.dumps({"mode": health.get("mode"), "runtime": runtime, "build": build}, ensure_ascii=False))
 if runtime.get("advisory_only") is not True:
     sys.exit(3)
 if runtime.get("training_enabled") is not False:
     sys.exit(4)
+if build.get("commit") in {None, "", "unknown"} or build.get("trusted") is not True:
+    sys.exit(5)
+if build.get("commit") != expected:
+    sys.exit(6)
 PY
     code=$?
     set -e
@@ -123,7 +160,7 @@ PY
       log "health gate passed: advisory_only=true and training_enabled=false"
       return 0
     fi
-    if [ "$code" -eq 3 ] || [ "$code" -eq 4 ]; then
+    if [ "$code" -ge 3 ] && [ "$code" -le 6 ]; then
       log "unsafe runtime detected after rebuild; collection will not start"
       exit "$code"
     fi
@@ -136,9 +173,49 @@ PY
   exit 1
 }
 
+verify_build_identity() {
+  cd "$runtime_dir"
+  api_image="$(docker inspect --format '{{.Image}}' stock-analyzer-api)"
+  scheduler_image="$(docker inspect --format '{{.Image}}' stock-analyzer-scheduler)"
+  if [ -z "$api_image" ] || [ "$api_image" != "$scheduler_image" ]; then
+    log "api/scheduler image digest mismatch: api=${api_image} scheduler=${scheduler_image}"
+    exit 1
+  fi
+  attempt=1
+  while [ "$attempt" -le "$health_attempts" ]; do
+    if [ -s "${runtime_artifacts_dir}/runtime/scheduler_heartbeat.json" ]; then
+      break
+    fi
+    sleep "$health_sleep_sec"
+    attempt=$((attempt + 1))
+  done
+  python - "$runtime_dir" "$runtime_artifacts_dir" "$api_image" <<'PY'
+import json
+import pathlib
+import sys
+
+runtime_dir = pathlib.Path(sys.argv[1])
+artifacts = pathlib.Path(sys.argv[2])
+digest = sys.argv[3]
+expected = (runtime_dir / ".build_commit").read_text(encoding="utf-8").strip()
+heartbeat = json.loads((artifacts / "runtime" / "scheduler_heartbeat.json").read_text(encoding="utf-8"))
+scheduler_commit = ((heartbeat.get("build") or {}).get("commit") or "").strip()
+if not expected or expected == "unknown" or scheduler_commit != expected:
+    raise SystemExit("scheduler build identity mismatch")
+report = {"repo_head": expected, "scheduler_commit": scheduler_commit, "image_digest": digest}
+(artifacts / "runtime" / "build_identity_gate.json").write_text(
+    json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+)
+print(json.dumps(report, ensure_ascii=False))
+PY
+}
+
 run_collection() {
   cd "$runtime_dir"
   log "capturing NAS environment evidence"
+  python scripts/export_support_bundle.py --mode host \
+    --base-url "$api_base" \
+    --output "${output_dir}/nas_support_bundle_after.json"
   python scripts/p1_capture_nas_environment.py \
     --api-base "$api_base" \
     --output-dir "$output_dir" \
@@ -177,6 +254,8 @@ run_collection() {
 check_repo
 checkout_branch
 sync_runtime_dir
+migrate_runtime_state
 rebuild_services
 wait_for_safe_health
+verify_build_identity
 run_collection

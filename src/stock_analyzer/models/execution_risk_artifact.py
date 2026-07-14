@@ -19,6 +19,8 @@ class ExecutionRiskArtifact:
     feature_names: list[str]
     trained_targets: list[str]
     target_models: dict[str, dict[str, object]]
+    qualification_status: str = "shadow_only"
+    qualification: dict[str, object] = field(default_factory=dict)
     training_summary: dict[str, object] = field(default_factory=dict)
     metadata: dict[str, object] = field(default_factory=dict)
 
@@ -29,6 +31,8 @@ class ExecutionRiskArtifact:
         dataset_id: str,
         feature_names: list[str],
         target_models: dict[str, dict[str, object]],
+        qualification_status: str = "shadow_only",
+        qualification: dict[str, object] | None = None,
         training_summary: dict[str, object] | None = None,
         metadata: dict[str, object] | None = None,
     ) -> ExecutionRiskArtifact:
@@ -39,6 +43,8 @@ class ExecutionRiskArtifact:
             feature_names=[str(item) for item in feature_names],
             trained_targets=sorted(str(item) for item in target_models.keys()),
             target_models={str(key): dict(value) for key, value in target_models.items()},
+            qualification_status=_normalize_qualification_status(qualification_status),
+            qualification=dict(qualification or {}),
             training_summary=dict(training_summary or {}),
             metadata=dict(metadata or {}),
         )
@@ -51,6 +57,10 @@ class ExecutionRiskArtifact:
             "feature_names": list(self.feature_names),
             "trained_targets": list(self.trained_targets),
             "target_models": {str(key): dict(value) for key, value in self.target_models.items()},
+            "qualification_status": _normalize_qualification_status(
+                self.qualification_status
+            ),
+            "qualification": dict(self.qualification),
             "training_summary": dict(self.training_summary),
             "metadata": dict(self.metadata),
         }
@@ -77,6 +87,7 @@ class ExecutionRiskArtifact:
             raise ValueError("invalid execution-risk artifact models payload")
         training_summary = payload.get("training_summary", {})
         metadata = payload.get("metadata", {})
+        qualification = payload.get("qualification", {})
         return cls(
             version=str(payload.get("version", "v1")),
             created_at=str(payload.get("created_at", "")),
@@ -84,14 +95,30 @@ class ExecutionRiskArtifact:
             feature_names=[str(item) for item in feature_names],
             trained_targets=[str(item) for item in trained_targets],
             target_models={str(key): dict(value) for key, value in target_models.items()},
+            # Artifacts created before qualification existed are never active by default.
+            qualification_status=_normalize_qualification_status(
+                payload.get("qualification_status", "shadow_only")
+            ),
+            qualification=dict(qualification) if isinstance(qualification, dict) else {},
             training_summary=(
                 dict(training_summary) if isinstance(training_summary, dict) else {}
             ),
             metadata=dict(metadata) if isinstance(metadata, dict) else {},
         )
 
+    @property
+    def can_rerank(self) -> bool:
+        return _normalize_qualification_status(self.qualification_status) == "qualified"
+
 
 def _atomic_write_text(path: Path, content: str) -> None:
     tmp_path = path.with_name(f".{path.name}.tmp")
     tmp_path.write_text(content, encoding="utf-8")
     os.replace(tmp_path, path)
+
+
+def _normalize_qualification_status(value: object) -> str:
+    normalized = str(value).strip().lower()
+    if normalized in {"shadow_only", "qualified", "rejected"}:
+        return normalized
+    return "shadow_only"

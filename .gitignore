@@ -7,6 +7,7 @@ config/llm.local.yaml
 __pycache__/
 .pytest_cache/
 .pytest-tmp/
+.pytest-*/
 .ruff_cache/
 .mypy_cache/
 .coverage
@@ -38,6 +39,7 @@ htmlcov/
 .tmp_pytest*/
 manual_test_tmp/
 /data/
+/build_manifest.json
 suggestions/
 artifacts/*
 !artifacts/model_v1.json

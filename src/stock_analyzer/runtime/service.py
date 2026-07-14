@@ -96,6 +96,7 @@ from stock_analyzer.research import (
     run_tft_sidecar,
 )
 from stock_analyzer.research.signal_quality_auditor import SignalQualityAuditor
+from stock_analyzer.runtime.market_outcomes import summarize_market_observation
 from stock_analyzer.runtime.news_provider_factory import build_news_provider
 from stock_analyzer.runtime.notifier_factory import build_notifier
 from stock_analyzer.runtime.scheduler import DailyScheduler
@@ -170,6 +171,11 @@ _RECOMMENDATION_EXTRA_FIELDS = {
     "current_return_pct",
     "holding_days",
     "outcome_status",
+    "position_state",
+    "recommendation_state",
+    "execution_state",
+    "outcome_state",
+    "pending_reason",
 }
 _RECOMMENDATION_SIGNAL_EXIT_REASONS = {
     "model_sell_signal",
@@ -3723,6 +3729,7 @@ class StockAnalyzerService:
                 "adjusted": 0,
                 "trimmed": 0,
                 "closed_expired": 0,
+                "exit_due": 0,
                 "skipped_max_holdings": 0,
                 "skipped_same_sector": 0,
                 "skipped_no_cash": 0,
@@ -3809,6 +3816,10 @@ class StockAnalyzerService:
                 "symbols": [],
                 "status": "skipped_execution_dry_run",
             }
+            market_outcome_update = {
+                "updated": 0,
+                "status": "skipped_execution_dry_run",
+            }
         else:
             recommendation_update = self._sync_recommendation_lifecycle_from_signals(
                 signals=signals,
@@ -3830,12 +3841,16 @@ class StockAnalyzerService:
                 timestamp=timestamp,
                 trace_id=trace_id,
             )
+            market_outcome_update = self._refresh_recommendation_market_outcomes(
+                timestamp=timestamp,
+            )
         recommendation_sync_ms = int((perf_counter() - recommendation_sync_started) * 1000)
         portfolio_changed = (
             _as_int(portfolio_update.get("opened"), default=0) > 0
             or _as_int(portfolio_update.get("adjusted"), default=0) > 0
             or _as_int(portfolio_update.get("trimmed"), default=0) > 0
             or _as_int(portfolio_update.get("closed_expired"), default=0) > 0
+            or _as_int(portfolio_update.get("exit_due"), default=0) > 0
             or _as_int(portfolio_update.get("closed_signals"), default=0) > 0
         )
         runtime_state_persist_reasons: list[str] = []
@@ -3847,6 +3862,8 @@ class StockAnalyzerService:
             runtime_state_persist_reasons.append("execution_recommendation_update")
         if _as_int(holding_recommendation_update.get("updated"), default=0) > 0:
             runtime_state_persist_reasons.append("holding_recommendation_update")
+        if _as_int(market_outcome_update.get("updated"), default=0) > 0:
+            runtime_state_persist_reasons.append("market_outcome_update")
         if portfolio_changed:
             runtime_state_persist_reasons.append("portfolio_changed")
 
@@ -3882,6 +3899,7 @@ class StockAnalyzerService:
         payload["recommendation_update"] = recommendation_update
         payload["execution_recommendation_update"] = execution_recommendation_update
         payload["holding_recommendation_update"] = holding_recommendation_update
+        payload["market_outcome_update"] = market_outcome_update
         if execution_dry_run or _as_int(learning_outcome_update.get("updated"), default=0) > 0:
             payload["learning_outcome_update"] = learning_outcome_update
         payload["holding_alerts"] = holding_alerts
@@ -3939,7 +3957,7 @@ class StockAnalyzerService:
         if notifications_enabled and not execution_dry_run:
             self._notify_expired_position_exits_if_needed(
                 timestamp=timestamp,
-                closed_expired=_as_int(portfolio_update.get("closed_expired"), default=0),
+                closed_expired=_as_int(portfolio_update.get("exit_due"), default=0),
                 trace_id=trace_id,
             )
             self._notify_risk_status_if_needed(risk_payload, trace_id=trace_id)
@@ -7522,10 +7540,15 @@ class StockAnalyzerService:
 
     def run_walk_forward(self, symbol: str, lookback_days: int = 800) -> dict[str, object]:
         bars = self._provider.fetch_daily_bars(symbol=symbol, lookback_days=lookback_days)
+        walk_forward_config = self._config.walk_forward.model_copy(deep=True)
+        walk_forward_config.train_window = max(
+            int(walk_forward_config.train_window),
+            int(self._config.training.min_samples),
+        )
         engine = WalkForwardEngine(
             training=self._config.training,
             labels=self._config.labels,
-            walk_forward=self._config.walk_forward,
+            walk_forward=walk_forward_config,
             matcher=self._config.backtest_matcher,
             limit_rule=self._config.limit_rule,
             models=self._config.models,
@@ -8401,6 +8424,11 @@ class StockAnalyzerService:
                 continue
             trade_plan = item.get("trade_plan") if isinstance(item.get("trade_plan"), dict) else {}
             raw_events = item.get("events")
+            state_fields = _derive_recommendation_states(
+                item=item,
+                status=normalized_status,
+                is_open=symbol in open_symbols,
+            )
             row = {
                 "symbol": symbol,
                 "strategy": str(item.get("strategy", "manual")).strip() or "manual",
@@ -8439,6 +8467,7 @@ class StockAnalyzerService:
                 "current_return_pct": _as_float(item.get("current_return_pct"), default=0.0),
                 "holding_days": _as_int(item.get("holding_days"), default=0),
                 "outcome_status": str(item.get("outcome_status", "")),
+                **state_fields,
                 "events": list(raw_events)[-12:] if isinstance(raw_events, list) else [],
             }
             rows.append(row)
@@ -8753,13 +8782,28 @@ class StockAnalyzerService:
             event_name = "entry_triggered" if normalized_status == "entry_triggered" else "bought"
         elif normalized_status in {"sold", "closed"}:
             exit_price = _as_float(record.get("exit_price"), default=0.0)
-            self._close_recommendation_record_metrics(
-                record,
-                exit_price=exit_price,
-                timestamp=timestamp,
-                reason=str(record.get("closed_reason", "")) or source,
-            )
-            event_name = "closed"
+            exit_quantity = _as_int(record.get("exit_quantity"), default=0)
+            exit_trade_id = str(record.get("exit_trade_id", "")).strip()
+            if exit_price <= 0 or exit_quantity <= 0 or not exit_trade_id:
+                normalized_status = "sell_alert"
+                record["status"] = normalized_status
+                record["exit_alert_at"] = now_iso
+                record["execution_state"] = "pending_confirmation"
+                record["outcome_state"] = "pending"
+                record["pending_reason"] = "exit_fill_not_confirmed"
+                record.pop("closed_at", None)
+                event_name = "sell_alert"
+            else:
+                self._close_recommendation_record_metrics(
+                    record,
+                    exit_price=exit_price,
+                    timestamp=timestamp,
+                    reason=str(record.get("closed_reason", "")) or source,
+                )
+                record["execution_state"] = "confirmed"
+                record["outcome_state"] = "realized"
+                record["position_state"] = "closed"
+                event_name = "closed"
         elif normalized_status == "sell_alert":
             record.setdefault("exit_alert_at", now_iso)
             record.setdefault("outcome_status", "open")
@@ -8813,6 +8857,18 @@ class StockAnalyzerService:
                 {},
                 extra=extra_payload,
             )
+            is_open = normalized_symbol in self._portfolio.position_map()
+            if (
+                is_open
+                and status == "sell_alert"
+                and str(item.get("closed_reason", "")).strip()
+            ):
+                normalized[normalized_symbol]["position_state"] = "legacy_observation"
+                normalized[normalized_symbol]["execution_state"] = "pending_confirmation"
+                normalized[normalized_symbol]["outcome_state"] = "pending"
+                normalized[normalized_symbol]["pending_reason"] = (
+                    "legacy_open_position_conflicts_with_closed_fields"
+                )
         self._recommendation_lifecycle = normalized
 
     def _ensure_symbol_tracked_in_watchlist(
@@ -11844,6 +11900,78 @@ class StockAnalyzerService:
             return None
         return float(close.iloc[-1])
 
+    def _refresh_recommendation_market_outcomes(
+        self,
+        *,
+        timestamp: datetime,
+        limit: int = 100,
+    ) -> dict[str, object]:
+        updated = 0
+        pending = 0
+        mature_pending = 0
+        observed = 0
+        horizon_days = max(1, _as_int(self._config.labels.horizon_days, default=7))
+        rows = sorted(
+            self._recommendation_lifecycle.items(),
+            key=lambda item: _report_timestamp({"timestamp": item[1].get("updated_at", "")}),
+            reverse=True,
+        )[: max(1, limit)]
+        for symbol, record in rows:
+            if str(record.get("outcome_state", "")).strip() == "realized":
+                continue
+            if str(record.get("market_outcome_status", "")).strip() == "observed":
+                observed += 1
+                continue
+            recommended_at = _parse_iso_datetime(record.get("first_recommended_at"))
+            if recommended_at is None:
+                record["pending_reason"] = "recommendation_time_missing"
+                pending += 1
+                continue
+            trade_plan = record.get("trade_plan")
+            reference_price = _as_float(record.get("entry_price"), default=0.0)
+            if reference_price <= 0 and isinstance(trade_plan, Mapping):
+                reference_price = _as_float(trade_plan.get("reference_price"), default=0.0)
+            try:
+                bars = self._provider.fetch_daily_bars(symbol=symbol, lookback_days=120)
+            except Exception:
+                bars = pd.DataFrame()
+            outcome = summarize_market_observation(
+                bars=bars,
+                recommended_at=recommended_at,
+                observed_at=timestamp,
+                reference_price=reference_price,
+                horizon_days=horizon_days,
+            )
+            before = dict(record)
+            if outcome.get("status") == "observed":
+                record["market_outcome_status"] = "observed"
+                record["market_outcome"] = outcome
+                record["outcome_state"] = "market_observed"
+                record["pending_reason"] = ""
+                observed += 1
+            else:
+                record["outcome_state"] = "pending"
+                record["pending_reason"] = str(
+                    outcome.get("pending_reason", "market_outcome_pending")
+                )
+                record["market_outcome"] = outcome
+                pending += 1
+                if record["pending_reason"] != "observation_window_not_matured":
+                    mature_pending += 1
+            if record != before:
+                record["updated_at"] = timestamp.isoformat()
+                updated += 1
+        return {
+            "updated": updated,
+            "observed": observed,
+            "pending": pending,
+            "mature_pending": mature_pending,
+            "mature_completeness": round(
+                observed / max(1, observed + mature_pending),
+                6,
+            ),
+        }
+
     def _live_auto_execution_enabled(self, *, use_live_runtime: bool) -> bool:
         return (
             not bool(self._config.app.advisory_only)
@@ -12500,6 +12628,7 @@ class StockAnalyzerService:
             "adjusted": adjusted,
             "trimmed": trimmed,
             "closed_expired": _as_int(base_update.get("closed_expired"), default=0),
+            "exit_due": _as_int(base_update.get("exit_due"), default=0),
             "closed_signals": closed_signals,
             "skipped_max_holdings": skipped_max_holdings,
             "skipped_same_sector": skipped_same_sector,
@@ -13100,41 +13229,33 @@ class StockAnalyzerService:
     ) -> None:
         if closed_expired <= 0:
             return
-        recent_trades = self._portfolio.trades(limit=max(5, closed_expired * 4))
         timestamp_iso = timestamp.isoformat()
-        matched: list[dict[str, object]] = []
-        for item in reversed(recent_trades):
-            if not isinstance(item, dict):
-                continue
-            if str(item.get("side", "")).strip().lower() != "sell":
-                continue
-            if str(item.get("reason", "")).strip() != "max_hold_days_exit":
-                continue
-            if str(item.get("timestamp", "")).strip() != timestamp_iso:
-                continue
-            matched.append(item)
-            if len(matched) >= closed_expired:
-                break
+        matched = [
+            item
+            for item in self._portfolio.positions()
+            if str(item.get("status", "")).strip().lower() == "exit_due"
+            and str(item.get("updated_at", "")).strip() == timestamp_iso
+        ][:closed_expired]
 
         max_hold_days = max(1, _as_int(self._config.soup_strategy.max_hold_days, default=5))
         for item in reversed(matched):
             symbol = str(item.get("symbol", "")).strip()
             if not symbol:
                 continue
-            dedup_key = f"expired-exit:{timestamp_iso}:{symbol}"
+            dedup_key = f"expired-exit-due:{timestamp_iso}:{symbol}"
             if self._cache.exists(dedup_key):
                 continue
             self._cache.set(dedup_key, "1", ttl_sec=18 * 3600)
             self.notify(
                 title=_push_title(
-                    priority="P0", category="action", summary=f"sell instruction {symbol}"
+                    priority="P0", category="action", summary=f"exit alert {symbol}"
                 ),
                 content=_notification_message_zh(
                     trigger=f"持有标的【{symbol}】已达到最长持仓上限 {max_hold_days} 天。",
-                    impact="系统模拟盘已按规则记为到期卖出，如券商侧未同步处理，将产生账实偏差。",
-                    action="请立即核对券商端是否已完成卖出；若尚未处理，请尽快执行并回到本地监控雷达对账。",
+                    impact="系统仅生成退出提醒，尚未记录卖出成交，也未计入已实现收益。",
+                    action="请人工复核；只有取得价格、数量、时间和 trade_id 的确认成交后才能关闭持仓。",
                     details=[
-                        "处理类型：到期卖出",
+                        "处理类型：exit_due 提醒",
                         f"触发时间：{_format_notification_time_zh(timestamp_iso)}",
                     ],
                 ),
@@ -17884,6 +18005,7 @@ def _audit_portfolio_update_summary(portfolio_update: Mapping[str, object]) -> d
         "adjusted",
         "trimmed",
         "closed_expired",
+        "exit_due",
         "closed_signals",
         "skipped_max_holdings",
         "skipped_same_sector",
@@ -18060,6 +18182,71 @@ def _digest_text(value: object, *, length: int = 16) -> str:
 def _digest_json(value: object, *, length: int = 16) -> str:
     serialized = json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     return _digest_text(serialized, length=length)
+
+
+def _derive_recommendation_states(
+    *,
+    item: Mapping[str, object],
+    status: str,
+    is_open: bool,
+) -> dict[str, str]:
+    explicit_position = str(item.get("position_state", "")).strip().lower()
+    explicit_recommendation = str(item.get("recommendation_state", "")).strip().lower()
+    explicit_execution = str(item.get("execution_state", "")).strip().lower()
+    explicit_outcome = str(item.get("outcome_state", "")).strip().lower()
+    exit_trade_id = str(item.get("exit_trade_id", "")).strip()
+    exit_price = _as_float(item.get("exit_price"), default=0.0)
+    exit_quantity = _as_int(item.get("exit_quantity"), default=0)
+    confirmed_exit = bool(exit_trade_id and exit_price > 0 and exit_quantity > 0)
+    conflicting_close = bool(is_open and str(item.get("closed_reason", "")).strip())
+
+    if explicit_position:
+        position_state = explicit_position
+    elif conflicting_close:
+        position_state = "legacy_observation"
+    elif is_open:
+        position_state = "active"
+    elif status in {"sold", "closed"} and confirmed_exit:
+        position_state = "closed"
+    else:
+        position_state = "none"
+
+    recommendation_state = explicit_recommendation or (
+        "exit_alert"
+        if status == "sell_alert"
+        else "closed"
+        if status in _RECOMMENDATION_TERMINAL_STATUSES
+        else "active"
+    )
+    execution_state = explicit_execution or (
+        "confirmed"
+        if confirmed_exit
+        else "pending_confirmation"
+        if status in {"sell_alert", "sold", "closed"} or position_state == "legacy_observation"
+        else "not_executed"
+    )
+    outcome_state = explicit_outcome or (
+        "realized"
+        if confirmed_exit and status in {"sold", "closed"}
+        else "market_observed"
+        if str(item.get("market_outcome_status", "")).strip()
+        else "pending"
+    )
+    pending_reason = str(item.get("pending_reason", "")).strip()
+    if not pending_reason and outcome_state == "pending":
+        if position_state == "legacy_observation":
+            pending_reason = "legacy_position_requires_manual_reconciliation"
+        elif status == "sell_alert":
+            pending_reason = "exit_fill_not_confirmed"
+        else:
+            pending_reason = "observation_window_not_matured"
+    return {
+        "position_state": position_state,
+        "recommendation_state": recommendation_state,
+        "execution_state": execution_state,
+        "outcome_state": outcome_state,
+        "pending_reason": pending_reason,
+    }
 
 
 def _normalize_recommendation_status(value: object, default: str = "watching") -> str:

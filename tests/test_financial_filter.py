@@ -154,3 +154,21 @@ def test_financial_filter_treats_nan_as_missing_under_reject_policy() -> None:
     assert "financial_filter:missing_financial_data" in decision.reasons
     assert "financial_filter:missing_roe" in decision.reasons
     assert "financial_filter:missing_debt_ratio" in decision.reasons
+
+
+def test_financial_filter_only_applies_uncertainty_penalty_to_heuristic_values() -> None:
+    filterer = FinancialRiskFilter(config=FinancialFilterConfig(enabled=True))
+    decision = filterer.evaluate(
+        symbol="600000",
+        strategy="trend",
+        snapshot={
+            "roe": 0.01,
+            "debt_ratio": 0.95,
+            "financial_data_complete": False,
+            "trust_level": "heuristic",
+        },
+    )
+
+    assert decision.allowed is True
+    assert decision.penalty_score == 5.0
+    assert decision.reasons == ["financial_quality:untrusted_financial_provenance"]

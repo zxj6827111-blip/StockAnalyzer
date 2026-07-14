@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Collection
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 
 from stock_analyzer.config import SchedulerConfig
 
@@ -57,6 +57,7 @@ class DailyScheduler:
         self._interval_jobs: dict[str, _IntervalJob] = {}
         self._last_run: dict[str, date] = {}
         self._last_interval_slot: dict[str, tuple[date, int]] = {}
+        self._job_runtime: dict[str, dict[str, object]] = {}
 
     def register(
         self,
@@ -139,6 +140,14 @@ class DailyScheduler:
             already_ran = self._last_run.get(name) == today
             if job.latest_time is not None and current.time() > job.latest_time and not already_ran:
                 self._last_run[name] = today
+                self._record_job_result(
+                    name=name,
+                    attempted_at=current,
+                    ran=False,
+                    success=False,
+                    detail="expired",
+                    next_due_at=datetime.combine(today + timedelta(days=1), job.trigger_time),
+                )
                 results.append(
                     ScheduledTaskResult(
                         job=name,
@@ -164,8 +173,19 @@ class DailyScheduler:
 
             try:
                 ran, success, detail, payload = _normalize_callback_result(job.callback())
-                if ran:
+                if ran and success:
                     self._last_run[name] = today
+                self._record_job_result(
+                    name=name,
+                    attempted_at=current,
+                    ran=ran,
+                    success=success,
+                    detail=detail,
+                    next_due_at=datetime.combine(
+                        today + timedelta(days=1) if ran and success else today,
+                        job.trigger_time,
+                    ),
+                )
                 results.append(
                     ScheduledTaskResult(
                         job=name,
@@ -176,6 +196,14 @@ class DailyScheduler:
                     )
                 )
             except Exception as exc:
+                self._record_job_result(
+                    name=name,
+                    attempted_at=current,
+                    ran=True,
+                    success=False,
+                    detail=str(exc),
+                    next_due_at=current,
+                )
                 results.append(
                     ScheduledTaskResult(
                         job=name,
@@ -235,8 +263,20 @@ class DailyScheduler:
                 ran, success, detail, payload = _normalize_callback_result(
                     interval_job.callback()
                 )
-                if ran:
+                if ran and success:
                     self._last_interval_slot[name] = slot_marker
+                self._record_job_result(
+                    name=name,
+                    attempted_at=current,
+                    ran=ran,
+                    success=success,
+                    detail=detail,
+                    next_due_at=_next_interval_due(
+                        interval_job,
+                        current=current,
+                        completed_slot=slot if ran and success else None,
+                    ),
+                )
                 results.append(
                     ScheduledTaskResult(
                         job=name,
@@ -247,6 +287,14 @@ class DailyScheduler:
                     )
                 )
             except Exception as exc:
+                self._record_job_result(
+                    name=name,
+                    attempted_at=current,
+                    ran=True,
+                    success=False,
+                    detail=str(exc),
+                    next_due_at=current,
+                )
                 results.append(
                     ScheduledTaskResult(
                         job=name,
@@ -281,6 +329,7 @@ class DailyScheduler:
                     self._last_interval_slot.items(), key=lambda item: item[0]
                 )
             },
+            "jobs": {name: dict(value) for name, value in sorted(self._job_runtime.items())},
         }
 
     def import_state(self, raw: object) -> None:
@@ -313,6 +362,47 @@ class DailyScheduler:
 
         self._last_run = loaded_last_run
         self._last_interval_slot = loaded_interval_slot
+        raw_jobs = raw.get("jobs")
+        self._job_runtime = {
+            str(name): dict(value)
+            for name, value in raw_jobs.items()
+            if isinstance(value, dict)
+        } if isinstance(raw_jobs, dict) else {}
+
+    def _record_job_result(
+        self,
+        *,
+        name: str,
+        attempted_at: datetime,
+        ran: bool,
+        success: bool,
+        detail: str,
+        next_due_at: datetime,
+    ) -> None:
+        previous = self._job_runtime.get(name, {})
+        failures = int(previous.get("consecutive_failures", 0) or 0)
+        if ran and success:
+            failures = 0
+        elif ran or detail == "expired":
+            failures += 1
+        payload = {
+            "last_attempt_at": attempted_at.isoformat() if ran else str(
+                previous.get("last_attempt_at", "")
+            ),
+            "last_success_at": (
+                attempted_at.isoformat()
+                if ran and success
+                else str(previous.get("last_success_at", ""))
+            ),
+            "last_failure": (
+                "" if ran and success else detail if ran or detail == "expired" else str(
+                    previous.get("last_failure", "")
+                )
+            ),
+            "consecutive_failures": failures,
+            "next_due_at": next_due_at.isoformat(),
+        }
+        self._job_runtime[name] = payload
 
 
 def _parse_hhmm(raw: str) -> time:
@@ -415,6 +505,23 @@ def _due_interval_slot(job: _IntervalJob, current: time) -> int | None:
     end_min = _to_minutes(job.window_end)
     if current_min < start_min or current_min > end_min:
         return None
-    if (current_min - start_min) % job.interval_minutes != 0:
-        return None
-    return current_min
+    return start_min + ((current_min - start_min) // job.interval_minutes) * job.interval_minutes
+
+
+def _next_interval_due(
+    job: _IntervalJob,
+    *,
+    current: datetime,
+    completed_slot: int | None,
+) -> datetime:
+    start_min = _to_minutes(job.window_start)
+    end_min = _to_minutes(job.window_end)
+    if completed_slot is None:
+        next_min = max(start_min, _to_minutes(current.time()))
+    else:
+        next_min = completed_slot + job.interval_minutes
+    next_day = current.date()
+    if next_min > end_min:
+        next_day += timedelta(days=1)
+        next_min = start_min
+    return datetime.combine(next_day, time(hour=next_min // 60, minute=next_min % 60))

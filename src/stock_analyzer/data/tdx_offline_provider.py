@@ -39,6 +39,9 @@ _SELECTED_COLUMNS = [
     "financial_missing_fields",
     "financial_source",
     "financial_report_date",
+    "financial_as_of",
+    "financial_trust_level",
+    "financial_completeness",
     "holder_count",
     "block_trade_net",
     "financing_balance",
@@ -60,6 +63,7 @@ _NUMERIC_COLUMNS = {
     "float_market_cap",
     "roe",
     "debt_ratio",
+    "financial_completeness",
     "holder_count",
     "block_trade_net",
     "financing_balance",
@@ -81,12 +85,15 @@ _DEFAULT_VALUES: dict[str, str | bool | float] = {
     "name": "",
     "is_st": False,
     "is_delisting_risk": False,
-    "roe": 0.08,
-    "debt_ratio": 0.55,
-    "financial_data_complete": True,
-    "financial_missing_fields": "",
+    "roe": float("nan"),
+    "debt_ratio": float("nan"),
+    "financial_data_complete": False,
+    "financial_missing_fields": "roe,debt_ratio",
     "financial_source": "tdx_offline",
     "financial_report_date": "",
+    "financial_as_of": "",
+    "financial_trust_level": "missing",
+    "financial_completeness": 0.0,
     "holder_count": 60_000.0,
     "block_trade_net": 0.0,
     "financing_balance": 2_500_000_000.0,
@@ -99,8 +106,6 @@ _DEFAULT_VALUES: dict[str, str | bool | float] = {
 }
 
 _NUMERIC_DEFAULT_VALUES: dict[str, float] = {
-    "roe": 0.08,
-    "debt_ratio": 0.55,
     "holder_count": 60_000.0,
     "block_trade_net": 0.0,
     "financing_balance": 2_500_000_000.0,
@@ -249,6 +254,8 @@ def _normalize_frame(frame: pd.DataFrame, symbol: str) -> pd.DataFrame:
     for col in _NUMERIC_COLUMNS:
         if col in normalized.columns:
             normalized[col] = pd.to_numeric(normalized[col], errors="coerce")
+            if col == "financial_completeness":
+                normalized[col] = normalized[col].fillna(0.0).clip(lower=0.0, upper=1.0)
             if col in _NUMERIC_DEFAULT_VALUES:
                 normalized[col] = normalized[col].fillna(_NUMERIC_DEFAULT_VALUES[col])
 
@@ -269,10 +276,34 @@ def _normalize_frame(frame: pd.DataFrame, symbol: str) -> pd.DataFrame:
         "financial_missing_fields",
         "financial_source",
         "financial_report_date",
+        "financial_as_of",
+        "financial_trust_level",
         "board",
     ):
         if col in normalized.columns:
             normalized[col] = normalized[col].map(_clean_text_value)
+
+    financial_values_present = normalized["roe"].notna() & normalized["debt_ratio"].notna()
+    suspicious_defaults = (
+        financial_values_present
+        & normalized["roe"].eq(0.08)
+        & normalized["debt_ratio"].eq(0.55)
+        & normalized["financial_report_date"].eq("")
+    )
+    missing_trust = normalized["financial_trust_level"].eq("") | normalized[
+        "financial_trust_level"
+    ].eq("missing")
+    normalized.loc[suspicious_defaults & missing_trust, "financial_trust_level"] = "heuristic"
+    trusted_values = financial_values_present & ~suspicious_defaults
+    normalized.loc[trusted_values & missing_trust, "financial_trust_level"] = "derived"
+    normalized.loc[trusted_values, "financial_completeness"] = 1.0
+    normalized.loc[trusted_values, "financial_data_complete"] = True
+    normalized.loc[trusted_values, "financial_missing_fields"] = ""
+    normalized.loc[suspicious_defaults, "financial_completeness"] = 0.5
+    normalized.loc[suspicious_defaults, "financial_data_complete"] = False
+    normalized.loc[normalized["financial_as_of"].eq(""), "financial_as_of"] = normalized[
+        "financial_report_date"
+    ]
 
     selected = normalized[_SELECTED_COLUMNS].copy()
     selected.index.name = "date"

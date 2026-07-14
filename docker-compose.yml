@@ -4,6 +4,9 @@ services:
       context: .
       args:
         STOCK_ANALYZER_BUILD_COMMIT: ${STOCK_ANALYZER_BUILD_COMMIT:-unknown}
+        STOCK_ANALYZER_BUILD_SHORT_COMMIT: ${STOCK_ANALYZER_BUILD_SHORT_COMMIT:-unknown}
+        STOCK_ANALYZER_BUILD_DIRTY: ${STOCK_ANALYZER_BUILD_DIRTY:-unknown}
+        STOCK_ANALYZER_BUILD_TIME_UTC: ${STOCK_ANALYZER_BUILD_TIME_UTC:-unknown}
     image: stock-analyzer:latest
     container_name: stock-analyzer-api
     command:
@@ -20,6 +23,10 @@ services:
       STOCK_ANALYZER_CONTAINERIZED: "1"
       STOCK_ANALYZER_CONFIG: /app/config/default.yaml
       TZ: Asia/Shanghai
+      SA__APP__MODE: simulation
+      SA__APP__ADVISORY_ONLY: "true"
+      SA__TRAINING__ENABLED: "false"
+      SA__AUTO_PROMOTION__ENABLED: "false"
       SA__CACHE__BACKEND: redis
       SA__CACHE__REDIS_URL: redis://redis:6379/0
       SA__DATA_SOURCE__PRIMARY: market_warehouse
@@ -46,6 +53,9 @@ services:
       context: .
       args:
         STOCK_ANALYZER_BUILD_COMMIT: ${STOCK_ANALYZER_BUILD_COMMIT:-unknown}
+        STOCK_ANALYZER_BUILD_SHORT_COMMIT: ${STOCK_ANALYZER_BUILD_SHORT_COMMIT:-unknown}
+        STOCK_ANALYZER_BUILD_DIRTY: ${STOCK_ANALYZER_BUILD_DIRTY:-unknown}
+        STOCK_ANALYZER_BUILD_TIME_UTC: ${STOCK_ANALYZER_BUILD_TIME_UTC:-unknown}
     image: stock-analyzer:latest
     container_name: stock-analyzer-scheduler
     command:
@@ -59,6 +69,10 @@ services:
       STOCK_ANALYZER_CONTAINERIZED: "1"
       STOCK_ANALYZER_CONFIG: /app/config/default.yaml
       TZ: Asia/Shanghai
+      SA__APP__MODE: simulation
+      SA__APP__ADVISORY_ONLY: "true"
+      SA__TRAINING__ENABLED: "false"
+      SA__AUTO_PROMOTION__ENABLED: "false"
       SA__CACHE__BACKEND: redis
       SA__CACHE__REDIS_URL: redis://redis:6379/0
       SA__DATA_SOURCE__PRIMARY: market_warehouse

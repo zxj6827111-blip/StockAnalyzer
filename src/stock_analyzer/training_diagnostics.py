@@ -433,7 +433,12 @@ def _maybe_build_market_index(
 
 def _normalize_policies(*, configured: str, requested: list[str] | None) -> list[str]:
     active: list[str] = []
-    for item in [configured, "bar_shape_heuristic", "soft_label"]:
+    for item in [
+        configured,
+        "bar_shape_heuristic",
+        "soft_label",
+        "conservative_zero",
+    ]:
         normalized = str(item).strip().lower()
         if normalized and normalized not in active:
             active.append(normalized)

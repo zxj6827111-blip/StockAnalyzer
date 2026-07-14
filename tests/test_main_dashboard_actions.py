@@ -19,11 +19,23 @@ def _close_all_positions(client: TestClient) -> None:
         symbol = str(item.get("symbol", "")).strip()
         if not symbol:
             continue
+        quantity = int(item.get("quantity") or 1)
+        exit_price = float(item.get("entry_price") or item.get("last_price") or 1.0)
         close_response = client.post(
             "/dashboard/command/quick",
-            json={"action": "CLOSE_POSITION", "payload": {"symbol": symbol}},
+            json={
+                "action": "CLOSE_POSITION",
+                "payload": {
+                    "symbol": symbol,
+                    "exit_price": exit_price,
+                    "quantity": quantity,
+                    "trade_time": "2026-03-31T15:00:00",
+                    "note": "test cleanup confirmed fill",
+                },
+            },
         )
         assert close_response.status_code == 200
+        assert close_response.json()["result"]["command_update"]["closed"] is True
 
 
 def test_dashboard_quick_command_pause_and_resume() -> None:
@@ -177,7 +189,7 @@ def test_dashboard_quick_command_set_recommendation_status() -> None:
     assert recommendation_page.headers["location"] == "/ui/recommendations"
 
 
-def test_dashboard_quick_command_close_all_positions() -> None:
+def test_dashboard_quick_command_close_all_requires_confirmed_fills() -> None:
     client = TestClient(app)
     _set_ops_enabled(client, True)
     _close_all_positions(client)
@@ -199,7 +211,11 @@ def test_dashboard_quick_command_close_all_positions() -> None:
     assert close_all_response.status_code == 200
     close_payload = close_all_response.json()
     assert close_payload["result"]["accepted"] is True
-    assert close_payload["result"]["command_update"]["closed_count"] >= 1
+    command_update = close_payload["result"]["command_update"]
+    assert command_update["closed_count"] == 0
+    positions = client.get("/portfolio/positions").json().get("positions", [])
+    assert any(item.get("symbol") == "605002" for item in positions)
+    _close_all_positions(client)
 
 
 def test_dashboard_quick_command_close_position_with_manual_fill_payload() -> None:

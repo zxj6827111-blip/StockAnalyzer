@@ -32,18 +32,21 @@ def test_portfolio_book_enforces_max_holdings() -> None:
     assert len(book.positions()) == 1
 
 
-def test_portfolio_book_closes_expired_positions() -> None:
+def test_portfolio_book_marks_expired_positions_exit_due_without_trade() -> None:
     book = PortfolioBook(max_holdings=2, max_hold_days=1)
     opened_at = datetime.fromisoformat("2026-03-01T10:00:00")
     book.apply_signals(trace_id="trace-1", timestamp=opened_at, signals=[_buy_signal("600000")])
 
     next_day = opened_at + timedelta(days=1)
     update = book.apply_signals(trace_id="trace-2", timestamp=next_day, signals=[])
-    assert update["closed_expired"] == 1
-    assert len(book.positions()) == 0
+    assert update["closed_expired"] == 0
+    assert update["exit_due"] == 1
+    positions = book.positions()
+    assert len(positions) == 1
+    assert positions[0]["status"] == "exit_due"
     trades = book.trades(limit=10)
-    assert len(trades) == 2
-    assert trades[-1]["side"] == "sell"
+    assert len(trades) == 1
+    assert trades[-1]["side"] == "buy"
 
 
 def test_portfolio_book_enforces_same_sector_limit() -> None:
@@ -78,8 +81,8 @@ def test_portfolio_book_manual_set_and_close() -> None:
         timestamp=now,
         trace_id="cmd-2",
     )
-    assert closed is True
-    assert len(book.positions()) == 0
+    assert closed is False
+    assert len(book.positions()) == 1
 
 
 def test_portfolio_book_manual_set_accepts_fill_payload() -> None:

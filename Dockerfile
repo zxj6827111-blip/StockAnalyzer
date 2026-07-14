@@ -51,8 +51,19 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN chmod +x /app/scripts/docker-entrypoint.sh
 
 ARG STOCK_ANALYZER_BUILD_COMMIT=unknown
-LABEL org.opencontainers.image.revision=${STOCK_ANALYZER_BUILD_COMMIT}
+ARG STOCK_ANALYZER_BUILD_SHORT_COMMIT=unknown
+ARG STOCK_ANALYZER_BUILD_DIRTY=unknown
+ARG STOCK_ANALYZER_BUILD_TIME_UTC=unknown
+RUN python /app/scripts/generate_build_manifest.py \
+    --output /app/build_manifest.json \
+    --commit "${STOCK_ANALYZER_BUILD_COMMIT}" \
+    --short-commit "${STOCK_ANALYZER_BUILD_SHORT_COMMIT}" \
+    --dirty "${STOCK_ANALYZER_BUILD_DIRTY}" \
+    --built-at-utc "${STOCK_ANALYZER_BUILD_TIME_UTC}"
+LABEL org.opencontainers.image.revision=${STOCK_ANALYZER_BUILD_COMMIT} \
+      org.opencontainers.image.created=${STOCK_ANALYZER_BUILD_TIME_UTC}
 ENV STOCK_ANALYZER_BUILD_COMMIT=${STOCK_ANALYZER_BUILD_COMMIT}
+ENV STOCK_ANALYZER_BUILD_MANIFEST=/app/build_manifest.json
 
 EXPOSE 8000
 

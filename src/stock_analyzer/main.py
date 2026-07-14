@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import json
-import os
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -37,6 +36,7 @@ if TYPE_CHECKING:
 else:
     from pydantic import BaseModel, Field
 
+from stock_analyzer.build_identity import get_build_manifest
 from stock_analyzer.command.channel import CommandEnvelope, SignedCommandProcessor
 from stock_analyzer.command.feishu_interaction import (
     FeishuMessageEvent,
@@ -1946,14 +1946,11 @@ class NewsScoreCacheClearRequest(BaseModel):
 
 @app.get("/health")
 def health() -> dict[str, object]:
+    build_manifest = get_build_manifest()
     return {
         "status": "ok",
         "mode": _config.app.mode,
-        "build": {
-            "commit": os.environ.get("STOCK_ANALYZER_BUILD_COMMIT", "").strip()
-            or "unknown",
-            "code_commit_id": _config.evolution.code_commit_id,
-        },
+        "build": {**build_manifest, "code_commit_id": _config.evolution.code_commit_id},
         "runtime": {
             "advisory_only": bool(_config.app.advisory_only),
             "scheduler_enabled": bool(_config.scheduler.enabled),
@@ -1967,14 +1964,11 @@ def health() -> dict[str, object]:
 
 @app.get("/health/deep")
 def health_deep() -> dict[str, object]:
+    build_manifest = get_build_manifest()
     return {
         "status": "ok",
         "mode": _config.app.mode,
-        "build": {
-            "commit": os.environ.get("STOCK_ANALYZER_BUILD_COMMIT", "").strip()
-            or "unknown",
-            "code_commit_id": _config.evolution.code_commit_id,
-        },
+        "build": {**build_manifest, "code_commit_id": _config.evolution.code_commit_id},
         "provider": _service.provider_status(),
         "runtime": _service.runtime_status(include_learning_governance=False),
     }

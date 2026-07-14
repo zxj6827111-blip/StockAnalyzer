@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from dataclasses import asdict
@@ -199,21 +200,23 @@ class RuntimeOpsService:
     ) -> dict[str, object]:
         service = self._service
         trades = service._portfolio.trades(limit=max_records)
-        reconcile_recent = service._reconcile_history[-max_records:]
-        run_summaries = service._run_summaries[-max_records:]
-        latency_recent = service._latency_history_ms[-max_records:]
-        audit_recent = service._audit_events[-max_records:]
         lifecycle = service.recommendation_lifecycle(limit=max_records)
         holding_alerts = service.holding_alerts(now=now)
         execution_bias = service.execution_bias_report(days=30, limit=max_records)
+        state_path = service._runtime_state_path
+        try:
+            state_bytes = state_path.read_bytes()
+        except OSError:
+            state_bytes = b""
+        sidecars = service._runtime_state_service._runtime_state_history_sidecar_metadata()
         summary = {
             "watchlist": len(service._state.watchlist),
             "positions": len(service._portfolio.positions()),
             "trades": len(trades),
-            "reconcile_history": len(reconcile_recent),
-            "run_summaries": len(run_summaries),
-            "latency_records": len(latency_recent),
-            "audit_events": len(audit_recent),
+            "reconcile_history": len(service._reconcile_history),
+            "run_summaries": len(service._run_summaries),
+            "latency_records": len(service._latency_history_ms),
+            "audit_events": len(service._audit_events),
             "lifecycle_records": _as_int(lifecycle.get("records"), default=0),
             "holding_alert_records": _as_int(holding_alerts.get("records"), default=0),
             "execution_bias_records_30d": _as_int(
@@ -222,27 +225,32 @@ class RuntimeOpsService:
             ),
         }
         return {
-            "archive_version": 1,
+            "archive_version": 2,
             "generated_at": now.isoformat(),
             "day": now.strftime("%Y-%m-%d"),
             "summary": summary,
-            "runtime_state": service._default_runtime_state_payload(),
-            "latest_signals": service.latest_signals_snapshot(),
-            "portfolio": {
+            "runtime_state_ref": {
+                "schema_version": 9,
+                "path": str(state_path),
+                "size_bytes": len(state_bytes),
+                "sha256": hashlib.sha256(state_bytes).hexdigest() if state_bytes else "",
+                "sidecars": sidecars,
+            },
+            "latest": {
+                "signals": service.latest_signals_snapshot(),
+                "reconcile": service._last_reconcile_report,
+                "week4_acceptance": service._last_week4_acceptance_report,
+                "week5_scan": service._last_week5_scan_report,
+                "week6": service._last_week6_report,
+                "market_warehouse": service._last_market_warehouse_report,
+                "evolution": service._last_evolution_report,
+            },
+            "hot_data": {
                 "positions": service.portfolio_positions(),
-                "trades": trades,
-            },
-            "recommendation_lifecycle": lifecycle,
-            "holding_alerts": holding_alerts,
-            "execution_bias_30d": execution_bias,
-            "reconcile": {
-                "latest": service._last_reconcile_report,
-                "history": reconcile_recent,
-            },
-            "runtime": {
-                "run_summaries": run_summaries,
-                "latency_history_ms": latency_recent,
-                "audit_events": audit_recent,
+                "trades_count": len(trades),
+                "recommendation_summary": lifecycle.get("summary", {}),
+                "holding_alert_summary": holding_alerts.get("summary", {}),
+                "execution_bias_summary": execution_bias.get("summary", {}),
             },
         }
 

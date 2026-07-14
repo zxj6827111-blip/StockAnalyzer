@@ -111,6 +111,10 @@ def test_collect_support_bundle_uses_host_runtime_state_and_redacts_env(tmp_path
     )
 
     assert bundle["summary"]["status"] == "ok"
+    assert bundle["schema_version"] == "nas-support-bundle.v2"
+    assert bundle["mode"] == "host"
+    assert bundle["config_summary"]["env"]["values_included"] is False
+    assert bundle["http"]["health"]["latency_ms"] >= 0
     assert bundle["runtime_artifacts"]["runtime_state_source"] == "host_file"
     assert bundle["runtime_artifacts"]["runtime_state"]["system_stage"]["code"] == "night"
     assert bundle["docker"]["redis"]["runtime_realtime_key_count"] == 2
@@ -143,3 +147,24 @@ def test_collect_support_bundle_marks_unavailable_runtime_endpoint_as_error(tmp_
     assert bundle["docker"]["available"] is False
     assert bundle["summary"]["status"] == "error"
     assert "runtime stage endpoint unavailable" in bundle["summary"]["issues"]
+
+
+def test_collect_support_bundle_container_mode_lists_namespace_omissions(tmp_path: Path) -> None:
+    def fake_http(url: str, timeout_sec: float) -> dict[str, object]:
+        return {"status": "ok"}
+
+    def fake_command(command: list[str]) -> dict[str, object]:
+        return {"returncode": 1, "stdout": "", "stderr": "unavailable"}
+
+    bundle = collect_support_bundle(
+        project_root=tmp_path,
+        mode="container",
+        command_runner=fake_command,
+        http_getter=fake_http,
+    )
+
+    assert bundle["mode"] == "container"
+    assert {item["item"] for item in bundle["omissions"]} >= {
+        "host_docker_daemon",
+        "host_mount_layout",
+    }

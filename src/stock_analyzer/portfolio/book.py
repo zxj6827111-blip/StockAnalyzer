@@ -80,6 +80,8 @@ class TradeRecord:
     exit_account: str = ""
     exit_trade_time: str = ""
     exit_note: str = ""
+    execution_state: str = "unconfirmed"
+    valid_execution: bool = False
 
     def to_dict(self) -> dict[str, object]:
         payload = asdict(self)
@@ -104,7 +106,7 @@ class PortfolioBook:
         timestamp: datetime,
         signals: list[PipelineSignal],
     ) -> dict[str, int]:
-        closed_expired = self._close_expired(timestamp)
+        exit_due = self._mark_expired_exit_due(timestamp)
         opened = 0
         adjusted = 0
         skipped_limit = 0
@@ -116,6 +118,7 @@ class PortfolioBook:
             if existing is not None:
                 existing.target_position = signal.target_position
                 existing.updated_at = timestamp
+                existing.status = "open"
                 adjusted += 1
                 continue
 
@@ -156,7 +159,8 @@ class PortfolioBook:
         return {
             "opened": opened,
             "adjusted": adjusted,
-            "closed_expired": closed_expired,
+            "closed_expired": 0,
+            "exit_due": exit_due,
             "skipped_max_holdings": skipped_limit,
             "skipped_same_sector": skipped_same_sector,
             "open_positions": len(self._positions),
@@ -247,9 +251,19 @@ class PortfolioBook:
         reason: str = "manual_close",
         manual_fill: dict[str, object] | None = None,
     ) -> bool:
-        record = self._positions.pop(symbol, None)
+        record = self._positions.get(symbol)
         if record is None:
             return False
+        normalized_fill = _normalize_manual_close_fill_payload(manual_fill)
+        if normalized_fill["quantity"] is None and record.quantity is not None:
+            normalized_fill["quantity"] = record.quantity
+        if not normalized_fill["manual_trade_time"]:
+            normalized_fill["manual_trade_time"] = timestamp.isoformat()
+        if not _is_confirmed_close_fill(normalized_fill):
+            record.status = "exit_due"
+            record.updated_at = timestamp
+            return False
+        self._positions.pop(symbol, None)
         self._append_trade(
             side="sell",
             symbol=record.symbol,
@@ -258,7 +272,7 @@ class PortfolioBook:
             timestamp=timestamp,
             trace_id=trace_id,
             reason=reason,
-            close_fill=manual_fill,
+            close_fill=normalized_fill,
         )
         return True
 
@@ -310,10 +324,18 @@ class PortfolioBook:
                 exit_quantity = min(current_quantity, exit_quantity)
                 remaining_quantity = max(0, current_quantity - exit_quantity)
             normalized_fill["quantity"] = exit_quantity if exit_quantity > 0 else None
+        if not normalized_fill["manual_trade_time"]:
+            normalized_fill["manual_trade_time"] = timestamp.isoformat()
+        if not _is_confirmed_close_fill(normalized_fill):
+            record.status = "exit_due"
+            record.updated_at = timestamp
+            return "pending_confirmation"
+        if current_quantity is not None:
             record.quantity = remaining_quantity if remaining_quantity > 0 else None
 
         record.target_position = max(0.0, float(target_position))
         record.updated_at = timestamp
+        record.status = "open"
         self._append_trade(
             side="sell",
             symbol=record.symbol,
@@ -448,24 +470,18 @@ class PortfolioBook:
             if (record.sector_tag or _infer_sector_tag(record.symbol)) == normalized_sector
         )
 
-    def _close_expired(self, now: datetime) -> int:
+    def _mark_expired_exit_due(self, now: datetime) -> int:
         expired_symbols: list[str] = []
         for symbol, record in self._positions.items():
             holding_days = (now.date() - record.opened_at.date()).days
-            if holding_days >= self._max_hold_days:
+            if holding_days >= self._max_hold_days and record.status != "exit_due":
                 expired_symbols.append(symbol)
 
         for symbol in expired_symbols:
-            record = self._positions.pop(symbol)
-            self._append_trade(
-                side="sell",
-                symbol=record.symbol,
-                strategy=record.strategy,
-                target_position=0.0,
-                timestamp=now,
-                trace_id=record.open_trace_id,
-                reason="max_hold_days_exit",
-            )
+            record = self._positions[symbol]
+            record.status = "exit_due"
+            record.updated_at = now
+            record.note = _append_note(record.note, "max_hold_days_exit_due")
         return len(expired_symbols)
 
     def _append_trade(
@@ -482,6 +498,12 @@ class PortfolioBook:
     ) -> None:
         normalized_fill = _normalize_manual_fill_payload(manual_fill)
         normalized_close_fill = _normalize_manual_close_fill_payload(close_fill)
+        execution_confirmed = (
+            _is_confirmed_close_fill(normalized_close_fill)
+            if side == "sell"
+            else normalized_fill["entry_price"] is not None
+            and normalized_fill["quantity"] is not None
+        )
         self._trade_seq += 1
         self._trades.append(
             TradeRecord(
@@ -505,6 +527,8 @@ class PortfolioBook:
                 exit_account=normalized_close_fill["account"],
                 exit_trade_time=normalized_close_fill["manual_trade_time"],
                 exit_note=normalized_close_fill["note"],
+                execution_state="confirmed" if execution_confirmed else "unconfirmed",
+                valid_execution=execution_confirmed,
             )
         )
 
@@ -589,6 +613,21 @@ def _normalize_manual_close_fill_payload(
     }
 
 
+def _is_confirmed_close_fill(close_fill: ManualCloseFillPayload) -> bool:
+    return bool(
+        close_fill["exit_price"] is not None
+        and close_fill["exit_price"] > 0
+        and close_fill["quantity"] is not None
+        and close_fill["quantity"] > 0
+        and close_fill["manual_trade_time"]
+    )
+
+
+def _append_note(existing: str, note: str) -> str:
+    values = [item for item in (existing.strip(), note.strip()) if item]
+    return ";".join(dict.fromkeys(values))
+
+
 def _apply_manual_fill_to_position(record: PositionRecord, manual_fill: ManualFillPayload) -> None:
     entry_price = manual_fill.get("entry_price")
     if isinstance(entry_price, (int, float)) and entry_price > 0:
@@ -664,6 +703,22 @@ def _parse_trade_record(raw: object) -> TradeRecord | None:
     ):
         return None
     trade_side: TradeSide = "buy" if side == "buy" else "sell"
+    exit_price = _safe_float(raw.get("exit_price"))
+    exit_quantity = _safe_int(raw.get("exit_quantity"))
+    entry_price = _safe_float(raw.get("entry_price"))
+    quantity = _safe_int(raw.get("quantity"))
+    inferred_confirmed = (
+        exit_price is not None
+        and exit_price > 0
+        and exit_quantity is not None
+        and exit_quantity > 0
+        if trade_side == "sell"
+        else entry_price is not None and entry_price > 0 and quantity is not None and quantity > 0
+    )
+    explicit_valid = raw.get("valid_execution")
+    valid_execution = (
+        bool(explicit_valid) if isinstance(explicit_valid, bool) else inferred_confirmed
+    )
     return TradeRecord(
         trade_id=trade_id,
         side=trade_side,
@@ -673,18 +728,23 @@ def _parse_trade_record(raw: object) -> TradeRecord | None:
         timestamp=timestamp,
         trace_id=str(raw.get("trace_id", "")).strip(),
         reason=str(raw.get("reason", "")).strip(),
-        entry_price=_safe_float(raw.get("entry_price")),
-        quantity=_safe_int(raw.get("quantity")),
+        entry_price=entry_price,
+        quantity=quantity,
         fee=_safe_float(raw.get("fee")) or 0.0,
         account=str(raw.get("account", "")).strip(),
         manual_trade_time=str(raw.get("manual_trade_time", "")).strip(),
         note=str(raw.get("note", "")).strip(),
-        exit_price=_safe_float(raw.get("exit_price")),
-        exit_quantity=_safe_int(raw.get("exit_quantity")),
+        exit_price=exit_price,
+        exit_quantity=exit_quantity,
         exit_fee=_safe_float(raw.get("exit_fee")) or 0.0,
         exit_account=str(raw.get("exit_account", "")).strip(),
         exit_trade_time=str(raw.get("exit_trade_time", "")).strip(),
         exit_note=str(raw.get("exit_note", "")).strip(),
+        execution_state=str(
+            raw.get("execution_state", "confirmed" if valid_execution else "legacy_invalid")
+        ).strip()
+        or ("confirmed" if valid_execution else "legacy_invalid"),
+        valid_execution=valid_execution,
     )
 
 

@@ -48,6 +48,7 @@ _DAILY_NUMERIC_COLUMNS = {
     "float_market_cap",
     "roe",
     "debt_ratio",
+    "financial_completeness",
     "holder_count",
     "block_trade_net",
     "financing_balance",
@@ -67,6 +68,8 @@ _DAILY_STRING_COLUMNS = {
     "financial_missing_fields",
     "financial_source",
     "financial_report_date",
+    "financial_as_of",
+    "financial_trust_level",
     "background_data_source",
     "board",
 }
@@ -112,6 +115,9 @@ class MarketWarehouse:
                     financial_missing_fields VARCHAR,
                     financial_source VARCHAR,
                     financial_report_date VARCHAR,
+                    financial_as_of VARCHAR,
+                    financial_trust_level VARCHAR,
+                    financial_completeness DOUBLE,
                     holder_count DOUBLE,
                     block_trade_net DOUBLE,
                     financing_balance DOUBLE,
@@ -124,6 +130,16 @@ class MarketWarehouse:
                 )
                 """
             )
+            # NAS 上的既有 DuckDB 不会因 CREATE TABLE IF NOT EXISTS 自动补列。
+            for column_name, column_type in (
+                ("financial_as_of", "VARCHAR"),
+                ("financial_trust_level", "VARCHAR"),
+                ("financial_completeness", "DOUBLE"),
+            ):
+                connection.execute(
+                    f"ALTER TABLE {_DAILY_TABLE} "
+                    f"ADD COLUMN IF NOT EXISTS {column_name} {column_type}"
+                )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS intraday_summary_1m (
@@ -401,7 +417,9 @@ class MarketWarehouse:
                     field_metrics["dragon_tiger_flag"].get("non_zero_count", 0)
                 ),
             },
-            "stale_symbols_sample": [str(row[0]).strip() for row in stale_rows if str(row[0]).strip()],
+            "stale_symbols_sample": [
+                str(row[0]).strip() for row in stale_rows if str(row[0]).strip()
+            ],
         }
 
     def replace_daily_bars(self, *, symbol: str, frame: pd.DataFrame) -> None:

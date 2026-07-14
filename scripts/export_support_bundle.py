@@ -17,6 +17,12 @@ def main() -> int:
         description="Export a NAS support bundle for remote diagnostics.",
     )
     parser.add_argument(
+        "--mode",
+        choices=("host", "container"),
+        default="host",
+        help="Collection namespace. Production NAS diagnostics should use host.",
+    )
+    parser.add_argument(
         "--output",
         default="artifacts/support/nas_support_bundle.json",
         help="Target JSON file path.",
@@ -64,6 +70,7 @@ def main() -> int:
         redis_container=args.redis_container,
         log_tail=args.log_tail,
         timeout_sec=args.timeout_sec,
+        mode=args.mode,
     )
     print(output_path)
     return 0

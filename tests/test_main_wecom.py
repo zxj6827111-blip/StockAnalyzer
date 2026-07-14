@@ -26,7 +26,7 @@ def _enable_wecom(monkeypatch: MonkeyPatch, *, safe_mode: bool = False) -> None:
     monkeypatch.setattr(cfg, "enabled", True)
     monkeypatch.setattr(cfg, "token", "wx-test-token")
     monkeypatch.setattr(cfg, "verify_signature", True)
-    monkeypatch.setattr(cfg, "allowed_users", [])
+    monkeypatch.setattr(cfg, "allowed_users", ["user_a"])
     monkeypatch.setattr(cfg, "auto_reconcile_after_broker_snapshot", True)
     if safe_mode:
         monkeypatch.setattr(cfg, "encoding_aes_key", _aes_key())

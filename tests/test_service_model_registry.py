@@ -646,11 +646,15 @@ def test_service_train_execution_risk_model_persists_status_and_history(tmp_path
     )
 
     assert payload["ok"] is True
-    assert payload["status"] == "trained"
+    assert payload["status"] == "trained_shadow_only"
+    assert payload["qualification_status"] == "shadow_only"
+    assert _as_mapping(payload["qualification"])["active_rerank_allowed"] is False
     assert Path(str(payload["artifact_path"])).exists() is True
     assert "can_fill" in cast(list[object], payload["trained_targets"])
     assert "can_fill" in _as_mapping(payload["target_split_strategies"])
     assert status["artifact_exists"] is True
+    assert status["qualification_status"] == "shadow_only"
+    assert status["active_rerank_allowed"] is False
     assert "can_fill" in cast(list[object], status["trained_targets"])
     assert int(history["records"]) >= 1
     assert int(audit_payload["records"]) >= 1

@@ -68,7 +68,7 @@ def _normalize_nonempty_string(value: object, default: str = "") -> str:
 class AppConfig(_StrictModel):
     timezone: str = "Asia/Shanghai"
     mode: str = "simulation"
-    advisory_only: bool = False
+    advisory_only: bool = True
 
 
 class DataSourceConfig(_StrictModel):
@@ -685,7 +685,7 @@ class MarketRelativeFeatureConfig(_StrictModel):
 
 
 class TrainingConfig(_StrictModel):
-    enabled: bool = True
+    enabled: bool = False
     min_samples: int = 200
     validation_ratio: float = 0.2
     calibration_ratio: float = 0.1

@@ -56,7 +56,11 @@ def test_build_realtime_runtime_provider_wraps_tdx_offline_with_live_overlay(
     tmp_path: Path,
 ) -> None:
     (tmp_path / "bars").mkdir(parents=True, exist_ok=True)
-    config = DataSourceConfig(primary="tdx_offline", local_data_root=str(tmp_path))
+    config = DataSourceConfig(
+        primary="tdx_offline",
+        local_data_root=str(tmp_path),
+        runtime_live_cache_ttl_sec=15,
+    )
 
     provider = build_realtime_runtime_provider(config, timezone="Asia/Shanghai")
 

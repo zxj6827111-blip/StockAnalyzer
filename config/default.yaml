@@ -1,7 +1,7 @@
 app:
   timezone: Asia/Shanghai
   mode: simulation
-  advisory_only: false
+  advisory_only: true
 
 security:
   api_auth_enabled: false
@@ -501,7 +501,7 @@ market_relative_feature:
   fallback_symbol: "399001"
 
 training:
-  enabled: true
+  enabled: false
   min_samples: 200
   validation_ratio: 0.2
   calibration_ratio: 0.1

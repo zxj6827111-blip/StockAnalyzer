@@ -37,7 +37,11 @@ def test_tdx_offline_provider_loads_csv_and_fills_defaults(tmp_path: Path) -> No
     bars = provider.fetch_daily_bars(symbol="600000", lookback_days=2)
     assert len(bars) == 2
     assert bars.index.name == "date"
-    assert bool(bars["financial_data_complete"].iloc[-1]) is True
+    assert bool(bars["financial_data_complete"].iloc[-1]) is False
+    assert bars["financial_trust_level"].iloc[-1] == "missing"
+    assert float(bars["financial_completeness"].iloc[-1]) == 0.0
+    assert pd.isna(bars["roe"].iloc[-1])
+    assert pd.isna(bars["debt_ratio"].iloc[-1])
     assert bars["board"].iloc[-1] == "main"
     assert "northbound_net" in bars.columns
 

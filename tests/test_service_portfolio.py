@@ -1578,8 +1578,8 @@ def test_service_manual_portfolio_commands_are_applied() -> None:
     close_result = service.execute_command(close_cmd)
     assert close_result["accepted"] is True
     close_update = _as_mapping(close_result["command_update"])
-    assert close_update["closed"] is True
-    assert len(service.portfolio_positions()) == 0
+    assert close_update["closed"] is False
+    assert len(service.portfolio_positions()) == 1
 
 
 def test_service_set_position_watchlist_sync_is_deduplicated() -> None:
@@ -1733,7 +1733,12 @@ def test_service_recommendation_lifecycle_tracks_manual_transitions() -> None:
     close_cmd = _sign(
         action="CLOSE_POSITION",
         command_id="cmd-rec-close",
-        payload={"symbol": "600000"},
+        payload={
+            "symbol": "600000",
+            "exit_price": 10.5,
+            "quantity": 100,
+            "trade_time": "2026-03-03T14:55:00",
+        },
         secret=config.command_channel.secret_key,
     )
     close_result = service.execute_command(close_cmd)
@@ -2044,12 +2049,11 @@ def test_service_expired_position_exit_notification_emits_sell_instruction() -> 
 
     _patch_attr(service, "notify", _fake_notify)
     trade_time = datetime.fromisoformat("2026-03-06T10:00:00")
-    _patch_attr(service._portfolio, "trades", lambda limit=100: [
+    _patch_attr(service._portfolio, "positions", lambda: [
         {
-            "side": "sell",
             "symbol": "600000",
-            "reason": "max_hold_days_exit",
-            "timestamp": trade_time.isoformat(),
+            "status": "exit_due",
+            "updated_at": trade_time.isoformat(),
         }
     ])
 
@@ -2060,9 +2064,10 @@ def test_service_expired_position_exit_notification_emits_sell_instruction() -> 
     )
 
     assert len(notifications) == 1
-    assert "卖出指令 600000" in notifications[0]["title"]
+    assert "600000" in notifications[0]["title"]
     assert str(config.soup_strategy.max_hold_days) in notifications[0]["content"]
-    assert "处理类型：到期卖出" in notifications[0]["content"]
+    assert "exit_due" in notifications[0]["content"]
+    assert "trade_id" in notifications[0]["content"]
 
 
 def test_service_risk_status_notifies_capital_protection_on_state_change() -> None:
@@ -2227,8 +2232,10 @@ def test_service_close_all_positions_command_closes_everything() -> None:
     )
     close_result = service.execute_command(close_all)
     assert close_result["accepted"] is True
-    assert _as_mapping(close_result["command_update"])["closed_count"] == 1
-    assert len(service.portfolio_positions()) == 0
+    close_update = _as_mapping(close_result["command_update"])
+    assert close_update["closed_count"] == 0
+    assert close_update["closed_symbols"] == []
+    assert len(service.portfolio_positions()) == 1
 
 
 def test_service_reconcile_with_broker_snapshot_command() -> None:

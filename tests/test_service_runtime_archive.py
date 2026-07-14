@@ -74,12 +74,15 @@ def test_runtime_history_archive_writes_file_and_purges_expired(tmp_path: Path) 
     output_path = Path(str(report["path"]))
     assert output_path.exists()
     payload = json.loads(output_path.read_text(encoding="utf-8"))
-    assert payload["archive_version"] == 1
+    assert payload["archive_version"] == 2
     assert "summary" in payload
-    assert "portfolio" in payload
+    assert "runtime_state_ref" in payload
+    assert "runtime_state" not in payload
 
 
-def test_runtime_history_archive_keeps_pipeline_portfolio_executions(tmp_path: Path) -> None:
+def test_runtime_history_archive_keeps_only_execution_counts_and_sidecar_pointer(
+    tmp_path: Path,
+) -> None:
     config = _load_test_config(tmp_path)
     service = StockAnalyzerService(config=config)
     service._record_audit_event(  # noqa: SLF001
@@ -109,14 +112,9 @@ def test_runtime_history_archive_keeps_pipeline_portfolio_executions(tmp_path: P
         force=True,
     )
     payload = json.loads(Path(str(report["path"])).read_text(encoding="utf-8"))
-    audit_events = payload["runtime"]["audit_events"]
-    pipeline_event = next(
-        item for item in audit_events if item["event_type"] == "pipeline_run"
-    )
-    portfolio_update = pipeline_event["payload"]["portfolio_update"]
-
-    assert portfolio_update["skipped_max_holdings"] == 1
-    assert portfolio_update["executions"][0]["status"] == "rejected_max_holdings"
+    assert payload["summary"]["audit_events"] == 1
+    assert "runtime" not in payload
+    assert "sidecars" in payload["runtime_state_ref"]
 
 
 def test_runtime_history_archive_if_needed_dedups_same_day(tmp_path: Path) -> None:

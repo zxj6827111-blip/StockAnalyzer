@@ -345,7 +345,10 @@ class RuntimeWeek5Service:
                 ),
             ),
             "watchlist_after_sync": (
-                _as_int(watchlist_sync.get("watchlist_after"), default=len(service._state.watchlist))
+                _as_int(
+                    watchlist_sync.get("watchlist_after"),
+                    default=len(service._state.watchlist),
+                )
                 if isinstance(watchlist_sync, dict)
                 else len(service._state.watchlist)
             ),
@@ -588,7 +591,9 @@ class RuntimeWeek5Service:
                 queued_research.get("queued_count"),
                 default=len(review_pool_input),
             ),
-            "review_pool_size": _as_int(queued_research.get("active_count"), default=len(review_pool)),
+            "review_pool_size": _as_int(
+                queued_research.get("active_count"), default=len(review_pool)
+            ),
             "review_pool_symbols": [
                 str(item.get("symbol", "")).strip()
                 for item in review_pool
@@ -716,7 +721,9 @@ class RuntimeWeek5Service:
             normalized = {str(key): value for key, value in item.items()}
             normalized["symbol"] = symbol
             normalized["timestamp"] = str(normalized.get("timestamp") or now.isoformat())
-            normalized["source"] = str(normalized.get("source") or default_source).strip() or default_source
+            normalized["source"] = (
+                str(normalized.get("source") or default_source).strip() or default_source
+            )
             normalized_records.append(normalized)
         active_pool = self._merge_market_radar_review_pool(records=normalized_records, now=now)
         if normalized_records:
@@ -1691,13 +1698,15 @@ class RuntimeWeek5Service:
                 "reason": reason,
             }
 
+        shadow_only = not predictor.can_rerank
+
         applied_count = 0
         skipped_missing_snapshot = 0
         skipped_snapshot_not_found = 0
         skipped_prediction_failed = 0
         for candidate in candidates:
-            snapshot_id = str(candidate.get("snapshot_id", "")).strip() or _extract_learning_snapshot_id(
-                candidate
+            snapshot_id = str(candidate.get("snapshot_id", "")).strip() or (
+                _extract_learning_snapshot_id(candidate)
             )
             if not snapshot_id:
                 skipped_missing_snapshot += 1
@@ -1742,16 +1751,26 @@ class RuntimeWeek5Service:
             candidate["execution_aware_score"] = round(execution_score_value, 6)
             candidate["execution_high_risk"] = high_risk
             candidate["execution_risk"] = normalize_execution_risk_payload(risk)
-            candidate["execution_reranked_score"] = combine_execution_reranked_score(
-                shortlist_score=_as_float(candidate.get("shortlist_score"), default=0.0),
-                execution_aware_score_value=execution_score_value,
-                high_execution_risk=high_risk,
+            candidate["execution_risk_mode"] = (
+                "shadow_only" if shadow_only else "qualified"
             )
-            candidate["execution_rerank_applied"] = True
-            candidate["execution_rerank_reason"] = "applied"
+            if shadow_only:
+                candidate["execution_reranked_score"] = _as_float(
+                    candidate.get("shortlist_score"), default=0.0
+                )
+                candidate["execution_rerank_applied"] = False
+                candidate["execution_rerank_reason"] = "artifact_shadow_only"
+            else:
+                candidate["execution_reranked_score"] = combine_execution_reranked_score(
+                    shortlist_score=_as_float(candidate.get("shortlist_score"), default=0.0),
+                    execution_aware_score_value=execution_score_value,
+                    high_execution_risk=high_risk,
+                )
+                candidate["execution_rerank_applied"] = True
+                candidate["execution_rerank_reason"] = "applied"
             applied_count += 1
 
-        applied = applied_count > 0
+        applied = applied_count > 0 and not shadow_only
         return {
             "applied": applied,
             "score_key": "execution_reranked_score" if applied else "shortlist_score",
@@ -1759,7 +1778,15 @@ class RuntimeWeek5Service:
             "applied_count": applied_count,
             "coverage_ratio": round(applied_count / max(1, candidate_count), 6),
             "artifact_path": str(artifact_path),
-            "reason": "applied" if applied else "no_candidate_snapshot_match",
+            "reason": (
+                "applied"
+                if applied
+                else "artifact_shadow_only"
+                if applied_count > 0 and shadow_only
+                else "no_candidate_snapshot_match"
+            ),
+            "qualification_status": predictor.qualification_status,
+            "shadow_predictions": applied_count if shadow_only else 0,
             "skipped_missing_snapshot": skipped_missing_snapshot,
             "skipped_snapshot_not_found": skipped_snapshot_not_found,
             "skipped_prediction_failed": skipped_prediction_failed,
@@ -2271,7 +2298,9 @@ class RuntimeWeek5Service:
         working = daily_bars.sort_index().copy()
         daily_dates = list(working.index)
         latest_daily = working.iloc[-1]
-        latest_name = _clean_display_text(latest_daily.get("name")) or _latest_name_from_bars(working)
+        latest_name = _clean_display_text(
+            latest_daily.get("name")
+        ) or _latest_name_from_bars(working)
         daily_close_series = [
             _as_float(value, default=0.0)
             for value in working.get("close", pd.Series(dtype=float)).tolist()

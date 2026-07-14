@@ -193,6 +193,38 @@ def test_market_warehouse_read_connection_stays_compatible_with_open_write_conne
         assert warehouse._table_exists("daily_bars") is True
 
 
+def test_market_warehouse_schema_migration_adds_financial_provenance_columns(
+    tmp_path: Path,
+) -> None:
+    warehouse = MarketWarehouse(
+        db_path=tmp_path / "warehouse" / "market.duckdb",
+        package_root=tmp_path / "package",
+    )
+    warehouse.ensure_schema()
+    with warehouse._connect_write() as connection:
+        connection.execute("ALTER TABLE daily_bars DROP COLUMN financial_as_of")
+        connection.execute("ALTER TABLE daily_bars DROP COLUMN financial_trust_level")
+        connection.execute("ALTER TABLE daily_bars DROP COLUMN financial_completeness")
+
+    warehouse.ensure_schema()
+    warehouse.ensure_schema()
+
+    with warehouse._connect_readonly() as connection:
+        rows = connection.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'daily_bars'
+            """
+        ).fetchall()
+    columns = {str(row[0]) for row in rows}
+    assert {
+        "financial_as_of",
+        "financial_trust_level",
+        "financial_completeness",
+    } <= columns
+
+
 def test_market_warehouse_materialize_runtime_package_exports_database_rows(
     tmp_path: Path,
 ) -> None:

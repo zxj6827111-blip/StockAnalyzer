@@ -38,6 +38,16 @@ class ExecutionRiskTrainingConfig:
     seed: int = 42
 
 
+@dataclass(frozen=True, slots=True)
+class ExecutionRiskQualificationConfig:
+    min_samples_per_target: int = 500
+    min_class_samples_per_target: int = 100
+    min_label_coverage_ratio: float = 0.10
+    min_auc: float = 0.65
+    max_ece: float = 0.10
+    min_baseline_improvement_ratio: float = 0.05
+
+
 @dataclass(slots=True)
 class ExecutionRiskTrainResult:
     artifact: ExecutionRiskArtifact
@@ -375,10 +385,16 @@ class ExecutionRiskTrainer:
         if not target_models:
             raise ValueError("execution-risk training produced no trainable targets")
 
+        qualification = qualify_execution_risk_artifact(
+            dataset=dataset,
+            target_models=target_models,
+        )
         artifact = ExecutionRiskArtifact.create(
             dataset_id=dataset.dataset_id,
             feature_names=feature_names,
             target_models=target_models,
+            qualification_status=str(qualification["status"]),
+            qualification=qualification,
             training_summary={
                 "row_count": dataset.row_count,
                 "source_snapshot_count": dataset.source_snapshot_count,
@@ -689,14 +705,135 @@ def _evaluate_binary_metrics(*, y_true: FloatArray, y_prob: FloatArray) -> dict[
     brier = float(np.mean((clipped - y) ** 2))
     accuracy = float(np.mean((clipped >= 0.5) == (y >= 0.5)))
     auc = _binary_auc(y_true=y, y_prob=clipped)
+    positive_rate = float(np.mean(y))
+    baseline = np.full_like(y, positive_rate, dtype=float)
+    baseline_clipped = np.clip(baseline, 1e-6, 1.0 - 1e-6)
+    baseline_logloss = float(
+        -np.mean(y * np.log(baseline_clipped) + (1.0 - y) * np.log(1.0 - baseline_clipped))
+    )
+    baseline_brier = float(np.mean((baseline_clipped - y) ** 2))
+    ece = _expected_calibration_error(y_true=y, y_prob=clipped)
     return {
         "logloss": round(loss, 6),
         "brier": round(brier, 6),
         "accuracy": round(accuracy, 6),
         "auc": round(auc, 6),
-        "positive_rate": round(float(np.mean(y)), 6),
+        "ece": round(ece, 6),
+        "baseline_logloss": round(baseline_logloss, 6),
+        "baseline_brier": round(baseline_brier, 6),
+        "positive_rate": round(positive_rate, 6),
         "avg_probability": round(float(np.mean(clipped)), 6),
     }
+
+
+def qualify_execution_risk_artifact(
+    *,
+    dataset: ExecutionRiskDataset,
+    target_models: dict[str, dict[str, object]],
+    config: ExecutionRiskQualificationConfig | None = None,
+) -> dict[str, object]:
+    """Return an auditable active-rerank qualification decision."""
+
+    resolved = config or ExecutionRiskQualificationConfig()
+    target_checks: dict[str, dict[str, object]] = {}
+    blockers: list[str] = []
+    source_count = max(1, int(dataset.source_snapshot_count))
+    for target_name, model_payload in sorted(target_models.items()):
+        rows = int(dataset.target_coverage.get(target_name, 0))
+        labels = [
+            float(row.targets[target_name])
+            for row in dataset.rows_for_target(target_name)
+        ]
+        positive = sum(1 for value in labels if value >= 0.5)
+        negative = len(labels) - positive
+        coverage = rows / source_count
+        raw_metrics = model_payload.get("metrics", {})
+        metrics = raw_metrics if isinstance(raw_metrics, dict) else {}
+        auc = _finite_metric(metrics.get("auc"))
+        ece = _finite_metric(metrics.get("ece"))
+        brier = _finite_metric(metrics.get("brier"))
+        logloss = _finite_metric(metrics.get("logloss"))
+        baseline_brier = _finite_metric(metrics.get("baseline_brier"))
+        baseline_logloss = _finite_metric(metrics.get("baseline_logloss"))
+        brier_improvement = _relative_improvement(baseline_brier, brier)
+        logloss_improvement = _relative_improvement(baseline_logloss, logloss)
+        checks = {
+            "samples": rows >= resolved.min_samples_per_target,
+            "classes": min(positive, negative) >= resolved.min_class_samples_per_target,
+            "coverage": coverage >= resolved.min_label_coverage_ratio,
+            "finite_metrics": all(
+                value is not None
+                for value in (auc, ece, brier, logloss, baseline_brier, baseline_logloss)
+            ),
+            "auc": auc is not None and auc >= resolved.min_auc,
+            "ece": ece is not None and ece <= resolved.max_ece,
+            "brier_improvement": (
+                brier_improvement is not None
+                and brier_improvement >= resolved.min_baseline_improvement_ratio
+            ),
+            "logloss_improvement": (
+                logloss_improvement is not None
+                and logloss_improvement >= resolved.min_baseline_improvement_ratio
+            ),
+        }
+        failed = [name for name, passed in checks.items() if not passed]
+        if failed:
+            blockers.extend(f"{target_name}:{name}" for name in failed)
+        target_checks[target_name] = {
+            "rows": rows,
+            "positive": positive,
+            "negative": negative,
+            "coverage_ratio": round(coverage, 6),
+            "checks": checks,
+            "failed_checks": failed,
+            "metrics": dict(metrics),
+            "brier_improvement_ratio": brier_improvement,
+            "logloss_improvement_ratio": logloss_improvement,
+        }
+
+    if not target_models:
+        blockers.append("no_trained_targets")
+    status = "qualified" if not blockers else "shadow_only"
+    return {
+        "status": status,
+        "active_rerank_allowed": status == "qualified",
+        "blockers": blockers,
+        "thresholds": asdict(resolved),
+        "targets": target_checks,
+    }
+
+
+def _expected_calibration_error(
+    *,
+    y_true: FloatArray,
+    y_prob: FloatArray,
+    bins: int = 10,
+) -> float:
+    total = max(1, len(y_true))
+    error = 0.0
+    for idx in range(max(2, bins)):
+        low = idx / bins
+        high = (idx + 1) / bins
+        mask = (y_prob >= low) & (y_prob < high if idx < bins - 1 else y_prob <= high)
+        count = int(np.sum(mask))
+        if count <= 0:
+            continue
+        error += (count / total) * abs(float(np.mean(y_prob[mask])) - float(np.mean(y_true[mask])))
+    return float(error)
+
+
+def _finite_metric(value: object) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _relative_improvement(baseline: float | None, observed: float | None) -> float | None:
+    if baseline is None or observed is None or baseline <= 0:
+        return None
+    return round((baseline - observed) / baseline, 6)
 
 
 def _binary_auc(*, y_true: FloatArray, y_prob: FloatArray) -> float:

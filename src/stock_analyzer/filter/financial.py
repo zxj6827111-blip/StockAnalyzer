@@ -39,6 +39,14 @@ class FinancialRiskFilter:
         if not breaches:
             return FinancialRiskDecision(allowed=True)
 
+        quality_reasons = {"untrusted_financial_provenance"}
+        if all(item in quality_reasons for item in breaches):
+            return FinancialRiskDecision(
+                allowed=True,
+                penalty_score=5.0,
+                reasons=[f"financial_quality:{item}" for item in breaches],
+            )
+
         penalty_decision = self._penalty_decision_for_strategy(
             strategy=normalized_strategy,
             breaches=breaches,
@@ -94,6 +102,10 @@ class FinancialRiskFilter:
         roe = _optional_float(snapshot.get("roe"))
         debt_ratio = _optional_float(snapshot.get("debt_ratio"))
         complete_flag = snapshot.get("financial_data_complete")
+        trust_level = str(snapshot.get("trust_level", "")).strip().lower()
+        if not trust_level:
+            trust_level = "reported" if roe is not None or debt_ratio is not None else "missing"
+        trusted_financials = trust_level in {"reported", "derived"} and complete_flag is not False
         missing_policy = self._config.missing_data_policy.strip().lower()
 
         if self._config.exclude_st and is_st:
@@ -101,20 +113,25 @@ class FinancialRiskFilter:
         if self._config.exclude_delisting_risk and is_delisting:
             breaches.append("delisting_risk")
 
-        if complete_flag is False and missing_policy == "reject":
+        untrusted_only = trust_level in {"heuristic", "default"}
+        if complete_flag is False and missing_policy == "reject" and not untrusted_only:
             breaches.append("missing_financial_data")
 
         if roe is None:
-            if missing_policy == "reject":
+            if missing_policy == "reject" and not untrusted_only:
                 breaches.append("missing_roe")
-        elif roe < self._config.min_roe:
+        elif trusted_financials and roe < self._config.min_roe:
             breaches.append("low_roe")
+        elif not trusted_financials:
+            breaches.append("untrusted_financial_provenance")
 
         if debt_ratio is None:
-            if missing_policy == "reject":
+            if missing_policy == "reject" and not untrusted_only:
                 breaches.append("missing_debt_ratio")
-        elif debt_ratio > self._config.max_debt_ratio:
+        elif trusted_financials and debt_ratio > self._config.max_debt_ratio:
             breaches.append("high_debt_ratio")
+        elif not trusted_financials and "untrusted_financial_provenance" not in breaches:
+            breaches.append("untrusted_financial_provenance")
 
         if not symbol.strip():
             breaches.append("invalid_symbol")

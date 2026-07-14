@@ -29,6 +29,8 @@ def test_health_endpoint_exposes_build_identity(monkeypatch) -> None:
     payload = response.json()
     assert payload["health_type"] == "lightweight"
     assert payload["build"]["commit"] == "abc1234"
+    assert payload["build"]["short_commit"] == "abc1234"
+    assert payload["build"]["runtime_state_schema"] == 9
     assert payload["build"]["code_commit_id"] == main_module._config.evolution.code_commit_id
 
 

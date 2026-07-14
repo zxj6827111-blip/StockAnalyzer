@@ -19,7 +19,7 @@ def test_load_default_config_values(monkeypatch: MonkeyPatch) -> None:
     config = load_config(root / "config" / "default.yaml")
     assert config.data_source.primary == "market_warehouse"
     assert config.data_source.local_data_root == "artifacts/warehouse/package"
-    assert config.app.advisory_only is False
+    assert config.app.advisory_only is True
     assert config.financial_filter.missing_data_policy == "allow"
     assert config.financial_filter.trend_mode == "score_penalty"
     assert config.financial_filter.trend_penalty == 6.0
@@ -135,6 +135,7 @@ def test_load_default_config_values(monkeypatch: MonkeyPatch) -> None:
     assert config.week5.live_runtime_backpressure_threshold_ms == 60_000
     assert config.week5.live_runtime_backpressure_cooldown_min == 5
     assert config.training.bootstrap_retry_enabled is True
+    assert config.training.enabled is False
     assert config.training.bootstrap_retry_interval_min == 15
     assert config.training.bootstrap_full_market is True
     assert config.training.bootstrap_seed_watchlist_size == 200

@@ -70,6 +70,51 @@ def test_scheduler_interval_job_runs_once_per_slot_within_window() -> None:
     assert runs == ["ok", "ok"]
 
 
+def test_scheduler_interval_job_catches_latest_crossed_slot() -> None:
+    scheduler = DailyScheduler(config=SchedulerConfig(enabled=True))
+    runs: list[str] = []
+    scheduler.register_interval(
+        name="interval_job",
+        window_start_hhmm="09:30",
+        window_end_hhmm="10:00",
+        interval_minutes=5,
+        callback=lambda: _record_run(runs),
+    )
+
+    first = scheduler.run_due(datetime.fromisoformat("2026-03-02T09:37:41"))
+    duplicate = scheduler.run_due(datetime.fromisoformat("2026-03-02T09:39:59"))
+    next_slot = scheduler.run_due(datetime.fromisoformat("2026-03-02T09:41:00"))
+
+    assert first[0].ran is True
+    assert duplicate[0].ran is False
+    assert next_slot[0].ran is True
+    assert runs == ["ok", "ok"]
+
+
+def test_scheduler_persists_attempt_success_and_failure_state() -> None:
+    scheduler = DailyScheduler(config=SchedulerConfig(enabled=True))
+    attempts = 0
+
+    def _callback() -> dict[str, object]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("temporary_failure")
+        return {"status": "ok"}
+
+    scheduler.register("daily", "08:30", callback=_callback)
+    failed = scheduler.run_due(datetime.fromisoformat("2026-03-02T08:31:00"))
+    recovered = scheduler.run_due(datetime.fromisoformat("2026-03-02T08:32:00"))
+    state = scheduler.export_state()["jobs"]["daily"]
+
+    assert failed[0].success is False
+    assert recovered[0].success is True
+    assert state["last_attempt_at"] == "2026-03-02T08:32:00"
+    assert state["last_success_at"] == "2026-03-02T08:32:00"
+    assert state["last_failure"] == ""
+    assert state["consecutive_failures"] == 0
+
+
 def test_scheduler_retries_daily_job_when_callback_does_not_claim_execution_rights() -> None:
     config = SchedulerConfig(
         enabled=True,

@@ -529,7 +529,11 @@ class RuntimeTrainingService:
         payload = {
             "ok": True,
             "mode": "execution_risk_training",
-            "status": "trained",
+            "status": "trained_shadow_only"
+            if result.artifact.qualification_status != "qualified"
+            else "trained_qualified",
+            "qualification_status": result.artifact.qualification_status,
+            "qualification": dict(result.artifact.qualification),
             "timestamp": run_now.isoformat(),
             "artifact_path": str(resolved_artifact_path),
             "dataset_id": result.artifact.dataset_id,
@@ -559,6 +563,7 @@ class RuntimeTrainingService:
                 "dataset_id": result.artifact.dataset_id,
                 "artifact_path": str(resolved_artifact_path),
                 "trained_targets": list(result.trained_targets),
+                "qualification_status": result.artifact.qualification_status,
             },
         )
         service._persist_runtime_state_to_disk()
@@ -629,11 +634,15 @@ class RuntimeTrainingService:
         artifact_exists = bool(artifact_path and artifact_path.exists())
         trained_targets: list[str] = []
         dataset_id = str((latest or {}).get("dataset_id", "")).strip()
+        qualification_status = str(
+            (latest or {}).get("qualification_status", "shadow_only")
+        ).strip()
         if artifact_exists and artifact_path is not None:
             try:
                 artifact = ExecutionRiskArtifact.load(artifact_path)
                 trained_targets = list(artifact.trained_targets)
                 dataset_id = dataset_id or artifact.dataset_id
+                qualification_status = artifact.qualification_status
             except Exception:
                 artifact_exists = False
         return {
@@ -643,6 +652,8 @@ class RuntimeTrainingService:
             "artifact_path": str(artifact_path) if artifact_path is not None else "",
             "trained_targets": trained_targets,
             "dataset_id": dataset_id,
+            "qualification_status": qualification_status or "shadow_only",
+            "active_rerank_allowed": qualification_status == "qualified",
             "source": status_source,
             "runtime_state_history_count": runtime_state_history_count,
             "artifact_scan_error": scan_result.error,
@@ -677,7 +688,11 @@ class RuntimeTrainingService:
                 {
                     "ok": True,
                     "mode": "execution_risk_training",
-                    "status": "trained",
+                    "status": "trained_qualified"
+                    if artifact.qualification_status == "qualified"
+                    else "trained_shadow_only",
+                    "qualification_status": artifact.qualification_status,
+                    "qualification": dict(artifact.qualification),
                     "timestamp": _newer_execution_risk_timestamp(
                         created_at,
                         filename_timestamp,

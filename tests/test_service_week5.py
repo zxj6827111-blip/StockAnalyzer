@@ -984,7 +984,7 @@ def test_service_week5_scan_generates_report_and_history(
     assert _as_int(history["records"]) >= 1
 
 
-def test_service_week5_scan_applies_execution_aware_reranker_when_artifact_available(
+def test_service_week5_scan_keeps_shadow_execution_risk_out_of_ranking(
     tmp_path: Path,
 ) -> None:
     config = _load_test_config()
@@ -1050,16 +1050,19 @@ def test_service_week5_scan_applies_execution_aware_reranker_when_artifact_avail
     execution_rerank = _as_mapping(ranking["execution_rerank"])
     candidates = _as_mapping_list(signal_pool["candidates"])
 
-    assert ranking["score_key"] == "execution_reranked_score"
-    assert execution_rerank["applied"] is True
-    assert [str(item["symbol"]) for item in candidates[:2]] == ["000001", "600000"]
-    assert float(candidates[0]["shortlist_score"]) < float(candidates[1]["shortlist_score"])
-    assert candidates[0]["execution_rerank_applied"] is True
-    assert candidates[1]["execution_high_risk"] is True
-    assert float(candidates[0]["execution_reranked_score"]) > float(
-        candidates[1]["execution_reranked_score"]
+    assert ranking["score_key"] == "shortlist_score"
+    assert execution_rerank["applied"] is False
+    assert execution_rerank["reason"] == "artifact_shadow_only"
+    assert execution_rerank["qualification_status"] == "shadow_only"
+    assert [str(item["symbol"]) for item in candidates[:2]] == ["600000", "000001"]
+    assert float(candidates[0]["shortlist_score"]) > float(candidates[1]["shortlist_score"])
+    assert candidates[0]["execution_rerank_applied"] is False
+    assert candidates[0]["execution_high_risk"] is True
+    assert candidates[0]["execution_rerank_reason"] == "artifact_shadow_only"
+    assert float(candidates[0]["execution_reranked_score"]) == float(
+        candidates[0]["shortlist_score"]
     )
-    assert service.state.watchlist == ["000001", "600000"]
+    assert service.state.watchlist == ["600000", "000001"]
 
 
 def test_service_week5_scan_falls_back_to_shortlist_order_without_execution_risk_artifact(

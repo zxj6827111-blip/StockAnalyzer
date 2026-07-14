@@ -20,6 +20,8 @@ class ExecutionRiskPredictor:
     models: dict[str, LogisticProbModel]
     calibrators: dict[str, IsotonicCalibrator]
     artifact_metadata: dict[str, object] = field(default_factory=dict)
+    qualification_status: str = "shadow_only"
+    qualification: dict[str, object] = field(default_factory=dict)
 
     @classmethod
     def from_artifact(cls, artifact: ExecutionRiskArtifact) -> ExecutionRiskPredictor:
@@ -41,7 +43,13 @@ class ExecutionRiskPredictor:
             models=models,
             calibrators=calibrators,
             artifact_metadata=dict(artifact.metadata),
+            qualification_status=artifact.qualification_status,
+            qualification=dict(artifact.qualification),
         )
+
+    @property
+    def can_rerank(self) -> bool:
+        return self.qualification_status == "qualified"
 
     @classmethod
     def load(cls, path: str | Path) -> ExecutionRiskPredictor:
