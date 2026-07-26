@@ -189,6 +189,22 @@ class FinancialFilterConfig(_StrictModel):
     missing_data_policy: str = "allow"
 
 
+class FallThenRiseConfig(_StrictModel):
+    """先跌后涨5日外 TDX signal filter (see feature/tdx_indicators.py)."""
+
+    enabled: bool = False
+    mode: str = "annotate"  # annotate | bonus | gate
+    apply_to: list[str] = Field(default_factory=lambda: ["trend", "monster"])
+    bonus_points: float = 6.0
+    # Which condition set triggers the bonus in bonus mode:
+    #   signal      = full six-condition TDX signal (incl. 60-min MACD)
+    #   signal_daily= daily conditions only
+    #   ma_gates    = both "MA golden cross more than 5 bars ago" conditions
+    bonus_condition: str = "signal"
+    vipdoc_root: str = ""  # falls back to tdx_sync.vipdoc_root when empty
+    min60_missing_policy: str = "pass"  # pass | fail when no 60-min data
+
+
 class CrossReviewConfig(_StrictModel):
     p_lgbm_min: float = 0.60
     p_xgb_min: float = 0.55
@@ -1141,6 +1157,7 @@ class StockAnalyzerConfig(_StrictModel):
     liquidity_filter_trend: LiquidityFilterConfig
     liquidity_filter_monster: LiquidityFilterConfig
     financial_filter: FinancialFilterConfig = Field(default_factory=FinancialFilterConfig)
+    fall_then_rise: FallThenRiseConfig = Field(default_factory=FallThenRiseConfig)
     models: ModelsConfig
     score: ScoreConfig
     strategy_scores: dict[str, StrategyScoreConfig] = Field(default_factory=dict)

@@ -19,6 +19,7 @@ from stock_analyzer.data.provider import DataSourceError, MarketDataProvider
 from stock_analyzer.data.provider_factory import build_runtime_provider
 from stock_analyzer.feature.engineer import FeatureEngineer
 from stock_analyzer.feature.market_context import build_market_relative_frame
+from stock_analyzer.filter.fall_then_rise import FallThenRiseFilter
 from stock_analyzer.filter.financial import FinancialRiskFilter
 from stock_analyzer.learning.feature_schema_registry import FeatureSchemaRegistry
 from stock_analyzer.learning.feedback_features import ensure_feedback_feature_frame
@@ -96,6 +97,10 @@ class AnalyzerPipeline:
         self._strategy = SoupStrategy(config.soup_strategy)
         self._main_force_tracker = MainForceTracker(config.week6.main_force)
         self._financial_filter = FinancialRiskFilter(config=config.financial_filter)
+        self._fall_then_rise_filter = FallThenRiseFilter(
+            config.fall_then_rise,
+            vipdoc_root=str(config.tdx_sync.vipdoc_root),
+        )
         self._predictor, self._predictor_status = _load_predictor(config.training.artifact_path)
         self._news_provider = (
             news_provider if news_provider is not None else NeutralNewsSignalProvider()
@@ -669,6 +674,23 @@ class AnalyzerPipeline:
                 components=scored.components,
             )
 
+        fall_then_rise_decision = self._fall_then_rise_filter.evaluate(
+            symbol=symbol,
+            strategy=strategy,
+            bars=analysis_bars,
+        )
+        if fall_then_rise_decision.bonus_score > 0:
+            adjusted_score = min(100.0, scored.total_score + fall_then_rise_decision.bonus_score)
+            scored = ScoredSignal(
+                total_score=adjusted_score,
+                grade=_grade_by_strategy(
+                    score=adjusted_score,
+                    strategy=strategy,
+                    config=self._config,
+                ),
+                components=scored.components,
+            )
+
         liquidity_config = (
             self._config.liquidity_filter_monster
             if strategy == "monster"
@@ -706,6 +728,10 @@ class AnalyzerPipeline:
             decision.action = "hold"
             decision.target_position = 0.0
             decision.reason = "model_probability_unhealthy"
+        if not fall_then_rise_decision.allowed and decision.action == "buy":
+            decision.action = "hold"
+            decision.target_position = 0.0
+            decision.reason = "fall_then_rise_block"
 
         reasons = list(cross_review.reasons)
         dropped_rows = _as_int(time_gate.get("dropped_rows"), default=0)
@@ -722,6 +748,8 @@ class AnalyzerPipeline:
         reasons.append(f"news_component:{news_component:.3f}")
         reasons.append(f"board_component:{board_component:.3f}")
         reasons.append(f"completion_component:{completion_component:.3f}")
+        if fall_then_rise_decision.applied:
+            reasons.append(f"fall_then_rise:{fall_then_rise_decision.reason}")
         predictor_mode = str(self._predictor_status.get("predictor_mode", "")).strip()
         if predictor_mode and predictor_mode != "artifact_loaded":
             reasons.append(f"predictor_mode:{predictor_mode}")
@@ -795,6 +823,7 @@ class AnalyzerPipeline:
                 "trust_level": financial_snapshot.get("trust_level", "missing"),
                 "completeness": financial_snapshot.get("completeness", 0.0),
             },
+            "fall_then_rise_gate": fall_then_rise_decision.trace(),
             "strategy_decision": {
                 "action": strategy_decision_action,
                 "reason": strategy_decision_reason,

@@ -122,6 +122,21 @@ financial_filter:
   monster_penalty: 15.0
   missing_data_policy: allow
 
+# 先跌后涨5日外 TDX 信号（feature/tdx_indicators.py）
+# mode: annotate=仅记录到 decision_trace；bonus=命中条件加分；gate=无完整信号禁止 buy
+# bonus_condition: signal=六条件完整信号 | signal_daily=仅日线条件 | ma_gates=两个"金叉5日外"条件
+# 2026-07 评估（artifacts/analysis/fall_then_rise_eval_v2.json）：候选池中通过 ma_gates
+# 的票 5 日胜率 77.5%/76.2% vs 基线 74.4%，未通过的仅 ~61%；完整信号过严（1817 选 1）
+# 且全市场无超额，故按 ma_gates 加分、不建议 gate。
+fall_then_rise:
+  enabled: true
+  mode: bonus
+  apply_to: [trend, monster]
+  bonus_points: 4.0
+  bonus_condition: ma_gates
+  vipdoc_root: ""            # 留空时使用 tdx_sync.vipdoc_root
+  min60_missing_policy: pass # 无60分钟数据时: pass=只用日线条件, fail=信号不成立
+
 models:
   calibration: isotonic
   cross_review:
