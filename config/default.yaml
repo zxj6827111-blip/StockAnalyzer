@@ -159,6 +159,8 @@ models:
   include_random_feature_baseline: true
   recent_data_weight_years: 3
 
+# 2026-07 优化档：score>=65 + ma_gates 加分重排 + 最多1仓（约10笔/年回测）
+# A 级门槛 65：买入需总分>=65（先跌后涨 +4 后重算等级）
 score:
   weights:
     lgbm: 0.30
@@ -169,14 +171,14 @@ score:
     completion: 0.10
   thresholds:
     s: 78
-    a: 60
+    a: 65
     b: 50
 
 strategy_scores:
   trend:
     thresholds:
       s: 78
-      a: 60
+      a: 65
       b: 50
     weights:
       lgbm: 0.35
@@ -188,7 +190,7 @@ strategy_scores:
   monster:
     thresholds:
       s: 76
-      a: 60
+      a: 65
       b: 50
     weights:
       lgbm: 0.25
@@ -210,15 +212,15 @@ soup_strategy:
   stop_loss: 5
   trailing_stop: 5
   max_hold_days: 10
-  max_holdings: 3
+  max_holdings: 1
   max_same_sector: 2
   dynamic_position: "min(0.15, 0.02/(ATR14/close))"
   recovery_buy_enabled: true
-  recovery_min_score: 50
+  recovery_min_score: 65
   recovery_max_position: 0.03
   recovery_allowed_grades: [S, A, B]
   disagreement_probe_enabled: true
-  disagreement_probe_min_raw_score: 60
+  disagreement_probe_min_raw_score: 65
   disagreement_probe_lgbm_min: 0.995
   disagreement_probe_xgb_min: 0.25
   disagreement_probe_meta_min: 0.48
@@ -468,9 +470,9 @@ feishu_interaction:
 notification_filter:
   enabled: true
   cooldown_sec: 300
-  min_score: 60
+  min_score: 65
   min_score_by_action:
-    buy: 45
+    buy: 65
     watch: 50
   allowed_actions: [buy, watch]
   max_signals_per_run: 5
