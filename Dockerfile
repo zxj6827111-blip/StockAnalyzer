@@ -31,7 +31,10 @@ ENV STOCK_ANALYZER_CONTAINERIZED=1
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates cpulimit \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        cpulimit \
+        libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml /app/

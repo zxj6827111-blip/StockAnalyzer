@@ -1703,6 +1703,7 @@ class RuntimeWeek5Service:
         applied_count = 0
         skipped_missing_snapshot = 0
         skipped_snapshot_not_found = 0
+        skipped_snapshot_read_failed = 0
         skipped_prediction_failed = 0
         for candidate in candidates:
             snapshot_id = str(candidate.get("snapshot_id", "")).strip() or (
@@ -1712,7 +1713,14 @@ class RuntimeWeek5Service:
                 skipped_missing_snapshot += 1
                 candidate["execution_rerank_reason"] = "snapshot_id_missing"
                 continue
-            snapshot = service._sample_store.get_snapshot(snapshot_id)
+            try:
+                snapshot = service._sample_store.get_snapshot(snapshot_id)
+            except Exception as exc:
+                skipped_snapshot_read_failed += 1
+                candidate["execution_rerank_reason"] = (
+                    f"snapshot_read_failed:{exc.__class__.__name__}"
+                )
+                continue
             if snapshot is None:
                 skipped_snapshot_not_found += 1
                 candidate["execution_rerank_reason"] = "snapshot_not_found"
@@ -1789,6 +1797,7 @@ class RuntimeWeek5Service:
             "shadow_predictions": applied_count if shadow_only else 0,
             "skipped_missing_snapshot": skipped_missing_snapshot,
             "skipped_snapshot_not_found": skipped_snapshot_not_found,
+            "skipped_snapshot_read_failed": skipped_snapshot_read_failed,
             "skipped_prediction_failed": skipped_prediction_failed,
         }
 

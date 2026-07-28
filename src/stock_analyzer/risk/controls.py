@@ -40,6 +40,12 @@ class CapitalCurveGuard:
     initial_equity: float = 1.0
     peak_equity: float = 1.0
 
+    def rebaseline(self, equity: float = 1.0) -> None:
+        """Reset peak/initial equity baseline (e.g. after sim-account reset)."""
+        value = max(0.01, float(equity))
+        self.initial_equity = value
+        self.peak_equity = value
+
     def evaluate(self, current_equity: float) -> tuple[str, float]:
         if current_equity <= 0:
             return "freeze", 100.0
@@ -118,6 +124,10 @@ class RiskController:
 
         self._hard_degraded_mode = bool(hard_degraded_mode)
         self._soft_degraded_mode = bool(soft_degraded_mode)
+
+    def rebaseline_capital(self, equity: float = 1.0) -> None:
+        """Reset capital-curve peak/initial so a fresh equity does not inherit old drawdown."""
+        self._capital_guard.rebaseline(equity=equity)
 
     def evaluate(self, current_equity: float) -> RiskStatus:
         capital_action, drawdown_pct = self._capital_guard.evaluate(current_equity)

@@ -2734,6 +2734,34 @@ def dashboard_quick_command(
     typer.echo(json.dumps(response, ensure_ascii=False, indent=2))
 
 
+@app.command("reset-sim-account")
+def reset_sim_account(
+    current_equity: float = typer.Option(1.0, help="Equity ratio after reset, 1.0 = baseline"),
+    clear_portfolio: bool = typer.Option(
+        True,
+        help="Clear simulation positions and trades so equity is not recomputed from losses",
+    ),
+    resume_new_buy: bool = typer.Option(True, help="Clear pause_new_buy flag"),
+) -> None:
+    """Reset simulation equity/portfolio and rebaseline capital-curve freeze state."""
+    if current_equity <= 0:
+        raise typer.BadParameter("current_equity must be > 0")
+    config = get_config()
+    service = StockAnalyzerService(config=config)
+    response = _execute_signed_command(
+        service=service,
+        secret_key=config.command_channel.secret_key,
+        action="RESET_SIM_ACCOUNT",
+        payload={
+            "current_equity": float(current_equity),
+            "clear_portfolio": bool(clear_portfolio),
+            "resume_new_buy": bool(resume_new_buy),
+        },
+        command_id="",
+    )
+    typer.echo(json.dumps(response, ensure_ascii=False, indent=2))
+
+
 @app.command("dashboard-quick-reconcile")
 def dashboard_quick_reconcile(
     positions: str = typer.Option(

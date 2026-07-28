@@ -17352,7 +17352,81 @@ class StockAnalyzerService:
             self._state.reconcile_required = False
             return {"action": action, "status": "acknowledged"}
 
+        if action == "RESET_SIM_ACCOUNT":
+            return self._reset_simulation_account(
+                command_payload=command_payload,
+                timestamp=timestamp,
+                trace_id=trace_id,
+            )
+
+        if action == "SET_EQUITY":
+            equity = max(0.01, _as_float(command_payload.get("current_equity"), default=1.0))
+            self._rebaseline_pipeline_capital_risk(equity=equity)
+            return {
+                "action": action,
+                "current_equity": round(self._state.current_equity, 6),
+                "capital_rebaselined": True,
+            }
+
         return None
+
+    def _rebaseline_pipeline_capital_risk(self, *, equity: float) -> None:
+        value = max(0.01, float(equity))
+        self._pipeline.rebaseline_capital_risk(equity=value)
+        if self._realtime_pipeline is not None:
+            self._realtime_pipeline.rebaseline_capital_risk(equity=value)
+
+    def _reset_simulation_account(
+        self,
+        *,
+        command_payload: dict[str, Any],
+        timestamp: datetime,
+        trace_id: str,
+    ) -> dict[str, object]:
+        """Clear sim portfolio book and rebaseline equity/capital peak.
+
+        Used to recover from stale capital_curve:freeze after historical sim losses.
+        """
+        equity = max(0.01, _as_float(command_payload.get("current_equity"), default=1.0))
+        clear_portfolio = bool(command_payload.get("clear_portfolio", True))
+        resume_new_buy = bool(command_payload.get("resume_new_buy", True))
+        before_equity = float(self._state.current_equity)
+        portfolio_before = self._portfolio.export_state()
+        positions_before = 0
+        trades_before = 0
+        if isinstance(portfolio_before, dict):
+            raw_positions = portfolio_before.get("positions")
+            raw_trades = portfolio_before.get("trades")
+            positions_before = len(raw_positions) if isinstance(raw_positions, list) else 0
+            trades_before = len(raw_trades) if isinstance(raw_trades, list) else 0
+
+        if clear_portfolio:
+            self._portfolio.restore_state(
+                {"trade_seq": 0, "positions": [], "trades": []}
+            )
+
+        self._state.current_equity = round(equity, 6)
+        if resume_new_buy:
+            self._state.pause_new_buy = False
+        self._rebaseline_pipeline_capital_risk(equity=equity)
+        self._risk_capital_protection_level = ""
+        self._risk_circuit_breaker_alert_active = False
+
+        return {
+            "action": "RESET_SIM_ACCOUNT",
+            "timestamp": timestamp.isoformat(),
+            "trace_id": trace_id,
+            "before_equity": round(before_equity, 6),
+            "current_equity": round(self._state.current_equity, 6),
+            "clear_portfolio": clear_portfolio,
+            "resume_new_buy": resume_new_buy,
+            "pause_new_buy": bool(self._state.pause_new_buy),
+            "positions_before": positions_before,
+            "trades_before": trades_before,
+            "positions_after": len(self._portfolio.positions()),
+            "trades_after": len(self._portfolio.trades(limit=10_000)),
+            "capital_rebaselined": True,
+        }
 
     @staticmethod
     def _apply_new_buy_pause(signals: list[PipelineSignal]) -> None:

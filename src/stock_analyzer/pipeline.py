@@ -174,6 +174,10 @@ class AnalyzerPipeline:
         self._latest_report = report
         return report
 
+    def rebaseline_capital_risk(self, equity: float = 1.0) -> None:
+        """Reset capital-curve peak so a rebased equity does not inherit old drawdown."""
+        self._risk_controller.rebaseline_capital(equity=equity)
+
     def provider_status(self) -> dict[str, object]:
         health_status = self._health_monitor.snapshot()
         predictor_status = dict(self._predictor_status)

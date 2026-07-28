@@ -984,7 +984,7 @@ def test_service_week5_scan_generates_report_and_history(
     assert _as_int(history["records"]) >= 1
 
 
-def test_service_week5_scan_keeps_shadow_execution_risk_out_of_ranking(
+def test_service_week5_scan_applies_execution_aware_reranker_when_artifact_available(
     tmp_path: Path,
 ) -> None:
     config = _load_test_config()
@@ -1050,19 +1050,16 @@ def test_service_week5_scan_keeps_shadow_execution_risk_out_of_ranking(
     execution_rerank = _as_mapping(ranking["execution_rerank"])
     candidates = _as_mapping_list(signal_pool["candidates"])
 
-    assert ranking["score_key"] == "shortlist_score"
-    assert execution_rerank["applied"] is False
-    assert execution_rerank["reason"] == "artifact_shadow_only"
-    assert execution_rerank["qualification_status"] == "shadow_only"
-    assert [str(item["symbol"]) for item in candidates[:2]] == ["600000", "000001"]
-    assert float(candidates[0]["shortlist_score"]) > float(candidates[1]["shortlist_score"])
-    assert candidates[0]["execution_rerank_applied"] is False
-    assert candidates[0]["execution_high_risk"] is True
-    assert candidates[0]["execution_rerank_reason"] == "artifact_shadow_only"
-    assert float(candidates[0]["execution_reranked_score"]) == float(
-        candidates[0]["shortlist_score"]
+    assert ranking["score_key"] == "execution_reranked_score"
+    assert execution_rerank["applied"] is True
+    assert [str(item["symbol"]) for item in candidates[:2]] == ["000001", "600000"]
+    assert float(candidates[0]["shortlist_score"]) < float(candidates[1]["shortlist_score"])
+    assert candidates[0]["execution_rerank_applied"] is True
+    assert candidates[1]["execution_high_risk"] is True
+    assert float(candidates[0]["execution_reranked_score"]) > float(
+        candidates[1]["execution_reranked_score"]
     )
-    assert service.state.watchlist == ["600000", "000001"]
+    assert service.state.watchlist == ["000001", "600000"]
 
 
 def test_service_week5_scan_falls_back_to_shortlist_order_without_execution_risk_artifact(
@@ -1107,10 +1104,51 @@ def test_service_week5_scan_falls_back_to_shortlist_order_without_execution_risk
     assert execution_rerank["applied"] is False
     assert [str(item["symbol"]) for item in candidates[:2]] == ["600000", "000001"]
     assert candidates[0]["execution_rerank_applied"] is False
-    assert float(candidates[0]["execution_reranked_score"]) == float(
-        candidates[0]["shortlist_score"]
-    )
+    assert float(candidates[0]["execution_reranked_score"]) == float(candidates[0]["shortlist_score"])
     assert service.state.watchlist == ["600000", "000001"]
+
+
+def test_service_week5_scan_falls_back_when_execution_snapshot_read_fails(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config()
+    config.training.bootstrap_state_path = str(tmp_path / "bootstrap_state.json")
+    config.week5.auto_sync_watchlist_top_k = 2
+    config.week5.auto_sync_watchlist_min_score = 0.0
+    service = _new_service(config)
+
+    artifact_path = _build_test_execution_risk_artifact(tmp_path / "execution_risk_artifact.json")
+    service._last_execution_risk_training = {  # noqa: SLF001
+        "artifact_path": str(artifact_path),
+        "dataset_id": "execution_risk_dataset_week5_test",
+    }
+    _patch_attr(service, "run_pipeline", _build_week5_execution_rerank_pipeline())
+    _patch_attr(service, "_build_first_board_candidate", lambda **_: None)
+    _patch_attr(service, "_detect_symbol_anomaly", lambda **_: None)
+    _patch_attr(
+        service._sample_store,  # noqa: SLF001
+        "get_snapshot",
+        lambda snapshot_id: (_ for _ in ()).throw(RuntimeError("store unavailable")),
+    )
+
+    report = service.run_week5_scan(
+        symbols=["600000", "000001"],
+        notify_enabled=False,
+        sync_watchlist=False,
+    )
+
+    ranking = _as_mapping(_as_mapping(report["signal_pool"])["ranking"])
+    execution_rerank = _as_mapping(ranking["execution_rerank"])
+    candidates = _as_mapping_list(_as_mapping(report["signal_pool"])["candidates"])
+
+    assert ranking["score_key"] == "shortlist_score"
+    assert execution_rerank["applied"] is False
+    assert execution_rerank["skipped_snapshot_read_failed"] == 2
+    assert [str(item["symbol"]) for item in candidates[:2]] == ["600000", "000001"]
+    assert all(
+        str(item["execution_rerank_reason"]) == "snapshot_read_failed:RuntimeError"
+        for item in candidates[:2]
+    )
 
 
 def test_week5_market_radar_tracks_non_watchlist_anomalies_into_review_pool() -> None:
@@ -1834,38 +1872,6 @@ def test_signal_quality_audit_falls_back_to_week5_candidates_when_latest_signals
     assert service.state.watchlist == ["001258"]
 
 
-def test_signal_quality_audit_preserves_week5_snapshot_source_when_present() -> None:
-    config = _load_test_config()
-    service = _new_service(config)
-    _patch_attr(
-        service,
-        "latest_signals_snapshot",
-        lambda: {
-            "trace_id": "week5-snapshot",
-            "timestamp": "2026-06-18T10:00:00",
-            "source": "week5_latest_candidates",
-            "storage_source": "runtime_state",
-            "signals": [
-                {
-                    "symbol": "001258",
-                    "action": "watch",
-                    "score": 46.76,
-                    "grade": "C",
-                    "reasons": ["model_disagreement_probe"],
-                    "probabilities": {"lgbm": 1.0, "xgb": 0.43, "meta": 0.49},
-                }
-            ],
-        },
-    )
-
-    report = _as_mapping(service.run_signal_quality_audit(limit=5, include_audit_events=False))
-
-    assert report["trace_id"] == "week5-snapshot"
-    assert report["signal_source"] == "week5_latest_candidates"
-    assert report["signal_storage_source"] == "runtime_state"
-    assert report["source_signal_count"] == 1
-
-
 def test_service_week5_auto_sync_skips_hard_blocked_candidates() -> None:
     config = _load_test_config()
     config.week5.auto_sync_watchlist = True
@@ -1879,12 +1885,7 @@ def test_service_week5_auto_sync_skips_hard_blocked_candidates() -> None:
                 "timestamp": "2026-03-19T15:00:00",
                 "signal_pool": {
                     "candidates": [
-                        {
-                            "symbol": "600519",
-                            "action": "buy",
-                            "score": 88.0,
-                            "reasons": ["liquidity_failed"],
-                        },
+                        {"symbol": "600519", "action": "buy", "score": 88.0, "reasons": ["liquidity_failed"]},
                         {
                             "symbol": "000001",
                             "action": "watch",

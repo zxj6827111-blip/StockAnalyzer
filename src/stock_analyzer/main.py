@@ -2305,6 +2305,16 @@ def _build_interactive_success_message(
         return "已暂停开仓"
     if action == "RESUME_NEW_BUY":
         return "已恢复开仓"
+    if action == "RESET_SIM_ACCOUNT":
+        equity = _as_float(update.get("current_equity"), default=1.0)
+        trades_before = _as_int(update.get("trades_before"), default=0)
+        return f"已重置模拟账户：净值 {equity:.4f}，清除历史成交 {trades_before} 笔"
+    if action == "SET_EQUITY":
+        equity = _as_float(
+            update.get("current_equity"),
+            default=_as_float(payload.get("current_equity"), default=1.0),
+        )
+        return f"已更新净值：{equity:.4f}"
 
     return f"已执行：{action}"
 

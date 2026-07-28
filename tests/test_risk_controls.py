@@ -45,6 +45,18 @@ def test_risk_controller_freezes_on_large_drawdown() -> None:
     assert status.drawdown_pct >= 15.0
 
 
+def test_risk_controller_rebaseline_clears_freeze() -> None:
+    config = _load_default()
+    risk = RiskController(config)
+    frozen = risk.evaluate(current_equity=0.81)
+    assert frozen.action == "freeze"
+    risk.rebaseline_capital(equity=1.0)
+    recovered = risk.evaluate(current_equity=1.0)
+    assert recovered.action == "normal"
+    assert recovered.drawdown_pct == 0.0
+    assert recovered.can_open_new_position is True
+
+
 def test_risk_status_contract_includes_split_degraded_flags() -> None:
     names = {item.name for item in fields(RiskStatus)}
     assert "hard_degraded_mode" in names

@@ -164,6 +164,29 @@ class SignedCommandProcessor:
                 state=self._state,
             )
 
+        if action == "RESET_SIM_ACCOUNT":
+            # Simulation-only recovery: clear freeze by rebasing equity and clearing book.
+            equity_raw = payload.get("current_equity", 1.0)
+            try:
+                equity = float(equity_raw)
+            except (TypeError, ValueError):
+                equity = 1.0
+            if equity <= 0:
+                return CommandExecutionResult(
+                    accepted=False,
+                    code="bad_payload",
+                    message="current_equity must be > 0",
+                    state=self._state,
+                )
+            self._state.current_equity = equity
+            self._state.pause_new_buy = False
+            return CommandExecutionResult(
+                accepted=True,
+                code="ok",
+                message="simulation account reset accepted",
+                state=self._state,
+            )
+
         if action == "ADD_SYMBOL":
             symbol = str(payload.get("symbol", "")).strip()
             if not symbol:

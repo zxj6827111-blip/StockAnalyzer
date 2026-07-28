@@ -1772,6 +1772,9 @@ class RuntimeMarketSyncService:
         try:
             _publish_progress(force_write=True)
             warehouse = service._market_warehouse()
+            # Existing warehouse files may predate newly required daily-bar columns.
+            # Upgrade before any read of historical bars during an incremental sync.
+            warehouse.ensure_schema()
             package_root = warehouse.package_root
             bootstrap_source_root = service._resolve_market_warehouse_bootstrap_source_root()
             report["db_path"] = str(warehouse.db_path)

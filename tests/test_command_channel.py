@@ -134,6 +134,33 @@ def test_command_processor_handles_pause_and_resume_new_buy() -> None:
     assert resume_result.state.pause_new_buy is False
 
 
+def test_command_processor_accepts_reset_sim_account() -> None:
+    processor = _processor()
+    processor.state_snapshot().current_equity = 0.81
+    processor.state_snapshot().pause_new_buy = True
+    ts = int(time.time())
+    payload = {"current_equity": 1.0, "clear_portfolio": True}
+    signature = SignedCommandProcessor.build_signature(
+        secret_key="test-secret",
+        command_id="cmd-reset-sim",
+        timestamp=ts,
+        action="RESET_SIM_ACCOUNT",
+        payload=payload,
+    )
+    result = processor.execute(
+        CommandEnvelope(
+            command_id="cmd-reset-sim",
+            timestamp=ts,
+            action="RESET_SIM_ACCOUNT",
+            payload=payload,
+            signature=signature,
+        )
+    )
+    assert result.accepted is True
+    assert result.state.current_equity == 1.0
+    assert result.state.pause_new_buy is False
+
+
 def test_command_processor_accepts_broker_positions_command() -> None:
     processor = _processor()
     ts = int(time.time())
