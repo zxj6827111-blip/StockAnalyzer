@@ -134,8 +134,9 @@ class MarketWarehouseConfig(_StrictModel):
     bootstrap_on_first_sync: bool = True
     offline_bootstrap_enabled: bool = False
     online_bootstrap_lookback_days: int = 750
-    online_daily_primary: str = "akshare"
-    online_daily_backup: str = "efinance"
+    online_daily_primary: str = "tushare"
+    online_daily_backup: str = "akshare"
+    tushare_token: str = ""
     request_interval_sec: float = 0.6
     online_socket_timeout_sec: float = 6.0
     daily_symbol_hard_timeout_sec: float = 20.0

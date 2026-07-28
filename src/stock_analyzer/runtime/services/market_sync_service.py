@@ -20,6 +20,7 @@ import pandas as pd
 from stock_analyzer.data.akshare_provider import AkshareProvider
 from stock_analyzer.data.cached_provider import CachedProvider
 from stock_analyzer.data.efinance_provider import EfinanceProvider
+from stock_analyzer.data.tushare_provider import TushareProvider
 from stock_analyzer.data.intraday_summary import (
     fetch_sina_minute_bars,
     summarize_minute_bars,
@@ -817,6 +818,14 @@ class RuntimeMarketSyncService:
     ) -> MarketDataProvider:
         service = self._service
         normalized = provider_name.strip().lower()
+        if normalized in {"tushare", "ts", "tushare_pro"}:
+            token = str(service._config.market_warehouse.tushare_token).strip()
+            return TushareProvider(
+                token=token,
+                retry_delay_sec=request_interval,
+                max_attempts=max_attempts,
+                socket_timeout_sec=socket_timeout_sec,
+            )
         if normalized in {"akshare", "ak"}:
             return AkshareProvider(
                 retry_delay_sec=request_interval,

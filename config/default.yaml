@@ -67,9 +67,12 @@ market_warehouse:
   bootstrap_on_first_sync: true
   offline_bootstrap_enabled: false
   online_bootstrap_lookback_days: 750
-  online_daily_primary: "akshare"
-  online_daily_backup: "efinance"
-  request_interval_sec: 0.6
+  # Online warehouse fill providers. Prefer tushare when token is set via
+  # SA__MARKET_WAREHOUSE__TUSHARE_TOKEN (or market_warehouse.tushare_token).
+  online_daily_primary: "tushare"
+  online_daily_backup: "akshare"
+  tushare_token: ""
+  request_interval_sec: 0.35
   online_socket_timeout_sec: 6.0
   daily_symbol_hard_timeout_sec: 20.0
   daily_symbol_hard_timeout_sec_full_universe: 20.0

@@ -34,7 +34,7 @@ def test_load_default_config_values(monkeypatch: MonkeyPatch) -> None:
     assert config.liquidity_filter_trend.min_daily_turnover == 80_000_000
     assert config.command_channel.dedup_ttl_sec == 86_400
     assert config.notification_filter.cooldown_sec == 300
-    assert config.notification_filter.min_score == 60.0
+    assert config.notification_filter.min_score == 65.0
     assert config.notification_filter.max_signals_per_run == 5
     assert config.backtest_matcher.dynamic_slippage_enabled is True
     assert config.backtest_matcher.max_dynamic_slippage_ratio == 0.012
@@ -76,8 +76,9 @@ def test_load_default_config_values(monkeypatch: MonkeyPatch) -> None:
     assert config.market_warehouse.bootstrap_on_first_sync is True
     assert config.market_warehouse.offline_bootstrap_enabled is False
     assert config.market_warehouse.online_bootstrap_lookback_days == 750
-    assert config.market_warehouse.online_daily_primary == "akshare"
-    assert config.market_warehouse.online_daily_backup == "efinance"
+    assert config.market_warehouse.online_daily_primary == "tushare"
+    assert config.market_warehouse.online_daily_backup == "akshare"
+    assert config.market_warehouse.tushare_token == ""
     assert config.market_warehouse.post_followup_force_universe_scan is False
     assert config.market_warehouse.daily_symbol_hard_timeout_sec == 20.0
     assert config.market_warehouse.daily_symbol_hard_timeout_sec_full_universe == 20.0
@@ -230,13 +231,13 @@ def test_load_default_config_values(monkeypatch: MonkeyPatch) -> None:
     assert config.evolution.llm_model == "gpt-5.4"
     assert config.evolution.llm_backup_base_url == "https://gmn.chuangzuoli.com/v1"
     assert config.evolution.llm_backup_model == "gpt-5.2"
-    assert config.score.thresholds.a == 60.0
+    assert config.score.thresholds.a == 65.0
     assert config.score.thresholds.b == 50.0
-    assert config.strategy_scores["trend"].thresholds.a == 60.0
+    assert config.strategy_scores["trend"].thresholds.a == 65.0
     assert config.strategy_scores["trend"].thresholds.b == 50.0
-    assert config.strategy_scores["monster"].thresholds.a == 60.0
+    assert config.strategy_scores["monster"].thresholds.a == 65.0
     assert config.strategy_scores["monster"].thresholds.b == 50.0
-    assert config.notification_filter.min_score == 60.0
+    assert config.notification_filter.min_score == 65.0
     assert config.notification_filter.max_signals_per_run == 5
     assert config.idle_queue.manual_ack_required is True
     assert config.idle_queue.enabled_policy == "auto"

@@ -9,6 +9,7 @@ from stock_analyzer.config import DataSourceConfig, MarketDepthConfig
 from stock_analyzer.data.akshare_provider import AkshareProvider
 from stock_analyzer.data.efinance_provider import EfinanceProvider
 from stock_analyzer.data.hybrid_runtime_provider import HybridRuntimeProvider
+from stock_analyzer.data.tushare_provider import TushareProvider
 from stock_analyzer.data.market_depth import (
     CachedMarketDepthProvider,
     EasyQuotationMarketDepthProvider,
@@ -37,6 +38,12 @@ def build_primary_provider(config: DataSourceConfig) -> MarketDataProvider:
     socket_timeout_sec, max_attempts, _ = _runtime_provider_tuning()
     if primary in {"synthetic", "synthetic_test"}:
         return SyntheticProvider()
+    if primary in {"tushare", "ts", "tushare_pro"}:
+        return TushareProvider(
+            retry_delay_sec=config.request_interval_sec,
+            max_attempts=max_attempts,
+            socket_timeout_sec=socket_timeout_sec,
+        )
     if primary in {"akshare", "ak"}:
         return AkshareProvider(
             retry_delay_sec=config.request_interval_sec,
