@@ -6408,7 +6408,9 @@ class StockAnalyzerService:
                     "reason": "post_followup_run_learning_backfill_disabled",
                 }
 
-            if bool(config.post_followup_run_training):
+            if bool(config.post_followup_run_training) and bool(
+                self._config.training.enabled
+            ):
                 self._write_post_market_warehouse_followup_state(
                     stage="build_trainable_manifest",
                     status="running",
@@ -6546,33 +6548,39 @@ class StockAnalyzerService:
                         "reason": "training_summary_notification_disabled",
                     }
             else:
+                training_skip_reason = (
+                    "training_disabled"
+                    if not bool(self._config.training.enabled)
+                    else "post_followup_run_training_disabled"
+                )
                 steps["build_trainable_manifest"] = {
                     "ok": True,
                     "skipped": True,
-                    "reason": "post_followup_run_training_disabled",
+                    "reason": training_skip_reason,
                 }
                 steps["learning_runtime_history_bootstrap"] = {
                     "ok": True,
                     "skipped": True,
-                    "reason": "post_followup_run_training_disabled",
+                    "reason": training_skip_reason,
                 }
                 steps["train_learning_manifest"] = {
                     "ok": True,
                     "skipped": True,
-                    "reason": "post_followup_run_training_disabled",
+                    "reason": training_skip_reason,
                 }
                 steps["learning_shadow_proposal"] = {
                     "ok": True,
                     "skipped": True,
-                    "reason": "post_followup_run_training_disabled",
+                    "reason": training_skip_reason,
                 }
                 steps["auto_promotion"] = {
                     "enabled": False,
                     "status": "skipped",
+                    "reason": training_skip_reason,
                 }
                 steps["learning_summary_notification"] = {
                     "sent": False,
-                    "reason": "post_followup_run_training_disabled",
+                    "reason": training_skip_reason,
                 }
 
             if bool(config.post_followup_run_phase_d_tabular_deep):
@@ -15523,6 +15531,46 @@ class StockAnalyzerService:
             or promotion_gate.get("status", "")
             or workflow.get("status", "")
         ).strip().lower()
+        shadow_model_id = str(proposal_payload.get("shadow_model_id", "")).strip() or str(
+            workflow.get("shadow_model_id", "")
+        ).strip()
+        dataset_manifest_id = str(
+            proposal_payload.get("dataset_manifest_id", "")
+            or workflow.get("dataset_manifest_id", "")
+        ).strip()
+        proposal_id = str(proposal.get("proposal_id", "")).strip()
+        artifact_path = str(training.get("artifact_path", "")).strip()
+        predictor_loaded = bool(training.get("predictor_loaded", False)) or bool(
+            auto_promotion.get("predictor_loaded", False)
+        )
+        model_upgraded = bool(auto_promotion.get("auto_release", False)) and (
+            str(auto_promotion.get("status", "")).strip().lower() == "released"
+        ) and predictor_loaded
+        detail_lines = [
+            f"dataset_manifest_id={dataset_manifest_id or '-'}",
+            f"shadow_model_id={shadow_model_id or '-'}",
+            f"proposal_id={proposal_id or '-'}",
+            f"artifact_path={artifact_path or '-'}",
+            f"predictor_loaded={str(predictor_loaded).lower()}",
+            f"auto_promotion_status={str(auto_promotion.get('status', '')).strip() or '-'}",
+        ]
+
+        if model_upgraded:
+            content = _notification_message_zh(
+                trigger="买卖主模型已自动升级并热加载",
+                impact="仓后训练通过门控且已自动发布，runtime predictor 已切换到新模型。",
+                action="次日扫描将使用新模型；如需回滚请走模型发布治理。",
+                details=detail_lines,
+                detail_title="模型升级摘要",
+            )
+            self.notify(
+                title=_push_title(priority="P1", category="ops", summary="model upgraded"),
+                content=content,
+                level="info",
+                trace_id=trace_id,
+            )
+            return {"sent": True, "status": "model_upgraded", "gate_status": gate_status}
+
         if bool(auto_promotion.get("auto_release", False)):
             return {
                 "sent": False,
@@ -15536,24 +15584,10 @@ class StockAnalyzerService:
                 "gate_status": gate_status,
             }
 
-        shadow_model_id = str(proposal_payload.get("shadow_model_id", "")).strip() or str(
-            workflow.get("shadow_model_id", "")
-        ).strip()
-        dataset_manifest_id = str(
-            proposal_payload.get("dataset_manifest_id", "")
-            or workflow.get("dataset_manifest_id", "")
-        ).strip()
-        proposal_id = str(proposal.get("proposal_id", "")).strip()
-        detail_lines = [
-            f"dataset_manifest_id={dataset_manifest_id or '-'}",
-            f"shadow_model_id={shadow_model_id or '-'}",
-            f"proposal_id={proposal_id or '-'}",
-        ]
-
         if not bool(shadow_validation.get("ok", False)):
             content = _notification_message_zh(
-                trigger="训练或 shadow validation 未完成",
-                impact="本次学习模型没有形成可进入发布治理的候选结果。",
+                trigger="仓后模型训练或 shadow validation 未完成",
+                impact="本次没有形成可发布的买卖主模型候选；当前 runtime 模型保持不变。",
                 action="请优先检查 manifest、训练产物和 shadow validation 错误。",
                 details=detail_lines
                 + [
@@ -15577,8 +15611,8 @@ class StockAnalyzerService:
 
         if gate_status != "pass":
             content = _notification_message_zh(
-                trigger="训练已完成，但门控未通过",
-                impact="本次 shadow 模型不会进入自动发布，当前 champion 继续保持不变。",
+                trigger="仓后模型训练已完成，但门控未通过",
+                impact="shadow 候选不会自动替换买卖主模型，当前 champion 保持不变。",
                 action="请查看门控原因，决定是否人工复核、调参或重新训练。",
                 details=detail_lines
                 + [
@@ -15608,18 +15642,10 @@ class StockAnalyzerService:
             }
 
         content = _notification_message_zh(
-            trigger="训练和门控已完成，等待人工发布",
-            impact="候选模型已经可审阅，但当前 runtime predictor 尚未自动切换。",
+            trigger="仓后模型训练和门控已完成，等待人工发布",
+            impact="候选模型可审阅，但 runtime predictor 尚未自动切换；这不是主模型已升级。",
             action="请在治理链路中确认 proposal 并决定是否发版。",
-            details=detail_lines
-            + [
-                f"artifact_path={str(training.get('artifact_path', '')).strip() or '-'}",
-                "predictor_loaded="
-                + str(
-                    bool(training.get("predictor_loaded", False))
-                    or bool(auto_promotion.get("predictor_loaded", False))
-                ).lower(),
-            ],
+            details=detail_lines,
             detail_title="训练摘要",
         )
         self.notify(

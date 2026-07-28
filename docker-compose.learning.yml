@@ -1,0 +1,37 @@
+# Optional NAS overlay: enable nightly self-learning AFTER market warehouse sync.
+# Chain: 21:45 market_warehouse_sync → post_followup → train/shadow → (auto) promotion
+#
+# Usage with existing runtime stack:
+#   docker compose --env-file .env \
+#     -f docker-compose.yml \
+#     -f docker-compose.runtime.yml \
+#     -f docker-compose.runtime.localvol.yml \
+#     -f docker-compose.learning.yml \
+#     up -d --force-recreate api scheduler
+#
+# Or set the same keys in .env; this file only provides safe defaults for learning.
+services:
+  api:
+    environment:
+      SA__TRAINING__ENABLED: ${SA__TRAINING__ENABLED:-true}
+      SA__AUTO_PROMOTION__ENABLED: ${SA__AUTO_PROMOTION__ENABLED:-true}
+      SA__AUTO_PROMOTION__AUTO_LOAD_PREDICTOR: ${SA__AUTO_PROMOTION__AUTO_LOAD_PREDICTOR:-true}
+      SA__AUTO_PROMOTION__NOTIFY_ON_TRAINING_SUMMARY: ${SA__AUTO_PROMOTION__NOTIFY_ON_TRAINING_SUMMARY:-true}
+      SA__AUTO_PROMOTION__NOTIFY_ON_REJECTION: ${SA__AUTO_PROMOTION__NOTIFY_ON_REJECTION:-true}
+      SA__AUTO_PROMOTION__NOTIFY_ON_MANUAL_RELEASE_PENDING: ${SA__AUTO_PROMOTION__NOTIFY_ON_MANUAL_RELEASE_PENDING:-true}
+      SA__MARKET_WAREHOUSE__POST_FOLLOWUP_ENABLED: ${SA__MARKET_WAREHOUSE__POST_FOLLOWUP_ENABLED:-true}
+      SA__MARKET_WAREHOUSE__POST_FOLLOWUP_RUN_TRAINING: ${SA__MARKET_WAREHOUSE__POST_FOLLOWUP_RUN_TRAINING:-true}
+      # Allow post-sync learning notifies (warehouse job is 21:45; avoid swallowing until midnight)
+      SA__NOTIFICATION_FILTER__QUIET_WINDOWS: ${SA__NOTIFICATION_FILTER__QUIET_WINDOWS:-["00:30-08:30"]}
+
+  scheduler:
+    environment:
+      SA__TRAINING__ENABLED: ${SA__TRAINING__ENABLED:-true}
+      SA__AUTO_PROMOTION__ENABLED: ${SA__AUTO_PROMOTION__ENABLED:-true}
+      SA__AUTO_PROMOTION__AUTO_LOAD_PREDICTOR: ${SA__AUTO_PROMOTION__AUTO_LOAD_PREDICTOR:-true}
+      SA__AUTO_PROMOTION__NOTIFY_ON_TRAINING_SUMMARY: ${SA__AUTO_PROMOTION__NOTIFY_ON_TRAINING_SUMMARY:-true}
+      SA__AUTO_PROMOTION__NOTIFY_ON_REJECTION: ${SA__AUTO_PROMOTION__NOTIFY_ON_REJECTION:-true}
+      SA__AUTO_PROMOTION__NOTIFY_ON_MANUAL_RELEASE_PENDING: ${SA__AUTO_PROMOTION__NOTIFY_ON_MANUAL_RELEASE_PENDING:-true}
+      SA__MARKET_WAREHOUSE__POST_FOLLOWUP_ENABLED: ${SA__MARKET_WAREHOUSE__POST_FOLLOWUP_ENABLED:-true}
+      SA__MARKET_WAREHOUSE__POST_FOLLOWUP_RUN_TRAINING: ${SA__MARKET_WAREHOUSE__POST_FOLLOWUP_RUN_TRAINING:-true}
+      SA__NOTIFICATION_FILTER__QUIET_WINDOWS: ${SA__NOTIFICATION_FILTER__QUIET_WINDOWS:-["00:30-08:30"]}

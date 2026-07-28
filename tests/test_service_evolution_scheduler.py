@@ -214,10 +214,11 @@ def test_evolution_offhours_sends_learning_completion_notification(tmp_path: Pat
     dedup_key = str(captured.get("dedup_key", ""))
 
     assert payload["symbol_source"] == "watchlist"
-    assert title.endswith("夜间学习完成")
+    assert title.endswith("夜间进化完成")
     assert dedup_key.endswith(":offhours_weekday_light_topk_deep")
-    assert "升级方面：" in content
-    assert "学习结果：" in content
+    assert "运行参数调整：" in content
+    assert "模块观察：" in content
+    assert "不代表买卖主模型" in content
     assert "授权级别 C" in content
     assert "新增 2 只" in content
     assert "000001" in content

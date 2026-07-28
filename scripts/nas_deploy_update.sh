@@ -93,6 +93,11 @@ COMPOSE=(docker compose --env-file "${ROOT}/.env"
   -f docker-compose.runtime.yml
   -f docker-compose.runtime.localvol.yml
 )
+# Optional nightly train-after-sync overlay
+if [[ -f "${ROOT}/docker-compose.learning.yml" ]] && [[ "${ENABLE_LEARNING:-1}" = "1" ]]; then
+  COMPOSE+=(-f docker-compose.learning.yml)
+  echo "learning overlay: enabled (ENABLE_LEARNING=1)"
+fi
 
 echo "[2/4] build api image"
 "${COMPOSE[@]}" build api

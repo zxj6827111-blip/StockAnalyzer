@@ -25,8 +25,9 @@ services:
       TZ: Asia/Shanghai
       SA__APP__MODE: simulation
       SA__APP__ADVISORY_ONLY: "true"
-      SA__TRAINING__ENABLED: "false"
-      SA__AUTO_PROMOTION__ENABLED: "false"
+      # Overridable via .env / docker-compose.learning.yml
+      SA__TRAINING__ENABLED: ${SA__TRAINING__ENABLED:-false}
+      SA__AUTO_PROMOTION__ENABLED: ${SA__AUTO_PROMOTION__ENABLED:-false}
       SA__CACHE__BACKEND: redis
       SA__CACHE__REDIS_URL: redis://redis:6379/0
       SA__DATA_SOURCE__PRIMARY: market_warehouse
@@ -71,8 +72,8 @@ services:
       TZ: Asia/Shanghai
       SA__APP__MODE: simulation
       SA__APP__ADVISORY_ONLY: "true"
-      SA__TRAINING__ENABLED: "false"
-      SA__AUTO_PROMOTION__ENABLED: "false"
+      SA__TRAINING__ENABLED: ${SA__TRAINING__ENABLED:-false}
+      SA__AUTO_PROMOTION__ENABLED: ${SA__AUTO_PROMOTION__ENABLED:-false}
       SA__CACHE__BACKEND: redis
       SA__CACHE__REDIS_URL: redis://redis:6379/0
       SA__DATA_SOURCE__PRIMARY: market_warehouse

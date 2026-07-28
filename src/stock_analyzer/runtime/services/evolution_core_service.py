@@ -697,11 +697,11 @@ class RuntimeEvolutionCoreService:
         )
         detail_lines = [
             f"完成时间：{completed_at}",
-            f"升级批次：{proposal_id or run_id or '-'}",
+            f"进化批次：{proposal_id or run_id or '-'}",
             f"输入标的：{symbol_count} 只（来源：{_evolution_symbol_source_zh(symbol_source)}）",
-            f"升级方面：{upgrade_summary}",
-            f"升级依据：{reason_summary}",
-            f"学习结果：{learning_summary}",
+            f"运行参数调整：{upgrade_summary}",
+            f"调整依据：{reason_summary}",
+            f"模块观察：{learning_summary}",
             (
                 "策略提案：授权级别 "
                 f"{authorization_level}；变更项 {', '.join(change_keys[:4]) or '-'}"
@@ -714,6 +714,8 @@ class RuntimeEvolutionCoreService:
             ),
             f"观察池结果：{watchlist_result}",
             f"候选股票：{selected_result}",
+            "说明：本通知仅覆盖盘后进化评估/运行参数建议/观察池复核，"
+            "不代表买卖主模型（model artifact）已自动升级。",
         ]
         frozen_symbols = _normalized_symbol_list(m9.get("frozen_symbols", []))
         if frozen_symbols:
@@ -724,11 +726,11 @@ class RuntimeEvolutionCoreService:
                 f"本轮授权级别 {authorization_level}。"
             ),
             impact=(
-                "系统已完成夜间数据补充、学习升级与观察池复核，"
-                "次日盘前提示、盘中盯盘和模拟盘会沿用这轮结果继续运行。"
+                "系统已完成夜间进化评估、运行参数建议与观察池复核；"
+                "买卖主模型是否升级请看仓后训练/发布通知。"
             ),
             action=(
-                "建议直接查看这条企业微信摘要；若要复核细节，再打开本地监控页查看"
+                "可直接看本摘要；若要复核细节，打开本地监控页查看"
                 " evolution 报告、观察池和候选池。"
             ),
             details=detail_lines,
@@ -1674,12 +1676,12 @@ def _resolve_offhours_scan_profile(week5_refresh: Mapping[str, object]) -> str:
 def _evolution_offhours_summary_text(scan_profile: str) -> str:
     normalized = scan_profile.strip().lower()
     if normalized == "offhours_friday_full_deep":
-        return "周五深扫学习完成"
+        return "周五深扫进化完成"
     if normalized == "offhours_weekend_full_deep":
-        return "周末深扫学习完成"
+        return "周末深扫进化完成"
     if normalized == "offhours_forced_full_deep":
-        return "夜间深扫学习完成"
-    return "夜间学习完成"
+        return "夜间深扫进化完成"
+    return "夜间进化完成"
 
 
 def _scan_profile_label_zh(scan_profile: str) -> str:
