@@ -15,8 +15,6 @@ import pandas as pd
 from stock_analyzer.data.provider import DataSourceError
 
 _DEFAULT_FLOAT_MARKET_CAP = 12_000_000_000.0
-_DEFAULT_HOLDER_COUNT = 60_000.0
-_DEFAULT_FINANCING_BALANCE = 2_500_000_000.0
 _SYMBOL_RE = re.compile(r"(\d{6})")
 
 
@@ -38,6 +36,23 @@ class _TushareProApi(Protocol):
         fields: str = "",
     ) -> object: ...
 
+    def adj_factor(
+        self,
+        *,
+        ts_code: str = "",
+        start_date: str = "",
+        end_date: str = "",
+    ) -> object: ...
+
+    def trade_cal(
+        self,
+        *,
+        exchange: str = "",
+        start_date: str = "",
+        end_date: str = "",
+        is_open: str = "",
+    ) -> object: ...
+
     def stock_basic(
         self,
         *,
@@ -47,7 +62,7 @@ class _TushareProApi(Protocol):
 
 
 class TushareProvider:
-    """Fetch A-share daily bars from Tushare Pro (`pro.daily`)."""
+    """Fetch A-share daily bars from Tushare Pro (`pro.daily` + `adj_factor` → qfq)."""
 
     def __init__(
         self,
@@ -57,13 +72,16 @@ class TushareProvider:
         retry_delay_sec: float = 0.35,
         max_attempts: int = 2,
         socket_timeout_sec: float = 15.0,
+        price_series_mode: str = "qfq",
     ) -> None:
         self._token = str(token or "").strip() or _resolve_tushare_token()
         self._pro_api = pro_api
         self._retry_delay_sec = max(0.0, float(retry_delay_sec))
         self._max_attempts = max(1, int(max_attempts))
         self._socket_timeout_sec = max(0.1, float(socket_timeout_sec))
+        self._price_series_mode = str(price_series_mode or "qfq").strip().lower() or "qfq"
         self._name_cache: dict[str, str] = {}
+        self._trade_cal_cache: dict[str, list[date]] = {}
 
     def fetch_daily_bars(
         self,
@@ -78,7 +96,6 @@ class TushareProvider:
             raise DataSourceError(f"invalid symbol for tushare: {symbol}")
         ts_code = _to_ts_code(code6)
         resolved_end = end_date or date.today()
-        # calendar cushion for weekends/holidays
         start = resolved_end - timedelta(days=max(1, int(lookback_days)) * 2 + 10)
         start_s = start.strftime("%Y%m%d")
         end_s = resolved_end.strftime("%Y%m%d")
@@ -87,7 +104,7 @@ class TushareProvider:
             raw = self._call_with_retry(
                 lambda: pro.daily(ts_code=ts_code, start_date=start_s, end_date=end_s)
             )
-        except Exception as exc:  # pragma: no cover - network/provider dependent
+        except Exception as exc:  # pragma: no cover
             raise DataSourceError(f"tushare daily failed for {ts_code}: {exc}") from exc
 
         daily = _coerce_frame(raw)
@@ -108,13 +125,38 @@ class TushareProvider:
         except Exception:
             basic = pd.DataFrame()
 
+        adj = pd.DataFrame()
+        if self._price_series_mode in {"qfq", "hfq"}:
+            try:
+                adj_start = (start - timedelta(days=400)).strftime("%Y%m%d")
+                adj_raw = self._call_with_retry(
+                    lambda: pro.adj_factor(
+                        ts_code=ts_code,
+                        start_date=adj_start,
+                        end_date=end_s,
+                    )
+                )
+                adj = _coerce_frame(adj_raw)
+            except Exception as exc:
+                raise DataSourceError(
+                    f"tushare adj_factor failed for {ts_code} "
+                    f"(required for price_series_mode={self._price_series_mode}): {exc}"
+                ) from exc
+            if adj.empty:
+                raise DataSourceError(
+                    f"tushare adj_factor empty for {ts_code} "
+                    f"(required for price_series_mode={self._price_series_mode})"
+                )
+
         name = self._lookup_name(pro=pro, ts_code=ts_code, code6=code6)
         frame = _normalize_tushare_daily(
             daily=daily,
             basic=basic,
+            adj=adj,
             symbol=code6,
             name=name,
             lookback_days=lookback_days,
+            price_series_mode=self._price_series_mode,
         )
         if frame.empty:
             raise DataSourceError(f"tushare normalized empty for {ts_code}")
@@ -128,6 +170,76 @@ class TushareProvider:
     ) -> pd.DataFrame:
         _ = symbol, interval, lookback_days
         return pd.DataFrame()
+
+    def list_open_trade_dates(
+        self,
+        *,
+        start_date: date,
+        end_date: date,
+        exchange: str = "SSE",
+    ) -> list[date]:
+        """Return open exchange session dates in [start_date, end_date]."""
+        if end_date < start_date:
+            return []
+        pro = self._resolve_pro_api()
+        start_s = start_date.strftime("%Y%m%d")
+        end_s = end_date.strftime("%Y%m%d")
+        cache_key = f"{exchange}:{start_s}:{end_s}"
+        cached = self._trade_cal_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+        try:
+            raw = self._call_with_retry(
+                lambda: pro.trade_cal(
+                    exchange=exchange,
+                    start_date=start_s,
+                    end_date=end_s,
+                    is_open="1",
+                )
+            )
+        except Exception as exc:  # pragma: no cover
+            raise DataSourceError(f"tushare trade_cal failed: {exc}") from exc
+        frame = _coerce_frame(raw)
+        if frame.empty or "cal_date" not in frame.columns:
+            self._trade_cal_cache[cache_key] = []
+            return []
+        parsed = pd.to_datetime(
+            frame["cal_date"].astype(str), format="%Y%m%d", errors="coerce"
+        ).dropna()
+        dates = sorted(
+            {
+                item
+                for item in parsed.dt.date.tolist()
+                if isinstance(item, date) and start_date <= item <= end_date
+            }
+        )
+        self._trade_cal_cache[cache_key] = dates
+        return list(dates)
+
+    def resolve_target_trade_date(
+        self,
+        *,
+        now: date | None = None,
+        after_close: bool = True,
+    ) -> date:
+        """Resolve latest open session date for warehouse sync targeting."""
+        current = now or date.today()
+        start = current - timedelta(days=20)
+        open_dates = self.list_open_trade_dates(start_date=start, end_date=current)
+        if not open_dates:
+            cursor = current if after_close else current - timedelta(days=1)
+            while cursor.weekday() >= 5:
+                cursor -= timedelta(days=1)
+            return cursor
+        if after_close:
+            return open_dates[-1]
+        if open_dates[-1] == current and len(open_dates) >= 2:
+            return open_dates[-2]
+        if open_dates[-1] < current:
+            return open_dates[-1]
+        if len(open_dates) >= 2:
+            return open_dates[-2]
+        return open_dates[-1]
 
     def _resolve_pro_api(self) -> _TushareProApi:
         if self._pro_api is not None:
@@ -214,13 +326,65 @@ def _coerce_frame(raw: object) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def _apply_price_adjust(
+    frame: pd.DataFrame,
+    *,
+    adj: pd.DataFrame,
+    price_series_mode: str,
+) -> pd.DataFrame:
+    """Apply Tushare adj_factor to match system price_series_mode (default qfq).
+
+    Tushare ``daily`` is unadjusted. Forward-adjusted (qfq) uses:
+        price_qfq = price_raw * adj_factor / adj_factor_latest
+    Volume is scaled inversely so price*volume stays consistent with turnover.
+    """
+    mode = str(price_series_mode or "raw").strip().lower()
+    if mode in {"", "raw"}:
+        return frame.copy()
+    if mode not in {"qfq", "hfq"}:
+        raise DataSourceError(f"unsupported tushare price_series_mode: {price_series_mode}")
+    if adj.empty or "trade_date" not in adj.columns or "adj_factor" not in adj.columns:
+        raise DataSourceError("tushare adj_factor required for qfq/hfq but missing columns")
+
+    adj2 = adj.copy()
+    adj2["date"] = pd.to_datetime(adj2["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
+    adj2["adj_factor"] = pd.to_numeric(adj2["adj_factor"], errors="coerce")
+    adj2 = adj2.dropna(subset=["date", "adj_factor"]).drop_duplicates(subset=["date"], keep="last")
+    if adj2.empty:
+        raise DataSourceError("tushare adj_factor empty after normalize")
+
+    out = frame.merge(adj2[["date", "adj_factor"]], on="date", how="left")
+    if out["adj_factor"].isna().any():
+        out["adj_factor"] = out["adj_factor"].ffill().bfill()
+    if out["adj_factor"].isna().any():
+        raise DataSourceError("tushare adj_factor could not be aligned to daily bars")
+
+    if mode == "qfq":
+        latest = float(out["adj_factor"].iloc[-1])
+        if latest == 0:
+            raise DataSourceError("tushare adj_factor latest is zero")
+        scale = out["adj_factor"] / latest
+    else:
+        first = float(out["adj_factor"].iloc[0])
+        if first == 0:
+            raise DataSourceError("tushare adj_factor first is zero")
+        scale = out["adj_factor"] / first
+
+    for col in ("open", "high", "low", "close"):
+        out[col] = pd.to_numeric(out[col], errors="coerce") * scale
+    out["volume"] = pd.to_numeric(out["volume"], errors="coerce") / scale.replace(0, np.nan)
+    return out.drop(columns=["adj_factor"])
+
+
 def _normalize_tushare_daily(
     *,
     daily: pd.DataFrame,
     basic: pd.DataFrame,
+    adj: pd.DataFrame,
     symbol: str,
     name: str,
     lookback_days: int,
+    price_series_mode: str = "qfq",
 ) -> pd.DataFrame:
     frame = daily.copy()
     rename = {
@@ -237,7 +401,7 @@ def _normalize_tushare_daily(
             raise DataSourceError(f"tushare daily missing column: {col}")
         frame[col] = pd.to_numeric(frame[col], errors="coerce")
 
-    # Tushare vol is hand (手)=100 shares; amount is 千元.
+    # Tushare vol is 手 (=100 shares); amount is 千元.
     frame["volume"] = frame["volume"] * 100.0
     frame["turnover"] = frame["turnover"] * 1000.0
 
@@ -254,9 +418,9 @@ def _normalize_tushare_daily(
     if frame.empty:
         return frame
     frame = frame.sort_values("date").drop_duplicates(subset=["date"], keep="last")
+    frame = _apply_price_adjust(frame, adj=adj, price_series_mode=price_series_mode)
 
     if "circ_mv" in frame.columns:
-        # circ_mv is 万元
         circ = pd.to_numeric(frame["circ_mv"], errors="coerce") * 10000.0
         frame["float_market_cap"] = circ.fillna(_DEFAULT_FLOAT_MARKET_CAP)
     elif "turnover_rate" in frame.columns:
@@ -272,20 +436,22 @@ def _normalize_tushare_daily(
     frame["name"] = name
     frame["is_st"] = is_st
     frame["is_delisting_risk"] = is_delisting
-    frame["roe"] = 0.08
-    frame["debt_ratio"] = 0.55
-    frame["financial_data_complete"] = True
-    frame["financial_missing_fields"] = ""
-    frame["financial_source"] = "tushare_default"
+    # Do NOT invent financial completeness. Real values need ann_date-aware P1 enrichment.
+    frame["roe"] = np.nan
+    frame["debt_ratio"] = np.nan
+    frame["financial_data_complete"] = False
+    frame["financial_missing_fields"] = "roe,debt_ratio"
+    frame["financial_source"] = "tushare_pending"
     frame["financial_report_date"] = ""
-    frame["holder_count"] = _DEFAULT_HOLDER_COUNT
+    frame["holder_count"] = np.nan
     frame["block_trade_net"] = 0.0
-    frame["financing_balance"] = _DEFAULT_FINANCING_BALANCE
-    frame["margin_financing_balance"] = _DEFAULT_FINANCING_BALANCE
+    frame["financing_balance"] = np.nan
+    frame["margin_financing_balance"] = np.nan
     frame["northbound_net"] = 0.0
     frame["dragon_tiger_flag"] = 0.0
-    frame["background_data_source"] = "tushare_pro"
-    frame["background_data_complete"] = True
+    mode = str(price_series_mode or "qfq").strip().lower() or "qfq"
+    frame["background_data_source"] = f"tushare_pro_{mode}"
+    frame["background_data_complete"] = False
     frame["board"] = _infer_board(symbol)
 
     selected = frame[

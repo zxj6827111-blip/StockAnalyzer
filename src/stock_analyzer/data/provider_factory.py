@@ -43,6 +43,7 @@ def build_primary_provider(config: DataSourceConfig) -> MarketDataProvider:
             retry_delay_sec=config.request_interval_sec,
             max_attempts=max_attempts,
             socket_timeout_sec=socket_timeout_sec,
+            price_series_mode="qfq",
         )
     if primary in {"akshare", "ak"}:
         return AkshareProvider(

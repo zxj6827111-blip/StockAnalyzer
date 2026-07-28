@@ -820,11 +820,15 @@ class RuntimeMarketSyncService:
         normalized = provider_name.strip().lower()
         if normalized in {"tushare", "ts", "tushare_pro"}:
             token = str(service._config.market_warehouse.tushare_token).strip()
+            price_mode = str(
+                getattr(service._config.evolution.execution_spec, "price_series_mode", "qfq")
+            ).strip().lower() or "qfq"
             return TushareProvider(
                 token=token,
                 retry_delay_sec=request_interval,
                 max_attempts=max_attempts,
                 socket_timeout_sec=socket_timeout_sec,
+                price_series_mode=price_mode,
             )
         if normalized in {"akshare", "ak"}:
             return AkshareProvider(
@@ -876,10 +880,53 @@ class RuntimeMarketSyncService:
         return symbols
 
     def _resolve_market_warehouse_target_trade_date(self, *, now: datetime) -> date:
+        """Resolve warehouse sync target session date.
+
+        Prefer Tushare trade_cal when online primary is tushare (handles SSE holidays).
+        Fallback keeps weekend-only skip behavior.
+        """
         current = now.date()
-        if now.weekday() >= 5:
+        after_close = now.time() >= dt_time(hour=15, minute=5)
+        primary_name = str(
+            self._service._config.market_warehouse.online_daily_primary
+        ).strip().lower()
+        if primary_name in {"tushare", "ts", "tushare_pro"}:
+            try:
+                request_interval = max(
+                    0.0,
+                    _as_float(
+                        self._service._config.market_warehouse.request_interval_sec,
+                        default=self._service._config.data_source.request_interval_sec,
+                    ),
+                )
+                socket_timeout_sec = max(
+                    1.0,
+                    _as_float(
+                        self._service._config.market_warehouse.online_socket_timeout_sec,
+                        default=6.0,
+                    ),
+                )
+                max_attempts = max(
+                    1,
+                    _as_int(self._service._config.market_warehouse.online_max_attempts, default=1),
+                )
+                provider = self._build_market_warehouse_online_single_provider(
+                    provider_name=primary_name,
+                    request_interval=request_interval,
+                    socket_timeout_sec=socket_timeout_sec,
+                    max_attempts=max_attempts,
+                )
+                resolve = getattr(provider, "resolve_target_trade_date", None)
+                if callable(resolve):
+                    resolved = resolve(now=current, after_close=after_close)
+                    if isinstance(resolved, date):
+                        return resolved
+            except Exception:
+                # Fall through to weekend-only heuristic.
+                pass
+        if current.weekday() >= 5:
             return _last_friday(current)
-        if now.time() >= dt_time(hour=15, minute=5):
+        if after_close:
             return current
         previous = current - timedelta(days=1)
         while previous.weekday() >= 5:
