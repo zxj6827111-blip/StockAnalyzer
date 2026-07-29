@@ -26,6 +26,9 @@ _TRADE_STATUS_TABLE = "daily_trade_status"
 _MARGIN_TABLE = "margin_detail"
 _MONEYFLOW_TABLE = "moneyflow"
 _HK_HOLD_TABLE = "hk_hold"
+_TOP_LIST_TABLE = "top_list_events"
+_TOP_INST_TABLE = "top_inst_events"
+_BLOCK_TRADE_TABLE = "block_trade_events"
 _INTRADAY_TABLES = {
     "1m": "intraday_summary_1m",
     "5m": "intraday_summary_5m",
@@ -301,6 +304,56 @@ class MarketWarehouse:
                     hold_vol DOUBLE,
                     hold_ratio DOUBLE,
                     hold_market_cap DOUBLE,
+                    source VARCHAR,
+                    as_of VARCHAR,
+                    coverage_complete BOOLEAN
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS top_list_events (
+                    symbol VARCHAR,
+                    trade_date DATE,
+                    dragon_tiger_flag DOUBLE,
+                    reason_count INTEGER,
+                    reasons VARCHAR,
+                    buy_amount DOUBLE,
+                    sell_amount DOUBLE,
+                    turnover DOUBLE,
+                    source VARCHAR,
+                    as_of VARCHAR,
+                    coverage_complete BOOLEAN
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS top_inst_events (
+                    symbol VARCHAR,
+                    trade_date DATE,
+                    institution_name VARCHAR,
+                    inst_buy_amount DOUBLE,
+                    inst_sell_amount DOUBLE,
+                    inst_net_amount DOUBLE,
+                    source VARCHAR,
+                    as_of VARCHAR,
+                    coverage_complete BOOLEAN
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS block_trade_events (
+                    symbol VARCHAR,
+                    trade_date DATE,
+                    block_price DOUBLE,
+                    block_trade_volume DOUBLE,
+                    block_trade_amount DOUBLE,
+                    block_trade_premium_discount DOUBLE,
+                    block_trade_net DOUBLE,
+                    buyer VARCHAR,
+                    seller VARCHAR,
                     source VARCHAR,
                     as_of VARCHAR,
                     coverage_complete BOOLEAN
@@ -603,6 +656,161 @@ class MarketWarehouse:
             ).fetch_df())
         if not frame.empty and "trade_date" in frame.columns:
             frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
+        return frame
+
+
+
+    def upsert_top_list_events(self, *, symbol: str, frame: pd.DataFrame) -> int:
+        normalized_symbol = _normalize_symbol(symbol)
+        if frame is None or frame.empty:
+            return 0
+        payload = frame.copy()
+        payload["symbol"] = normalized_symbol
+        payload["trade_date"] = pd.to_datetime(
+            payload["trade_date"], errors="coerce"
+        ).dt.date
+        payload = payload.dropna(subset=["trade_date"])
+        if payload.empty:
+            return 0
+        self.ensure_schema()
+        with self._connect_write() as connection:
+            for d in payload["trade_date"].tolist():
+                connection.execute(
+                    f"DELETE FROM {_TOP_LIST_TABLE} "
+                    "WHERE symbol = ? AND trade_date = ?",
+                    [normalized_symbol, d],
+                )
+            connection.register("tl_stage", payload)
+            cols = [c for c in payload.columns if c in (
+                "symbol", "trade_date", "dragon_tiger_flag", "reason_count",
+                "reasons", "buy_amount", "sell_amount", "turnover",
+                "source", "as_of", "coverage_complete",
+            )]
+            col_str = ", ".join(cols)
+            connection.execute(
+                f"INSERT INTO {_TOP_LIST_TABLE} ({col_str}) "
+                f"SELECT {col_str} FROM tl_stage"
+            )
+            connection.unregister("tl_stage")
+        return int(len(payload))
+
+    def fetch_top_list_events(self, *, symbol: str) -> pd.DataFrame:
+        normalized_symbol = _normalize_symbol(symbol)
+        if not self._table_exists(_TOP_LIST_TABLE):
+            return pd.DataFrame()
+        with self._connect_readonly() as connection:
+            frame = cast(pd.DataFrame, connection.execute(
+                f"SELECT * FROM {_TOP_LIST_TABLE} "
+                "WHERE symbol = ? ORDER BY trade_date",
+                [normalized_symbol],
+            ).fetch_df())
+        if not frame.empty and "trade_date" in frame.columns:
+            frame["trade_date"] = pd.to_datetime(
+                frame["trade_date"], errors="coerce"
+            )
+        return frame
+
+    def upsert_top_inst_events(self, *, symbol: str, frame: pd.DataFrame) -> int:
+        normalized_symbol = _normalize_symbol(symbol)
+        if frame is None or frame.empty:
+            return 0
+        payload = frame.copy()
+        payload["symbol"] = normalized_symbol
+        payload["trade_date"] = pd.to_datetime(
+            payload["trade_date"], errors="coerce"
+        ).dt.date
+        payload = payload.dropna(subset=["trade_date"])
+        if payload.empty:
+            return 0
+        self.ensure_schema()
+        with self._connect_write() as connection:
+            for d in payload["trade_date"].tolist():
+                connection.execute(
+                    f"DELETE FROM {_TOP_INST_TABLE} "
+                    "WHERE symbol = ? AND trade_date = ?",
+                    [normalized_symbol, d],
+                )
+            connection.register("ti_stage", payload)
+            cols = [c for c in payload.columns if c in (
+                "symbol", "trade_date", "institution_name",
+                "inst_buy_amount", "inst_sell_amount", "inst_net_amount",
+                "source", "as_of", "coverage_complete",
+            )]
+            col_str = ", ".join(cols)
+            connection.execute(
+                f"INSERT INTO {_TOP_INST_TABLE} ({col_str}) "
+                f"SELECT {col_str} FROM ti_stage"
+            )
+            connection.unregister("ti_stage")
+        return int(len(payload))
+
+    def fetch_top_inst_events(self, *, symbol: str) -> pd.DataFrame:
+        normalized_symbol = _normalize_symbol(symbol)
+        if not self._table_exists(_TOP_INST_TABLE):
+            return pd.DataFrame()
+        with self._connect_readonly() as connection:
+            frame = cast(pd.DataFrame, connection.execute(
+                f"SELECT * FROM {_TOP_INST_TABLE} "
+                "WHERE symbol = ? ORDER BY trade_date",
+                [normalized_symbol],
+            ).fetch_df())
+        if not frame.empty and "trade_date" in frame.columns:
+            frame["trade_date"] = pd.to_datetime(
+                frame["trade_date"], errors="coerce"
+            )
+        return frame
+
+    def upsert_block_trade_events(
+        self, *, symbol: str, frame: pd.DataFrame
+    ) -> int:
+        normalized_symbol = _normalize_symbol(symbol)
+        if frame is None or frame.empty:
+            return 0
+        payload = frame.copy()
+        payload["symbol"] = normalized_symbol
+        payload["trade_date"] = pd.to_datetime(
+            payload["trade_date"], errors="coerce"
+        ).dt.date
+        payload = payload.dropna(subset=["trade_date"])
+        if payload.empty:
+            return 0
+        self.ensure_schema()
+        with self._connect_write() as connection:
+            for d in payload["trade_date"].tolist():
+                connection.execute(
+                    f"DELETE FROM {_BLOCK_TRADE_TABLE} "
+                    "WHERE symbol = ? AND trade_date = ?",
+                    [normalized_symbol, d],
+                )
+            connection.register("bt_stage", payload)
+            cols = [c for c in payload.columns if c in (
+                "symbol", "trade_date", "block_price",
+                "block_trade_volume", "block_trade_amount",
+                "block_trade_premium_discount", "block_trade_net",
+                "buyer", "seller", "source", "as_of", "coverage_complete",
+            )]
+            col_str = ", ".join(cols)
+            connection.execute(
+                f"INSERT INTO {_BLOCK_TRADE_TABLE} ({col_str}) "
+                f"SELECT {col_str} FROM bt_stage"
+            )
+            connection.unregister("bt_stage")
+        return int(len(payload))
+
+    def fetch_block_trade_events(self, *, symbol: str) -> pd.DataFrame:
+        normalized_symbol = _normalize_symbol(symbol)
+        if not self._table_exists(_BLOCK_TRADE_TABLE):
+            return pd.DataFrame()
+        with self._connect_readonly() as connection:
+            frame = cast(pd.DataFrame, connection.execute(
+                f"SELECT * FROM {_BLOCK_TRADE_TABLE} "
+                "WHERE symbol = ? ORDER BY trade_date",
+                [normalized_symbol],
+            ).fetch_df())
+        if not frame.empty and "trade_date" in frame.columns:
+            frame["trade_date"] = pd.to_datetime(
+                frame["trade_date"], errors="coerce"
+            )
         return frame
 
 

@@ -111,6 +111,33 @@ class _TushareProApi(Protocol):
         end_date: str = "",
     ) -> object: ...
 
+    def top_list(
+        self,
+        *,
+        ts_code: str = "",
+        trade_date: str = "",
+        start_date: str = "",
+        end_date: str = "",
+    ) -> object: ...
+
+    def top_inst(
+        self,
+        *,
+        ts_code: str = "",
+        trade_date: str = "",
+        start_date: str = "",
+        end_date: str = "",
+    ) -> object: ...
+
+    def block_trade(
+        self,
+        *,
+        ts_code: str = "",
+        trade_date: str = "",
+        start_date: str = "",
+        end_date: str = "",
+    ) -> object: ...
+
 
 class TushareProvider:
     """Fetch A-share daily bars from Tushare Pro (`pro.daily` + `adj_factor` → qfq)."""
@@ -482,6 +509,100 @@ class TushareProvider:
                 f"tushare hk_hold failed for {ts_code}: {exc}"
             ) from exc
         return _normalize_hk_hold(_coerce_frame(raw), symbol=code6)
+
+
+    def fetch_top_list(
+        self,
+        symbol: str,
+        *,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> pd.DataFrame:
+        """Fetch top_list (龙虎榜) events for a single stock."""
+        pro = self._resolve_pro_api()
+        code6 = _normalize_symbol(symbol)
+        if not code6:
+            raise DataSourceError(f"invalid symbol for top_list: {symbol}")
+        ts_code = _to_ts_code(code6)
+        resolved_end = end_date or date.today()
+        resolved_start = start_date or (resolved_end - timedelta(days=365))
+        start_s = resolved_start.strftime("%Y%m%d")
+        end_s = resolved_end.strftime("%Y%m%d")
+        try:
+            raw = self._call_with_retry(
+                lambda: pro.top_list(
+                    ts_code=ts_code,
+                    start_date=start_s,
+                    end_date=end_s,
+                )
+            )
+        except Exception as exc:
+            raise DataSourceError(
+                f"tushare top_list failed for {ts_code}: {exc}"
+            ) from exc
+        return _normalize_top_list(_coerce_frame(raw), symbol=code6)
+
+    def fetch_top_inst(
+        self,
+        symbol: str,
+        *,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> pd.DataFrame:
+        """Fetch top_inst (龙虎榜机构明细) for a single stock."""
+        pro = self._resolve_pro_api()
+        code6 = _normalize_symbol(symbol)
+        if not code6:
+            raise DataSourceError(f"invalid symbol for top_inst: {symbol}")
+        ts_code = _to_ts_code(code6)
+        resolved_end = end_date or date.today()
+        resolved_start = start_date or (resolved_end - timedelta(days=365))
+        start_s = resolved_start.strftime("%Y%m%d")
+        end_s = resolved_end.strftime("%Y%m%d")
+        try:
+            raw = self._call_with_retry(
+                lambda: pro.top_inst(
+                    ts_code=ts_code,
+                    start_date=start_s,
+                    end_date=end_s,
+                )
+            )
+        except Exception as exc:
+            raise DataSourceError(
+                f"tushare top_inst failed for {ts_code}: {exc}"
+            ) from exc
+        return _normalize_top_inst(_coerce_frame(raw), symbol=code6)
+
+    def fetch_block_trade(
+        self,
+        symbol: str,
+        *,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> pd.DataFrame:
+        """Fetch block_trade (大宗交易) events for a single stock."""
+        pro = self._resolve_pro_api()
+        code6 = _normalize_symbol(symbol)
+        if not code6:
+            raise DataSourceError(f"invalid symbol for block_trade: {symbol}")
+        ts_code = _to_ts_code(code6)
+        resolved_end = end_date or date.today()
+        resolved_start = start_date or (resolved_end - timedelta(days=365))
+        start_s = resolved_start.strftime("%Y%m%d")
+        end_s = resolved_end.strftime("%Y%m%d")
+        try:
+            raw = self._call_with_retry(
+                lambda: pro.block_trade(
+                    ts_code=ts_code,
+                    start_date=start_s,
+                    end_date=end_s,
+                )
+            )
+        except Exception as exc:
+            raise DataSourceError(
+                f"tushare block_trade failed for {ts_code}: {exc}"
+            ) from exc
+        return _normalize_block_trade(_coerce_frame(raw), symbol=code6)
 
     def _resolve_pro_api(self) -> _TushareProApi:
         if self._pro_api is not None:
@@ -1000,6 +1121,144 @@ def _normalize_hk_hold(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
             keep_cols.append(c)
     out = out[keep_cols].sort_values("trade_date").reset_index(drop=True)
     out["source"] = "tushare_hk_hold"
+    out["as_of"] = out["trade_date"].dt.strftime("%Y-%m-%d")
+    out["coverage_complete"] = True
+    return out
+
+
+def _normalize_top_list(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
+    """Normalize top_list (龙虎榜) rows.
+
+    dragon_tiger_flag = 1 on event days, 0 on confirmed no-event days.
+    NaN means not queried / request failed.
+    """
+    if frame is None or frame.empty or "trade_date" not in frame.columns:
+        return pd.DataFrame()
+    out = frame.copy()
+    out["symbol"] = str(symbol).zfill(6)[-6:]
+    out["trade_date"] = pd.to_datetime(
+        out["trade_date"].astype(str), format="%Y%m%d", errors="coerce"
+    )
+    out = out.dropna(subset=["trade_date"])
+    if out.empty:
+        return pd.DataFrame()
+
+    # Aggregate per trade_date (multiple reasons possible)
+    agg = out.groupby("trade_date", as_index=False).agg(
+        reason_count=("trade_date", "size"),
+    )
+    if "reason" in out.columns:
+        reasons = out.groupby("trade_date")["reason"].apply(
+            lambda x: "|".join(sorted(set(str(v) for v in x if v)))
+        ).reset_index()
+        reasons.columns = ["trade_date", "reasons"]
+        agg = agg.merge(reasons, on="trade_date", how="left")
+    else:
+        agg["reasons"] = ""
+
+    if "buy" in out.columns:
+        agg["buy_amount"] = out.groupby("trade_date")["buy"].sum().values
+    if "sell" in out.columns:
+        agg["sell_amount"] = out.groupby("trade_date")["sell"].sum().values
+    if "amount" in out.columns:
+        agg["turnover"] = out.groupby("trade_date")["amount"].sum().values
+
+    agg["dragon_tiger_flag"] = 1.0
+    agg["source"] = "tushare_top_list"
+    agg["as_of"] = agg["trade_date"].dt.strftime("%Y-%m-%d")
+    agg["coverage_complete"] = True
+    return agg.sort_values("trade_date").reset_index(drop=True)
+
+
+def _normalize_top_inst(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
+    """Normalize top_inst (龙虎榜机构明细) rows."""
+    if frame is None or frame.empty or "trade_date" not in frame.columns:
+        return pd.DataFrame()
+    out = frame.copy()
+    out["symbol"] = str(symbol).zfill(6)[-6:]
+    out["trade_date"] = pd.to_datetime(
+        out["trade_date"].astype(str), format="%Y%m%d", errors="coerce"
+    )
+    out = out.dropna(subset=["trade_date"])
+    if out.empty:
+        return pd.DataFrame()
+
+    rename = {
+        "exalter": "institution_name",
+        "buy": "inst_buy_amount",
+        "sell": "inst_sell_amount",
+        "net_buy": "inst_net_amount",
+    }
+    for old, new in rename.items():
+        if old in out.columns:
+            out[new] = out[old] if old == "exalter" else pd.to_numeric(out[old], errors="coerce")
+
+    keep = ["symbol", "trade_date"]
+    for c in ("institution_name", "inst_buy_amount", "inst_sell_amount", "inst_net_amount"):
+        if c in out.columns:
+            keep.append(c)
+    out = out[keep].sort_values("trade_date").reset_index(drop=True)
+    out["source"] = "tushare_top_inst"
+    out["as_of"] = out["trade_date"].dt.strftime("%Y-%m-%d")
+    out["coverage_complete"] = True
+    return out
+
+
+def _normalize_block_trade(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
+    """Normalize block_trade (大宗交易) rows.
+
+    Derived fields:
+    - block_trade_amount: 成交金额 (元)
+    - block_trade_volume: 成交量 (股)
+    - block_trade_premium_discount: (price - close) / close, NaN if close unknown
+    - block_trade_net: NaN (no reliable direction from block_trade API)
+
+    Note: block_trade_net stays NaN because Tushare block_trade does not
+    provide reliable buy/sell direction. Do NOT fill with amount.
+    """
+    if frame is None or frame.empty or "trade_date" not in frame.columns:
+        return pd.DataFrame()
+    out = frame.copy()
+    out["symbol"] = str(symbol).zfill(6)[-6:]
+    out["trade_date"] = pd.to_datetime(
+        out["trade_date"].astype(str), format="%Y%m%d", errors="coerce"
+    )
+    out = out.dropna(subset=["trade_date"])
+    if out.empty:
+        return pd.DataFrame()
+
+    if "price" in out.columns:
+        out["block_price"] = pd.to_numeric(out["price"], errors="coerce")
+    if "vol" in out.columns:
+        out["block_trade_volume"] = pd.to_numeric(out["vol"], errors="coerce") * 100.0
+    if "amount" in out.columns:
+        out["block_trade_amount"] = pd.to_numeric(out["amount"], errors="coerce")
+    if "close" in out.columns:
+        close = pd.to_numeric(out["close"], errors="coerce")
+        price = out.get("block_price", pd.Series(float("nan"), index=out.index))
+        out["block_trade_premium_discount"] = (price - close) / close.replace(0, float("nan"))
+    else:
+        out["block_trade_premium_discount"] = float("nan")
+
+    # block_trade_net: NaN (no reliable direction)
+    out["block_trade_net"] = float("nan")
+
+    keep = ["symbol", "trade_date"]
+    for c in (
+        "block_price", "block_trade_volume", "block_trade_amount",
+        "block_trade_premium_discount", "block_trade_net",
+    ):
+        if c in out.columns:
+            keep.append(c)
+    if "buyer" in out.columns:
+        keep.append("buyer")
+        out["buyer"] = out["buyer"].astype(str)
+    if "seller" in out.columns:
+        keep.append("seller")
+        out["seller"] = out["seller"].astype(str)
+
+    out = out[keep].sort_values("trade_date").reset_index(drop=True)
+    out["source"] = "tushare_block_trade"
     out["as_of"] = out["trade_date"].dt.strftime("%Y-%m-%d")
     out["coverage_complete"] = True
     return out

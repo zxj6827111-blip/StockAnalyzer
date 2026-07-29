@@ -1353,6 +1353,81 @@ class RuntimeMarketSyncService:
 
 
 
+
+    def _enrich_market_warehouse_p3_events(
+        self,
+        *,
+        warehouse: MarketWarehouse,
+        online_provider: MarketDataProvider,
+        symbol: str,
+        target_end_date: date,
+    ) -> dict[str, object]:
+        """Fetch top_list, top_inst, block_trade and store event tables."""
+        result: dict[str, object] = {"status": "skipped", "reason": "no_p3_api"}
+        top_list_fn = getattr(online_provider, "fetch_top_list", None)
+        top_inst_fn = getattr(online_provider, "fetch_top_inst", None)
+        block_fn = getattr(online_provider, "fetch_block_trade", None)
+        if not any(callable(f) for f in (top_list_fn, top_inst_fn, block_fn)):
+            for attr in ("_provider", "provider", "_primary", "_inner"):
+                nested = getattr(online_provider, attr, None)
+                if nested is not None:
+                    top_list_fn = top_list_fn or getattr(
+                        nested, "fetch_top_list", None
+                    )
+                    top_inst_fn = top_inst_fn or getattr(
+                        nested, "fetch_top_inst", None
+                    )
+                    block_fn = block_fn or getattr(
+                        nested, "fetch_block_trade", None
+                    )
+        if not any(callable(f) for f in (top_list_fn, top_inst_fn, block_fn)):
+            return result
+
+        counts: dict[str, int] = {}
+        errors: list[str] = []
+
+        if callable(top_list_fn):
+            try:
+                frame = cast(
+                    pd.DataFrame,
+                    top_list_fn(symbol=symbol, end_date=target_end_date),
+                )
+                counts["top_list"] = warehouse.upsert_top_list_events(
+                    symbol=symbol, frame=frame
+                )
+            except Exception as exc:
+                errors.append(f"top_list:{type(exc).__name__}")
+
+        if callable(top_inst_fn):
+            try:
+                frame = cast(
+                    pd.DataFrame,
+                    top_inst_fn(symbol=symbol, end_date=target_end_date),
+                )
+                counts["top_inst"] = warehouse.upsert_top_inst_events(
+                    symbol=symbol, frame=frame
+                )
+            except Exception as exc:
+                errors.append(f"top_inst:{type(exc).__name__}")
+
+        if callable(block_fn):
+            try:
+                frame = cast(
+                    pd.DataFrame,
+                    block_fn(symbol=symbol, end_date=target_end_date),
+                )
+                counts["block_trade"] = warehouse.upsert_block_trade_events(
+                    symbol=symbol, frame=frame
+                )
+            except Exception as exc:
+                errors.append(f"block_trade:{type(exc).__name__}")
+
+        result["status"] = "ok" if not errors else "partial"
+        result["counts"] = counts
+        if errors:
+            result["errors"] = errors
+        return result
+
     def _enrich_market_warehouse_p2_data(
         self,
         *,
@@ -1662,6 +1737,12 @@ class RuntimeMarketSyncService:
             symbol=symbol,
             target_end_date=target_end_date,
         )
+        p3_enrichment = self._enrich_market_warehouse_p3_events(
+            warehouse=warehouse,
+            online_provider=online_provider,
+            symbol=symbol,
+            target_end_date=target_end_date,
+        )
         # Re-read daily after optional financial enrichment for accurate row/latest stats.
         final_daily = warehouse.fetch_all_daily_bars(symbol=symbol)
         if final_daily.empty:
@@ -1699,6 +1780,7 @@ class RuntimeMarketSyncService:
             "financial_enrichment": financial_enrichment,
             "trade_status_enrichment": trade_status_enrichment,
             "p2_enrichment": p2_enrichment,
+            "p3_enrichment": p3_enrichment,
         }
 
     def _sync_market_warehouse_intraday_symbol(
