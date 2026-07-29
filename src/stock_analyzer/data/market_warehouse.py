@@ -22,6 +22,7 @@ _DUCK_CONNECTION = Any
 
 _DAILY_TABLE = "daily_bars"
 _FINANCIAL_SNAPSHOT_TABLE = "financial_snapshots"
+_TRADE_STATUS_TABLE = "daily_trade_status"
 _INTRADAY_TABLES = {
     "1m": "intraday_summary_1m",
     "5m": "intraday_summary_5m",
@@ -155,6 +156,8 @@ class MarketWarehouse:
                 ("adjustment_source", "VARCHAR"),
                 ("adjustment_anchor_date", "VARCHAR"),
                 ("adjustment_anchor_factor", "DOUBLE"),
+                ("up_limit", "DOUBLE"),
+                ("down_limit", "DOUBLE"),
             ):
                 connection.execute(
                     f"ALTER TABLE {_DAILY_TABLE} "
@@ -228,6 +231,27 @@ class MarketWarehouse:
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_financial_snapshots_key
                 ON financial_snapshots (symbol, end_date, ann_date, financial_source)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS daily_trade_status (
+                    symbol VARCHAR,
+                    trade_date DATE,
+                    up_limit DOUBLE,
+                    down_limit DOUBLE,
+                    suspended BOOLEAN,
+                    suspend_type VARCHAR,
+                    source VARCHAR,
+                    as_of VARCHAR,
+                    coverage_complete BOOLEAN
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_status_key
+                ON daily_trade_status (symbol, trade_date)
                 """
             )
 
@@ -323,6 +347,79 @@ class MarketWarehouse:
             frame=enriched,
         )
         return enriched
+
+
+    def upsert_trade_status(self, *, symbol: str, frame: pd.DataFrame) -> int:
+        """Idempotent upsert of daily trade status rows."""
+        normalized_symbol = _normalize_symbol(symbol)
+        if frame is None or frame.empty:
+            return 0
+        payload = frame.copy()
+        payload["symbol"] = normalized_symbol
+        payload["trade_date"] = pd.to_datetime(payload["trade_date"], errors="coerce").dt.date
+        payload = payload.dropna(subset=["trade_date"])
+        if payload.empty:
+            return 0
+        self.ensure_schema()
+        with self._connect_write() as connection:
+            dates = payload["trade_date"].tolist()
+            for d in dates:
+                connection.execute(
+                    f"DELETE FROM {_TRADE_STATUS_TABLE} WHERE symbol = ? AND trade_date = ?",
+                    [normalized_symbol, d],
+                )
+            connection.register("ts_stage", payload)
+            cols = [
+                "symbol", "trade_date", "up_limit", "down_limit",
+                "suspended", "suspend_type", "source", "as_of", "coverage_complete",
+            ]
+            present = [c for c in cols if c in payload.columns]
+            connection.execute(
+                f"""
+                INSERT INTO {_TRADE_STATUS_TABLE} ({", ".join(present)})
+                SELECT {", ".join(present)} FROM ts_stage
+                """
+            )
+            connection.unregister("ts_stage")
+        return int(len(payload))
+
+    def fetch_trade_status(self, *, symbol: str) -> pd.DataFrame:
+        normalized_symbol = _normalize_symbol(symbol)
+        if not self._table_exists(_TRADE_STATUS_TABLE):
+            return pd.DataFrame()
+        query = f"""
+            SELECT * FROM {_TRADE_STATUS_TABLE}
+            WHERE symbol = ?
+            ORDER BY trade_date ASC
+        """
+        with self._connect_readonly() as connection:
+            frame = cast(pd.DataFrame, connection.execute(query, [normalized_symbol]).fetch_df())
+        if frame.empty:
+            return frame
+        frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
+        return frame
+
+    def apply_trade_status_to_daily(self, *, symbol: str) -> pd.DataFrame:
+        """Merge trade status (up_limit, down_limit, suspended) into daily bars."""
+        daily = self.fetch_all_daily_bars(symbol=symbol)
+        if daily.empty:
+            return daily
+        status = self.fetch_trade_status(symbol=symbol)
+        if status.empty:
+            return daily
+        status_idx = status.set_index(pd.to_datetime(status["trade_date"]))
+        for ts, row in status_idx.iterrows():
+            if ts in daily.index:
+                up = row.get("up_limit")
+                down = row.get("down_limit")
+                susp = bool(row.get("suspended", False))
+                if up is not None and not pd.isna(up):
+                    daily.at[ts, "up_limit"] = float(up)
+                if down is not None and not pd.isna(down):
+                    daily.at[ts, "down_limit"] = float(down)
+                daily.at[ts, "suspended"] = susp
+        self.replace_daily_bars(symbol=symbol, frame=daily)
+        return daily
 
 
     def warehouse_meta_path(self, symbol: str | None = None) -> Path:

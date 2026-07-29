@@ -70,6 +70,23 @@ class _TushareProApi(Protocol):
         fields: str = "",
     ) -> object: ...
 
+    def stk_limit(
+        self,
+        *,
+        ts_code: str = "",
+        trade_date: str = "",
+        start_date: str = "",
+        end_date: str = "",
+    ) -> object: ...
+
+    def suspend_d(
+        self,
+        *,
+        ts_code: str = "",
+        start_date: str = "",
+        end_date: str = "",
+    ) -> object: ...
+
 
 class TushareProvider:
     """Fetch A-share daily bars from Tushare Pro (`pro.daily` + `adj_factor` → qfq)."""
@@ -289,6 +306,64 @@ class TushareProvider:
             ) from exc
         frame = _coerce_frame(raw)
         return normalize_fina_indicator_rows(frame, symbol=code6)
+
+
+    def fetch_trade_status(
+        self,
+        symbol: str,
+        *,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> pd.DataFrame:
+        """Fetch stk_limit + suspend_d and merge into daily_trade_status rows.
+
+        Returns DataFrame with columns:
+        symbol, trade_date, up_limit, down_limit, suspended, suspend_type,
+        source, as_of, coverage_complete
+        """
+        pro = self._resolve_pro_api()
+        code6 = _normalize_symbol(symbol)
+        if not code6:
+            raise DataSourceError(f"invalid symbol for trade_status: {symbol}")
+        ts_code = _to_ts_code(code6)
+        resolved_end = end_date or date.today()
+        resolved_start = start_date or (resolved_end - timedelta(days=365))
+        start_s = resolved_start.strftime("%Y%m%d")
+        end_s = resolved_end.strftime("%Y%m%d")
+
+        limit_frame = pd.DataFrame()
+        try:
+            raw_limit = self._call_with_retry(
+                lambda: pro.stk_limit(
+                    ts_code=ts_code,
+                    start_date=start_s,
+                    end_date=end_s,
+                )
+            )
+            limit_frame = _coerce_frame(raw_limit)
+        except Exception:
+            limit_frame = pd.DataFrame()
+
+        suspend_frame = pd.DataFrame()
+        try:
+            raw_suspend = self._call_with_retry(
+                lambda: pro.suspend_d(
+                    ts_code=ts_code,
+                    start_date=start_s,
+                    end_date=end_s,
+                )
+            )
+            suspend_frame = _coerce_frame(raw_suspend)
+        except Exception:
+            suspend_frame = pd.DataFrame()
+
+        return _normalize_trade_status(
+            limit_frame=limit_frame,
+            suspend_frame=suspend_frame,
+            symbol=code6,
+            start_date=resolved_start,
+            end_date=resolved_end,
+        )
 
     def _resolve_pro_api(self) -> _TushareProApi:
         if self._pro_api is not None:
@@ -600,3 +675,78 @@ def _infer_board(symbol: str) -> str:
     if code.startswith(("8", "4")):
         return "bse"
     return "main"
+
+
+def _normalize_trade_status(
+    *,
+    limit_frame: pd.DataFrame,
+    suspend_frame: pd.DataFrame,
+    symbol: str,
+    start_date: date,
+    end_date: date,
+) -> pd.DataFrame:
+    """Merge stk_limit and suspend_d into unified trade status rows."""
+    rows: dict[str, dict[str, object]] = {}
+
+    if not limit_frame.empty and "trade_date" in limit_frame.columns:
+        lf = limit_frame.copy()
+        lf["trade_date"] = pd.to_datetime(
+            lf["trade_date"].astype(str), format="%Y%m%d", errors="coerce"
+        )
+        lf = lf.dropna(subset=["trade_date"])
+        for _, row in lf.iterrows():
+            td = row["trade_date"]
+            key = td.strftime("%Y-%m-%d")
+            if key not in rows:
+                rows[key] = {
+                    "symbol": symbol,
+                    "trade_date": td,
+                    "up_limit": float("nan"),
+                    "down_limit": float("nan"),
+                    "suspended": False,
+                    "suspend_type": "",
+                    "source": "tushare_stk_limit",
+                    "as_of": key,
+                    "coverage_complete": True,
+                }
+            up = pd.to_numeric(row.get("up_limit"), errors="coerce")
+            down = pd.to_numeric(row.get("down_limit"), errors="coerce")
+            if not pd.isna(up):
+                rows[key]["up_limit"] = float(up)
+            if not pd.isna(down):
+                rows[key]["down_limit"] = float(down)
+
+    if not suspend_frame.empty and "trade_date" in suspend_frame.columns:
+        sf = suspend_frame.copy()
+        sf["trade_date"] = pd.to_datetime(
+            sf["trade_date"].astype(str), format="%Y%m%d", errors="coerce"
+        )
+        sf = sf.dropna(subset=["trade_date"])
+        for _, row in sf.iterrows():
+            td = row["trade_date"]
+            key = td.strftime("%Y-%m-%d")
+            if key not in rows:
+                rows[key] = {
+                    "symbol": symbol,
+                    "trade_date": td,
+                    "up_limit": float("nan"),
+                    "down_limit": float("nan"),
+                    "suspended": False,
+                    "suspend_type": "",
+                    "source": "tushare_suspend_d",
+                    "as_of": key,
+                    "coverage_complete": True,
+                }
+            rows[key]["suspended"] = True
+            stype = str(row.get("suspend_type", "") or row.get("reason", "") or "").strip()
+            if stype:
+                rows[key]["suspend_type"] = stype
+            rows[key]["source"] = "tushare_stk_limit+suspend_d"
+
+    if not rows:
+        return pd.DataFrame()
+
+    result = pd.DataFrame(list(rows.values()))
+    result["trade_date"] = pd.to_datetime(result["trade_date"])
+    result = result.sort_values("trade_date").reset_index(drop=True)
+    return result
