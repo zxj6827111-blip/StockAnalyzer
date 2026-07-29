@@ -1354,6 +1354,50 @@ class RuntimeMarketSyncService:
 
 
 
+
+    def _enrich_market_warehouse_index_daily(
+        self,
+        *,
+        warehouse: MarketWarehouse,
+        online_provider: MarketDataProvider,
+        target_end_date: date,
+    ) -> dict[str, object]:
+        """Fetch index_daily (CSI 300) and store in warehouse."""
+        result: dict[str, object] = {"status": "skipped", "reason": "no_index_api"}
+        fetch_fn = getattr(online_provider, "fetch_index_daily", None)
+        if not callable(fetch_fn):
+            for attr in ("_provider", "provider", "_primary", "_inner"):
+                nested = getattr(online_provider, attr, None)
+                if nested is not None and callable(
+                    getattr(nested, "fetch_index_daily", None)
+                ):
+                    fetch_fn = nested.fetch_index_daily
+                    break
+        if not callable(fetch_fn):
+            return result
+
+        try:
+            frame = cast(
+                pd.DataFrame,
+                fetch_fn("000300.SH", end_date=target_end_date),
+            )
+        except Exception as exc:
+            result["status"] = "failed"
+            result["reason"] = f"index_daily_error:{type(exc).__name__}"
+            result["error"] = str(exc)[:200]
+            return result
+
+        if frame is None or frame.empty:
+            result["status"] = "ok"
+            result["reason"] = "no_rows"
+            return result
+
+        count = warehouse.upsert_index_daily(frame=frame)
+        result["status"] = "ok"
+        result["reason"] = "enriched"
+        result["rows"] = int(count)
+        return result
+
     def _enrich_market_warehouse_p3_events(
         self,
         *,
@@ -1743,6 +1787,11 @@ class RuntimeMarketSyncService:
             symbol=symbol,
             target_end_date=target_end_date,
         )
+        index_enrichment = self._enrich_market_warehouse_index_daily(
+            warehouse=warehouse,
+            online_provider=online_provider,
+            target_end_date=target_end_date,
+        )
         # Re-read daily after optional financial enrichment for accurate row/latest stats.
         final_daily = warehouse.fetch_all_daily_bars(symbol=symbol)
         if final_daily.empty:
@@ -1781,6 +1830,7 @@ class RuntimeMarketSyncService:
             "trade_status_enrichment": trade_status_enrichment,
             "p2_enrichment": p2_enrichment,
             "p3_enrichment": p3_enrichment,
+            "index_enrichment": index_enrichment,
         }
 
     def _sync_market_warehouse_intraday_symbol(

@@ -29,6 +29,7 @@ _HK_HOLD_TABLE = "hk_hold"
 _TOP_LIST_TABLE = "top_list_events"
 _TOP_INST_TABLE = "top_inst_events"
 _BLOCK_TRADE_TABLE = "block_trade_events"
+_INDEX_DAILY_TABLE = "index_daily"
 _INTRADAY_TABLES = {
     "1m": "intraday_summary_1m",
     "5m": "intraday_summary_5m",
@@ -358,6 +359,29 @@ class MarketWarehouse:
                     as_of VARCHAR,
                     coverage_complete BOOLEAN
                 )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS index_daily (
+                    index_code VARCHAR,
+                    trade_date DATE,
+                    open DOUBLE,
+                    high DOUBLE,
+                    low DOUBLE,
+                    close DOUBLE,
+                    volume DOUBLE,
+                    turnover DOUBLE,
+                    source VARCHAR,
+                    as_of VARCHAR,
+                    coverage_complete BOOLEAN
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_index_daily_key
+                ON index_daily (index_code, trade_date)
                 """
             )
 
@@ -806,6 +830,56 @@ class MarketWarehouse:
                 f"SELECT * FROM {_BLOCK_TRADE_TABLE} "
                 "WHERE symbol = ? ORDER BY trade_date",
                 [normalized_symbol],
+            ).fetch_df())
+        if not frame.empty and "trade_date" in frame.columns:
+            frame["trade_date"] = pd.to_datetime(
+                frame["trade_date"], errors="coerce"
+            )
+        return frame
+
+
+
+    def upsert_index_daily(self, *, frame: pd.DataFrame) -> int:
+        if frame is None or frame.empty:
+            return 0
+        payload = frame.copy()
+        payload["trade_date"] = pd.to_datetime(
+            payload["trade_date"], errors="coerce"
+        ).dt.date
+        payload = payload.dropna(subset=["trade_date"])
+        if payload.empty:
+            return 0
+        self.ensure_schema()
+        with self._connect_write() as connection:
+            for _, row in payload.iterrows():
+                connection.execute(
+                    f"DELETE FROM {_INDEX_DAILY_TABLE} "
+                    "WHERE index_code = ? AND trade_date = ?",
+                    [str(row.get("index_code", "")), row["trade_date"]],
+                )
+            connection.register("idx_stage", payload)
+            cols = [c for c in payload.columns if c in (
+                "index_code", "trade_date", "open", "high", "low", "close",
+                "volume", "turnover", "source", "as_of", "coverage_complete",
+            )]
+            col_str = ", ".join(cols)
+            connection.execute(
+                f"INSERT INTO {_INDEX_DAILY_TABLE} ({col_str}) "
+                f"SELECT {col_str} FROM idx_stage"
+            )
+            connection.unregister("idx_stage")
+        return int(len(payload))
+
+    def fetch_index_daily(
+        self, *, index_code: str = "000300.SH"
+    ) -> pd.DataFrame:
+        if not self._table_exists(_INDEX_DAILY_TABLE):
+            return pd.DataFrame()
+        with self._connect_readonly() as connection:
+            frame = cast(pd.DataFrame, connection.execute(
+                f"SELECT * FROM {_INDEX_DAILY_TABLE} "
+                "WHERE index_code = ? ORDER BY trade_date",
+                [index_code],
             ).fetch_df())
         if not frame.empty and "trade_date" in frame.columns:
             frame["trade_date"] = pd.to_datetime(

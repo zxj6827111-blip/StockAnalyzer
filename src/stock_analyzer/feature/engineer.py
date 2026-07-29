@@ -271,6 +271,10 @@ class FeatureEngineer:
             index=ordered.index,
         )
         raw = pd.concat([raw, background], axis=1)
+        market_idx_frame = _prepare_market_index_frame(
+            frame=market_index,
+            target_index=ordered.index,
+        )
         raw = pd.concat(
             [
                 raw,
@@ -284,13 +288,69 @@ class FeatureEngineer:
                     prefix="i5m",
                     target_index=ordered.index,
                 ),
-                _prepare_market_index_frame(
-                    frame=market_index,
-                    target_index=ordered.index,
-                ),
+                market_idx_frame,
             ],
             axis=1,
         )
+
+        # Relative strength features vs market index (P4).
+        # Requires market_index with a "close" column aligned to bars index.
+        idx_close = (
+            pd.to_numeric(market_idx_frame.get("close"), errors="coerce")
+            if not market_idx_frame.empty and "close" in market_idx_frame.columns
+            else pd.Series(np.nan, index=ordered.index, dtype=float)
+        )
+        if idx_close.notna().any():
+            stock_ret_5 = close.pct_change(5)
+            stock_ret_20 = close.pct_change(20)
+            stock_ret_60 = close.pct_change(60)
+            idx_ret_5 = idx_close.pct_change(5)
+            idx_ret_20 = idx_close.pct_change(20)
+            idx_ret_60 = idx_close.pct_change(60)
+            raw["excess_ret_5"] = stock_ret_5 - idx_ret_5
+            raw["excess_ret_20"] = stock_ret_20 - idx_ret_20
+            raw["excess_ret_60"] = stock_ret_60 - idx_ret_60
+            raw["relative_strength_5"] = _safe_div(
+                close, idx_close
+            ).pct_change(5)
+            raw["relative_strength_20"] = _safe_div(
+                close, idx_close
+            ).pct_change(20)
+            raw["rs_ma5"] = raw["relative_strength_5"].rolling(
+                5, min_periods=1
+            ).mean()
+            raw["rs_ma20"] = raw["relative_strength_20"].rolling(
+                20, min_periods=1
+            ).mean()
+            # Rolling beta (60d covariance / index variance)
+            stock_ret_1 = close.pct_change()
+            idx_ret_1 = idx_close.pct_change()
+            cov_60 = stock_ret_1.rolling(60, min_periods=20).cov(idx_ret_1)
+            var_60 = idx_ret_1.rolling(60, min_periods=20).var()
+            raw["rolling_beta_60"] = _safe_div(cov_60, var_60)
+            # Excess return volatility
+            excess_1 = stock_ret_1 - idx_ret_1
+            raw["excess_vol_20"] = excess_1.rolling(
+                20, min_periods=5
+            ).std(ddof=0)
+            raw["excess_vol_60"] = excess_1.rolling(
+                60, min_periods=20
+            ).std(ddof=0)
+            # Market trend state: index above/below its MA20
+            idx_ma20 = idx_close.rolling(20, min_periods=1).mean()
+            raw["market_trend"] = (
+                (idx_close > idx_ma20).astype(float) * 2.0 - 1.0
+            )
+        else:
+            for feat in (
+                "excess_ret_5", "excess_ret_20", "excess_ret_60",
+                "relative_strength_5", "relative_strength_20",
+                "rs_ma5", "rs_ma20", "rolling_beta_60",
+                "excess_vol_20", "excess_vol_60", "market_trend",
+            ):
+                raw[feat] = pd.Series(
+                    np.nan, index=ordered.index, dtype=float
+                )
 
         # Defragment once before the final block to avoid repeated frame reallocation.
         raw = raw.copy()

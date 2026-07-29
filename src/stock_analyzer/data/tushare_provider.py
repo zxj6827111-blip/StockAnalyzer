@@ -138,6 +138,14 @@ class _TushareProApi(Protocol):
         end_date: str = "",
     ) -> object: ...
 
+    def index_daily(
+        self,
+        *,
+        ts_code: str = "",
+        start_date: str = "",
+        end_date: str = "",
+    ) -> object: ...
+
 
 class TushareProvider:
     """Fetch A-share daily bars from Tushare Pro (`pro.daily` + `adj_factor` → qfq)."""
@@ -603,6 +611,37 @@ class TushareProvider:
                 f"tushare block_trade failed for {ts_code}: {exc}"
             ) from exc
         return _normalize_block_trade(_coerce_frame(raw), symbol=code6)
+
+
+    def fetch_index_daily(
+        self,
+        index_code: str = "000300.SH",
+        *,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> pd.DataFrame:
+        """Fetch index_daily for market-level index (default: CSI 300).
+
+        Returns DataFrame with: trade_date, open, high, low, close, vol, amount
+        """
+        pro = self._resolve_pro_api()
+        resolved_end = end_date or date.today()
+        resolved_start = start_date or (resolved_end - timedelta(days=365 * 2))
+        start_s = resolved_start.strftime("%Y%m%d")
+        end_s = resolved_end.strftime("%Y%m%d")
+        try:
+            raw = self._call_with_retry(
+                lambda: pro.index_daily(
+                    ts_code=index_code,
+                    start_date=start_s,
+                    end_date=end_s,
+                )
+            )
+        except Exception as exc:
+            raise DataSourceError(
+                f"tushare index_daily failed for {index_code}: {exc}"
+            ) from exc
+        return _normalize_index_daily(_coerce_frame(raw), index_code=index_code)
 
     def _resolve_pro_api(self) -> _TushareProApi:
         if self._pro_api is not None:
@@ -1259,6 +1298,37 @@ def _normalize_block_trade(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
 
     out = out[keep].sort_values("trade_date").reset_index(drop=True)
     out["source"] = "tushare_block_trade"
+    out["as_of"] = out["trade_date"].dt.strftime("%Y-%m-%d")
+    out["coverage_complete"] = True
+    return out
+
+
+def _normalize_index_daily(frame: pd.DataFrame, *, index_code: str) -> pd.DataFrame:
+    """Normalize index_daily rows."""
+    if frame is None or frame.empty or "trade_date" not in frame.columns:
+        return pd.DataFrame()
+    out = frame.copy()
+    out["index_code"] = index_code
+    out["trade_date"] = pd.to_datetime(
+        out["trade_date"].astype(str), format="%Y%m%d", errors="coerce"
+    )
+    out = out.dropna(subset=["trade_date"])
+    if out.empty:
+        return pd.DataFrame()
+    for col in ("open", "high", "low", "close", "vol", "amount"):
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    if "vol" in out.columns:
+        out["volume"] = out["vol"] * 100.0
+    if "amount" in out.columns:
+        out["turnover"] = out["amount"] * 1000.0
+    keep = ["index_code", "trade_date", "open", "high", "low", "close"]
+    if "volume" in out.columns:
+        keep.append("volume")
+    if "turnover" in out.columns:
+        keep.append("turnover")
+    out = out[keep].sort_values("trade_date").reset_index(drop=True)
+    out["source"] = "tushare_index_daily"
     out["as_of"] = out["trade_date"].dt.strftime("%Y-%m-%d")
     out["coverage_complete"] = True
     return out
