@@ -87,6 +87,30 @@ class _TushareProApi(Protocol):
         end_date: str = "",
     ) -> object: ...
 
+    def margin_detail(
+        self,
+        *,
+        ts_code: str = "",
+        start_date: str = "",
+        end_date: str = "",
+    ) -> object: ...
+
+    def moneyflow(
+        self,
+        *,
+        ts_code: str = "",
+        start_date: str = "",
+        end_date: str = "",
+    ) -> object: ...
+
+    def hk_hold(
+        self,
+        *,
+        ts_code: str = "",
+        start_date: str = "",
+        end_date: str = "",
+    ) -> object: ...
+
 
 class TushareProvider:
     """Fetch A-share daily bars from Tushare Pro (`pro.daily` + `adj_factor` → qfq)."""
@@ -364,6 +388,100 @@ class TushareProvider:
             start_date=resolved_start,
             end_date=resolved_end,
         )
+
+
+    def fetch_margin_detail(
+        self,
+        symbol: str,
+        *,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> pd.DataFrame:
+        """Fetch margin_detail (融资融券) for a single stock."""
+        pro = self._resolve_pro_api()
+        code6 = _normalize_symbol(symbol)
+        if not code6:
+            raise DataSourceError(f"invalid symbol for margin_detail: {symbol}")
+        ts_code = _to_ts_code(code6)
+        resolved_end = end_date or date.today()
+        resolved_start = start_date or (resolved_end - timedelta(days=365))
+        start_s = resolved_start.strftime("%Y%m%d")
+        end_s = resolved_end.strftime("%Y%m%d")
+        try:
+            raw = self._call_with_retry(
+                lambda: pro.margin_detail(
+                    ts_code=ts_code,
+                    start_date=start_s,
+                    end_date=end_s,
+                )
+            )
+        except Exception as exc:
+            raise DataSourceError(
+                f"tushare margin_detail failed for {ts_code}: {exc}"
+            ) from exc
+        return _normalize_margin_detail(_coerce_frame(raw), symbol=code6)
+
+    def fetch_moneyflow(
+        self,
+        symbol: str,
+        *,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> pd.DataFrame:
+        """Fetch moneyflow (个股资金流) for a single stock."""
+        pro = self._resolve_pro_api()
+        code6 = _normalize_symbol(symbol)
+        if not code6:
+            raise DataSourceError(f"invalid symbol for moneyflow: {symbol}")
+        ts_code = _to_ts_code(code6)
+        resolved_end = end_date or date.today()
+        resolved_start = start_date or (resolved_end - timedelta(days=365))
+        start_s = resolved_start.strftime("%Y%m%d")
+        end_s = resolved_end.strftime("%Y%m%d")
+        try:
+            raw = self._call_with_retry(
+                lambda: pro.moneyflow(
+                    ts_code=ts_code,
+                    start_date=start_s,
+                    end_date=end_s,
+                )
+            )
+        except Exception as exc:
+            raise DataSourceError(
+                f"tushare moneyflow failed for {ts_code}: {exc}"
+            ) from exc
+        return _normalize_moneyflow(_coerce_frame(raw), symbol=code6)
+
+    def fetch_hk_hold(
+        self,
+        symbol: str,
+        *,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> pd.DataFrame:
+        """Fetch hk_hold (北向持股) for a single stock."""
+        pro = self._resolve_pro_api()
+        code6 = _normalize_symbol(symbol)
+        if not code6:
+            raise DataSourceError(f"invalid symbol for hk_hold: {symbol}")
+        ts_code = _to_ts_code(code6)
+        resolved_end = end_date or date.today()
+        resolved_start = start_date or (resolved_end - timedelta(days=365))
+        start_s = resolved_start.strftime("%Y%m%d")
+        end_s = resolved_end.strftime("%Y%m%d")
+        try:
+            raw = self._call_with_retry(
+                lambda: pro.hk_hold(
+                    ts_code=ts_code,
+                    start_date=start_s,
+                    end_date=end_s,
+                )
+            )
+        except Exception as exc:
+            raise DataSourceError(
+                f"tushare hk_hold failed for {ts_code}: {exc}"
+            ) from exc
+        return _normalize_hk_hold(_coerce_frame(raw), symbol=code6)
 
     def _resolve_pro_api(self) -> _TushareProApi:
         if self._pro_api is not None:
@@ -750,3 +868,138 @@ def _normalize_trade_status(
     result["trade_date"] = pd.to_datetime(result["trade_date"])
     result = result.sort_values("trade_date").reset_index(drop=True)
     return result
+
+
+def _normalize_margin_detail(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
+    """Normalize margin_detail rows.
+
+    Fields preserved:
+    - rzye -> financing_balance (融资余额, yuan)
+    - rzmre -> financing_buy_amount (融资买入额, yuan)
+    - rqye -> securities_lending_balance (融券余额, yuan)
+    - rqyl -> securities_lending_volume (融券余量, shares)
+    - rqmcl -> securities_lending_sell_volume (融券卖出量, shares)
+    """
+    if frame is None or frame.empty or "trade_date" not in frame.columns:
+        return pd.DataFrame()
+    out = frame.copy()
+    out["symbol"] = str(symbol).zfill(6)[-6:]
+    out["trade_date"] = pd.to_datetime(
+        out["trade_date"].astype(str), format="%Y%m%d", errors="coerce"
+    )
+    out = out.dropna(subset=["trade_date"])
+    if out.empty:
+        return pd.DataFrame()
+    rename = {
+        "rzye": "financing_balance",
+        "rzmre": "financing_buy_amount",
+        "rqye": "securities_lending_balance",
+        "rqyl": "securities_lending_volume",
+        "rqmcl": "securities_lending_sell_volume",
+    }
+    for old, new in rename.items():
+        if old in out.columns:
+            out[new] = pd.to_numeric(out[old], errors="coerce")
+    keep = ["symbol", "trade_date"] + [v for v in rename.values() if v in out.columns]
+    out = out[keep].sort_values("trade_date").reset_index(drop=True)
+    out["source"] = "tushare_margin_detail"
+    out["as_of"] = out["trade_date"].dt.strftime("%Y-%m-%d")
+    out["coverage_complete"] = True
+    return out
+
+
+def _normalize_moneyflow(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
+    """Normalize moneyflow rows.
+
+    Derived field:
+    - net_mf_amount = buy_lg + buy_elg - sell_lg - sell_elg (主力净流入, 万元)
+
+    Original fields preserved (万元):
+    - buy_sm_amount, sell_sm_amount (小单)
+    - buy_md_amount, sell_md_amount (中单)
+    - buy_lg_amount, sell_lg_amount (大单)
+    - buy_elg_amount, sell_elg_amount (超大单)
+    """
+    if frame is None or frame.empty or "trade_date" not in frame.columns:
+        return pd.DataFrame()
+    out = frame.copy()
+    out["symbol"] = str(symbol).zfill(6)[-6:]
+    out["trade_date"] = pd.to_datetime(
+        out["trade_date"].astype(str), format="%Y%m%d", errors="coerce"
+    )
+    out = out.dropna(subset=["trade_date"])
+    if out.empty:
+        return pd.DataFrame()
+
+    amount_cols = [
+        "buy_sm_amount", "sell_sm_amount",
+        "buy_md_amount", "sell_md_amount",
+        "buy_lg_amount", "sell_lg_amount",
+        "buy_elg_amount", "sell_elg_amount",
+    ]
+    for col in amount_cols:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    buy_lg = out.get("buy_lg_amount", pd.Series(0.0, index=out.index))
+    buy_elg = out.get("buy_elg_amount", pd.Series(0.0, index=out.index))
+    sell_lg = out.get("sell_lg_amount", pd.Series(0.0, index=out.index))
+    sell_elg = out.get("sell_elg_amount", pd.Series(0.0, index=out.index))
+    out["net_mf_amount"] = (
+        buy_lg.fillna(0) + buy_elg.fillna(0) - sell_lg.fillna(0) - sell_elg.fillna(0)
+    )
+    mask = buy_lg.isna() | buy_elg.isna() | sell_lg.isna() | sell_elg.isna()
+    out.loc[mask, "net_mf_amount"] = float("nan")
+
+    keep = ["symbol", "trade_date"] + [c for c in amount_cols if c in out.columns]
+    keep.append("net_mf_amount")
+    out = out[keep].sort_values("trade_date").reset_index(drop=True)
+    out["source"] = "tushare_moneyflow"
+    out["as_of"] = out["trade_date"].dt.strftime("%Y-%m-%d")
+    out["coverage_complete"] = True
+    return out
+
+
+def _normalize_hk_hold(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
+    """Normalize hk_hold rows.
+
+    Fields:
+    - hold_vol: 北向持股数量 (股)
+    - hold_ratio: 北向持股比例 (小数)
+    - hold_market_cap: 北向持股市值 (元)
+
+    0 rows from API = no coverage/unknown, NOT real zero.
+    """
+    if frame is None or frame.empty or "trade_date" not in frame.columns:
+        return pd.DataFrame()
+    out = frame.copy()
+    out["symbol"] = str(symbol).zfill(6)[-6:]
+    out["trade_date"] = pd.to_datetime(
+        out["trade_date"].astype(str), format="%Y%m%d", errors="coerce"
+    )
+    out = out.dropna(subset=["trade_date"])
+    if out.empty:
+        return pd.DataFrame()
+
+    if "vol" in out.columns:
+        out["hold_vol"] = pd.to_numeric(out["vol"], errors="coerce")
+    elif "hold_vol" in out.columns:
+        out["hold_vol"] = pd.to_numeric(out["hold_vol"], errors="coerce")
+    if "ratio" in out.columns:
+        out["hold_ratio"] = pd.to_numeric(out["ratio"], errors="coerce")
+    elif "hold_ratio" in out.columns:
+        out["hold_ratio"] = pd.to_numeric(out["hold_ratio"], errors="coerce")
+    if "market_cap" in out.columns:
+        out["hold_market_cap"] = pd.to_numeric(out["market_cap"], errors="coerce")
+    elif "hold_market_cap" in out.columns:
+        out["hold_market_cap"] = pd.to_numeric(out["hold_market_cap"], errors="coerce")
+
+    keep_cols = ["symbol", "trade_date"]
+    for c in ("hold_vol", "hold_ratio", "hold_market_cap"):
+        if c in out.columns:
+            keep_cols.append(c)
+    out = out[keep_cols].sort_values("trade_date").reset_index(drop=True)
+    out["source"] = "tushare_hk_hold"
+    out["as_of"] = out["trade_date"].dt.strftime("%Y-%m-%d")
+    out["coverage_complete"] = True
+    return out

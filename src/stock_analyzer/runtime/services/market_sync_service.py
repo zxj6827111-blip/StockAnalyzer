@@ -1352,6 +1352,60 @@ class RuntimeMarketSyncService:
 
 
 
+
+    def _enrich_market_warehouse_p2_data(
+        self,
+        *,
+        warehouse: MarketWarehouse,
+        online_provider: MarketDataProvider,
+        symbol: str,
+        target_end_date: date,
+    ) -> dict[str, object]:
+        """Fetch margin_detail, moneyflow, hk_hold and store in warehouse."""
+        result: dict[str, object] = {"status": "skipped", "reason": "no_p2_api"}
+        margin_fn = getattr(online_provider, "fetch_margin_detail", None)
+        moneyflow_fn = getattr(online_provider, "fetch_moneyflow", None)
+        hk_fn = getattr(online_provider, "fetch_hk_hold", None)
+        if not any(callable(f) for f in (margin_fn, moneyflow_fn, hk_fn)):
+            for attr in ("_provider", "provider", "_primary", "_inner"):
+                nested = getattr(online_provider, attr, None)
+                if nested is not None:
+                    margin_fn = margin_fn or getattr(nested, "fetch_margin_detail", None)
+                    moneyflow_fn = moneyflow_fn or getattr(nested, "fetch_moneyflow", None)
+                    hk_fn = hk_fn or getattr(nested, "fetch_hk_hold", None)
+        if not any(callable(f) for f in (margin_fn, moneyflow_fn, hk_fn)):
+            return result
+
+        counts: dict[str, int] = {}
+        errors: list[str] = []
+
+        if callable(margin_fn):
+            try:
+                frame = cast(pd.DataFrame, margin_fn(symbol=symbol, end_date=target_end_date))
+                counts["margin"] = warehouse.upsert_margin_detail(symbol=symbol, frame=frame)
+            except Exception as exc:
+                errors.append(f"margin:{type(exc).__name__}")
+
+        if callable(moneyflow_fn):
+            try:
+                frame = cast(pd.DataFrame, moneyflow_fn(symbol=symbol, end_date=target_end_date))
+                counts["moneyflow"] = warehouse.upsert_moneyflow(symbol=symbol, frame=frame)
+            except Exception as exc:
+                errors.append(f"moneyflow:{type(exc).__name__}")
+
+        if callable(hk_fn):
+            try:
+                frame = cast(pd.DataFrame, hk_fn(symbol=symbol, end_date=target_end_date))
+                counts["hk_hold"] = warehouse.upsert_hk_hold(symbol=symbol, frame=frame)
+            except Exception as exc:
+                errors.append(f"hk_hold:{type(exc).__name__}")
+
+        result["status"] = "ok" if not errors else "partial"
+        result["counts"] = counts
+        if errors:
+            result["errors"] = errors
+        return result
+
     def _enrich_market_warehouse_trade_status(
         self,
         *,
@@ -1602,6 +1656,12 @@ class RuntimeMarketSyncService:
             symbol=symbol,
             target_end_date=target_end_date,
         )
+        p2_enrichment = self._enrich_market_warehouse_p2_data(
+            warehouse=warehouse,
+            online_provider=online_provider,
+            symbol=symbol,
+            target_end_date=target_end_date,
+        )
         # Re-read daily after optional financial enrichment for accurate row/latest stats.
         final_daily = warehouse.fetch_all_daily_bars(symbol=symbol)
         if final_daily.empty:
@@ -1638,6 +1698,7 @@ class RuntimeMarketSyncService:
             },
             "financial_enrichment": financial_enrichment,
             "trade_status_enrichment": trade_status_enrichment,
+            "p2_enrichment": p2_enrichment,
         }
 
     def _sync_market_warehouse_intraday_symbol(

@@ -23,6 +23,9 @@ _DUCK_CONNECTION = Any
 _DAILY_TABLE = "daily_bars"
 _FINANCIAL_SNAPSHOT_TABLE = "financial_snapshots"
 _TRADE_STATUS_TABLE = "daily_trade_status"
+_MARGIN_TABLE = "margin_detail"
+_MONEYFLOW_TABLE = "moneyflow"
+_HK_HOLD_TABLE = "hk_hold"
 _INTRADAY_TABLES = {
     "1m": "intraday_summary_1m",
     "5m": "intraday_summary_5m",
@@ -254,6 +257,56 @@ class MarketWarehouse:
                 ON daily_trade_status (symbol, trade_date)
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS margin_detail (
+                    symbol VARCHAR,
+                    trade_date DATE,
+                    financing_balance DOUBLE,
+                    financing_buy_amount DOUBLE,
+                    securities_lending_balance DOUBLE,
+                    securities_lending_volume DOUBLE,
+                    securities_lending_sell_volume DOUBLE,
+                    source VARCHAR,
+                    as_of VARCHAR,
+                    coverage_complete BOOLEAN
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS moneyflow (
+                    symbol VARCHAR,
+                    trade_date DATE,
+                    buy_sm_amount DOUBLE,
+                    sell_sm_amount DOUBLE,
+                    buy_md_amount DOUBLE,
+                    sell_md_amount DOUBLE,
+                    buy_lg_amount DOUBLE,
+                    sell_lg_amount DOUBLE,
+                    buy_elg_amount DOUBLE,
+                    sell_elg_amount DOUBLE,
+                    net_mf_amount DOUBLE,
+                    source VARCHAR,
+                    as_of VARCHAR,
+                    coverage_complete BOOLEAN
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS hk_hold (
+                    symbol VARCHAR,
+                    trade_date DATE,
+                    hold_vol DOUBLE,
+                    hold_ratio DOUBLE,
+                    hold_market_cap DOUBLE,
+                    source VARCHAR,
+                    as_of VARCHAR,
+                    coverage_complete BOOLEAN
+                )
+                """
+            )
 
 
     def upsert_financial_snapshots(self, *, symbol: str, frame: pd.DataFrame) -> int:
@@ -420,6 +473,137 @@ class MarketWarehouse:
                 daily.at[ts, "suspended"] = susp
         self.replace_daily_bars(symbol=symbol, frame=daily)
         return daily
+
+
+
+    def upsert_margin_detail(self, *, symbol: str, frame: pd.DataFrame) -> int:
+        normalized_symbol = _normalize_symbol(symbol)
+        if frame is None or frame.empty:
+            return 0
+        payload = frame.copy()
+        payload["symbol"] = normalized_symbol
+        payload["trade_date"] = pd.to_datetime(payload["trade_date"], errors="coerce").dt.date
+        payload = payload.dropna(subset=["trade_date"])
+        if payload.empty:
+            return 0
+        self.ensure_schema()
+        with self._connect_write() as connection:
+            for d in payload["trade_date"].tolist():
+                connection.execute(
+                    f"DELETE FROM {_MARGIN_TABLE} WHERE symbol = ? AND trade_date = ?",
+                    [normalized_symbol, d],
+                )
+            connection.register("margin_stage", payload)
+            cols = [c for c in payload.columns if c in (
+                "symbol", "trade_date", "financing_balance", "financing_buy_amount",
+                "securities_lending_balance", "securities_lending_volume",
+                "securities_lending_sell_volume", "source", "as_of", "coverage_complete",
+            )]
+            connection.execute(
+                f"INSERT INTO {_MARGIN_TABLE} ({', '.join(cols)}) "
+                f"SELECT {', '.join(cols)} FROM margin_stage"
+            )
+            connection.unregister("margin_stage")
+        return int(len(payload))
+
+    def fetch_margin_detail(self, *, symbol: str) -> pd.DataFrame:
+        normalized_symbol = _normalize_symbol(symbol)
+        if not self._table_exists(_MARGIN_TABLE):
+            return pd.DataFrame()
+        with self._connect_readonly() as connection:
+            frame = cast(pd.DataFrame, connection.execute(
+                f"SELECT * FROM {_MARGIN_TABLE} WHERE symbol = ? ORDER BY trade_date",
+                [normalized_symbol],
+            ).fetch_df())
+        if not frame.empty and "trade_date" in frame.columns:
+            frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
+        return frame
+
+    def upsert_moneyflow(self, *, symbol: str, frame: pd.DataFrame) -> int:
+        normalized_symbol = _normalize_symbol(symbol)
+        if frame is None or frame.empty:
+            return 0
+        payload = frame.copy()
+        payload["symbol"] = normalized_symbol
+        payload["trade_date"] = pd.to_datetime(payload["trade_date"], errors="coerce").dt.date
+        payload = payload.dropna(subset=["trade_date"])
+        if payload.empty:
+            return 0
+        self.ensure_schema()
+        with self._connect_write() as connection:
+            for d in payload["trade_date"].tolist():
+                connection.execute(
+                    f"DELETE FROM {_MONEYFLOW_TABLE} WHERE symbol = ? AND trade_date = ?",
+                    [normalized_symbol, d],
+                )
+            connection.register("mf_stage", payload)
+            cols = [c for c in payload.columns if c in (
+                "symbol", "trade_date", "buy_sm_amount", "sell_sm_amount",
+                "buy_md_amount", "sell_md_amount", "buy_lg_amount", "sell_lg_amount",
+                "buy_elg_amount", "sell_elg_amount", "net_mf_amount",
+                "source", "as_of", "coverage_complete",
+            )]
+            connection.execute(
+                f"INSERT INTO {_MONEYFLOW_TABLE} ({', '.join(cols)}) "
+                f"SELECT {', '.join(cols)} FROM mf_stage"
+            )
+            connection.unregister("mf_stage")
+        return int(len(payload))
+
+    def fetch_moneyflow(self, *, symbol: str) -> pd.DataFrame:
+        normalized_symbol = _normalize_symbol(symbol)
+        if not self._table_exists(_MONEYFLOW_TABLE):
+            return pd.DataFrame()
+        with self._connect_readonly() as connection:
+            frame = cast(pd.DataFrame, connection.execute(
+                f"SELECT * FROM {_MONEYFLOW_TABLE} WHERE symbol = ? ORDER BY trade_date",
+                [normalized_symbol],
+            ).fetch_df())
+        if not frame.empty and "trade_date" in frame.columns:
+            frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
+        return frame
+
+    def upsert_hk_hold(self, *, symbol: str, frame: pd.DataFrame) -> int:
+        normalized_symbol = _normalize_symbol(symbol)
+        if frame is None or frame.empty:
+            return 0
+        payload = frame.copy()
+        payload["symbol"] = normalized_symbol
+        payload["trade_date"] = pd.to_datetime(payload["trade_date"], errors="coerce").dt.date
+        payload = payload.dropna(subset=["trade_date"])
+        if payload.empty:
+            return 0
+        self.ensure_schema()
+        with self._connect_write() as connection:
+            for d in payload["trade_date"].tolist():
+                connection.execute(
+                    f"DELETE FROM {_HK_HOLD_TABLE} WHERE symbol = ? AND trade_date = ?",
+                    [normalized_symbol, d],
+                )
+            connection.register("hk_stage", payload)
+            cols = [c for c in payload.columns if c in (
+                "symbol", "trade_date", "hold_vol", "hold_ratio", "hold_market_cap",
+                "source", "as_of", "coverage_complete",
+            )]
+            connection.execute(
+                f"INSERT INTO {_HK_HOLD_TABLE} ({', '.join(cols)}) "
+                f"SELECT {', '.join(cols)} FROM hk_stage"
+            )
+            connection.unregister("hk_stage")
+        return int(len(payload))
+
+    def fetch_hk_hold(self, *, symbol: str) -> pd.DataFrame:
+        normalized_symbol = _normalize_symbol(symbol)
+        if not self._table_exists(_HK_HOLD_TABLE):
+            return pd.DataFrame()
+        with self._connect_readonly() as connection:
+            frame = cast(pd.DataFrame, connection.execute(
+                f"SELECT * FROM {_HK_HOLD_TABLE} WHERE symbol = ? ORDER BY trade_date",
+                [normalized_symbol],
+            ).fetch_df())
+        if not frame.empty and "trade_date" in frame.columns:
+            frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
+        return frame
 
 
     def warehouse_meta_path(self, symbol: str | None = None) -> Path:
