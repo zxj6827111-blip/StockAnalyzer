@@ -21,6 +21,7 @@ from stock_analyzer.data.tdx_offline_provider import (
 _DUCK_CONNECTION = Any
 
 _DAILY_TABLE = "daily_bars"
+_FINANCIAL_SNAPSHOT_TABLE = "financial_snapshots"
 _INTRADAY_TABLES = {
     "1m": "intraday_summary_1m",
     "5m": "intraday_summary_5m",
@@ -199,6 +200,130 @@ class MarketWarehouse:
                 )
                 """
             )
+
+
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS financial_snapshots (
+                    symbol VARCHAR,
+                    end_date DATE,
+                    ann_date DATE,
+                    roe DOUBLE,
+                    debt_ratio DOUBLE,
+                    update_flag INTEGER,
+                    financial_report_date VARCHAR,
+                    financial_as_of VARCHAR,
+                    financial_source VARCHAR,
+                    financial_trust_level VARCHAR,
+                    financial_missing_fields VARCHAR,
+                    financial_data_complete BOOLEAN,
+                    financial_completeness DOUBLE,
+                    coverage_complete BOOLEAN,
+                    as_of VARCHAR,
+                    source VARCHAR
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_financial_snapshots_key
+                ON financial_snapshots (symbol, end_date, ann_date, financial_source)
+                """
+            )
+
+
+    def upsert_financial_snapshots(self, *, symbol: str, frame: pd.DataFrame) -> int:
+        """Idempotent upsert of PIT financial snapshot events. Returns row count stored."""
+        from stock_analyzer.data.financial_pit import merge_snapshot_frames
+
+        normalized_symbol = _normalize_symbol(symbol)
+        if frame is None or frame.empty:
+            return int(len(self.fetch_financial_snapshots(symbol=normalized_symbol)))
+        incoming = frame.copy()
+        if "symbol" not in incoming.columns:
+            incoming.insert(0, "symbol", normalized_symbol)
+        else:
+            incoming["symbol"] = normalized_symbol
+        existing = self.fetch_financial_snapshots(symbol=normalized_symbol)
+        merged = merge_snapshot_frames(existing, incoming)
+        if merged.empty:
+            return 0
+        payload = merged.copy()
+        for col in ("end_date", "ann_date"):
+            if col in payload.columns:
+                payload[col] = pd.to_datetime(payload[col], errors="coerce").dt.date
+        self.ensure_schema()
+        with self._connect_write() as connection:
+            connection.execute(
+                f"DELETE FROM {_FINANCIAL_SNAPSHOT_TABLE} WHERE symbol = ?",
+                [normalized_symbol],
+            )
+            connection.register("fin_snap_stage", payload)
+            cols = [
+                "symbol",
+                "end_date",
+                "ann_date",
+                "roe",
+                "debt_ratio",
+                "update_flag",
+                "financial_report_date",
+                "financial_as_of",
+                "financial_source",
+                "financial_trust_level",
+                "financial_missing_fields",
+                "financial_data_complete",
+                "financial_completeness",
+                "coverage_complete",
+                "as_of",
+                "source",
+            ]
+            present = [c for c in cols if c in payload.columns]
+            connection.execute(
+                f"""
+                INSERT INTO {_FINANCIAL_SNAPSHOT_TABLE} ({", ".join(present)})
+                SELECT {", ".join(present)} FROM fin_snap_stage
+                """
+            )
+            connection.unregister("fin_snap_stage")
+        return int(len(payload))
+
+    def fetch_financial_snapshots(self, *, symbol: str) -> pd.DataFrame:
+        normalized_symbol = _normalize_symbol(symbol)
+        if not self._table_exists(_FINANCIAL_SNAPSHOT_TABLE):
+            return pd.DataFrame()
+        query = f"""
+            SELECT *
+            FROM {_FINANCIAL_SNAPSHOT_TABLE}
+            WHERE symbol = ?
+            ORDER BY ann_date ASC, end_date ASC, update_flag ASC
+        """
+        with self._connect_readonly() as connection:
+            frame = cast(pd.DataFrame, connection.execute(query, [normalized_symbol]).fetch_df())
+        if frame.empty:
+            return frame
+        for col in ("end_date", "ann_date"):
+            if col in frame.columns:
+                frame[col] = pd.to_datetime(frame[col], errors="coerce")
+        return frame
+
+    def apply_financial_snapshots_to_daily(self, *, symbol: str) -> pd.DataFrame:
+        """Re-materialize daily bars financial columns from PIT snapshots."""
+        from stock_analyzer.data.financial_pit import apply_financial_snapshots_asof
+        daily = self.fetch_all_daily_bars(symbol=symbol)
+        if daily.empty:
+            return daily
+        snaps = self.fetch_financial_snapshots(symbol=symbol)
+        if snaps.empty:
+            return daily
+        enriched = apply_financial_snapshots_asof(daily, snaps, only_fill_pending=False)
+        self.replace_daily_bars(symbol=symbol, frame=enriched)
+        write_package_daily_bars(
+            package_root=self.package_root,
+            symbol=symbol,
+            frame=enriched,
+        )
+        return enriched
+
 
     def warehouse_meta_path(self, symbol: str | None = None) -> Path:
         if symbol:

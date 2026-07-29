@@ -1350,6 +1350,81 @@ class RuntimeMarketSyncService:
             "force": bool(force),
         }
 
+
+    def _enrich_market_warehouse_financials(
+        self,
+        *,
+        warehouse: MarketWarehouse,
+        online_provider: MarketDataProvider,
+        symbol: str,
+        target_end_date: date,
+    ) -> dict[str, object]:
+        """Fetch fina_indicator, store PIT snapshots, as-of join onto daily bars.
+
+        API failure does not wipe prior trusted snapshots or daily financial columns.
+        """
+        result: dict[str, object] = {
+            "status": "skipped",
+            "reason": "provider_without_fina_indicator",
+            "snapshots": 0,
+        }
+        fetch_fn = getattr(online_provider, "fetch_fina_indicator", None)
+        if not callable(fetch_fn):
+            # Try nested providers (cached/resilient).
+            for attr in ("_provider", "provider", "_primary", "_inner"):
+                nested = getattr(online_provider, attr, None)
+                if nested is not None and callable(getattr(nested, "fetch_fina_indicator", None)):
+                    fetch_fn = nested.fetch_fina_indicator
+                    break
+        if not callable(fetch_fn):
+            return result
+
+        existing_snaps = warehouse.fetch_financial_snapshots(symbol=symbol)
+        try:
+            incoming = cast(
+                pd.DataFrame,
+                fetch_fn(symbol=symbol, end_date=target_end_date),
+            )
+        except Exception as exc:
+            result["status"] = "failed"
+            result["reason"] = f"fina_indicator_error:{type(exc).__name__}"
+            result["error"] = str(exc)[:200]
+            result["snapshots"] = int(len(existing_snaps))
+            # Do not overwrite trusted daily financials on failure.
+            return result
+
+        if incoming is None:
+            incoming = pd.DataFrame()
+        snap_count = warehouse.upsert_financial_snapshots(symbol=symbol, frame=incoming)
+        result["snapshots"] = int(snap_count)
+
+        snaps = warehouse.fetch_financial_snapshots(symbol=symbol)
+        if snaps.empty:
+            result["status"] = "ok"
+            result["reason"] = "no_snapshots"
+            return result
+
+        from stock_analyzer.data.financial_pit import apply_financial_snapshots_asof
+
+        daily = warehouse.fetch_all_daily_bars(symbol=symbol)
+        if daily.empty:
+            result["status"] = "ok"
+            result["reason"] = "no_daily"
+            return result
+        enriched = apply_financial_snapshots_asof(daily, snaps, only_fill_pending=False)
+        warehouse.replace_daily_bars(symbol=symbol, frame=enriched)
+        write_package_daily_bars(
+            package_root=warehouse.package_root,
+            symbol=symbol,
+            frame=enriched,
+        )
+        result["status"] = "ok"
+        result["reason"] = "enriched"
+        result["reported_rows"] = int(
+            enriched["financial_trust_level"].astype(str).str.lower().eq("reported").sum()
+        ) if "financial_trust_level" in enriched.columns else 0
+        return result
+
     def _sync_market_warehouse_daily_symbol(
         self,
         *,
@@ -1474,6 +1549,16 @@ class RuntimeMarketSyncService:
             symbol=symbol,
             frame=merged_daily,
         )
+        financial_enrichment = self._enrich_market_warehouse_financials(
+            warehouse=warehouse,
+            online_provider=online_provider,
+            symbol=symbol,
+            target_end_date=target_end_date,
+        )
+        # Re-read daily after optional financial enrichment for accurate row/latest stats.
+        final_daily = warehouse.fetch_all_daily_bars(symbol=symbol)
+        if final_daily.empty:
+            final_daily = merged_daily
         if fresh_meta.get("price_series_mode"):
             warehouse.update_price_series_contract(
                 symbol=symbol,
@@ -1489,12 +1574,12 @@ class RuntimeMarketSyncService:
             )
             warehouse.refresh_package_manifests()
         latest_date = (
-            merged_daily.index[-1].date().isoformat() if len(merged_daily.index) > 0 else ""
+            final_daily.index[-1].date().isoformat() if len(final_daily.index) > 0 else ""
         )
         return {
             "status": "ok",
             "latest_date": latest_date,
-            "rows": int(len(merged_daily)),
+            "rows": int(len(final_daily)),
             "mode": sync_mode,
             "lookback_days": lookback_days,
             "price_series_action": action,
@@ -1504,6 +1589,7 @@ class RuntimeMarketSyncService:
                 "adjustment_anchor_date": fresh_meta.get("adjustment_anchor_date"),
                 "adjustment_anchor_factor": fresh_meta.get("adjustment_anchor_factor"),
             },
+            "financial_enrichment": financial_enrichment,
         }
 
     def _sync_market_warehouse_intraday_symbol(

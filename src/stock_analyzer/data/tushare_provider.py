@@ -12,6 +12,7 @@ from typing import Any, Protocol
 import numpy as np
 import pandas as pd
 
+from stock_analyzer.data.financial_pit import normalize_fina_indicator_rows
 from stock_analyzer.data.provider import DataSourceError
 
 _DEFAULT_FLOAT_MARKET_CAP = 12_000_000_000.0
@@ -57,6 +58,15 @@ class _TushareProApi(Protocol):
         self,
         *,
         ts_code: str = "",
+        fields: str = "",
+    ) -> object: ...
+
+    def fina_indicator(
+        self,
+        *,
+        ts_code: str = "",
+        start_date: str = "",
+        end_date: str = "",
         fields: str = "",
     ) -> object: ...
 
@@ -240,6 +250,45 @@ class TushareProvider:
         if len(open_dates) >= 2:
             return open_dates[-2]
         return open_dates[-1]
+
+
+    def fetch_fina_indicator(
+        self,
+        symbol: str,
+        *,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> pd.DataFrame:
+        """Fetch fina_indicator rows and normalize to PIT financial snapshots.
+
+        Returns empty DataFrame on successful empty query.
+        Raises DataSourceError on API failure so callers preserve prior snapshots.
+        """
+        pro = self._resolve_pro_api()
+        code6 = _normalize_symbol(symbol)
+        if not code6:
+            raise DataSourceError(f"invalid symbol for tushare fina_indicator: {symbol}")
+        ts_code = _to_ts_code(code6)
+        resolved_end = end_date or date.today()
+        resolved_start = start_date or (resolved_end - timedelta(days=365 * 5 + 30))
+        start_s = resolved_start.strftime("%Y%m%d")
+        end_s = resolved_end.strftime("%Y%m%d")
+        fields = "ts_code,ann_date,end_date,roe,debt_to_assets,update_flag"
+        try:
+            raw = self._call_with_retry(
+                lambda: pro.fina_indicator(
+                    ts_code=ts_code,
+                    start_date=start_s,
+                    end_date=end_s,
+                    fields=fields,
+                )
+            )
+        except Exception as exc:
+            raise DataSourceError(
+                f"tushare fina_indicator failed for {ts_code}: {exc}"
+            ) from exc
+        frame = _coerce_frame(raw)
+        return normalize_fina_indicator_rows(frame, symbol=code6)
 
     def _resolve_pro_api(self) -> _TushareProApi:
         if self._pro_api is not None:
