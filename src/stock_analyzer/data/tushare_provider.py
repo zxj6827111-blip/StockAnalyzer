@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import os
 import re
+import time
 from datetime import date, timedelta
 from time import sleep
 from typing import Any, Protocol
@@ -159,6 +160,7 @@ class TushareProvider:
         max_attempts: int = 2,
         socket_timeout_sec: float = 15.0,
         price_series_mode: str = "qfq",
+        min_request_interval_sec: float = 0.3,
     ) -> None:
         self._token = str(token or "").strip() or _resolve_tushare_token()
         self._pro_api = pro_api
@@ -166,6 +168,8 @@ class TushareProvider:
         self._max_attempts = max(1, int(max_attempts))
         self._socket_timeout_sec = max(0.1, float(socket_timeout_sec))
         self._price_series_mode = str(price_series_mode or "qfq").strip().lower() or "qfq"
+        self._min_request_interval_sec = max(0.0, float(min_request_interval_sec))
+        self._last_request_time: float = 0.0
         self._name_cache: dict[str, str] = {}
         self._trade_cal_cache: dict[str, list[date]] = {}
 
@@ -433,6 +437,7 @@ class TushareProvider:
             symbol=code6,
             start_date=resolved_start,
             end_date=resolved_end,
+            suspend_available=suspend_error is None,
         )
 
 
@@ -676,6 +681,13 @@ class TushareProvider:
         return self._pro_api
 
     def _call_with_retry(self, fn: Any) -> object:
+        # Rate limiting: enforce minimum interval between requests
+        if self._min_request_interval_sec > 0 and self._last_request_time > 0:
+            elapsed = time.time() - self._last_request_time
+            if elapsed < self._min_request_interval_sec:
+                sleep(self._min_request_interval_sec - elapsed)
+        self._last_request_time = time.time()
+
         last_error: Exception | None = None
         for attempt in range(1, self._max_attempts + 1):
             try:
@@ -973,8 +985,14 @@ def _normalize_trade_status(
     symbol: str,
     start_date: date,
     end_date: date,
+    suspend_available: bool = True,
 ) -> pd.DataFrame:
-    """Merge stk_limit and suspend_d into unified trade status rows."""
+    """Merge stk_limit and suspend_d into unified trade status rows.
+
+    When suspend_available=False (suspend_d failed), suspended is set to None
+    (unknown) and coverage_complete=False. This prevents the execution layer
+    from treating unknown suspension status as "not suspended".
+    """
     rows: dict[str, dict[str, object]] = {}
 
     if not limit_frame.empty and "trade_date" in limit_frame.columns:
@@ -992,11 +1010,11 @@ def _normalize_trade_status(
                     "trade_date": td,
                     "up_limit": float("nan"),
                     "down_limit": float("nan"),
-                    "suspended": False,
+                    "suspended": None if not suspend_available else False,
                     "suspend_type": "",
                     "source": "tushare_stk_limit",
                     "as_of": key,
-                    "coverage_complete": True,
+                    "coverage_complete": suspend_available,
                 }
             up = pd.to_numeric([row.get("up_limit")], errors="coerce")[0]
             down = pd.to_numeric([row.get("down_limit")], errors="coerce")[0]
@@ -1027,6 +1045,7 @@ def _normalize_trade_status(
                     "coverage_complete": True,
                 }
             rows[key]["suspended"] = True
+            rows[key]["coverage_complete"] = True
             stype = str(row.get("suspend_type", "") or row.get("reason", "") or "").strip()
             if stype:
                 rows[key]["suspend_type"] = stype

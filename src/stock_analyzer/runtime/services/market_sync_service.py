@@ -1405,6 +1405,7 @@ class RuntimeMarketSyncService:
         online_provider: MarketDataProvider,
         symbol: str,
         target_end_date: date,
+        start_date: date | None = None,
     ) -> dict[str, object]:
         """Fetch top_list, top_inst, block_trade and store event tables."""
         result: dict[str, object] = {"status": "skipped", "reason": "no_p3_api"}
@@ -1432,10 +1433,10 @@ class RuntimeMarketSyncService:
 
         if callable(top_list_fn):
             try:
-                frame = cast(
-                    pd.DataFrame,
-                    top_list_fn(symbol=symbol, end_date=target_end_date),
-                )
+                top_list_kwargs: dict[str, object] = {"symbol": symbol, "end_date": target_end_date}
+                if start_date is not None:
+                    top_list_kwargs["start_date"] = start_date
+                frame = cast(pd.DataFrame, top_list_fn(**top_list_kwargs))
                 counts["top_list"] = warehouse.upsert_top_list_events(
                     symbol=symbol, frame=frame
                 )
@@ -1444,10 +1445,10 @@ class RuntimeMarketSyncService:
 
         if callable(top_inst_fn):
             try:
-                frame = cast(
-                    pd.DataFrame,
-                    top_inst_fn(symbol=symbol, end_date=target_end_date),
-                )
+                top_inst_kwargs: dict[str, object] = {"symbol": symbol, "end_date": target_end_date}
+                if start_date is not None:
+                    top_inst_kwargs["start_date"] = start_date
+                frame = cast(pd.DataFrame, top_inst_fn(**top_inst_kwargs))
                 counts["top_inst"] = warehouse.upsert_top_inst_events(
                     symbol=symbol, frame=frame
                 )
@@ -1456,10 +1457,10 @@ class RuntimeMarketSyncService:
 
         if callable(block_fn):
             try:
-                frame = cast(
-                    pd.DataFrame,
-                    block_fn(symbol=symbol, end_date=target_end_date),
-                )
+                block_kwargs: dict[str, object] = {"symbol": symbol, "end_date": target_end_date}
+                if start_date is not None:
+                    block_kwargs["start_date"] = start_date
+                frame = cast(pd.DataFrame, block_fn(**block_kwargs))
                 counts["block_trade"] = warehouse.upsert_block_trade_events(
                     symbol=symbol, frame=frame
                 )
@@ -1479,6 +1480,7 @@ class RuntimeMarketSyncService:
         online_provider: MarketDataProvider,
         symbol: str,
         target_end_date: date,
+        start_date: date | None = None,
     ) -> dict[str, object]:
         """Fetch margin_detail, moneyflow, hk_hold and store in warehouse."""
         result: dict[str, object] = {"status": "skipped", "reason": "no_p2_api"}
@@ -1500,21 +1502,33 @@ class RuntimeMarketSyncService:
 
         if callable(margin_fn):
             try:
-                frame = cast(pd.DataFrame, margin_fn(symbol=symbol, end_date=target_end_date))
+                margin_kwargs: dict[str, object] = {"symbol": symbol, "end_date": target_end_date}
+                if start_date is not None:
+                    margin_kwargs["start_date"] = start_date
+                frame = cast(pd.DataFrame, margin_fn(**margin_kwargs))
                 counts["margin"] = warehouse.upsert_margin_detail(symbol=symbol, frame=frame)
             except Exception as exc:
                 errors.append(f"margin:{type(exc).__name__}")
 
         if callable(moneyflow_fn):
             try:
-                frame = cast(pd.DataFrame, moneyflow_fn(symbol=symbol, end_date=target_end_date))
+                moneyflow_kwargs: dict[str, object] = {
+                    "symbol": symbol,
+                    "end_date": target_end_date,
+                }
+                if start_date is not None:
+                    moneyflow_kwargs["start_date"] = start_date
+                frame = cast(pd.DataFrame, moneyflow_fn(**moneyflow_kwargs))
                 counts["moneyflow"] = warehouse.upsert_moneyflow(symbol=symbol, frame=frame)
             except Exception as exc:
                 errors.append(f"moneyflow:{type(exc).__name__}")
 
         if callable(hk_fn):
             try:
-                frame = cast(pd.DataFrame, hk_fn(symbol=symbol, end_date=target_end_date))
+                hk_kwargs: dict[str, object] = {"symbol": symbol, "end_date": target_end_date}
+                if start_date is not None:
+                    hk_kwargs["start_date"] = start_date
+                frame = cast(pd.DataFrame, hk_fn(**hk_kwargs))
                 counts["hk_hold"] = warehouse.upsert_hk_hold(symbol=symbol, frame=frame)
             except Exception as exc:
                 errors.append(f"hk_hold:{type(exc).__name__}")
@@ -1532,6 +1546,7 @@ class RuntimeMarketSyncService:
         online_provider: MarketDataProvider,
         symbol: str,
         target_end_date: date,
+        start_date: date | None = None,
     ) -> dict[str, object]:
         """Fetch stk_limit + suspend_d, store trade status, merge into daily bars."""
         result: dict[str, object] = {"status": "skipped", "reason": "no_trade_status_api"}
@@ -1546,7 +1561,10 @@ class RuntimeMarketSyncService:
             return result
 
         try:
-            incoming = cast(pd.DataFrame, fetch_fn(symbol=symbol, end_date=target_end_date))
+            kwargs: dict[str, object] = {"symbol": symbol, "end_date": target_end_date}
+            if start_date is not None:
+                kwargs["start_date"] = start_date
+            incoming = cast(pd.DataFrame, fetch_fn(**kwargs))
         except Exception as exc:
             result["status"] = "failed"
             result["reason"] = f"trade_status_error:{type(exc).__name__}"
@@ -1572,6 +1590,7 @@ class RuntimeMarketSyncService:
         online_provider: MarketDataProvider,
         symbol: str,
         target_end_date: date,
+        start_date: date | None = None,
     ) -> dict[str, object]:
         """Fetch fina_indicator, store PIT snapshots, as-of join onto daily bars.
 
@@ -1595,10 +1614,10 @@ class RuntimeMarketSyncService:
 
         existing_snaps = warehouse.fetch_financial_snapshots(symbol=symbol)
         try:
-            incoming = cast(
-                pd.DataFrame,
-                fetch_fn(symbol=symbol, end_date=target_end_date),
-            )
+            fetch_kwargs: dict[str, object] = {"symbol": symbol, "end_date": target_end_date}
+            if start_date is not None:
+                fetch_kwargs["start_date"] = start_date
+            incoming = cast(pd.DataFrame, fetch_fn(**fetch_kwargs))
         except Exception as exc:
             result["status"] = "failed"
             result["reason"] = f"fina_indicator_error:{type(exc).__name__}"
@@ -1640,6 +1659,58 @@ class RuntimeMarketSyncService:
         return result
 
 
+    def _read_enrichment_checkpoint(
+        self, *, warehouse: MarketWarehouse, symbol: str, phase: str
+    ) -> date | None:
+        """Read last successful enrichment date for a phase."""
+        meta = warehouse.read_symbol_meta(symbol)
+        checkpoints = meta.get("enrichment_checkpoints", {})
+        if not isinstance(checkpoints, dict):
+            return None
+        value = checkpoints.get(phase)
+        if not value:
+            return None
+        try:
+            return date.fromisoformat(str(value))
+        except (ValueError, TypeError):
+            return None
+
+    def _write_enrichment_checkpoint(
+        self,
+        *,
+        warehouse: MarketWarehouse,
+        symbol: str,
+        phase: str,
+        success_date: date,
+    ) -> None:
+        """Write enrichment checkpoint after successful phase."""
+        meta = warehouse.read_symbol_meta(symbol)
+        checkpoints = meta.get("enrichment_checkpoints", {})
+        if not isinstance(checkpoints, dict):
+            checkpoints = {}
+        checkpoints[phase] = success_date.isoformat()
+        meta["enrichment_checkpoints"] = checkpoints
+        warehouse.write_symbol_meta(symbol, meta)
+
+    def _resolve_enrichment_start_date(
+        self,
+        *,
+        warehouse: MarketWarehouse,
+        symbol: str,
+        phase: str,
+        target_end_date: date,
+        default_lookback_days: int = 365,
+    ) -> date:
+        """Resolve incremental start date from checkpoint or default lookback."""
+        checkpoint = self._read_enrichment_checkpoint(
+            warehouse=warehouse, symbol=symbol, phase=phase
+        )
+        if checkpoint is not None and checkpoint < target_end_date:
+            # Resume from day after checkpoint
+            return checkpoint + timedelta(days=1)
+        # No checkpoint or checkpoint >= target: use default lookback
+        return target_end_date - timedelta(days=default_lookback_days)
+
     def _enrich_market_warehouse_symbol(
         self,
         *,
@@ -1648,36 +1719,100 @@ class RuntimeMarketSyncService:
         symbol: str,
         target_end_date: date,
     ) -> dict[str, object]:
-        """Run all per-symbol enrichment phases and project P2/P3 back to daily.
+        """Run all per-symbol enrichment phases with incremental windows.
 
-        Runs independently of daily sync status so an up_to_date symbol still gets
-        financial/trade_status/P2/P3 backfill. Individual phase failures are captured
-        and do not abort the remaining phases. Aggregated status reflects worst phase.
+        Each phase uses checkpoint-based incremental fetch to avoid re-pulling
+        years of data on every sync. Checkpoints are written after success.
         """
+        # Resolve incremental start dates per phase
+        financial_start = self._resolve_enrichment_start_date(
+            warehouse=warehouse,
+            symbol=symbol,
+            phase="financial",
+            target_end_date=target_end_date,
+            default_lookback_days=365 * 5,  # financial reports are sparse
+        )
+        trade_status_start = self._resolve_enrichment_start_date(
+            warehouse=warehouse,
+            symbol=symbol,
+            phase="trade_status",
+            target_end_date=target_end_date,
+            default_lookback_days=90,
+        )
+        p2_start = self._resolve_enrichment_start_date(
+            warehouse=warehouse,
+            symbol=symbol,
+            phase="p2",
+            target_end_date=target_end_date,
+            default_lookback_days=180,
+        )
+        p3_start = self._resolve_enrichment_start_date(
+            warehouse=warehouse,
+            symbol=symbol,
+            phase="p3",
+            target_end_date=target_end_date,
+            default_lookback_days=180,
+        )
+
         financial = self._enrich_market_warehouse_financials(
             warehouse=warehouse,
             online_provider=online_provider,
             symbol=symbol,
             target_end_date=target_end_date,
+            start_date=financial_start,
         )
+        if financial.get("status") == "ok":
+            self._write_enrichment_checkpoint(
+                warehouse=warehouse,
+                symbol=symbol,
+                phase="financial",
+                success_date=target_end_date,
+            )
+
         trade_status = self._enrich_market_warehouse_trade_status(
             warehouse=warehouse,
             online_provider=online_provider,
             symbol=symbol,
             target_end_date=target_end_date,
+            start_date=trade_status_start,
         )
+        if trade_status.get("status") == "ok":
+            self._write_enrichment_checkpoint(
+                warehouse=warehouse,
+                symbol=symbol,
+                phase="trade_status",
+                success_date=target_end_date,
+            )
+
         p2 = self._enrich_market_warehouse_p2_data(
             warehouse=warehouse,
             online_provider=online_provider,
             symbol=symbol,
             target_end_date=target_end_date,
+            start_date=p2_start,
         )
+        if p2.get("status") == "ok":
+            self._write_enrichment_checkpoint(
+                warehouse=warehouse,
+                symbol=symbol,
+                phase="p2",
+                success_date=target_end_date,
+            )
+
         p3 = self._enrich_market_warehouse_p3_events(
             warehouse=warehouse,
             online_provider=online_provider,
             symbol=symbol,
             target_end_date=target_end_date,
+            start_date=p3_start,
         )
+        if p3.get("status") == "ok":
+            self._write_enrichment_checkpoint(
+                warehouse=warehouse,
+                symbol=symbol,
+                phase="p3",
+                success_date=target_end_date,
+            )
         # Project margin + dragon-tiger events back into daily bars + package so the
         # runtime package (CSV/Parquet) and FeatureEngineer actually consume them.
         try:
@@ -2757,6 +2892,7 @@ class RuntimeMarketSyncService:
                         enrichment_partial += 1
                     elif enrich_status == "failed":
                         enrichment_failed += 1
+                        _record_failed_symbol(symbol)
                         if len(failed_samples) < 20:
                             failed_phase_names = [
                                 str(item)
@@ -2776,6 +2912,7 @@ class RuntimeMarketSyncService:
                         enrichment_skipped += 1
                 except Exception as exc:
                     enrichment_failed += 1
+                    _record_failed_symbol(symbol)
                     if len(failed_samples) < 20:
                         failed_samples.append(
                             {
@@ -2891,13 +3028,16 @@ class RuntimeMarketSyncService:
             report["background_data"] = warehouse.background_data_quality_snapshot()
             report["symbols_completed"] = symbols_completed
             report["progress_write_every_symbols"] = progress_write_every
+            index_failed = str(index_enrichment.get("status", "")).lower() == "failed"
             total_failed = daily_failed + intraday_failed + enrichment_failed
             total_ok = daily_ok + intraday_ok + enrichment_ok
             total_skipped = daily_skipped + intraday_skipped + enrichment_skipped
-            if total_failed == 0 and enrichment_partial == 0:
+            if total_failed == 0 and enrichment_partial == 0 and not index_failed:
                 report["status"] = "ok"
-            elif total_ok > 0 or total_skipped > 0 or enrichment_partial > 0:
+            elif total_ok > 0 or total_skipped > 0 or enrichment_partial > 0 or index_failed:
                 report["status"] = "partial"
+                if index_failed:
+                    report["index_enrichment_failed"] = True
             else:
                 report["status"] = "failed"
                 report["reason"] = "all_symbols_failed"
