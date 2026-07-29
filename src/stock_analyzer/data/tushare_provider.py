@@ -331,16 +331,27 @@ def _apply_price_adjust(
     *,
     adj: pd.DataFrame,
     price_series_mode: str,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, dict[str, object]]:
     """Apply Tushare adj_factor to match system price_series_mode (default qfq).
 
     Tushare ``daily`` is unadjusted. Forward-adjusted (qfq) uses:
         price_qfq = price_raw * adj_factor / adj_factor_latest
-    Volume is scaled inversely so price*volume stays consistent with turnover.
+
+    Volume/turnover contract (aligned with AKShare qfq runtime path):
+    - volume stays actual traded share count (Tushare vol*100), not reverse-scaled.
+    - turnover stays actual traded amount (Tushare amount*1000).
+    Do not invent volume continuity via price*volume; actual shares are the runtime unit.
     """
     mode = str(price_series_mode or "raw").strip().lower()
     if mode in {"", "raw"}:
-        return frame.copy()
+        out = frame.copy()
+        meta: dict[str, object] = {
+            "price_series_mode": "raw",
+            "adjustment_source": "none",
+            "adjustment_anchor_date": "",
+            "adjustment_anchor_factor": float("nan"),
+        }
+        return out, meta
     if mode not in {"qfq", "hfq"}:
         raise DataSourceError(f"unsupported tushare price_series_mode: {price_series_mode}")
     if adj.empty or "trade_date" not in adj.columns or "adj_factor" not in adj.columns:
@@ -360,20 +371,31 @@ def _apply_price_adjust(
         raise DataSourceError("tushare adj_factor could not be aligned to daily bars")
 
     if mode == "qfq":
-        latest = float(out["adj_factor"].iloc[-1])
-        if latest == 0:
+        anchor_factor = float(out["adj_factor"].iloc[-1])
+        anchor_date = pd.Timestamp(out["date"].iloc[-1]).date().isoformat()
+        if anchor_factor == 0:
             raise DataSourceError("tushare adj_factor latest is zero")
-        scale = out["adj_factor"] / latest
+        scale = out["adj_factor"] / anchor_factor
     else:
-        first = float(out["adj_factor"].iloc[0])
-        if first == 0:
+        anchor_factor = float(out["adj_factor"].iloc[0])
+        anchor_date = pd.Timestamp(out["date"].iloc[0]).date().isoformat()
+        if anchor_factor == 0:
             raise DataSourceError("tushare adj_factor first is zero")
-        scale = out["adj_factor"] / first
+        scale = out["adj_factor"] / anchor_factor
 
     for col in ("open", "high", "low", "close"):
         out[col] = pd.to_numeric(out[col], errors="coerce") * scale
-    out["volume"] = pd.to_numeric(out["volume"], errors="coerce") / scale.replace(0, np.nan)
-    return out.drop(columns=["adj_factor"])
+    # Keep actual share volume; do not reverse-scale for synthetic price*volume continuity.
+    out["volume"] = pd.to_numeric(out["volume"], errors="coerce")
+    out["turnover"] = pd.to_numeric(out["turnover"], errors="coerce")
+    out = out.drop(columns=["adj_factor"])
+    meta = {
+        "price_series_mode": mode,
+        "adjustment_source": "tushare_adj_factor",
+        "adjustment_anchor_date": anchor_date,
+        "adjustment_anchor_factor": float(anchor_factor),
+    }
+    return out, meta
 
 
 def _normalize_tushare_daily(
@@ -418,7 +440,7 @@ def _normalize_tushare_daily(
     if frame.empty:
         return frame
     frame = frame.sort_values("date").drop_duplicates(subset=["date"], keep="last")
-    frame = _apply_price_adjust(frame, adj=adj, price_series_mode=price_series_mode)
+    frame, adjust_meta = _apply_price_adjust(frame, adj=adj, price_series_mode=price_series_mode)
 
     if "circ_mv" in frame.columns:
         circ = pd.to_numeric(frame["circ_mv"], errors="coerce") * 10000.0
@@ -443,15 +465,34 @@ def _normalize_tushare_daily(
     frame["financial_missing_fields"] = "roe,debt_ratio"
     frame["financial_source"] = "tushare_pending"
     frame["financial_report_date"] = ""
+    frame["financial_as_of"] = ""
+    frame["financial_trust_level"] = "missing"
+    frame["financial_completeness"] = 0.0
+    # Unknown / not queried => NaN. Confirmed zero-event fields stay NaN until real feeds exist.
     frame["holder_count"] = np.nan
-    frame["block_trade_net"] = 0.0
+    frame["block_trade_net"] = np.nan
     frame["financing_balance"] = np.nan
     frame["margin_financing_balance"] = np.nan
-    frame["northbound_net"] = 0.0
-    frame["dragon_tiger_flag"] = 0.0
-    mode = str(price_series_mode or "qfq").strip().lower() or "qfq"
+    frame["northbound_net"] = np.nan
+    frame["dragon_tiger_flag"] = np.nan
+    mode = (
+        str(adjust_meta.get("price_series_mode") or price_series_mode or "qfq")
+        .strip()
+        .lower()
+        or "qfq"
+    )
     frame["background_data_source"] = f"tushare_pro_{mode}"
     frame["background_data_complete"] = False
+    frame["background_missing_fields"] = (
+        "holder_count,block_trade_net,financing_balance,"
+        "margin_financing_balance,northbound_net,dragon_tiger_flag"
+    )
+    frame["background_as_of"] = ""
+    frame["price_series_mode"] = mode
+    frame["adjustment_source"] = str(adjust_meta.get("adjustment_source") or "")
+    frame["adjustment_anchor_date"] = str(adjust_meta.get("adjustment_anchor_date") or "")
+    anchor_factor: Any = adjust_meta.get("adjustment_anchor_factor")
+    frame["adjustment_anchor_factor"] = float(anchor_factor or float("nan"))
     frame["board"] = _infer_board(symbol)
 
     selected = frame[
@@ -474,6 +515,9 @@ def _normalize_tushare_daily(
             "financial_missing_fields",
             "financial_source",
             "financial_report_date",
+            "financial_as_of",
+            "financial_trust_level",
+            "financial_completeness",
             "holder_count",
             "block_trade_net",
             "financing_balance",
@@ -482,12 +526,19 @@ def _normalize_tushare_daily(
             "dragon_tiger_flag",
             "background_data_source",
             "background_data_complete",
+            "background_missing_fields",
+            "background_as_of",
+            "price_series_mode",
+            "adjustment_source",
+            "adjustment_anchor_date",
+            "adjustment_anchor_factor",
             "board",
         ]
     ].copy()
     selected = selected.tail(max(1, int(lookback_days)))
     selected = selected.set_index("date")
     selected.index.name = "date"
+    selected.attrs["price_series_meta"] = dict(adjust_meta)
     return selected
 
 

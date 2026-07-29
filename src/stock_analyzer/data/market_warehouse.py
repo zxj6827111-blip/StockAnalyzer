@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -55,6 +56,7 @@ _DAILY_NUMERIC_COLUMNS = {
     "margin_financing_balance",
     "northbound_net",
     "dragon_tiger_flag",
+    "adjustment_anchor_factor",
 }
 _DAILY_BOOLEAN_COLUMNS = {
     "suspended",
@@ -71,6 +73,11 @@ _DAILY_STRING_COLUMNS = {
     "financial_as_of",
     "financial_trust_level",
     "background_data_source",
+    "background_missing_fields",
+    "background_as_of",
+    "price_series_mode",
+    "adjustment_source",
+    "adjustment_anchor_date",
     "board",
 }
 
@@ -126,6 +133,12 @@ class MarketWarehouse:
                     dragon_tiger_flag DOUBLE,
                     background_data_source VARCHAR,
                     background_data_complete BOOLEAN,
+                    background_missing_fields VARCHAR,
+                    background_as_of VARCHAR,
+                    price_series_mode VARCHAR,
+                    adjustment_source VARCHAR,
+                    adjustment_anchor_date VARCHAR,
+                    adjustment_anchor_factor DOUBLE,
                     board VARCHAR
                 )
                 """
@@ -135,6 +148,12 @@ class MarketWarehouse:
                 ("financial_as_of", "VARCHAR"),
                 ("financial_trust_level", "VARCHAR"),
                 ("financial_completeness", "DOUBLE"),
+                ("background_missing_fields", "VARCHAR"),
+                ("background_as_of", "VARCHAR"),
+                ("price_series_mode", "VARCHAR"),
+                ("adjustment_source", "VARCHAR"),
+                ("adjustment_anchor_date", "VARCHAR"),
+                ("adjustment_anchor_factor", "DOUBLE"),
             ):
                 connection.execute(
                     f"ALTER TABLE {_DAILY_TABLE} "
@@ -180,6 +199,175 @@ class MarketWarehouse:
                 )
                 """
             )
+
+    def warehouse_meta_path(self, symbol: str | None = None) -> Path:
+        if symbol:
+            return self.package_root / "meta" / f"{_normalize_symbol(symbol)}.json"
+        return self._db_path.with_name("warehouse_meta.json")
+
+    def read_symbol_meta(self, symbol: str) -> dict[str, object]:
+        path = self.warehouse_meta_path(symbol)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return _read_json(path) or {}
+
+    def write_symbol_meta(self, symbol: str, payload: dict[str, object]) -> Path:
+        path = self.warehouse_meta_path(symbol)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
+
+    def read_warehouse_meta(self) -> dict[str, object]:
+        return _read_json(self.warehouse_meta_path())
+
+    def write_warehouse_meta(self, payload: dict[str, object]) -> Path:
+        path = self.warehouse_meta_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
+
+    @staticmethod
+    def _price_series_contract_from_meta(meta: dict[str, object]) -> dict[str, object]:
+        return {
+            "price_series_mode": str(meta.get("price_series_mode", "") or "").strip().lower(),
+            "adjustment_source": str(meta.get("adjustment_source", "") or "").strip(),
+            "adjustment_anchor_date": str(meta.get("adjustment_anchor_date", "") or "").strip(),
+            "adjustment_anchor_factor": meta.get("adjustment_anchor_factor", None),
+            "known": bool(str(meta.get("price_series_mode", "") or "").strip()),
+        }
+
+    def price_series_contract(self, *, symbol: str | None = None) -> dict[str, object]:
+        if symbol:
+            return self._price_series_contract_from_meta(self.read_symbol_meta(symbol))
+
+        contracts = [
+            self.price_series_contract(symbol=item)
+            for item in self.list_symbols()
+        ]
+        known_contracts = [item for item in contracts if bool(item.get("known"))]
+        if not known_contracts:
+            return self._price_series_contract_from_meta({})
+
+        def _common_value(key: str) -> object:
+            values = {item.get(key) for item in known_contracts}
+            return next(iter(values)) if len(values) == 1 else None
+
+        mode = _common_value("price_series_mode")
+        return {
+            "price_series_mode": str(mode or "mixed"),
+            "adjustment_source": str(_common_value("adjustment_source") or ""),
+            "adjustment_anchor_date": str(_common_value("adjustment_anchor_date") or ""),
+            "adjustment_anchor_factor": _common_value("adjustment_anchor_factor"),
+            "known": len(known_contracts) == len(contracts),
+            "mixed": any(
+                _common_value(key) is None
+                for key in ("price_series_mode", "adjustment_anchor_factor")
+            ),
+            "symbols_total": len(contracts),
+            "symbols_known": len(known_contracts),
+        }
+
+    def update_price_series_contract(
+        self,
+        *,
+        symbol: str,
+        price_series_mode: str,
+        adjustment_source: str = "",
+        adjustment_anchor_date: str = "",
+        adjustment_anchor_factor: float | None = None,
+        extra: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        meta = self.read_symbol_meta(symbol)
+        meta.update(
+            {
+                "price_series_mode": str(price_series_mode or "").strip().lower() or "unknown",
+                "adjustment_source": str(adjustment_source or "").strip(),
+                "adjustment_anchor_date": str(adjustment_anchor_date or "").strip(),
+                "adjustment_anchor_factor": adjustment_anchor_factor,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+        if extra:
+            meta.update(extra)
+        self.write_symbol_meta(symbol, meta)
+        return meta
+
+    def handle_reanchor_symbol(
+        self,
+        *,
+        symbol: str,
+        fresh_daily: pd.DataFrame,
+        old_anchor_factor: float,
+        new_anchor_factor: float,
+        fresh_meta: dict[str, object],
+    ) -> pd.DataFrame:
+        """Rebase stored adjusted OHLC to a new anchor without changing traded units."""
+
+        try:
+            old_factor = float(old_anchor_factor)
+            new_factor = float(new_anchor_factor)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid_reanchor_factor") from exc
+        if not (
+            math.isfinite(old_factor)
+            and math.isfinite(new_factor)
+            and old_factor > 0.0
+            and new_factor > 0.0
+        ):
+            raise ValueError("invalid_reanchor_factor")
+
+        fresh_factor = fresh_meta.get("adjustment_anchor_factor")
+        try:
+            parsed_fresh_factor = float(cast(Any, fresh_factor))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("fresh_anchor_factor_missing") from exc
+        if not math.isclose(parsed_fresh_factor, new_factor, rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError("fresh_anchor_factor_mismatch")
+
+        existing = self.fetch_all_daily_bars(symbol=symbol)
+        rebased = existing.copy()
+        if not rebased.empty:
+            stored_factors = pd.to_numeric(
+                rebased["adjustment_anchor_factor"], errors="coerce"
+            ).dropna()
+            if not stored_factors.empty and not stored_factors.map(
+                lambda value: math.isclose(
+                    float(value), old_factor, rel_tol=0.0, abs_tol=1e-9
+                )
+            ).all():
+                raise ValueError("stored_anchor_factor_mismatch")
+
+            ratio = old_factor / new_factor
+            for column in ("open", "high", "low", "close"):
+                if column in rebased.columns:
+                    rebased[column] = pd.to_numeric(
+                        rebased[column], errors="coerce"
+                    ) * ratio
+
+            for column in (
+                "price_series_mode",
+                "adjustment_source",
+                "adjustment_anchor_date",
+                "adjustment_anchor_factor",
+            ):
+                if column in rebased.columns:
+                    rebased[column] = cast(Any, fresh_meta.get(column))
+
+        merged = (
+            fresh_daily.copy()
+            if rebased.empty
+            else pd.concat([rebased, fresh_daily], axis=0)
+        )
+        return merged[~merged.index.duplicated(keep="last")].sort_index()
+
+    def clone_to_shadow_paths(
+        self,
+        *,
+        shadow_db_path: str | Path,
+        shadow_package_root: str | Path,
+    ) -> MarketWarehouse:
+        """Create a new empty shadow warehouse without deleting/overwriting the current one."""
+        return MarketWarehouse(db_path=shadow_db_path, package_root=shadow_package_root)
+
     def has_daily_data(self) -> bool:
         if not self._table_exists(_DAILY_TABLE):
             return False
@@ -764,6 +952,11 @@ class MarketWarehouse:
                     frame=daily_frame,
                 )
                 daily_written += 1
+
+            # Persist symbol-specific meta
+            meta = self.read_symbol_meta(symbol)
+            if meta.get("price_series_mode"):
+                self.write_symbol_meta(symbol, meta)
             for interval in interval_list:
                 intraday_frame = self.fetch_all_intraday_summary(symbol=symbol, interval=interval)
                 if intraday_frame.empty:
@@ -799,19 +992,31 @@ class MarketWarehouse:
         }
 
         existing_daily = _read_json(self.package_root / "manifest.json")
-        db_symbols_total = int(daily_summary["symbols_total"])
-        package_symbols_total = int(daily_file_summary["symbols_total"])
+        db_symbols_total = int(cast(Any, daily_summary["symbols_total"]))
+        package_symbols_total = int(cast(Any, daily_file_summary["symbols_total"]))
         missing_daily_symbols = sorted(
-            set(daily_summary["symbols"]) - set(daily_file_summary["symbols"])
+            set(cast(list[str], daily_summary["symbols"]))
+            - set(cast(list[str], daily_file_summary["symbols"]))
         )
         extra_daily_symbols = sorted(
-            set(daily_file_summary["symbols"]) - set(daily_summary["symbols"])
+            set(cast(list[str], daily_file_summary["symbols"]))
+            - set(cast(list[str], daily_summary["symbols"]))
         )
+        contract = self.price_series_contract()
         daily_manifest = {
             **existing_daily,
             "generated_at": datetime.now().isoformat(timespec="seconds"),
             "output_root": str(self.package_root.resolve()),
             "package_version": str(existing_daily.get("package_version", "warehouse-v1")),
+            "price_series_mode": contract.get("price_series_mode")
+            or existing_daily.get("price_series_mode", ""),
+            "adjustment_source": contract.get("adjustment_source")
+            or existing_daily.get("adjustment_source", ""),
+            "adjustment_anchor_date": contract.get("adjustment_anchor_date")
+            or existing_daily.get("adjustment_anchor_date", ""),
+            "adjustment_anchor_factor": contract.get("adjustment_anchor_factor")
+            if contract.get("adjustment_anchor_factor") is not None
+            else existing_daily.get("adjustment_anchor_factor"),
             "db_symbols_total": db_symbols_total,
             "package_symbol_files_total": package_symbols_total,
             "symbol_files_total": db_symbols_total,
@@ -851,8 +1056,13 @@ class MarketWarehouse:
                     "files_written": intraday_file_summary[interval]["symbols_total"],
                     "failed": max(
                         0,
-                        int(summary["symbols_total"])
-                        - int(intraday_file_summary[interval]["symbols_total"]),
+                        int(cast(Any, summary["symbols_total"]))
+                        - int(
+                            cast(
+                                Any,
+                                intraday_file_summary[interval]["symbols_total"],
+                            )
+                        ),
                     ),
                     "latest_date_max": summary["latest_date_max"],
                     "target_end_date": summary["latest_date_max"],

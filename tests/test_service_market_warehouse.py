@@ -11,6 +11,7 @@ from threading import Thread
 from typing import Any, cast
 
 import pandas as pd
+import pytest
 
 from stock_analyzer.config import StockAnalyzerConfig, load_config
 from stock_analyzer.data.market_warehouse import (
@@ -1329,3 +1330,470 @@ def test_service_market_warehouse_sync_materializes_package_when_missing(tmp_pat
     assert materialize_calls == 1
     assert package_materialization["status"] == "ok"
     assert _as_int(package_materialization["daily_written"]) == 1
+
+
+def test_price_series_action_rebuild_required_for_legacy(tmp_path: Path) -> None:
+    package_root = tmp_path / "package"
+    db_path = tmp_path / "warehouse" / "market.duckdb"
+    _build_sample_package(package_root)
+    config = _load_test_config(package_root=package_root, db_path=db_path)
+    service = _new_service(config)
+    warehouse = service._market_warehouse()
+    warehouse.bootstrap_from_offline_package(source_root=package_root)
+    # No warehouse_meta => unknown contract
+    action = service._resolve_market_warehouse_price_series_action(
+        warehouse=warehouse,
+        symbol="600000",
+        fresh_meta={
+            "price_series_mode": "qfq",
+            "adjustment_source": "tushare_adj_factor",
+            "adjustment_anchor_date": "2026-03-06",
+            "adjustment_anchor_factor": 16.0,
+        },
+        force=False,
+    )
+    assert action["action"] == "rebuild_required"
+    assert "legacy" in str(action["reason"])
+
+
+def test_price_series_action_reanchor_when_factor_changes(tmp_path: Path) -> None:
+    package_root = tmp_path / "package"
+    db_path = tmp_path / "warehouse" / "market.duckdb"
+    _build_sample_package(package_root)
+    config = _load_test_config(package_root=package_root, db_path=db_path)
+    service = _new_service(config)
+    warehouse = service._market_warehouse()
+    warehouse.bootstrap_from_offline_package(source_root=package_root)
+    warehouse.update_price_series_contract(
+        symbol="600000",
+        price_series_mode="qfq",
+        adjustment_source="tushare_adj_factor",
+        adjustment_anchor_date="2026-03-04",
+        adjustment_anchor_factor=10.0,
+    )
+    action = service._resolve_market_warehouse_price_series_action(
+        warehouse=warehouse,
+        symbol="600000",
+        fresh_meta={
+            "price_series_mode": "qfq",
+            "adjustment_source": "tushare_adj_factor",
+            "adjustment_anchor_date": "2026-03-06",
+            "adjustment_anchor_factor": 20.0,
+        },
+        force=True,
+    )
+    assert action["action"] == "reanchor"
+    assert action.get("force_is_not_full_rebuild") is True
+
+
+def test_price_series_action_uses_only_requested_symbol_contract(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config(
+        package_root=tmp_path / "package",
+        db_path=tmp_path / "warehouse" / "market.duckdb",
+    )
+    service = _new_service(config)
+    warehouse = service._market_warehouse()
+    frame = _build_daily_frame(
+        ["2026-03-04"],
+        [10.0],
+        include_date_column=False,
+    )
+    warehouse.replace_daily_bars(symbol="600000", frame=frame)
+    warehouse.replace_daily_bars(symbol="000001", frame=frame)
+    warehouse.update_price_series_contract(
+        symbol="600000",
+        price_series_mode="qfq",
+        adjustment_source="tushare_adj_factor",
+        adjustment_anchor_date="2026-03-04",
+        adjustment_anchor_factor=10.0,
+    )
+    warehouse.update_price_series_contract(
+        symbol="000001",
+        price_series_mode="qfq",
+        adjustment_source="tushare_adj_factor",
+        adjustment_anchor_date="2026-03-04",
+        adjustment_anchor_factor=20.0,
+    )
+
+    action = service._resolve_market_warehouse_price_series_action(
+        warehouse=warehouse,
+        symbol="000001",
+        fresh_meta={
+            "price_series_mode": "qfq",
+            "adjustment_source": "tushare_adj_factor",
+            "adjustment_anchor_date": "2026-03-06",
+            "adjustment_anchor_factor": 20.0,
+        },
+        force=False,
+    )
+
+    assert action["action"] == "incremental"
+    assert _as_mapping(action["contract"])["adjustment_anchor_factor"] == 20.0
+
+
+def test_carry_forward_trusted_financial_as_of_and_pending(tmp_path: Path) -> None:
+    package_root = tmp_path / "package"
+    db_path = tmp_path / "warehouse" / "market.duckdb"
+    config = _load_test_config(package_root=package_root, db_path=db_path)
+    service = _new_service(config)
+
+    existing = pd.DataFrame(
+        {
+            "open": [10.0, 10.1, 10.2],
+            "high": [10.0, 10.1, 10.2],
+            "low": [10.0, 10.1, 10.2],
+            "close": [10.0, 10.1, 10.2],
+            "volume": [1.0, 1.0, 1.0],
+            "turnover": [1.0, 1.0, 1.0],
+            "float_market_cap": [1.0, 1.0, 1.0],
+            "roe": [0.12, 0.12, 0.12],
+            "debt_ratio": [0.3, 0.3, 0.3],
+            "financial_data_complete": [True, True, True],
+            "financial_missing_fields": ["", "", ""],
+            "financial_source": ["reported_filing", "reported_filing", "reported_filing"],
+            "financial_report_date": ["20251231", "20251231", "20251231"],
+            "financial_as_of": ["2026-03-04", "2026-03-04", "2026-03-04"],
+            "financial_trust_level": ["reported", "reported", "reported"],
+            "financial_completeness": [1.0, 1.0, 1.0],
+        },
+        index=pd.to_datetime(["2026-03-03", "2026-03-04", "2026-03-05"]),
+    )
+    existing.index.name = "date"
+
+    # Fresh pending rows before and after as-of
+    fresh = pd.DataFrame(
+        {
+            "open": [10.3, 10.4],
+            "high": [10.3, 10.4],
+            "low": [10.3, 10.4],
+            "close": [10.3, 10.4],
+            "volume": [1.0, 1.0],
+            "turnover": [1.0, 1.0],
+            "float_market_cap": [1.0, 1.0],
+            "roe": [float("nan"), float("nan")],
+            "debt_ratio": [float("nan"), float("nan")],
+            "financial_data_complete": [False, False],
+            "financial_missing_fields": ["roe,debt_ratio", "roe,debt_ratio"],
+            "financial_source": ["tushare_pending", "tushare_pending"],
+            "financial_report_date": ["", ""],
+            "financial_as_of": ["", ""],
+            "financial_trust_level": ["missing", "missing"],
+            "financial_completeness": [0.0, 0.0],
+        },
+        index=pd.to_datetime(["2026-03-03", "2026-03-06"]),
+    )
+    fresh.index.name = "date"
+
+    carried = service._carry_forward_market_warehouse_financial_fields(
+        existing_daily=existing,
+        fresh_daily=fresh,
+    )
+    # Before as-of: no carry
+    assert pd.isna(carried.loc[pd.Timestamp("2026-03-03"), "roe"])
+    # After as-of: carry trusted values; pending does not wipe truth
+    assert float(carried.loc[pd.Timestamp("2026-03-06"), "roe"]) == pytest.approx(0.12)
+    assert carried.loc[pd.Timestamp("2026-03-06"), "financial_trust_level"] == "reported"
+    assert carried.loc[pd.Timestamp("2026-03-06"), "financial_source"] == "reported_filing"
+
+
+def test_carry_forward_skips_heuristic_default(tmp_path: Path) -> None:
+    package_root = tmp_path / "package"
+    db_path = tmp_path / "warehouse" / "market.duckdb"
+    config = _load_test_config(package_root=package_root, db_path=db_path)
+    service = _new_service(config)
+
+    existing = pd.DataFrame(
+        {
+            "open": [10.0],
+            "high": [10.0],
+            "low": [10.0],
+            "close": [10.0],
+            "volume": [1.0],
+            "turnover": [1.0],
+            "float_market_cap": [1.0],
+            "roe": [0.08],
+            "debt_ratio": [0.55],
+            "financial_data_complete": [False],
+            "financial_missing_fields": [""],
+            "financial_source": ["akshare_tx_default"],
+            "financial_report_date": [""],
+            "financial_as_of": ["2026-03-04"],
+            "financial_trust_level": ["heuristic"],
+            "financial_completeness": [0.5],
+        },
+        index=pd.to_datetime(["2026-03-04"]),
+    )
+    existing.index.name = "date"
+    fresh = pd.DataFrame(
+        {
+            "open": [10.1],
+            "high": [10.1],
+            "low": [10.1],
+            "close": [10.1],
+            "volume": [1.0],
+            "turnover": [1.0],
+            "float_market_cap": [1.0],
+            "roe": [float("nan")],
+            "debt_ratio": [float("nan")],
+            "financial_data_complete": [False],
+            "financial_missing_fields": ["roe,debt_ratio"],
+            "financial_source": ["tushare_pending"],
+            "financial_report_date": [""],
+            "financial_as_of": [""],
+            "financial_trust_level": ["missing"],
+            "financial_completeness": [0.0],
+        },
+        index=pd.to_datetime(["2026-03-06"]),
+    )
+    fresh.index.name = "date"
+    carried = service._carry_forward_market_warehouse_financial_fields(
+        existing_daily=existing,
+        fresh_daily=fresh,
+    )
+    assert pd.isna(carried.loc[pd.Timestamp("2026-03-06"), "roe"])
+    assert carried.loc[pd.Timestamp("2026-03-06"), "financial_source"] == "tushare_pending"
+
+
+def test_carry_forward_uses_latest_effective_financial_snapshot(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config(
+        package_root=tmp_path / "package",
+        db_path=tmp_path / "warehouse" / "market.duckdb",
+    )
+    service = _new_service(config)
+    existing = pd.DataFrame(
+        {
+            "roe": [0.10, 0.20],
+            "debt_ratio": [0.30, 0.40],
+            "financial_data_complete": [True, True],
+            "financial_missing_fields": ["", ""],
+            "financial_source": ["reported_filing", "reported_filing"],
+            "financial_report_date": ["20251231", "20260331"],
+            "financial_as_of": ["2026-03-04", "2026-04-01"],
+            "financial_trust_level": ["reported", "reported"],
+            "financial_completeness": [1.0, 1.0],
+        },
+        index=pd.to_datetime(["2026-03-04", "2026-04-01"]),
+    )
+    existing.index.name = "date"
+    fresh = pd.DataFrame(
+        {
+            "roe": [float("nan")] * 3,
+            "debt_ratio": [float("nan")] * 3,
+            "financial_data_complete": [False] * 3,
+            "financial_missing_fields": ["roe,debt_ratio"] * 3,
+            "financial_source": ["tushare_pending"] * 3,
+            "financial_report_date": [""] * 3,
+            "financial_as_of": [""] * 3,
+            "financial_trust_level": ["missing"] * 3,
+            "financial_completeness": [0.0] * 3,
+        },
+        index=pd.to_datetime(["2026-03-03", "2026-03-05", "2026-04-02"]),
+    )
+    fresh.index.name = "date"
+
+    carried = service._carry_forward_market_warehouse_financial_fields(
+        existing_daily=existing,
+        fresh_daily=fresh,
+    )
+
+    assert pd.isna(carried.loc[pd.Timestamp("2026-03-03"), "roe"])
+    assert float(carried.loc[pd.Timestamp("2026-03-05"), "roe"]) == pytest.approx(0.10)
+    assert float(carried.loc[pd.Timestamp("2026-04-02"), "roe"]) == pytest.approx(0.20)
+    assert float(carried.loc[pd.Timestamp("2026-04-02"), "debt_ratio"]) == pytest.approx(
+        0.40
+    )
+
+
+def test_sync_counts_returned_rebuild_required_as_failed(tmp_path: Path) -> None:
+    package_root = tmp_path / "package"
+    package_root.mkdir(parents=True, exist_ok=True)
+    config = _load_test_config(
+        package_root=package_root,
+        db_path=tmp_path / "warehouse" / "market.duckdb",
+    )
+    config.market_warehouse.intraday_sync_enabled = True
+    config.market_warehouse.intraday_intervals = ["5m"]
+    config.market_warehouse.intraday_sync_scope = "all"
+    service = _new_service(config)
+    provider_online = FakeOnlineProvider()
+    _patch_attr(service, "_build_market_warehouse_online_provider", lambda: provider_online)
+    _apply_lightweight_market_warehouse_state(
+        service,
+        latest_daily_dates={"600000": date(2026, 3, 4)},
+    )
+    _patch_attr(
+        service,
+        "_sync_market_warehouse_daily_symbol",
+        lambda **kwargs: {
+            "status": "failed",
+            "reason": "legacy_price_series_metadata_unknown",
+            "mode": "rebuild_required",
+        },
+    )
+    intraday_calls: list[str] = []
+    _patch_attr(
+        service,
+        "_sync_market_warehouse_intraday_symbol",
+        lambda **kwargs: intraday_calls.append(str(kwargs["symbol"])),
+    )
+
+    report = _as_mapping(
+        service.run_market_warehouse_sync(
+            symbols=["600000"],
+            force=False,
+            timestamp=pd.Timestamp("2026-03-06 20:30:00").to_pydatetime(),
+        )
+    )
+    daily_sync = _as_mapping(report["daily_sync"])
+    intraday_sync = _as_mapping(report["intraday_sync"])
+
+    assert report["status"] == "failed"
+    assert report["reason"] == "all_symbols_failed"
+    assert _as_int(daily_sync["failed"]) == 1
+    assert _as_int(daily_sync["skipped"]) == 0
+    assert _as_int(intraday_sync["ok"]) == 0
+    assert intraday_calls == []
+    assert report["failed_symbols"] == ["600000"]
+    assert _as_int(report["failed_symbols_total"]) == 1
+    assert cast(list[dict[str, str]], report["failed_samples"])[0]["reason"] == (
+        "legacy_price_series_metadata_unknown"
+    )
+
+
+def test_reanchor_failure_does_not_advance_symbol_meta(tmp_path: Path) -> None:
+    package_root = tmp_path / "package"
+    config = _load_test_config(
+        package_root=package_root,
+        db_path=tmp_path / "warehouse" / "market.duckdb",
+    )
+    service = _new_service(config)
+    warehouse = service._market_warehouse()
+    existing = _build_daily_frame(
+        ["2026-03-02", "2026-03-03"],
+        [10.0, 10.2],
+        include_date_column=False,
+    )
+    existing["price_series_mode"] = "qfq"
+    existing["adjustment_source"] = "tushare_adj_factor"
+    existing["adjustment_anchor_date"] = "2026-03-03"
+    existing["adjustment_anchor_factor"] = 10.0
+    warehouse.replace_daily_bars(symbol="600000", frame=existing)
+    warehouse.update_price_series_contract(
+        symbol="600000",
+        price_series_mode="qfq",
+        adjustment_source="tushare_adj_factor",
+        adjustment_anchor_date="2026-03-03",
+        adjustment_anchor_factor=10.0,
+    )
+
+    provider_online = FakeOnlineProvider()
+    fresh = _build_daily_frame(
+        ["2026-03-03", "2026-03-04"],
+        [5.1, 5.2],
+        include_date_column=False,
+    )
+    fresh["price_series_mode"] = "qfq"
+    fresh["adjustment_source"] = "tushare_adj_factor"
+    fresh["adjustment_anchor_date"] = "2026-03-04"
+    fresh["adjustment_anchor_factor"] = 20.0
+    fresh.attrs["price_series_meta"] = {
+        "price_series_mode": "qfq",
+        "adjustment_source": "tushare_adj_factor",
+        "adjustment_anchor_date": "2026-03-04",
+        "adjustment_anchor_factor": 20.0,
+    }
+    provider_online._daily_frame = fresh
+
+    def _fail_reanchor(**kwargs: object) -> pd.DataFrame:
+        _ = kwargs
+        raise ValueError("simulated_reanchor_failure")
+
+    _patch_attr(warehouse, "handle_reanchor_symbol", _fail_reanchor)
+    with pytest.raises(ValueError, match="simulated_reanchor_failure"):
+        service._sync_market_warehouse_daily_symbol(
+            warehouse=warehouse,
+            online_provider=provider_online,
+            symbol="600000",
+            force=False,
+            target_end_date=date(2026, 3, 4),
+            latest_daily=date(2026, 3, 3),
+        )
+
+    assert provider_online.calls == [("600000", 6, date(2026, 3, 4))]
+    assert warehouse.price_series_contract(symbol="600000")[
+        "adjustment_anchor_factor"
+    ] == 10.0
+
+
+def test_reanchor_sync_rebases_full_history_with_single_fetch(tmp_path: Path) -> None:
+    package_root = tmp_path / "package"
+    config = _load_test_config(
+        package_root=package_root,
+        db_path=tmp_path / "warehouse" / "market.duckdb",
+    )
+    service = _new_service(config)
+    warehouse = service._market_warehouse()
+    existing = _build_daily_frame(
+        ["2026-03-02", "2026-03-03"],
+        [10.0, 10.2],
+        include_date_column=False,
+    )
+    existing["price_series_mode"] = "qfq"
+    existing["adjustment_source"] = "tushare_adj_factor"
+    existing["adjustment_anchor_date"] = "2026-03-03"
+    existing["adjustment_anchor_factor"] = 10.0
+    warehouse.replace_daily_bars(symbol="600000", frame=existing)
+    warehouse.update_price_series_contract(
+        symbol="600000",
+        price_series_mode="qfq",
+        adjustment_source="tushare_adj_factor",
+        adjustment_anchor_date="2026-03-03",
+        adjustment_anchor_factor=10.0,
+    )
+
+    provider_online = FakeOnlineProvider()
+    fresh = _build_daily_frame(
+        ["2026-03-03", "2026-03-04"],
+        [5.1, 5.2],
+        include_date_column=False,
+    )
+    fresh["price_series_mode"] = "qfq"
+    fresh["adjustment_source"] = "tushare_adj_factor"
+    fresh["adjustment_anchor_date"] = "2026-03-04"
+    fresh["adjustment_anchor_factor"] = 20.0
+    fresh.attrs["price_series_meta"] = {
+        "price_series_mode": "qfq",
+        "adjustment_source": "tushare_adj_factor",
+        "adjustment_anchor_date": "2026-03-04",
+        "adjustment_anchor_factor": 20.0,
+    }
+    provider_online._daily_frame = fresh
+
+    result = _as_mapping(
+        service._sync_market_warehouse_daily_symbol(
+            warehouse=warehouse,
+            online_provider=provider_online,
+            symbol="600000",
+            force=False,
+            target_end_date=date(2026, 3, 4),
+            latest_daily=date(2026, 3, 3),
+        )
+    )
+
+    loaded = warehouse.fetch_all_daily_bars(symbol="600000")
+    packaged = load_package_daily_bars(source_root=package_root, symbol="600000")
+    assert result["status"] == "ok"
+    assert result["mode"] == "reanchor"
+    assert provider_online.calls == [("600000", 6, date(2026, 3, 4))]
+    assert len(loaded) == 3
+    assert len(packaged) == 3
+    assert float(loaded.loc[pd.Timestamp("2026-03-02"), "close"]) == pytest.approx(5.0)
+    assert float(loaded.loc[pd.Timestamp("2026-03-02"), "volume"]) == 1_000_000.0
+    assert float(loaded.loc[pd.Timestamp("2026-03-02"), "turnover"]) == 10_000_000.0
+    assert warehouse.price_series_contract(symbol="600000")[
+        "adjustment_anchor_factor"
+    ] == 20.0

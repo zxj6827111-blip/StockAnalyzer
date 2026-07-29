@@ -116,3 +116,34 @@ def test_build_primary_provider_requires_warehouse_db_path() -> None:
     config = DataSourceConfig(primary="market_warehouse", local_data_root="")
     with pytest.raises(DataSourceError):
         build_primary_provider(config)
+
+
+def test_tdx_offline_provider_preserves_nan_background(tmp_path: Path) -> None:
+    bars_dir = tmp_path / "bars"
+    bars_dir.mkdir(parents=True, exist_ok=True)
+    frame = pd.DataFrame(
+        {
+            "date": ["2026-02-27", "2026-02-28"],
+            "open": [10.0, 10.2],
+            "high": [10.3, 10.4],
+            "low": [9.9, 10.1],
+            "close": [10.2, 10.3],
+            "volume": [1_000_000, 1_100_000],
+            "turnover": [10_200_000.0, 11_300_000.0],
+            "float_market_cap": [12_000_000_000.0, 12_000_000_000.0],
+            "holder_count": [float("nan"), float("nan")],
+            "financing_balance": [float("nan"), float("nan")],
+            "northbound_net": [float("nan"), float("nan")],
+            "block_trade_net": [float("nan"), float("nan")],
+            "background_data_complete": [False, False],
+        }
+    )
+    frame.to_csv(bars_dir / "600000.csv", index=False)
+    provider = TdxOfflineProvider(data_root=str(tmp_path))
+    bars = provider.fetch_daily_bars(symbol="600000", lookback_days=2)
+    assert pd.isna(bars["holder_count"].iloc[-1])
+    assert pd.isna(bars["financing_balance"].iloc[-1])
+    assert pd.isna(bars["northbound_net"].iloc[-1])
+    assert bool(bars["background_data_complete"].iloc[-1]) is False
+    # Must not invent 60000 / 25e8 / unknown zeros
+    assert bars["holder_count"].iloc[-1] != 60_000.0

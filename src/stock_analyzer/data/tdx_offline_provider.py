@@ -50,6 +50,12 @@ _SELECTED_COLUMNS = [
     "dragon_tiger_flag",
     "background_data_source",
     "background_data_complete",
+    "background_missing_fields",
+    "background_as_of",
+    "price_series_mode",
+    "adjustment_source",
+    "adjustment_anchor_date",
+    "adjustment_anchor_factor",
     "board",
 ]
 
@@ -70,6 +76,7 @@ _NUMERIC_COLUMNS = {
     "margin_financing_balance",
     "northbound_net",
     "dragon_tiger_flag",
+    "adjustment_anchor_factor",
 }
 
 _BOOLEAN_COLUMNS = {
@@ -94,25 +101,30 @@ _DEFAULT_VALUES: dict[str, str | bool | float] = {
     "financial_as_of": "",
     "financial_trust_level": "missing",
     "financial_completeness": 0.0,
-    "holder_count": 60_000.0,
-    "block_trade_net": 0.0,
-    "financing_balance": 2_500_000_000.0,
-    "margin_financing_balance": 2_500_000_000.0,
-    "northbound_net": 0.0,
-    "dragon_tiger_flag": 0.0,
+    # Missing / not queried background fields stay NaN (never invent 60000 / 25e8 / unknown zero).
+    "holder_count": float("nan"),
+    "block_trade_net": float("nan"),
+    "financing_balance": float("nan"),
+    "margin_financing_balance": float("nan"),
+    "northbound_net": float("nan"),
+    "dragon_tiger_flag": float("nan"),
     "background_data_source": "tdx_offline",
-    "background_data_complete": True,
+    "background_data_complete": False,
+    "background_missing_fields": (
+        "holder_count,block_trade_net,financing_balance,"
+        "margin_financing_balance,northbound_net,dragon_tiger_flag"
+    ),
+    "background_as_of": "",
+    "price_series_mode": "unknown",
+    "adjustment_source": "unknown",
+    "adjustment_anchor_date": "",
+    "adjustment_anchor_factor": float("nan"),
     "board": "main",
 }
 
-_NUMERIC_DEFAULT_VALUES: dict[str, float] = {
-    "holder_count": 60_000.0,
-    "block_trade_net": 0.0,
-    "financing_balance": 2_500_000_000.0,
-    "margin_financing_balance": 2_500_000_000.0,
-    "northbound_net": 0.0,
-    "dragon_tiger_flag": 0.0,
-}
+# Only fill NaN for pure OHLC/volume market structure fields if truly missing.
+# Background/financial numerics must preserve provider NaN (unknown != zero).
+_NUMERIC_DEFAULT_VALUES: dict[str, float] = {}
 
 
 @dataclass(slots=True)
@@ -256,7 +268,7 @@ def _normalize_frame(frame: pd.DataFrame, symbol: str) -> pd.DataFrame:
             normalized[col] = pd.to_numeric(normalized[col], errors="coerce")
             if col == "financial_completeness":
                 normalized[col] = normalized[col].fillna(0.0).clip(lower=0.0, upper=1.0)
-            if col in _NUMERIC_DEFAULT_VALUES:
+            elif col in _NUMERIC_DEFAULT_VALUES:
                 normalized[col] = normalized[col].fillna(_NUMERIC_DEFAULT_VALUES[col])
 
     for col in _BOOLEAN_COLUMNS:
@@ -278,6 +290,11 @@ def _normalize_frame(frame: pd.DataFrame, symbol: str) -> pd.DataFrame:
         "financial_report_date",
         "financial_as_of",
         "financial_trust_level",
+        "background_missing_fields",
+        "background_as_of",
+        "price_series_mode",
+        "adjustment_source",
+        "adjustment_anchor_date",
         "board",
     ):
         if col in normalized.columns:
@@ -305,18 +322,45 @@ def _normalize_frame(frame: pd.DataFrame, symbol: str) -> pd.DataFrame:
         "financial_report_date"
     ]
 
+    # If background is incomplete, ensure missing-field audit list is non-empty for NaN fields.
+    bg_fields = [
+        "holder_count",
+        "block_trade_net",
+        "financing_balance",
+        "margin_financing_balance",
+        "northbound_net",
+        "dragon_tiger_flag",
+    ]
+    missing_bg = []
+    for background_field in bg_fields:
+        series = pd.to_numeric(normalized[background_field], errors="coerce")
+        if series.isna().all():
+            missing_bg.append(background_field)
+    if missing_bg and (
+        normalized["background_missing_fields"].eq("").all()
+        or normalized["background_missing_fields"].isna().all()
+    ):
+        normalized["background_missing_fields"] = ",".join(missing_bg)
+    incomplete_mask = ~normalized["background_data_complete"].astype(bool)
+    # Historical numeric defaults must not silently upgrade an incomplete row.
+    normalized.loc[incomplete_mask, "background_data_complete"] = False
+
     selected = normalized[_SELECTED_COLUMNS].copy()
     selected.index.name = "date"
     return selected
 
 
 def _clean_text_value(value: object) -> str:
-    if value is None or pd.isna(value):
+    if value is None:
         return ""
     text = str(value).strip()
     if not text:
         return ""
-    return "" if text.lower() in {"nan", "null", "none", "undefined"} else text
+    return (
+        ""
+        if text.lower() in {"nan", "nat", "<na>", "null", "none", "undefined"}
+        else text
+    )
 
 
 def _normalize_symbol(symbol: str) -> str:

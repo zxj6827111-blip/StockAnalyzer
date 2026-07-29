@@ -245,3 +245,193 @@ def test_market_warehouse_materialize_runtime_package_exports_database_rows(
     assert warehouse.has_materialized_package() is True
     exported = load_package_daily_bars(source_root=runtime_package_root, symbol="600000")
     assert len(exported) == 3
+
+
+def test_market_warehouse_preserves_nan_roundtrip(tmp_path: Path) -> None:
+    warehouse = MarketWarehouse(
+        db_path=tmp_path / "warehouse" / "market.duckdb",
+        package_root=tmp_path / "package",
+    )
+    frame = pd.DataFrame(
+        {
+            "open": [10.0, 10.1],
+            "high": [10.2, 10.3],
+            "low": [9.9, 10.0],
+            "close": [10.1, 10.2],
+            "volume": [1_000_000.0, 1_100_000.0],
+            "turnover": [10_100_000.0, 11_220_000.0],
+            "float_market_cap": [12_000_000_000.0, 12_000_000_000.0],
+            "holder_count": [float("nan"), float("nan")],
+            "financing_balance": [float("nan"), float("nan")],
+            "northbound_net": [float("nan"), float("nan")],
+            "block_trade_net": [float("nan"), float("nan")],
+            "background_data_complete": [False, False],
+            "background_missing_fields": [
+                "holder_count,financing_balance",
+                "holder_count,financing_balance",
+            ],
+            "background_data_source": ["tushare_pro_qfq", "tushare_pro_qfq"],
+            "price_series_mode": ["qfq", "qfq"],
+            "adjustment_source": ["tushare_adj_factor", "tushare_adj_factor"],
+            "adjustment_anchor_date": ["2026-07-14", "2026-07-14"],
+            "adjustment_anchor_factor": [16.0, 16.0],
+            "financial_source": ["tushare_pending", "tushare_pending"],
+            "financial_trust_level": ["missing", "missing"],
+            "roe": [float("nan"), float("nan")],
+            "debt_ratio": [float("nan"), float("nan")],
+        },
+        index=pd.to_datetime(["2026-07-11", "2026-07-14"]),
+    )
+    frame.index.name = "date"
+    warehouse.replace_daily_bars(symbol="600000", frame=frame)
+    warehouse.update_price_series_contract(
+        symbol="600000",
+        price_series_mode="qfq",
+        adjustment_source="tushare_adj_factor",
+        adjustment_anchor_date="2026-07-14",
+        adjustment_anchor_factor=16.0,
+    )
+    warehouse.materialize_runtime_package(symbols=["600000"])
+
+    loaded = warehouse.fetch_all_daily_bars(symbol="600000")
+    assert pd.isna(loaded["holder_count"].iloc[-1])
+    assert pd.isna(loaded["financing_balance"].iloc[-1])
+    assert pd.isna(loaded["northbound_net"].iloc[-1])
+    assert bool(loaded["background_data_complete"].iloc[-1]) is False
+
+    package_bars = load_package_daily_bars(source_root=tmp_path / "package", symbol="600000")
+    assert pd.isna(package_bars["holder_count"].iloc[-1])
+    assert package_bars["price_series_mode"].iloc[-1] == "qfq"
+    assert package_bars["adjustment_source"].iloc[-1] == "tushare_adj_factor"
+    manifest = (tmp_path / "package" / "manifest.json").read_text(encoding="utf-8")
+    assert "price_series_mode" in manifest
+    assert "tushare_adj_factor" in manifest or "adjustment_source" in manifest
+
+
+def test_market_warehouse_price_series_contract_unknown_by_default(tmp_path: Path) -> None:
+    warehouse = MarketWarehouse(
+        db_path=tmp_path / "warehouse" / "market.duckdb",
+        package_root=tmp_path / "package",
+    )
+    contract = warehouse.price_series_contract(symbol="600000")
+    assert contract["known"] is False
+    shadow = warehouse.clone_to_shadow_paths(
+        shadow_db_path=tmp_path / "shadow" / "market.duckdb",
+        shadow_package_root=tmp_path / "shadow_package",
+    )
+    assert shadow.db_path != warehouse.db_path
+    assert shadow.package_root != warehouse.package_root
+
+
+def test_market_warehouse_price_series_contract_is_isolated_per_symbol(
+    tmp_path: Path,
+) -> None:
+    warehouse = MarketWarehouse(
+        db_path=tmp_path / "warehouse" / "market.duckdb",
+        package_root=tmp_path / "package",
+    )
+    for symbol in ("600000", "000001"):
+        frame = pd.DataFrame(
+            {
+                "open": [10.0],
+                "high": [10.2],
+                "low": [9.9],
+                "close": [10.1],
+                "volume": [1_000_000.0],
+                "turnover": [10_100_000.0],
+                "float_market_cap": [12_000_000_000.0],
+            },
+            index=pd.to_datetime(["2026-07-14"]),
+        )
+        frame.index.name = "date"
+        warehouse.replace_daily_bars(symbol=symbol, frame=frame)
+
+    warehouse.update_price_series_contract(
+        symbol="600000",
+        price_series_mode="qfq",
+        adjustment_source="tushare_adj_factor",
+        adjustment_anchor_date="2026-07-14",
+        adjustment_anchor_factor=10.0,
+    )
+    warehouse.update_price_series_contract(
+        symbol="000001",
+        price_series_mode="qfq",
+        adjustment_source="tushare_adj_factor",
+        adjustment_anchor_date="2026-07-14",
+        adjustment_anchor_factor=20.0,
+    )
+
+    assert warehouse.price_series_contract(symbol="600000")[
+        "adjustment_anchor_factor"
+    ] == 10.0
+    assert warehouse.price_series_contract(symbol="000001")[
+        "adjustment_anchor_factor"
+    ] == 20.0
+    assert warehouse.price_series_contract()["mixed"] is True
+    assert warehouse.warehouse_meta_path("600000").exists()
+    assert warehouse.warehouse_meta_path("000001").exists()
+    assert warehouse.warehouse_meta_path().exists() is False
+
+
+def test_market_warehouse_reanchor_preserves_history_and_traded_units(
+    tmp_path: Path,
+) -> None:
+    warehouse = MarketWarehouse(
+        db_path=tmp_path / "warehouse" / "market.duckdb",
+        package_root=tmp_path / "package",
+    )
+    existing = pd.DataFrame(
+        {
+            "open": [10.0, 11.0, 12.0],
+            "high": [10.2, 11.2, 12.2],
+            "low": [9.8, 10.8, 11.8],
+            "close": [10.1, 11.1, 12.1],
+            "volume": [100.0, 200.0, 300.0],
+            "turnover": [1_010.0, 2_220.0, 3_630.0],
+            "float_market_cap": [12_000_000_000.0] * 3,
+            "price_series_mode": ["qfq", "qfq", "qfq"],
+            "adjustment_source": ["tushare_adj_factor"] * 3,
+            "adjustment_anchor_date": ["2026-07-13"] * 3,
+            "adjustment_anchor_factor": [10.0, 10.0, 10.0],
+        },
+        index=pd.to_datetime(["2026-07-11", "2026-07-12", "2026-07-13"]),
+    )
+    existing.index.name = "date"
+    warehouse.replace_daily_bars(symbol="600000", frame=existing)
+
+    fresh = pd.DataFrame(
+        {
+            "open": [6.0, 6.2],
+            "high": [6.1, 6.3],
+            "low": [5.9, 6.1],
+            "close": [6.05, 6.25],
+            "volume": [300.0, 400.0],
+            "turnover": [3_630.0, 5_000.0],
+            "float_market_cap": [12_000_000_000.0] * 2,
+            "price_series_mode": ["qfq", "qfq"],
+            "adjustment_source": ["tushare_adj_factor", "tushare_adj_factor"],
+            "adjustment_anchor_date": ["2026-07-14", "2026-07-14"],
+            "adjustment_anchor_factor": [20.0, 20.0],
+        },
+        index=pd.to_datetime(["2026-07-13", "2026-07-14"]),
+    )
+    fresh.index.name = "date"
+    merged = warehouse.handle_reanchor_symbol(
+        symbol="600000",
+        fresh_daily=fresh,
+        old_anchor_factor=10.0,
+        new_anchor_factor=20.0,
+        fresh_meta={
+            "price_series_mode": "qfq",
+            "adjustment_source": "tushare_adj_factor",
+            "adjustment_anchor_date": "2026-07-14",
+            "adjustment_anchor_factor": 20.0,
+        },
+    )
+
+    assert len(merged) == 4
+    assert float(merged.loc[pd.Timestamp("2026-07-11"), "close"]) == pytest.approx(5.05)
+    assert float(merged.loc[pd.Timestamp("2026-07-11"), "volume"]) == 100.0
+    assert float(merged.loc[pd.Timestamp("2026-07-11"), "turnover"]) == 1_010.0
+    assert float(merged.loc[pd.Timestamp("2026-07-13"), "close"]) == 6.05
+    assert set(pd.to_numeric(merged["adjustment_anchor_factor"]).dropna()) == {20.0}

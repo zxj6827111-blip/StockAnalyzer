@@ -5932,6 +5932,25 @@ class StockAnalyzerService:
             fresh_daily=fresh_daily,
         )
 
+    def _extract_price_series_meta_from_frame(self, frame: pd.DataFrame) -> dict[str, object]:
+        return self._market_sync_service._extract_price_series_meta_from_frame(frame)
+
+    def _resolve_market_warehouse_price_series_action(
+        self,
+        *,
+        warehouse: MarketWarehouse,
+        symbol: str,
+        fresh_meta: dict[str, object],
+        force: bool,
+    ) -> dict[str, object]:
+        return self._market_sync_service._resolve_market_warehouse_price_series_action(
+            warehouse=warehouse,
+            symbol=symbol,
+            fresh_meta=fresh_meta,
+            force=force,
+        )
+
+
     def _sync_market_warehouse_daily_symbol(
         self,
         *,

@@ -124,3 +124,14 @@ def test_feature_engineer_merges_market_relative_features_with_t_minus_1_shift()
     assert float(features.loc[idx, "benchmark_above_ma20"]) == pytest.approx(
         float(market_index.iloc[9]["benchmark_above_ma20"])
     )
+
+
+def test_feature_engineer_handles_nan_background_fields() -> None:
+    bars = _bars()
+    bars["holder_count"] = np.nan
+    bars["northbound_net"] = np.nan
+    bars["block_trade_net"] = np.nan
+    bars["margin_financing_balance"] = np.nan
+    features = FeatureEngineer().transform(bars)
+    assert features.shape[0] > 0
+    assert np.isfinite(features.to_numpy(dtype=float)).all()

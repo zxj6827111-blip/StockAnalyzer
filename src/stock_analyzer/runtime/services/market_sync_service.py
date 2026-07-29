@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import socket
 import time
@@ -20,7 +21,6 @@ import pandas as pd
 from stock_analyzer.data.akshare_provider import AkshareProvider
 from stock_analyzer.data.cached_provider import CachedProvider
 from stock_analyzer.data.efinance_provider import EfinanceProvider
-from stock_analyzer.data.tushare_provider import TushareProvider
 from stock_analyzer.data.intraday_summary import (
     fetch_sina_minute_bars,
     summarize_minute_bars,
@@ -41,6 +41,7 @@ from stock_analyzer.data.tdx_sync import (
     load_tdx_manifest,
     run_tdx_offline_package_build,
 )
+from stock_analyzer.data.tushare_provider import TushareProvider
 
 
 def classify_market_warehouse_health(
@@ -1094,14 +1095,87 @@ class RuntimeMarketSyncService:
         existing_daily: pd.DataFrame,
         fresh_daily: pd.DataFrame,
     ) -> pd.DataFrame:
+        """Carry trusted financials only; never upgrade heuristic/default; honor as-of.
+
+        Rules:
+        - Only trust_level in {reported, derived} may carry forward.
+        - heuristic/default/missing never become trusted via carry.
+        - Carry only onto rows on/after financial_as_of; no pre-announcement backfill.
+        - tushare_pending / empty means provider omitted financials; it does NOT invalidate
+          already-disclosed trusted values already stored in the warehouse.
+        """
         if existing_daily.empty or fresh_daily.empty:
             return fresh_daily
         adjusted = fresh_daily.copy()
-        latest_existing = existing_daily.iloc[-1]
-        financial_source = ""
-        if "financial_source" in adjusted.columns and len(adjusted.index) > 0:
-            financial_source = str(adjusted["financial_source"].iloc[-1]).strip()
-        if financial_source.endswith("_default") or not financial_source:
+
+        trusted_snapshots: list[dict[str, object]] = []
+        for row_index, row in existing_daily.iterrows():
+            trust = str(row.get("financial_trust_level", "") or "").strip().lower()
+            source = str(row.get("financial_source", "") or "").strip().lower()
+            as_of = pd.to_datetime(
+                cast(Any, row.get("financial_as_of")), errors="coerce"
+            )
+            if (
+                trust not in {"reported", "derived"}
+                or source in {"", "missing", "tdx_offline", "tushare_pending"}
+                or pd.isna(as_of)
+            ):
+                continue
+            bar_date = pd.to_datetime(
+                cast(Any, row.get("date") or row.get("trade_date") or row_index),
+                errors="coerce",
+            )
+            trusted_snapshots.append(
+                {
+                    "as_of": as_of,
+                    "bar_date": bar_date,
+                    "row": row.to_dict(),
+                }
+            )
+
+        if not trusted_snapshots:
+            return adjusted
+
+        trusted_snapshots.sort(
+            key=lambda item: (
+                cast(pd.Timestamp, item["as_of"]),
+                cast(pd.Timestamp, item["bar_date"])
+                if not pd.isna(cast(Any, item["bar_date"]))
+                else pd.Timestamp.min,
+            )
+        )
+
+        for idx in adjusted.index:
+            current = adjusted.loc[idx]
+            bar_ts = pd.to_datetime(
+                cast(Any, current.get("date") or current.get("trade_date") or idx),
+                errors="coerce",
+            )
+            if pd.isna(bar_ts):
+                continue
+
+            current_trust = str(
+                current.get("financial_trust_level", "") or ""
+            ).strip().lower()
+            current_source = str(current.get("financial_source", "") or "").strip().lower()
+            if current_trust not in {"", "missing", "pending"} and current_source not in {
+                "",
+                "missing",
+                "tushare_pending",
+            }:
+                continue
+
+            valid_snapshots = [
+                snapshot
+                for snapshot in trusted_snapshots
+                if cast(pd.Timestamp, snapshot["as_of"]) <= bar_ts
+            ]
+            if not valid_snapshots:
+                continue
+            latest_row = valid_snapshots[-1]["row"]
+            if not isinstance(latest_row, dict):
+                continue
+
             for column in (
                 "roe",
                 "debt_ratio",
@@ -1109,12 +1183,172 @@ class RuntimeMarketSyncService:
                 "financial_missing_fields",
                 "financial_source",
                 "financial_report_date",
-                "holder_count",
+                "financial_as_of",
+                "financial_trust_level",
+                "financial_completeness",
             ):
-                if column not in adjusted.columns or column not in latest_existing.index:
-                    continue
-                adjusted[column] = latest_existing[column]
+                if column in adjusted.columns and column in latest_row:
+                    adjusted.at[idx, column] = latest_row[column]
         return adjusted
+
+    def _extract_price_series_meta_from_frame(self, frame: pd.DataFrame) -> dict[str, object]:
+        attrs = getattr(frame, "attrs", {}) or {}
+        meta = attrs.get("price_series_meta") if isinstance(attrs, dict) else None
+        if isinstance(meta, dict) and meta:
+            return {
+                "price_series_mode": str(meta.get("price_series_mode", "") or "").strip().lower(),
+                "adjustment_source": str(meta.get("adjustment_source", "") or "").strip(),
+                "adjustment_anchor_date": str(meta.get("adjustment_anchor_date", "") or "").strip(),
+                "adjustment_anchor_factor": meta.get("adjustment_anchor_factor"),
+            }
+        result: dict[str, object] = {
+            "price_series_mode": "",
+            "adjustment_source": "",
+            "adjustment_anchor_date": "",
+            "adjustment_anchor_factor": None,
+        }
+        if frame.empty:
+            return result
+        last = frame.iloc[-1]
+        for key in (
+            "price_series_mode",
+            "adjustment_source",
+            "adjustment_anchor_date",
+            "adjustment_anchor_factor",
+        ):
+            if key in frame.columns:
+                value = last.get(key)
+                if key == "adjustment_anchor_factor":
+                    try:
+                        result[key] = (
+                            float(value)
+                            if value is not None and not pd.isna(value)
+                            else None
+                        )
+                    except (TypeError, ValueError):
+                        result[key] = None
+                else:
+                    result[key] = str(value or "").strip()
+        result["price_series_mode"] = str(result.get("price_series_mode") or "").strip().lower()
+        return result
+
+    def _resolve_market_warehouse_price_series_action(
+        self,
+        *,
+        warehouse: MarketWarehouse,
+        symbol: str,
+        fresh_meta: dict[str, object],
+        force: bool,
+    ) -> dict[str, object]:
+        """Decide incremental / reanchor / rebuild_required for qfq safety.
+
+        force only widens lookback; it is NOT a full-history rebuild signal.
+        Unknown legacy warehouses must not silently mix anchors.
+        """
+        contract = warehouse.price_series_contract(symbol=symbol)
+        fresh_mode = str(fresh_meta.get("price_series_mode") or "").strip().lower()
+        fresh_factor = fresh_meta.get("adjustment_anchor_factor")
+
+        if not fresh_mode:
+            return {
+                "action": (
+                    "bootstrap"
+                    if warehouse.fetch_all_daily_bars(symbol=symbol).empty
+                    else "incremental"
+                ),
+                "reason": "fresh_price_series_metadata_unknown",
+                "fresh_meta": fresh_meta,
+                "contract": contract,
+                "force": bool(force),
+            }
+
+        try:
+            fresh_f = (
+                float(cast(Any, fresh_factor)) if fresh_factor is not None else None
+            )
+        except (TypeError, ValueError):
+            fresh_f = None
+        if fresh_mode in {"qfq", "hfq"} and (
+            fresh_f is None or not math.isfinite(fresh_f) or fresh_f <= 0.0
+        ):
+            return {
+                "action": "rebuild_required",
+                "reason": "fresh_adjustment_anchor_factor_invalid",
+                "fresh_meta": fresh_meta,
+                "contract": contract,
+            }
+
+        symbol_daily_empty = warehouse.fetch_all_daily_bars(symbol=symbol).empty
+        if symbol_daily_empty:
+            return {
+                "action": "bootstrap",
+                "reason": "empty_symbol_history",
+                "fresh_meta": fresh_meta,
+                "contract": contract,
+            }
+
+        if not bool(contract.get("known")):
+            # Existing bars without audited qfq metadata: refuse in-place mix.
+            return {
+                "action": "rebuild_required",
+                "reason": "legacy_price_series_metadata_unknown",
+                "fresh_meta": fresh_meta,
+                "contract": contract,
+                "shadow_hint": "create new warehouse/package, validate, then switch",
+            }
+
+        stored_mode = str(contract.get("price_series_mode") or "").strip().lower()
+        if fresh_mode and stored_mode and fresh_mode != stored_mode:
+            return {
+                "action": "rebuild_required",
+                "reason": f"price_series_mode_mismatch:{stored_mode}->{fresh_mode}",
+                "fresh_meta": fresh_meta,
+                "contract": contract,
+            }
+
+        stored_factor = contract.get("adjustment_anchor_factor")
+        try:
+            stored_f = (
+                float(cast(Any, stored_factor)) if stored_factor is not None else None
+            )
+        except (TypeError, ValueError):
+            stored_f = None
+        if stored_mode in {"qfq", "hfq"} and (
+            stored_f is None or not math.isfinite(stored_f) or stored_f <= 0.0
+        ):
+            return {
+                "action": "rebuild_required",
+                "reason": "stored_adjustment_anchor_factor_invalid",
+                "fresh_meta": fresh_meta,
+                "contract": contract,
+            }
+
+        if (
+            stored_mode in {"qfq", "hfq"}
+            and stored_f is not None
+            and fresh_f is not None
+            and abs(stored_f - fresh_f) > 1e-9
+        ):
+            # Anchor moved (e.g. post-split). Incremental window alone is unsafe.
+            # Reanchor requires full symbol history rewrite from provider; force lookback
+            # is still limited, so require explicit rebuilt path / full bootstrap lookback.
+            return {
+                "action": "reanchor",
+                "reason": "adjustment_anchor_factor_changed",
+                "fresh_meta": fresh_meta,
+                "contract": contract,
+                "stored_anchor_factor": stored_f,
+                "fresh_anchor_factor": fresh_f,
+                "force_is_not_full_rebuild": True,
+            }
+
+        return {
+            "action": "incremental",
+            "reason": "anchor_compatible",
+            "fresh_meta": fresh_meta,
+            "contract": contract,
+            "force": bool(force),
+        }
 
     def _sync_market_warehouse_daily_symbol(
         self,
@@ -1194,22 +1428,66 @@ class RuntimeMarketSyncService:
             }
 
         existing_daily = warehouse.fetch_all_daily_bars(symbol=symbol)
+        fresh_meta = service._extract_price_series_meta_from_frame(fresh_daily)
+        price_action = service._resolve_market_warehouse_price_series_action(
+            warehouse=warehouse,
+            symbol=symbol,
+            fresh_meta=fresh_meta,
+            force=force,
+        )
+        action = str(price_action.get("action") or "incremental")
+        if action == "rebuild_required":
+            return {
+                "status": "failed",
+                "reason": str(price_action.get("reason") or "rebuild_required"),
+                "mode": "rebuild_required",
+                "lookback_days": lookback_days,
+                "price_series": price_action,
+                "latest_date": latest_daily.isoformat() if latest_daily else "",
+                "failed_symbols": [symbol],
+                "failed_symbols_total": 1,
+            }
         fresh_daily = service._carry_forward_market_warehouse_financial_fields(
             existing_daily=existing_daily,
             fresh_daily=fresh_daily,
         )
-        merged_daily = (
-            fresh_daily
-            if existing_daily.empty
-            else pd.concat([existing_daily, fresh_daily], axis=0)
-        )
-        merged_daily = merged_daily[~merged_daily.index.duplicated(keep="last")].sort_index()
+        if action == "reanchor":
+            merged_daily = warehouse.handle_reanchor_symbol(
+                symbol=symbol,
+                fresh_daily=fresh_daily,
+                old_anchor_factor=float(price_action["stored_anchor_factor"]),
+                new_anchor_factor=float(price_action["fresh_anchor_factor"]),
+                fresh_meta=fresh_meta,
+            )
+            sync_mode = "reanchor"
+        else:
+            merged_daily = (
+                fresh_daily
+                if existing_daily.empty
+                else pd.concat([existing_daily, fresh_daily], axis=0)
+            )
+            merged_daily = merged_daily[~merged_daily.index.duplicated(keep="last")].sort_index()
+
         warehouse.replace_daily_bars(symbol=symbol, frame=merged_daily)
         write_package_daily_bars(
             package_root=warehouse.package_root,
             symbol=symbol,
             frame=merged_daily,
         )
+        if fresh_meta.get("price_series_mode"):
+            warehouse.update_price_series_contract(
+                symbol=symbol,
+                price_series_mode=str(fresh_meta.get("price_series_mode") or ""),
+                adjustment_source=str(fresh_meta.get("adjustment_source") or ""),
+                adjustment_anchor_date=str(fresh_meta.get("adjustment_anchor_date") or ""),
+                adjustment_anchor_factor=(
+                    float(fresh_meta["adjustment_anchor_factor"])
+                    if fresh_meta.get("adjustment_anchor_factor") is not None
+                    else None
+                ),
+                extra={"last_sync_mode": sync_mode},
+            )
+            warehouse.refresh_package_manifests()
         latest_date = (
             merged_daily.index[-1].date().isoformat() if len(merged_daily.index) > 0 else ""
         )
@@ -1219,6 +1497,13 @@ class RuntimeMarketSyncService:
             "rows": int(len(merged_daily)),
             "mode": sync_mode,
             "lookback_days": lookback_days,
+            "price_series_action": action,
+            "price_series": {
+                "mode": fresh_meta.get("price_series_mode"),
+                "adjustment_source": fresh_meta.get("adjustment_source"),
+                "adjustment_anchor_date": fresh_meta.get("adjustment_anchor_date"),
+                "adjustment_anchor_factor": fresh_meta.get("adjustment_anchor_factor"),
+            },
         }
 
     def _sync_market_warehouse_intraday_symbol(
@@ -1298,7 +1583,12 @@ class RuntimeMarketSyncService:
 
     def _resolve_market_warehouse_sync_lock_path(self) -> Path:
         service = self._service
-        return service._market_warehouse_progress_path.with_name("market_warehouse_sync.lock")
+        return cast(
+            Path,
+            service._market_warehouse_progress_path.with_name(
+                "market_warehouse_sync.lock"
+            ),
+        )
 
     def _resolve_market_warehouse_retry_source_report(
         self,
@@ -1547,7 +1837,12 @@ class RuntimeMarketSyncService:
         daily_ok = 0
         daily_failed = 0
         daily_skipped = 0
-        daily_mode_counts: dict[str, int] = {"bootstrap": 0, "full": 0, "incremental": 0}
+        daily_mode_counts: dict[str, int] = {
+            "bootstrap": 0,
+            "full": 0,
+            "incremental": 0,
+            "reanchor": 0,
+        }
         intraday_ok = 0
         intraday_failed = 0
         intraday_skipped = 0
@@ -1739,6 +2034,7 @@ class RuntimeMarketSyncService:
         )
         if preacquired_lock:
             lock_path = scheduler_lock_path
+            assert lock_path is not None
             lock_owner_token = scheduler_lock_owner_token.strip()
             active_lock = self._read_market_warehouse_sync_lock(lock_path)
             if str(active_lock.get("owner_token", "")).strip() != lock_owner_token:
@@ -1807,6 +2103,7 @@ class RuntimeMarketSyncService:
             name="market-warehouse-lock-heartbeat",
             daemon=True,
         )
+        assert lock_path is not None
         self._touch_market_warehouse_sync_lock(lock_path=lock_path, owner_token=lock_owner_token)
         heartbeat_thread.start()
         lock_cleanup_done = False
@@ -2004,11 +2301,33 @@ class RuntimeMarketSyncService:
                         latest_daily=latest_daily_map.get(symbol),
                         hard_timeout_sec=effective_daily_symbol_hard_timeout_sec,
                     )
-                    if str(daily_result.get("status", "")) == "ok":
+                    daily_status = str(daily_result.get("status", "")).strip().lower()
+                    if daily_status == "ok":
                         daily_ok += 1
                         sync_mode = str(daily_result.get("mode", "")).strip().lower()
                         if sync_mode in daily_mode_counts:
                             daily_mode_counts[sync_mode] += 1
+                    elif daily_status in {"failed", "blocked"}:
+                        daily_failed += 1
+                        _record_failed_symbol(symbol)
+                        if len(failed_samples) < 20:
+                            failed_samples.append(
+                                {
+                                    "symbol": symbol,
+                                    "stage": "daily",
+                                    "reason": str(
+                                        daily_result.get("reason") or daily_status
+                                    ),
+                                }
+                            )
+                        symbols_completed = index
+                        _publish_progress(
+                            phase="syncing",
+                            current_symbol=symbol,
+                            current_stage=current_stage,
+                            force_write=index == len(symbol_list),
+                        )
+                        continue
                     else:
                         daily_skipped += 1
                 except Exception as exc:
