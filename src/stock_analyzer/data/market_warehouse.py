@@ -66,6 +66,8 @@ _DAILY_NUMERIC_COLUMNS = {
     "northbound_net",
     "dragon_tiger_flag",
     "adjustment_anchor_factor",
+    "up_limit",
+    "down_limit",
 }
 _DAILY_BOOLEAN_COLUMNS = {
     "suspended",
@@ -530,7 +532,7 @@ class MarketWarehouse:
         return frame
 
     def apply_trade_status_to_daily(self, *, symbol: str) -> pd.DataFrame:
-        """Merge trade status (up_limit, down_limit, suspended) into daily bars."""
+        """Merge trade status (up_limit, down_limit, suspended) into daily bars + package."""
         daily = self.fetch_all_daily_bars(symbol=symbol)
         if daily.empty:
             return daily
@@ -549,6 +551,11 @@ class MarketWarehouse:
                     daily.at[ts, "down_limit"] = float(down)
                 daily.at[ts, "suspended"] = susp
         self.replace_daily_bars(symbol=symbol, frame=daily)
+        write_package_daily_bars(
+            package_root=self.package_root,
+            symbol=symbol,
+            frame=daily,
+        )
         return daily
 
 
@@ -886,6 +893,57 @@ class MarketWarehouse:
                 frame["trade_date"], errors="coerce"
             )
         return frame
+
+
+
+    def apply_p2_p3_to_daily(self, *, symbol: str) -> pd.DataFrame:
+        """Project margin_detail and top_list events back onto daily bars + package.
+
+        Semantics (honest, no fabricated values):
+        - margin_detail.financing_balance -> daily.financing_balance AND
+          daily.margin_financing_balance (both = Tushare 融资余额 rzye, as-of trade_date).
+        - top_list.dragon_tiger_flag -> daily.dragon_tiger_flag on event days (=1).
+          Non-event days keep prior value (NaN = not confirmed, NOT forced to 0).
+        - northbound_net stays NaN: hk_hold is a holding stock, not a net flow.
+        - block_trade_net stays NaN: no reliable buy/sell direction from API.
+        """
+        daily = self.fetch_all_daily_bars(symbol=symbol)
+        if daily.empty:
+            return daily
+
+        changed = False
+
+        margin = self.fetch_margin_detail(symbol=symbol)
+        if not margin.empty and "financing_balance" in margin.columns:
+            m = margin.dropna(subset=["trade_date"]).copy()
+            m = m.set_index(pd.to_datetime(m["trade_date"]))
+            for ts, row in m.iterrows():
+                if ts in daily.index:
+                    val = row.get("financing_balance")
+                    if val is not None and not pd.isna(val):
+                        daily.at[ts, "financing_balance"] = float(val)
+                        daily.at[ts, "margin_financing_balance"] = float(val)
+                        changed = True
+
+        top_list = self.fetch_top_list_events(symbol=symbol)
+        if not top_list.empty and "dragon_tiger_flag" in top_list.columns:
+            t = top_list.dropna(subset=["trade_date"]).copy()
+            t = t.set_index(pd.to_datetime(t["trade_date"]))
+            for ts, row in t.iterrows():
+                if ts in daily.index:
+                    flag = row.get("dragon_tiger_flag")
+                    if flag is not None and not pd.isna(flag):
+                        daily.at[ts, "dragon_tiger_flag"] = float(flag)
+                        changed = True
+
+        if changed:
+            self.replace_daily_bars(symbol=symbol, frame=daily)
+            write_package_daily_bars(
+                package_root=self.package_root,
+                symbol=symbol,
+                frame=daily,
+            )
+        return daily
 
 
     def warehouse_meta_path(self, symbol: str | None = None) -> Path:

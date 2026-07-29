@@ -20,8 +20,10 @@ from stock_analyzer.data.tushare_provider import TushareProvider
 
 
 def test_percent_to_ratio_converts_tushare_percent_points() -> None:
+    # Tushare fina_indicator fields are always percentage points.
     assert percent_to_ratio(12.5) == pytest.approx(0.125)
-    assert percent_to_ratio(0.125) == pytest.approx(0.125)
+    assert percent_to_ratio(1.2) == pytest.approx(0.012)
+    assert percent_to_ratio(0.5) == pytest.approx(0.005)
     assert np.isnan(percent_to_ratio(None))
 
 

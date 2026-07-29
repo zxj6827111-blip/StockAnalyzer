@@ -39,13 +39,15 @@ def _to_float(value: object) -> float:
 
 
 def percent_to_ratio(value: object) -> float:
-    """Convert Tushare percent-style fields to system decimal ratios."""
+    """Convert Tushare percent-style fields to system decimal ratios.
+
+    Tushare fina_indicator roe/debt_to_assets are always in percentage points
+    (e.g. roe=1.2 means 1.2%, roe=12.5 means 12.5%). Always divide by 100.
+    """
     raw = _to_float(value)
     if np.isnan(raw):
         return float("nan")
-    if abs(raw) > 1.5:
-        return raw / 100.0
-    return raw
+    return raw / 100.0
 
 
 def normalize_fina_indicator_rows(

@@ -391,6 +391,7 @@ class TushareProvider:
         end_s = resolved_end.strftime("%Y%m%d")
 
         limit_frame = pd.DataFrame()
+        limit_error: Exception | None = None
         try:
             raw_limit = self._call_with_retry(
                 lambda: pro.stk_limit(
@@ -400,10 +401,11 @@ class TushareProvider:
                 )
             )
             limit_frame = _coerce_frame(raw_limit)
-        except Exception:
-            limit_frame = pd.DataFrame()
+        except Exception as exc:
+            limit_error = exc
 
         suspend_frame = pd.DataFrame()
+        suspend_error: Exception | None = None
         try:
             raw_suspend = self._call_with_retry(
                 lambda: pro.suspend_d(
@@ -413,8 +415,17 @@ class TushareProvider:
                 )
             )
             suspend_frame = _coerce_frame(raw_suspend)
-        except Exception:
-            suspend_frame = pd.DataFrame()
+        except Exception as exc:
+            suspend_error = exc
+
+        # If BOTH interfaces fail we must NOT report success-as-empty; raise so the
+        # caller records a failed phase and preserves prior trusted data. A single
+        # interface failure still yields a partial (but real) result.
+        if limit_error is not None and suspend_error is not None:
+            raise DataSourceError(
+                f"tushare trade_status failed for {ts_code}: "
+                f"stk_limit={limit_error}; suspend_d={suspend_error}"
+            )
 
         return _normalize_trade_status(
             limit_frame=limit_frame,
@@ -987,8 +998,8 @@ def _normalize_trade_status(
                     "as_of": key,
                     "coverage_complete": True,
                 }
-            up = pd.to_numeric(row.get("up_limit"), errors="coerce")
-            down = pd.to_numeric(row.get("down_limit"), errors="coerce")
+            up = pd.to_numeric([row.get("up_limit")], errors="coerce")[0]
+            down = pd.to_numeric([row.get("down_limit")], errors="coerce")[0]
             if not pd.isna(up):
                 rows[key]["up_limit"] = float(up)
             if not pd.isna(down):

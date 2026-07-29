@@ -295,11 +295,16 @@ class FeatureEngineer:
 
         # Relative strength features vs market index (P4).
         # Requires market_index with a "close" column aligned to bars index.
-        idx_close = (
-            pd.to_numeric(market_idx_frame.get("close"), errors="coerce")
-            if not market_idx_frame.empty and "close" in market_idx_frame.columns
-            else pd.Series(np.nan, index=ordered.index, dtype=float)
-        )
+        idx_col = None
+        if not market_idx_frame.empty:
+            if "benchmark_close" in market_idx_frame.columns:
+                idx_col = "benchmark_close"
+            elif "close" in market_idx_frame.columns:
+                idx_col = "close"
+        if idx_col is not None:
+            idx_close = pd.to_numeric(market_idx_frame[idx_col], errors="coerce")
+        else:
+            idx_close = pd.Series(np.nan, index=ordered.index, dtype=float)
         if idx_close.notna().any():
             stock_ret_5 = close.pct_change(5)
             stock_ret_20 = close.pct_change(20)

@@ -110,8 +110,12 @@ def build_market_index_frame(
     )
     aligned["beta_20d"] = beta_20d
     aligned["beta_60d"] = beta_60d
+    # Expose aligned benchmark close so downstream (FeatureEngineer P4) can
+    # compute relative-strength features that require the index price level.
+    aligned["benchmark_close"] = benchmark_close.reindex(ordered_bars.index).ffill()
 
     columns = [
+        "benchmark_close",
         "benchmark_ret_1d",
         "benchmark_ret_5d",
         "benchmark_ret_20d",

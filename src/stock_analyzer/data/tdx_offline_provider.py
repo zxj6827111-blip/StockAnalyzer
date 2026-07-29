@@ -56,6 +56,8 @@ _SELECTED_COLUMNS = [
     "adjustment_source",
     "adjustment_anchor_date",
     "adjustment_anchor_factor",
+    "up_limit",
+    "down_limit",
     "board",
 ]
 
@@ -77,6 +79,8 @@ _NUMERIC_COLUMNS = {
     "northbound_net",
     "dragon_tiger_flag",
     "adjustment_anchor_factor",
+    "up_limit",
+    "down_limit",
 }
 
 _BOOLEAN_COLUMNS = {
@@ -119,6 +123,8 @@ _DEFAULT_VALUES: dict[str, str | bool | float] = {
     "adjustment_source": "unknown",
     "adjustment_anchor_date": "",
     "adjustment_anchor_factor": float("nan"),
+    "up_limit": float("nan"),
+    "down_limit": float("nan"),
     "board": "main",
 }
 

@@ -1639,6 +1639,87 @@ class RuntimeMarketSyncService:
         ) if "financial_trust_level" in enriched.columns else 0
         return result
 
+
+    def _enrich_market_warehouse_symbol(
+        self,
+        *,
+        warehouse: MarketWarehouse,
+        online_provider: MarketDataProvider,
+        symbol: str,
+        target_end_date: date,
+    ) -> dict[str, object]:
+        """Run all per-symbol enrichment phases and project P2/P3 back to daily.
+
+        Runs independently of daily sync status so an up_to_date symbol still gets
+        financial/trade_status/P2/P3 backfill. Individual phase failures are captured
+        and do not abort the remaining phases. Aggregated status reflects worst phase.
+        """
+        financial = self._enrich_market_warehouse_financials(
+            warehouse=warehouse,
+            online_provider=online_provider,
+            symbol=symbol,
+            target_end_date=target_end_date,
+        )
+        trade_status = self._enrich_market_warehouse_trade_status(
+            warehouse=warehouse,
+            online_provider=online_provider,
+            symbol=symbol,
+            target_end_date=target_end_date,
+        )
+        p2 = self._enrich_market_warehouse_p2_data(
+            warehouse=warehouse,
+            online_provider=online_provider,
+            symbol=symbol,
+            target_end_date=target_end_date,
+        )
+        p3 = self._enrich_market_warehouse_p3_events(
+            warehouse=warehouse,
+            online_provider=online_provider,
+            symbol=symbol,
+            target_end_date=target_end_date,
+        )
+        # Project margin + dragon-tiger events back into daily bars + package so the
+        # runtime package (CSV/Parquet) and FeatureEngineer actually consume them.
+        try:
+            warehouse.apply_p2_p3_to_daily(symbol=symbol)
+            projection: dict[str, object] = {"status": "ok"}
+        except Exception as exc:
+            projection = {
+                "status": "failed",
+                "reason": f"p2_p3_projection:{type(exc).__name__}",
+                "error": str(exc)[:200],
+            }
+
+        phases: dict[str, dict[str, object]] = {
+            "financial": financial,
+            "trade_status": trade_status,
+            "p2": p2,
+            "p3": p3,
+            "projection": projection,
+        }
+        failed_phases = [
+            name
+            for name, result in phases.items()
+            if str(result.get("status", "")).lower() == "failed"
+        ]
+        partial_phases = [
+            name
+            for name, result in phases.items()
+            if str(result.get("status", "")).lower() == "partial"
+        ]
+        if failed_phases:
+            agg_status = "failed"
+        elif partial_phases:
+            agg_status = "partial"
+        else:
+            agg_status = "ok"
+        return {
+            "status": agg_status,
+            "failed_phases": failed_phases,
+            "partial_phases": partial_phases,
+            "phases": phases,
+        }
+
     def _sync_market_warehouse_daily_symbol(
         self,
         *,
@@ -1763,36 +1844,10 @@ class RuntimeMarketSyncService:
             symbol=symbol,
             frame=merged_daily,
         )
-        financial_enrichment = self._enrich_market_warehouse_financials(
-            warehouse=warehouse,
-            online_provider=online_provider,
-            symbol=symbol,
-            target_end_date=target_end_date,
-        )
-        trade_status_enrichment = self._enrich_market_warehouse_trade_status(
-            warehouse=warehouse,
-            online_provider=online_provider,
-            symbol=symbol,
-            target_end_date=target_end_date,
-        )
-        p2_enrichment = self._enrich_market_warehouse_p2_data(
-            warehouse=warehouse,
-            online_provider=online_provider,
-            symbol=symbol,
-            target_end_date=target_end_date,
-        )
-        p3_enrichment = self._enrich_market_warehouse_p3_events(
-            warehouse=warehouse,
-            online_provider=online_provider,
-            symbol=symbol,
-            target_end_date=target_end_date,
-        )
-        index_enrichment = self._enrich_market_warehouse_index_daily(
-            warehouse=warehouse,
-            online_provider=online_provider,
-            target_end_date=target_end_date,
-        )
-        # Re-read daily after optional financial enrichment for accurate row/latest stats.
+        # Re-read daily after write for accurate row/latest stats.
+        # Per-symbol enrichment (financial/trade_status/P2/P3) runs in a separate
+        # pass (_enrich_market_warehouse_symbol) so it also executes when daily is
+        # already up_to_date. Index enrichment runs once per run, not per symbol.
         final_daily = warehouse.fetch_all_daily_bars(symbol=symbol)
         if final_daily.empty:
             final_daily = merged_daily
@@ -1826,11 +1881,6 @@ class RuntimeMarketSyncService:
                 "adjustment_anchor_date": fresh_meta.get("adjustment_anchor_date"),
                 "adjustment_anchor_factor": fresh_meta.get("adjustment_anchor_factor"),
             },
-            "financial_enrichment": financial_enrichment,
-            "trade_status_enrichment": trade_status_enrichment,
-            "p2_enrichment": p2_enrichment,
-            "p3_enrichment": p3_enrichment,
-            "index_enrichment": index_enrichment,
         }
 
     def _sync_market_warehouse_intraday_symbol(
@@ -2611,6 +2661,18 @@ class RuntimeMarketSyncService:
                 )
                 for interval in intervals
             }
+            # Index (market-level) enrichment runs ONCE per run, not per symbol,
+            # to avoid thousands of duplicate index_daily requests / rate-limit hits.
+            index_enrichment = self._enrich_market_warehouse_index_daily(
+                warehouse=warehouse,
+                online_provider=online_provider,
+                target_end_date=target_trade_date,
+            )
+            enrichment_ok = 0
+            enrichment_partial = 0
+            enrichment_failed = 0
+            enrichment_skipped = 0
+
             _publish_progress(phase="syncing", current_stage="daily", force_write=True)
 
             for index, symbol in enumerate(symbol_list, start=1):
@@ -2676,6 +2738,52 @@ class RuntimeMarketSyncService:
                         force_write=index == len(symbol_list),
                     )
                     continue
+
+                # Per-symbol enrichment (financial/trade_status/P2/P3 + projection).
+                # Runs regardless of whether daily was updated, so up_to_date symbols
+                # still get background backfill. Failures are counted but do not fail daily.
+                current_stage = "enrichment"
+                try:
+                    enrich_result = self._enrich_market_warehouse_symbol(
+                        warehouse=warehouse,
+                        online_provider=online_provider,
+                        symbol=symbol,
+                        target_end_date=target_trade_date,
+                    )
+                    enrich_status = str(enrich_result.get("status", "")).lower()
+                    if enrich_status == "ok":
+                        enrichment_ok += 1
+                    elif enrich_status == "partial":
+                        enrichment_partial += 1
+                    elif enrich_status == "failed":
+                        enrichment_failed += 1
+                        if len(failed_samples) < 20:
+                            failed_phase_names = [
+                                str(item)
+                                for item in cast(
+                                    "list[object]",
+                                    enrich_result.get("failed_phases") or [],
+                                )
+                            ] or ["unknown"]
+                            failed_samples.append(
+                                {
+                                    "symbol": symbol,
+                                    "stage": "enrichment",
+                                    "reason": ",".join(failed_phase_names),
+                                }
+                            )
+                    else:
+                        enrichment_skipped += 1
+                except Exception as exc:
+                    enrichment_failed += 1
+                    if len(failed_samples) < 20:
+                        failed_samples.append(
+                            {
+                                "symbol": symbol,
+                                "stage": "enrichment",
+                                "reason": f"{exc.__class__.__name__}:{exc}",
+                            }
+                        )
 
                 if (
                     bool(service._config.market_warehouse.intraday_sync_enabled)
@@ -2760,6 +2868,14 @@ class RuntimeMarketSyncService:
                 "failed": intraday_failed,
                 "target_trade_date": target_trade_date.isoformat(),
             }
+            report["enrichment_sync"] = {
+                "ok": enrichment_ok,
+                "partial": enrichment_partial,
+                "failed": enrichment_failed,
+                "skipped": enrichment_skipped,
+                "index": index_enrichment,
+                "target_trade_date": target_trade_date.isoformat(),
+            }
             report["failed_samples"] = failed_samples
             report["failed_symbols"] = failed_symbols
             report["failed_symbols_total"] = len(failed_symbols)
@@ -2775,9 +2891,12 @@ class RuntimeMarketSyncService:
             report["background_data"] = warehouse.background_data_quality_snapshot()
             report["symbols_completed"] = symbols_completed
             report["progress_write_every_symbols"] = progress_write_every
-            if daily_failed == 0 and intraday_failed == 0:
+            total_failed = daily_failed + intraday_failed + enrichment_failed
+            total_ok = daily_ok + intraday_ok + enrichment_ok
+            total_skipped = daily_skipped + intraday_skipped + enrichment_skipped
+            if total_failed == 0 and enrichment_partial == 0:
                 report["status"] = "ok"
-            elif daily_ok > 0 or intraday_ok > 0 or daily_skipped > 0 or intraday_skipped > 0:
+            elif total_ok > 0 or total_skipped > 0 or enrichment_partial > 0:
                 report["status"] = "partial"
             else:
                 report["status"] = "failed"
