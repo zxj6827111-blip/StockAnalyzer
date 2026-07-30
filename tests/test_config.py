@@ -48,6 +48,15 @@ def test_load_default_config_values(monkeypatch: MonkeyPatch) -> None:
     assert config.tdx_sync.output_root == "artifacts/imports/tdx_offline_package"
     assert config.tdx_sync.refresh_before_evolution is False
     assert config.data_source.warehouse_db_path == "artifacts/warehouse/market.duckdb"
+    assert config.data_source.vendor_zip_index_path == ""
+    assert config.data_source.vendor_zip_daily_dir == "全A日K"
+    assert config.data_source.vendor_zip_price_series_mode == "raw"
+    assert config.data_source.vendor_zip_daily_volume_multiplier == 100.0
+    assert config.data_source.vendor_zip_daily_turnover_multiplier == 1000.0
+    assert config.data_source.vendor_zip_minute_volume_multiplier == 100.0
+    assert config.data_source.vendor_zip_minute_amount_multiplier == 1.0
+    assert config.data_source.vendor_zip_intraday_enabled is True
+    assert config.data_source.vendor_zip_memory_cache_symbols == 32
     assert config.data_source.runtime_live_enabled is True
     assert config.data_source.runtime_live_provider == "sina"
     assert config.data_source.runtime_live_interval_priority == ["1m", "5m"]

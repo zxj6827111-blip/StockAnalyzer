@@ -19,7 +19,6 @@ from uuid import uuid4
 import pandas as pd
 
 from stock_analyzer.data.akshare_provider import AkshareProvider
-from stock_analyzer.data.cached_provider import CachedProvider
 from stock_analyzer.data.efinance_provider import EfinanceProvider
 from stock_analyzer.data.intraday_summary import (
     fetch_sina_minute_bars,
@@ -42,6 +41,7 @@ from stock_analyzer.data.tdx_sync import (
     run_tdx_offline_package_build,
 )
 from stock_analyzer.data.tushare_provider import TushareProvider
+from stock_analyzer.data.vendor_zip_overlay import VendorZipOverlayProvider
 
 
 def classify_market_warehouse_health(
@@ -77,6 +77,95 @@ class RuntimeMarketSyncService:
 
     def __init__(self, service: Any) -> None:
         self._service = service
+
+    def _iter_provider_graph(self, *roots: object) -> list[object]:
+        pending = [root for root in roots if root is not None]
+        seen: set[int] = set()
+        providers: list[object] = []
+        wrapper_attrs = (
+            "primary",
+            "backup",
+            "inner",
+            "base_provider",
+            "provider",
+            "_primary",
+            "_backup",
+            "_inner",
+            "_base_provider",
+            "_provider",
+        )
+        while pending:
+            provider = pending.pop(0)
+            provider_id = id(provider)
+            if provider_id in seen:
+                continue
+            seen.add(provider_id)
+            providers.append(provider)
+            for attr in wrapper_attrs:
+                nested = getattr(provider, attr, None)
+                if nested is not None:
+                    pending.append(nested)
+        return providers
+
+    def _resolve_online_provider_callable(
+        self,
+        online_provider: object,
+        method_name: str,
+    ) -> Callable[..., object] | None:
+        """Resolve optional Tushare enrichment methods through provider wrappers.
+
+        Warehouse online providers are commonly wrapped as
+        ResilientProvider(primary=..., backup=...) or CachedProvider(inner=...).
+        Enrichment APIs are intentionally optional and are not part of the base
+        MarketDataProvider protocol, so relying on only the outer wrapper would
+        silently skip P1-P4 background data. Search only known provider-wrapper
+        attributes to avoid invoking arbitrary object graphs.
+        """
+        for provider in self._iter_provider_graph(online_provider):
+            candidate = getattr(provider, method_name, None)
+            if callable(candidate):
+                return cast(Callable[..., object], candidate)
+        return None
+
+    def _vendor_zip_overlay_provider(self) -> VendorZipOverlayProvider | None:
+        service = self._service
+        for provider in self._iter_provider_graph(
+            service._provider,
+            service._realtime_provider,
+        ):
+            if isinstance(provider, VendorZipOverlayProvider):
+                return provider
+        return None
+
+    def _vendor_zip_overlay_status(self) -> dict[str, object]:
+        service = self._service
+        primary = str(service._config.data_source.primary).strip().lower()
+        enabled = primary in {
+            "vendor_zip_overlay",
+            "vendor_overlay",
+            "local_vendor_zip",
+        }
+        configured_root = str(service._config.data_source.local_data_root).strip()
+        configured_index = str(service._config.data_source.vendor_zip_index_path).strip()
+        status: dict[str, object] = {
+            "enabled": enabled,
+            "root": configured_root,
+            "root_exists": bool(configured_root and Path(configured_root).expanduser().is_dir()),
+            "index_path": configured_index,
+            "index_exists": bool(
+                configured_index and Path(configured_index).expanduser().is_file()
+            ),
+            "delta_db_path": str(service._resolve_market_warehouse_db_path()),
+            "delta_package_root": str(service._resolve_market_warehouse_package_root()),
+            "price_series_mode": str(
+                service._config.data_source.vendor_zip_price_series_mode
+            ).strip().lower(),
+        }
+        provider = self._vendor_zip_overlay_provider()
+        if provider is not None:
+            status.update(provider.status())
+            status["enabled"] = True
+        return status
 
     def latest_tdx_sync_report(self) -> dict[str, object] | None:
         """Return latest TongDaXin offline sync report."""
@@ -206,6 +295,7 @@ class RuntimeMarketSyncService:
             "progress": self.latest_market_warehouse_progress(),
             "lock": self.market_warehouse_sync_lock_status(),
             "background_data": self.market_warehouse_background_data_status(),
+            "vendor_zip_overlay": self._vendor_zip_overlay_status(),
         }
 
     def _load_tdx_sync_history_from_disk(self) -> None:
@@ -414,31 +504,39 @@ class RuntimeMarketSyncService:
 
         inner_daily_cache_cleared = False
         inner_intraday_cache_cleared = False
-        provider = service._provider
-        if isinstance(provider, CachedProvider):
-            daily_cache_map = getattr(provider.inner, "_cache", None)
-            intraday_cache_map = getattr(provider.inner, "_intraday_cache", None)
-            if isinstance(daily_cache_map, dict):
-                daily_cache_map.clear()
-                inner_daily_cache_cleared = True
-            if isinstance(intraday_cache_map, dict):
-                intraday_cache_map.clear()
-                inner_intraday_cache_cleared = True
-        else:
-            daily_cache_map = getattr(provider, "_cache", None)
-            intraday_cache_map = getattr(provider, "_intraday_cache", None)
-            if isinstance(daily_cache_map, dict):
-                daily_cache_map.clear()
-                inner_daily_cache_cleared = True
-            if isinstance(intraday_cache_map, dict):
-                intraday_cache_map.clear()
-                inner_intraday_cache_cleared = True
+        provider_clear_cache_calls = 0
+        providers = self._iter_provider_graph(
+            service._provider,
+            service._realtime_provider,
+        )
+        for provider in providers:
+            clear_cache = getattr(provider, "clear_cache", None)
+            if callable(clear_cache):
+                try:
+                    clear_cache()
+                    provider_clear_cache_calls += 1
+                    inner_daily_cache_cleared = True
+                    inner_intraday_cache_cleared = True
+                except Exception:
+                    pass
+            for attr in ("_cache", "_daily_cache"):
+                daily_cache_map = getattr(provider, attr, None)
+                if isinstance(daily_cache_map, dict):
+                    daily_cache_map.clear()
+                    inner_daily_cache_cleared = True
+            for attr in ("_intraday_cache", "_live_minute_cache"):
+                intraday_cache_map = getattr(provider, attr, None)
+                if isinstance(intraday_cache_map, dict):
+                    intraday_cache_map.clear()
+                    inner_intraday_cache_cleared = True
 
         return {
             "deleted_bar_cache_keys": deleted_bar_cache_keys,
             "deleted_intraday_cache_keys": deleted_intraday_cache_keys,
             "inner_provider_daily_cache_cleared": inner_daily_cache_cleared,
             "inner_provider_intraday_cache_cleared": inner_intraday_cache_cleared,
+            "provider_clear_cache_calls": provider_clear_cache_calls,
+            "providers_inspected": len(providers),
         }
 
     def _list_tdx_package_symbols(self, package_root: Path) -> list[str]:
@@ -746,9 +844,16 @@ class RuntimeMarketSyncService:
 
     def _market_warehouse(self) -> MarketWarehouse:
         service = self._service
+        primary = str(service._config.data_source.primary).strip().lower()
+        package_writes_enabled = primary not in {
+            "vendor_zip_overlay",
+            "vendor_overlay",
+            "local_vendor_zip",
+        }
         return MarketWarehouse(
             db_path=service._resolve_market_warehouse_db_path(),
             package_root=service._resolve_market_warehouse_package_root(),
+            package_writes_enabled=package_writes_enabled,
         )
 
     def _resolve_market_warehouse_auto_refresh(
@@ -821,12 +926,23 @@ class RuntimeMarketSyncService:
         normalized = provider_name.strip().lower()
         if normalized in {"tushare", "ts", "tushare_pro"}:
             token = str(service._config.market_warehouse.tushare_token).strip()
-            price_mode = str(
-                getattr(service._config.evolution.execution_spec, "price_series_mode", "qfq")
-            ).strip().lower() or "qfq"
+            runtime_primary = str(service._config.data_source.primary).strip().lower()
+            if runtime_primary in {
+                "vendor_zip_overlay",
+                "vendor_overlay",
+                "local_vendor_zip",
+            }:
+                price_mode = str(
+                    service._config.data_source.vendor_zip_price_series_mode
+                ).strip().lower() or "raw"
+            else:
+                price_mode = str(
+                    getattr(service._config.evolution.execution_spec, "price_series_mode", "qfq")
+                ).strip().lower() or "qfq"
             return TushareProvider(
                 token=token,
                 retry_delay_sec=request_interval,
+                min_request_interval_sec=request_interval,
                 max_attempts=max_attempts,
                 socket_timeout_sec=socket_timeout_sec,
                 price_series_mode=price_mode,
@@ -868,6 +984,7 @@ class RuntimeMarketSyncService:
             [
                 *warehouse.list_symbols(),
                 *service._list_tdx_package_symbols(package_root),
+                *service._load_symbol_universe_from_provider(),
             ]
         )
         if not symbols:
@@ -879,6 +996,46 @@ class RuntimeMarketSyncService:
         if max_symbols > 0:
             return symbols[:max_symbols]
         return symbols
+
+    def _resolve_market_warehouse_latest_daily_dates(
+        self,
+        *,
+        warehouse: MarketWarehouse,
+        symbols: list[str],
+    ) -> dict[str, date]:
+        latest: dict[str, date] = warehouse.latest_daily_dates(symbols=symbols)
+        service = self._service
+        for provider in self._iter_provider_graph(
+            service._provider,
+            service._realtime_provider,
+        ):
+            latest_dates = getattr(provider, "latest_daily_dates", None)
+            if not callable(latest_dates):
+                continue
+            try:
+                payload = latest_dates(symbols=symbols)
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            for raw_symbol, raw_date in payload.items():
+                symbol = _normalize_a_share_symbol(raw_symbol)
+                if not symbol:
+                    continue
+                parsed_date: date | None
+                if isinstance(raw_date, datetime):
+                    parsed_date = raw_date.date()
+                elif isinstance(raw_date, date):
+                    parsed_date = raw_date
+                else:
+                    parsed = pd.to_datetime(raw_date, errors="coerce")
+                    parsed_date = None if pd.isna(parsed) else parsed.date()
+                if parsed_date is None:
+                    continue
+                current = latest.get(symbol)
+                if current is None or parsed_date > current:
+                    latest[symbol] = parsed_date
+        return latest
 
     def _resolve_market_warehouse_target_trade_date(self, *, now: datetime) -> date:
         """Resolve warehouse sync target session date.
@@ -1361,25 +1518,37 @@ class RuntimeMarketSyncService:
         warehouse: MarketWarehouse,
         online_provider: MarketDataProvider,
         target_end_date: date,
+        force: bool = False,
     ) -> dict[str, object]:
         """Fetch index_daily (CSI 300) and store in warehouse."""
         result: dict[str, object] = {"status": "skipped", "reason": "no_index_api"}
-        fetch_fn = getattr(online_provider, "fetch_index_daily", None)
-        if not callable(fetch_fn):
-            for attr in ("_provider", "provider", "_primary", "_inner"):
-                nested = getattr(online_provider, attr, None)
-                if nested is not None and callable(
-                    getattr(nested, "fetch_index_daily", None)
-                ):
-                    fetch_fn = nested.fetch_index_daily
-                    break
+        fetch_fn = self._resolve_online_provider_callable(
+            online_provider,
+            "fetch_index_daily",
+        )
         if not callable(fetch_fn):
             return result
+
+        start_date = self._resolve_enrichment_start_date(
+            warehouse=warehouse,
+            symbol="000300",
+            phase="index_daily",
+            target_end_date=target_end_date,
+            default_lookback_days=365 * 2,
+            overlap_days=5,
+            force=force,
+        )
+        if start_date is None:
+            return {"status": "skipped", "reason": "checkpoint_current"}
 
         try:
             frame = cast(
                 pd.DataFrame,
-                fetch_fn("000300.SH", end_date=target_end_date),
+                fetch_fn(
+                    "000300.SH",
+                    start_date=start_date,
+                    end_date=target_end_date,
+                ),
             )
         except Exception as exc:
             result["status"] = "failed"
@@ -1390,12 +1559,24 @@ class RuntimeMarketSyncService:
         if frame is None or frame.empty:
             result["status"] = "ok"
             result["reason"] = "no_rows"
+            self._write_enrichment_checkpoint(
+                warehouse=warehouse,
+                symbol="000300",
+                phase="index_daily",
+                success_date=target_end_date,
+            )
             return result
 
         count = warehouse.upsert_index_daily(frame=frame)
         result["status"] = "ok"
         result["reason"] = "enriched"
         result["rows"] = int(count)
+        self._write_enrichment_checkpoint(
+            warehouse=warehouse,
+            symbol="000300",
+            phase="index_daily",
+            success_date=target_end_date,
+        )
         return result
 
     def _enrich_market_warehouse_p3_events(
@@ -1409,22 +1590,18 @@ class RuntimeMarketSyncService:
     ) -> dict[str, object]:
         """Fetch top_list, top_inst, block_trade and store event tables."""
         result: dict[str, object] = {"status": "skipped", "reason": "no_p3_api"}
-        top_list_fn = getattr(online_provider, "fetch_top_list", None)
-        top_inst_fn = getattr(online_provider, "fetch_top_inst", None)
-        block_fn = getattr(online_provider, "fetch_block_trade", None)
-        if not any(callable(f) for f in (top_list_fn, top_inst_fn, block_fn)):
-            for attr in ("_provider", "provider", "_primary", "_inner"):
-                nested = getattr(online_provider, attr, None)
-                if nested is not None:
-                    top_list_fn = top_list_fn or getattr(
-                        nested, "fetch_top_list", None
-                    )
-                    top_inst_fn = top_inst_fn or getattr(
-                        nested, "fetch_top_inst", None
-                    )
-                    block_fn = block_fn or getattr(
-                        nested, "fetch_block_trade", None
-                    )
+        top_list_fn = self._resolve_online_provider_callable(
+            online_provider,
+            "fetch_top_list",
+        )
+        top_inst_fn = self._resolve_online_provider_callable(
+            online_provider,
+            "fetch_top_inst",
+        )
+        block_fn = self._resolve_online_provider_callable(
+            online_provider,
+            "fetch_block_trade",
+        )
         if not any(callable(f) for f in (top_list_fn, top_inst_fn, block_fn)):
             return result
 
@@ -1484,16 +1661,18 @@ class RuntimeMarketSyncService:
     ) -> dict[str, object]:
         """Fetch margin_detail, moneyflow, hk_hold and store in warehouse."""
         result: dict[str, object] = {"status": "skipped", "reason": "no_p2_api"}
-        margin_fn = getattr(online_provider, "fetch_margin_detail", None)
-        moneyflow_fn = getattr(online_provider, "fetch_moneyflow", None)
-        hk_fn = getattr(online_provider, "fetch_hk_hold", None)
-        if not any(callable(f) for f in (margin_fn, moneyflow_fn, hk_fn)):
-            for attr in ("_provider", "provider", "_primary", "_inner"):
-                nested = getattr(online_provider, attr, None)
-                if nested is not None:
-                    margin_fn = margin_fn or getattr(nested, "fetch_margin_detail", None)
-                    moneyflow_fn = moneyflow_fn or getattr(nested, "fetch_moneyflow", None)
-                    hk_fn = hk_fn or getattr(nested, "fetch_hk_hold", None)
+        margin_fn = self._resolve_online_provider_callable(
+            online_provider,
+            "fetch_margin_detail",
+        )
+        moneyflow_fn = self._resolve_online_provider_callable(
+            online_provider,
+            "fetch_moneyflow",
+        )
+        hk_fn = self._resolve_online_provider_callable(
+            online_provider,
+            "fetch_hk_hold",
+        )
         if not any(callable(f) for f in (margin_fn, moneyflow_fn, hk_fn)):
             return result
 
@@ -1550,13 +1729,10 @@ class RuntimeMarketSyncService:
     ) -> dict[str, object]:
         """Fetch stk_limit + suspend_d, store trade status, merge into daily bars."""
         result: dict[str, object] = {"status": "skipped", "reason": "no_trade_status_api"}
-        fetch_fn = getattr(online_provider, "fetch_trade_status", None)
-        if not callable(fetch_fn):
-            for attr in ("_provider", "provider", "_primary", "_inner"):
-                nested = getattr(online_provider, attr, None)
-                if nested is not None and callable(getattr(nested, "fetch_trade_status", None)):
-                    fetch_fn = nested.fetch_trade_status
-                    break
+        fetch_fn = self._resolve_online_provider_callable(
+            online_provider,
+            "fetch_trade_status",
+        )
         if not callable(fetch_fn):
             return result
 
@@ -1571,16 +1747,34 @@ class RuntimeMarketSyncService:
             result["error"] = str(exc)[:200]
             return result
 
-        if incoming is None or incoming.empty:
-            result["status"] = "ok"
-            result["reason"] = "no_rows"
+        if incoming is None:
+            incoming = pd.DataFrame()
+        coverage_attr = incoming.attrs.get("coverage_complete")
+        if coverage_attr is None and "coverage_complete" in incoming.columns:
+            coverage_values = incoming["coverage_complete"].dropna()
+            coverage_complete = bool(
+                not coverage_values.empty and coverage_values.astype(bool).all()
+            )
+        else:
+            coverage_complete = bool(coverage_attr is not False)
+        failed_components = [
+            str(item) for item in incoming.attrs.get("failed_components", [])
+        ]
+
+        if incoming.empty:
+            result["status"] = "ok" if coverage_complete else "partial"
+            result["reason"] = "no_rows" if coverage_complete else "partial_coverage"
+            if failed_components:
+                result["failed_components"] = failed_components
             return result
 
         count = warehouse.upsert_trade_status(symbol=symbol, frame=incoming)
         warehouse.apply_trade_status_to_daily(symbol=symbol)
-        result["status"] = "ok"
-        result["reason"] = "enriched"
+        result["status"] = "ok" if coverage_complete else "partial"
+        result["reason"] = "enriched" if coverage_complete else "partial_coverage"
         result["rows"] = int(count)
+        if failed_components:
+            result["failed_components"] = failed_components
         return result
 
     def _enrich_market_warehouse_financials(
@@ -1601,14 +1795,10 @@ class RuntimeMarketSyncService:
             "reason": "provider_without_fina_indicator",
             "snapshots": 0,
         }
-        fetch_fn = getattr(online_provider, "fetch_fina_indicator", None)
-        if not callable(fetch_fn):
-            # Try nested providers (cached/resilient).
-            for attr in ("_provider", "provider", "_primary", "_inner"):
-                nested = getattr(online_provider, attr, None)
-                if nested is not None and callable(getattr(nested, "fetch_fina_indicator", None)):
-                    fetch_fn = nested.fetch_fina_indicator
-                    break
+        fetch_fn = self._resolve_online_provider_callable(
+            online_provider,
+            "fetch_fina_indicator",
+        )
         if not callable(fetch_fn):
             return result
 
@@ -1646,11 +1836,12 @@ class RuntimeMarketSyncService:
             return result
         enriched = apply_financial_snapshots_asof(daily, snaps, only_fill_pending=False)
         warehouse.replace_daily_bars(symbol=symbol, frame=enriched)
-        write_package_daily_bars(
-            package_root=warehouse.package_root,
-            symbol=symbol,
-            frame=enriched,
-        )
+        if warehouse.package_writes_enabled:
+            write_package_daily_bars(
+                package_root=warehouse.package_root,
+                symbol=symbol,
+                frame=enriched,
+            )
         result["status"] = "ok"
         result["reason"] = "enriched"
         result["reported_rows"] = int(
@@ -1700,16 +1891,21 @@ class RuntimeMarketSyncService:
         phase: str,
         target_end_date: date,
         default_lookback_days: int = 365,
-    ) -> date:
-        """Resolve incremental start date from checkpoint or default lookback."""
+        overlap_days: int = 3,
+        force: bool = False,
+    ) -> date | None:
+        """Resolve an idempotent incremental window, or None when already current."""
         checkpoint = self._read_enrichment_checkpoint(
             warehouse=warehouse, symbol=symbol, phase=phase
         )
-        if checkpoint is not None and checkpoint < target_end_date:
-            # Resume from day after checkpoint
-            return checkpoint + timedelta(days=1)
-        # No checkpoint or checkpoint >= target: use default lookback
-        return target_end_date - timedelta(days=default_lookback_days)
+        default_start = target_end_date - timedelta(days=default_lookback_days)
+        if checkpoint is None or force:
+            return default_start
+        if checkpoint >= target_end_date:
+            return None
+        # A small overlap catches same-day corrections and late revisions; warehouse
+        # upserts are idempotent, so replaying these rows is safe.
+        return max(default_start, checkpoint - timedelta(days=max(0, overlap_days)))
 
     def _enrich_market_warehouse_symbol(
         self,
@@ -1718,6 +1914,7 @@ class RuntimeMarketSyncService:
         online_provider: MarketDataProvider,
         symbol: str,
         target_end_date: date,
+        force: bool = False,
     ) -> dict[str, object]:
         """Run all per-symbol enrichment phases with incremental windows.
 
@@ -1731,6 +1928,8 @@ class RuntimeMarketSyncService:
             phase="financial",
             target_end_date=target_end_date,
             default_lookback_days=365 * 5,  # financial reports are sparse
+            overlap_days=7,
+            force=force,
         )
         trade_status_start = self._resolve_enrichment_start_date(
             warehouse=warehouse,
@@ -1738,6 +1937,8 @@ class RuntimeMarketSyncService:
             phase="trade_status",
             target_end_date=target_end_date,
             default_lookback_days=90,
+            overlap_days=3,
+            force=force,
         )
         p2_start = self._resolve_enrichment_start_date(
             warehouse=warehouse,
@@ -1745,6 +1946,8 @@ class RuntimeMarketSyncService:
             phase="p2",
             target_end_date=target_end_date,
             default_lookback_days=180,
+            overlap_days=3,
+            force=force,
         )
         p3_start = self._resolve_enrichment_start_date(
             warehouse=warehouse,
@@ -1752,14 +1955,36 @@ class RuntimeMarketSyncService:
             phase="p3",
             target_end_date=target_end_date,
             default_lookback_days=180,
+            overlap_days=3,
+            force=force,
         )
 
-        financial = self._enrich_market_warehouse_financials(
-            warehouse=warehouse,
-            online_provider=online_provider,
-            symbol=symbol,
-            target_end_date=target_end_date,
-            start_date=financial_start,
+        def _run_phase(
+            phase_name: str,
+            callback: Callable[[], dict[str, object]],
+        ) -> dict[str, object]:
+            try:
+                return callback()
+            except Exception as exc:
+                return {
+                    "status": "failed",
+                    "reason": f"{phase_name}_error:{type(exc).__name__}",
+                    "error": str(exc)[:200],
+                }
+
+        financial: dict[str, object] = (
+            {"status": "skipped", "reason": "checkpoint_current"}
+            if financial_start is None
+            else _run_phase(
+                "financial",
+                lambda: self._enrich_market_warehouse_financials(
+                    warehouse=warehouse,
+                    online_provider=online_provider,
+                    symbol=symbol,
+                    target_end_date=target_end_date,
+                    start_date=financial_start,
+                ),
+            )
         )
         if financial.get("status") == "ok":
             self._write_enrichment_checkpoint(
@@ -1769,12 +1994,19 @@ class RuntimeMarketSyncService:
                 success_date=target_end_date,
             )
 
-        trade_status = self._enrich_market_warehouse_trade_status(
-            warehouse=warehouse,
-            online_provider=online_provider,
-            symbol=symbol,
-            target_end_date=target_end_date,
-            start_date=trade_status_start,
+        trade_status: dict[str, object] = (
+            {"status": "skipped", "reason": "checkpoint_current"}
+            if trade_status_start is None
+            else _run_phase(
+                "trade_status",
+                lambda: self._enrich_market_warehouse_trade_status(
+                    warehouse=warehouse,
+                    online_provider=online_provider,
+                    symbol=symbol,
+                    target_end_date=target_end_date,
+                    start_date=trade_status_start,
+                ),
+            )
         )
         if trade_status.get("status") == "ok":
             self._write_enrichment_checkpoint(
@@ -1784,12 +2016,19 @@ class RuntimeMarketSyncService:
                 success_date=target_end_date,
             )
 
-        p2 = self._enrich_market_warehouse_p2_data(
-            warehouse=warehouse,
-            online_provider=online_provider,
-            symbol=symbol,
-            target_end_date=target_end_date,
-            start_date=p2_start,
+        p2: dict[str, object] = (
+            {"status": "skipped", "reason": "checkpoint_current"}
+            if p2_start is None
+            else _run_phase(
+                "p2",
+                lambda: self._enrich_market_warehouse_p2_data(
+                    warehouse=warehouse,
+                    online_provider=online_provider,
+                    symbol=symbol,
+                    target_end_date=target_end_date,
+                    start_date=p2_start,
+                ),
+            )
         )
         if p2.get("status") == "ok":
             self._write_enrichment_checkpoint(
@@ -1799,12 +2038,19 @@ class RuntimeMarketSyncService:
                 success_date=target_end_date,
             )
 
-        p3 = self._enrich_market_warehouse_p3_events(
-            warehouse=warehouse,
-            online_provider=online_provider,
-            symbol=symbol,
-            target_end_date=target_end_date,
-            start_date=p3_start,
+        p3: dict[str, object] = (
+            {"status": "skipped", "reason": "checkpoint_current"}
+            if p3_start is None
+            else _run_phase(
+                "p3",
+                lambda: self._enrich_market_warehouse_p3_events(
+                    warehouse=warehouse,
+                    online_provider=online_provider,
+                    symbol=symbol,
+                    target_end_date=target_end_date,
+                    start_date=p3_start,
+                ),
+            )
         )
         if p3.get("status") == "ok":
             self._write_enrichment_checkpoint(
@@ -1974,11 +2220,12 @@ class RuntimeMarketSyncService:
             merged_daily = merged_daily[~merged_daily.index.duplicated(keep="last")].sort_index()
 
         warehouse.replace_daily_bars(symbol=symbol, frame=merged_daily)
-        write_package_daily_bars(
-            package_root=warehouse.package_root,
-            symbol=symbol,
-            frame=merged_daily,
-        )
+        if warehouse.package_writes_enabled:
+            write_package_daily_bars(
+                package_root=warehouse.package_root,
+                symbol=symbol,
+                frame=merged_daily,
+            )
         # Re-read daily after write for accurate row/latest stats.
         # Per-symbol enrichment (financial/trade_status/P2/P3) runs in a separate
         # pass (_enrich_market_warehouse_symbol) so it also executes when daily is
@@ -2079,12 +2326,13 @@ class RuntimeMarketSyncService:
         merged = online_summary if existing.empty else pd.concat([existing, online_summary], axis=0)
         merged = merged[~merged.index.duplicated(keep="last")].sort_index()
         warehouse.replace_intraday_summary(symbol=symbol, interval=interval, frame=merged)
-        write_package_intraday_summary(
-            package_root=warehouse.package_root,
-            symbol=symbol,
-            interval=interval,
-            frame=merged,
-        )
+        if warehouse.package_writes_enabled:
+            write_package_intraday_summary(
+                package_root=warehouse.package_root,
+                symbol=symbol,
+                interval=interval,
+                frame=merged,
+            )
         latest_date = merged.index[-1].date().isoformat() if len(merged.index) > 0 else ""
         return {
             "status": "ok",
@@ -2330,6 +2578,7 @@ class RuntimeMarketSyncService:
         service = self._service
         now = timestamp or datetime.now()
         requested_symbols = _normalize_market_warehouse_symbols(symbols or [])
+        vendor_overlay_status = self._vendor_zip_overlay_status()
         report: dict[str, object] = {
             "timestamp": now.isoformat(),
             "trace_id": source_trace_id,
@@ -2343,6 +2592,7 @@ class RuntimeMarketSyncService:
             "progress_path": service._to_evolution_relative(
                 service._market_warehouse_progress_path
             ),
+            "vendor_zip_overlay": vendor_overlay_status,
         }
         if retry_report_trace_id.strip():
             report["retry_report_trace_id"] = retry_report_trace_id.strip()
@@ -2381,6 +2631,7 @@ class RuntimeMarketSyncService:
             "db_path": "",
             "package_root": "",
             "bootstrap_source_root": "",
+            "vendor_zip_overlay": vendor_overlay_status,
             "target_trade_date": "",
             "symbols_total": 0,
             "symbols_completed": 0,
@@ -2477,6 +2728,10 @@ class RuntimeMarketSyncService:
             progress_snapshot["package_root"] = str(report.get("package_root", ""))
             progress_snapshot["bootstrap_source_root"] = str(
                 report.get("bootstrap_source_root", "")
+            )
+            progress_snapshot["vendor_zip_overlay"] = report.get(
+                "vendor_zip_overlay",
+                {},
             )
             progress_snapshot["target_trade_date"] = str(report.get("target_trade_date", ""))
             progress_snapshot["symbols_total"] = total
@@ -2645,6 +2900,11 @@ class RuntimeMarketSyncService:
             report["db_path"] = str(warehouse.db_path)
             report["package_root"] = str(package_root)
             report["bootstrap_source_root"] = str(bootstrap_source_root)
+            report["storage_mode"] = (
+                "vendor_zip_readonly_plus_duckdb_delta"
+                if bool(vendor_overlay_status.get("enabled", False))
+                else "market_warehouse"
+            )
 
             warehouse_has_daily_data = warehouse.has_daily_data()
             bootstrap_report: dict[str, object] = {
@@ -2788,7 +3048,10 @@ class RuntimeMarketSyncService:
                 symbol_list=symbol_list,
             )
             intraday_symbol_set = set(intraday_symbol_list)
-            latest_daily_map = warehouse.latest_daily_dates(symbols=symbol_list)
+            latest_daily_map = self._resolve_market_warehouse_latest_daily_dates(
+                warehouse=warehouse,
+                symbols=symbol_list,
+            )
             latest_intraday_maps = {
                 interval: warehouse.latest_intraday_dates(
                     interval=interval,
@@ -2802,6 +3065,7 @@ class RuntimeMarketSyncService:
                 warehouse=warehouse,
                 online_provider=online_provider,
                 target_end_date=target_trade_date,
+                force=force,
             )
             enrichment_ok = 0
             enrichment_partial = 0
@@ -2884,12 +3148,29 @@ class RuntimeMarketSyncService:
                         online_provider=online_provider,
                         symbol=symbol,
                         target_end_date=target_trade_date,
+                        force=force,
                     )
                     enrich_status = str(enrich_result.get("status", "")).lower()
                     if enrich_status == "ok":
                         enrichment_ok += 1
                     elif enrich_status == "partial":
                         enrichment_partial += 1
+                        _record_failed_symbol(symbol)
+                        if len(failed_samples) < 20:
+                            partial_phase_names = [
+                                str(item)
+                                for item in cast(
+                                    "list[object]",
+                                    enrich_result.get("partial_phases") or [],
+                                )
+                            ] or ["unknown"]
+                            failed_samples.append(
+                                {
+                                    "symbol": symbol,
+                                    "stage": "enrichment_partial",
+                                    "reason": ",".join(partial_phase_names),
+                                }
+                            )
                     elif enrich_status == "failed":
                         enrichment_failed += 1
                         _record_failed_symbol(symbol)

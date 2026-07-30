@@ -75,6 +75,15 @@ class DataSourceConfig(_StrictModel):
     primary: str = "akshare"
     local_data_root: str = ""
     warehouse_db_path: str = ""
+    vendor_zip_index_path: str = ""
+    vendor_zip_daily_dir: str = "全A日K"
+    vendor_zip_price_series_mode: str = "raw"
+    vendor_zip_daily_volume_multiplier: float = 100.0
+    vendor_zip_daily_turnover_multiplier: float = 1000.0
+    vendor_zip_minute_volume_multiplier: float = 100.0
+    vendor_zip_minute_amount_multiplier: float = 1.0
+    vendor_zip_intraday_enabled: bool = True
+    vendor_zip_memory_cache_symbols: int = 32
     enable_cache_fallback: bool = True
     switch_after_failures: int = 3
     request_interval_sec: float = 0.5

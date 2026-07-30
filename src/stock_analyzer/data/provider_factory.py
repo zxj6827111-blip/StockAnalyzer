@@ -9,7 +9,6 @@ from stock_analyzer.config import DataSourceConfig, MarketDepthConfig
 from stock_analyzer.data.akshare_provider import AkshareProvider
 from stock_analyzer.data.efinance_provider import EfinanceProvider
 from stock_analyzer.data.hybrid_runtime_provider import HybridRuntimeProvider
-from stock_analyzer.data.tushare_provider import TushareProvider
 from stock_analyzer.data.market_depth import (
     CachedMarketDepthProvider,
     EasyQuotationMarketDepthProvider,
@@ -22,6 +21,14 @@ from stock_analyzer.data.market_warehouse import MarketWarehouse
 from stock_analyzer.data.provider import DataSourceError, MarketDataProvider, SyntheticProvider
 from stock_analyzer.data.resilient_provider import ResilientProvider
 from stock_analyzer.data.tdx_offline_provider import TdxOfflineProvider
+from stock_analyzer.data.tushare_provider import TushareProvider
+from stock_analyzer.data.vendor_zip_overlay import VendorZipOverlayProvider
+
+_VENDOR_ZIP_OVERLAY_ALIASES = {
+    "vendor_zip_overlay",
+    "vendor_overlay",
+    "local_vendor_zip",
+}
 
 
 def _runtime_provider_tuning() -> tuple[float, int, bool]:
@@ -41,6 +48,7 @@ def build_primary_provider(config: DataSourceConfig) -> MarketDataProvider:
     if primary in {"tushare", "ts", "tushare_pro"}:
         return TushareProvider(
             retry_delay_sec=config.request_interval_sec,
+            min_request_interval_sec=config.request_interval_sec,
             max_attempts=max_attempts,
             socket_timeout_sec=socket_timeout_sec,
             price_series_mode="qfq",
@@ -64,7 +72,44 @@ def build_primary_provider(config: DataSourceConfig) -> MarketDataProvider:
                 "data_source.local_data_root is required when data_source.primary=tdx_offline"
             )
         return TdxOfflineProvider(data_root=root)
-    if primary in {"market_warehouse", "warehouse", "warehouse_offline"}:
+    if primary in _VENDOR_ZIP_OVERLAY_ALIASES:
+        root = config.local_data_root.strip()
+        if not root:
+            raise DataSourceError(
+                "data_source.local_data_root is required "
+                "when data_source.primary=vendor_zip_overlay"
+            )
+        index_path = config.vendor_zip_index_path.strip()
+        if not index_path:
+            raise DataSourceError(
+                "data_source.vendor_zip_index_path is required "
+                "when data_source.primary=vendor_zip_overlay"
+            )
+        db_path = config.warehouse_db_path.strip()
+        if not db_path:
+            raise DataSourceError(
+                "data_source.warehouse_db_path is required "
+                "when data_source.primary=vendor_zip_overlay"
+            )
+        return VendorZipOverlayProvider(
+            data_root=root,
+            index_path=index_path,
+            delta_db_path=db_path,
+            daily_dir_name=config.vendor_zip_daily_dir,
+            price_series_mode=config.vendor_zip_price_series_mode,
+            daily_volume_multiplier=config.vendor_zip_daily_volume_multiplier,
+            daily_turnover_multiplier=config.vendor_zip_daily_turnover_multiplier,
+            minute_volume_multiplier=config.vendor_zip_minute_volume_multiplier,
+            minute_amount_multiplier=config.vendor_zip_minute_amount_multiplier,
+            intraday_enabled=config.vendor_zip_intraday_enabled,
+            memory_cache_symbols=config.vendor_zip_memory_cache_symbols,
+        )
+    if primary in {
+        "market_warehouse",
+        "warehouse",
+        "warehouse_offline",
+        *_VENDOR_ZIP_OVERLAY_ALIASES,
+    }:
         db_path = config.warehouse_db_path.strip()
         if not db_path:
             raise DataSourceError(
@@ -101,7 +146,12 @@ def build_online_backup_provider(config: DataSourceConfig) -> MarketDataProvider
             max_attempts=max_attempts,
             socket_timeout_sec=socket_timeout_sec,
         )
-    if primary in {"market_warehouse", "warehouse", "warehouse_offline"}:
+    if primary in {
+        "market_warehouse",
+        "warehouse",
+        "warehouse_offline",
+        *_VENDOR_ZIP_OVERLAY_ALIASES,
+    }:
         return ResilientProvider(
             primary=EfinanceProvider(
                 retry_delay_sec=config.request_interval_sec,
@@ -164,6 +214,7 @@ def build_realtime_runtime_provider(
             "market_warehouse",
             "warehouse",
             "warehouse_offline",
+            *_VENDOR_ZIP_OVERLAY_ALIASES,
         }
         and live_provider_key in {"sina", "sina_minute"}
     ):

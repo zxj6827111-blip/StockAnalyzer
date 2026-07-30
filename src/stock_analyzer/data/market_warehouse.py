@@ -65,6 +65,13 @@ _DAILY_NUMERIC_COLUMNS = {
     "margin_financing_balance",
     "northbound_net",
     "dragon_tiger_flag",
+    "moneyflow_net_amount",
+    "hk_hold_ratio",
+    "hk_hold_change",
+    "inst_net_amount",
+    "block_trade_amount",
+    "block_trade_volume",
+    "block_trade_premium_discount",
     "adjustment_anchor_factor",
     "up_limit",
     "down_limit",
@@ -94,11 +101,18 @@ _DAILY_STRING_COLUMNS = {
 
 
 class MarketWarehouse:
-    """Persist normalized market data into DuckDB and export runtime package files."""
+    """Persist normalized market data into DuckDB and optionally export package files."""
 
-    def __init__(self, *, db_path: str | Path, package_root: str | Path) -> None:
+    def __init__(
+        self,
+        *,
+        db_path: str | Path,
+        package_root: str | Path,
+        package_writes_enabled: bool = True,
+    ) -> None:
         self._db_path = Path(db_path).expanduser()
         self._package_root = Path(package_root).expanduser()
+        self._package_writes_enabled = bool(package_writes_enabled)
 
     @property
     def db_path(self) -> Path:
@@ -107,6 +121,10 @@ class MarketWarehouse:
     @property
     def package_root(self) -> Path:
         return self._package_root
+
+    @property
+    def package_writes_enabled(self) -> bool:
+        return self._package_writes_enabled
 
     def ensure_schema(self) -> None:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -142,6 +160,13 @@ class MarketWarehouse:
                     margin_financing_balance DOUBLE,
                     northbound_net DOUBLE,
                     dragon_tiger_flag DOUBLE,
+                    moneyflow_net_amount DOUBLE,
+                    hk_hold_ratio DOUBLE,
+                    hk_hold_change DOUBLE,
+                    inst_net_amount DOUBLE,
+                    block_trade_amount DOUBLE,
+                    block_trade_volume DOUBLE,
+                    block_trade_premium_discount DOUBLE,
                     background_data_source VARCHAR,
                     background_data_complete BOOLEAN,
                     background_missing_fields VARCHAR,
@@ -167,6 +192,13 @@ class MarketWarehouse:
                 ("adjustment_anchor_factor", "DOUBLE"),
                 ("up_limit", "DOUBLE"),
                 ("down_limit", "DOUBLE"),
+                ("moneyflow_net_amount", "DOUBLE"),
+                ("hk_hold_ratio", "DOUBLE"),
+                ("hk_hold_change", "DOUBLE"),
+                ("inst_net_amount", "DOUBLE"),
+                ("block_trade_amount", "DOUBLE"),
+                ("block_trade_volume", "DOUBLE"),
+                ("block_trade_premium_discount", "DOUBLE"),
             ):
                 connection.execute(
                     f"ALTER TABLE {_DAILY_TABLE} "
@@ -473,11 +505,12 @@ class MarketWarehouse:
             return daily
         enriched = apply_financial_snapshots_asof(daily, snaps, only_fill_pending=False)
         self.replace_daily_bars(symbol=symbol, frame=enriched)
-        write_package_daily_bars(
-            package_root=self.package_root,
-            symbol=symbol,
-            frame=enriched,
-        )
+        if self.package_writes_enabled:
+            write_package_daily_bars(
+                package_root=self.package_root,
+                symbol=symbol,
+                frame=enriched,
+            )
         return enriched
 
 
@@ -544,18 +577,22 @@ class MarketWarehouse:
             if ts in daily.index:
                 up = row.get("up_limit")
                 down = row.get("down_limit")
-                susp = bool(row.get("suspended", False))
+                suspended = row.get("suspended")
                 if up is not None and not pd.isna(up):
                     daily.at[ts, "up_limit"] = float(up)
                 if down is not None and not pd.isna(down):
                     daily.at[ts, "down_limit"] = float(down)
-                daily.at[ts, "suspended"] = susp
+                # NULL means suspend_d coverage is unavailable. Preserve the prior
+                # daily value instead of coercing unknown into False.
+                if suspended is not None and not pd.isna(suspended):
+                    daily.at[ts, "suspended"] = bool(suspended)
         self.replace_daily_bars(symbol=symbol, frame=daily)
-        write_package_daily_bars(
-            package_root=self.package_root,
-            symbol=symbol,
-            frame=daily,
-        )
+        if self.package_writes_enabled:
+            write_package_daily_bars(
+                package_root=self.package_root,
+                symbol=symbol,
+                frame=daily,
+            )
         return daily
 
 
@@ -875,6 +912,25 @@ class MarketWarehouse:
                 f"SELECT {col_str} FROM idx_stage"
             )
             connection.unregister("idx_stage")
+        if self.package_writes_enabled:
+            # Package-backed providers consume index history through the same P4 path.
+            for index_code in sorted(payload["index_code"].astype(str).unique()):
+                stored = self.fetch_index_daily(index_code=index_code)
+                if stored.empty:
+                    continue
+                benchmark = stored.copy()
+                benchmark.index = pd.to_datetime(
+                    benchmark["trade_date"], errors="coerce"
+                )
+                benchmark = benchmark.loc[benchmark.index.notna()]
+                benchmark.index.name = "date"
+                benchmark["float_market_cap"] = float("nan")
+                benchmark["suspended"] = False
+                write_package_daily_bars(
+                    package_root=self.package_root,
+                    symbol=_normalize_symbol(index_code),
+                    frame=benchmark,
+                )
         return int(len(payload))
 
     def fetch_index_daily(
@@ -897,7 +953,7 @@ class MarketWarehouse:
 
 
     def apply_p2_p3_to_daily(self, *, symbol: str) -> pd.DataFrame:
-        """Project margin_detail and top_list events back onto daily bars + package.
+        """Project reliable P2/P3 fields back onto daily bars and runtime package.
 
         Semantics (honest, no fabricated values):
         - margin_detail.financing_balance -> daily.financing_balance AND
@@ -906,6 +962,8 @@ class MarketWarehouse:
           Non-event days keep prior value (NaN = not confirmed, NOT forced to 0).
         - northbound_net stays NaN: hk_hold is a holding stock, not a net flow.
         - block_trade_net stays NaN: no reliable buy/sell direction from API.
+        - moneyflow/top_inst/block_trade use explicit amount/event fields rather than
+          overloading the legacy directional fields.
         """
         daily = self.fetch_all_daily_bars(symbol=symbol)
         if daily.empty:
@@ -925,6 +983,36 @@ class MarketWarehouse:
                         daily.at[ts, "margin_financing_balance"] = float(val)
                         changed = True
 
+        moneyflow = self.fetch_moneyflow(symbol=symbol)
+        if not moneyflow.empty and "net_mf_amount" in moneyflow.columns:
+            mflow = moneyflow.dropna(subset=["trade_date"]).copy()
+            mflow = mflow.set_index(pd.to_datetime(mflow["trade_date"]))
+            for ts, row in mflow.iterrows():
+                value = row.get("net_mf_amount")
+                if ts in daily.index and value is not None and not pd.isna(value):
+                    daily.at[ts, "moneyflow_net_amount"] = float(value)
+                    changed = True
+
+        hk_hold = self.fetch_hk_hold(symbol=symbol)
+        if not hk_hold.empty:
+            hk = hk_hold.dropna(subset=["trade_date"]).copy()
+            hk["trade_date"] = pd.to_datetime(hk["trade_date"])
+            hk = hk.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
+            if "hold_vol" in hk.columns:
+                hk["hold_change"] = pd.to_numeric(hk["hold_vol"], errors="coerce").diff()
+            for _, row in hk.iterrows():
+                ts = row["trade_date"]
+                if ts not in daily.index:
+                    continue
+                hold_ratio = row.get("hold_ratio")
+                hold_change = row.get("hold_change")
+                if hold_ratio is not None and not pd.isna(hold_ratio):
+                    daily.at[ts, "hk_hold_ratio"] = float(hold_ratio)
+                    changed = True
+                if hold_change is not None and not pd.isna(hold_change):
+                    daily.at[ts, "hk_hold_change"] = float(hold_change)
+                    changed = True
+
         top_list = self.fetch_top_list_events(symbol=symbol)
         if not top_list.empty and "dragon_tiger_flag" in top_list.columns:
             t = top_list.dropna(subset=["trade_date"]).copy()
@@ -936,13 +1024,67 @@ class MarketWarehouse:
                         daily.at[ts, "dragon_tiger_flag"] = float(flag)
                         changed = True
 
+        top_inst = self.fetch_top_inst_events(symbol=symbol)
+        if not top_inst.empty and "inst_net_amount" in top_inst.columns:
+            inst = top_inst.dropna(subset=["trade_date"]).copy()
+            inst["trade_date"] = pd.to_datetime(inst["trade_date"])
+            inst["inst_net_amount"] = pd.to_numeric(
+                inst["inst_net_amount"], errors="coerce"
+            )
+            inst_daily = inst.groupby("trade_date")["inst_net_amount"].sum(min_count=1)
+            for ts, value in inst_daily.items():
+                if ts in daily.index and not pd.isna(value):
+                    daily.at[ts, "inst_net_amount"] = float(value)
+                    changed = True
+
+        block_trade = self.fetch_block_trade_events(symbol=symbol)
+        if not block_trade.empty:
+            block = block_trade.dropna(subset=["trade_date"]).copy()
+            block["trade_date"] = pd.to_datetime(block["trade_date"])
+            for column in (
+                "block_trade_amount",
+                "block_trade_volume",
+                "block_trade_premium_discount",
+            ):
+                if column in block.columns:
+                    block[column] = pd.to_numeric(block[column], errors="coerce")
+            for ts, rows in block.groupby("trade_date"):
+                if ts not in daily.index:
+                    continue
+                amount = rows.get("block_trade_amount", pd.Series(dtype=float)).sum(
+                    min_count=1
+                )
+                volume = rows.get("block_trade_volume", pd.Series(dtype=float)).sum(
+                    min_count=1
+                )
+                premium_series = rows.get(
+                    "block_trade_premium_discount", pd.Series(dtype=float)
+                )
+                premium = premium_series.mean()
+                weights = rows.get("block_trade_amount", pd.Series(dtype=float))
+                valid = premium_series.notna() & weights.notna() & weights.gt(0)
+                if valid.any():
+                    premium = float(
+                        (premium_series.loc[valid] * weights.loc[valid]).sum()
+                        / weights.loc[valid].sum()
+                    )
+                for column, value in (
+                    ("block_trade_amount", amount),
+                    ("block_trade_volume", volume),
+                    ("block_trade_premium_discount", premium),
+                ):
+                    if not pd.isna(value):
+                        daily.at[ts, column] = float(value)
+                        changed = True
+
         if changed:
             self.replace_daily_bars(symbol=symbol, frame=daily)
-            write_package_daily_bars(
-                package_root=self.package_root,
-                symbol=symbol,
-                frame=daily,
-            )
+            if self.package_writes_enabled:
+                write_package_daily_bars(
+                    package_root=self.package_root,
+                    symbol=symbol,
+                    frame=daily,
+                )
         return daily
 
 
@@ -1112,7 +1254,11 @@ class MarketWarehouse:
         shadow_package_root: str | Path,
     ) -> MarketWarehouse:
         """Create a new empty shadow warehouse without deleting/overwriting the current one."""
-        return MarketWarehouse(db_path=shadow_db_path, package_root=shadow_package_root)
+        return MarketWarehouse(
+            db_path=shadow_db_path,
+            package_root=shadow_package_root,
+            package_writes_enabled=self.package_writes_enabled,
+        )
 
     def has_daily_data(self) -> bool:
         if not self._table_exists(_DAILY_TABLE):
@@ -1640,6 +1786,8 @@ class MarketWarehouse:
         }
 
     def has_materialized_package(self) -> bool:
+        if not self.package_writes_enabled:
+            return False
         bars_root = self.package_root / "bars"
         if not bars_root.exists() or not bars_root.is_dir():
             return False
@@ -1654,6 +1802,14 @@ class MarketWarehouse:
         symbols: list[str] | None = None,
         intervals: list[str] | None = None,
     ) -> dict[str, object]:
+        if not self.package_writes_enabled:
+            return {
+                "status": "skipped",
+                "reason": "package_writes_disabled",
+                "symbols_total": 0,
+                "daily_written": 0,
+                "intraday_written": {interval: 0 for interval in _INTRADAY_TABLES},
+            }
         if not self.has_daily_data():
             return {
                 "status": "skipped",
@@ -1725,6 +1881,12 @@ class MarketWarehouse:
         }
 
     def refresh_package_manifests(self) -> dict[str, object]:
+        if not self.package_writes_enabled:
+            return {
+                "status": "skipped",
+                "reason": "package_writes_disabled",
+                "package_root": str(self.package_root),
+            }
         self.package_root.mkdir(parents=True, exist_ok=True)
         daily_summary = self._daily_summary()
         daily_file_summary = _package_daily_file_summary(self.package_root)

@@ -466,6 +466,19 @@ class StockAnalyzerService:
         config: StockAnalyzerConfig,
     ) -> DataSourceConfig:
         primary = str(config.data_source.primary).strip().lower()
+        vendor_overlay_primaries = {
+            "vendor_zip_overlay",
+            "vendor_overlay",
+            "local_vendor_zip",
+        }
+        if primary in vendor_overlay_primaries:
+            warehouse_db_path = (
+                str(config.data_source.warehouse_db_path).strip()
+                or str(config.market_warehouse.db_path).strip()
+            )
+            return config.data_source.model_copy(
+                update={"warehouse_db_path": warehouse_db_path}
+            )
         if primary not in {"market_warehouse", "warehouse", "warehouse_offline"}:
             return config.data_source
         package_root = (
@@ -4858,6 +4871,9 @@ class StockAnalyzerService:
             "tdx_offline",
             "offline",
             "local",
+            "vendor_zip_overlay",
+            "vendor_overlay",
+            "local_vendor_zip",
         } and bool(effective_local_root)
 
     def _format_symbol_display(self, symbol: str, name: str = "") -> str:
@@ -4958,6 +4974,55 @@ class StockAnalyzerService:
         if not deduped:
             raise RuntimeError("akshare_catalog_empty")
         return deduped
+
+    def _iter_market_data_provider_graph(self) -> list[object]:
+        pending: list[object] = [self._provider]
+        if self._realtime_provider is not None:
+            pending.append(self._realtime_provider)
+        seen: set[int] = set()
+        providers: list[object] = []
+        wrapper_attrs = (
+            "primary",
+            "backup",
+            "inner",
+            "base_provider",
+            "provider",
+            "_primary",
+            "_backup",
+            "_inner",
+            "_base_provider",
+            "_provider",
+        )
+        while pending:
+            provider = pending.pop(0)
+            provider_id = id(provider)
+            if provider_id in seen:
+                continue
+            seen.add(provider_id)
+            providers.append(provider)
+            for attr in wrapper_attrs:
+                nested = getattr(provider, attr, None)
+                if nested is not None:
+                    pending.append(nested)
+        return providers
+
+    def _load_symbol_universe_from_provider(self) -> list[str]:
+        candidates: list[str] = []
+        for provider in self._iter_market_data_provider_graph():
+            list_symbols = getattr(provider, "list_symbols", None)
+            if not callable(list_symbols):
+                continue
+            try:
+                raw_symbols = list_symbols()
+            except Exception:
+                continue
+            if isinstance(raw_symbols, (str, bytes)):
+                continue
+            try:
+                candidates.extend(str(item) for item in raw_symbols)
+            except TypeError:
+                continue
+        return _filter_supported_universe_symbols(candidates)
 
     def _load_symbol_universe_from_local_files(self, cap: int = 12000) -> list[str]:
         roots: list[Path] = []
@@ -5073,17 +5138,37 @@ class StockAnalyzerService:
         prefer_local = self._prefer_local_symbol_universe()
 
         if prefer_local:
-            local_primary_symbols = self._load_symbol_universe_from_local_files()
-            if len(local_primary_symbols) >= min_required:
-                selected = local_primary_symbols
-                source = "local_files_primary"
+            provider_primary_symbols = self._load_symbol_universe_from_provider()
+            if len(provider_primary_symbols) >= min_required:
+                selected = provider_primary_symbols
+                source = "provider_index_primary"
                 self._persist_symbol_universe_cache(selected, source=source)
-            elif len(local_primary_symbols) > len(provisional_symbols):
-                provisional_symbols = local_primary_symbols
-                provisional_source = "local_files_primary"
+            elif len(provider_primary_symbols) > len(provisional_symbols):
+                provisional_symbols = provider_primary_symbols
+                provisional_source = "provider_index_primary"
                 errors.append(
-                    f"local_files_universe_too_small:{len(local_primary_symbols)}<{min_required}"
+                    "provider_index_universe_too_small:"
+                    f"{len(provider_primary_symbols)}<{min_required}"
                 )
+
+            vendor_overlay_primary = str(self._config.data_source.primary).strip().lower() in {
+                "vendor_zip_overlay",
+                "vendor_overlay",
+                "local_vendor_zip",
+            }
+            if not selected and not vendor_overlay_primary:
+                local_primary_symbols = self._load_symbol_universe_from_local_files()
+                if len(local_primary_symbols) >= min_required:
+                    selected = local_primary_symbols
+                    source = "local_files_primary"
+                    self._persist_symbol_universe_cache(selected, source=source)
+                elif len(local_primary_symbols) > len(provisional_symbols):
+                    provisional_symbols = local_primary_symbols
+                    provisional_source = "local_files_primary"
+                    errors.append(
+                        "local_files_universe_too_small:"
+                        f"{len(local_primary_symbols)}<{min_required}"
+                    )
 
         if not selected and allow_online_sources:
             for spot_source, error_prefix, fetcher in self._preferred_universe_spot_sources():
@@ -5157,7 +5242,11 @@ class StockAnalyzerService:
                 source = "watchlist_fallback"
                 errors.append("fallback_to_watchlist")
 
-        if not selected:
+        if not selected and str(self._config.data_source.primary).strip().lower() not in {
+            "vendor_zip_overlay",
+            "vendor_overlay",
+            "local_vendor_zip",
+        }:
             local_symbols = self._load_symbol_universe_from_local_files()
             if local_symbols:
                 selected = local_symbols
@@ -5178,7 +5267,13 @@ class StockAnalyzerService:
             "source": source,
             "symbols": selected,
             "count": len(selected),
-            "degraded": source not in {"akshare_spot", "efinance_spot", "local_files_primary"},
+            "degraded": source
+            not in {
+                "akshare_spot",
+                "efinance_spot",
+                "local_files_primary",
+                "provider_index_primary",
+            },
             "errors": errors,
             "cache_path": str(self._universe_cache_path),
         }

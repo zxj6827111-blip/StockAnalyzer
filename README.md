@@ -16,6 +16,7 @@ uvicorn stock_analyzer.main:app --reload
 
 - `docs/v13_deployment_guide.md`
 - `docs/fn_nas_deployment_runtime_localvol.md`
+- `docs/vendor_zip_overlay_nas_deployment.md`
 - `docs/signal_tuning_v1_v2_20260320.md`
 - `docs/v13_training_and_acceptance.md`
 - `docs/v13_runtime_operations.md`

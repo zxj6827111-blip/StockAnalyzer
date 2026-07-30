@@ -11,6 +11,16 @@ data_source:
   primary: market_warehouse
   local_data_root: "artifacts/warehouse/package"
   warehouse_db_path: "artifacts/warehouse/market.duckdb"
+  # Optional read-only annual-ZIP history + writable DuckDB delta overlay.
+  vendor_zip_index_path: ""
+  vendor_zip_daily_dir: "全A日K"
+  vendor_zip_price_series_mode: "raw"
+  vendor_zip_daily_volume_multiplier: 100.0
+  vendor_zip_daily_turnover_multiplier: 1000.0
+  vendor_zip_minute_volume_multiplier: 100.0
+  vendor_zip_minute_amount_multiplier: 1.0
+  vendor_zip_intraday_enabled: true
+  vendor_zip_memory_cache_symbols: 32
   enable_cache_fallback: true
   switch_after_failures: 2
   request_interval_sec: 0.6
