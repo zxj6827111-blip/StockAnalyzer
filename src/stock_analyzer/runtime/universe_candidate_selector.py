@@ -903,7 +903,11 @@ class UniverseCandidateSelector:
         if generated_at is None:
             return None, "snapshot_missing_generated_at"
         effective_reference = reference_date or datetime.now().date()
-        if generated_at.date() > effective_reference:
+        # A snapshot may be generated the day after its market as-of date
+        # (for example, Friday data persisted during Saturday validation).
+        # Compare against the wall clock for genuine future corruption, while
+        # using the market reference date only for expiry age calculation.
+        if generated_at > datetime.now():
             return None, "snapshot_from_future"
         snapshot_age_days = max(0, (effective_reference - generated_at.date()).days)
         if snapshot_age_days > self._snapshot_max_age_days:

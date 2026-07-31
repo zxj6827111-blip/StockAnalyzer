@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Single-directory NAS update: git pull -> build -> recreate api/scheduler.
+# Single-directory NAS update: git pull -> build -> validate -> recreate api.
 # Run from the runtime project root (recommended: /vol1/docker/StockAnalyzer).
 #
 # Prerequisites:
@@ -20,6 +20,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BRANCH="main"
 DO_RECREATE=1
 DO_PULL=1
+START_SCHEDULER=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -33,6 +34,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-pull)
       DO_PULL=0
+      shift
+      ;;
+    --start-scheduler)
+      START_SCHEDULER=1
       shift
       ;;
     -h|--help)
@@ -92,29 +97,74 @@ COMPOSE=(docker compose --env-file "${ROOT}/.env"
   -f docker-compose.yml
   -f docker-compose.runtime.yml
   -f docker-compose.runtime.localvol.yml
+  -f docker-compose.advisory.yml
+  -f docker-compose.vendor-overlay.yml
 )
-# Optional nightly train-after-sync overlay
-if [[ -f "${ROOT}/docker-compose.learning.yml" ]] && [[ "${ENABLE_LEARNING:-1}" = "1" ]]; then
-  COMPOSE+=(-f docker-compose.learning.yml)
-  echo "learning overlay: enabled (ENABLE_LEARNING=1)"
+if [[ "${ENABLE_LEARNING:-0}" = "1" ]]; then
+  echo "ERROR: ENABLE_LEARNING=1 is forbidden for advisory vendor-overlay deployment" >&2
+  exit 1
 fi
 
-echo "[2/4] build api image"
-"${COMPOSE[@]}" build api
+echo "[2/4] render and fail-closed validate advisory vendor-overlay config"
+RENDERED="$(mktemp)"
+trap 'rm -f "${RENDERED}"' EXIT
+"${COMPOSE[@]}" config --format json > "${RENDERED}"
+python - "${RENDERED}" <<'PY'
+import json, sys
+from pathlib import Path
+d = json.loads(Path(sys.argv[1]).read_text())
+for name, service in d.get("services", {}).items():
+    if name not in {"api", "scheduler"}:
+        continue
+    env = service.get("environment") or {}
+    if isinstance(env, list): env = dict(item.split("=", 1) for item in env if "=" in item)
+    expected = {"SA__APP__ADVISORY_ONLY":"true", "SA__TRAINING__ENABLED":"false", "SA__AUTO_PROMOTION__ENABLED":"false", "SA__DATA_SOURCE__PRIMARY":"vendor_zip_overlay"}
+    for key, value in expected.items():
+        if str(env.get(key, "")).lower() != value: raise SystemExit(f"fail-closed: {name} {key}={env.get(key)!r}, expected {value!r}")
+    mounts = service.get("volumes") or []
+    vendor_mounts = [item for item in mounts if isinstance(item, dict) and item.get("target") == "/data/vendor_history"]
+    if len(vendor_mounts) != 1 or vendor_mounts[0].get("read_only") is not True:
+        raise SystemExit(f"fail-closed: {name} vendor_history is not read-only")
+print("rendered config safety checks passed")
+PY
+echo "[3/4] build api image with commit metadata"
+"${COMPOSE[@]}" build --build-arg STOCK_ANALYZER_BUILD_COMMIT="${COMMIT}" --build-arg STOCK_ANALYZER_BUILD_SHORT_COMMIT="${SHORT}" --build-arg STOCK_ANALYZER_BUILD_DIRTY=0 api
 
 if [[ "${DO_RECREATE}" -eq 1 ]]; then
-  echo "[3/4] recreate api scheduler"
-  "${COMPOSE[@]}" up -d --no-build --force-recreate api scheduler
+  echo "[4/4] recreate api only; scheduler requires explicit --start-scheduler"
+  "${COMPOSE[@]}" up -d --no-build --force-recreate api
+  if [[ "${START_SCHEDULER}" -eq 1 ]]; then
+    "${COMPOSE[@]}" up -d --no-build --force-recreate scheduler
+  else
+    echo "scheduler: not started (vendor compatibility gate required)"
+  fi
 else
-  echo "[3/4] skip recreate"
+  echo "[4/4] skip recreate"
 fi
 
-echo "[4/4] health"
+echo "[4/4] health and image identity"
 "${COMPOSE[@]}" ps
+LABEL_COMMIT="$(docker image inspect stock-analyzer:latest --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')"
+if [[ "${LABEL_COMMIT}" != "${COMMIT}" ]]; then
+  echo "ERROR: image label commit ${LABEL_COMMIT} != source ${COMMIT}" >&2
+  exit 1
+fi
 PORT="$(grep -E '^SA_API_HOST_PORT=' .env 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
 PORT="${PORT:-18001}"
 sleep 3
-curl -fsS "http://127.0.0.1:${PORT}/health" || true
+HEALTH="$(curl -fsS "http://127.0.0.1:${PORT}/health")"
+python - "${HEALTH}" "${COMMIT}" <<'PY'
+import json, sys
+h = json.loads(sys.argv[1])
+expected = sys.argv[2]
+build = h.get("build") or {}
+if build.get("commit") != expected or build.get("short_commit") != expected[:7]:
+    raise SystemExit(f"health commit mismatch: {build}")
+runtime = h.get("runtime") or {}
+if runtime.get("advisory_only") is not True or runtime.get("training_enabled") is not False:
+    raise SystemExit(f"health safety mismatch: {runtime}")
+print(json.dumps({"build_commit": build.get("commit"), "advisory_only": runtime.get("advisory_only"), "training_enabled": runtime.get("training_enabled")}, separators=(",", ":")))
+PY
 echo
 echo "OK. commit=${SHORT}"
 echo "If capital_curve:freeze still active, run: bash scripts/nas_reset_sim_account.sh"
