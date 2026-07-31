@@ -1323,6 +1323,67 @@ class MarketWarehouse:
                 latest[normalized_symbol] = parsed
         return latest
 
+    def fetch_universe_quality_metrics(
+        self,
+        *,
+        symbols: list[str],
+        lookback_days: int,
+    ) -> pd.DataFrame:
+        """Batch-fetch per-symbol daily bars (last ``lookback_days`` rows each).
+
+        Single DuckDB query returning one frame with all columns needed for
+        quality scoring across the whole universe. Deliberately avoids
+        per-symbol ``fetch_daily_bars`` calls so 5000+ symbols can be scored in
+        one pass without opening thousands of connections or DataFrames.
+
+        Returns an empty frame when the daily table is missing or no requested
+        symbol has data. Callers must treat empty as "batch unavailable" and
+        enter an explicit degraded fallback rather than silently falling back
+        to per-symbol reads.
+        """
+        if not self._table_exists(_DAILY_TABLE):
+            return pd.DataFrame()
+        normalized_symbols = sorted(
+            {
+                _normalize_symbol(symbol)
+                for symbol in (symbols or [])
+                if _normalize_symbol(symbol)
+            }
+        )
+        if not normalized_symbols:
+            return pd.DataFrame()
+        symbols_df = pd.DataFrame({"symbol": normalized_symbols})
+        limit = max(1, int(lookback_days))
+        with self._connect_readonly() as connection:
+            connection.register("_uqs_symbols", symbols_df)
+            try:
+                frame = cast(
+                    pd.DataFrame,
+                    connection.execute(
+                        f"""
+                        WITH ranked AS (
+                            SELECT
+                                t.*,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY t.symbol ORDER BY t.date DESC
+                                ) AS _rn
+                            FROM {_DAILY_TABLE} t
+                            WHERE t.symbol IN (SELECT symbol FROM _uqs_symbols)
+                        )
+                        SELECT * FROM ranked WHERE _rn <= ?
+                        ORDER BY symbol, date
+                        """,
+                        [limit],
+                    ).fetch_df(),
+                )
+            finally:
+                connection.unregister("_uqs_symbols")
+        if frame.empty:
+            return frame
+        frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+        frame = frame.dropna(subset=["date"]).sort_values(["symbol", "date"])
+        return frame
+
     def background_data_quality_snapshot(self) -> dict[str, object]:
         if not self._table_exists(_DAILY_TABLE):
             return {

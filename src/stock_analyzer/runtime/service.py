@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import traceback
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -5261,7 +5262,18 @@ class StockAnalyzerService:
                 errors.append("fallback_to_bootstrap_seed_symbols")
 
         if cap > 0:
-            selected = selected[:cap]
+            seed_trade_date = self._resolve_universe_seed_trade_date()
+            selected, quota_meta = _quota_sample_universe(
+                selected,
+                cap=cap,
+                board_scope=list(self._config.evolution.universe_spec.board_scope),
+                universe_ruleset_id=str(
+                    self._config.evolution.universe_spec.universe_ruleset_id
+                ),
+                seed_trade_date=seed_trade_date,
+            )
+        else:
+            quota_meta = {"truncation_mode": "none", "cap": 0}
 
         return {
             "source": source,
@@ -5276,7 +5288,109 @@ class StockAnalyzerService:
             },
             "errors": errors,
             "cache_path": str(self._universe_cache_path),
+            "board_quota": quota_meta,
         }
+
+    def _select_universe_quality_candidates(
+        self,
+        *,
+        symbols: list[str],
+        target_size: int,
+        trade_date: str,
+        ruleset_id: str,
+        board_scope: list[str],
+        reference_date: date | datetime | str | None = None,
+    ) -> dict[str, object]:
+        """Run :class:`UniverseCandidateSelector` to pick ``target_size`` candidates.
+
+        Thin glue: constructs the standalone selector with config-derived knobs
+        and the market warehouse, delegates the heavy work (batch metric fetch,
+        hard filter, quality scoring, board-quota selection, exploration) to the
+        selector module, and persists the audit snapshot. Degraded fallback to
+        :func:`_quota_sample_universe` is wired through ``fallback_sampler`` so
+        this method never silently switches to per-symbol reads.
+        """
+        from stock_analyzer.runtime.universe_candidate_selector import (
+            UniverseCandidateSelector,
+            persist_selection_snapshot,
+        )
+
+        cfg = self._config.week5
+        warehouse = self._market_warehouse()
+        selector = UniverseCandidateSelector(
+            warehouse=warehouse,
+            weights=cfg.universe_quality_weights,
+            min_history_days=_as_int(cfg.universe_quality_min_history_days, default=60),
+            min_avg_turnover_20=_as_float(
+                cfg.universe_quality_min_avg_turnover_20, default=0.0
+            ),
+            min_float_market_cap=_as_float(
+                cfg.universe_quality_min_float_market_cap, default=0.0
+            ),
+            min_batch_coverage_ratio=_as_float(
+                cfg.universe_quality_min_batch_coverage_ratio, default=0.90
+            ),
+            max_staleness_days=_as_int(
+                cfg.universe_quality_max_staleness_days, default=10
+            ),
+            require_financial_data=bool(cfg.universe_quality_require_financial_data),
+            min_roe=_as_float(cfg.universe_quality_min_roe, default=0.0),
+            max_debt_ratio=_as_float(
+                cfg.universe_quality_max_debt_ratio, default=0.80
+            ),
+            exploration_ratio=_as_float(cfg.universe_quality_exploration_ratio, default=0.05),
+            lookback_days=max(
+                60,
+                _as_int(cfg.universe_prefilter_lookback_days, default=240),
+            ),
+            snapshot_path=str(cfg.universe_quality_snapshot_path),
+            snapshot_max_age_days=_as_int(
+                cfg.universe_quality_snapshot_max_age_days, default=7
+            ),
+            fallback_sampler=_quota_sample_universe,
+        )
+        result = selector.select(
+            symbols=symbols,
+            target_size=target_size,
+            trade_date=trade_date,
+            ruleset_id=ruleset_id,
+            board_scope=board_scope,
+            reference_date=reference_date,
+        )
+        report = result.get("report", {})
+        if isinstance(report, dict):
+            report["snapshot_path"] = str(cfg.universe_quality_snapshot_path)
+            report["snapshot_persisted"] = False
+            selector_mode = str(report.get("selector_mode", "")).strip()
+            if selector_mode in {"quality", "quality_all_eligible"}:
+                report_target_size = max(
+                    1,
+                    _as_int(report.get("target_size"), default=target_size),
+                )
+                selected_count = max(
+                    0,
+                    _as_int(report.get("selected_count"), default=0),
+                )
+                if selected_count < report_target_size:
+                    report["snapshot_persist_skip_reason"] = (
+                        "selected_below_target:"
+                        f"{selected_count}<{report_target_size}"
+                    )
+                else:
+                    try:
+                        persist_selection_snapshot(
+                            report,
+                            str(cfg.universe_quality_snapshot_path),
+                        )
+                    except Exception as exc:
+                        report["snapshot_persist_error"] = f"{type(exc).__name__}:{exc}"
+                    else:
+                        report["snapshot_persisted"] = True
+            else:
+                report["snapshot_persist_skip_reason"] = (
+                    f"selector_mode_not_successful:{selector_mode or 'unknown'}"
+                )
+        return result
 
     def _prefilter_week5_universe_symbol(
         self,
@@ -5947,6 +6061,62 @@ class StockAnalyzerService:
 
     def _market_warehouse(self) -> MarketWarehouse:
         return self._market_sync_service._market_warehouse()
+
+    def _resolve_universe_seed_trade_date(self) -> str:
+        """解析用于 universe 配额抽样的真实最新交易日。
+
+        优先级（与方案一致，避免 wall-clock 漂移）：
+        1. market_warehouse.background_data_quality_snapshot()["latest_trade_date"]
+           —— 数据仓库的权威最新交易日，与盘后扫描数据一致
+        2. provider graph 中的 latest_daily_dates() 聚合最大值（vendor_zip_overlay 有）
+        3. 稳定 sentinel "unresolved" —— 不使用 wall-clock 日期，
+           避免周末/节假日无交易日变化时仍轮换样本
+
+        任何一级抛异常或为空都自动降级到下一级，不阻断扫描。
+        """
+        # 第 1 级：market_warehouse 快照（权威来源）
+        try:
+            snapshot = self._market_warehouse().background_data_quality_snapshot()
+            if isinstance(snapshot, dict):
+                latest = str(snapshot.get("latest_trade_date", "")).strip()
+                if latest:
+                    return latest
+        except Exception:
+            pass
+
+        # 第 2 级：provider graph 的 latest_daily_dates
+        try:
+            max_date: date | None = None
+            for provider in self._iter_market_data_provider_graph():
+                fetcher = getattr(provider, "latest_daily_dates", None)
+                if not callable(fetcher):
+                    continue
+                try:
+                    dates_map = fetcher()
+                except Exception:
+                    continue
+                if not isinstance(dates_map, dict):
+                    continue
+                for value in dates_map.values():
+                    candidate: date | None = None
+                    if isinstance(value, date) and not isinstance(value, datetime):
+                        candidate = value
+                    elif isinstance(value, datetime):
+                        candidate = value.date()
+                    elif isinstance(value, str) and value.strip():
+                        try:
+                            candidate = datetime.fromisoformat(value.strip()).date()
+                        except ValueError:
+                            continue
+                    if candidate is not None and (max_date is None or candidate > max_date):
+                        max_date = candidate
+            if max_date is not None:
+                return max_date.isoformat()
+        except Exception:
+            pass
+
+        # 第 3 级：稳定 sentinel，不使用 wall-clock 日期
+        return "unresolved"
 
     def _resolve_market_warehouse_auto_refresh(
         self,
@@ -20040,6 +20210,263 @@ def _exchange_from_a_share_symbol(symbol: object) -> str:
     if digits.startswith(("4", "8")):
         return "BSE"
     return ""
+
+
+# 五板块分类，比交易所级更细：SH_MAIN 与 SH_STAR 独立，SZ_MAIN 与 SZ_GEM 独立
+_BOARD_ORDER: tuple[str, ...] = (
+    "SZ_MAIN",
+    "SZ_GEM",
+    "SH_MAIN",
+    "SH_STAR",
+    "BSE",
+    "OTHER",
+)
+_BOARD_EXCHANGE_MAP: dict[str, str] = {
+    "SZ_MAIN": "SZSE",
+    "SZ_GEM": "SZSE",
+    "SH_MAIN": "SSE",
+    "SH_STAR": "SSE",
+    "BSE": "BSE",
+    "OTHER": "",
+}
+
+
+def _board_from_a_share_symbol(symbol: object) -> str:
+    """A 股五板块分类：深主板/创业板/沪主板/科创板/北交所/其它。
+
+    比交易所级分类更细——SH_MAIN(600/601/603/605) 与 SH_STAR(688/689) 独立，
+    SZ_MAIN(000/001/002/003) 与 SZ_GEM(300/301/302) 独立，使配额抽样能分别保底。
+
+    覆盖范围与 `_exchange_from_a_share_symbol` 保持一致：
+    - 0/1/2/3 开头 → SZSE，其中 3xx → SZ_GEM，其余 → SZ_MAIN
+    - 6/9 开头 → SSE，其中 688/689 → SH_STAR，其余 → SH_MAIN
+    - 4/8 开头 → BSE
+    """
+    digits = _normalize_a_share_symbol(symbol)
+    if not digits:
+        return ""
+    # 深市：0/1/2 开头为深主板，3 开头为创业板
+    if digits.startswith("3"):
+        return "SZ_GEM"
+    if digits.startswith(("0", "1", "2")):
+        return "SZ_MAIN"
+    # 沪市：688/689 为科创板，其余 6/9 开头为沪主板
+    if digits.startswith(("688", "689")):
+        return "SH_STAR"
+    if digits.startswith(("6", "9")):
+        return "SH_MAIN"
+    if digits.startswith(("4", "8")):
+        return "BSE"
+    return "OTHER"
+
+
+def _quota_sample_universe(
+    symbols: list[str],
+    *,
+    cap: int,
+    board_scope: list[str],
+    universe_ruleset_id: str,
+    seed_trade_date: str,
+    min_quota_per_in_scope_board: int = 10,
+) -> tuple[list[str], dict[str, object]]:
+    """按五板块对 universe 做配额抽样，替代裸字典序切片。
+
+    背景：原本 `selected[:cap]` 会按 rglob 字典序取前 N 只，导致沪市(6xx)排到
+    300 名之后被切掉，产生市场偏置。这里改为按五板块分类（SZ_MAIN/SZ_GEM/
+    SH_MAIN/SH_STAR/BSE/OTHER）分组，对所属交易所在 board_scope 内的板块按
+    "最小保底 + 实际占比"分配名额，组内随机抽样。
+
+    板块分类比交易所级更细：SH_MAIN(6/9 开头，除 688/689) 与 SH_STAR(688/689) 独立
+    保底，SZ_MAIN(0/1/2 开头) 与 SZ_GEM(3 开头) 独立保底，避免科创板/创业板被主板
+    挤占。board_scope 是交易所级（SSE/SZSE/BSE），板块所属交易所决定是否参与。
+
+    - 同 seed_trade_date + 同 ruleset_id 可复现
+    - 跨日自然轮换，不同股票不同日有机会进入
+    - 不污染全局 random 状态
+    """
+    if cap <= 0 or not symbols:
+        return list(symbols), {
+            "truncation_mode": "none",
+            "cap": cap,
+            "board_scope": list(board_scope),
+            "boards": {},
+            "seed_trade_date": str(seed_trade_date),
+            "ruleset_id": str(universe_ruleset_id),
+        }
+
+    scope_set = {str(item).strip().upper() for item in board_scope if str(item).strip()}
+    # 按五板块分组——所有符号都入组（包括 scope 外），用于观测字段保留 input_count
+    groups: dict[str, list[str]] = {b: [] for b in _BOARD_ORDER}
+    for raw_symbol in symbols:
+        normalized = _normalize_a_share_symbol(raw_symbol)
+        if not normalized:
+            continue
+        board = _board_from_a_share_symbol(normalized)
+        if not board:
+            board = "OTHER"
+        groups[board].append(normalized)
+
+    # 确定参与配额的板块：有数据且所属交易所在 board_scope 内（或 scope 为空）
+    in_scope_boards = [
+        b for b in _BOARD_ORDER
+        if groups[b] and (not scope_set or _BOARD_EXCHANGE_MAP.get(b, "") in scope_set)
+    ]
+
+    total_available = sum(len(groups[b]) for b in in_scope_boards)
+    if total_available == 0:
+        # 无在 scope 内的符号：返回空结果，不把已排除的 scope 外股票选回。
+        # 从 groups 生成真实 metadata，保留各板块实际 input_count。
+        boards_meta = {
+            b: {
+                "exchange": _BOARD_EXCHANGE_MAP.get(b, ""),
+                "in_scope": b in in_scope_boards,
+                "input_count": len(groups[b]),
+                "quota": 0,
+                "selected_count": 0,
+            }
+            for b in _BOARD_ORDER
+        }
+        return [], {
+            "truncation_mode": "no_in_scope_symbols",
+            "cap": cap,
+            "effective_cap": 0,
+            "board_scope": list(board_scope),
+            "boards": boards_meta,
+            "seed_trade_date": str(seed_trade_date),
+            "ruleset_id": str(universe_ruleset_id),
+            "reason": "no_in_scope_symbols",
+        }
+
+    effective_cap = min(cap, total_available)
+    min_quota = max(0, int(min_quota_per_in_scope_board))
+    # 当 cap 极小（不足以给每个板块都保底）时，保底自动降级
+    num_in_scope = len(in_scope_boards)
+    if num_in_scope > 0:
+        min_quota = min(min_quota, max(0, effective_cap // num_in_scope))
+
+    pool_sizes = {b: len(groups[b]) for b in in_scope_boards}
+
+    # 第 1 步：给每个在 scope 内的板块分配最小保底
+    quotas: dict[str, int] = {b: 0 for b in in_scope_boards}
+    for b in in_scope_boards:
+        quotas[b] = min(min_quota, pool_sizes[b])
+
+    # 第 2 步：剩余名额按各组实际数量占比分配
+    remaining = max(0, effective_cap - sum(quotas.values()))
+    if remaining > 0:
+        total_size = sum(pool_sizes.values())
+        if total_size > 0:
+            raw_shares = {b: pool_sizes[b] / total_size * remaining for b in in_scope_boards}
+            floor_shares = {b: int(math.floor(raw_shares[b])) for b in in_scope_boards}
+            for b in in_scope_boards:
+                quotas[b] += floor_shares[b]
+            # 余数按小数部分降序补齐
+            leftover = effective_cap - sum(quotas.values())
+            if leftover > 0:
+                for b in sorted(
+                    in_scope_boards,
+                    key=lambda b: (-(raw_shares[b] - floor_shares[b]), -pool_sizes[b], b),
+                ):
+                    if leftover <= 0:
+                        break
+                    if quotas[b] < pool_sizes[b]:
+                        quotas[b] += 1
+                        leftover -= 1
+
+    # 第 3 步：若保底之和已超 cap，按组规模反向削减
+    total_quota = sum(quotas.values())
+    if total_quota > effective_cap:
+        overflow = total_quota - effective_cap
+        for b in sorted(in_scope_boards, key=lambda b: (pool_sizes[b], b)):
+            if overflow <= 0:
+                break
+            cut = min(overflow, max(0, quotas[b] - 1))
+            quotas[b] -= cut
+            overflow -= cut
+
+    # 第 4 步：循环回流——处理"配额 > 池规模"的溢出，回补给有余量的板块。
+    # 多个小板块同时耗尽时需循环补足，单次遍历不够。
+    while True:
+        # 截断超配，收集溢出
+        overflow = 0
+        for b in in_scope_boards:
+            if quotas[b] > pool_sizes[b]:
+                overflow += quotas[b] - pool_sizes[b]
+                quotas[b] = pool_sizes[b]
+        if overflow <= 0:
+            break
+        # 把溢出回补给有余量的板块，按剩余 room 降序优先补大池
+        assigned_any = False
+        for b in sorted(
+            in_scope_boards,
+            key=lambda b: (-(pool_sizes[b] - quotas[b]), -pool_sizes[b], b),
+        ):
+            if overflow <= 0:
+                break
+            room = pool_sizes[b] - quotas[b]
+            if room <= 0:
+                continue
+            add = min(overflow, room)
+            quotas[b] += add
+            overflow -= add
+            assigned_any = True
+        if not assigned_any:
+            break  # 所有板块都满了，无法再补
+
+    # 第 5 步：若仍有缺额（回流后总数 < effective_cap），循环补足
+    while True:
+        deficit = effective_cap - sum(quotas.values())
+        if deficit <= 0:
+            break
+        assigned_any = False
+        for b in sorted(in_scope_boards, key=lambda b: (-pool_sizes[b], b)):
+            if deficit <= 0:
+                break
+            if quotas[b] < pool_sizes[b]:
+                quotas[b] += 1
+                deficit -= 1
+                assigned_any = True
+        if not assigned_any:
+            break
+
+    # 第 6 步：组内随机抽样。先对每个 pool 排序，保证可复现性不依赖 provider 返回顺序
+    seed_str = f"{seed_trade_date}|{universe_ruleset_id}|{cap}"
+    seed_int = int.from_bytes(hashlib.sha256(seed_str.encode("utf-8")).digest()[:8], "big")
+    rng = random.Random(seed_int)
+    sampled: list[str] = []
+    selected_counts: dict[str, int] = {b: 0 for b in in_scope_boards}
+    for b in in_scope_boards:
+        pool = sorted(groups[b])
+        take = min(quotas[b], len(pool))
+        if take <= 0:
+            continue
+        sampled.extend(rng.sample(pool, take))
+        selected_counts[b] = take
+
+    rng.shuffle(sampled)
+
+    # 观测字段：按板块返回 input_count/quota/selected_count，保留 scope 外板块的 input_count
+    boards_meta: dict[str, dict[str, object]] = {}
+    for b in _BOARD_ORDER:
+        in_scope = b in in_scope_boards
+        boards_meta[b] = {
+            "exchange": _BOARD_EXCHANGE_MAP.get(b, ""),
+            "in_scope": in_scope,
+            "input_count": len(groups[b]),
+            "quota": quotas.get(b, 0) if in_scope else 0,
+            "selected_count": selected_counts.get(b, 0) if in_scope else 0,
+        }
+
+    return sampled, {
+        "truncation_mode": "board_quota_sample",
+        "cap": cap,
+        "effective_cap": effective_cap,
+        "board_scope": list(board_scope),
+        "boards": boards_meta,
+        "seed_trade_date": str(seed_trade_date),
+        "ruleset_id": str(universe_ruleset_id),
+        "min_quota_per_in_scope_board": min_quota,
+    }
 
 
 def _is_missing_scalar(value: object) -> bool:

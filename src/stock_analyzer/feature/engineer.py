@@ -47,6 +47,15 @@ class FeatureEngineer:
         margin_financing = _optional_numeric(ordered, "margin_financing_balance")
         northbound_net = _optional_numeric(ordered, "northbound_net")
         dragon_tiger_flag = _optional_binary(ordered, "dragon_tiger_flag")
+        moneyflow_net = _optional_numeric(ordered, "moneyflow_net_amount")
+        hk_hold_ratio = _optional_numeric(ordered, "hk_hold_ratio")
+        hk_hold_change = _optional_numeric(ordered, "hk_hold_change")
+        inst_net_amount = _optional_numeric(ordered, "inst_net_amount")
+        block_trade_amount = _optional_numeric(ordered, "block_trade_amount")
+        block_trade_volume = _optional_numeric(ordered, "block_trade_volume")
+        block_trade_premium = _optional_numeric(
+            ordered, "block_trade_premium_discount"
+        )
         board_code = _encode_board(
             ordered.get("board", pd.Series(index=ordered.index, dtype=object))
         )
@@ -208,6 +217,29 @@ class FeatureEngineer:
                 ),
                 "bg_northbound_net5": northbound_net.rolling(5, min_periods=1).sum(),
                 "bg_dragon_tiger_freq20": dragon_tiger_flag.rolling(20, min_periods=1).mean(),
+                "moneyflow_net_5": moneyflow_net.rolling(5, min_periods=1).sum(),
+                "moneyflow_net_20": moneyflow_net.rolling(20, min_periods=1).sum(),
+                "moneyflow_net_zscore_60": _rolling_zscore(moneyflow_net, window=60),
+                "hk_hold_ratio_chg_5": hk_hold_ratio.diff(5),
+                "hk_hold_ratio_chg_20": hk_hold_ratio.diff(20),
+                "hk_hold_change_5": hk_hold_change.rolling(5, min_periods=1).sum(),
+                "hk_hold_change_20": hk_hold_change.rolling(20, min_periods=1).sum(),
+                "inst_net_amount_5": inst_net_amount.rolling(5, min_periods=1).sum(),
+                "inst_net_amount_20": inst_net_amount.rolling(20, min_periods=1).sum(),
+                "block_trade_amount_5": block_trade_amount.rolling(5, min_periods=1).sum(),
+                "block_trade_amount_20": block_trade_amount.rolling(20, min_periods=1).sum(),
+                "block_trade_volume_20": block_trade_volume.rolling(20, min_periods=1).sum(),
+                "block_trade_turnover_ratio_20": _safe_div(
+                    block_trade_amount.rolling(20, min_periods=1).sum(),
+                    turnover.rolling(20, min_periods=1).sum(),
+                ),
+                "block_trade_premium_mean_20": block_trade_premium.rolling(
+                    20, min_periods=1
+                ).mean(),
+                "block_trade_event_freq_20": block_trade_amount.notna()
+                .astype(float)
+                .rolling(20, min_periods=1)
+                .mean(),
                 "bg_board_code": board_code,
                 "holder_count_chg_5": _safe_div(
                     holder_count.diff(5),

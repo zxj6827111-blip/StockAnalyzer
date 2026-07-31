@@ -1,0 +1,33 @@
+﻿============================= test session starts =============================
+platform win32 -- Python 3.12.13, pytest-9.1.0, pluggy-1.6.0
+rootdir: E:\Software Development\StockAnalyzer
+configfile: pyproject.toml
+plugins: anyio-4.14.2, cov-7.1.0
+collected 1 item
+
+tests\test_universe_candidate_selector.py F                              [100%]
+
+================================== FAILURES ===================================
+____________________ test_performance_5000_scale_under_30s ____________________
+tests\test_universe_candidate_selector.py:531: in test_performance_5000_scale_under_30s
+    warehouse = _build_warehouse(tmp_path, spec)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests\test_universe_candidate_selector.py:74: in _build_warehouse
+    warehouse.replace_daily_bars(symbol=symbol, frame=_make_daily_frame(**kwargs))
+src\stock_analyzer\data\market_warehouse.py:1576: in replace_daily_bars
+    with self._connect_write() as connection:
+         ^^^^^^^^^^^^^^^^^^^^^
+src\stock_analyzer\data\market_warehouse.py:1578: in replace_daily_bars
+    connection.execute(
+E   _duckdb.CatalogException: Catalog Error: Table with name daily_bars does not exist!
+E   Did you mean "daily_stage_df"?
+E   
+E   LINE 1: DELETE FROM daily_bars WHERE symbol = ?
+E                       ^
+=========================== short test summary info ===========================
+FAILED tests/test_universe_candidate_selector.py::test_performance_5000_scale_under_30s - _duckdb.CatalogException: Catalog Error: Table with name daily_bars does not exist!
+Did you mean "daily_stage_df"?
+
+LINE 1: DELETE FROM daily_bars WHERE symbol = ?
+                    ^
+============================= 1 failed in 20.04s ==============================

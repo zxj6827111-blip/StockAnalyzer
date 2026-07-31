@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 from datetime import date
 
 import pandas as pd
 import pytest
 
+from stock_analyzer.data import tushare_provider as tushare_provider_module
 from stock_analyzer.data.provider import DataSourceError
 from stock_analyzer.data.tushare_provider import (
     TushareProvider,
@@ -178,6 +180,73 @@ def test_tushare_provider_requires_token_without_injected_api() -> None:
     provider._token = ""  # noqa: SLF001
     with pytest.raises(DataSourceError, match="token missing"):
         provider.fetch_daily_bars(symbol="600000", lookback_days=5)
+
+
+def test_tushare_provider_uses_http_fallback_when_sdk_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Response:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = payload
+
+        def __enter__(self) -> _Response:
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            _ = exc_type, exc, tb
+
+        def read(self) -> bytes:
+            return json.dumps(self._payload).encode("utf-8")
+
+    calls: list[str] = []
+
+    def _fake_import_module(name: str) -> object:
+        if name == "tushare":
+            raise ImportError("missing tushare sdk")
+        raise AssertionError(f"unexpected import: {name}")
+
+    def _fake_urlopen(request: object, timeout: float) -> _Response:
+        _ = timeout
+        request_data = request.data  # type: ignore[attr-defined]
+        payload = json.loads(request_data.decode("utf-8"))
+        api_name = str(payload.get("api_name", ""))
+        calls.append(api_name)
+        if api_name == "daily":
+            fields = ["ts_code", "trade_date", "open", "high", "low", "close", "vol", "amount"]
+            items = [
+                ["600000.SH", "20260711", 10.0, 10.5, 9.8, 10.2, 1000.0, 1000.0],
+                ["600000.SH", "20260714", 10.2, 10.7, 10.0, 10.4, 1200.0, 1200.0],
+            ]
+        elif api_name == "daily_basic":
+            fields = ["ts_code", "trade_date", "turnover_rate", "circ_mv", "total_mv"]
+            items = [
+                ["600000.SH", "20260711", 1.0, 1_000_000.0, 2_000_000.0],
+                ["600000.SH", "20260714", 1.1, 1_200_000.0, 2_200_000.0],
+            ]
+        elif api_name == "adj_factor":
+            fields = ["ts_code", "trade_date", "adj_factor"]
+            items = [
+                ["600000.SH", "20260711", 16.0],
+                ["600000.SH", "20260714", 16.0],
+            ]
+        elif api_name == "stock_basic":
+            fields = ["ts_code", "name"]
+            items = [["600000.SH", "浦发银行"]]
+        else:
+            fields = []
+            items = []
+        return _Response({"code": 0, "data": {"fields": fields, "items": items}})
+
+    monkeypatch.setattr(tushare_provider_module.importlib, "import_module", _fake_import_module)
+    monkeypatch.setattr(tushare_provider_module.urllib.request, "urlopen", _fake_urlopen)
+
+    provider = TushareProvider(token="dummy", price_series_mode="qfq")
+    bars = provider.fetch_daily_bars(symbol="600000", lookback_days=2)
+
+    assert {"daily", "daily_basic", "adj_factor", "stock_basic"}.issubset(calls)
+    assert bars["background_data_source"].iloc[-1] == "tushare_pro_qfq"
+    assert bars.attrs["price_series_meta"]["adjustment_source"] == "tushare_adj_factor"
+    assert bars["name"].iloc[-1] == "浦发银行"
 
 
 def test_tushare_resolve_target_trade_date_skips_holiday() -> None:

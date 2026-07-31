@@ -2,7 +2,7 @@
   "task_id": "WD-P0-01",
   "trade_date": "20260302",
   "phase": "end",
-  "timestamp": "2026-03-30T13:19:45.290653",
+  "timestamp": "2026-07-30T18:45:10.730853",
   "extra": {
     "result": {
       "status": "ok",
@@ -16,12 +16,12 @@
         {
           "attempt": 1,
           "status": "ok",
-          "elapsed_seconds": 3.458412,
+          "elapsed_seconds": 8.09626,
           "error_code": "unknown_error"
         }
       ],
       "retry_attempts": 0,
-      "elapsed_seconds": 3.458486,
+      "elapsed_seconds": 8.096312,
       "max_wall_time_minutes": 30,
       "retry_policy": {
         "max_retries": 1,

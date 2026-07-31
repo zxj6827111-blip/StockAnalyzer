@@ -1879,6 +1879,7 @@ def test_post_market_warehouse_followup_maps_shadow_proposal_into_compatibility_
     config.market_warehouse.post_followup_run_learning_backfill = False
     config.market_warehouse.post_followup_run_training = True
     config.market_warehouse.post_followup_run_phase_d_tabular_deep = False
+    config.training.enabled = True
     config.auto_promotion.notify_on_training_summary = False
     service = _new_service(config)
 

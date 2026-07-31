@@ -48,6 +48,17 @@ def fetch_market_benchmark_bars(
 
     errors: list[str] = []
     for symbol in candidates:
+        index_bars = _fetch_index_daily_compat(
+            provider,
+            symbol=symbol,
+            lookback_days=max(120, int(lookback_days)),
+            end_date=end_date,
+        )
+        if not index_bars.empty:
+            ordered_index = _normalize_price_frame(index_bars)
+            if not ordered_index.empty and "close" in ordered_index.columns:
+                ordered_index.attrs["benchmark_symbol"] = symbol
+                return ordered_index
         try:
             bars = _fetch_daily_bars_compat(
                 provider,
@@ -164,3 +175,50 @@ def _fetch_daily_bars_compat(
         )
     except TypeError:
         return provider.fetch_daily_bars(symbol=symbol, lookback_days=lookback_days)
+
+
+def _fetch_index_daily_compat(
+    provider: MarketDataProvider,
+    *,
+    symbol: str,
+    lookback_days: int,
+    end_date: date | None,
+) -> pd.DataFrame:
+    fetch_fn = getattr(provider, "fetch_index_daily", None)
+    if not callable(fetch_fn):
+        return pd.DataFrame()
+    index_code = _normalize_index_code(symbol)
+    start_date = None
+    if end_date is not None:
+        from datetime import timedelta
+
+        start_date = end_date - timedelta(days=max(120, int(lookback_days)) * 2)
+    try:
+        frame = fetch_fn(
+            index_code=index_code,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    except TypeError:
+        try:
+            frame = fetch_fn(index_code=index_code)
+        except Exception:
+            return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return pd.DataFrame()
+    ordered = _normalize_price_frame(frame)
+    if end_date is not None:
+        date_mask = pd.DatetimeIndex(ordered.index).date <= end_date
+        ordered = ordered.loc[date_mask]
+    return ordered.tail(max(120, int(lookback_days)))
+
+
+def _normalize_index_code(symbol: str) -> str:
+    normalized = str(symbol).strip().upper()
+    if "." in normalized:
+        return normalized
+    if normalized.startswith("399"):
+        return f"{normalized}.SZ"
+    return f"{normalized}.SH"

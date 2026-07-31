@@ -7,9 +7,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from stock_analyzer.data.market_warehouse import MarketWarehouse
+from stock_analyzer.data.market_warehouse import MarketWarehouse, load_package_daily_bars
 from stock_analyzer.data.tushare_provider import TushareProvider
 from stock_analyzer.feature.engineer import FeatureEngineer
+from stock_analyzer.feature.market_context import fetch_market_benchmark_bars
 
 
 class _FakeProP4:
@@ -118,6 +119,15 @@ def test_warehouse_index_daily_roundtrip(tmp_path: Path) -> None:
     stored = wh.fetch_index_daily(index_code="000300.SH")
     assert len(stored) == 2
     assert stored.iloc[0]["close"] == pytest.approx(3530.0)
+    package = load_package_daily_bars(source_root=pkg, symbol="000300")
+    assert len(package) == 2
+    benchmark = fetch_market_benchmark_bars(
+        wh,
+        lookback_days=120,
+        primary_symbol="000300",
+        end_date=date(2024, 4, 19),
+    )
+    assert float(benchmark.iloc[-1]["close"]) == pytest.approx(3540.0)
 
 
 def _make_bars(n: int = 80) -> pd.DataFrame:

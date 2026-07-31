@@ -308,6 +308,64 @@ def test_market_warehouse_preserves_nan_roundtrip(tmp_path: Path) -> None:
     assert "tushare_adj_factor" in manifest or "adjustment_source" in manifest
 
 
+def test_financial_snapshot_incremental_upsert_preserves_prior_history(
+    tmp_path: Path,
+) -> None:
+    warehouse = MarketWarehouse(
+        db_path=tmp_path / "warehouse" / "market.duckdb",
+        package_root=tmp_path / "package",
+    )
+
+    def snapshots(
+        rows: list[tuple[str, str, float, float]],
+    ) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "symbol": ["600000"] * len(rows),
+                "end_date": pd.to_datetime([row[0] for row in rows]),
+                "ann_date": pd.to_datetime([row[1] for row in rows]),
+                "roe": [row[2] for row in rows],
+                "debt_ratio": [row[3] for row in rows],
+                "update_flag": [0] * len(rows),
+                "financial_report_date": [row[0] for row in rows],
+                "financial_as_of": [row[1] for row in rows],
+                "financial_source": ["tushare_fina_indicator"] * len(rows),
+                "financial_trust_level": ["reported"] * len(rows),
+                "financial_missing_fields": [""] * len(rows),
+                "financial_data_complete": [True] * len(rows),
+                "financial_completeness": [1.0] * len(rows),
+                "coverage_complete": [True] * len(rows),
+                "as_of": [row[1] for row in rows],
+                "source": ["tushare_fina_indicator"] * len(rows),
+            }
+        )
+
+    # First sync has an older announcement outside the next incremental window.
+    warehouse.upsert_financial_snapshots(
+        symbol="600000",
+        frame=snapshots([("2024-12-31", "2025-03-20", 0.10, 0.40)]),
+    )
+    # The next sync overlaps the 2025 announcement and brings a newer one.
+    warehouse.upsert_financial_snapshots(
+        symbol="600000",
+        frame=snapshots(
+            [
+                ("2024-12-31", "2025-03-20", 0.11, 0.39),
+                ("2025-03-31", "2025-04-25", 0.12, 0.38),
+            ]
+        ),
+    )
+
+    stored = warehouse.fetch_financial_snapshots(symbol="600000")
+    assert len(stored) == 2
+    assert float(
+        stored.loc[stored["ann_date"] == pd.Timestamp("2025-03-20"), "roe"].iloc[0]
+    ) == pytest.approx(0.11)
+    assert float(
+        stored.loc[stored["ann_date"] == pd.Timestamp("2025-04-25"), "roe"].iloc[0]
+    ) == pytest.approx(0.12)
+
+
 def test_market_warehouse_price_series_contract_unknown_by_default(tmp_path: Path) -> None:
     warehouse = MarketWarehouse(
         db_path=tmp_path / "warehouse" / "market.duckdb",
@@ -435,3 +493,96 @@ def test_market_warehouse_reanchor_preserves_history_and_traded_units(
     assert float(merged.loc[pd.Timestamp("2026-07-11"), "turnover"]) == 1_010.0
     assert float(merged.loc[pd.Timestamp("2026-07-13"), "close"]) == 6.05
     assert set(pd.to_numeric(merged["adjustment_anchor_factor"]).dropna()) == {20.0}
+
+
+def _make_quality_daily_frame(symbol: str, days: int) -> pd.DataFrame:
+    dates = pd.bdate_range(end="2026-07-31", periods=days)
+    closes = [10.0 + i * 0.01 for i in range(days)]
+    frame = pd.DataFrame(
+        {
+            "open": closes,
+            "high": [c + 0.1 for c in closes],
+            "low": [c - 0.1 for c in closes],
+            "close": closes,
+            "volume": [1_000_000.0] * days,
+            "turnover": [10_000_000.0] * days,
+            "float_market_cap": [5_000_000_000.0] * days,
+            "roe": [0.12] * days,
+            "debt_ratio": [0.35] * days,
+            "financial_data_complete": [True] * days,
+            "financial_completeness": [0.9] * days,
+            "background_data_complete": [True] * days,
+        },
+        index=dates,
+    )
+    frame.index.name = "date"
+    _ = symbol
+    return frame
+
+
+def test_fetch_universe_quality_metrics_batches_all_symbols_in_one_query(
+    tmp_path: Path,
+) -> None:
+    warehouse = MarketWarehouse(
+        db_path=tmp_path / "warehouse" / "market.duckdb",
+        package_root=tmp_path / "package",
+    )
+    symbols = ["600000", "000001", "300001", "688001", "830001"]
+    for symbol in symbols:
+        warehouse.replace_daily_bars(
+            symbol=symbol, frame=_make_quality_daily_frame(symbol, 80)
+        )
+
+    frame = warehouse.fetch_universe_quality_metrics(
+        symbols=symbols, lookback_days=30
+    )
+    assert not frame.empty
+    # Single batch call returns all requested symbols.
+    assert set(frame["symbol"].unique()) == set(symbols)
+    # Each symbol capped at lookback_days rows.
+    counts = frame.groupby("symbol").size().to_dict()
+    for symbol in symbols:
+        assert counts[symbol] == 30, f"{symbol} got {counts[symbol]} rows"
+    # Required quality-scoring columns are present.
+    for col in (
+        "symbol", "date", "open", "high", "low", "close", "volume", "turnover",
+        "float_market_cap", "suspended", "is_st", "is_delisting_risk",
+        "roe", "debt_ratio", "financial_data_complete", "financial_completeness",
+        "background_data_complete", "holder_count", "northbound_net",
+        "dragon_tiger_flag",
+    ):
+        assert col in frame.columns, f"missing column {col}"
+    # Rows sorted by symbol then date.
+    assert frame.equals(frame.sort_values(["symbol", "date"]).reset_index(drop=True))
+
+
+def test_fetch_universe_quality_metrics_empty_when_table_missing(
+    tmp_path: Path,
+) -> None:
+    warehouse = MarketWarehouse(
+        db_path=tmp_path / "warehouse" / "market.duckdb",
+        package_root=tmp_path / "package",
+    )
+    # No bootstrap -> daily_bars table does not exist.
+    frame = warehouse.fetch_universe_quality_metrics(
+        symbols=["600000"], lookback_days=30
+    )
+    assert frame.empty
+
+
+def test_fetch_universe_quality_metrics_filters_to_requested_symbols(
+    tmp_path: Path,
+) -> None:
+    warehouse = MarketWarehouse(
+        db_path=tmp_path / "warehouse" / "market.duckdb",
+        package_root=tmp_path / "package",
+    )
+    for symbol in ["600000", "600001", "600002"]:
+        warehouse.replace_daily_bars(
+            symbol=symbol, frame=_make_quality_daily_frame(symbol, 50)
+        )
+    frame = warehouse.fetch_universe_quality_metrics(
+        symbols=["600000", "600002"], lookback_days=20
+    )
+    assert set(frame["symbol"].unique()) == {"600000", "600002"}
+    assert "600001" not in set(frame["symbol"].unique())

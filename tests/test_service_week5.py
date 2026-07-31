@@ -140,6 +140,9 @@ def _load_test_config() -> StockAnalyzerConfig:
     config.command_channel.history_archive_enabled = False
     config.week5.auto_notify = False
     config.week5.first_board_windows = ["09:30-09:31"]
+    # Default to legacy universe path for existing tests; tests that exercise the
+    # quality selector enable it explicitly via _enable_universe_quality_selector.
+    config.week5.universe_quality_selector_enabled = False
     config.training.artifact_path = str(root / "artifacts" / "nonexistent_test_model.json")
     config.training.bootstrap_auto_run_on_first_start = False
     config.training.bootstrap_require_completion_for_runtime = False
@@ -183,8 +186,8 @@ def _new_service(
     )
     original_build_market_depth_provider = runtime_service_module.build_market_depth_provider
     try:
-        runtime_service_module.build_runtime_provider = (
-            lambda config, synthetic_seed=2026: runtime_provider
+        runtime_service_module.build_runtime_provider = lambda config, synthetic_seed=2026: (
+            runtime_provider
         )
         runtime_service_module.build_realtime_runtime_provider = (
             lambda config, synthetic_seed=2026, timezone="Asia/Shanghai": runtime_provider
@@ -246,6 +249,7 @@ def _build_test_execution_risk_artifact(path: Path) -> Path:
                 "calibrator": _build_identity_calibrator(),
             },
         },
+        qualification_status="qualified",
         metadata={"test_artifact": True},
     )
     artifact.save(path)
@@ -690,12 +694,7 @@ def _build_shared_week5_signal_pool_live_service() -> StockAnalyzerService:
     _patch_attr(
         service,
         "_build_week5_signal_pool_live_item",
-        lambda *,
-        symbol,
-        candidate,
-        force_refresh,
-        prefer_online,
-        depth_snapshot=None: {
+        lambda *, symbol, candidate, force_refresh, prefer_online, depth_snapshot=None: {
             "symbol": symbol,
             "name": str((depth_snapshot or {}).get("name", "")),
             "score": float(candidate.get("score", 0.0)),
@@ -770,12 +769,16 @@ def _build_shared_week5_prefilter_service() -> StockAnalyzerService:
     service = _new_service(config, provider=provider)
     _patch_attr(service, "test_provider", provider)
     _patch_attr(service, "test_config", config)
-    _patch_attr(service, "_resolve_symbol_universe", lambda **_: {
-        "source": "local_files_primary",
-        "symbols": ["600000", "000001", "600519", "300750", "002594", "601318"],
-        "count": 6,
-        "errors": [],
-    })
+    _patch_attr(
+        service,
+        "_resolve_symbol_universe",
+        lambda **_: {
+            "source": "local_files_primary",
+            "symbols": ["600000", "000001", "600519", "300750", "002594", "601318"],
+            "count": 6,
+            "errors": [],
+        },
+    )
     _patch_attr(
         service,
         "run_week5_scan",
@@ -794,30 +797,34 @@ def _reset_shared_week5_signal_pool_live_service(service: StockAnalyzerService) 
     depth_provider = getattr(service, "test_depth_provider", None)
     if isinstance(depth_provider, RecordingDepthProvider):
         depth_provider.calls.clear()
-    _patch_attr(service, "_last_week5_scan_report", {
-        "timestamp": "2026-03-10T10:18:00",
-        "signal_pool": {
-            "candidate_count": 2,
-            "candidates": [
-                {
-                    "symbol": "600000",
-                    "score": 80.0,
-                    "leader_score": 81.0,
-                    "action": "buy",
-                    "suggested_position": 0.08,
-                    "reasons": ["high_score"],
-                },
-                {
-                    "symbol": "000001",
-                    "score": 72.0,
-                    "leader_score": 73.0,
-                    "action": "watch",
-                    "suggested_position": 0.04,
-                    "reasons": ["watch_signal"],
-                },
-            ],
+    _patch_attr(
+        service,
+        "_last_week5_scan_report",
+        {
+            "timestamp": "2026-03-10T10:18:00",
+            "signal_pool": {
+                "candidate_count": 2,
+                "candidates": [
+                    {
+                        "symbol": "600000",
+                        "score": 80.0,
+                        "leader_score": 81.0,
+                        "action": "buy",
+                        "suggested_position": 0.08,
+                        "reasons": ["high_score"],
+                    },
+                    {
+                        "symbol": "000001",
+                        "score": 72.0,
+                        "leader_score": 73.0,
+                        "action": "watch",
+                        "suggested_position": 0.04,
+                        "reasons": ["watch_signal"],
+                    },
+                ],
+            },
         },
-    })
+    )
 
 
 @fixture(scope="module")
@@ -839,12 +846,16 @@ def _build_shared_weekday_offhours_service() -> StockAnalyzerService:
     service = _new_service(config, provider=provider)
     _patch_attr(service, "test_provider", provider)
     _patch_attr(service, "test_config", config)
-    _patch_attr(service, "_resolve_symbol_universe", lambda **_: {
-        "source": "local_files_primary",
-        "symbols": ["600000", "000001", "600519", "300750", "002594", "601318"],
-        "count": 6,
-        "errors": [],
-    })
+    _patch_attr(
+        service,
+        "_resolve_symbol_universe",
+        lambda **_: {
+            "source": "local_files_primary",
+            "symbols": ["600000", "000001", "600519", "300750", "002594", "601318"],
+            "count": 6,
+            "errors": [],
+        },
+    )
     _patch_attr(
         service,
         "run_week5_scan",
@@ -871,12 +882,16 @@ def _build_shared_weekend_offhours_service() -> StockAnalyzerService:
     service = _new_service(config, provider=provider)
     _patch_attr(service, "test_provider", provider)
     _patch_attr(service, "test_config", config)
-    _patch_attr(service, "_resolve_symbol_universe", lambda **_: {
-        "source": "local_files_primary",
-        "symbols": ["600000", "000001", "600519", "300750"],
-        "count": 4,
-        "errors": [],
-    })
+    _patch_attr(
+        service,
+        "_resolve_symbol_universe",
+        lambda **_: {
+            "source": "local_files_primary",
+            "symbols": ["600000", "000001", "600519", "300750"],
+            "count": 4,
+            "errors": [],
+        },
+    )
     _patch_attr(
         service,
         "run_week5_scan",
@@ -901,12 +916,16 @@ def _build_shared_forced_full_deep_offhours_service() -> StockAnalyzerService:
     service = _new_service(config, provider=provider)
     _patch_attr(service, "test_provider", provider)
     _patch_attr(service, "test_config", config)
-    _patch_attr(service, "_resolve_symbol_universe", lambda **_: {
-        "source": "local_files_primary",
-        "symbols": ["600000", "000001", "600519", "300750"],
-        "count": 4,
-        "errors": [],
-    })
+    _patch_attr(
+        service,
+        "_resolve_symbol_universe",
+        lambda **_: {
+            "source": "local_files_primary",
+            "symbols": ["600000", "000001", "600519", "300750"],
+            "count": 4,
+            "errors": [],
+        },
+    )
     _patch_attr(
         service,
         "run_week5_scan",
@@ -1104,7 +1123,9 @@ def test_service_week5_scan_falls_back_to_shortlist_order_without_execution_risk
     assert execution_rerank["applied"] is False
     assert [str(item["symbol"]) for item in candidates[:2]] == ["600000", "000001"]
     assert candidates[0]["execution_rerank_applied"] is False
-    assert float(candidates[0]["execution_reranked_score"]) == float(candidates[0]["shortlist_score"])
+    assert float(candidates[0]["execution_reranked_score"]) == float(
+        candidates[0]["shortlist_score"]
+    )
     assert service.state.watchlist == ["600000", "000001"]
 
 
@@ -1508,6 +1529,47 @@ def test_week5_offhours_refresh_includes_market_radar_review_pool_and_clears_it(
     assert service._market_radar_review_pool == []  # noqa: SLF001
 
 
+def test_week5_offhours_full_deep_preserves_universe_source_provenance() -> None:
+    config = _load_test_config()
+    config.week5.offhours_weekend_full_deep_scan_enabled = True
+    service = _new_service(config)
+    expected_source = "provider_index_primary:quality_selector"
+
+    def _fake_run_week5_scan(**kwargs: object) -> dict[str, object]:
+        return {
+            "timestamp": "2026-03-14T20:30:00",
+            "trace_id": "offhours-quality-provenance",
+            "watchlist_size": 300,
+            "symbol_source": "stale-value",
+            "scan_profile": str(kwargs.get("scan_profile", "")),
+            "prefilter": {
+                "universe_source": expected_source,
+                "universe_quality_selection": {
+                    "selector_mode": "quality",
+                    "selected_count": 300,
+                },
+            },
+            "signal_pool": {},
+            "summary": {},
+        }
+
+    _patch_attr(service, "run_week5_scan", _fake_run_week5_scan)
+
+    report = _as_mapping(
+        service.run_week5_offhours_refresh(
+            timestamp=datetime(2026, 3, 14, 20, 30),
+            notify_enabled=False,
+            sync_watchlist=False,
+        )
+    )
+
+    prefilter = _as_mapping(report["prefilter"])
+    assert report["symbol_source"] == f"{expected_source}:full_deep"
+    assert report["universe_quality_selector_mode"] == "quality"
+    assert prefilter["universe_source"] == expected_source
+    assert prefilter["universe_quality_selector_mode"] == "quality"
+
+
 def test_week5_offhours_refresh_uses_explicit_research_pool_and_dynamic_queue() -> None:
     config = _load_test_config()
     config.week5.universe_prefilter_top_k = 3
@@ -1861,9 +1923,7 @@ def test_signal_quality_audit_falls_back_to_week5_candidates_when_latest_signals
         },
     )
 
-    report = _as_mapping(
-        service.run_signal_quality_audit(limit=5, include_audit_events=False)
-    )
+    report = _as_mapping(service.run_signal_quality_audit(limit=5, include_audit_events=False))
 
     assert report["status"] == "ok"
     assert report["signal_source"] == "week5_latest_candidates"
@@ -1885,7 +1945,12 @@ def test_service_week5_auto_sync_skips_hard_blocked_candidates() -> None:
                 "timestamp": "2026-03-19T15:00:00",
                 "signal_pool": {
                     "candidates": [
-                        {"symbol": "600519", "action": "buy", "score": 88.0, "reasons": ["liquidity_failed"]},
+                        {
+                            "symbol": "600519",
+                            "action": "buy",
+                            "score": 88.0,
+                            "reasons": ["liquidity_failed"],
+                        },
                         {
                             "symbol": "000001",
                             "action": "watch",
@@ -2409,3 +2474,1168 @@ def test_week5_offhours_refresh_forces_full_deep_on_exception_conditions() -> No
     ]
     assert len(requested_240) == 0
     assert len(requested_500) == 4
+
+
+def _build_synthetic_a_share_universe(
+    *,
+    szse_main: int = 3500,
+    szse_gem: int = 0,
+    sse_main: int = 2200,
+    sse_star: int = 0,
+    bse: int = 96,
+) -> list[str]:
+    """构造模拟 A 股 universe，用于配额抽样测试。生成 6 位标准代码。
+
+    每个前缀最多 1000 个代码（000000-000999），避免跨前缀重叠。
+    """
+    symbols: list[str] = []
+
+    def _gen_with_prefix(prefix: str, count: int) -> None:
+        for index in range(min(count, 1000)):
+            symbols.append(f"{prefix}{index:03d}")
+
+    def _distribute(prefixes: tuple[str, ...], total: int) -> None:
+        remaining = total
+        for prefix in prefixes:
+            chunk = min(1000, remaining)
+            if chunk <= 0:
+                break
+            _gen_with_prefix(prefix, chunk)
+            remaining -= chunk
+
+    # 深主板 000/001/002
+    _distribute(("000", "001", "002"), szse_main)
+    # 创业板 300/301
+    _distribute(("300", "301"), szse_gem)
+    # 沪主板 600/601/603
+    _distribute(("600", "601", "603"), sse_main)
+    # 科创板 688
+    _gen_with_prefix("688", sse_star)
+    # 北交所 430
+    _gen_with_prefix("430", bse)
+    return symbols
+
+
+def _board_of(symbol: str) -> str:
+    return runtime_service_module._board_from_a_share_symbol(symbol)
+
+
+def test_quota_sample_eliminates_market_bias_for_shanghai() -> None:
+    """回归测试：cap=300 截断时沪市不再被字典序前 300 挤掉。"""
+    symbols = _build_synthetic_a_share_universe(
+        sse_main=2200, szse_main=3500, sse_star=300, szse_gem=500, bse=96
+    )
+    # 字典序下 000/001/002 排最前，旧逻辑 selected[:300] 几乎全是 SZ_MAIN，SH_MAIN=0
+    sampled, meta = runtime_service_module._quota_sample_universe(
+        symbols,
+        cap=300,
+        board_scope=["SSE", "SZSE"],
+        universe_ruleset_id="a_share_default_v1",
+        seed_trade_date="2026-03-16",
+    )
+
+    assert len(sampled) == 300
+    from collections import Counter
+
+    board_counts = Counter(_board_of(s) for s in sampled)
+    # 沪主板必须有显著代表性（不再是 0）
+    assert board_counts["SH_MAIN"] >= 80, f"SH_MAIN underrepresented: {board_counts}"
+    # 深主板也必须有代表性
+    assert board_counts["SZ_MAIN"] >= 100, f"SZ_MAIN underrepresented: {board_counts}"
+    # 科创板和创业板也应出现（独立保底）
+    assert board_counts["SH_STAR"] >= 10, f"SH_STAR underrepresented: {board_counts}"
+    assert board_counts["SZ_GEM"] >= 10, f"SZ_GEM underrepresented: {board_counts}"
+    # BSE 不在 board_scope 内，不应出现
+    assert board_counts.get("BSE", 0) == 0
+    assert meta["truncation_mode"] == "board_quota_sample"
+    assert meta["seed_trade_date"] == "2026-03-16"
+    # 观测字段结构验证
+    assert "boards" in meta
+    for board_name in ("SZ_MAIN", "SZ_GEM", "SH_MAIN", "SH_STAR", "BSE"):
+        assert board_name in meta["boards"]
+        board_meta = meta["boards"][board_name]
+        assert "input_count" in board_meta
+        assert "quota" in board_meta
+        assert "selected_count" in board_meta
+
+
+def test_quota_sample_sh_star_not_squeezed_by_sh_main() -> None:
+    """SH_STAR(科创板) 不被 SH_MAIN(沪主板) 挤占——五板块独立保底回归测试。
+
+    反例：SH_STAR 输入 10 只、seed=2026-01-01 时，旧交易所级实现选中 0 只 688。
+    五板块实现后 SH_STAR 应独立保底，至少选中 min(10, 10)=10 只。
+    """
+    symbols = _build_synthetic_a_share_universe(sse_main=2000, szse_main=2000, sse_star=10, bse=0)
+    sampled, meta = runtime_service_module._quota_sample_universe(
+        symbols,
+        cap=300,
+        board_scope=["SSE", "SZSE"],
+        universe_ruleset_id="a_share_default_v1",
+        seed_trade_date="2026-01-01",
+    )
+    sh_star_count = sum(1 for s in sampled if _board_of(s) == "SH_STAR")
+    assert sh_star_count >= 10, (
+        f"SH_STAR squeezed by SH_MAIN: only {sh_star_count} selected, expected >= 10"
+    )
+    # 观测字段确认 SH_STAR 独立配额
+    assert meta["boards"]["SH_STAR"]["quota"] >= 10
+    assert meta["boards"]["SH_STAR"]["selected_count"] >= 10
+    assert meta["boards"]["SH_STAR"]["in_scope"] is True
+
+
+def test_quota_sample_sz_gem_not_squeezed_by_sz_main() -> None:
+    """SZ_GEM(创业板) 不被 SZ_MAIN(深主板) 挤占——五板块独立保底。"""
+    symbols = _build_synthetic_a_share_universe(sse_main=2000, szse_main=2000, szse_gem=15, bse=0)
+    sampled, meta = runtime_service_module._quota_sample_universe(
+        symbols,
+        cap=300,
+        board_scope=["SSE", "SZSE"],
+        universe_ruleset_id="a_share_default_v1",
+        seed_trade_date="2026-01-01",
+    )
+    sz_gem_count = sum(1 for s in sampled if _board_of(s) == "SZ_GEM")
+    assert sz_gem_count >= 10, (
+        f"SZ_GEM squeezed by SZ_MAIN: only {sz_gem_count} selected, expected >= 10"
+    )
+    assert meta["boards"]["SZ_GEM"]["quota"] >= 10
+
+
+def test_quota_sample_is_reproducible_with_same_seed() -> None:
+    """同 seed_trade_date + 同 ruleset_id 两次调用结果完全一致。"""
+    symbols = _build_synthetic_a_share_universe(
+        sse_main=2200, szse_main=3500, sse_star=300, szse_gem=500
+    )
+    kwargs = {
+        "cap": 300,
+        "board_scope": ["SSE", "SZSE"],
+        "universe_ruleset_id": "a_share_default_v1",
+        "seed_trade_date": "2026-03-16",
+    }
+    sampled_a, _ = runtime_service_module._quota_sample_universe(symbols, **kwargs)
+    sampled_b, _ = runtime_service_module._quota_sample_universe(symbols, **kwargs)
+    assert sampled_a == sampled_b
+
+
+def test_quota_sample_rotates_across_trade_dates() -> None:
+    """不同 seed_trade_date 的结果集合应有差异（跨日轮换）。"""
+    symbols = _build_synthetic_a_share_universe(
+        sse_main=2200, szse_main=3500, sse_star=300, szse_gem=500
+    )
+    base = {
+        "cap": 300,
+        "board_scope": ["SSE", "SZSE"],
+        "universe_ruleset_id": "a_share_default_v1",
+    }
+    sampled_day1, _ = runtime_service_module._quota_sample_universe(
+        symbols, seed_trade_date="2026-03-16", **base
+    )
+    sampled_day2, _ = runtime_service_module._quota_sample_universe(
+        symbols, seed_trade_date="2026-03-17", **base
+    )
+    assert set(sampled_day1) != set(sampled_day2)
+
+
+def test_quota_sample_excludes_out_of_scope_boards() -> None:
+    """board_scope=[SSE,SZSE] 时 BSE 不参与，结果不含 BSE。"""
+    symbols = _build_synthetic_a_share_universe(
+        sse_main=100, szse_main=100, sse_star=20, szse_gem=20, bse=96
+    )
+    sampled, meta = runtime_service_module._quota_sample_universe(
+        symbols,
+        cap=80,
+        board_scope=["SSE", "SZSE"],
+        universe_ruleset_id="a_share_default_v1",
+        seed_trade_date="2026-03-16",
+    )
+    bse_count = sum(1 for s in sampled if _board_of(s) == "BSE")
+    assert bse_count == 0
+    # BSE 板块在观测字段中 in_scope=False，但 input_count 保留
+    assert meta["boards"]["BSE"]["in_scope"] is False
+    assert meta["boards"]["BSE"]["input_count"] == 96
+    assert meta["boards"]["BSE"]["quota"] == 0
+    assert meta["boards"]["BSE"]["selected_count"] == 0
+
+
+def test_quota_sample_enforces_minimum_quota_for_small_board() -> None:
+    """某板块数量极少时，仍至少拿到 min(实际数量, min_quota)。"""
+    symbols = _build_synthetic_a_share_universe(sse_main=2000, szse_main=2000)
+    # 仅给沪主板留极少量
+    symbols = [s for s in symbols if not s.startswith("60")] + ["600001", "600002", "600003"]
+    sampled, meta = runtime_service_module._quota_sample_universe(
+        symbols,
+        cap=300,
+        board_scope=["SSE", "SZSE"],
+        universe_ruleset_id="a_share_default_v1",
+        seed_trade_date="2026-03-16",
+        min_quota_per_in_scope_board=10,
+    )
+    sh_main_count = sum(1 for s in sampled if _board_of(s) == "SH_MAIN")
+    # SH_MAIN 只有 3 只，保底取 min(10, 3) = 3，全部纳入
+    assert sh_main_count == 3
+    assert meta["boards"]["SH_MAIN"]["quota"] == 3
+    assert meta["boards"]["SH_MAIN"]["selected_count"] == 3
+
+
+def test_quota_sample_no_truncation_when_cap_zero() -> None:
+    """cap=0 时走原路径，不抽样，truncation_mode=none。"""
+    symbols = _build_synthetic_a_share_universe(sse_main=100, szse_main=100)
+    sampled, meta = runtime_service_module._quota_sample_universe(
+        symbols,
+        cap=0,
+        board_scope=["SSE", "SZSE"],
+        universe_ruleset_id="a_share_default_v1",
+        seed_trade_date="2026-03-16",
+    )
+    assert sampled == symbols
+    assert meta["truncation_mode"] == "none"
+    assert meta["cap"] == 0
+
+
+def test_quota_sample_total_exactly_equals_cap() -> None:
+    """抽样总数必须恰等于 cap（循环回流补齐正确）。"""
+    symbols = _build_synthetic_a_share_universe(
+        sse_main=2200, szse_main=3500, sse_star=300, szse_gem=500, bse=0
+    )
+    total_in_scope = len(set(symbols))
+    for cap in [1, 2, 7, 23, 99, 200, 300, 500, 5700, 9999]:
+        sampled, _ = runtime_service_module._quota_sample_universe(
+            symbols,
+            cap=cap,
+            board_scope=["SSE", "SZSE"],
+            universe_ruleset_id="a_share_default_v1",
+            seed_trade_date="2026-03-16",
+        )
+        expected = min(cap, total_in_scope)
+        assert len(sampled) == expected, f"cap={cap}: got {len(sampled)}, expected {expected}"
+        # 无重复
+        assert len(set(sampled)) == len(sampled), f"cap={cap}: duplicates found"
+
+
+def test_quota_sample_circular_backfill_when_multiple_small_boards_exhausted() -> None:
+    """多个小板块同时耗尽时，循环补足确保总数仍等于 effective_cap。"""
+    # 两个大板块 + 两个极小板块（SH_STAR=5, SZ_GEM=3）
+    symbols = _build_synthetic_a_share_universe(
+        sse_main=2000, szse_main=2000, sse_star=5, szse_gem=3, bse=0
+    )
+    sampled, meta = runtime_service_module._quota_sample_universe(
+        symbols,
+        cap=300,
+        board_scope=["SSE", "SZSE"],
+        universe_ruleset_id="a_share_default_v1",
+        seed_trade_date="2026-03-16",
+    )
+    # 小板块全部纳入
+    sh_star_count = sum(1 for s in sampled if _board_of(s) == "SH_STAR")
+    sz_gem_count = sum(1 for s in sampled if _board_of(s) == "SZ_GEM")
+    assert sh_star_count == 5
+    assert sz_gem_count == 3
+    # 总数仍等于 cap（回流给大板块）
+    assert len(sampled) == 300
+
+
+def test_board_classification_covers_all_prefixes_consistent_with_exchange() -> None:
+    """板块分类覆盖范围与交易所分类一致，不再有代码被漏入 OTHER。
+
+    回归覆盖审核发现的 157 只漏网代码：003/302/605/689 前缀。
+    保证对任意 6 位代码，_board_from_a_share_symbol 返回的板块所属交易所
+    与 _exchange_from_a_share_symbol 返回的交易所一致。
+    """
+    board_to_exchange = runtime_service_module._BOARD_EXCHANGE_MAP
+    # 覆盖各前缀首只 + 边界前缀
+    probe_symbols = [
+        # 深主板 SZ_MAIN
+        "000001",
+        "001001",
+        "002001",
+        "003001",
+        # 创业板 SZ_GEM
+        "300001",
+        "301001",
+        "302001",
+        # 沪主板 SH_MAIN
+        "600001",
+        "601001",
+        "603001",
+        "605001",
+        # 科创板 SH_STAR
+        "688001",
+        "689001",
+        # 北交所 BSE
+        "430001",
+        "830001",
+    ]
+    for symbol in probe_symbols:
+        board = runtime_service_module._board_from_a_share_symbol(symbol)
+        exchange = runtime_service_module._exchange_from_a_share_symbol(symbol)
+        assert board != "OTHER", f"{symbol} should not be OTHER"
+        assert board_to_exchange.get(board, "") == exchange, (
+            f"{symbol}: board={board} exchange={exchange} inconsistent"
+        )
+
+    # 特别验证审核发现的四类前缀不再被漏入 OTHER
+    assert runtime_service_module._board_from_a_share_symbol("003001") == "SZ_MAIN"
+    assert runtime_service_module._board_from_a_share_symbol("302001") == "SZ_GEM"
+    assert runtime_service_module._board_from_a_share_symbol("605001") == "SH_MAIN"
+    assert runtime_service_module._board_from_a_share_symbol("689001") == "SH_STAR"
+
+
+def test_quota_sample_all_out_of_scope_returns_empty_not_fallback_slice() -> None:
+    """全部股票都在 scope 外时，返回空结果，不把已排除股票选回。
+
+    回归覆盖审核反例：symbols=430001,430002,830001 / board_scope=SSE,SZSE / cap=2
+    旧实现会 fallback_slice 选回 BSE，且 BSE.input_count 错误报告为 0。
+    """
+    symbols = ["430001", "430002", "830001"]
+    sampled, meta = runtime_service_module._quota_sample_universe(
+        symbols,
+        cap=2,
+        board_scope=["SSE", "SZSE"],
+        universe_ruleset_id="a_share_default_v1",
+        seed_trade_date="2026-03-16",
+    )
+    # 不选回 scope 外股票
+    assert sampled == []
+    assert meta["truncation_mode"] == "no_in_scope_symbols"
+    assert meta["effective_cap"] == 0
+    # BSE 实际输入数为 3，metadata 必须真实报告
+    assert meta["boards"]["BSE"]["input_count"] == 3
+    assert meta["boards"]["BSE"]["in_scope"] is False
+    assert meta["boards"]["BSE"]["quota"] == 0
+    assert meta["boards"]["BSE"]["selected_count"] == 0
+    # 沪深板块输入为 0
+    assert meta["boards"]["SH_MAIN"]["input_count"] == 0
+    assert meta["boards"]["SZ_MAIN"]["input_count"] == 0
+
+
+def test_quota_sample_reproducible_regardless_of_input_order() -> None:
+    """同 seed 下，输入顺序不同但符号集合相同时，抽样结果一致。
+
+    因为抽样前对每个 pool 排序，可复现性不依赖 provider 返回顺序。
+    """
+    symbols_a = _build_synthetic_a_share_universe(
+        sse_main=500, szse_main=500, sse_star=50, szse_gem=50, bse=0
+    )
+    # 打乱顺序
+    import random as _random
+
+    rng_shuffle = _random.Random(12345)
+    symbols_b = list(symbols_a)
+    rng_shuffle.shuffle(symbols_b)
+    assert symbols_a != symbols_b  # 确认确实打乱了
+    kwargs = {
+        "cap": 100,
+        "board_scope": ["SSE", "SZSE"],
+        "universe_ruleset_id": "a_share_default_v1",
+        "seed_trade_date": "2026-03-16",
+    }
+    sampled_a, _ = runtime_service_module._quota_sample_universe(symbols_a, **kwargs)
+    sampled_b, _ = runtime_service_module._quota_sample_universe(symbols_b, **kwargs)
+    assert sampled_a == sampled_b
+
+
+def test_resolve_universe_seed_trade_date_prefers_warehouse_over_provider() -> None:
+    """seed_trade_date 优先级：market_warehouse 快照 > provider graph > sentinel。
+
+    warehouse 有值时必须用 warehouse，不降级到 provider。
+    """
+    config = _load_test_config()
+    service = _new_service(config)
+
+    class _FakeWarehouse:
+        def background_data_quality_snapshot(self) -> dict[str, object]:
+            return {"latest_trade_date": "2026-07-30"}
+
+    class _FakeProvider:
+        def latest_daily_dates(self) -> dict[str, object]:
+            # provider 的日期更晚，但优先级低，不应被采用
+            return {"000001": "2026-07-31"}
+
+    _patch_attr(service, "_market_warehouse", lambda: _FakeWarehouse())
+    _patch_attr(service, "_iter_market_data_provider_graph", lambda: [_FakeProvider()])
+    result = service._resolve_universe_seed_trade_date()
+    assert result == "2026-07-30"
+
+
+def test_resolve_universe_seed_trade_date_falls_back_to_provider_when_warehouse_empty() -> None:
+    """warehouse 快照为空时，降级到 provider graph 的 latest_daily_dates max。"""
+    config = _load_test_config()
+    service = _new_service(config)
+
+    class _FakeWarehouse:
+        def background_data_quality_snapshot(self) -> dict[str, object]:
+            return {"latest_trade_date": ""}
+
+    class _FakeProvider:
+        def latest_daily_dates(self) -> dict[str, object]:
+            return {"000001": "2026-07-29", "600001": "2026-07-28"}
+
+    _patch_attr(service, "_market_warehouse", lambda: _FakeWarehouse())
+    _patch_attr(service, "_iter_market_data_provider_graph", lambda: [_FakeProvider()])
+    result = service._resolve_universe_seed_trade_date()
+    assert result == "2026-07-29"
+
+
+def test_resolve_universe_seed_trade_date_returns_sentinel_when_all_unavailable() -> None:
+    """warehouse 和 provider 都无可用日期时，返回稳定 sentinel，不用 wall-clock。"""
+    config = _load_test_config()
+    service = _new_service(config)
+
+    class _FakeWarehouse:
+        def background_data_quality_snapshot(self) -> dict[str, object]:
+            return {}
+
+    class _FakeProvider:
+        pass  # 无 latest_daily_dates 方法
+
+    _patch_attr(service, "_market_warehouse", lambda: _FakeWarehouse())
+    _patch_attr(service, "_iter_market_data_provider_graph", lambda: [_FakeProvider()])
+    result = service._resolve_universe_seed_trade_date()
+    assert result == "unresolved"
+
+
+def test_week5_force_universe_scan_propagates_board_quota_to_prefilter_report() -> None:
+    """force_universe_scan 时，_resolve_symbol_universe 返回的 board_quota
+    必须透传到 prefilter_report['universe_board_quota']，便于定时任务产物验证配额。
+    """
+    config = _load_test_config()
+    service = _new_service(config)
+    service.state.watchlist = ["600000"]
+
+    board_quota_payload = {
+        "truncation_mode": "board_quota_sample",
+        "cap": 300,
+        "effective_cap": 3,
+        "board_scope": ["SSE", "SZSE"],
+        "boards": {
+            "SZ_MAIN": {
+                "exchange": "SZSE",
+                "in_scope": True,
+                "input_count": 1,
+                "quota": 1,
+                "selected_count": 1,
+            },
+            "SH_MAIN": {
+                "exchange": "SSE",
+                "in_scope": True,
+                "input_count": 1,
+                "quota": 1,
+                "selected_count": 1,
+            },
+        },
+        "seed_trade_date": "2026-03-16",
+        "ruleset_id": "a_share_default_v1",
+    }
+    _patch_attr(
+        service,
+        "_resolve_symbol_universe",
+        lambda **_: {
+            "source": "test_universe",
+            "symbols": ["600000", "000001", "300001"],
+            "errors": [],
+            "board_quota": board_quota_payload,
+        },
+    )
+    _patch_attr(
+        service,
+        "_prefilter_week5_universe_symbols",
+        lambda **_: {
+            "enabled": True,
+            "applied": True,
+            "lookback_days": 240,
+            "top_k": 500,
+            "universe_count": 3,
+            "eligible_count": 3,
+            "shortlisted_count": 1,
+            "symbols": ["000001"],
+            "shortlisted": [{"symbol": "000001", "baseline_score": 70.0}],
+            "preview": [],
+            "stages": {
+                "stage2": {
+                    "applied": False,
+                    "status": "pending_signal_scan",
+                    "shortlist_top_n": 50,
+                    "input_count": 0,
+                    "advanced_count": 0,
+                    "weights": {},
+                    "preview": [],
+                }
+            },
+        },
+    )
+    _patch_attr(
+        service,
+        "run_pipeline",
+        lambda **kwargs: {
+            "trace_id": "board-quota-propagation-test",
+            "signals": [],
+            "risk": {"action": "monitor", "drawdown_pct": 0.0},
+        },
+    )
+    _patch_attr(service, "_build_first_board_candidate", lambda **_: None)
+    _patch_attr(service, "_detect_symbol_anomaly", lambda **_: None)
+    _patch_attr(
+        service,
+        "_monster_isolation_gate",
+        lambda **_: {
+            "can_open_new_position": True,
+            "reasons": [],
+            "total_monster_position": 0.0,
+            "max_monster_position": 0.0,
+            "sentiment_score": 0.0,
+        },
+    )
+
+    report = _as_mapping(
+        service.run_week5_scan(
+            timestamp=datetime(2026, 3, 16, 20, 30),
+            notify_enabled=False,
+            force_universe_scan=True,
+            prefilter_enabled_override=True,
+        )
+    )
+    prefilter = _as_mapping(report["prefilter"])
+    propagated = prefilter.get("universe_board_quota")
+    assert isinstance(propagated, dict)
+    assert propagated == board_quota_payload
+
+
+# ---------------------------------------------------------------------------
+# UniverseCandidateSelector integration (Week5 全市场质量选择入口)
+# ---------------------------------------------------------------------------
+def _enable_universe_quality_selector(config: StockAnalyzerConfig) -> None:
+    config.week5.universe_quality_selector_enabled = True
+    config.week5.universe_quality_target_size = 300
+    config.week5.universe_quality_exploration_ratio = 0.0
+    config.week5.universe_quality_min_history_days = 60
+    config.week5.universe_quality_min_avg_turnover_20 = 0.0
+    config.week5.universe_quality_min_float_market_cap = 0.0
+    config.week5.universe_quality_min_batch_coverage_ratio = 0.90
+    config.week5.universe_quality_max_staleness_days = 10
+    config.week5.universe_quality_require_financial_data = True
+    config.week5.universe_quality_min_roe = 0.0
+    config.week5.universe_quality_max_debt_ratio = 0.80
+    config.week5.universe_quality_snapshot_path = str(
+        Path(tempfile.gettempdir()) / "stock_analyzer_tests" / "uqs_snapshot.json"
+    )
+
+
+def _patch_minimal_prefilter_and_pipeline(service: StockAnalyzerService) -> dict[str, object]:
+    """Patch prefilter + pipeline so run_week5_scan can complete without real data."""
+    captured: dict[str, object] = {}
+
+    def _fake_prefilter(**kwargs: object) -> dict[str, object]:
+        captured["prefilter_kwargs"] = kwargs
+        symbols_in = _as_text_list(kwargs.get("symbols", []))
+        return {
+            "enabled": True,
+            "applied": True,
+            "lookback_days": 240,
+            "top_k": 200,
+            "universe_count": len(symbols_in),
+            "eligible_count": len(symbols_in),
+            "shortlisted_count": len(symbols_in),
+            "symbols": symbols_in,
+            "shortlisted": [{"symbol": s, "baseline_score": 70.0} for s in symbols_in],
+            "preview": [],
+            "stages": {
+                "stage2": {
+                    "applied": False,
+                    "status": "pending_signal_scan",
+                    "shortlist_top_n": 50,
+                    "input_count": 0,
+                    "advanced_count": 0,
+                    "weights": {},
+                    "preview": [],
+                }
+            },
+        }
+
+    _patch_attr(service, "_prefilter_week5_universe_symbols", _fake_prefilter)
+    _patch_attr(
+        service,
+        "run_pipeline",
+        lambda **kwargs: {
+            "trace_id": "uqs-integration-test",
+            "signals": [],
+            "risk": {"action": "monitor", "drawdown_pct": 0.0},
+        },
+    )
+    _patch_attr(service, "_build_first_board_candidate", lambda **_: None)
+    _patch_attr(service, "_detect_symbol_anomaly", lambda **_: None)
+    _patch_attr(
+        service,
+        "_monster_isolation_gate",
+        lambda **_: {
+            "can_open_new_position": True,
+            "reasons": [],
+            "total_monster_position": 0.0,
+            "max_monster_position": 0.0,
+            "sentiment_score": 0.0,
+        },
+    )
+    return captured
+
+
+def test_week5_quality_selector_invoked_and_report_propagated() -> None:
+    """force_universe_scan + quality selector enabled -> _select_universe_quality_candidates
+    is invoked, its selection feeds prefilter, and the audit report lands in
+    prefilter_report['universe_quality_selection'] with required fields."""
+    config = _load_test_config()
+    _enable_universe_quality_selector(config)
+    service = _new_service(config)
+    service.state.watchlist = []
+
+    universe_symbols = [f"600{i:03d}" for i in range(400)]
+    _patch_attr(
+        service,
+        "_resolve_symbol_universe",
+        lambda **_: {
+            "source": "test_universe",
+            "symbols": universe_symbols,
+            "errors": [],
+        },
+    )
+
+    selected_symbols = universe_symbols[:300]
+    selection_report = {
+        "input_count": 400,
+        "hard_eligible_count": 320,
+        "rejected_count_by_reason": {"low_float_market_cap": 80},
+        "selected_count": 300,
+        "core_selected_count": 300,
+        "exploration_selected_count": 0,
+        "selected_by_board": {"SH_MAIN": 300},
+        "score_distribution": {"min": 40.0, "p50": 65.0, "max": 92.0, "count": 300},
+        "selected": [
+            {
+                "symbol": s,
+                "score": 90.0 - i * 0.1,
+                "components": {},
+                "reason_codes": ["core_quality_selected"],
+            }
+            for i, s in enumerate(selected_symbols)
+        ],
+        "trade_date": "2026-03-16",
+        "ruleset_id": "a_share_default_v1",
+        "selector_mode": "quality",
+        "degraded_fallback_reason": "",
+        "input_symbol_hash": "abc123",
+        "output_symbol_hash": "def456",
+        "board_quotas": {
+            "SH_MAIN": {
+                "exchange": "SSE",
+                "in_scope": True,
+                "input_count": 320,
+                "quota": 300,
+                "selected_count": 300,
+            }
+        },
+    }
+    select_calls: dict[str, object] = {}
+
+    def _fake_select(**kwargs: object) -> dict[str, object]:
+        select_calls.update(kwargs)
+        return {"selected": selected_symbols, "report": selection_report}
+
+    _patch_attr(service, "_select_universe_quality_candidates", _fake_select)
+    _patch_attr(service, "_resolve_universe_seed_trade_date", lambda: "2026-03-16")
+    captured = _patch_minimal_prefilter_and_pipeline(service)
+
+    report = _as_mapping(
+        service.run_week5_scan(
+            timestamp=datetime(2026, 3, 16, 20, 30),
+            notify_enabled=False,
+            force_universe_scan=True,
+            prefilter_enabled_override=True,
+        )
+    )
+
+    # Selector invoked with full universe (not pre-truncated) and target_size=300.
+    assert select_calls["target_size"] == 300
+    assert select_calls["trade_date"] == "2026-03-16"
+    assert select_calls["reference_date"] == "2026-03-16"
+    assert select_calls["ruleset_id"] == "a_share_default_v1"
+    symbols_passed = _as_text_list(cast(list, select_calls["symbols"]))
+    assert len(symbols_passed) == 400
+    assert symbols_passed == universe_symbols
+
+    prefilter = _as_mapping(report["prefilter"])
+    # Selection report propagated.
+    propagated_report = prefilter.get("universe_quality_selection")
+    assert isinstance(propagated_report, dict)
+    assert propagated_report["selector_mode"] == "quality"
+    assert propagated_report["selected_count"] == 300
+    assert propagated_report["input_count"] == 400
+    assert propagated_report["input_symbol_hash"] == "abc123"
+    assert propagated_report["output_symbol_hash"] == "def456"
+    assert propagated_report["trade_date"] == "2026-03-16"
+    # Quality selection exposes the same board-quota audit contract as the
+    # legacy quota sampler, while making the quality floor semantics explicit.
+    assert prefilter["universe_quality_selector_mode"] == "quality"
+    assert prefilter["universe_board_quota"] == {
+        "truncation_mode": "quality_ranked_board_floor",
+        "cap": 300,
+        "effective_cap": 300,
+        "board_scope": ["SSE", "SZSE"],
+        "boards": selection_report["board_quotas"],
+        "seed_trade_date": "2026-03-16",
+        "ruleset_id": "a_share_default_v1",
+        "selector_mode": "quality",
+    }
+    # Prefilter received the 300 selected symbols.
+    prefilter_kwargs = cast(dict, captured["prefilter_kwargs"])
+    prefilter_input = _as_text_list(cast(list, prefilter_kwargs.get("symbols", [])))
+    assert len(prefilter_input) == 300
+    assert set(prefilter_input) == set(selected_symbols)
+
+
+def test_week5_quality_selector_disabled_falls_back_to_quota_sample() -> None:
+    """When universe_quality_selector_enabled=False, the legacy _quota_sample_universe
+    path runs and no universe_quality_selection report is produced (no regression)."""
+    config = _load_test_config()
+    config.week5.universe_quality_selector_enabled = False
+    service = _new_service(config)
+    service.state.watchlist = []
+
+    universe_symbols = [f"600{i:03d}" for i in range(400)]
+    _patch_attr(
+        service,
+        "_resolve_symbol_universe",
+        lambda **_: {
+            "source": "test_universe",
+            "symbols": universe_symbols,
+            "errors": [],
+        },
+    )
+    select_calls: list[bool] = []
+
+    def _fail_select(**kwargs: object) -> dict[str, object]:
+        select_calls.append(True)
+        return {"selected": [], "report": {}}
+
+    _patch_attr(service, "_select_universe_quality_candidates", _fail_select)
+    _patch_minimal_prefilter_and_pipeline(service)
+
+    report = _as_mapping(
+        service.run_week5_scan(
+            timestamp=datetime(2026, 3, 16, 20, 30),
+            notify_enabled=False,
+            force_universe_scan=True,
+            prefilter_enabled_override=True,
+        )
+    )
+    # Quality selector must NOT be invoked when disabled.
+    assert select_calls == []
+    prefilter = _as_mapping(report["prefilter"])
+    assert prefilter.get("universe_quality_selection") is None
+    # Legacy path still feeds prefilter with universe symbols.
+    assert prefilter["reason"] == "universe_scan"
+
+
+def test_week5_quality_selector_does_not_affect_manual_symbols() -> None:
+    """Manual symbols path bypasses the quality selector entirely (no regression)."""
+    config = _load_test_config()
+    _enable_universe_quality_selector(config)
+    service = _new_service(config)
+    service.state.watchlist = ["600000"]
+
+    select_calls: list[bool] = []
+    pipeline_symbols: list[list[str]] = []
+
+    def _fail_select(**kwargs: object) -> dict[str, object]:
+        select_calls.append(True)
+        return {"selected": [], "report": {}}
+
+    _patch_attr(service, "_select_universe_quality_candidates", _fail_select)
+    _patch_minimal_prefilter_and_pipeline(service)
+
+    def _capture_pipeline(**kwargs: object) -> dict[str, object]:
+        pipeline_symbols.append(_as_text_list(cast(list, kwargs.get("symbols", []))))
+        return {
+            "trace_id": "uqs-manual-test",
+            "signals": [],
+            "risk": {"action": "monitor", "drawdown_pct": 0.0},
+        }
+
+    _patch_attr(service, "run_pipeline", _capture_pipeline)
+
+    report = _as_mapping(
+        service.run_week5_scan(
+            timestamp=datetime(2026, 3, 16, 20, 30),
+            notify_enabled=False,
+            symbols=["600000", "000001"],
+        )
+    )
+    # Quality selector never runs for manual symbols.
+    assert select_calls == []
+    # Manual symbols reach the pipeline directly (prefilter is skipped for manual input).
+    assert pipeline_symbols
+    assert set(pipeline_symbols[0]) == {"600000", "000001"}
+    prefilter = _as_mapping(report["prefilter"])
+    assert prefilter["reason"] == "manual_symbols"
+    assert prefilter.get("universe_quality_selection") is None
+
+
+def test_week5_full_deep_monster_cap_uses_global_quality_score() -> None:
+    config = _load_test_config()
+    _enable_universe_quality_selector(config)
+    config.week5.monster_scan_max_symbols = 120
+    service = _new_service(config)
+    service.state.watchlist = []
+
+    selected_symbols = [
+        *[f"000{i:03d}" for i in range(1, 151)],
+        *[f"600{i:03d}" for i in range(1, 151)],
+    ]
+    score_by_symbol = {symbol: float(index) for index, symbol in enumerate(selected_symbols)}
+    selection_report = {
+        "input_count": 300,
+        "hard_eligible_count": 300,
+        "selected_count": 300,
+        "core_selected_count": 300,
+        "exploration_selected_count": 0,
+        "selected_by_board": {"SZ_MAIN": 150, "SH_MAIN": 150},
+        "score_distribution": {"count": 300},
+        "selected": [
+            {
+                "symbol": symbol,
+                "score": score_by_symbol[symbol],
+                "components": {},
+                "reason_codes": ["core_quality_selected"],
+            }
+            for symbol in selected_symbols
+        ],
+        "trade_date": "2026-03-16",
+        "ruleset_id": "a_share_default_v1",
+        "selector_mode": "quality",
+        "fallback_reason": "",
+        "input_symbol_hash": "input-hash",
+        "output_symbol_hash": "output-hash",
+        "board_quotas": {},
+    }
+    _patch_attr(
+        service,
+        "_resolve_symbol_universe",
+        lambda **_: {
+            "source": "test_universe",
+            "symbols": selected_symbols,
+            "errors": [],
+        },
+    )
+    _patch_attr(
+        service,
+        "_select_universe_quality_candidates",
+        lambda **_: {"selected": selected_symbols, "report": selection_report},
+    )
+    _patch_attr(service, "_resolve_universe_seed_trade_date", lambda: "2026-03-16")
+    _patch_minimal_prefilter_and_pipeline(service)
+    pipeline_symbols: list[list[str]] = []
+
+    def _capture_pipeline(**kwargs: object) -> dict[str, object]:
+        pipeline_symbols.append(_as_text_list(cast(list, kwargs.get("symbols", []))))
+        return {
+            "trace_id": "quality-monster-cap-test",
+            "signals": [],
+            "risk": {"action": "monitor", "drawdown_pct": 0.0},
+        }
+
+    _patch_attr(service, "run_pipeline", _capture_pipeline)
+    pinned = "000001"
+    report = _as_mapping(
+        service.run_week5_scan(
+            timestamp=datetime(2026, 3, 16, 20, 30),
+            notify_enabled=False,
+            force_universe_scan=True,
+            prefilter_enabled_override=False,
+            pinned_symbols=[pinned],
+        )
+    )
+
+    expected_non_pinned = sorted(
+        [symbol for symbol in selected_symbols if symbol != pinned],
+        key=lambda symbol: (-score_by_symbol[symbol], symbol),
+    )[:119]
+    assert pipeline_symbols[0] == [pinned, *expected_non_pinned]
+    controls = _as_mapping(report["monster_scan_controls"])
+    assert controls["cap"] == 120
+    assert controls["cap_applied"] is True
+    assert controls["ranking_mode"] == "universe_quality_score"
+
+
+def test_week5_full_deep_degraded_fallback_scans_pinned_only() -> None:
+    config = _load_test_config()
+    _enable_universe_quality_selector(config)
+    config.week5.monster_scan_max_symbols = 120
+    service = _new_service(config)
+    service.state.watchlist = []
+
+    degraded_symbols = [f"600{i:03d}" for i in range(300)]
+    degraded_boards = {
+        "SH_MAIN": {
+            "exchange": "SSE",
+            "in_scope": True,
+            "input_count": 300,
+            "quota": 300,
+            "selected_count": 300,
+        }
+    }
+    selection_report = {
+        "input_count": 5000,
+        "target_size": 300,
+        "selected_count": 300,
+        "selected": [
+            {
+                "symbol": symbol,
+                "score": 0.0,
+                "components": {},
+                "reason_codes": ["degraded_fallback"],
+            }
+            for symbol in degraded_symbols
+        ],
+        "trade_date": "2026-03-16",
+        "ruleset_id": "a_share_default_v1",
+        "selector_mode": "degraded_fallback",
+        "fallback_source": "quota_sampler",
+        "fallback_reason": "batch_coverage_below_threshold",
+        "board_quotas": degraded_boards,
+    }
+    _patch_attr(
+        service,
+        "_resolve_symbol_universe",
+        lambda **_: {
+            "source": "provider_index_primary",
+            "symbols": degraded_symbols,
+            "errors": [],
+        },
+    )
+    _patch_attr(
+        service,
+        "_select_universe_quality_candidates",
+        lambda **_: {"selected": degraded_symbols, "report": selection_report},
+    )
+    _patch_attr(service, "_resolve_universe_seed_trade_date", lambda: "2026-03-16")
+    _patch_minimal_prefilter_and_pipeline(service)
+    pipeline_symbols: list[list[str]] = []
+
+    def _capture_pipeline(**kwargs: object) -> dict[str, object]:
+        pipeline_symbols.append(_as_text_list(cast(list, kwargs.get("symbols", []))))
+        return {
+            "trace_id": "degraded-fail-closed-test",
+            "signals": [],
+            "risk": {"action": "monitor", "drawdown_pct": 0.0},
+        }
+
+    _patch_attr(service, "run_pipeline", _capture_pipeline)
+    pinned = "300999"
+    report = _as_mapping(
+        service.run_week5_scan(
+            timestamp=datetime(2026, 3, 16, 20, 30),
+            notify_enabled=False,
+            force_universe_scan=True,
+            prefilter_enabled_override=False,
+            pinned_symbols=[pinned],
+        )
+    )
+
+    assert pipeline_symbols == [[pinned]]
+    prefilter = _as_mapping(report["prefilter"])
+    assert prefilter["degraded_fail_closed"] is True
+    assert prefilter["degraded_fail_closed_reason"] == "quality_unavailable_without_snapshot"
+    quota_report = _as_mapping(prefilter["universe_board_quota"])
+    assert quota_report["truncation_mode"] == "quality_ranked_board_floor"
+    assert quota_report["selector_mode"] == "degraded_fallback"
+    assert quota_report["boards"] == degraded_boards
+    assert "truncation_mode" not in _as_mapping(quota_report["boards"])
+    controls = _as_mapping(report["monster_scan_controls"])
+    assert controls["ranking_mode"] == "degraded_fail_closed_pinned_only"
+    assert controls["selected_count"] == 1
+
+
+def test_quality_snapshot_persist_failure_is_reported(tmp_path: Path) -> None:
+    config = _load_test_config()
+    _enable_universe_quality_selector(config)
+    snapshot_directory = tmp_path / "snapshot-target-is-directory"
+    snapshot_directory.mkdir()
+    config.week5.universe_quality_snapshot_path = str(snapshot_directory)
+    service = _new_service(config)
+
+    days = 80
+    dates = pd.bdate_range(end="2026-07-31", periods=days)
+    close = np.linspace(10.0, 14.0, days)
+    frame = pd.DataFrame(
+        {
+            "symbol": ["600001"] * days,
+            "date": dates,
+            "open": close * 0.998,
+            "high": close * 1.01,
+            "low": close * 0.99,
+            "close": close,
+            "volume": [10_000_000.0] * days,
+            "turnover": [50_000_000.0] * days,
+            "float_market_cap": [4_000_000_000.0] * days,
+            "suspended": [False] * days,
+            "is_st": [False] * days,
+            "is_delisting_risk": [False] * days,
+            "roe": [0.12] * days,
+            "debt_ratio": [0.30] * days,
+            "financial_data_complete": [True] * days,
+            "financial_completeness": [0.95] * days,
+            "background_data_complete": [True] * days,
+            "holder_count": [40_000.0] * days,
+            "northbound_net": [0.0] * days,
+            "dragon_tiger_flag": [0.0] * days,
+        }
+    )
+
+    class _Warehouse:
+        def fetch_universe_quality_metrics(self, **_kwargs: object) -> pd.DataFrame:
+            return frame.copy()
+
+    _patch_attr(service, "_market_warehouse", lambda: _Warehouse())
+    result = service._select_universe_quality_candidates(
+        symbols=["600001"],
+        target_size=1,
+        trade_date="2026-07-31",
+        reference_date="2026-07-31",
+        ruleset_id="a_share_default_v1",
+        board_scope=["SSE"],
+    )
+    report = _as_mapping(result["report"])
+    assert report["selector_mode"] == "quality_all_eligible"
+    assert report["snapshot_persisted"] is False
+    assert "snapshot_persist_error" in report
+    assert snapshot_directory.is_dir()
+
+
+def test_quality_all_eligible_below_target_does_not_overwrite_snapshot(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config()
+    _enable_universe_quality_selector(config)
+    snapshot_path = tmp_path / "existing-quality-snapshot.json"
+    existing_payload = b'{"sentinel":"existing-success"}'
+    snapshot_path.write_bytes(existing_payload)
+    config.week5.universe_quality_snapshot_path = str(snapshot_path)
+    service = _new_service(config)
+
+    days = 80
+    dates = pd.bdate_range(end="2026-07-31", periods=days)
+    close = np.linspace(10.0, 14.0, days)
+    frame = pd.DataFrame(
+        {
+            "symbol": ["600001"] * days,
+            "date": dates,
+            "open": close * 0.998,
+            "high": close * 1.01,
+            "low": close * 0.99,
+            "close": close,
+            "volume": [10_000_000.0] * days,
+            "turnover": [50_000_000.0] * days,
+            "float_market_cap": [4_000_000_000.0] * days,
+            "suspended": [False] * days,
+            "is_st": [False] * days,
+            "is_delisting_risk": [False] * days,
+            "roe": [0.12] * days,
+            "debt_ratio": [0.30] * days,
+            "financial_data_complete": [True] * days,
+            "financial_completeness": [0.95] * days,
+            "background_data_complete": [True] * days,
+            "holder_count": [40_000.0] * days,
+            "northbound_net": [0.0] * days,
+            "dragon_tiger_flag": [0.0] * days,
+        }
+    )
+
+    class _Warehouse:
+        def fetch_universe_quality_metrics(self, **_kwargs: object) -> pd.DataFrame:
+            return frame.copy()
+
+    _patch_attr(service, "_market_warehouse", lambda: _Warehouse())
+    result = service._select_universe_quality_candidates(
+        symbols=["600001"],
+        target_size=2,
+        trade_date="2026-07-31",
+        reference_date="2026-07-31",
+        ruleset_id="a_share_default_v1",
+        board_scope=["SSE"],
+    )
+    report = _as_mapping(result["report"])
+    assert report["selector_mode"] == "quality_all_eligible"
+    assert report["target_size"] == 2
+    assert report["selected_count"] == 1
+    assert report["snapshot_persisted"] is False
+    assert report["snapshot_persist_skip_reason"] == "selected_below_target:1<2"
+    assert snapshot_path.read_bytes() == existing_payload
+
+
+def test_degraded_selection_does_not_overwrite_success_snapshot(tmp_path: Path) -> None:
+    config = _load_test_config()
+    _enable_universe_quality_selector(config)
+    snapshot_path = tmp_path / "quality-snapshot.json"
+    config.week5.universe_quality_snapshot_path = str(snapshot_path)
+    service = _new_service(config)
+
+    dates = pd.bdate_range(end="2026-07-31", periods=80)
+    frames: list[pd.DataFrame] = []
+    for index, symbol in enumerate(("600001", "600002")):
+        close = np.linspace(10.0, 14.0 + index, len(dates))
+        frames.append(
+            pd.DataFrame(
+                {
+                    "symbol": [symbol] * len(dates),
+                    "date": dates,
+                    "open": close * 0.998,
+                    "high": close * 1.01,
+                    "low": close * 0.99,
+                    "close": close,
+                    "volume": [10_000_000.0] * len(dates),
+                    "turnover": [50_000_000.0] * len(dates),
+                    "float_market_cap": [4_000_000_000.0] * len(dates),
+                    "suspended": [False] * len(dates),
+                    "is_st": [False] * len(dates),
+                    "is_delisting_risk": [False] * len(dates),
+                    "roe": [0.12 + index * 0.01] * len(dates),
+                    "debt_ratio": [0.30] * len(dates),
+                    "financial_data_complete": [True] * len(dates),
+                    "financial_completeness": [0.95] * len(dates),
+                    "background_data_complete": [True] * len(dates),
+                    "holder_count": [40_000.0] * len(dates),
+                    "northbound_net": [0.0] * len(dates),
+                    "dragon_tiger_flag": [0.0] * len(dates),
+                }
+            )
+        )
+    full_frame = pd.concat(frames, ignore_index=True)
+
+    class _MutableWarehouse:
+        def __init__(self, frame: pd.DataFrame) -> None:
+            self.frame = frame
+
+        def fetch_universe_quality_metrics(self, **_kwargs: object) -> pd.DataFrame:
+            return self.frame.copy()
+
+    warehouse = _MutableWarehouse(full_frame)
+    _patch_attr(service, "_market_warehouse", lambda: warehouse)
+    kwargs = {
+        "symbols": ["600001", "600002"],
+        "target_size": 1,
+        "trade_date": "2026-07-31",
+        "reference_date": "2026-07-31",
+        "ruleset_id": "a_share_default_v1",
+        "board_scope": ["SSE"],
+    }
+    success = service._select_universe_quality_candidates(**kwargs)
+    success_report = _as_mapping(success["report"])
+    assert success_report["selector_mode"] == "quality"
+    assert success_report["snapshot_persisted"] is True
+    persisted_before = snapshot_path.read_bytes()
+
+    warehouse.frame = full_frame[full_frame["symbol"] == "600001"].copy()
+    degraded = service._select_universe_quality_candidates(**kwargs)
+    degraded_report = _as_mapping(degraded["report"])
+    assert degraded_report["selector_mode"] == "snapshot_fallback"
+    assert degraded_report["snapshot_persisted"] is False
+    assert str(degraded_report["snapshot_persist_skip_reason"]).startswith(
+        "selector_mode_not_successful"
+    )
+    assert snapshot_path.read_bytes() == persisted_before

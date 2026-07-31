@@ -473,8 +473,18 @@ def test_docker_build_commit_identity_is_build_time_and_exposed_to_health() -> N
     assert "STOCK_ANALYZER_BUILD_COMMIT: ${STOCK_ANALYZER_BUILD_COMMIT:-unknown}" in compose
     assert compose.count('SA__APP__MODE: simulation') == 2
     assert compose.count('SA__APP__ADVISORY_ONLY: "true"') == 2
-    assert compose.count('SA__TRAINING__ENABLED: "false"') == 2
-    assert compose.count('SA__AUTO_PROMOTION__ENABLED: "false"') == 2
+    assert (
+        compose.count(
+            "SA__TRAINING__ENABLED: ${SA__TRAINING__ENABLED:-false}"
+        )
+        == 2
+    )
+    assert (
+        compose.count(
+            "SA__AUTO_PROMOTION__ENABLED: ${SA__AUTO_PROMOTION__ENABLED:-false}"
+        )
+        == 2
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -74,14 +74,8 @@ def test_load_default_config_values(monkeypatch: MonkeyPatch) -> None:
     assert config.market_warehouse.auto_run is True
     assert config.market_warehouse.run_time == "21:45"
     assert config.market_warehouse.db_path == "artifacts/warehouse/market.duckdb"
-    assert (
-        config.market_warehouse.package_root
-        == "artifacts/warehouse/package"
-    )
-    assert (
-        config.market_warehouse.bootstrap_source_root
-        == "artifacts/imports/tdx_offline_package"
-    )
+    assert config.market_warehouse.package_root == "artifacts/warehouse/package"
+    assert config.market_warehouse.bootstrap_source_root == "artifacts/imports/tdx_offline_package"
     assert config.market_warehouse.bootstrap_on_first_sync is True
     assert config.market_warehouse.offline_bootstrap_enabled is False
     assert config.market_warehouse.online_bootstrap_lookback_days == 750
@@ -98,6 +92,30 @@ def test_load_default_config_values(monkeypatch: MonkeyPatch) -> None:
     assert config.week5.universe_prefilter_lookback_days == 240
     assert config.week5.universe_prefilter_top_k == 500
     assert config.week5.universe_prefilter_shortlist_top_n == 50
+    assert config.week5.universe_quality_selector_enabled is True
+    assert config.week5.universe_quality_target_size == 300
+    assert config.week5.universe_quality_min_history_days == 60
+    assert config.week5.universe_quality_min_avg_turnover_20 == 5_000_000.0
+    assert config.week5.universe_quality_min_float_market_cap == 300_000_000.0
+    assert config.week5.universe_quality_min_batch_coverage_ratio == 0.90
+    assert config.week5.universe_quality_max_staleness_days == 10
+    assert config.week5.universe_quality_require_financial_data is True
+    assert config.week5.universe_quality_min_roe == 0.0
+    assert config.week5.universe_quality_max_debt_ratio == 0.80
+    assert config.week5.universe_quality_exploration_ratio == 0.05
+    assert config.week5.universe_quality_weights == {
+        "trend": 0.30,
+        "capital_flow": 0.20,
+        "price_volume": 0.15,
+        "liquidity": 0.15,
+        "fundamental": 0.20,
+        "risk_penalty": 0.10,
+    }
+    assert (
+        config.week5.universe_quality_snapshot_path
+        == "artifacts/runtime/universe_quality_snapshot.json"
+    )
+    assert config.week5.universe_quality_snapshot_max_age_days == 7
     assert config.week5.monster_scan_intraday_max_symbols == 15
     assert config.week5.monster_scan_max_symbols == 120
     assert config.week5.monster_scan_sla_target_ms == 900_000
@@ -284,12 +302,12 @@ def test_env_override_is_applied(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("SA__WECOM_INTERACTION__ENFORCE_RECEIVE_ID", "true")
     monkeypatch.setenv("SA__FEISHU_INTERACTION__ENABLED", "true")
     monkeypatch.setenv("SA__FEISHU_INTERACTION__SUBSCRIPTION_MODE", "ws")
-    monkeypatch.setenv("SA__FEISHU_INTERACTION__ALLOWED_USERS", "[\"ou_xxx\"]")
+    monkeypatch.setenv("SA__FEISHU_INTERACTION__ALLOWED_USERS", '["ou_xxx"]')
     monkeypatch.setenv("SA__NOTIFICATIONS__PRIMARY", "feishu_app")
     monkeypatch.setenv("SA__NOTIFICATIONS__FEISHU_APP_RECEIVE_ID_TYPE", "email")
     monkeypatch.setenv("SA__NOTIFICATIONS__FEISHU_ENTERPRISE_ENABLED", "true")
     monkeypatch.setenv("SA__NOTIFICATIONS__FEISHU_ENTERPRISE_MODE", "enterprise_department")
-    monkeypatch.setenv("SA__NOTIFICATIONS__FEISHU_ENTERPRISE_DEPARTMENT_IDS", "[\"od_xxx\"]")
+    monkeypatch.setenv("SA__NOTIFICATIONS__FEISHU_ENTERPRISE_DEPARTMENT_IDS", '["od_xxx"]')
     monkeypatch.setenv("SA__TDX_SYNC__RUN_TIME", "18:35")
     config = load_config(root / "config" / "default.yaml")
     assert config.data_source.switch_after_failures == 5

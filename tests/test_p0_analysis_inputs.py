@@ -703,7 +703,7 @@ def test_financial_data_quality_classifies_missing_stale_default_and_low_roe(
                     },
                     {
                         "symbol": "000001",
-                        "score": 62,
+                        "score": 80,
                         "action": "watch",
                         "reasons": ["financial_penalty:low_roe"],
                         "roe": -0.01,

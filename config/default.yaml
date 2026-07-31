@@ -278,6 +278,26 @@ week5:
   universe_prefilter_lookback_days: 240
   universe_prefilter_top_k: 500
   universe_prefilter_shortlist_top_n: 50
+  universe_quality_selector_enabled: true
+  universe_quality_target_size: 300
+  universe_quality_min_history_days: 60
+  universe_quality_min_avg_turnover_20: 5000000.0
+  universe_quality_min_float_market_cap: 300000000.0
+  universe_quality_min_batch_coverage_ratio: 0.90
+  universe_quality_max_staleness_days: 10
+  universe_quality_require_financial_data: true
+  universe_quality_min_roe: 0.0
+  universe_quality_max_debt_ratio: 0.80
+  universe_quality_exploration_ratio: 0.05
+  universe_quality_weights:
+    trend: 0.30
+    capital_flow: 0.20
+    price_volume: 0.15
+    liquidity: 0.15
+    fundamental: 0.20
+    risk_penalty: 0.10
+  universe_quality_snapshot_path: "artifacts/runtime/universe_quality_snapshot.json"
+  universe_quality_snapshot_max_age_days: 7
   monster_scan_intraday_max_symbols: 15
   monster_scan_max_symbols: 120
   monster_scan_sla_target_ms: 900000

@@ -1664,6 +1664,50 @@ def test_sync_counts_returned_rebuild_required_as_failed(tmp_path: Path) -> None
     )
 
 
+def test_partial_enrichment_symbol_is_retryable(tmp_path: Path) -> None:
+    package_root = tmp_path / "package"
+    db_path = tmp_path / "warehouse" / "market.duckdb"
+    _build_sample_package(package_root)
+    config = _load_test_config(package_root=package_root, db_path=db_path)
+    service = _new_service(config)
+    provider_online = FakeOnlineProvider()
+    _patch_attr(service, "_build_market_warehouse_online_provider", lambda: provider_online)
+    _apply_lightweight_market_warehouse_state(
+        service,
+        latest_daily_dates={"600000": date(2026, 3, 6)},
+    )
+    _patch_attr(
+        service,
+        "_sync_market_warehouse_daily_symbol",
+        _build_lightweight_daily_sync(service),
+    )
+    _patch_attr(
+        service._market_sync_service,
+        "_enrich_market_warehouse_symbol",
+        lambda **kwargs: {
+            "status": "partial",
+            "failed_phases": [],
+            "partial_phases": ["p2"],
+            "phases": {},
+        },
+    )
+
+    report = _as_mapping(
+        service.run_market_warehouse_sync(
+            symbols=["600000"],
+            force=False,
+            timestamp=pd.Timestamp("2026-03-06 20:30:00").to_pydatetime(),
+        )
+    )
+
+    assert report["status"] == "partial"
+    assert report["failed_symbols"] == ["600000"]
+    assert _as_int(report["failed_symbols_total"]) == 1
+    retry_plan = _as_mapping(report["retry_plan"])
+    assert retry_plan["symbols"] == ["600000"]
+    assert retry_plan["next_action"] == "targeted_retry"
+
+
 def test_reanchor_failure_does_not_advance_symbol_meta(tmp_path: Path) -> None:
     package_root = tmp_path / "package"
     config = _load_test_config(

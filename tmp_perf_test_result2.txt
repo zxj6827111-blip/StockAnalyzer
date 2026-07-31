@@ -1,0 +1,10 @@
+﻿============================= test session starts =============================
+platform win32 -- Python 3.12.13, pytest-9.1.0, pluggy-1.6.0
+rootdir: E:\Software Development\StockAnalyzer
+configfile: pyproject.toml
+plugins: anyio-4.14.2, cov-7.1.0
+collected 1 item
+
+tests\test_universe_candidate_selector.py .                              [100%]
+
+======================= 1 passed in 1115.90s (0:18:35) ========================

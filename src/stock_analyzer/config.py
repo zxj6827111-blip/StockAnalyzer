@@ -321,6 +321,29 @@ class Week5Config(_StrictModel):
     universe_prefilter_lookback_days: int = 240
     universe_prefilter_top_k: int = 500
     universe_prefilter_shortlist_top_n: int = 50
+    universe_quality_selector_enabled: bool = True
+    universe_quality_target_size: int = 300
+    universe_quality_min_history_days: int = 60
+    universe_quality_min_avg_turnover_20: float = 5_000_000.0
+    universe_quality_min_float_market_cap: float = 300_000_000.0
+    universe_quality_min_batch_coverage_ratio: float = 0.90
+    universe_quality_max_staleness_days: int = 10
+    universe_quality_require_financial_data: bool = True
+    universe_quality_min_roe: float = 0.0
+    universe_quality_max_debt_ratio: float = 0.80
+    universe_quality_exploration_ratio: float = 0.05
+    universe_quality_weights: dict[str, float] = Field(
+        default_factory=lambda: {
+            "trend": 0.30,
+            "capital_flow": 0.20,
+            "price_volume": 0.15,
+            "liquidity": 0.15,
+            "fundamental": 0.20,
+            "risk_penalty": 0.10,
+        }
+    )
+    universe_quality_snapshot_path: str = "artifacts/runtime/universe_quality_snapshot.json"
+    universe_quality_snapshot_max_age_days: int = 7
     monster_scan_intraday_max_symbols: int = 15
     monster_scan_max_symbols: int = 120
     monster_scan_sla_target_ms: int = 900_000

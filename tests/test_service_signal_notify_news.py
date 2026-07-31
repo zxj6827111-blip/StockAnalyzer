@@ -116,7 +116,9 @@ def test_notify_actionable_buy_uses_strategy_a_threshold() -> None:
 
 
 def test_notify_actionable_buy_uses_lowered_monster_strategy_threshold() -> None:
-    service = StockAnalyzerService(config=_load_test_config())
+    config = _load_test_config()
+    config.strategy_scores["monster"].thresholds.a = 60
+    service = StockAnalyzerService(config=config)
     captured: list[dict[str, object]] = []
 
     def _fake_notify(

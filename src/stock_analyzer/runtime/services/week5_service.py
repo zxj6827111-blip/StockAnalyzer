@@ -234,12 +234,23 @@ class RuntimeWeek5Service:
             )
             return report
 
-        universe = service._resolve_symbol_universe(
-            max_symbols=_as_int(profile.get("universe_max_symbols"), default=0),
-            allow_seed_fallback=True,
-            allow_online_sources=not bool(profile.get("prefer_local_universe", False)),
+        quality_selector_enabled = bool(
+            service._config.week5.universe_quality_selector_enabled
         )
-        raw_symbols = _string_list(universe.get("symbols", []))
+        # When the quality selector is enabled, run_week5_scan resolves the full
+        # universe and runs the selector itself; the separate _quota_sample_universe
+        # call here would be a wasteful duplicate and is skipped. The annotation
+        # counts are derived from the returned universe_quality_selection report.
+        annotate_source = "universe"
+        annotate_symbol_count = 0
+        if not quality_selector_enabled:
+            universe = service._resolve_symbol_universe(
+                max_symbols=_as_int(profile.get("universe_max_symbols"), default=0),
+                allow_seed_fallback=True,
+                allow_online_sources=not bool(profile.get("prefer_local_universe", False)),
+            )
+            annotate_source = str(universe.get("source", "universe"))
+            annotate_symbol_count = len(_string_list(universe.get("symbols", [])))
         report = cast(
             dict[str, object],
             service.run_week5_scan(
@@ -263,16 +274,34 @@ class RuntimeWeek5Service:
             ),
         )
         report["offhours_refresh_profile"] = profile
-        report["symbol_source"] = f"{str(universe.get('source', 'universe'))}:full_deep"
         prefilter = report.get("prefilter")
+        quality_selection = (
+            prefilter.get("universe_quality_selection")
+            if isinstance(prefilter, dict)
+            else None
+        )
+        selector_mode = ""
+        if isinstance(prefilter, dict):
+            prefilter_source = str(prefilter.get("universe_source", "")).strip()
+            if prefilter_source:
+                annotate_source = prefilter_source
+        if isinstance(quality_selection, dict) and quality_selection:
+            selector_mode = str(quality_selection.get("selector_mode", "")).strip()
+            annotate_symbol_count = _as_int(
+                quality_selection.get("selected_count"),
+                default=annotate_symbol_count,
+            )
+        report["universe_quality_selector_mode"] = selector_mode
+        report["symbol_source"] = f"{annotate_source}:full_deep"
         if isinstance(prefilter, dict):
             prefilter["enabled"] = False
             prefilter["applied"] = False
             prefilter["reason"] = "disabled_by_offhours_full_deep_profile"
-            prefilter["universe_source"] = str(universe.get("source", "universe"))
-            prefilter["universe_count"] = len(raw_symbols)
-            prefilter["eligible_count"] = len(raw_symbols)
-            prefilter["shortlisted_count"] = len(raw_symbols)
+            prefilter["universe_source"] = annotate_source
+            prefilter["universe_quality_selector_mode"] = selector_mode
+            prefilter["universe_count"] = annotate_symbol_count
+            prefilter["eligible_count"] = annotate_symbol_count
+            prefilter["shortlisted_count"] = annotate_symbol_count
         self._finalize_offhours_market_radar_review(
             report=report,
             review_symbols=review_symbols,
@@ -1101,6 +1130,11 @@ class RuntimeWeek5Service:
         prefilter_details_by_symbol: dict[str, dict[str, object]] = {}
         prefer_local_universe = service._prefer_local_symbol_universe()
         should_scan_universe = bool(force_universe_scan)
+        # Locals preserved across the prefilter_report reassignment below so the
+        # quality-selector audit report and universe errors are not lost when
+        # _prefilter_week5_universe_symbols returns a fresh dict.
+        quality_selection_report: dict[str, object] | None = None
+        universe_errors_list: list[str] | None = None
 
         if symbols is not None and not force_universe_scan:
             raw_symbols = symbols
@@ -1116,26 +1150,105 @@ class RuntimeWeek5Service:
                     symbol_source = "intraday_preserved_watchlist"
                     prefilter_report["reason"] = "intraday_preserve_existing"
             if force_universe_scan or (not raw_symbols and not intraday_scheduler_mode):
-                universe_max_symbols = (
-                    max(0, _as_int(universe_max_symbols_override, default=0))
-                    if universe_max_symbols_override is not None
-                    else (0 if prefer_local_universe else 1200)
+                quality_selector_enabled = bool(
+                    service._config.week5.universe_quality_selector_enabled
                 )
-                universe = service._resolve_symbol_universe(
-                    max_symbols=universe_max_symbols,
-                    allow_seed_fallback=True,
-                    allow_online_sources=not prefer_local_universe,
-                )
-                raw_symbols = _string_list(universe.get("symbols", []))
-                symbol_source = str(universe.get("source", "universe"))
-                should_scan_universe = True
-                prefilter_report["reason"] = "universe_scan"
-                prefilter_report["universe_source"] = symbol_source
-                raw_errors = universe.get("errors", [])
-                if isinstance(raw_errors, list):
-                    prefilter_report["universe_errors"] = [
-                        str(item).strip() for item in raw_errors if str(item).strip()
-                    ][:20]
+                if quality_selector_enabled:
+                    # Full universe first — never truncate via _quota_sample_universe
+                    # before the quality selector runs.
+                    universe = service._resolve_symbol_universe(
+                        max_symbols=0,
+                        allow_seed_fallback=True,
+                        allow_online_sources=not prefer_local_universe,
+                    )
+                    full_universe_symbols = _string_list(universe.get("symbols", []))
+                    quality_target = _resolve_positive_int(
+                        universe_max_symbols_override,
+                        fallback=_as_int(
+                            service._config.week5.universe_quality_target_size,
+                            default=300,
+                        ),
+                    )
+                    quality_trade_date = service._resolve_universe_seed_trade_date()
+                    quality_ruleset_id = str(
+                        service._config.evolution.universe_spec.universe_ruleset_id
+                    )
+                    quality_board_scope = list(
+                        service._config.evolution.universe_spec.board_scope
+                    )
+                    selection = service._select_universe_quality_candidates(
+                        symbols=full_universe_symbols,
+                        target_size=quality_target,
+                        trade_date=quality_trade_date,
+                        reference_date=now.date().isoformat(),
+                        ruleset_id=quality_ruleset_id,
+                        board_scope=quality_board_scope,
+                    )
+                    selection_report = selection.get("report", {})
+                    if not isinstance(selection_report, dict):
+                        selection_report = {}
+                    raw_symbols = _string_list(selection.get("selected", []))
+                    selector_mode = str(
+                        selection_report.get("selector_mode", "")
+                    ).strip()
+                    symbol_source = (
+                        str(universe.get("source", "universe")) + ":quality_selector"
+                    )
+                    should_scan_universe = True
+                    prefilter_report["reason"] = "universe_scan"
+                    prefilter_report["universe_source"] = symbol_source
+                    prefilter_report["universe_quality_selection"] = selection_report
+                    prefilter_report["universe_quality_selector_mode"] = selector_mode
+                    quality_selection_report = selection_report
+                    board_quotas = selection_report.get("board_quotas")
+                    universe_board_quota = {
+                        "truncation_mode": "quality_ranked_board_floor",
+                        "cap": quality_target,
+                        "effective_cap": max(
+                            0,
+                            _as_int(
+                                selection_report.get("selected_count"),
+                                default=len(raw_symbols),
+                            ),
+                        ),
+                        "board_scope": quality_board_scope,
+                        "boards": board_quotas if isinstance(board_quotas, dict) else {},
+                        "seed_trade_date": quality_trade_date,
+                        "ruleset_id": quality_ruleset_id,
+                        "selector_mode": selector_mode,
+                    }
+                    prefilter_report["universe_board_quota"] = universe_board_quota
+                    raw_errors = universe.get("errors", [])
+                    if isinstance(raw_errors, list):
+                        universe_errors_list = [
+                            str(item).strip() for item in raw_errors if str(item).strip()
+                        ][:20]
+                        prefilter_report["universe_errors"] = universe_errors_list
+                else:
+                    universe_max_symbols = (
+                        max(0, _as_int(universe_max_symbols_override, default=0))
+                        if universe_max_symbols_override is not None
+                        else (0 if prefer_local_universe else 1200)
+                    )
+                    universe = service._resolve_symbol_universe(
+                        max_symbols=universe_max_symbols,
+                        allow_seed_fallback=True,
+                        allow_online_sources=not prefer_local_universe,
+                    )
+                    raw_symbols = _string_list(universe.get("symbols", []))
+                    symbol_source = str(universe.get("source", "universe"))
+                    should_scan_universe = True
+                    prefilter_report["reason"] = "universe_scan"
+                    prefilter_report["universe_source"] = symbol_source
+                    universe_board_quota = universe.get("board_quota")
+                    if isinstance(universe_board_quota, dict):
+                        prefilter_report["universe_board_quota"] = universe_board_quota
+                    raw_errors = universe.get("errors", [])
+                    if isinstance(raw_errors, list):
+                        universe_errors_list = [
+                            str(item).strip() for item in raw_errors if str(item).strip()
+                        ][:20]
+                        prefilter_report["universe_errors"] = universe_errors_list
             else:
                 if prefilter_report.get("reason") == "not_requested":
                     prefilter_report["reason"] = "existing_watchlist"
@@ -1148,6 +1261,17 @@ class RuntimeWeek5Service:
             )
             prefilter_report["reason"] = "universe_scan"
             prefilter_report["universe_source"] = symbol_source
+            if isinstance(universe_board_quota, dict):
+                prefilter_report["universe_board_quota"] = universe_board_quota
+            # Re-apply quality-selector audit report + universe errors that were
+            # captured before this reassignment (prefilter returns a fresh dict).
+            if quality_selection_report is not None:
+                prefilter_report["universe_quality_selection"] = quality_selection_report
+                prefilter_report["universe_quality_selector_mode"] = str(
+                    quality_selection_report.get("selector_mode", "")
+                ).strip()
+            if universe_errors_list is not None:
+                prefilter_report["universe_errors"] = universe_errors_list
             raw_shortlisted = prefilter_report.get("shortlisted", [])
             if isinstance(raw_shortlisted, list):
                 prefilter_details_by_symbol = {
@@ -1159,6 +1283,23 @@ class RuntimeWeek5Service:
                 }
             symbol_list = _string_list(prefilter_report.get("symbols", []))
             symbol_source = f"{symbol_source}:prefilter"
+
+        quality_selector_mode = (
+            str(quality_selection_report.get("selector_mode", "")).strip()
+            if isinstance(quality_selection_report, dict)
+            else ""
+        )
+        degraded_fail_closed = bool(
+            should_scan_universe
+            and not bool(prefilter_report.get("applied", False))
+            and quality_selector_mode == "degraded_fallback"
+        )
+        if degraded_fail_closed:
+            symbol_list = []
+            prefilter_report["degraded_fail_closed"] = True
+            prefilter_report["degraded_fail_closed_reason"] = (
+                "quality_unavailable_without_snapshot"
+            )
 
         normalized_pinned_symbols = _dedupe_preserve_order(
             [
@@ -1198,6 +1339,14 @@ class RuntimeWeek5Service:
         monster_scan_cap_applied = bool(
             monster_scan_cap > 0 and len(symbol_list) > monster_scan_cap
         )
+        if degraded_fail_closed:
+            ranking_mode = "degraded_fail_closed_pinned_only"
+        else:
+            ranking_mode = (
+                "prefilter_order"
+                if bool(prefilter_report.get("applied", False))
+                else "input_order"
+            )
         if monster_scan_cap_applied:
             pinned_set = set(normalized_pinned_symbols)
             pinned_first = [
@@ -1210,6 +1359,36 @@ class RuntimeWeek5Service:
                 for symbol in symbol_list
                 if (_normalize_a_share_symbol(symbol) or symbol) not in pinned_set
             ]
+            if (
+                not bool(prefilter_report.get("applied", False))
+                and isinstance(quality_selection_report, dict)
+            ):
+                selected_payload = quality_selection_report.get("selected", [])
+                quality_score_by_symbol = {
+                    normalized: _as_float(item.get("score"), default=0.0)
+                    for item in selected_payload
+                    if isinstance(item, dict)
+                    for normalized in [_normalize_a_share_symbol(item.get("symbol"))]
+                    if normalized
+                } if isinstance(selected_payload, list) else {}
+                selector_mode = str(
+                    quality_selection_report.get("selector_mode", "")
+                ).strip()
+                if quality_score_by_symbol and selector_mode in {
+                    "quality",
+                    "quality_all_eligible",
+                    "snapshot_fallback",
+                }:
+                    non_pinned.sort(
+                        key=lambda symbol: (
+                            -quality_score_by_symbol.get(
+                                _normalize_a_share_symbol(symbol) or symbol,
+                                0.0,
+                            ),
+                            _normalize_a_share_symbol(symbol) or symbol,
+                        )
+                    )
+                    ranking_mode = "universe_quality_score"
             symbol_list = _dedupe_preserve_order([*pinned_first, *non_pinned])[:monster_scan_cap]
             symbol_source = f"{symbol_source}:monster_cap"
             prefilter_report["selected_count"] = len(symbol_list)
@@ -1220,6 +1399,7 @@ class RuntimeWeek5Service:
             "input_count": original_monster_scan_count,
             "selected_count": len(symbol_list),
             "dropped_count": max(0, original_monster_scan_count - len(symbol_list)),
+            "ranking_mode": ranking_mode,
         }
         prefilter_report["monster_scan_controls"] = monster_scan_controls
 

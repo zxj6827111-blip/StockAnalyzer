@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from datetime import date
 from pathlib import Path
@@ -21,11 +21,15 @@ class _FakeProP3:
         self._top_list = top_list if top_list is not None else pd.DataFrame()
         self._top_inst = top_inst if top_inst is not None else pd.DataFrame()
         self._block_trade = block_trade if block_trade is not None else pd.DataFrame()
+        self.top_list_calls: list[dict[str, object]] = []
+        self.top_inst_calls: list[dict[str, object]] = []
 
     def top_list(self, **kwargs: object) -> object:
+        self.top_list_calls.append(dict(kwargs))
         return self._top_list
 
     def top_inst(self, **kwargs: object) -> object:
+        self.top_inst_calls.append(dict(kwargs))
         return self._top_inst
 
     def block_trade(self, **kwargs: object) -> object:
@@ -67,17 +71,18 @@ class _FakeProP3:
 
 def test_fetch_top_list_event_day() -> None:
     raw = pd.DataFrame({
-        "ts_code": ["600000.SH", "600000.SH"],
-        "trade_date": ["20240419", "20240419"],
-        "reason": ["涨幅偏离7%", "换手率达20%"],
-        "buy": [1e8, 5e7],
-        "sell": [3e7, 2e7],
-        "amount": [2e9, 1.5e9],
+        "ts_code": ["600000.SH", "600000.SH", "000001.SZ"],
+        "trade_date": ["20240419", "20240419", "20240419"],
+        "reason": ["涨幅偏离7%", "换手率达20%", "无关股票"],
+        "buy": [1e8, 5e7, 9e9],
+        "sell": [3e7, 2e7, 8e9],
+        "amount": [2e9, 1.5e9, 7e9],
     })
     pro = _FakeProP3(top_list=raw)
     provider = TushareProvider(pro_api=pro)  # type: ignore[arg-type]
     out = provider.fetch_top_list("600000", end_date=date(2024, 4, 19))
     assert len(out) == 1
+    assert pro.top_list_calls[0] == {"trade_date": "20240419"}
     row = out.iloc[0]
     assert row["dragon_tiger_flag"] == 1.0
     assert row["reason_count"] == 2
@@ -95,17 +100,18 @@ def test_top_list_empty_means_no_event() -> None:
 
 def test_fetch_top_inst() -> None:
     raw = pd.DataFrame({
-        "ts_code": ["600000.SH"],
-        "trade_date": ["20240419"],
-        "exalter": ["机构专用"],
-        "buy": [5e7],
-        "sell": [1e7],
-        "net_buy": [4e7],
+        "ts_code": ["600000.SH", "000001.SZ"],
+        "trade_date": ["20240419", "20240419"],
+        "exalter": ["机构专用", "无关机构"],
+        "buy": [5e7, 9e9],
+        "sell": [1e7, 8e9],
+        "net_buy": [4e7, 1e9],
     })
     pro = _FakeProP3(top_inst=raw)
     provider = TushareProvider(pro_api=pro)  # type: ignore[arg-type]
     out = provider.fetch_top_inst("600000", end_date=date(2024, 4, 19))
     assert len(out) == 1
+    assert pro.top_inst_calls[0] == {"trade_date": "20240419"}
     assert out.iloc[0]["institution_name"] == "机构专用"
     assert out.iloc[0]["inst_net_amount"] == pytest.approx(4e7)
 

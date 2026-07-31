@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import re
-import time
+import urllib.request
 from datetime import date, timedelta
-from time import sleep
+from threading import Lock
+from time import monotonic, sleep
 from typing import Any, Protocol
 
 import numpy as np
@@ -148,6 +150,257 @@ class _TushareProApi(Protocol):
     ) -> object: ...
 
 
+class _HttpTushareProApi:
+    """Minimal Tushare Pro HTTP client used when the optional SDK is absent."""
+
+    _API_URL = "http://api.tushare.pro"
+
+    def __init__(self, *, token: str, timeout_sec: float) -> None:
+        self._token = str(token).strip()
+        self._timeout_sec = max(0.1, float(timeout_sec))
+
+    def _call(self, api_name: str, **kwargs: object) -> pd.DataFrame:
+        fields = str(kwargs.pop("fields", "") or "")
+        params = {str(key): value for key, value in kwargs.items() if value is not None}
+        payload = {
+            "api_name": str(api_name).strip(),
+            "token": self._token,
+            "params": params,
+            "fields": fields,
+        }
+        request = urllib.request.Request(
+            self._API_URL,
+            data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=self._timeout_sec) as response:
+            parsed = json.loads(response.read().decode("utf-8"))
+        if not isinstance(parsed, dict):
+            raise DataSourceError(f"tushare {api_name} returned invalid response")
+        if parsed.get("code") != 0:
+            msg = str(parsed.get("msg", "") or "").strip()
+            raise DataSourceError(
+                f"tushare {api_name} failed: code={parsed.get('code')} msg={msg}"
+            )
+        data = parsed.get("data", {})
+        if not isinstance(data, dict):
+            return pd.DataFrame()
+        response_fields = data.get("fields", [])
+        items = data.get("items", [])
+        if not isinstance(response_fields, list) or not isinstance(items, list):
+            return pd.DataFrame()
+        return pd.DataFrame(items, columns=[str(item) for item in response_fields])
+
+    def daily(
+        self,
+        *,
+        ts_code: str = "",
+        start_date: str = "",
+        end_date: str = "",
+    ) -> object:
+        return self._call("daily", ts_code=ts_code, start_date=start_date, end_date=end_date)
+
+    def daily_basic(
+        self,
+        *,
+        ts_code: str = "",
+        start_date: str = "",
+        end_date: str = "",
+        fields: str = "",
+    ) -> object:
+        return self._call(
+            "daily_basic",
+            ts_code=ts_code,
+            start_date=start_date,
+            end_date=end_date,
+            fields=fields,
+        )
+
+    def adj_factor(
+        self,
+        *,
+        ts_code: str = "",
+        start_date: str = "",
+        end_date: str = "",
+    ) -> object:
+        return self._call(
+            "adj_factor",
+            ts_code=ts_code,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+    def trade_cal(
+        self,
+        *,
+        exchange: str = "",
+        start_date: str = "",
+        end_date: str = "",
+        is_open: str = "",
+    ) -> object:
+        return self._call(
+            "trade_cal",
+            exchange=exchange,
+            start_date=start_date,
+            end_date=end_date,
+            is_open=is_open,
+        )
+
+    def stock_basic(self, *, ts_code: str = "", fields: str = "") -> object:
+        return self._call("stock_basic", ts_code=ts_code, fields=fields)
+
+    def fina_indicator(
+        self,
+        *,
+        ts_code: str = "",
+        start_date: str = "",
+        end_date: str = "",
+        fields: str = "",
+    ) -> object:
+        return self._call(
+            "fina_indicator",
+            ts_code=ts_code,
+            start_date=start_date,
+            end_date=end_date,
+            fields=fields,
+        )
+
+    def stk_limit(
+        self,
+        *,
+        ts_code: str = "",
+        trade_date: str = "",
+        start_date: str = "",
+        end_date: str = "",
+    ) -> object:
+        return self._call(
+            "stk_limit",
+            ts_code=ts_code,
+            trade_date=trade_date,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+    def suspend_d(
+        self,
+        *,
+        ts_code: str = "",
+        start_date: str = "",
+        end_date: str = "",
+    ) -> object:
+        return self._call(
+            "suspend_d",
+            ts_code=ts_code,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+    def margin_detail(
+        self,
+        *,
+        ts_code: str = "",
+        start_date: str = "",
+        end_date: str = "",
+    ) -> object:
+        return self._call(
+            "margin_detail",
+            ts_code=ts_code,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+    def moneyflow(
+        self,
+        *,
+        ts_code: str = "",
+        start_date: str = "",
+        end_date: str = "",
+    ) -> object:
+        return self._call(
+            "moneyflow",
+            ts_code=ts_code,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+    def hk_hold(
+        self,
+        *,
+        ts_code: str = "",
+        start_date: str = "",
+        end_date: str = "",
+    ) -> object:
+        return self._call(
+            "hk_hold",
+            ts_code=ts_code,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+    def top_list(
+        self,
+        *,
+        ts_code: str = "",
+        trade_date: str = "",
+        start_date: str = "",
+        end_date: str = "",
+    ) -> object:
+        return self._call(
+            "top_list",
+            ts_code=ts_code,
+            trade_date=trade_date,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+    def top_inst(
+        self,
+        *,
+        ts_code: str = "",
+        trade_date: str = "",
+        start_date: str = "",
+        end_date: str = "",
+    ) -> object:
+        return self._call(
+            "top_inst",
+            ts_code=ts_code,
+            trade_date=trade_date,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+    def block_trade(
+        self,
+        *,
+        ts_code: str = "",
+        trade_date: str = "",
+        start_date: str = "",
+        end_date: str = "",
+    ) -> object:
+        return self._call(
+            "block_trade",
+            ts_code=ts_code,
+            trade_date=trade_date,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+    def index_daily(
+        self,
+        *,
+        ts_code: str = "",
+        start_date: str = "",
+        end_date: str = "",
+    ) -> object:
+        return self._call(
+            "index_daily",
+            ts_code=ts_code,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+
 class TushareProvider:
     """Fetch A-share daily bars from Tushare Pro (`pro.daily` + `adj_factor` → qfq)."""
 
@@ -160,7 +413,7 @@ class TushareProvider:
         max_attempts: int = 2,
         socket_timeout_sec: float = 15.0,
         price_series_mode: str = "qfq",
-        min_request_interval_sec: float = 0.3,
+        min_request_interval_sec: float | None = None,
     ) -> None:
         self._token = str(token or "").strip() or _resolve_tushare_token()
         self._pro_api = pro_api
@@ -168,10 +421,20 @@ class TushareProvider:
         self._max_attempts = max(1, int(max_attempts))
         self._socket_timeout_sec = max(0.1, float(socket_timeout_sec))
         self._price_series_mode = str(price_series_mode or "qfq").strip().lower() or "qfq"
-        self._min_request_interval_sec = max(0.0, float(min_request_interval_sec))
+        self._min_request_interval_sec = max(
+            0.0,
+            float(
+                retry_delay_sec
+                if min_request_interval_sec is None
+                else min_request_interval_sec
+            ),
+        )
         self._last_request_time: float = 0.0
+        self._request_lock = Lock()
         self._name_cache: dict[str, str] = {}
         self._trade_cal_cache: dict[str, list[date]] = {}
+        self._top_list_by_trade_date_cache: dict[str, pd.DataFrame] = {}
+        self._top_inst_by_trade_date_cache: dict[str, pd.DataFrame] = {}
 
     def fetch_daily_bars(
         self,
@@ -431,14 +694,23 @@ class TushareProvider:
                 f"stk_limit={limit_error}; suspend_d={suspend_error}"
             )
 
-        return _normalize_trade_status(
+        result = _normalize_trade_status(
             limit_frame=limit_frame,
             suspend_frame=suspend_frame,
             symbol=code6,
             start_date=resolved_start,
             end_date=resolved_end,
+            limit_available=limit_error is None,
             suspend_available=suspend_error is None,
         )
+        failed_components: list[str] = []
+        if limit_error is not None:
+            failed_components.append('stk_limit')
+        if suspend_error is not None:
+            failed_components.append('suspend_d')
+        result.attrs['coverage_complete'] = not failed_components
+        result.attrs['failed_components'] = failed_components
+        return result
 
 
     def fetch_margin_detail(
@@ -535,6 +807,77 @@ class TushareProvider:
         return _normalize_hk_hold(_coerce_frame(raw), symbol=code6)
 
 
+    def _resolve_event_trade_dates(
+        self,
+        *,
+        start_date: date,
+        end_date: date,
+    ) -> list[date]:
+        """Resolve event-ledger dates; fallback keeps unit tests and degraded smoke cheap."""
+        try:
+            dates = self.list_open_trade_dates(start_date=start_date, end_date=end_date)
+        except Exception:
+            dates = []
+        if dates:
+            return dates
+        return [end_date]
+
+    def _fetch_top_list_raw_range(
+        self,
+        *,
+        pro: _TushareProApi,
+        start_date: date,
+        end_date: date,
+    ) -> pd.DataFrame:
+        frames: list[pd.DataFrame] = []
+        for trade_day in self._resolve_event_trade_dates(
+            start_date=start_date,
+            end_date=end_date,
+        ):
+            trade_date_s = trade_day.strftime("%Y%m%d")
+            cached = self._top_list_by_trade_date_cache.get(trade_date_s)
+            if cached is None:
+                raw = self._call_with_retry(
+                    lambda trade_date_s=trade_date_s: pro.top_list(
+                        trade_date=trade_date_s,
+                    )
+                )
+                cached = _coerce_frame(raw)
+                self._top_list_by_trade_date_cache[trade_date_s] = cached
+            if not cached.empty:
+                frames.append(cached.copy())
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, axis=0, ignore_index=True)
+
+    def _fetch_top_inst_raw_range(
+        self,
+        *,
+        pro: _TushareProApi,
+        start_date: date,
+        end_date: date,
+    ) -> pd.DataFrame:
+        frames: list[pd.DataFrame] = []
+        for trade_day in self._resolve_event_trade_dates(
+            start_date=start_date,
+            end_date=end_date,
+        ):
+            trade_date_s = trade_day.strftime("%Y%m%d")
+            cached = self._top_inst_by_trade_date_cache.get(trade_date_s)
+            if cached is None:
+                raw = self._call_with_retry(
+                    lambda trade_date_s=trade_date_s: pro.top_inst(
+                        trade_date=trade_date_s,
+                    )
+                )
+                cached = _coerce_frame(raw)
+                self._top_inst_by_trade_date_cache[trade_date_s] = cached
+            if not cached.empty:
+                frames.append(cached.copy())
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, axis=0, ignore_index=True)
+
     def fetch_top_list(
         self,
         symbol: str,
@@ -542,23 +885,25 @@ class TushareProvider:
         start_date: date | None = None,
         end_date: date | None = None,
     ) -> pd.DataFrame:
-        """Fetch top_list (龙虎榜) events for a single stock."""
+        """Fetch top_list (龙虎榜) events for a single stock.
+
+        Tushare top_list requires a single trade_date and returns all stocks for
+        that date, so fetch by trade day and filter by ts_code locally. Per-date
+        caches prevent a full-universe sync from refetching the same event ledger
+        for every symbol.
+        """
         pro = self._resolve_pro_api()
         code6 = _normalize_symbol(symbol)
         if not code6:
             raise DataSourceError(f"invalid symbol for top_list: {symbol}")
         ts_code = _to_ts_code(code6)
         resolved_end = end_date or date.today()
-        resolved_start = start_date or (resolved_end - timedelta(days=365))
-        start_s = resolved_start.strftime("%Y%m%d")
-        end_s = resolved_end.strftime("%Y%m%d")
+        resolved_start = start_date or resolved_end
         try:
-            raw = self._call_with_retry(
-                lambda: pro.top_list(
-                    ts_code=ts_code,
-                    start_date=start_s,
-                    end_date=end_s,
-                )
+            raw = self._fetch_top_list_raw_range(
+                pro=pro,
+                start_date=resolved_start,
+                end_date=resolved_end,
             )
         except Exception as exc:
             raise DataSourceError(
@@ -573,23 +918,23 @@ class TushareProvider:
         start_date: date | None = None,
         end_date: date | None = None,
     ) -> pd.DataFrame:
-        """Fetch top_inst (龙虎榜机构明细) for a single stock."""
+        """Fetch top_inst (龙虎榜机构明细) for a single stock.
+
+        Tushare top_inst follows the same trade_date event-ledger contract as
+        top_list; fetch by day and filter by current symbol before normalization.
+        """
         pro = self._resolve_pro_api()
         code6 = _normalize_symbol(symbol)
         if not code6:
             raise DataSourceError(f"invalid symbol for top_inst: {symbol}")
         ts_code = _to_ts_code(code6)
         resolved_end = end_date or date.today()
-        resolved_start = start_date or (resolved_end - timedelta(days=365))
-        start_s = resolved_start.strftime("%Y%m%d")
-        end_s = resolved_end.strftime("%Y%m%d")
+        resolved_start = start_date or resolved_end
         try:
-            raw = self._call_with_retry(
-                lambda: pro.top_inst(
-                    ts_code=ts_code,
-                    start_date=start_s,
-                    end_date=end_s,
-                )
+            raw = self._fetch_top_inst_raw_range(
+                pro=pro,
+                start_date=resolved_start,
+                end_date=resolved_end,
             )
         except Exception as exc:
             raise DataSourceError(
@@ -669,8 +1014,12 @@ class TushareProvider:
             )
         try:
             ts = importlib.import_module("tushare")
-        except ImportError as exc:
-            raise DataSourceError("tushare is not installed") from exc
+        except ImportError:
+            self._pro_api = _HttpTushareProApi(
+                token=self._token,
+                timeout_sec=self._socket_timeout_sec,
+            )
+            return self._pro_api
         set_token = getattr(ts, "set_token", None)
         if callable(set_token):
             set_token(self._token)
@@ -681,15 +1030,15 @@ class TushareProvider:
         return self._pro_api
 
     def _call_with_retry(self, fn: Any) -> object:
-        # Rate limiting: enforce minimum interval between requests
-        if self._min_request_interval_sec > 0 and self._last_request_time > 0:
-            elapsed = time.time() - self._last_request_time
-            if elapsed < self._min_request_interval_sec:
-                sleep(self._min_request_interval_sec - elapsed)
-        self._last_request_time = time.time()
-
         last_error: Exception | None = None
         for attempt in range(1, self._max_attempts + 1):
+            # Apply the same cadence to initial calls and retries. The lock prevents
+            # hard-timeout worker threads from issuing a burst through one provider.
+            with self._request_lock:
+                elapsed = monotonic() - self._last_request_time
+                if self._last_request_time > 0 and elapsed < self._min_request_interval_sec:
+                    sleep(self._min_request_interval_sec - elapsed)
+                self._last_request_time = monotonic()
             try:
                 return fn()
             except Exception as exc:  # pragma: no cover
@@ -985,6 +1334,7 @@ def _normalize_trade_status(
     symbol: str,
     start_date: date,
     end_date: date,
+    limit_available: bool = True,
     suspend_available: bool = True,
 ) -> pd.DataFrame:
     """Merge stk_limit and suspend_d into unified trade status rows.
@@ -1014,7 +1364,7 @@ def _normalize_trade_status(
                     "suspend_type": "",
                     "source": "tushare_stk_limit",
                     "as_of": key,
-                    "coverage_complete": suspend_available,
+                    "coverage_complete": limit_available and suspend_available,
                 }
             up = pd.to_numeric([row.get("up_limit")], errors="coerce")[0]
             down = pd.to_numeric([row.get("down_limit")], errors="coerce")[0]
@@ -1045,11 +1395,16 @@ def _normalize_trade_status(
                     "coverage_complete": True,
                 }
             rows[key]["suspended"] = True
-            rows[key]["coverage_complete"] = True
+            rows[key]["coverage_complete"] = limit_available and suspend_available
             stype = str(row.get("suspend_type", "") or row.get("reason", "") or "").strip()
             if stype:
                 rows[key]["suspend_type"] = stype
-            rows[key]["source"] = "tushare_stk_limit+suspend_d"
+            prior_source = str(rows[key].get("source", ""))
+            rows[key]["source"] = (
+                "tushare_stk_limit+suspend_d"
+                if "stk_limit" in prior_source
+                else "tushare_suspend_d"
+            )
 
     if not rows:
         return pd.DataFrame()
@@ -1072,7 +1427,9 @@ def _normalize_margin_detail(frame: pd.DataFrame, *, symbol: str) -> pd.DataFram
     """
     if frame is None or frame.empty or "trade_date" not in frame.columns:
         return pd.DataFrame()
-    out = frame.copy()
+    out = _filter_symbol_event_rows(frame, symbol=symbol)
+    if out.empty:
+        return pd.DataFrame()
     out["symbol"] = str(symbol).zfill(6)[-6:]
     out["trade_date"] = pd.to_datetime(
         out["trade_date"].astype(str), format="%Y%m%d", errors="coerce"
@@ -1112,7 +1469,9 @@ def _normalize_moneyflow(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
     """
     if frame is None or frame.empty or "trade_date" not in frame.columns:
         return pd.DataFrame()
-    out = frame.copy()
+    out = _filter_symbol_event_rows(frame, symbol=symbol)
+    if out.empty:
+        return pd.DataFrame()
     out["symbol"] = str(symbol).zfill(6)[-6:]
     out["trade_date"] = pd.to_datetime(
         out["trade_date"].astype(str), format="%Y%m%d", errors="coerce"
@@ -1195,6 +1554,21 @@ def _normalize_hk_hold(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
     return out
 
 
+def _filter_symbol_event_rows(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
+    """Filter date-level Tushare event rows down to one 6-digit symbol."""
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    code6 = str(symbol).zfill(6)[-6:]
+    out = frame.copy()
+    if "ts_code" in out.columns:
+        raw_codes = out["ts_code"].astype(str).str.upper()
+        return out.loc[raw_codes.str.startswith(code6)].copy()
+    if "symbol" in out.columns:
+        normalized = out["symbol"].astype(str).map(_normalize_symbol)
+        return out.loc[normalized == code6].copy()
+    return pd.DataFrame()
+
+
 def _normalize_top_list(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
     """Normalize top_list (龙虎榜) rows.
 
@@ -1203,7 +1577,9 @@ def _normalize_top_list(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
     """
     if frame is None or frame.empty or "trade_date" not in frame.columns:
         return pd.DataFrame()
-    out = frame.copy()
+    out = _filter_symbol_event_rows(frame, symbol=symbol)
+    if out.empty:
+        return pd.DataFrame()
     out["symbol"] = str(symbol).zfill(6)[-6:]
     out["trade_date"] = pd.to_datetime(
         out["trade_date"].astype(str), format="%Y%m%d", errors="coerce"
@@ -1217,9 +1593,11 @@ def _normalize_top_list(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
         reason_count=("trade_date", "size"),
     )
     if "reason" in out.columns:
-        reasons = out.groupby("trade_date")["reason"].apply(
-            lambda x: "|".join(sorted(set(str(v) for v in x if v)))
-        ).reset_index()
+        reasons = (
+            out.groupby("trade_date")["reason"]
+            .apply(lambda x: "|".join(sorted(set(str(v) for v in x if v))))
+            .reset_index()
+        )
         reasons.columns = ["trade_date", "reasons"]
         agg = agg.merge(reasons, on="trade_date", how="left")
     else:
@@ -1238,12 +1616,13 @@ def _normalize_top_list(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
     agg["coverage_complete"] = True
     return agg.sort_values("trade_date").reset_index(drop=True)
 
-
 def _normalize_top_inst(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
     """Normalize top_inst (龙虎榜机构明细) rows."""
     if frame is None or frame.empty or "trade_date" not in frame.columns:
         return pd.DataFrame()
-    out = frame.copy()
+    out = _filter_symbol_event_rows(frame, symbol=symbol)
+    if out.empty:
+        return pd.DataFrame()
     out["symbol"] = str(symbol).zfill(6)[-6:]
     out["trade_date"] = pd.to_datetime(
         out["trade_date"].astype(str), format="%Y%m%d", errors="coerce"
@@ -1271,7 +1650,6 @@ def _normalize_top_inst(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
     out["as_of"] = out["trade_date"].dt.strftime("%Y-%m-%d")
     out["coverage_complete"] = True
     return out
-
 
 def _normalize_block_trade(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
     """Normalize block_trade (大宗交易) rows.

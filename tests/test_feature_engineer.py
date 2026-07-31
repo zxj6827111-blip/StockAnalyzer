@@ -29,6 +29,15 @@ def _bars() -> pd.DataFrame:
             "margin_financing_balance": np.linspace(1_000_000_000, 1_200_000_000, num=30),
             "northbound_net": np.linspace(-50_000_000, 80_000_000, num=30),
             "dragon_tiger_flag": [1 if i % 7 == 0 else 0 for i in range(30)],
+            "moneyflow_net_amount": np.linspace(-2_000_000, 3_000_000, num=30),
+            "hk_hold_ratio": np.linspace(1.0, 1.4, num=30),
+            "hk_hold_change": np.linspace(-10_000, 20_000, num=30),
+            "inst_net_amount": np.where(np.arange(30) % 7 == 0, 1_000_000.0, np.nan),
+            "block_trade_amount": np.where(np.arange(30) % 5 == 0, 2_000_000.0, np.nan),
+            "block_trade_volume": np.where(np.arange(30) % 5 == 0, 100_000.0, np.nan),
+            "block_trade_premium_discount": np.where(
+                np.arange(30) % 5 == 0, 0.01, np.nan
+            ),
             "board": ["main"] * 30,
         },
         index=dates,
@@ -49,6 +58,10 @@ def test_feature_engineer_uses_t_minus_1_values() -> None:
     assert abs(float(features.loc[idx, "ma5"]) - expected_ma5) < 1e-9
     assert float(features.loc[idx, "bg_roe"]) == pytest.approx(float(bars.iloc[9]["roe"]))
     assert float(features.loc[idx, "bg_board_code"]) == 0.0
+    assert "moneyflow_net_20" in features.columns
+    assert "hk_hold_ratio_chg_5" in features.columns
+    assert "inst_net_amount_20" in features.columns
+    assert "block_trade_turnover_ratio_20" in features.columns
     assert features.shape[1] >= 60
     assert "__not_exists__" not in features.columns
     assert np.isfinite(features.to_numpy(dtype=float)).all()
