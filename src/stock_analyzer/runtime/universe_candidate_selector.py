@@ -22,14 +22,29 @@ import random
 from collections.abc import Callable, Mapping
 from datetime import date, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Protocol, runtime_checkable
 from uuid import uuid4
 
 import numpy as np
 import pandas as pd
 
-if TYPE_CHECKING:
-    from stock_analyzer.data.market_warehouse import MarketWarehouse
+
+@runtime_checkable
+class UniverseQualityBatchSource(Protocol):
+    """Minimal batch quality-metrics contract for the selector.
+
+    Anything with ``fetch_universe_quality_metrics`` may back the selector —
+    a full ``MarketWarehouse``, a ``VendorZipOverlayProvider`` (ZIP history +
+    delta overlay), or a wrapper around either. The selector never reaches
+    into provider internals; it only calls this one batch method.
+    """
+
+    def fetch_universe_quality_metrics(
+        self,
+        *,
+        symbols: list[str],
+        lookback_days: int,
+    ) -> pd.DataFrame: ...
 
 # Five-board classification mirroring runtime.service._BOARD_ORDER / map.
 # Re-implemented locally to avoid a circular import on service.
@@ -105,7 +120,7 @@ class UniverseCandidateSelector:
     def __init__(
         self,
         *,
-        warehouse: MarketWarehouse,
+        warehouse: UniverseQualityBatchSource,
         weights: Mapping[str, float] | None = None,
         min_history_days: int = 60,
         min_avg_turnover_20: float = 0.0,

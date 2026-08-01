@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import time
+import zipfile
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,7 +14,13 @@ from pytest import fixture
 
 from stock_analyzer.command.channel import CommandEnvelope, SignedCommandProcessor
 from stock_analyzer.config import StockAnalyzerConfig, load_config
+from stock_analyzer.data.cached_provider import CachedProvider
 from stock_analyzer.data.provider import SyntheticProvider
+from stock_analyzer.data.vendor_zip_overlay import (
+    VendorZipOverlayProvider,
+    write_vendor_zip_daily_index,
+)
+from stock_analyzer.infra.cache import InMemoryCache
 from stock_analyzer.learning.sample_schema import SignalSnapshot
 from stock_analyzer.models.calibration import IsotonicCalibrator
 from stock_analyzer.models.execution_risk_artifact import ExecutionRiskArtifact
@@ -3639,3 +3646,229 @@ def test_degraded_selection_does_not_overwrite_success_snapshot(tmp_path: Path) 
         "selector_mode_not_successful"
     )
     assert snapshot_path.read_bytes() == persisted_before
+
+
+# ---------------------------------------------------------------------------
+# Batch source resolution: provider graph before market warehouse
+# ---------------------------------------------------------------------------
+def _write_vendor_daily_zip(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    daily_csv = "\n".join(
+        [
+            "code,datetime,open,high,low,close,volume,amount,circ_mv",
+            "600000.SH,2025-12-30,10,11,9,10.5,100,123.4,200000",
+            "600000.SH,2025-12-31,10.5,11.5,10,11,200,234.5,210000",
+        ]
+    )
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("2025/600000.SH.csv", daily_csv.encode("utf-8"))
+
+
+def _build_vendor_overlay_provider(tmp_path: Path) -> VendorZipOverlayProvider:
+    _write_vendor_daily_zip(tmp_path / "全A日K" / "2025.zip")
+    index_path = tmp_path / "index" / "daily_index.json"
+    write_vendor_zip_daily_index(root=tmp_path, output_path=index_path)
+    return VendorZipOverlayProvider(
+        data_root=str(tmp_path),
+        index_path=str(index_path),
+        delta_db_path=str(tmp_path / "delta" / "market_delta.duckdb"),
+        delta_package_root=str(tmp_path / "delta" / "package"),
+    )
+
+
+def _bare_service_with_provider(
+    config: StockAnalyzerConfig, provider: object
+) -> StockAnalyzerService:
+    service = object.__new__(StockAnalyzerService)
+    object.__setattr__(service, "_config", config)
+    object.__setattr__(service, "_provider", provider)
+    object.__setattr__(service, "_realtime_provider", None)
+
+    def _unexpected_market_warehouse() -> object:
+        raise AssertionError("market warehouse must not be reached when a batch provider exists")
+
+    object.__setattr__(service, "_market_warehouse", _unexpected_market_warehouse)
+    return service
+
+
+def test_week5_batch_source_prefers_vendor_overlay_provider_through_wrapper(
+    tmp_path: Path,
+) -> None:
+    """vendor overlay 部署:selector 数据源必须是 provider graph 里的
+    VendorZipOverlayProvider,即使外层包了 CachedProvider;绝不允许把
+    overlay 内部的 delta MarketWarehouse 当成完整数据源。"""
+    config = _load_test_config()
+    overlay = _build_vendor_overlay_provider(tmp_path)
+    wrapped = CachedProvider(
+        inner=overlay,
+        cache=InMemoryCache(),
+        ttl_sec=60,
+        key_prefix="week5_test",
+    )
+    service = _bare_service_with_provider(config, wrapped)
+
+    source = service._resolve_universe_quality_batch_source()
+
+    assert source is overlay
+
+
+def test_week5_batch_source_prefers_vendor_overlay_provider_without_wrapper(
+    tmp_path: Path,
+) -> None:
+    """未启用缓存时 provider 直接是 VendorZipOverlayProvider,仍应被选中。"""
+    config = _load_test_config()
+    overlay = _build_vendor_overlay_provider(tmp_path)
+    service = _bare_service_with_provider(config, overlay)
+
+    source = service._resolve_universe_quality_batch_source()
+
+    assert source is overlay
+
+
+def test_week5_batch_source_falls_back_to_market_warehouse_when_no_provider_batch(
+    tmp_path: Path,
+) -> None:
+    """普通 market_warehouse/离线部署:provider graph 无批量能力时必须回退
+    到 _market_warehouse(),保持原行为。"""
+    config = _load_test_config()
+    service = _new_service(config)
+
+    class _MarketWarehouseFallback:
+        pass
+
+    fallback = _MarketWarehouseFallback()
+    _patch_attr(service, "_market_warehouse", lambda: fallback)
+
+    source = service._resolve_universe_quality_batch_source()
+
+    assert source is fallback
+
+
+def test_week5_quality_selector_uses_vendor_overlay_batch_source(tmp_path: Path) -> None:
+    """_select_universe_quality_candidates 在 vendor overlay 模式下必须把
+    VendorZipOverlayProvider 的批量能力传给 UniverseCandidateSelector。"""
+    config = _load_test_config()
+    _enable_universe_quality_selector(config)
+    overlay = _build_vendor_overlay_provider(tmp_path)
+    service = _bare_service_with_provider(config, overlay)
+    captured: dict[str, object] = {}
+
+    class _CapturingSelector:
+        def __init__(self, **kwargs: object) -> None:
+            captured["warehouse"] = kwargs["warehouse"]
+
+        def select(self, **kwargs: object) -> dict[str, object]:
+            captured["select_symbols"] = kwargs["symbols"]
+            return {
+                "selected": ["600000"],
+                "report": {
+                    "selector_mode": "quality",
+                    "target_size": 300,
+                    "selected_count": 1,
+                },
+            }
+
+    from stock_analyzer.runtime import universe_candidate_selector as selector_module_ref
+
+    original_selector = selector_module_ref.UniverseCandidateSelector
+    original_persist = selector_module_ref.persist_selection_snapshot
+    try:
+        selector_module_ref.UniverseCandidateSelector = _CapturingSelector  # type: ignore[assignment]
+        selector_module_ref.persist_selection_snapshot = lambda *a, **k: None  # type: ignore[assignment]
+        result = service._select_universe_quality_candidates(
+            symbols=["600000"],
+            target_size=300,
+            trade_date="2026-07-31",
+            reference_date="2026-07-31",
+            ruleset_id="a_share_default_v1",
+            board_scope=["SSE", "SZSE", "BSE"],
+        )
+    finally:
+        selector_module_ref.UniverseCandidateSelector = original_selector
+        selector_module_ref.persist_selection_snapshot = original_persist
+
+    assert captured["warehouse"] is overlay
+    assert captured["select_symbols"] == ["600000"]
+    assert result["selected"] == ["600000"]
+
+
+def _write_vendor_daily_zip_multi_day(
+    path: Path,
+    *,
+    symbol: str = "600000.SH",
+    start: str = "2025-01-02",
+    end: str = "2025-12-31",
+) -> None:
+    """A full trading-year vendor CSV so the selector's min-history gate passes."""
+    dates = pd.bdate_range(start=start, end=end)
+    rows = [f"{symbol},{dt.strftime('%Y-%m-%d')},10,11,9,10.5,200,234.5,210000" for dt in dates]
+    daily_csv = "\n".join(["code,datetime,open,high,low,close,volume,amount,circ_mv", *rows])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("2025/600000.SH.csv", daily_csv.encode("utf-8"))
+
+
+def test_week5_quality_selector_passes_financial_gate_with_backfilled_snapshots(
+    tmp_path: Path,
+) -> None:
+    """vendor overlay 部署:backfill 的财务快照经 batch PIT join 后,quality
+    selector 的财务硬门禁(require_financial_data)必须真实通过,600000 被
+    quality 模式选中(而不是 degraded_fallback 或财务剔除)。"""
+    config = _load_test_config()
+    _enable_universe_quality_selector(config)
+    _write_vendor_daily_zip_multi_day(tmp_path / "全A日K" / "2025.zip")
+    index_path = tmp_path / "index" / "daily_index.json"
+    write_vendor_zip_daily_index(root=tmp_path, output_path=index_path)
+    overlay = VendorZipOverlayProvider(
+        data_root=str(tmp_path),
+        index_path=str(index_path),
+        delta_db_path=str(tmp_path / "delta" / "market_delta.duckdb"),
+        delta_package_root=str(tmp_path / "delta" / "package"),
+    )
+    snapshots = pd.DataFrame(
+        {
+            "symbol": ["600000"],
+            "end_date": pd.to_datetime(["2025-09-30"]),
+            "ann_date": pd.to_datetime(["2025-11-10"]),
+            "roe": [0.15],
+            "debt_ratio": [0.45],
+            "update_flag": [0],
+            "financial_report_date": ["2025-09-30"],
+            "financial_as_of": ["2025-11-10"],
+            "financial_source": ["tushare_fina_indicator"],
+            "financial_trust_level": ["reported"],
+            "financial_missing_fields": [""],
+            "financial_data_complete": [True],
+            "financial_completeness": [1.0],
+            "coverage_complete": [True],
+            "as_of": ["2025-11-10"],
+            "source": ["tushare_fina_indicator"],
+        }
+    )
+    from stock_analyzer.data.market_warehouse import MarketWarehouse
+
+    MarketWarehouse(
+        db_path=str(tmp_path / "delta" / "market_delta.duckdb"),
+        package_root=str(tmp_path / "delta" / "package"),
+    ).upsert_financial_snapshots(symbol="600000", frame=snapshots)
+    service = _bare_service_with_provider(config, overlay)
+
+    result = service._select_universe_quality_candidates(
+        symbols=["600000"],
+        target_size=300,
+        trade_date="2025-12-31",
+        reference_date="2025-12-31",
+        ruleset_id="a_share_default_v1",
+        board_scope=["SSE"],
+    )
+
+    report = result["report"]
+    assert isinstance(report, dict)
+    assert report["selector_mode"] in {"quality", "quality_all_eligible"}
+    assert report["selected_count"] == 1
+    assert result["selected"] == ["600000"]
+    assert report.get("fallback_reason") in (None, "")
+    rejected = report.get("rejected_count_by_reason", {})
+    assert isinstance(rejected, dict)
+    assert "financial" not in rejected
+    assert rejected.get("stale", 0) == 0

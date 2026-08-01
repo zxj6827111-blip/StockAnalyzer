@@ -76,9 +76,7 @@ def normalize_fina_indicator_rows(
     out["end_date"] = pd.to_datetime(frame[end_col].astype(str), format="%Y%m%d", errors="coerce")
     out["ann_date"] = pd.to_datetime(frame[ann_col].astype(str), format="%Y%m%d", errors="coerce")
     out["roe"] = frame[roe_col].map(percent_to_ratio) if roe_col is not None else np.nan
-    out["debt_ratio"] = (
-        frame[debt_col].map(percent_to_ratio) if debt_col is not None else np.nan
-    )
+    out["debt_ratio"] = frame[debt_col].map(percent_to_ratio) if debt_col is not None else np.nan
     if update_col is not None:
         out["update_flag"] = pd.to_numeric(frame[update_col], errors="coerce").fillna(0).astype(int)
     else:
@@ -301,6 +299,151 @@ def apply_financial_snapshots_asof(
         work.index.name = "date"
         return work
     return work
+
+
+def apply_financial_snapshots_asof_batch(
+    daily: pd.DataFrame,
+    snapshots: pd.DataFrame,
+    *,
+    only_fill_pending: bool = True,
+) -> pd.DataFrame:
+    """Vectorized multi-symbol as-of financial join (one merge_asof for the whole universe).
+
+    Same PIT semantics as :func:`apply_financial_snapshots_asof` (ann_date
+    disclosure without pre-announcement leak, later end_date / higher
+    update_flag win on the same ann_date), but performed with a single
+    ``pd.merge_asof(by="symbol")`` so thousands of symbols are enriched in
+    one pass instead of per-symbol loops. ``daily`` must carry a ``symbol``
+    column and a ``date`` column.
+    """
+    if daily is None or daily.empty:
+        return daily
+    out = daily.copy()
+    if snapshots is None or snapshots.empty:
+        return out
+    if "symbol" not in out.columns or "date" not in out.columns:
+        return out
+
+    work = out.copy()
+    work["date"] = pd.to_datetime(work["date"], errors="coerce")
+    work = work.dropna(subset=["date"])
+    if work.empty:
+        return out
+
+    snap = snapshots.copy()
+    snap["ann_date"] = pd.to_datetime(snap["ann_date"], errors="coerce")
+    if "end_date" in snap.columns:
+        snap["end_date"] = pd.to_datetime(snap["end_date"], errors="coerce")
+    if "update_flag" not in snap.columns:
+        snap["update_flag"] = 0
+    snap = snap.dropna(subset=["ann_date"]).copy()
+    if snap.empty:
+        return out
+
+    # PIT single-row-per-ann_date per symbol: later end_date then higher
+    # update_flag win on the same disclosure date.
+    snap = snap.sort_values(
+        by=["symbol", "ann_date", "end_date", "update_flag"],
+        ascending=[True, True, True, True],
+        kind="mergesort",
+    )
+    snap = snap.drop_duplicates(subset=["symbol", "ann_date"], keep="last")
+
+    fill_mask = pd.Series(True, index=work.index)
+    if only_fill_pending:
+        fill_mask = pd.Series(False, index=work.index)
+        if "financial_trust_level" in work.columns:
+            trust = work["financial_trust_level"].astype(str).str.strip().str.lower()
+            source_col = work.get("financial_source", pd.Series("", index=work.index)).astype(str)
+            source = source_col.str.strip().str.lower()
+            keep_trusted = trust.isin({"reported", "derived"}) & ~source.isin(
+                {
+                    "",
+                    "missing",
+                    "tushare_pending",
+                    "tdx_offline",
+                    "heuristic",
+                    "default",
+                    "akshare_tx_default",
+                    "efinance_default",
+                }
+            )
+            fill_mask = ~keep_trusted
+
+    positions = np.flatnonzero(fill_mask.to_numpy())
+    if positions.size == 0:
+        return out
+
+    work_fill = work.loc[fill_mask]
+    drop_cols = [col for col in _BATCH_FINANCIAL_COLUMNS if col in work_fill.columns]
+    left = work_fill.drop(columns=drop_cols, errors="ignore")
+    # merge_asof requires the on key to be globally sorted even when `by` is
+    # used; per-symbol groups are handled by the `by` argument itself. The
+    # original work_fill order (== positions order) is restored afterwards.
+    left_sorted = left.sort_values("date")
+    right = snap.sort_values("ann_date")
+    joined = pd.merge_asof(
+        left_sorted,
+        right,
+        left_on="date",
+        right_on="ann_date",
+        by="symbol",
+        direction="backward",
+        allow_exact_matches=True,
+    )
+    # merge_asof reorders output by `by` groups and resets the index to
+    # positional; restore the original daily row order via the sorted-left
+    # index labels so the fill below aligns with `positions`.
+    aligned = joined.copy()
+    aligned.index = left_sorted.index.to_numpy()
+    aligned = aligned.sort_index()
+    joined = aligned
+    joined["roe"] = pd.to_numeric(joined.get("roe"), errors="coerce")
+    joined["debt_ratio"] = pd.to_numeric(joined.get("debt_ratio"), errors="coerce")
+    joined["financial_data_complete"] = (
+        joined.get("financial_data_complete", pd.Series(np.nan, index=joined.index))
+        .fillna(False)
+        .astype(bool)
+    )
+    joined["financial_missing_fields"] = joined.get(
+        "financial_missing_fields", pd.Series(index=joined.index, dtype=object)
+    ).fillna("roe,debt_ratio")
+    joined["financial_source"] = joined.get(
+        "financial_source", pd.Series(index=joined.index, dtype=object)
+    ).fillna(_FINANCIAL_SOURCE)
+    # Unmatched bars (no snapshot disclosed as of that date) keep the same
+    # "tushare_pending" marker as the single-symbol path.
+    if "ann_date" in joined.columns:
+        joined.loc[joined["ann_date"].isna(), "financial_source"] = "tushare_pending"
+    joined["financial_report_date"] = joined.get(
+        "financial_report_date", pd.Series(index=joined.index, dtype=object)
+    ).fillna("")
+    joined["financial_as_of"] = joined.get(
+        "financial_as_of", pd.Series(index=joined.index, dtype=object)
+    ).fillna("")
+    joined["financial_trust_level"] = joined.get(
+        "financial_trust_level", pd.Series(index=joined.index, dtype=object)
+    ).fillna("missing")
+    joined["financial_completeness"] = pd.to_numeric(
+        joined.get("financial_completeness"), errors="coerce"
+    ).fillna(0.0)
+
+    for col in _BATCH_FINANCIAL_COLUMNS:
+        out.iloc[positions, out.columns.get_loc(col)] = joined[col].to_numpy()
+    return out
+
+
+_BATCH_FINANCIAL_COLUMNS = (
+    "roe",
+    "debt_ratio",
+    "financial_data_complete",
+    "financial_missing_fields",
+    "financial_source",
+    "financial_report_date",
+    "financial_as_of",
+    "financial_trust_level",
+    "financial_completeness",
+)
 
 
 def _empty_snapshot_frame() -> pd.DataFrame:

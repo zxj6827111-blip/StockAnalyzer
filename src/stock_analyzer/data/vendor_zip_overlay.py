@@ -144,8 +144,7 @@ def load_vendor_zip_daily_index(path: str | Path) -> dict[str, object]:
     version = int(payload.get("version", 0))
     if version != VENDOR_ZIP_INDEX_VERSION:
         raise DataSourceError(
-            f"unsupported vendor ZIP index version: {version}; "
-            f"expected {VENDOR_ZIP_INDEX_VERSION}"
+            f"unsupported vendor ZIP index version: {version}; expected {VENDOR_ZIP_INDEX_VERSION}"
         )
     if not isinstance(payload.get("symbols"), dict):
         raise DataSourceError(f"vendor ZIP index has no symbols mapping: {target}")
@@ -171,16 +170,10 @@ class VendorZipOverlayProvider:
     _root: Path = field(init=False)
     _index: dict[str, object] = field(init=False)
     _warehouse: MarketWarehouse = field(init=False)
-    _daily_cache: OrderedDict[str, pd.DataFrame] = field(
-        default_factory=OrderedDict, init=False
-    )
-    _intraday_cache: OrderedDict[str, pd.DataFrame] = field(
-        default_factory=OrderedDict, init=False
-    )
+    _daily_cache: OrderedDict[str, pd.DataFrame] = field(default_factory=OrderedDict, init=False)
+    _intraday_cache: OrderedDict[str, pd.DataFrame] = field(default_factory=OrderedDict, init=False)
     _minute_archives: dict[str, list[Path]] = field(default_factory=dict, init=False)
-    _minute_entry_index: dict[Path, dict[str, list[str]]] = field(
-        default_factory=dict, init=False
-    )
+    _minute_entry_index: dict[Path, dict[str, list[str]]] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
         self._root = Path(self.data_root).expanduser()
@@ -208,11 +201,7 @@ class VendorZipOverlayProvider:
 
     def list_symbols(self) -> list[str]:
         symbols = self._symbols_mapping()
-        return sorted(
-            symbol
-            for symbol in (_normalize_symbol(item) for item in symbols)
-            if symbol
-        )
+        return sorted(symbol for symbol in (_normalize_symbol(item) for item in symbols) if symbol)
 
     def latest_daily_dates(self, *, symbols: list[str] | None = None) -> dict[str, date]:
         requested = {
@@ -265,6 +254,100 @@ class VendorZipOverlayProvider:
         result.attrs["historical_root"] = str(self._root)
         result.attrs["delta_db_path"] = str(self._warehouse.db_path)
         return result
+
+    def fetch_universe_quality_metrics(
+        self,
+        *,
+        symbols: list[str],
+        lookback_days: int,
+    ) -> pd.DataFrame:
+        """Batch-fetch per-symbol daily history (ZIP baseline + delta overlay).
+
+        Single call covering the whole requested universe, mirroring
+        ``MarketWarehouse.fetch_universe_quality_metrics`` so the Week5
+        quality selector can treat the overlay as a full-market batch source.
+
+        I/O rules:
+        - requested symbols are normalized, de-duplicated and sorted;
+        - the delta DuckDB is queried exactly once;
+        - ZIP entries are grouped by annual archive and each annual archive is
+          opened at most once per call, newest year first;
+        - per symbol, reading stops once ``lookback_days`` rows accumulated,
+          so earlier (older) annual files are skipped;
+        - ZIP archives are never extracted and neither ZIPs, index, DuckDB nor
+          named volumes are modified;
+        - per-symbol rows never enter the small per-symbol LRU cache.
+
+        Merge rules: ZIP provides the historical baseline, delta provides the
+        recent increment, and on duplicate symbol/date the delta row wins.
+        The final frame keeps at most the last ``lookback_days`` rows per
+        symbol and is sorted by symbol, date (date is a plain column).
+        """
+        limit = max(1, int(lookback_days))
+        normalized = sorted(
+            {item for item in (_normalize_symbol(value) for value in (symbols or [])) if item}
+        )
+        if not normalized:
+            return pd.DataFrame()
+
+        delta = self._warehouse.fetch_universe_quality_metrics(
+            symbols=normalized,
+            lookback_days=limit,
+        )
+        if not delta.empty:
+            delta = delta[delta["symbol"].isin(normalized)]
+
+        zip_frames = self._load_vendor_daily_batch(symbols=normalized, limit=limit)
+        pieces = [frame for frame in zip_frames if not frame.empty]
+        if not delta.empty:
+            pieces.append(delta)
+        if not pieces:
+            return pd.DataFrame()
+
+        combined = pd.concat(pieces, axis=0, sort=False, ignore_index=True)
+        combined["date"] = pd.to_datetime(combined["date"], errors="coerce")
+        combined = combined.dropna(subset=["date"])
+        combined["symbol"] = combined["symbol"].astype(str)
+        # Stable sort keeps ZIP rows before delta rows on the same date so
+        # drop_duplicates(keep="last") lets the delta row win.
+        combined = combined.sort_values(["symbol", "date"], kind="stable")
+        combined = combined.drop_duplicates(subset=["symbol", "date"], keep="last")
+        combined = combined.groupby("symbol", sort=False).tail(limit)
+        combined = combined.sort_values(["symbol", "date"]).reset_index(drop=True)
+        combined = self._apply_financial_snapshots_batch(combined, symbols=normalized)
+        return combined
+
+    def _apply_financial_snapshots_batch(
+        self,
+        frame: pd.DataFrame,
+        *,
+        symbols: list[str],
+    ) -> pd.DataFrame:
+        """Batch PIT as-of join of financial snapshots onto the merged frame.
+
+        Reads the delta warehouse ``financial_snapshots`` table once for the
+        whole universe and joins with a single vectorized ``merge_asof``
+        (never one query per symbol). ZIP-only rows without any snapshot stay
+        honestly missing; delta rows that already carry reported/derived
+        financials are preserved.
+        """
+        if frame is None or frame.empty:
+            return frame
+        if not symbols:
+            return frame
+        snapshots = self._warehouse.fetch_financial_snapshots_batch(symbols=symbols)
+        if snapshots.empty:
+            return frame
+        from stock_analyzer.data.financial_pit import apply_financial_snapshots_asof_batch
+
+        return cast(
+            pd.DataFrame,
+            apply_financial_snapshots_asof_batch(
+                frame,
+                snapshots,
+                only_fill_pending=True,
+            ),
+        )
 
     def fetch_intraday_summary(
         self,
@@ -354,6 +437,90 @@ class VendorZipOverlayProvider:
         self._remember(self._daily_cache, symbol, merged)
         return merged.copy()
 
+    def _load_vendor_daily_batch(
+        self,
+        *,
+        symbols: list[str],
+        limit: int,
+    ) -> list[pd.DataFrame]:
+        """Read ZIP daily history for many symbols without per-symbol calls.
+
+        Returns one long frame per symbol (date as a plain column), reading
+        annual archives newest year first and stopping per symbol once
+        ``limit`` rows have been accumulated. Each annual ZIP archive is
+        opened at most once.
+        """
+        entries_by_symbol: dict[str, list[dict[str, object]]] = {}
+        for symbol in symbols:
+            raw_symbol = self._symbols_mapping().get(symbol)
+            if not isinstance(raw_symbol, dict):
+                continue
+            raw_entries = raw_symbol.get("entries")
+            if not isinstance(raw_entries, list):
+                continue
+            entries = [
+                item
+                for item in raw_entries
+                if isinstance(item, dict)
+                and str(item.get("zip", "")).strip()
+                and str(item.get("entry", "")).strip()
+            ]
+            if entries:
+                entries_by_symbol[symbol] = entries
+
+        by_archive: dict[str, dict[str, str]] = {}
+        archive_years: dict[str, int] = {}
+        for symbol, entries in entries_by_symbol.items():
+            for item in entries:
+                relative_zip = str(item.get("zip", "")).strip()
+                entry_name = str(item.get("entry", "")).strip()
+                year = _coerce_int(item.get("year"))
+                by_archive.setdefault(relative_zip, {})[symbol] = entry_name
+                archive_years[relative_zip] = max(archive_years.get(relative_zip, 0), year)
+
+        accumulated: dict[str, list[pd.DataFrame]] = {symbol: [] for symbol in symbols}
+        remaining = {
+            symbol: max(0, limit - sum(len(frame) for frame in frames))
+            for symbol, frames in accumulated.items()
+        }
+        archive_order = sorted(archive_years, key=lambda path: archive_years[path], reverse=True)
+        for relative_zip in archive_order:
+            refs = by_archive[relative_zip]
+            needed_symbols = [symbol for symbol in refs if remaining[symbol] > 0]
+            if not needed_symbols:
+                continue
+            archive_path = self._root / Path(relative_zip)
+            if not archive_path.exists():
+                raise DataSourceError(f"vendor ZIP archive is missing: {archive_path}")
+            with zipfile.ZipFile(archive_path) as archive:
+                for symbol in needed_symbols:
+                    entry_name = refs[symbol]
+                    try:
+                        with archive.open(entry_name) as stream:
+                            raw = pd.read_csv(stream)
+                    except KeyError as exc:
+                        raise DataSourceError(
+                            f"vendor ZIP entry is missing: {archive_path}!{entry_name}"
+                        ) from exc
+                    normalized = self._normalize_vendor_daily(raw=raw, symbol=symbol)
+                    if not normalized.empty:
+                        frames = accumulated[symbol]
+                        frames.append(normalized)
+                        remaining[symbol] = max(0, remaining[symbol] - len(normalized))
+
+        long_frames: list[pd.DataFrame] = []
+        for symbol in symbols:
+            frames = accumulated[symbol]
+            if not frames:
+                continue
+            merged = _merge_overlay_frames(*frames)
+            if merged.empty:
+                continue
+            frame = merged.tail(limit).reset_index()
+            frame.insert(0, "symbol", symbol)
+            long_frames.append(frame)
+        return long_frames
+
     def _normalize_vendor_daily(self, *, raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
         if raw.empty:
             return pd.DataFrame()
@@ -373,16 +540,13 @@ class VendorZipOverlayProvider:
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
         frame["volume"] = frame["volume"] * max(0.0, float(self.daily_volume_multiplier))
         if "amount" in frame.columns:
-            frame["turnover"] = (
-                pd.to_numeric(frame["amount"], errors="coerce")
-                * max(0.0, float(self.daily_turnover_multiplier))
+            frame["turnover"] = pd.to_numeric(frame["amount"], errors="coerce") * max(
+                0.0, float(self.daily_turnover_multiplier)
             )
         elif "turnover" not in frame.columns:
             frame["turnover"] = frame["close"] * frame["volume"]
         if "circ_mv" in frame.columns:
-            frame["float_market_cap"] = (
-                pd.to_numeric(frame["circ_mv"], errors="coerce") * 10000.0
-            )
+            frame["float_market_cap"] = pd.to_numeric(frame["circ_mv"], errors="coerce") * 10000.0
         elif "float_market_cap" not in frame.columns:
             frame["float_market_cap"] = np.nan
         frame["suspended"] = False
@@ -402,9 +566,7 @@ class VendorZipOverlayProvider:
         )
         frame["price_series_mode"] = self.price_series_mode
         frame["adjustment_source"] = (
-            "local_vendor_raw"
-            if self.price_series_mode == "raw"
-            else "local_vendor_declared"
+            "local_vendor_raw" if self.price_series_mode == "raw" else "local_vendor_declared"
         )
         frame["adjustment_anchor_date"] = ""
         frame["adjustment_anchor_factor"] = np.nan
@@ -433,9 +595,7 @@ class VendorZipOverlayProvider:
                 normalized = self._normalize_vendor_minute(raw)
                 if not normalized.empty:
                     normalized_index = pd.DatetimeIndex(normalized.index)
-                    normalized = normalized.loc[
-                        normalized_index >= pd.Timestamp(cutoff)
-                    ]
+                    normalized = normalized.loc[normalized_index >= pd.Timestamp(cutoff)]
                     if not normalized.empty:
                         minute_frames.append(normalized)
         minute_bars = _merge_overlay_frames(*minute_frames)
@@ -594,9 +754,7 @@ def _minute_archive_coverage(path: Path) -> tuple[date, date] | None:
 
 def _merge_overlay_frames(*frames: pd.DataFrame) -> pd.DataFrame:
     materialized = [
-        frame
-        for frame in frames
-        if isinstance(frame, pd.DataFrame) and not frame.empty
+        frame for frame in frames if isinstance(frame, pd.DataFrame) and not frame.empty
     ]
     if not materialized:
         return pd.DataFrame()

@@ -437,6 +437,34 @@ def test_reproducible_same_input_date(tmp_path: Path) -> None:
     assert r1["report"]["output_symbol_hash"] == r2["report"]["output_symbol_hash"]
 
 
+def test_input_order_does_not_change_selection(tmp_path: Path) -> None:
+    spec = _default_symbols_spec(count_per_board=40)
+    frame = _build_batch_frame(spec)
+    symbols = sorted(spec.keys())
+    shuffled = symbols[:]
+    import random
+
+    random.Random(7).shuffle(shuffled)
+    assert shuffled != symbols
+    base = {
+        "target_size": 120,
+        "trade_date": "2026-07-31",
+        "ruleset_id": "a_share_default_v1",
+        "board_scope": ["SSE", "SZSE", "BSE"],
+    }
+    r1 = _make_selector(_FrameWarehouse(frame), exploration_ratio=0.05).select(
+        symbols=symbols, **base
+    )
+    r2 = _make_selector(_FrameWarehouse(frame), exploration_ratio=0.05).select(
+        symbols=shuffled, **base
+    )
+    assert r1["selected"] == r2["selected"]
+    for key in set(r1["report"]) | set(r2["report"]):
+        if key in ("elapsed_ms", "generated_at"):
+            continue
+        assert r1["report"][key] == r2["report"][key]
+
+
 # ---------------------------------------------------------------------------
 # 7. Different date -> only exploration rotates; core high-score pool stable
 # ---------------------------------------------------------------------------
@@ -933,6 +961,56 @@ def test_stale_and_financial_thresholds_are_hard_rejected() -> None:
     assert rejected["financial_data_incomplete"] == 1
     assert rejected["roe_below_min"] == 1
     assert rejected["debt_ratio_above_max"] == 1
+
+
+def test_missing_financial_data_respected_when_require_financial_data() -> None:
+    base = {
+        "days": 100,
+        "start_close": 10.0,
+        "drift": 0.002,
+        "turnover": 50_000_000.0,
+        "float_market_cap": 4_000_000_000.0,
+    }
+    spec = {
+        "600001": dict(base, roe=0.10, debt_ratio=0.30),
+        # Claims complete financials but ROE is missing.
+        "600002": dict(
+            base,
+            roe=np.nan,
+            debt_ratio=0.30,
+            financial_data_complete=True,
+            financial_completeness=1.0,
+        ),
+        # Honest missing financials (e.g. ZIP-history-only rows).
+        "600003": dict(base, roe=np.nan, debt_ratio=np.nan, financial_data_complete=False),
+        # Claims complete financials but debt_ratio is missing.
+        "600004": dict(
+            base,
+            roe=0.10,
+            debt_ratio=np.nan,
+            financial_data_complete=True,
+            financial_completeness=1.0,
+        ),
+    }
+    frame = _build_batch_frame(spec)
+    result = _make_selector(
+        _FrameWarehouse(frame),
+        exploration_ratio=0.0,
+        require_financial_data=True,
+    ).select(
+        symbols=["600001", "600002", "600003", "600004"],
+        target_size=2,
+        trade_date="2026-07-31",
+        reference_date="2026-07-31",
+        ruleset_id="a_share_default_v1",
+        board_scope=["SSE"],
+    )
+    assert result["selected"] == ["600001"]
+    rejected = result["report"]["rejected_count_by_reason"]
+    assert rejected["missing_roe"] == 1
+    assert rejected["missing_debt_ratio"] == 1
+    assert rejected["financial_data_incomplete"] == 1
+    assert rejected["missing_debt_ratio"] == 1
 
 
 def test_exploration_quota_spans_multiple_boards() -> None:
