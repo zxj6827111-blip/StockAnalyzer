@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
+from stock_analyzer import main as main_module
+from stock_analyzer.data.provider import SyntheticProvider
 from stock_analyzer.main import app
 
 
@@ -26,7 +28,14 @@ def test_acceptance_week4_endpoints_run_latest_and_history() -> None:
     assert history_payload["records"] >= 1
 
 
-def test_acceptance_v13_bundle_endpoint_generates_artifacts() -> None:
+def test_acceptance_v13_bundle_endpoint_generates_artifacts(monkeypatch) -> None:
+    provider = SyntheticProvider(seed_offset=2026)
+    monkeypatch.setattr(main_module._service, "_provider", provider)
+    monkeypatch.setattr(main_module._service._pipeline, "_provider", provider)
+    monkeypatch.setattr(main_module._service, "_realtime_provider", provider)
+    if main_module._service._realtime_pipeline is not None:
+        monkeypatch.setattr(main_module._service._realtime_pipeline, "_provider", provider)
+
     client = TestClient(app)
 
     response = client.post(

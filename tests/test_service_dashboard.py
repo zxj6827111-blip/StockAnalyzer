@@ -8,8 +8,10 @@ from typing import cast
 
 from stock_analyzer.command.channel import CommandEnvelope, SignedCommandProcessor
 from stock_analyzer.config import StockAnalyzerConfig, load_config
-from stock_analyzer.runtime.services.dashboard_service import _resolve_training_overview_warehouse_context
 from stock_analyzer.runtime.service import StockAnalyzerService
+from stock_analyzer.runtime.services.dashboard_service import (
+    _resolve_training_overview_warehouse_context,
+)
 
 
 def _as_mapping(value: object) -> Mapping[str, object]:
@@ -147,6 +149,8 @@ def test_service_sla_report_has_percentiles_after_runs() -> None:
 
 def test_service_holding_alerts_use_manual_cost_basis() -> None:
     config = _load_test_config()
+    config.data_source.primary = "synthetic"
+    config.data_source.runtime_live_enabled = False
     service = StockAnalyzerService(config=config)
 
     set_cmd = _sign(
@@ -541,15 +545,17 @@ def test_service_training_overview_uses_short_cache(tmp_path: Path, monkeypatch)
     monkeypatch.setattr(
         service,
         "market_warehouse_background_data_status",
-        lambda: direct_background_call_count.__setitem__(
-            "count",
-            direct_background_call_count["count"] + 1,
-        )
-        or {
-            "latest_trade_date_coverage_ratio": 0.98,
-            "symbols_stale": 5,
-            "fields": {"holder_count": {"coverage": 0.97}},
-        },
+        lambda: (
+            direct_background_call_count.__setitem__(
+                "count",
+                direct_background_call_count["count"] + 1,
+            )
+            or {
+                "latest_trade_date_coverage_ratio": 0.98,
+                "symbols_stale": 5,
+                "fields": {"holder_count": {"coverage": 0.97}},
+            }
+        ),
     )
     monkeypatch.setattr(
         service,

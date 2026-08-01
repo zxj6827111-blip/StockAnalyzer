@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import zlib
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Protocol
@@ -48,7 +49,7 @@ class SyntheticProvider:
         *,
         end_date: date | None = None,
     ) -> pd.DataFrame:
-        seed = (abs(hash(symbol)) + self.seed_offset) % (2**32)
+        seed = _stable_synthetic_seed(symbol=symbol, seed_offset=self.seed_offset)
         rng = np.random.default_rng(seed)
         dates = pd.bdate_range(end=end_date or datetime.now().date(), periods=lookback_days)
         record_count = len(dates)
@@ -104,6 +105,11 @@ class SyntheticProvider:
     ) -> pd.DataFrame:
         _ = symbol, interval, lookback_days
         return pd.DataFrame()
+
+
+def _stable_synthetic_seed(*, symbol: str, seed_offset: int) -> int:
+    symbol_hash = zlib.crc32(symbol.encode("utf-8"))
+    return (symbol_hash + seed_offset) % (2**32)
 
 
 def _infer_board(symbol: str) -> str:
