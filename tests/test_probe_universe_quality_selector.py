@@ -260,10 +260,18 @@ def test_cli_max_elapsed_ms_arg_is_enforced(
     _clear_sa_overrides(monkeypatch)
     config_path = _write_synthetic_config(tmp_path)
     probe = _load_probe()
+    calls = {"n": 0}
+
+    def _fake_perf_counter() -> float:
+        calls["n"] += 1
+        return 0.0 if calls["n"] == 1 else 2.0
+
+    monkeypatch.setattr("time.perf_counter", _fake_perf_counter)
     exit_code = probe._main(  # type: ignore[attr-defined]
         ["--config", str(config_path), "--target-size", "300", "--max-elapsed-ms", "1"]
     )
     assert exit_code == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is False
+    assert payload["elapsed_ms"] == 2000
     assert any("max_elapsed_ms" in failure for failure in payload.get("acceptance_failures", []))
