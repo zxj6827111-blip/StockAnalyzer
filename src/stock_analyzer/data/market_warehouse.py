@@ -245,7 +245,6 @@ class MarketWarehouse:
                 """
             )
 
-
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS financial_snapshots (
@@ -419,7 +418,6 @@ class MarketWarehouse:
                 """
             )
 
-
     def upsert_financial_snapshots(self, *, symbol: str, frame: pd.DataFrame) -> int:
         """Idempotent upsert of PIT financial snapshot events. Returns row count stored."""
         from stock_analyzer.data.financial_pit import merge_snapshot_frames
@@ -494,9 +492,67 @@ class MarketWarehouse:
                 frame[col] = pd.to_datetime(frame[col], errors="coerce")
         return frame
 
+    def fetch_financial_snapshots_batch(
+        self,
+        *,
+        symbols: list[str] | None = None,
+        as_of: date | pd.Timestamp | str | None = None,
+    ) -> pd.DataFrame:
+        """Batch-fetch PIT financial snapshots for many symbols in one query.
+
+        Returns rows for all requested symbols (or the whole table when
+        ``symbols`` is empty), optionally restricted to snapshots disclosed
+        on or before ``as_of`` (ann_date <= as_of, PIT semantics). Columns
+        match ``fetch_financial_snapshots``.
+        """
+        if not self._table_exists(_FINANCIAL_SNAPSHOT_TABLE):
+            return pd.DataFrame()
+        normalized = sorted(
+            {item for item in (_normalize_symbol(value) for value in (symbols or [])) if item}
+        )
+        with self._connect_readonly() as connection:
+            if normalized:
+                symbols_df = pd.DataFrame({"symbol": normalized})
+                connection.register("fin_snap_symbols", symbols_df)
+                try:
+                    frame = cast(
+                        pd.DataFrame,
+                        connection.execute(
+                            f"""
+                            SELECT *
+                            FROM {_FINANCIAL_SNAPSHOT_TABLE}
+                            WHERE symbol IN (SELECT symbol FROM fin_snap_symbols)
+                            ORDER BY ann_date ASC, end_date ASC, update_flag ASC
+                            """
+                        ).fetch_df(),
+                    )
+                finally:
+                    connection.unregister("fin_snap_symbols")
+            else:
+                frame = cast(
+                    pd.DataFrame,
+                    connection.execute(
+                        f"""
+                        SELECT *
+                        FROM {_FINANCIAL_SNAPSHOT_TABLE}
+                        ORDER BY ann_date ASC, end_date ASC, update_flag ASC
+                        """
+                    ).fetch_df(),
+                )
+        if frame.empty:
+            return frame
+        for col in ("end_date", "ann_date"):
+            if col in frame.columns:
+                frame[col] = pd.to_datetime(frame[col], errors="coerce")
+        if as_of is not None:
+            as_of_ts = pd.Timestamp(as_of)
+            frame = frame[frame["ann_date"] <= as_of_ts].reset_index(drop=True)
+        return frame
+
     def apply_financial_snapshots_to_daily(self, *, symbol: str) -> pd.DataFrame:
         """Re-materialize daily bars financial columns from PIT snapshots."""
         from stock_analyzer.data.financial_pit import apply_financial_snapshots_asof
+
         daily = self.fetch_all_daily_bars(symbol=symbol)
         if daily.empty:
             return daily
@@ -515,7 +571,6 @@ class MarketWarehouse:
                 frame=enriched,
             )
         return enriched
-
 
     def upsert_trade_status(self, *, symbol: str, frame: pd.DataFrame) -> int:
         """Idempotent upsert of daily trade status rows."""
@@ -538,8 +593,15 @@ class MarketWarehouse:
                 )
             connection.register("ts_stage", payload)
             cols = [
-                "symbol", "trade_date", "up_limit", "down_limit",
-                "suspended", "suspend_type", "source", "as_of", "coverage_complete",
+                "symbol",
+                "trade_date",
+                "up_limit",
+                "down_limit",
+                "suspended",
+                "suspend_type",
+                "source",
+                "as_of",
+                "coverage_complete",
             ]
             present = [c for c in cols if c in payload.columns]
             connection.execute(
@@ -598,8 +660,6 @@ class MarketWarehouse:
             )
         return daily
 
-
-
     def upsert_margin_detail(self, *, symbol: str, frame: pd.DataFrame) -> int:
         normalized_symbol = _normalize_symbol(symbol)
         if frame is None or frame.empty:
@@ -618,11 +678,23 @@ class MarketWarehouse:
                     [normalized_symbol, d],
                 )
             connection.register("margin_stage", payload)
-            cols = [c for c in payload.columns if c in (
-                "symbol", "trade_date", "financing_balance", "financing_buy_amount",
-                "securities_lending_balance", "securities_lending_volume",
-                "securities_lending_sell_volume", "source", "as_of", "coverage_complete",
-            )]
+            cols = [
+                c
+                for c in payload.columns
+                if c
+                in (
+                    "symbol",
+                    "trade_date",
+                    "financing_balance",
+                    "financing_buy_amount",
+                    "securities_lending_balance",
+                    "securities_lending_volume",
+                    "securities_lending_sell_volume",
+                    "source",
+                    "as_of",
+                    "coverage_complete",
+                )
+            ]
             connection.execute(
                 f"INSERT INTO {_MARGIN_TABLE} ({', '.join(cols)}) "
                 f"SELECT {', '.join(cols)} FROM margin_stage"
@@ -635,10 +707,13 @@ class MarketWarehouse:
         if not self._table_exists(_MARGIN_TABLE):
             return pd.DataFrame()
         with self._connect_readonly() as connection:
-            frame = cast(pd.DataFrame, connection.execute(
-                f"SELECT * FROM {_MARGIN_TABLE} WHERE symbol = ? ORDER BY trade_date",
-                [normalized_symbol],
-            ).fetch_df())
+            frame = cast(
+                pd.DataFrame,
+                connection.execute(
+                    f"SELECT * FROM {_MARGIN_TABLE} WHERE symbol = ? ORDER BY trade_date",
+                    [normalized_symbol],
+                ).fetch_df(),
+            )
         if not frame.empty and "trade_date" in frame.columns:
             frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
         return frame
@@ -661,12 +736,27 @@ class MarketWarehouse:
                     [normalized_symbol, d],
                 )
             connection.register("mf_stage", payload)
-            cols = [c for c in payload.columns if c in (
-                "symbol", "trade_date", "buy_sm_amount", "sell_sm_amount",
-                "buy_md_amount", "sell_md_amount", "buy_lg_amount", "sell_lg_amount",
-                "buy_elg_amount", "sell_elg_amount", "net_mf_amount",
-                "source", "as_of", "coverage_complete",
-            )]
+            cols = [
+                c
+                for c in payload.columns
+                if c
+                in (
+                    "symbol",
+                    "trade_date",
+                    "buy_sm_amount",
+                    "sell_sm_amount",
+                    "buy_md_amount",
+                    "sell_md_amount",
+                    "buy_lg_amount",
+                    "sell_lg_amount",
+                    "buy_elg_amount",
+                    "sell_elg_amount",
+                    "net_mf_amount",
+                    "source",
+                    "as_of",
+                    "coverage_complete",
+                )
+            ]
             connection.execute(
                 f"INSERT INTO {_MONEYFLOW_TABLE} ({', '.join(cols)}) "
                 f"SELECT {', '.join(cols)} FROM mf_stage"
@@ -679,10 +769,13 @@ class MarketWarehouse:
         if not self._table_exists(_MONEYFLOW_TABLE):
             return pd.DataFrame()
         with self._connect_readonly() as connection:
-            frame = cast(pd.DataFrame, connection.execute(
-                f"SELECT * FROM {_MONEYFLOW_TABLE} WHERE symbol = ? ORDER BY trade_date",
-                [normalized_symbol],
-            ).fetch_df())
+            frame = cast(
+                pd.DataFrame,
+                connection.execute(
+                    f"SELECT * FROM {_MONEYFLOW_TABLE} WHERE symbol = ? ORDER BY trade_date",
+                    [normalized_symbol],
+                ).fetch_df(),
+            )
         if not frame.empty and "trade_date" in frame.columns:
             frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
         return frame
@@ -705,10 +798,21 @@ class MarketWarehouse:
                     [normalized_symbol, d],
                 )
             connection.register("hk_stage", payload)
-            cols = [c for c in payload.columns if c in (
-                "symbol", "trade_date", "hold_vol", "hold_ratio", "hold_market_cap",
-                "source", "as_of", "coverage_complete",
-            )]
+            cols = [
+                c
+                for c in payload.columns
+                if c
+                in (
+                    "symbol",
+                    "trade_date",
+                    "hold_vol",
+                    "hold_ratio",
+                    "hold_market_cap",
+                    "source",
+                    "as_of",
+                    "coverage_complete",
+                )
+            ]
             connection.execute(
                 f"INSERT INTO {_HK_HOLD_TABLE} ({', '.join(cols)}) "
                 f"SELECT {', '.join(cols)} FROM hk_stage"
@@ -721,15 +825,16 @@ class MarketWarehouse:
         if not self._table_exists(_HK_HOLD_TABLE):
             return pd.DataFrame()
         with self._connect_readonly() as connection:
-            frame = cast(pd.DataFrame, connection.execute(
-                f"SELECT * FROM {_HK_HOLD_TABLE} WHERE symbol = ? ORDER BY trade_date",
-                [normalized_symbol],
-            ).fetch_df())
+            frame = cast(
+                pd.DataFrame,
+                connection.execute(
+                    f"SELECT * FROM {_HK_HOLD_TABLE} WHERE symbol = ? ORDER BY trade_date",
+                    [normalized_symbol],
+                ).fetch_df(),
+            )
         if not frame.empty and "trade_date" in frame.columns:
             frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
         return frame
-
-
 
     def upsert_top_list_events(self, *, symbol: str, frame: pd.DataFrame) -> int:
         normalized_symbol = _normalize_symbol(symbol)
@@ -737,9 +842,7 @@ class MarketWarehouse:
             return 0
         payload = frame.copy()
         payload["symbol"] = normalized_symbol
-        payload["trade_date"] = pd.to_datetime(
-            payload["trade_date"], errors="coerce"
-        ).dt.date
+        payload["trade_date"] = pd.to_datetime(payload["trade_date"], errors="coerce").dt.date
         payload = payload.dropna(subset=["trade_date"])
         if payload.empty:
             return 0
@@ -747,20 +850,31 @@ class MarketWarehouse:
         with self._connect_write() as connection:
             for d in payload["trade_date"].tolist():
                 connection.execute(
-                    f"DELETE FROM {_TOP_LIST_TABLE} "
-                    "WHERE symbol = ? AND trade_date = ?",
+                    f"DELETE FROM {_TOP_LIST_TABLE} WHERE symbol = ? AND trade_date = ?",
                     [normalized_symbol, d],
                 )
             connection.register("tl_stage", payload)
-            cols = [c for c in payload.columns if c in (
-                "symbol", "trade_date", "dragon_tiger_flag", "reason_count",
-                "reasons", "buy_amount", "sell_amount", "turnover",
-                "source", "as_of", "coverage_complete",
-            )]
+            cols = [
+                c
+                for c in payload.columns
+                if c
+                in (
+                    "symbol",
+                    "trade_date",
+                    "dragon_tiger_flag",
+                    "reason_count",
+                    "reasons",
+                    "buy_amount",
+                    "sell_amount",
+                    "turnover",
+                    "source",
+                    "as_of",
+                    "coverage_complete",
+                )
+            ]
             col_str = ", ".join(cols)
             connection.execute(
-                f"INSERT INTO {_TOP_LIST_TABLE} ({col_str}) "
-                f"SELECT {col_str} FROM tl_stage"
+                f"INSERT INTO {_TOP_LIST_TABLE} ({col_str}) SELECT {col_str} FROM tl_stage"
             )
             connection.unregister("tl_stage")
         return int(len(payload))
@@ -770,15 +884,15 @@ class MarketWarehouse:
         if not self._table_exists(_TOP_LIST_TABLE):
             return pd.DataFrame()
         with self._connect_readonly() as connection:
-            frame = cast(pd.DataFrame, connection.execute(
-                f"SELECT * FROM {_TOP_LIST_TABLE} "
-                "WHERE symbol = ? ORDER BY trade_date",
-                [normalized_symbol],
-            ).fetch_df())
-        if not frame.empty and "trade_date" in frame.columns:
-            frame["trade_date"] = pd.to_datetime(
-                frame["trade_date"], errors="coerce"
+            frame = cast(
+                pd.DataFrame,
+                connection.execute(
+                    f"SELECT * FROM {_TOP_LIST_TABLE} WHERE symbol = ? ORDER BY trade_date",
+                    [normalized_symbol],
+                ).fetch_df(),
             )
+        if not frame.empty and "trade_date" in frame.columns:
+            frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
         return frame
 
     def upsert_top_inst_events(self, *, symbol: str, frame: pd.DataFrame) -> int:
@@ -787,9 +901,7 @@ class MarketWarehouse:
             return 0
         payload = frame.copy()
         payload["symbol"] = normalized_symbol
-        payload["trade_date"] = pd.to_datetime(
-            payload["trade_date"], errors="coerce"
-        ).dt.date
+        payload["trade_date"] = pd.to_datetime(payload["trade_date"], errors="coerce").dt.date
         payload = payload.dropna(subset=["trade_date"])
         if payload.empty:
             return 0
@@ -797,20 +909,29 @@ class MarketWarehouse:
         with self._connect_write() as connection:
             for d in payload["trade_date"].tolist():
                 connection.execute(
-                    f"DELETE FROM {_TOP_INST_TABLE} "
-                    "WHERE symbol = ? AND trade_date = ?",
+                    f"DELETE FROM {_TOP_INST_TABLE} WHERE symbol = ? AND trade_date = ?",
                     [normalized_symbol, d],
                 )
             connection.register("ti_stage", payload)
-            cols = [c for c in payload.columns if c in (
-                "symbol", "trade_date", "institution_name",
-                "inst_buy_amount", "inst_sell_amount", "inst_net_amount",
-                "source", "as_of", "coverage_complete",
-            )]
+            cols = [
+                c
+                for c in payload.columns
+                if c
+                in (
+                    "symbol",
+                    "trade_date",
+                    "institution_name",
+                    "inst_buy_amount",
+                    "inst_sell_amount",
+                    "inst_net_amount",
+                    "source",
+                    "as_of",
+                    "coverage_complete",
+                )
+            ]
             col_str = ", ".join(cols)
             connection.execute(
-                f"INSERT INTO {_TOP_INST_TABLE} ({col_str}) "
-                f"SELECT {col_str} FROM ti_stage"
+                f"INSERT INTO {_TOP_INST_TABLE} ({col_str}) SELECT {col_str} FROM ti_stage"
             )
             connection.unregister("ti_stage")
         return int(len(payload))
@@ -820,28 +941,24 @@ class MarketWarehouse:
         if not self._table_exists(_TOP_INST_TABLE):
             return pd.DataFrame()
         with self._connect_readonly() as connection:
-            frame = cast(pd.DataFrame, connection.execute(
-                f"SELECT * FROM {_TOP_INST_TABLE} "
-                "WHERE symbol = ? ORDER BY trade_date",
-                [normalized_symbol],
-            ).fetch_df())
-        if not frame.empty and "trade_date" in frame.columns:
-            frame["trade_date"] = pd.to_datetime(
-                frame["trade_date"], errors="coerce"
+            frame = cast(
+                pd.DataFrame,
+                connection.execute(
+                    f"SELECT * FROM {_TOP_INST_TABLE} WHERE symbol = ? ORDER BY trade_date",
+                    [normalized_symbol],
+                ).fetch_df(),
             )
+        if not frame.empty and "trade_date" in frame.columns:
+            frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
         return frame
 
-    def upsert_block_trade_events(
-        self, *, symbol: str, frame: pd.DataFrame
-    ) -> int:
+    def upsert_block_trade_events(self, *, symbol: str, frame: pd.DataFrame) -> int:
         normalized_symbol = _normalize_symbol(symbol)
         if frame is None or frame.empty:
             return 0
         payload = frame.copy()
         payload["symbol"] = normalized_symbol
-        payload["trade_date"] = pd.to_datetime(
-            payload["trade_date"], errors="coerce"
-        ).dt.date
+        payload["trade_date"] = pd.to_datetime(payload["trade_date"], errors="coerce").dt.date
         payload = payload.dropna(subset=["trade_date"])
         if payload.empty:
             return 0
@@ -849,21 +966,32 @@ class MarketWarehouse:
         with self._connect_write() as connection:
             for d in payload["trade_date"].tolist():
                 connection.execute(
-                    f"DELETE FROM {_BLOCK_TRADE_TABLE} "
-                    "WHERE symbol = ? AND trade_date = ?",
+                    f"DELETE FROM {_BLOCK_TRADE_TABLE} WHERE symbol = ? AND trade_date = ?",
                     [normalized_symbol, d],
                 )
             connection.register("bt_stage", payload)
-            cols = [c for c in payload.columns if c in (
-                "symbol", "trade_date", "block_price",
-                "block_trade_volume", "block_trade_amount",
-                "block_trade_premium_discount", "block_trade_net",
-                "buyer", "seller", "source", "as_of", "coverage_complete",
-            )]
+            cols = [
+                c
+                for c in payload.columns
+                if c
+                in (
+                    "symbol",
+                    "trade_date",
+                    "block_price",
+                    "block_trade_volume",
+                    "block_trade_amount",
+                    "block_trade_premium_discount",
+                    "block_trade_net",
+                    "buyer",
+                    "seller",
+                    "source",
+                    "as_of",
+                    "coverage_complete",
+                )
+            ]
             col_str = ", ".join(cols)
             connection.execute(
-                f"INSERT INTO {_BLOCK_TRADE_TABLE} ({col_str}) "
-                f"SELECT {col_str} FROM bt_stage"
+                f"INSERT INTO {_BLOCK_TRADE_TABLE} ({col_str}) SELECT {col_str} FROM bt_stage"
             )
             connection.unregister("bt_stage")
         return int(len(payload))
@@ -873,26 +1001,22 @@ class MarketWarehouse:
         if not self._table_exists(_BLOCK_TRADE_TABLE):
             return pd.DataFrame()
         with self._connect_readonly() as connection:
-            frame = cast(pd.DataFrame, connection.execute(
-                f"SELECT * FROM {_BLOCK_TRADE_TABLE} "
-                "WHERE symbol = ? ORDER BY trade_date",
-                [normalized_symbol],
-            ).fetch_df())
-        if not frame.empty and "trade_date" in frame.columns:
-            frame["trade_date"] = pd.to_datetime(
-                frame["trade_date"], errors="coerce"
+            frame = cast(
+                pd.DataFrame,
+                connection.execute(
+                    f"SELECT * FROM {_BLOCK_TRADE_TABLE} WHERE symbol = ? ORDER BY trade_date",
+                    [normalized_symbol],
+                ).fetch_df(),
             )
+        if not frame.empty and "trade_date" in frame.columns:
+            frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
         return frame
-
-
 
     def upsert_index_daily(self, *, frame: pd.DataFrame) -> int:
         if frame is None or frame.empty:
             return 0
         payload = frame.copy()
-        payload["trade_date"] = pd.to_datetime(
-            payload["trade_date"], errors="coerce"
-        ).dt.date
+        payload["trade_date"] = pd.to_datetime(payload["trade_date"], errors="coerce").dt.date
         payload = payload.dropna(subset=["trade_date"])
         if payload.empty:
             return 0
@@ -900,19 +1024,31 @@ class MarketWarehouse:
         with self._connect_write() as connection:
             for _, row in payload.iterrows():
                 connection.execute(
-                    f"DELETE FROM {_INDEX_DAILY_TABLE} "
-                    "WHERE index_code = ? AND trade_date = ?",
+                    f"DELETE FROM {_INDEX_DAILY_TABLE} WHERE index_code = ? AND trade_date = ?",
                     [str(row.get("index_code", "")), row["trade_date"]],
                 )
             connection.register("idx_stage", payload)
-            cols = [c for c in payload.columns if c in (
-                "index_code", "trade_date", "open", "high", "low", "close",
-                "volume", "turnover", "source", "as_of", "coverage_complete",
-            )]
+            cols = [
+                c
+                for c in payload.columns
+                if c
+                in (
+                    "index_code",
+                    "trade_date",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                    "turnover",
+                    "source",
+                    "as_of",
+                    "coverage_complete",
+                )
+            ]
             col_str = ", ".join(cols)
             connection.execute(
-                f"INSERT INTO {_INDEX_DAILY_TABLE} ({col_str}) "
-                f"SELECT {col_str} FROM idx_stage"
+                f"INSERT INTO {_INDEX_DAILY_TABLE} ({col_str}) SELECT {col_str} FROM idx_stage"
             )
             connection.unregister("idx_stage")
         if self.package_writes_enabled:
@@ -922,9 +1058,7 @@ class MarketWarehouse:
                 if stored.empty:
                     continue
                 benchmark = stored.copy()
-                benchmark.index = pd.to_datetime(
-                    benchmark["trade_date"], errors="coerce"
-                )
+                benchmark.index = pd.to_datetime(benchmark["trade_date"], errors="coerce")
                 benchmark = benchmark.loc[benchmark.index.notna()]
                 benchmark.index.name = "date"
                 benchmark["float_market_cap"] = float("nan")
@@ -936,24 +1070,20 @@ class MarketWarehouse:
                 )
         return int(len(payload))
 
-    def fetch_index_daily(
-        self, *, index_code: str = "000300.SH"
-    ) -> pd.DataFrame:
+    def fetch_index_daily(self, *, index_code: str = "000300.SH") -> pd.DataFrame:
         if not self._table_exists(_INDEX_DAILY_TABLE):
             return pd.DataFrame()
         with self._connect_readonly() as connection:
-            frame = cast(pd.DataFrame, connection.execute(
-                f"SELECT * FROM {_INDEX_DAILY_TABLE} "
-                "WHERE index_code = ? ORDER BY trade_date",
-                [index_code],
-            ).fetch_df())
-        if not frame.empty and "trade_date" in frame.columns:
-            frame["trade_date"] = pd.to_datetime(
-                frame["trade_date"], errors="coerce"
+            frame = cast(
+                pd.DataFrame,
+                connection.execute(
+                    f"SELECT * FROM {_INDEX_DAILY_TABLE} WHERE index_code = ? ORDER BY trade_date",
+                    [index_code],
+                ).fetch_df(),
             )
+        if not frame.empty and "trade_date" in frame.columns:
+            frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
         return frame
-
-
 
     def apply_p2_p3_to_daily(self, *, symbol: str) -> pd.DataFrame:
         """Project reliable P2/P3 fields back onto daily bars and runtime package.
@@ -1031,9 +1161,7 @@ class MarketWarehouse:
         if not top_inst.empty and "inst_net_amount" in top_inst.columns:
             inst = top_inst.dropna(subset=["trade_date"]).copy()
             inst["trade_date"] = pd.to_datetime(inst["trade_date"])
-            inst["inst_net_amount"] = pd.to_numeric(
-                inst["inst_net_amount"], errors="coerce"
-            )
+            inst["inst_net_amount"] = pd.to_numeric(inst["inst_net_amount"], errors="coerce")
             inst_daily = inst.groupby("trade_date")["inst_net_amount"].sum(min_count=1)
             for ts, value in inst_daily.items():
                 if ts in daily.index and not pd.isna(value):
@@ -1054,15 +1182,9 @@ class MarketWarehouse:
             for ts, rows in block.groupby("trade_date"):
                 if ts not in daily.index:
                     continue
-                amount = rows.get("block_trade_amount", pd.Series(dtype=float)).sum(
-                    min_count=1
-                )
-                volume = rows.get("block_trade_volume", pd.Series(dtype=float)).sum(
-                    min_count=1
-                )
-                premium_series = rows.get(
-                    "block_trade_premium_discount", pd.Series(dtype=float)
-                )
+                amount = rows.get("block_trade_amount", pd.Series(dtype=float)).sum(min_count=1)
+                volume = rows.get("block_trade_volume", pd.Series(dtype=float)).sum(min_count=1)
+                premium_series = rows.get("block_trade_premium_discount", pd.Series(dtype=float))
                 premium = premium_series.mean()
                 weights = rows.get("block_trade_amount", pd.Series(dtype=float))
                 valid = premium_series.notna() & weights.notna() & weights.gt(0)
@@ -1089,7 +1211,6 @@ class MarketWarehouse:
                     frame=daily,
                 )
         return daily
-
 
     def warehouse_meta_path(self, symbol: str | None = None) -> Path:
         if symbol:
@@ -1130,10 +1251,7 @@ class MarketWarehouse:
         if symbol:
             return self._price_series_contract_from_meta(self.read_symbol_meta(symbol))
 
-        contracts = [
-            self.price_series_contract(symbol=item)
-            for item in self.list_symbols()
-        ]
+        contracts = [self.price_series_contract(symbol=item) for item in self.list_symbols()]
         known_contracts = [item for item in contracts if bool(item.get("known"))]
         if not known_contracts:
             return self._price_series_contract_from_meta({})
@@ -1220,19 +1338,18 @@ class MarketWarehouse:
             stored_factors = pd.to_numeric(
                 rebased["adjustment_anchor_factor"], errors="coerce"
             ).dropna()
-            if not stored_factors.empty and not stored_factors.map(
-                lambda value: math.isclose(
-                    float(value), old_factor, rel_tol=0.0, abs_tol=1e-9
-                )
-            ).all():
+            if (
+                not stored_factors.empty
+                and not stored_factors.map(
+                    lambda value: math.isclose(float(value), old_factor, rel_tol=0.0, abs_tol=1e-9)
+                ).all()
+            ):
                 raise ValueError("stored_anchor_factor_mismatch")
 
             ratio = old_factor / new_factor
             for column in ("open", "high", "low", "close"):
                 if column in rebased.columns:
-                    rebased[column] = pd.to_numeric(
-                        rebased[column], errors="coerce"
-                    ) * ratio
+                    rebased[column] = pd.to_numeric(rebased[column], errors="coerce") * ratio
 
             for column in (
                 "price_series_mode",
@@ -1243,11 +1360,7 @@ class MarketWarehouse:
                 if column in rebased.columns:
                     rebased[column] = cast(Any, fresh_meta.get(column))
 
-        merged = (
-            fresh_daily.copy()
-            if rebased.empty
-            else pd.concat([rebased, fresh_daily], axis=0)
-        )
+        merged = fresh_daily.copy() if rebased.empty else pd.concat([rebased, fresh_daily], axis=0)
         return merged[~merged.index.duplicated(keep="last")].sort_index()
 
     def clone_to_shadow_paths(
@@ -1267,9 +1380,7 @@ class MarketWarehouse:
         if not self._table_exists(_DAILY_TABLE):
             return False
         with self._connect_readonly() as connection:
-            count = connection.execute(
-                f"SELECT COUNT(*) FROM {_DAILY_TABLE}"
-            ).fetchone()
+            count = connection.execute(f"SELECT COUNT(*) FROM {_DAILY_TABLE}").fetchone()
         return bool(count and int(count[0]) > 0)
 
     def list_symbols(self) -> list[str]:
@@ -1347,11 +1458,7 @@ class MarketWarehouse:
         if not self._table_exists(_DAILY_TABLE):
             return pd.DataFrame()
         normalized_symbols = sorted(
-            {
-                _normalize_symbol(symbol)
-                for symbol in (symbols or [])
-                if _normalize_symbol(symbol)
-            }
+            {_normalize_symbol(symbol) for symbol in (symbols or []) if _normalize_symbol(symbol)}
         )
         if not normalized_symbols:
             return pd.DataFrame()
@@ -1955,8 +2062,7 @@ class MarketWarehouse:
         daily_summary = self._daily_summary()
         daily_file_summary = _package_daily_file_summary(self.package_root)
         intraday_summary = {
-            interval: self._intraday_summary(interval)
-            for interval in _INTRADAY_TABLES
+            interval: self._intraday_summary(interval) for interval in _INTRADAY_TABLES
         }
         intraday_file_summary = {
             interval: _package_intraday_file_summary(self.package_root, interval)
@@ -2021,9 +2127,7 @@ class MarketWarehouse:
             "intervals": {
                 interval: {
                     "db_symbols_total": summary["symbols_total"],
-                    "package_symbol_files_total": intraday_file_summary[interval][
-                        "symbols_total"
-                    ],
+                    "package_symbol_files_total": intraday_file_summary[interval]["symbols_total"],
                     "symbols_total": summary["symbols_total"],
                     "files_written": intraday_file_summary[interval]["symbols_total"],
                     "failed": max(

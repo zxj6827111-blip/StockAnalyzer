@@ -21,6 +21,8 @@ BRANCH="main"
 DO_RECREATE=1
 DO_PULL=1
 START_SCHEDULER=0
+HEALTH_ATTEMPTS="${HEALTH_ATTEMPTS:-30}"
+HEALTH_SLEEP_SEC="${HEALTH_SLEEP_SEC:-2}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -52,6 +54,15 @@ while [[ $# -gt 0 ]]; do
 done
 
 cd "${ROOT}"
+
+if ! [[ "${HEALTH_ATTEMPTS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: HEALTH_ATTEMPTS must be a positive integer." >&2
+  exit 2
+fi
+if ! [[ "${HEALTH_SLEEP_SEC}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: HEALTH_SLEEP_SEC must be a positive integer." >&2
+  exit 2
+fi
 
 if [[ ! -f .env ]]; then
   echo "ERROR: ${ROOT}/.env missing. Keep secrets only in runtime .env." >&2
@@ -151,20 +162,51 @@ if [[ "${LABEL_COMMIT}" != "${COMMIT}" ]]; then
 fi
 PORT="$(grep -E '^SA_API_HOST_PORT=' .env 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
 PORT="${PORT:-18001}"
-sleep 3
-HEALTH="$(curl -fsS "http://127.0.0.1:${PORT}/health")"
-python - "${HEALTH}" "${COMMIT}" <<'PY'
+HEALTH_URL="http://127.0.0.1:${PORT}/health"
+attempt=1
+while [[ "${attempt}" -le "${HEALTH_ATTEMPTS}" ]]; do
+  HEALTH_ERROR="$(mktemp)"
+  if HEALTH="$(curl -fsS --connect-timeout 3 --max-time 10 "${HEALTH_URL}" 2>"${HEALTH_ERROR}")"; then
+    rm -f "${HEALTH_ERROR}"
+    if python - "${HEALTH}" "${COMMIT}" <<'PY'
 import json, sys
 h = json.loads(sys.argv[1])
 expected = sys.argv[2]
+if h.get("status") != "ok":
+    raise SystemExit(f"health status mismatch: {h.get('status')!r}")
 build = h.get("build") or {}
-if build.get("commit") != expected or build.get("short_commit") != expected[:7]:
+if (
+    build.get("commit") != expected
+    or build.get("short_commit") != expected[:7]
+    or build.get("trusted") is not True
+):
     raise SystemExit(f"health commit mismatch: {build}")
 runtime = h.get("runtime") or {}
 if runtime.get("advisory_only") is not True or runtime.get("training_enabled") is not False:
     raise SystemExit(f"health safety mismatch: {runtime}")
 print(json.dumps({"build_commit": build.get("commit"), "advisory_only": runtime.get("advisory_only"), "training_enabled": runtime.get("training_enabled")}, separators=(",", ":")))
 PY
-echo
-echo "OK. commit=${SHORT}"
-echo "If capital_curve:freeze still active, run: bash scripts/nas_reset_sim_account.sh"
+    then
+      echo
+      echo "OK. commit=${SHORT}"
+      echo "If capital_curve:freeze still active, run: bash scripts/nas_reset_sim_account.sh"
+      exit 0
+    fi
+    echo "ERROR: health endpoint responded but identity or safety validation failed." >&2
+    exit 1
+  else
+    CURL_CODE=$?
+  fi
+
+  HEALTH_MESSAGE="$(tr '\n' ' ' < "${HEALTH_ERROR}")"
+  rm -f "${HEALTH_ERROR}"
+  echo "health not ready (${attempt}/${HEALTH_ATTEMPTS}, curl=${CURL_CODE}): ${HEALTH_MESSAGE}" >&2
+  if [[ "${attempt}" -lt "${HEALTH_ATTEMPTS}" ]]; then
+    sleep "${HEALTH_SLEEP_SEC}"
+  fi
+  attempt=$((attempt + 1))
+done
+
+echo "ERROR: health did not become ready after ${HEALTH_ATTEMPTS} attempts: ${HEALTH_URL}" >&2
+docker logs stock-analyzer-api --tail 100 >&2 || true
+exit 1

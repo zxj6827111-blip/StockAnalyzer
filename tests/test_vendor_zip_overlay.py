@@ -214,9 +214,7 @@ def test_market_sync_builds_tushare_in_raw_mode_for_vendor_overlay() -> None:
     config = SimpleNamespace(
         data_source=DataSourceConfig(primary="vendor_zip_overlay"),
         market_warehouse=SimpleNamespace(tushare_token=""),
-        evolution=SimpleNamespace(
-            execution_spec=SimpleNamespace(price_series_mode="qfq")
-        ),
+        evolution=SimpleNamespace(execution_spec=SimpleNamespace(price_series_mode="qfq")),
     )
     service = SimpleNamespace(_config=config)
     sync = RuntimeMarketSyncService(service)
@@ -292,9 +290,7 @@ def test_vendor_delta_sync_does_not_export_package_bars(tmp_path: Path) -> None:
             "action": "incremental",
             "reason": "anchor_compatible",
         },
-        _carry_forward_market_warehouse_financial_fields=lambda **kwargs: kwargs[
-            "fresh_daily"
-        ],
+        _carry_forward_market_warehouse_financial_fields=lambda **kwargs: kwargs["fresh_daily"],
     )
     sync = RuntimeMarketSyncService(service)
 
@@ -313,3 +309,486 @@ def test_vendor_delta_sync_does_not_export_package_bars(tmp_path: Path) -> None:
     assert not (warehouse.package_root / "bars").exists()
     assert not (warehouse.package_root / "manifest.json").exists()
     assert warehouse.refresh_package_manifests()["reason"] == "package_writes_disabled"
+
+
+# ---------------------------------------------------------------------------
+# fetch_universe_quality_metrics batch interface (Week5 quality selector)
+# ---------------------------------------------------------------------------
+_UNIVERSE_QUALITY_REQUIRED_COLUMNS = {
+    "symbol",
+    "date",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "turnover",
+    "float_market_cap",
+    "suspended",
+    "is_st",
+    "is_delisting_risk",
+    "roe",
+    "debt_ratio",
+    "financial_data_complete",
+    "financial_completeness",
+    "background_data_complete",
+    "holder_count",
+    "northbound_net",
+    "dragon_tiger_flag",
+}
+
+
+def _daily_csv(*, symbol: str, dates: list[str]) -> str:
+    rows = [f"{symbol},{dt},10,11,9,10.5,100,123.4,200000" for dt in dates]
+    return "\n".join(["code,datetime,open,high,low,close,volume,amount,circ_mv", *rows])
+
+
+def _build_multi_year_daily_fixture(root: Path) -> Path:
+    """Two symbols across two annual archives (2024 + 2025)."""
+    _write_zip(
+        root / "全A日K" / "2024.zip",
+        {
+            "bars/600000.SH.csv": _daily_csv(
+                symbol="600000.SH", dates=["2024-01-02", "2024-01-03"]
+            ),
+            "bars/000001.SZ.csv": _daily_csv(
+                symbol="000001.SZ", dates=["2024-12-30", "2024-12-31"]
+            ),
+        },
+    )
+    _write_zip(
+        root / "全A日K" / "2025.zip",
+        {
+            "bars/600000.SH.csv": _daily_csv(
+                symbol="600000.SH", dates=["2025-12-29", "2025-12-30", "2025-12-31"]
+            ),
+            "bars/000001.SZ.csv": _daily_csv(
+                symbol="000001.SZ", dates=["2025-12-29", "2025-12-30", "2025-12-31"]
+            ),
+        },
+    )
+    index_path = root / "index" / "daily_index.json"
+    write_vendor_zip_daily_index(root=root, output_path=index_path)
+    return index_path
+
+
+def _delta_warehouse(root: Path) -> MarketWarehouse:
+    warehouse = MarketWarehouse(
+        db_path=root / "delta" / "market_delta.duckdb",
+        package_root=root / "delta" / "package",
+        package_writes_enabled=False,
+    )
+    return warehouse
+
+
+def _delta_frame(
+    *,
+    symbol: str,
+    dates: list[str],
+    close: float = 13.0,
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "open": [close - 0.1] * len(dates),
+            "high": [close + 0.2] * len(dates),
+            "low": [close - 0.2] * len(dates),
+            "close": [close] * len(dates),
+            "volume": [9999.0] * len(dates),
+            "turnover": [999_900.0] * len(dates),
+            "float_market_cap": [2_200_000_000.0] * len(dates),
+            "suspended": [False] * len(dates),
+            "is_st": [False] * len(dates),
+            "is_delisting_risk": [False] * len(dates),
+            "roe": [0.18] * len(dates),
+            "debt_ratio": [0.30] * len(dates),
+            "financial_data_complete": [True] * len(dates),
+            "financial_completeness": [0.95] * len(dates),
+            "background_data_complete": [True] * len(dates),
+            "holder_count": [40_000.0] * len(dates),
+            "northbound_net": [0.0] * len(dates),
+            "dragon_tiger_flag": [0.0] * len(dates),
+            "price_series_mode": ["raw"] * len(dates),
+            "adjustment_source": ["tushare_raw"] * len(dates),
+        },
+        index=pd.to_datetime(dates),
+    )
+
+
+def test_batch_quality_metrics_returns_multiple_symbols_with_required_columns(
+    tmp_path: Path,
+) -> None:
+    index_path = _build_multi_year_daily_fixture(tmp_path)
+    provider = _provider(tmp_path, index_path)
+
+    frame = provider.fetch_universe_quality_metrics(
+        symbols=["600000", "000001", "999999"],
+        lookback_days=10,
+    )
+
+    assert sorted(frame["symbol"].unique()) == ["000001", "600000"]
+    assert _UNIVERSE_QUALITY_REQUIRED_COLUMNS <= set(frame.columns)
+    # date is a plain column (not only an index).
+    assert "date" in frame.columns
+    assert not isinstance(frame.index, pd.DatetimeIndex)
+    for symbol in ("600000", "000001"):
+        symbol_rows = frame[frame["symbol"] == symbol]
+        assert symbol_rows["date"].is_monotonic_increasing
+    # ZIP rows keep vendor scales and honest missing financial fields.
+    zip_only = frame[frame["symbol"] == "000001"]
+    assert float(zip_only.iloc[-1]["volume"]) == 10_000.0
+    assert bool(zip_only.iloc[-1]["financial_data_complete"]) is False
+    assert pd.isna(zip_only.iloc[-1]["roe"])
+    assert pd.isna(zip_only.iloc[-1]["debt_ratio"])
+    assert pd.isna(zip_only.iloc[-1]["holder_count"])
+
+
+def test_batch_quality_metrics_limits_rows_per_symbol_to_lookback_days(
+    tmp_path: Path,
+) -> None:
+    index_path = _build_multi_year_daily_fixture(tmp_path)
+    provider = _provider(tmp_path, index_path)
+
+    frame = provider.fetch_universe_quality_metrics(
+        symbols=["600000", "000001"],
+        lookback_days=3,
+    )
+
+    assert len(frame[frame["symbol"] == "600000"]) == 3
+    assert len(frame[frame["symbol"] == "000001"]) == 3
+    # The 3 newest rows are kept: 3 from 2025 + 0 from 2024.
+    assert frame[frame["symbol"] == "600000"]["date"].max().year == 2025
+
+
+def test_batch_quality_metrics_delta_wins_on_duplicate_date(tmp_path: Path) -> None:
+    index_path = _build_daily_fixture(tmp_path)
+    delta_db = tmp_path / "delta" / "market_delta.duckdb"
+    delta_package = tmp_path / "delta" / "package"
+    warehouse = MarketWarehouse(db_path=delta_db, package_root=delta_package)
+    warehouse.replace_daily_bars(
+        symbol="600000",
+        frame=_delta_frame(
+            symbol="600000",
+            dates=["2025-12-31", "2026-01-02"],
+        ),
+    )
+    provider = VendorZipOverlayProvider(
+        data_root=str(tmp_path),
+        index_path=str(index_path),
+        delta_db_path=str(delta_db),
+        delta_package_root=str(delta_package),
+    )
+
+    frame = provider.fetch_universe_quality_metrics(
+        symbols=["600000"],
+        lookback_days=10,
+    )
+
+    rows = frame[frame["symbol"] == "600000"]
+    dates = rows["date"].dt.strftime("%Y-%m-%d").tolist()
+    assert dates == ["2025-12-30", "2025-12-31", "2026-01-02"]
+    duplicated = rows[rows["date"].dt.strftime("%Y-%m-%d") == "2025-12-31"]
+    assert len(duplicated) == 1
+    # Delta wins on the shared date: real financial fields present.
+    assert float(duplicated.iloc[0]["close"]) == 13.0
+    assert float(duplicated.iloc[0]["roe"]) == 0.18
+    assert bool(duplicated.iloc[0]["financial_data_complete"]) is True
+    # Delta-only latest row is included.
+    assert rows.iloc[-1]["date"].strftime("%Y-%m-%d") == "2026-01-02"
+
+
+def test_batch_quality_metrics_empty_input_returns_empty_frame(tmp_path: Path) -> None:
+    index_path = _build_multi_year_daily_fixture(tmp_path)
+    provider = _provider(tmp_path, index_path)
+
+    frame = provider.fetch_universe_quality_metrics(symbols=[], lookback_days=10)
+
+    assert isinstance(frame, pd.DataFrame)
+    assert frame.empty
+
+
+def test_batch_quality_metrics_unknown_symbols_yield_no_rows(tmp_path: Path) -> None:
+    index_path = _build_multi_year_daily_fixture(tmp_path)
+    provider = _provider(tmp_path, index_path)
+
+    frame = provider.fetch_universe_quality_metrics(
+        symbols=["999999", "123456.SH"],
+        lookback_days=10,
+    )
+
+    assert isinstance(frame, pd.DataFrame)
+    assert frame.empty
+
+
+def test_batch_quality_metrics_delta_only_symbols_still_returned(tmp_path: Path) -> None:
+    index_path = _build_multi_year_daily_fixture(tmp_path)
+    delta_db = tmp_path / "delta" / "market_delta.duckdb"
+    delta_package = tmp_path / "delta" / "package"
+    warehouse = MarketWarehouse(db_path=delta_db, package_root=delta_package)
+    warehouse.replace_daily_bars(
+        symbol="600519",
+        frame=_delta_frame(symbol="600519", dates=["2026-01-05", "2026-01-06"]),
+    )
+    provider = VendorZipOverlayProvider(
+        data_root=str(tmp_path),
+        index_path=str(index_path),
+        delta_db_path=str(delta_db),
+        delta_package_root=str(delta_package),
+    )
+
+    frame = provider.fetch_universe_quality_metrics(
+        symbols=["600519", "600000"],
+        lookback_days=10,
+    )
+
+    assert "600519" in frame["symbol"].tolist()
+    delta_rows = frame[frame["symbol"] == "600519"]
+    assert len(delta_rows) == 2
+    assert float(delta_rows.iloc[-1]["roe"]) == 0.18
+
+
+def test_batch_quality_metrics_opens_each_annual_zip_once_and_newest_first(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    index_path = _build_multi_year_daily_fixture(tmp_path)
+    provider = _provider(tmp_path, index_path)
+    opened: list[str] = []
+    real_zipfile = zipfile.ZipFile
+
+    class _CountingZipFile(real_zipfile):  # type: ignore[misc, valid-type]
+        def __init__(self, file: object, *args: object, **kwargs: object) -> None:
+            opened.append(str(file))
+            super().__init__(file, *args, **kwargs)
+
+    monkeypatch.setattr(zipfile, "ZipFile", _CountingZipFile)
+
+    # lookback=2: newest year (2025) alone satisfies both symbols, so the
+    # older 2024 archive must not be opened at all.
+    frame = provider.fetch_universe_quality_metrics(
+        symbols=["600000", "000001"],
+        lookback_days=2,
+    )
+
+    assert opened == [str(tmp_path / "全A日K" / "2025.zip")]
+    assert len(frame[frame["symbol"] == "600000"]) == 2
+    assert len(frame[frame["symbol"] == "000001"]) == 2
+    # Every symbol in the same annual archive shares one open.
+    assert len(set(opened)) == 1
+
+
+def test_batch_quality_metrics_opens_older_years_only_when_needed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    index_path = _build_multi_year_daily_fixture(tmp_path)
+    provider = _provider(tmp_path, index_path)
+    opened: list[str] = []
+    real_zipfile = zipfile.ZipFile
+
+    class _CountingZipFile(real_zipfile):  # type: ignore[misc, valid-type]
+        def __init__(self, file: object, *args: object, **kwargs: object) -> None:
+            opened.append(str(file))
+            super().__init__(file, *args, **kwargs)
+
+    monkeypatch.setattr(zipfile, "ZipFile", _CountingZipFile)
+
+    # lookback=5 > 3 rows available in 2025, so 2024 must be read for both.
+    frame = provider.fetch_universe_quality_metrics(
+        symbols=["600000", "000001"],
+        lookback_days=5,
+    )
+
+    assert set(opened) == {
+        str(tmp_path / "全A日K" / "2025.zip"),
+        str(tmp_path / "全A日K" / "2024.zip"),
+    }
+    assert len(frame[frame["symbol"] == "600000"]) == 5
+    assert frame[frame["symbol"] == "600000"]["date"].min().year == 2024
+
+
+def test_batch_quality_metrics_does_not_call_per_symbol_fetch_daily_bars(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    index_path = _build_multi_year_daily_fixture(tmp_path)
+    provider = _provider(tmp_path, index_path)
+
+    def _forbidden(*args: object, **kwargs: object) -> pd.DataFrame:
+        raise AssertionError("per-symbol fetch_daily_bars must not be called")
+
+    monkeypatch.setattr(
+        VendorZipOverlayProvider,
+        "fetch_daily_bars",
+        _forbidden,
+    )
+    delta_calls: list[int] = []
+
+    def _counting_delta_fetch(*, symbols: list[str], lookback_days: int) -> pd.DataFrame:
+        delta_calls.append(len(symbols))
+        return pd.DataFrame()
+
+    monkeypatch.setattr(
+        provider._warehouse, "fetch_universe_quality_metrics", _counting_delta_fetch
+    )
+
+    frame = provider.fetch_universe_quality_metrics(
+        symbols=["600000", "000001"],
+        lookback_days=10,
+    )
+
+    assert delta_calls == [2]
+    assert sorted(frame["symbol"].unique()) == ["000001", "600000"]
+    assert len(frame[frame["symbol"] == "600000"]) == 5
+
+
+def test_batch_quality_metrics_result_is_deterministic_regardless_of_input_order(
+    tmp_path: Path,
+) -> None:
+    index_path = _build_multi_year_daily_fixture(tmp_path)
+    provider = _provider(tmp_path, index_path)
+
+    ordered = provider.fetch_universe_quality_metrics(
+        symbols=["600000", "000001"],
+        lookback_days=3,
+    )
+    shuffled = provider.fetch_universe_quality_metrics(
+        symbols=["000001.SZ", "600000.SH"],
+        lookback_days=3,
+    )
+
+    assert ordered["symbol"].tolist() == shuffled["symbol"].tolist()
+    assert ordered["date"].tolist() == shuffled["date"].tolist()
+    assert ordered["close"].tolist() == shuffled["close"].tolist()
+
+
+def _financial_snapshot_frame(
+    *,
+    symbol: str,
+    end_date: str,
+    ann_date: str,
+    roe: float,
+    debt_ratio: float,
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "symbol": [symbol],
+            "end_date": pd.to_datetime([end_date]),
+            "ann_date": pd.to_datetime([ann_date]),
+            "roe": [roe],
+            "debt_ratio": [debt_ratio],
+            "update_flag": [0],
+            "financial_report_date": [end_date],
+            "financial_as_of": [ann_date],
+            "financial_source": ["tushare_fina_indicator"],
+            "financial_trust_level": ["reported"],
+            "financial_missing_fields": [""],
+            "financial_data_complete": [True],
+            "financial_completeness": [1.0],
+            "coverage_complete": [True],
+            "as_of": [ann_date],
+            "source": ["tushare_fina_indicator"],
+        }
+    )
+
+
+def test_batch_quality_metrics_fills_zip_rows_from_financial_snapshots(
+    tmp_path: Path,
+) -> None:
+    index_path = _build_multi_year_daily_fixture(tmp_path)
+    warehouse = _delta_warehouse(tmp_path)
+    warehouse.upsert_financial_snapshots(
+        symbol="600000",
+        frame=_financial_snapshot_frame(
+            symbol="600000",
+            end_date="2025-09-30",
+            ann_date="2025-11-10",
+            roe=0.15,
+            debt_ratio=0.45,
+        ),
+    )
+    provider = _provider(tmp_path, index_path)
+
+    frame = provider.fetch_universe_quality_metrics(
+        symbols=["600000", "000001"],
+        lookback_days=10,
+    )
+
+    for symbol in ("600000", "000001"):
+        symbol_rows = frame[frame["symbol"] == symbol]
+        assert symbol_rows["date"].is_monotonic_increasing
+    # 600000 ZIP bars disclosed after the snapshot announcement are filled
+    # from the snapshot table; 2024 bars (before any announcement) stay
+    # honestly missing with the same marker as the single-symbol path.
+    filled = frame[frame["symbol"] == "600000"]
+    assert float(
+        filled[filled["date"] == pd.Timestamp("2025-12-30")]["roe"].iloc[0]
+    ) == pytest.approx(0.15)
+    assert float(
+        filled[filled["date"] == pd.Timestamp("2025-12-30")]["debt_ratio"].iloc[0]
+    ) == pytest.approx(0.45)
+    assert (
+        bool(
+            filled[filled["date"] == pd.Timestamp("2025-12-30")]["financial_data_complete"].iloc[0]
+        )
+        is True
+    )
+    assert (
+        str(filled[filled["date"] == pd.Timestamp("2025-12-30")]["financial_source"].iloc[0])
+        == "tushare_fina_indicator"
+    )
+    old = filled[filled["date"] == pd.Timestamp("2024-01-02")]
+    assert pd.isna(old["roe"].iloc[0])
+    assert bool(old["financial_data_complete"].iloc[0]) is False
+    assert str(old["financial_source"].iloc[0]) == "tushare_pending"
+    # 000001 has no snapshots: all rows stay honestly missing.
+    zip_only = frame[frame["symbol"] == "000001"]
+    assert bool(zip_only.iloc[-1]["financial_data_complete"]) is False
+    assert pd.isna(zip_only.iloc[-1]["roe"])
+
+
+def test_batch_quality_metrics_keeps_reported_delta_financials(tmp_path: Path) -> None:
+    index_path = _build_multi_year_daily_fixture(tmp_path)
+    delta_db = tmp_path / "delta" / "market_delta.duckdb"
+    delta_package = tmp_path / "delta" / "package"
+    warehouse = MarketWarehouse(db_path=delta_db, package_root=delta_package)
+    delta_frame = _delta_frame(
+        symbol="600000",
+        dates=["2025-12-31"],
+    )
+    delta_frame["financial_source"] = "tushare_fina_indicator"
+    delta_frame["financial_trust_level"] = "reported"
+    delta_frame["financial_report_date"] = "2025-09-30"
+    delta_frame["financial_as_of"] = "2025-10-25"
+    warehouse.replace_daily_bars(symbol="600000", frame=delta_frame)
+    warehouse.upsert_financial_snapshots(
+        symbol="600000",
+        frame=_financial_snapshot_frame(
+            symbol="600000",
+            end_date="2025-09-30",
+            ann_date="2025-11-10",
+            roe=0.15,
+            debt_ratio=0.45,
+        ),
+    )
+    provider = VendorZipOverlayProvider(
+        data_root=str(tmp_path),
+        index_path=str(index_path),
+        delta_db_path=str(delta_db),
+        delta_package_root=str(delta_package),
+    )
+
+    frame = provider.fetch_universe_quality_metrics(
+        symbols=["600000"],
+        lookback_days=10,
+    )
+
+    rows = frame[frame["symbol"] == "600000"]
+    delta_row = rows[rows["date"] == pd.Timestamp("2025-12-31")]
+    assert len(delta_row) == 1
+    # Reported delta financials are trusted and never overwritten by the
+    # snapshot join (only_fill_pending=True).
+    assert float(delta_row.iloc[0]["roe"]) == 0.18
+    assert str(delta_row.iloc[0]["financial_source"]) == "tushare_fina_indicator"
+    # ZIP rows (local_vendor/missing) are filled from the snapshot table.
+    zip_row = rows[rows["date"] == pd.Timestamp("2025-12-30")]
+    assert float(zip_row.iloc[0]["roe"]) == pytest.approx(0.15)

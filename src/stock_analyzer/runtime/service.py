@@ -5007,6 +5007,26 @@ class StockAnalyzerService:
                     pending.append(nested)
         return providers
 
+    def _resolve_universe_quality_batch_source(self) -> object:
+        """Resolve the batch quality-metrics source for the Week5 selector.
+
+        Prefers a real provider in the runtime graph implementing
+        ``fetch_universe_quality_metrics`` (for example
+        ``VendorZipOverlayProvider`` under ``vendor_zip_overlay``). Wrapper
+        chains (``CachedProvider.inner`` / ``ResilientProvider.primary`` …)
+        are walked breadth-first, so an outer wrapper is inspected before its
+        nested providers — a ``VendorZipOverlayProvider`` is therefore found
+        before its internal delta ``MarketWarehouse``, and the delta warehouse
+        is never treated as a full-market batch source. When no provider in
+        the graph has the batch capability, the standalone market warehouse
+        is returned to preserve ``market_warehouse`` deployments.
+        """
+        for provider in self._iter_market_data_provider_graph():
+            fetcher = getattr(provider, "fetch_universe_quality_metrics", None)
+            if callable(fetcher):
+                return provider
+        return self._market_warehouse()
+
     def _load_symbol_universe_from_provider(self) -> list[str]:
         candidates: list[str] = []
         for provider in self._iter_market_data_provider_graph():
@@ -5304,11 +5324,15 @@ class StockAnalyzerService:
         """Run :class:`UniverseCandidateSelector` to pick ``target_size`` candidates.
 
         Thin glue: constructs the standalone selector with config-derived knobs
-        and the market warehouse, delegates the heavy work (batch metric fetch,
-        hard filter, quality scoring, board-quota selection, exploration) to the
-        selector module, and persists the audit snapshot. Degraded fallback to
-        :func:`_quota_sample_universe` is wired through ``fallback_sampler`` so
-        this method never silently switches to per-symbol reads.
+        and the batch quality source resolved from the runtime provider graph
+        (:meth:`_resolve_universe_quality_batch_source` — a real provider batch
+        implementation such as ``VendorZipOverlayProvider`` when present, the
+        market warehouse otherwise), delegates the heavy work (batch metric
+        fetch, hard filter, quality scoring, board-quota selection,
+        exploration) to the selector module, and persists the audit snapshot.
+        Degraded fallback to :func:`_quota_sample_universe` is wired through
+        ``fallback_sampler`` so this method never silently switches to
+        per-symbol reads.
         """
         from stock_analyzer.runtime.universe_candidate_selector import (
             UniverseCandidateSelector,
@@ -5316,7 +5340,7 @@ class StockAnalyzerService:
         )
 
         cfg = self._config.week5
-        warehouse = self._market_warehouse()
+        warehouse = self._resolve_universe_quality_batch_source()
         selector = UniverseCandidateSelector(
             warehouse=warehouse,
             weights=cfg.universe_quality_weights,
