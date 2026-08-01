@@ -1509,7 +1509,7 @@ def _evolution_window_report_cache_fingerprint(report_dir: Path) -> dict[str, ob
 
 
 def _evolution_window_report_cache_path(service: Any) -> Path:
-    return service._resolve_evolution_path("artifacts/evolution/window_report_cache.json")
+    return Path(service._resolve_evolution_path("artifacts/evolution/window_report_cache.json"))
 
 
 def _load_evolution_window_report_cache(
@@ -1519,7 +1519,7 @@ def _load_evolution_window_report_cache(
     fingerprint: dict[str, object],
 ) -> dict[str, object] | None:
     raw_cache = getattr(service, "_evolution_window_report_cache", None)
-    if _matches_evolution_window_report_cache(
+    if isinstance(raw_cache, dict) and _matches_evolution_window_report_cache(
         raw_cache,
         cache_key=cache_key,
         fingerprint=fingerprint,
@@ -1568,7 +1568,7 @@ def _store_evolution_window_report_cache(
         "cached_at_monotonic": monotonic(),
         "payload": deepcopy(payload),
     }
-    setattr(service, "_evolution_window_report_cache", cache_record)
+    service._evolution_window_report_cache = cache_record
     cache_path = _evolution_window_report_cache_path(service)
     try:
         cache_path.parent.mkdir(parents=True, exist_ok=True)

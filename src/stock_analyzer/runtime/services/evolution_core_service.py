@@ -7,7 +7,7 @@ import json
 import math
 import os
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from functools import lru_cache
 from importlib import import_module
@@ -1486,7 +1486,7 @@ def _extract_intraday_record_fields_for_trade_date(
     columns: tuple[str, ...],
     trade_date: str,
 ) -> dict[str, object]:
-    empty_payload = {
+    empty_payload: dict[str, object] = {
         f"{prefix}_latest_date": "",
         **{f"{prefix}_{column}": None for column in columns},
     }
@@ -1495,22 +1495,27 @@ def _extract_intraday_record_fields_for_trade_date(
     normalized_trade_date = _normalize_trade_date_text(trade_date)
     if not normalized_trade_date:
         return empty_payload
-    working = frame.copy()
     try:
-        if not isinstance(working.index, pd.DatetimeIndex):
-            working.index = pd.to_datetime(working.index, errors="coerce")
+        parsed_index = pd.DatetimeIndex(pd.to_datetime(list(frame.index), errors="coerce"))
     except (TypeError, ValueError):
         return empty_payload
-    if not isinstance(working.index, pd.DatetimeIndex):
+    valid_positions = [
+        position for position, value in enumerate(parsed_index) if not pd.isna(value)
+    ]
+    if not valid_positions:
         return empty_payload
-    working = working[~working.index.isna()]
-    if working.empty:
-        return empty_payload
+    working = frame.iloc[valid_positions].copy()
+    normalized_index = parsed_index.take(valid_positions)
     target_date = pd.Timestamp(normalized_trade_date).normalize()
-    matched = working.loc[working.index.normalize() == target_date]
-    if matched.empty:
+    matched_positions = [
+        position
+        for position, value in enumerate(normalized_index)
+        if value.normalize() == target_date
+    ]
+    if not matched_positions:
         return empty_payload
-    latest = matched.sort_index().iloc[-1]
+    latest_position = max(matched_positions, key=lambda position: normalized_index[position])
+    latest = working.iloc[latest_position]
     payload: dict[str, object] = {f"{prefix}_latest_date": target_date.date().isoformat()}
     for column in columns:
         payload[f"{prefix}_{column}"] = (
@@ -1522,10 +1527,13 @@ def _extract_intraday_record_fields_for_trade_date(
 def _normalize_trade_date_text(value: object) -> str:
     if isinstance(value, pd.Timestamp):
         return value.normalize().date().isoformat()
+    normalized = str(value).strip()
+    if not normalized:
+        return ""
     try:
-        parsed = pd.Timestamp(value)
+        parsed = pd.Timestamp(normalized)
     except (TypeError, ValueError):
-        return str(value).strip()
+        return normalized
     if pd.isna(parsed):
         return ""
     return parsed.normalize().date().isoformat()
@@ -1571,7 +1579,9 @@ def _load_json_mapping_records(path: Path) -> list[dict[str, object]]:
     return []
 
 
-def _summarize_intraday_loader_records(records: list[Mapping[str, object]]) -> dict[str, object]:
+def _summarize_intraday_loader_records(
+    records: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
     total = len(records)
     intraday_1m_records = sum(
         1 for record in records if _record_has_intraday_context(record, prefix="intraday_1m")

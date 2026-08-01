@@ -9,7 +9,6 @@ from pathlib import Path
 from time import monotonic
 from typing import Any, cast
 
-
 _TRAINING_OVERVIEW_CACHE_TTL_SEC = 15.0
 
 
@@ -163,7 +162,9 @@ class RuntimeDashboardService:
         warehouse_background = _as_dict(warehouse_context.get("background"))
 
         project_root = service._evolution_project_root
-        model_artifact_path = service._resolve_evolution_path(str(service._config.training.artifact_path))
+        model_artifact_path = service._resolve_evolution_path(
+            str(service._config.training.artifact_path)
+        )
         baseline_report_path = service._resolve_evolution_path(
             str(service._config.training.baseline_report_path)
         )
@@ -187,7 +188,9 @@ class RuntimeDashboardService:
         model_metadata = _as_dict(model_artifact.get("metadata"))
         model_training_metrics = _as_dict(model_artifact.get("training_metrics"))
 
-        evolution_items = evolution_history.get("items") if isinstance(evolution_history, dict) else []
+        evolution_items = (
+            evolution_history.get("items") if isinstance(evolution_history, dict) else []
+        )
         recent_evolution_runs: list[dict[str, object]] = []
         if isinstance(evolution_items, list):
             for raw_item in reversed(evolution_items[-capped_history_limit:]):
@@ -204,7 +207,7 @@ class RuntimeDashboardService:
             "latest_activity": _as_dict(runtime_stage.get("latest_activity")),
         }
 
-        payload = {
+        payload: dict[str, object] = {
             "generated_at": datetime.now().isoformat(),
             "bootstrap": bootstrap_payload,
             "model_artifact": {
@@ -858,15 +861,11 @@ def _store_training_overview_cache(
     history_limit: int,
     payload: dict[str, object],
 ) -> None:
-    setattr(
-        service,
-        "_dashboard_training_overview_cache",
-        {
-            "history_limit": history_limit,
-            "cached_at_monotonic": monotonic(),
-            "payload": deepcopy(payload),
-        },
-    )
+    service._dashboard_training_overview_cache = {
+        "history_limit": history_limit,
+        "cached_at_monotonic": monotonic(),
+        "payload": deepcopy(payload),
+    }
 
 
 def _summarize_training_regime(payload: dict[str, object]) -> dict[str, object]:

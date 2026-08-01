@@ -149,9 +149,7 @@ class RuntimeWeek5StateService:
         if isinstance(signal_pool, dict):
             ranking = signal_pool.get("ranking")
             ranking_score_key = (
-                str(ranking.get("score_key", "")).strip()
-                if isinstance(ranking, dict)
-                else ""
+                str(ranking.get("score_key", "")).strip() if isinstance(ranking, dict) else ""
             )
             if not ranking_score_key:
                 ranking_score_key = "shortlist_score"
@@ -344,11 +342,8 @@ class RuntimeWeek5StateService:
             if isinstance(raw_selected_symbols, list):
                 selected_symbols = [
                     symbol
-                    for symbol in (
-                        _normalize_a_share_symbol(item) for item in raw_selected_symbols
-                    )
-                    if symbol
-                    and not _candidate_has_hard_blockers(row_by_symbol.get(symbol, {}))
+                    for symbol in (_normalize_a_share_symbol(item) for item in raw_selected_symbols)
+                    if symbol and not _candidate_has_hard_blockers(row_by_symbol.get(symbol, {}))
                 ]
                 if selected_symbols:
                     return _dedupe_preserve_order(selected_symbols)[:top_k]
@@ -479,7 +474,9 @@ def _dedupe_preserve_order(items: list[str]) -> list[str]:
 def _candidate_has_hard_blockers(item: object) -> bool:
     if not isinstance(item, dict):
         return False
-    reasons = [str(reason).strip().lower() for reason in item.get("reasons", []) if str(reason).strip()]
+    reasons = [
+        str(reason).strip().lower() for reason in item.get("reasons", []) if str(reason).strip()
+    ]
     blocking_reasons = {
         "cross_review",
         "liquidity_failed",
@@ -524,11 +521,7 @@ def _watchlist_candidate_rows(report: dict[str, object]) -> list[tuple[dict[str,
     signal_pool = report.get("signal_pool")
     if isinstance(signal_pool, dict):
         ranking = signal_pool.get("ranking")
-        score_key = (
-            str(ranking.get("score_key", "")).strip()
-            if isinstance(ranking, dict)
-            else ""
-        )
+        score_key = str(ranking.get("score_key", "")).strip() if isinstance(ranking, dict) else ""
         if not score_key:
             score_key = "shortlist_score"
         raw_rows = signal_pool.get("candidates")
