@@ -137,11 +137,15 @@ class RuntimeLearningGovernanceService:
         proposal = _mapping(proposal_payload.get("proposal"))
         proposal_id = str(proposal.get("proposal_id", "")).strip()
         gate_payload = _mapping(workflow_payload.get("promotion_gate", {}))
-        gate_status = str(
-            proposal.get("gate_status", "")
-            or gate_payload.get("status", "")
-            or workflow_payload.get("status", "")
-        ).strip().lower()
+        gate_status = (
+            str(
+                proposal.get("gate_status", "")
+                or gate_payload.get("status", "")
+                or workflow_payload.get("status", "")
+            )
+            .strip()
+            .lower()
+        )
         workflow_errors = _string_list(workflow_payload.get("errors", []))
         proposal_errors = [
             item
@@ -216,9 +220,9 @@ class RuntimeLearningGovernanceService:
                         auto_promotion["status"] = "released"
                         if auto_reload_predictor:
                             shadow_model_id = str(
-                                _mapping(_mapping(exec_result.get("ticket")).get("release_payload")).get(
-                                    "shadow_model_id", ""
-                                )
+                                _mapping(
+                                    _mapping(exec_result.get("ticket")).get("release_payload")
+                                ).get("shadow_model_id", "")
                             ).strip()
                             shadow_entry = self._service._model_registry.get_by_id(shadow_model_id)
                             if shadow_entry is not None and str(shadow_entry.artifact_uri).strip():
@@ -250,9 +254,7 @@ class RuntimeLearningGovernanceService:
                 source_trace_id=source_trace_id,
             )
         latest_proposal = (
-            self._resolve_latest_learning_proposal(proposal_id=proposal_id)
-            if proposal_id
-            else None
+            self._resolve_latest_learning_proposal(proposal_id=proposal_id) if proposal_id else None
         )
         payload = {
             "ok": bool(workflow_payload.get("ok", False)) and accepted,
@@ -539,7 +541,10 @@ class RuntimeLearningGovernanceService:
         shadow_model_id = str(proposal.get("shadow_model_id", "")).strip()
         if revoke_model and shadow_model_id:
             target_entry = service._model_registry.get_by_id(shadow_model_id)
-            if target_entry is not None and target_entry.lifecycle_state != ModelLifecycleState.REVOKED:
+            if (
+                target_entry is not None
+                and target_entry.lifecycle_state != ModelLifecycleState.REVOKED
+            ):
                 transition_records: list[dict[str, object]] = []
                 if target_entry.role == ModelRole.CHAMPION:
                     transition_records.append(
@@ -810,7 +815,9 @@ class RuntimeLearningGovernanceService:
                 return {
                     "accepted": False,
                     "code": "champion_changed_since_ticket_issue",
-                    "message": "active champion changed after ticket issuance; regenerate proposal/ticket",
+                    "message": (
+                        "active champion changed after ticket issuance; regenerate proposal/ticket"
+                    ),
                     "ticket_id": str(ticket.get("ticket_id", "")),
                     "expected_champion_model_id": previous_champion_id,
                     "active_champion_model_id": previous_champion.model_id,
@@ -886,9 +893,7 @@ class RuntimeLearningGovernanceService:
             proposal=proposal,
             update={
                 "status": "executed",
-                "release_state": (
-                    "pending_confirmation" if confirmation_required else "confirmed"
-                ),
+                "release_state": ("pending_confirmation" if confirmation_required else "confirmed"),
                 "released_at": executed_at,
                 "ticket": {
                     "ticket_id": str(ticket.get("ticket_id", "")),
@@ -938,8 +943,7 @@ class RuntimeLearningGovernanceService:
         service.notify(
             title="Learning 模型发布已执行",
             content=(
-                f"票据 {ticket.get('ticket_id', '')} 已执行，"
-                f"新 Champion 模型为 {shadow_model_id}。"
+                f"票据 {ticket.get('ticket_id', '')} 已执行，新 Champion 模型为 {shadow_model_id}。"
             ),
             level="info",
             trace_id=source_trace_id,
@@ -1280,7 +1284,8 @@ class RuntimeLearningGovernanceService:
                 ticket_id=learning_ticket_id,
                 note="auto rollback: learning confirmation ttl exceeded",
                 timestamp=run_now,
-                source_trace_id=source_trace_id or f"learning-release-watchdog-{learning_ticket_id}",
+                source_trace_id=source_trace_id
+                or f"learning-release-watchdog-{learning_ticket_id}",
             )
             rollback_results.append(rollback)
             if bool(rollback.get("accepted", False)):
@@ -1347,9 +1352,7 @@ class RuntimeLearningGovernanceService:
 
             pending_confirmation = _mapping(snapshot.get("pending_confirmation"))
             if pending_confirmation:
-                item["pending_confirmation_state"] = str(
-                    pending_confirmation.get("state", "")
-                )
+                item["pending_confirmation_state"] = str(pending_confirmation.get("state", ""))
 
             event_name = "issued"
             event_timestamp = str(snapshot.get("timestamp", ""))
@@ -1713,7 +1716,9 @@ class RuntimeLearningGovernanceService:
             return {
                 "accepted": False,
                 "code": "promotion_gate_warn_not_allowed",
-                "message": "warning gate result requires allow_warn_status=true for proposal creation",
+                "message": (
+                    "warning gate result requires allow_warn_status=true for proposal creation"
+                ),
                 "errors": _string_list(gate.get("reason_codes", []))
                 or ["promotion_gate_warn_not_allowed"],
                 "promotion_gate": gate,
@@ -1852,16 +1857,20 @@ class RuntimeLearningGovernanceService:
     ) -> bool:
         service = self._service
         gate_payload = _mapping(workflow_payload.get("promotion_gate", {}))
-        gate_status = str(
-            gate_payload.get("status", "") or workflow_payload.get("status", "")
-        ).strip() or "unknown"
+        gate_status = (
+            str(gate_payload.get("status", "") or workflow_payload.get("status", "")).strip()
+            or "unknown"
+        )
         reason_codes = _string_list(gate_payload.get("reason_codes", []))
         proposal_errors = _string_list(proposal_payload.get("errors", []))
         detail_parts = [
             f"gate_status={gate_status}",
             f"proposal_id={proposal_id or '-'}",
             f"shadow_model_id={str(workflow_payload.get('shadow_model_id', '')).strip() or '-'}",
-            f"dataset_manifest_id={str(workflow_payload.get('dataset_manifest_id', '')).strip() or '-'}",
+            (
+                "dataset_manifest_id="
+                f"{str(workflow_payload.get('dataset_manifest_id', '')).strip() or '-'}"
+            ),
         ]
         if reason_codes:
             detail_parts.append(f"reason_codes={','.join(reason_codes)}")
@@ -2022,7 +2031,9 @@ class RuntimeLearningGovernanceService:
                 setattr(service, history_attr, history[overflow:])
 
     def _learning_governance_root(self) -> Path:
-        return self._service._resolve_evolution_path(self._service._config.evolution.suggestions_dir)
+        return self._service._resolve_evolution_path(
+            self._service._config.evolution.suggestions_dir
+        )
 
     def _build_learning_payload_uri(self, relative_path: Path) -> str:
         normalized = relative_path.as_posix().strip("/")

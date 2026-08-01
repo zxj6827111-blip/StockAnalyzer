@@ -258,7 +258,7 @@ class RuntimeStateService:
 
     def _runtime_state_sidecar_dir(self) -> Path:
         service = self._service
-        return service._runtime_state_path.with_name("runtime_state_history")
+        return Path(service._runtime_state_path).with_name("runtime_state_history")
 
     def _runtime_state_sidecar_specs(
         self,

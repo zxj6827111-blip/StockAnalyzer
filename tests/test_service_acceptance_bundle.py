@@ -23,6 +23,8 @@ def test_service_generates_v13_acceptance_bundle(tmp_path: Path) -> None:
         tmp_path / "artifacts" / "acceptance" / "baseline_report.json"
     )
 
+    config.data_source.primary = "synthetic"
+    config.data_source.runtime_live_enabled = False
     service = StockAnalyzerService(config=config)
     service.train_models(
         symbol="600000",

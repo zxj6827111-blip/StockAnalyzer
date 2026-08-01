@@ -1196,7 +1196,9 @@ class RuntimeAcceptanceService:
         if isinstance(label_conflict_shadow_report, Mapping):
             label_conflict_shadow_payload = dict(label_conflict_shadow_report)
         else:
-            label_conflict_shadow_path = Path("artifacts/acceptance/label_conflict_shadow_report.json")
+            label_conflict_shadow_path = Path(
+                "artifacts/acceptance/label_conflict_shadow_report.json"
+            )
             if label_conflict_shadow_path.exists():
                 loaded = json.loads(label_conflict_shadow_path.read_text(encoding="utf-8"))
                 if isinstance(loaded, dict):

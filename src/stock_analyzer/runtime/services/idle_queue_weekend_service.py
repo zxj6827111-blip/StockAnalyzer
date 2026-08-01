@@ -682,9 +682,12 @@ class RuntimeIdleQueueWeekendService:
             "ok",
             "degraded",
         }:
-            return service._notify_learning_workflow_summary(
-                proposal_payload=proposal_payload,
-                trace_id=trace_id,
+            return cast(
+                dict[str, object],
+                service._notify_learning_workflow_summary(
+                    proposal_payload=proposal_payload,
+                    trace_id=trace_id,
+                ),
             )
 
         trade_date = str(report.get("trade_date", "")).strip()

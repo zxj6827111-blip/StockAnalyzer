@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import locale
 import subprocess
+import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +30,8 @@ class QualityCommandResult:
     duration_ms: int
     log_path: str
     blocking: bool
+
+    output_tail: str = ""
 
 
 @dataclass
@@ -140,18 +143,19 @@ _SLOW_TEST_FILES = (
 def build_stage_specs(stage: str) -> list[QualityCommandSpec]:
     """Build the command list for a quality gate stage."""
     normalized = stage.strip().lower()
+    python = sys.executable
     if normalized == "clean-scope":
         specs = [
             QualityCommandSpec(
                 name="ruff_clean_scope",
-                command=("python", "-m", "ruff", "check", *_RUFF_TARGETS),
+                command=(python, "-m", "ruff", "check", *_RUFF_TARGETS),
                 log_name="ruff_clean_scope.log",
             )
         ]
         specs.extend(
             QualityCommandSpec(
                 name=f"mypy_{Path(target).stem}",
-                command=("python", "-m", "mypy", target, "--follow-imports", "skip"),
+                command=(python, "-m", "mypy", target, "--follow-imports", "skip"),
                 log_name=f"mypy_{Path(target).stem}.log",
             )
             for target in _MYPY_BLOCKING_TARGETS
@@ -159,7 +163,7 @@ def build_stage_specs(stage: str) -> list[QualityCommandSpec]:
         specs.extend(
             QualityCommandSpec(
                 name=f"mypy_{Path(target).stem}",
-                command=("python", "-m", "mypy", target, "--follow-imports", "skip"),
+                command=(python, "-m", "mypy", target, "--follow-imports", "skip"),
                 log_name=f"mypy_{Path(target).stem}.log",
                 blocking=False,
             )
@@ -170,7 +174,7 @@ def build_stage_specs(stage: str) -> list[QualityCommandSpec]:
         return [
             QualityCommandSpec(
                 name="pytest_smoke",
-                command=("python", "-m", "pytest", *_SMOKE_TEST_NODES, "-q"),
+                command=(python, "-m", "pytest", *_SMOKE_TEST_NODES, "-q"),
                 log_name="pytest_smoke.log",
             )
         ]
@@ -178,7 +182,7 @@ def build_stage_specs(stage: str) -> list[QualityCommandSpec]:
         return [
             QualityCommandSpec(
                 name="pytest_integration",
-                command=("python", "-m", "pytest", *_INTEGRATION_TEST_NODES, "-q"),
+                command=(python, "-m", "pytest", *_INTEGRATION_TEST_NODES, "-q"),
                 log_name="pytest_integration.log",
             )
         ]
@@ -186,7 +190,14 @@ def build_stage_specs(stage: str) -> list[QualityCommandSpec]:
         return [
             QualityCommandSpec(
                 name="pytest_slow_report",
-                command=("python", "-m", "pytest", *_SLOW_TEST_FILES, "--durations=20", "-q"),
+                command=(
+                    python,
+                    "-m",
+                    "pytest",
+                    *_SLOW_TEST_FILES,
+                    "--durations=20",
+                    "-q",
+                ),
                 log_name="pytest_slow_report.log",
             )
         ]
@@ -238,6 +249,7 @@ def run_quality_gate(
             duration_ms=duration_ms,
             log_path=str(log_path),
             blocking=spec.blocking,
+            output_tail=_output_tail(output) if completed.returncode != 0 else "",
         )
         results.append(result)
         if completed.returncode != 0:
@@ -279,3 +291,8 @@ def _decode_subprocess_stream(payload: bytes | str | None) -> str:
         except UnicodeDecodeError:
             continue
     return payload.decode("utf-8", errors="replace")
+
+
+def _output_tail(output: str, *, max_lines: int = 80, max_chars: int = 12_000) -> str:
+    lines = output.splitlines()
+    return "\n".join(lines[-max_lines:])[-max_chars:]

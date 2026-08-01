@@ -9,6 +9,11 @@ from stock_analyzer.data import provider as provider_module
 from stock_analyzer.data.provider import SyntheticProvider
 
 
+def test_synthetic_provider_symbol_seed_is_process_stable() -> None:
+    assert provider_module._stable_synthetic_seed(symbol="600000", seed_offset=123) == 4011845494
+    assert provider_module._stable_synthetic_seed(symbol="000001", seed_offset=123) == 1312896491
+
+
 def test_synthetic_provider_handles_weekend_end_date(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -389,16 +389,19 @@ class RuntimeTrainingService:
             symbol=normalized_symbol,
             lookback_days=max(lookback_days, len(bars) + 5),
         )
-        report = build_training_evaluation_report(
-            bars=bars,
-            training=service._config.training,
-            labels=service._config.labels,
-            models=service._config.models,
-            settlement_lag_days=service._config.evolution.execution_spec.settlement_lag,
-            intraday_1m=intraday_1m,
-            intraday_5m=intraday_5m,
-            provider=service._provider,
-            market_relative_feature=service._config.market_relative_feature,
+        report = cast(
+            dict[str, object],
+            build_training_evaluation_report(
+                bars=bars,
+                training=service._config.training,
+                labels=service._config.labels,
+                models=service._config.models,
+                settlement_lag_days=service._config.evolution.execution_spec.settlement_lag,
+                intraday_1m=intraday_1m,
+                intraday_5m=intraday_5m,
+                provider=service._provider,
+                market_relative_feature=service._config.market_relative_feature,
+            ),
         )
         report["symbol"] = normalized_symbol
         report["lookback_days"] = lookback_days
@@ -413,10 +416,10 @@ class RuntimeTrainingService:
             candidate = Path(normalized).expanduser()
             if candidate.is_absolute():
                 return candidate
-            return service._resolve_evolution_path(str(candidate))
+            return Path(service._resolve_evolution_path(str(candidate)))
         timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
         return (
-            service._training_bootstrap_state_path.parent
+            Path(service._training_bootstrap_state_path).parent
             / "execution_risk"
             / f"execution_risk_{timestamp}.json"
         )
@@ -663,7 +666,7 @@ class RuntimeTrainingService:
     def _discover_latest_execution_risk_artifact(
         self,
     ) -> _ExecutionRiskArtifactScanResult:
-        root = self._service._training_bootstrap_state_path.parent / "execution_risk"
+        root = Path(self._service._training_bootstrap_state_path).parent / "execution_risk"
         if not root.exists():
             return _ExecutionRiskArtifactScanResult()
         discovered: list[dict[str, object]] = []
@@ -748,9 +751,12 @@ class RuntimeTrainingService:
             max_rows=max_rows,
             execution_risk_artifact_path=artifact_path,
         )
-        payload = report.to_dict(
-            include_rows=include_rows,
-            preview_limit=max(1, int(preview_limit)),
+        payload = cast(
+            dict[str, object],
+            report.to_dict(
+                include_rows=include_rows,
+                preview_limit=max(1, int(preview_limit)),
+            ),
         )
         self._append_history(
             history_attr="_execution_aware_report_history",

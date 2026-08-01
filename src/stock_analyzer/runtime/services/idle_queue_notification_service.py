@@ -4,10 +4,10 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from functools import lru_cache
 from importlib import import_module
-import re
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:

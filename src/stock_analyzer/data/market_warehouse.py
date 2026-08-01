@@ -503,7 +503,10 @@ class MarketWarehouse:
         snaps = self.fetch_financial_snapshots(symbol=symbol)
         if snaps.empty:
             return daily
-        enriched = apply_financial_snapshots_asof(daily, snaps, only_fill_pending=False)
+        enriched = cast(
+            pd.DataFrame,
+            apply_financial_snapshots_asof(daily, snaps, only_fill_pending=False),
+        )
         self.replace_daily_bars(symbol=symbol, frame=enriched)
         if self.package_writes_enabled:
             write_package_daily_bars(
