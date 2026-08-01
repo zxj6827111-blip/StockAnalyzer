@@ -62,6 +62,7 @@ _RUFF_TARGETS = (
     "tests/test_release_smoke.py",
     "tests/test_release_snapshot.py",
     "tests/test_staging_rehearsal.py",
+    "tests/test_nas_deploy_update_script.py",
 )
 
 _MYPY_BLOCKING_TARGETS = (
@@ -90,6 +91,7 @@ _MYPY_INFORMATIONAL_TARGETS = (
 )
 
 _SMOKE_TEST_NODES = (
+    "tests/test_nas_deploy_update_script.py",
     "tests/test_release_preflight.py",
     "tests/test_release_smoke.py",
     "tests/test_release_snapshot.py",
