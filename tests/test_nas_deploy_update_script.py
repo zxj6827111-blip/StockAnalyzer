@@ -61,6 +61,35 @@ def test_nas_deploy_update_keeps_scheduler_start_opt_in() -> None:
     assert "scheduler: not started" in script
 
 
+def test_nas_deploy_update_resolves_host_python_interpreter() -> None:
+    script = _script()
+
+    assert 'HOST_PYTHON="${HOST_PYTHON:-}"' in script
+    assert 'command -v "${HOST_PYTHON}"' in script
+    assert "command -v python3" in script
+    assert "command -v python" in script
+    assert script.index("command -v python3 >") < script.index("command -v python >")
+    assert "using python interpreter: ${HOST_PYTHON}" in script
+
+
+def test_nas_deploy_update_uses_host_python_for_json_steps() -> None:
+    script = _script()
+
+    assert '"${HOST_PYTHON}" - "${RENDERED}"' in script
+    assert '"${HOST_PYTHON}" - "${HEALTH}" "${COMMIT}"' in script
+    assert "python - " not in script
+    assert "python3 - " not in script
+
+
+def test_nas_deploy_update_fails_closed_without_python() -> None:
+    script = _script()
+
+    assert "neither python3 nor python found on PATH" in script
+    assert 'echo "ERROR: HOST_PYTHON=${HOST_PYTHON} not found on PATH." >&2' in script
+    assert "exit 127" in script
+    assert "import json, sys" in script
+
+
 def test_nas_deploy_update_checks_run_in_quality_gate() -> None:
     clean_scope = next(
         spec for spec in build_stage_specs("clean-scope") if spec.name == "ruff_clean_scope"

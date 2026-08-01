@@ -23,6 +23,7 @@ DO_PULL=1
 START_SCHEDULER=0
 HEALTH_ATTEMPTS="${HEALTH_ATTEMPTS:-30}"
 HEALTH_SLEEP_SEC="${HEALTH_SLEEP_SEC:-2}"
+HOST_PYTHON="${HOST_PYTHON:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -86,6 +87,22 @@ if [[ -n "$(git status --porcelain --untracked-files=no 2>/dev/null || true)" ]]
   exit 1
 fi
 
+# Resolve the host Python interpreter before any pull/build/recreate step.
+if [[ -n "${HOST_PYTHON}" ]]; then
+  if ! command -v "${HOST_PYTHON}" >/dev/null 2>&1; then
+    echo "ERROR: HOST_PYTHON=${HOST_PYTHON} not found on PATH." >&2
+    exit 127
+  fi
+elif command -v python3 >/dev/null 2>&1; then
+  HOST_PYTHON="$(command -v python3)"
+elif command -v python >/dev/null 2>&1; then
+  HOST_PYTHON="$(command -v python)"
+else
+  echo "ERROR: neither python3 nor python found on PATH; install Python or set HOST_PYTHON." >&2
+  exit 127
+fi
+echo "using python interpreter: ${HOST_PYTHON}"
+
 if [[ "${DO_PULL}" -eq 1 ]]; then
   echo "[1/4] git fetch/pull origin/${BRANCH}"
   git fetch origin "${BRANCH}"
@@ -120,7 +137,7 @@ echo "[2/4] render and fail-closed validate advisory vendor-overlay config"
 RENDERED="$(mktemp)"
 trap 'rm -f "${RENDERED}"' EXIT
 "${COMPOSE[@]}" config --format json > "${RENDERED}"
-python - "${RENDERED}" <<'PY'
+"${HOST_PYTHON}" - "${RENDERED}" <<'PY'
 import json, sys
 from pathlib import Path
 d = json.loads(Path(sys.argv[1]).read_text())
@@ -168,7 +185,7 @@ while [[ "${attempt}" -le "${HEALTH_ATTEMPTS}" ]]; do
   HEALTH_ERROR="$(mktemp)"
   if HEALTH="$(curl -fsS --connect-timeout 3 --max-time 10 "${HEALTH_URL}" 2>"${HEALTH_ERROR}")"; then
     rm -f "${HEALTH_ERROR}"
-    if python - "${HEALTH}" "${COMMIT}" <<'PY'
+    if "${HOST_PYTHON}" - "${HEALTH}" "${COMMIT}" <<'PY'
 import json, sys
 h = json.loads(sys.argv[1])
 expected = sys.argv[2]
