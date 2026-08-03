@@ -1160,6 +1160,8 @@ def _normalize_symbol(symbol: str) -> str:
 
 
 def _to_ts_code(code6: str) -> str:
+    if code6.startswith("920"):
+        return f"{code6}.BJ"
     if code6.startswith(("5", "6", "9")):
         return f"{code6}.SH"
     if code6.startswith(("4", "8")):
