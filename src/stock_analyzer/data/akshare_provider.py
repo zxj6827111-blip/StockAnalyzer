@@ -254,6 +254,8 @@ def _infer_board(symbol: str) -> str:
 
 def _to_tx_symbol(symbol: str) -> str:
     text = symbol.strip()
+    if text.startswith("920"):
+        return f"bj{text}"
     if text.startswith(("5", "6", "9")):
         return f"sh{text}"
     return f"sz{text}"

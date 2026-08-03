@@ -5,8 +5,9 @@ from types import ModuleType
 from typing import Any, cast
 
 import pandas as pd
+import pytest
 
-from stock_analyzer.data.akshare_provider import AkshareProvider
+from stock_analyzer.data.akshare_provider import AkshareProvider, _to_tx_symbol
 from stock_analyzer.data.background_adapter import AkshareBackgroundAdapter
 from stock_analyzer.data.financial_adapter import AkshareFinancialAdapter
 
@@ -73,6 +74,25 @@ class _FakeAkshare:
                 "amount": [100_000.0, 120_000.0, 150_000.0],
             }
         )
+
+
+@pytest.mark.parametrize(
+    ("symbol", "expected"),
+    [
+        ("920002", "bj920002"),
+        ("920099", "bj920099"),
+        ("900901", "sh900901"),
+        ("600000", "sh600000"),
+        ("688001", "sh688001"),
+        ("510300", "sh510300"),
+        ("430047", "sz430047"),
+        ("830799", "sz830799"),
+        ("000001", "sz000001"),
+        ("300750", "sz300750"),
+    ],
+)
+def test_to_tx_symbol_mapping(symbol: str, expected: str) -> None:
+    assert _to_tx_symbol(symbol) == expected
 
 
 def test_akshare_provider_falls_back_to_tx_history() -> None:
