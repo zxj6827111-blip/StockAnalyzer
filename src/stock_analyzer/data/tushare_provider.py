@@ -6,6 +6,7 @@ import importlib
 import json
 import os
 import re
+import urllib.error
 import urllib.request
 from datetime import date, timedelta
 from threading import Lock
@@ -20,6 +21,14 @@ from stock_analyzer.data.provider import DataSourceError
 
 _DEFAULT_FLOAT_MARKET_CAP = 12_000_000_000.0
 _SYMBOL_RE = re.compile(r"(\d{6})")
+
+# Client errors that never warrant retry: bad parameters, auth/permission
+# problems and missing resources must surface immediately.
+_NON_RETRYABLE_HTTP_CODES = frozenset({400, 401, 403, 404, 405, 406, 409, 410, 413, 422})
+# Boundedly retryable client codes: throttling / service-busy signals.
+_TRANSIENT_HTTP_CODES = frozenset({408, 425, 429})
+# Any other 4xx is treated as non-transient; all 5xx are transient.
+_DEFAULT_MAX_BACKOFF_SEC = 32.0
 
 
 class _TushareProApi(Protocol):
@@ -180,9 +189,7 @@ class _HttpTushareProApi:
             raise DataSourceError(f"tushare {api_name} returned invalid response")
         if parsed.get("code") != 0:
             msg = str(parsed.get("msg", "") or "").strip()
-            raise DataSourceError(
-                f"tushare {api_name} failed: code={parsed.get('code')} msg={msg}"
-            )
+            raise DataSourceError(f"tushare {api_name} failed: code={parsed.get('code')} msg={msg}")
         data = parsed.get("data", {})
         if not isinstance(data, dict):
             return pd.DataFrame()
@@ -402,7 +409,31 @@ class _HttpTushareProApi:
 
 
 class TushareProvider:
-    """Fetch A-share daily bars from Tushare Pro (`pro.daily` + `adj_factor` → qfq)."""
+    """Fetch A-share daily bars from Tushare Pro (`pro.daily` + `adj_factor` → qfq).
+
+    Retry policy for :meth:`_call_with_retry`:
+    - HTTP 4xx client errors (400/401/403/404/405/406/409/410/413/422 and any
+      other 4xx) are non-transient: parameters, permissions and missing
+      resources must surface immediately, never be retried;
+    - HTTP 408/425/429 are transient and get a bounded retry;
+    - HTTP 5xx are transient and get a bounded retry;
+    - plain ``URLError``, ``TimeoutError`` (incl. the historical
+      ``socket.timeout`` alias), ``ConnectionError`` (reset/refused/aborted),
+      ``socket.gaierror``/``socket.herror`` (DNS) and ``BrokenPipeError`` are
+      transient and get a bounded retry; generic ``OSError`` subtypes such as
+      ``FileNotFoundError`` or ``PermissionError`` are NOT retried;
+    - the primary tushare SDK path raises ``requests.exceptions.*``:
+      ``Timeout``/``ConnectionError`` are transient, ``HTTPError`` follows
+      the same status-code policy as urllib (4xx non-transient except
+      408/425/429, 5xx transient), and any other ``RequestException`` is
+      non-transient;
+    - Tushare business errors (``DataSourceError`` from a JSON body
+      ``code != 0``) are non-transient: a bad parameter or permission issue
+      must not be replayed by text-matching the message.
+    Backoff is ``retry_delay_sec * attempt`` capped at ``max_backoff_sec``
+    (an absolute upper bound, default 32 s) - never an unbounded
+    "32x base" growth.
+    """
 
     def __init__(
         self,
@@ -414,6 +445,7 @@ class TushareProvider:
         socket_timeout_sec: float = 15.0,
         price_series_mode: str = "qfq",
         min_request_interval_sec: float | None = None,
+        max_backoff_sec: float = _DEFAULT_MAX_BACKOFF_SEC,
     ) -> None:
         self._token = str(token or "").strip() or _resolve_tushare_token()
         self._pro_api = pro_api
@@ -421,12 +453,11 @@ class TushareProvider:
         self._max_attempts = max(1, int(max_attempts))
         self._socket_timeout_sec = max(0.1, float(socket_timeout_sec))
         self._price_series_mode = str(price_series_mode or "qfq").strip().lower() or "qfq"
+        self._max_backoff_sec = max(0.0, float(max_backoff_sec))
         self._min_request_interval_sec = max(
             0.0,
             float(
-                retry_delay_sec
-                if min_request_interval_sec is None
-                else min_request_interval_sec
+                retry_delay_sec if min_request_interval_sec is None else min_request_interval_sec
             ),
         )
         self._last_request_time: float = 0.0
@@ -594,7 +625,6 @@ class TushareProvider:
             return open_dates[-2]
         return open_dates[-1]
 
-
     def fetch_fina_indicator(
         self,
         symbol: str,
@@ -627,12 +657,9 @@ class TushareProvider:
                 )
             )
         except Exception as exc:
-            raise DataSourceError(
-                f"tushare fina_indicator failed for {ts_code}: {exc}"
-            ) from exc
+            raise DataSourceError(f"tushare fina_indicator failed for {ts_code}: {exc}") from exc
         frame = _coerce_frame(raw)
         return normalize_fina_indicator_rows(frame, symbol=code6)
-
 
     def fetch_trade_status(
         self,
@@ -705,13 +732,12 @@ class TushareProvider:
         )
         failed_components: list[str] = []
         if limit_error is not None:
-            failed_components.append('stk_limit')
+            failed_components.append("stk_limit")
         if suspend_error is not None:
-            failed_components.append('suspend_d')
-        result.attrs['coverage_complete'] = not failed_components
-        result.attrs['failed_components'] = failed_components
+            failed_components.append("suspend_d")
+        result.attrs["coverage_complete"] = not failed_components
+        result.attrs["failed_components"] = failed_components
         return result
-
 
     def fetch_margin_detail(
         self,
@@ -739,9 +765,7 @@ class TushareProvider:
                 )
             )
         except Exception as exc:
-            raise DataSourceError(
-                f"tushare margin_detail failed for {ts_code}: {exc}"
-            ) from exc
+            raise DataSourceError(f"tushare margin_detail failed for {ts_code}: {exc}") from exc
         return _normalize_margin_detail(_coerce_frame(raw), symbol=code6)
 
     def fetch_moneyflow(
@@ -770,9 +794,7 @@ class TushareProvider:
                 )
             )
         except Exception as exc:
-            raise DataSourceError(
-                f"tushare moneyflow failed for {ts_code}: {exc}"
-            ) from exc
+            raise DataSourceError(f"tushare moneyflow failed for {ts_code}: {exc}") from exc
         return _normalize_moneyflow(_coerce_frame(raw), symbol=code6)
 
     def fetch_hk_hold(
@@ -801,11 +823,8 @@ class TushareProvider:
                 )
             )
         except Exception as exc:
-            raise DataSourceError(
-                f"tushare hk_hold failed for {ts_code}: {exc}"
-            ) from exc
+            raise DataSourceError(f"tushare hk_hold failed for {ts_code}: {exc}") from exc
         return _normalize_hk_hold(_coerce_frame(raw), symbol=code6)
-
 
     def _resolve_event_trade_dates(
         self,
@@ -906,9 +925,7 @@ class TushareProvider:
                 end_date=resolved_end,
             )
         except Exception as exc:
-            raise DataSourceError(
-                f"tushare top_list failed for {ts_code}: {exc}"
-            ) from exc
+            raise DataSourceError(f"tushare top_list failed for {ts_code}: {exc}") from exc
         return _normalize_top_list(_coerce_frame(raw), symbol=code6)
 
     def fetch_top_inst(
@@ -937,9 +954,7 @@ class TushareProvider:
                 end_date=resolved_end,
             )
         except Exception as exc:
-            raise DataSourceError(
-                f"tushare top_inst failed for {ts_code}: {exc}"
-            ) from exc
+            raise DataSourceError(f"tushare top_inst failed for {ts_code}: {exc}") from exc
         return _normalize_top_inst(_coerce_frame(raw), symbol=code6)
 
     def fetch_block_trade(
@@ -968,11 +983,8 @@ class TushareProvider:
                 )
             )
         except Exception as exc:
-            raise DataSourceError(
-                f"tushare block_trade failed for {ts_code}: {exc}"
-            ) from exc
+            raise DataSourceError(f"tushare block_trade failed for {ts_code}: {exc}") from exc
         return _normalize_block_trade(_coerce_frame(raw), symbol=code6)
-
 
     def fetch_index_daily(
         self,
@@ -999,9 +1011,7 @@ class TushareProvider:
                 )
             )
         except Exception as exc:
-            raise DataSourceError(
-                f"tushare index_daily failed for {index_code}: {exc}"
-            ) from exc
+            raise DataSourceError(f"tushare index_daily failed for {index_code}: {exc}") from exc
         return _normalize_index_daily(_coerce_frame(raw), index_code=index_code)
 
     def _resolve_pro_api(self) -> _TushareProApi:
@@ -1045,10 +1055,73 @@ class TushareProvider:
                 last_error = exc
                 if attempt >= self._max_attempts:
                     break
+                if not self._is_retryable_error(exc):
+                    break
                 if self._retry_delay_sec > 0:
-                    sleep(self._retry_delay_sec * attempt)
+                    backoff = min(
+                        self._retry_delay_sec * attempt,
+                        self._max_backoff_sec,
+                    )
+                    sleep(backoff)
         assert last_error is not None
         raise last_error
+
+    def _is_retryable_error(self, exc: Exception) -> bool:
+        """Classify exceptions for bounded retry.
+
+        ``HTTPError`` is a subclass of ``URLError`` so it must be checked
+        first: HTTP 4xx client errors (bad parameters, auth/permission
+        problems, missing resources) are non-transient, HTTP 408/425/429 and
+        all 5xx are transient, while plain ``URLError`` (DNS, timeout,
+        connection reset/refused) remains transient. Tushare business errors
+        already wrapped in ``DataSourceError`` are never retried. Only
+        explicit network-layer error types are transient: generic ``OSError``
+        (e.g. ``FileNotFoundError``, ``PermissionError``) is not.
+
+        Both transport stacks are covered: the urllib fallback
+        (``_HttpTushareProApi``) raises ``urllib.error.*``/builtin socket
+        errors, while the primary tushare SDK path raises
+        ``requests.exceptions.*`` (``RequestException`` is an ``OSError``
+        subclass, not the builtin ``ConnectionError``, so it must be matched
+        explicitly).
+        """
+        import socket as _socket
+
+        if isinstance(exc, urllib.error.HTTPError):
+            code = int(exc.code)
+            if code in _TRANSIENT_HTTP_CODES or code >= 500:
+                return True
+            if code in _NON_RETRYABLE_HTTP_CODES or 400 <= code < 500:
+                return False
+            return False
+        if isinstance(exc, DataSourceError):
+            return False
+        if isinstance(exc, urllib.error.URLError):
+            return True
+        if isinstance(exc, TimeoutError):
+            return True
+        if isinstance(exc, ConnectionError):
+            return True
+        if isinstance(exc, (_socket.gaierror, _socket.herror, BrokenPipeError)):
+            return True
+        try:
+            import requests  # type: ignore[import-untyped]
+        except ImportError:
+            return False
+        if isinstance(exc, requests.exceptions.HTTPError):
+            response = getattr(exc, "response", None)
+            status = getattr(response, "status_code", None)
+            if isinstance(status, int):
+                if status in _TRANSIENT_HTTP_CODES or status >= 500:
+                    return True
+                if status in _NON_RETRYABLE_HTTP_CODES or 400 <= status < 500:
+                    return False
+            return False
+        if isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+            return True
+        if isinstance(exc, requests.exceptions.RequestException):
+            return False
+        return False
 
     def _lookup_name(self, *, pro: _TushareProApi, ts_code: str, code6: str) -> str:
         cached = self._name_cache.get(code6)
@@ -1250,9 +1323,7 @@ def _normalize_tushare_daily(
     frame["northbound_net"] = np.nan
     frame["dragon_tiger_flag"] = np.nan
     mode = (
-        str(adjust_meta.get("price_series_mode") or price_series_mode or "qfq")
-        .strip()
-        .lower()
+        str(adjust_meta.get("price_series_mode") or price_series_mode or "qfq").strip().lower()
         or "qfq"
     )
     frame["background_data_source"] = f"tushare_pro_{mode}"
@@ -1481,10 +1552,14 @@ def _normalize_moneyflow(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     amount_cols = [
-        "buy_sm_amount", "sell_sm_amount",
-        "buy_md_amount", "sell_md_amount",
-        "buy_lg_amount", "sell_lg_amount",
-        "buy_elg_amount", "sell_elg_amount",
+        "buy_sm_amount",
+        "sell_sm_amount",
+        "buy_md_amount",
+        "sell_md_amount",
+        "buy_lg_amount",
+        "sell_lg_amount",
+        "buy_elg_amount",
+        "sell_elg_amount",
     ]
     for col in amount_cols:
         if col in out.columns:
@@ -1616,6 +1691,7 @@ def _normalize_top_list(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
     agg["coverage_complete"] = True
     return agg.sort_values("trade_date").reset_index(drop=True)
 
+
 def _normalize_top_inst(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
     """Normalize top_inst (龙虎榜机构明细) rows."""
     if frame is None or frame.empty or "trade_date" not in frame.columns:
@@ -1650,6 +1726,7 @@ def _normalize_top_inst(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
     out["as_of"] = out["trade_date"].dt.strftime("%Y-%m-%d")
     out["coverage_complete"] = True
     return out
+
 
 def _normalize_block_trade(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
     """Normalize block_trade (大宗交易) rows.
@@ -1692,8 +1769,11 @@ def _normalize_block_trade(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
 
     keep = ["symbol", "trade_date"]
     for c in (
-        "block_price", "block_trade_volume", "block_trade_amount",
-        "block_trade_premium_discount", "block_trade_net",
+        "block_price",
+        "block_trade_volume",
+        "block_trade_amount",
+        "block_trade_premium_discount",
+        "block_trade_net",
     ):
         if c in out.columns:
             keep.append(c)

@@ -625,7 +625,21 @@ class AnalyzerPipeline:
         features = ensure_feedback_feature_frame(features)
 
         latest_features = features.iloc[-1]
-        raw_probabilities = self._infer_probabilities(latest_features)
+        try:
+            raw_probabilities = self._infer_probabilities(latest_features)
+        except ValueError as exc:
+            if not str(exc).startswith("predictor_rejected:"):
+                raise
+            return PipelineSignal(
+                symbol=symbol,
+                strategy=strategy,
+                score=0.0,
+                grade="C",
+                action="hold",
+                target_position=0.0,
+                probabilities={"lgbm": 0.0, "xgb": 0.0, "meta": 0.0},
+                reasons=[f"predictor_rejected:{exc}"],
+            )
         self._last_probability_health = self._probability_health.observe(raw_probabilities)
         probabilities = sanitize_probabilities(raw_probabilities)
         champion_auc = self._active_champion_auc()
@@ -812,16 +826,10 @@ class AnalyzerPipeline:
                 "reasons": list(financial_decision.reasons),
                 "roe": financial_snapshot.get("roe"),
                 "debt_ratio": financial_snapshot.get("debt_ratio"),
-                "financial_data_complete": bool(
-                    financial_snapshot.get("financial_data_complete")
-                ),
-                "financial_missing_fields": financial_snapshot.get(
-                    "financial_missing_fields", ""
-                ),
+                "financial_data_complete": bool(financial_snapshot.get("financial_data_complete")),
+                "financial_missing_fields": financial_snapshot.get("financial_missing_fields", ""),
                 "financial_source": financial_snapshot.get("financial_source", ""),
-                "financial_report_date": financial_snapshot.get(
-                    "financial_report_date", ""
-                ),
+                "financial_report_date": financial_snapshot.get("financial_report_date", ""),
                 "source": financial_snapshot.get("source", ""),
                 "as_of": financial_snapshot.get("as_of", ""),
                 "trust_level": financial_snapshot.get("trust_level", "missing"),
@@ -905,20 +913,13 @@ class AnalyzerPipeline:
                 strategy=strategy,
                 decision_time=decision_time,
                 feature_vector={
-                    str(key): float(value)
-                    for key, value in latest_features.to_dict().items()
+                    str(key): float(value) for key, value in latest_features.to_dict().items()
                 },
                 feature_schema_id=feature_schema.feature_schema_id,
                 feature_schema_hash=feature_schema.feature_schema_hash,
                 feature_observed_at=decision_time,
-                model_outputs={
-                    str(key): float(value)
-                    for key, value in probabilities.items()
-                },
-                score_breakdown={
-                    str(key): float(value)
-                    for key, value in components.items()
-                },
+                model_outputs={str(key): float(value) for key, value in probabilities.items()},
+                score_breakdown={str(key): float(value) for key, value in components.items()},
                 risk_context=_json_safe_mapping(
                     {
                         "can_open_new_position": getattr(
@@ -968,6 +969,9 @@ class AnalyzerPipeline:
 
     def _infer_probabilities(self, feature_row: pd.Series) -> dict[str, float]:
         if self._predictor is not None:
+            blocked = str(getattr(self._predictor, "inference_blocked_reason", lambda: "")())
+            if blocked:
+                raise ValueError(f"predictor_rejected:{blocked}")
             return self._predictor.predict_row(feature_row)
         return _controlled_heuristic_probabilities(feature_row)
 
@@ -1137,9 +1141,11 @@ def _hard_degraded_reason(
 
 def _soft_degraded(evolution_controls: Mapping[str, object] | None = None) -> bool:
     controls = evolution_controls or {}
-    return bool(controls.get("soft_degraded_mode", False)) or bool(
-        controls.get("degraded_mode", False)
-    ) or bool(controls.get("conservative_mode", False))
+    return (
+        bool(controls.get("soft_degraded_mode", False))
+        or bool(controls.get("degraded_mode", False))
+        or bool(controls.get("conservative_mode", False))
+    )
 
 
 def _soft_degraded_reason(evolution_controls: Mapping[str, object] | None = None) -> str:
@@ -1228,10 +1234,15 @@ def _financial_snapshot(bar: pd.Series, symbol: str) -> dict[str, object]:
     if isinstance(raw_complete, bool):
         complete = raw_complete and trust_level in {"reported", "derived"}
     else:
-        complete = roe is not None and debt_ratio is not None and trust_level in {
-            "reported",
-            "derived",
-        }
+        complete = (
+            roe is not None
+            and debt_ratio is not None
+            and trust_level
+            in {
+                "reported",
+                "derived",
+            }
+        )
     return {
         "symbol": symbol,
         "name": str(bar.get("name", "")),

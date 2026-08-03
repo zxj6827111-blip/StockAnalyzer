@@ -29,6 +29,13 @@ _YEAR_ARCHIVE_RE = re.compile(r"^(?P<year>\d{4})(?:\((?P<copy>\d+)\))?\.zip$", r
 _DAILY_ENTRY_RE = re.compile(r"(?P<code>\d{6})\.(?:SH|SZ|BJ)\.csv$", re.I)
 _MINUTE_ARCHIVE_RE = re.compile(r"^(?P<year>\d{4})(?:-(?P<month>\d{2}))?", re.I)
 
+# Explicit access modes for the parsed-ZIP / delta DuckDB cache:
+# - read_write: production API, the delta DuckDB can be created and written;
+# - read_only: probes/audits, the delta DuckDB is opened read-only and can
+#   never be created, mutated or have its schema touched;
+# - disabled: no delta DuckDB at all, the overlay reads ZIP archives only.
+_DELTA_ACCESS_MODES = frozenset({"read_write", "read_only", "disabled"})
+
 
 def build_vendor_zip_daily_index(
     *,
@@ -167,9 +174,10 @@ class VendorZipOverlayProvider:
     minute_amount_multiplier: float = 1.0
     intraday_enabled: bool = True
     memory_cache_symbols: int = 32
+    delta_access_mode: str = "read_write"
     _root: Path = field(init=False)
     _index: dict[str, object] = field(init=False)
-    _warehouse: MarketWarehouse = field(init=False)
+    _warehouse: MarketWarehouse | None = field(init=False)
     _daily_cache: OrderedDict[str, pd.DataFrame] = field(default_factory=OrderedDict, init=False)
     _intraday_cache: OrderedDict[str, pd.DataFrame] = field(default_factory=OrderedDict, init=False)
     _minute_archives: dict[str, list[Path]] = field(default_factory=dict, init=False)
@@ -187,16 +195,27 @@ class VendorZipOverlayProvider:
                 f"got: {self.price_series_mode}"
             )
         self.price_series_mode = normalized_mode
-        package_root = (
-            Path(self.delta_package_root).expanduser()
-            if str(self.delta_package_root).strip()
-            else Path(self.delta_db_path).expanduser().parent / "package"
-        )
-        self._warehouse = MarketWarehouse(
-            db_path=Path(self.delta_db_path).expanduser(),
-            package_root=package_root,
-            package_writes_enabled=False,
-        )
+        access_mode = str(self.delta_access_mode or "read_write").strip().lower()
+        if access_mode not in _DELTA_ACCESS_MODES:
+            raise DataSourceError(
+                f"unsupported delta_access_mode: {self.delta_access_mode}; "
+                f"expected one of {sorted(_DELTA_ACCESS_MODES)}"
+            )
+        self.delta_access_mode = access_mode
+        if access_mode == "disabled":
+            self._warehouse = None
+        else:
+            package_root = (
+                Path(self.delta_package_root).expanduser()
+                if str(self.delta_package_root).strip()
+                else Path(self.delta_db_path).expanduser().parent / "package"
+            )
+            self._warehouse = MarketWarehouse(
+                db_path=Path(self.delta_db_path).expanduser(),
+                package_root=package_root,
+                package_writes_enabled=False,
+                read_only=access_mode == "read_only",
+            )
         self.memory_cache_symbols = max(1, int(self.memory_cache_symbols))
 
     def list_symbols(self) -> list[str]:
@@ -219,13 +238,15 @@ class VendorZipOverlayProvider:
             parsed = _coerce_date(raw.get("latest_date"))
             if parsed is not None:
                 latest[normalized] = parsed
-        delta_latest = self._warehouse.latest_daily_dates(
-            symbols=sorted(requested) if requested else None
-        )
-        for symbol, value in delta_latest.items():
-            current = latest.get(symbol)
-            if current is None or value > current:
-                latest[symbol] = value
+        delta_warehouse = self._delta_warehouse()
+        if delta_warehouse is not None:
+            delta_latest = delta_warehouse.latest_daily_dates(
+                symbols=sorted(requested) if requested else None
+            )
+            for symbol, value in delta_latest.items():
+                current = latest.get(symbol)
+                if current is None or value > current:
+                    latest[symbol] = value
         return latest
 
     def fetch_daily_bars(
@@ -239,10 +260,15 @@ class VendorZipOverlayProvider:
         if not normalized:
             raise DataSourceError(f"invalid vendor ZIP symbol: {symbol}")
         baseline = self._load_vendor_daily(normalized)
-        delta = self._warehouse.fetch_daily_bars(
-            normalized,
-            lookback_days=max(1, int(lookback_days)),
-            end_date=end_date,
+        delta_warehouse = self._delta_warehouse()
+        delta = (
+            delta_warehouse.fetch_daily_bars(
+                normalized,
+                lookback_days=max(1, int(lookback_days)),
+                end_date=end_date,
+            )
+            if delta_warehouse is not None
+            else pd.DataFrame()
         )
         if end_date is not None and not baseline.empty:
             baseline = baseline.loc[baseline.index <= pd.Timestamp(end_date)]
@@ -252,7 +278,7 @@ class VendorZipOverlayProvider:
         result = merged.tail(max(1, int(lookback_days))).copy()
         result.attrs["source"] = "vendor_zip_overlay"
         result.attrs["historical_root"] = str(self._root)
-        result.attrs["delta_db_path"] = str(self._warehouse.db_path)
+        result.attrs["delta_db_path"] = str(Path(self.delta_db_path).expanduser())
         return result
 
     def fetch_universe_quality_metrics(
@@ -290,12 +316,15 @@ class VendorZipOverlayProvider:
         if not normalized:
             return pd.DataFrame()
 
-        delta = self._warehouse.fetch_universe_quality_metrics(
-            symbols=normalized,
-            lookback_days=limit,
-        )
-        if not delta.empty:
-            delta = delta[delta["symbol"].isin(normalized)]
+        delta = pd.DataFrame()
+        delta_warehouse = self._delta_warehouse()
+        if delta_warehouse is not None:
+            delta = delta_warehouse.fetch_universe_quality_metrics(
+                symbols=normalized,
+                lookback_days=limit,
+            )
+            if not delta.empty:
+                delta = delta[delta["symbol"].isin(normalized)]
 
         zip_frames = self._load_vendor_daily_batch(symbols=normalized, limit=limit)
         pieces = [frame for frame in zip_frames if not frame.empty]
@@ -335,7 +364,10 @@ class VendorZipOverlayProvider:
             return frame
         if not symbols:
             return frame
-        snapshots = self._warehouse.fetch_financial_snapshots_batch(symbols=symbols)
+        delta_warehouse = self._delta_warehouse()
+        if delta_warehouse is None:
+            return frame
+        snapshots = delta_warehouse.fetch_financial_snapshots_batch(symbols=symbols)
         if snapshots.empty:
             return frame
         from stock_analyzer.data.financial_pit import apply_financial_snapshots_asof_batch
@@ -368,11 +400,14 @@ class VendorZipOverlayProvider:
             if self.intraday_enabled
             else pd.DataFrame()
         )
-        delta = self._warehouse.fetch_intraday_summary(
-            normalized,
-            interval_key,
-            lookback_days=max(1, int(lookback_days)),
-        )
+        delta = pd.DataFrame()
+        delta_warehouse = self._delta_warehouse()
+        if delta_warehouse is not None:
+            delta = delta_warehouse.fetch_intraday_summary(
+                normalized,
+                interval_key,
+                lookback_days=max(1, int(lookback_days)),
+            )
         return _merge_overlay_frames(baseline, delta).tail(max(1, int(lookback_days)))
 
     def clear_cache(self) -> None:
@@ -380,6 +415,7 @@ class VendorZipOverlayProvider:
         self._intraday_cache.clear()
 
     def status(self) -> dict[str, object]:
+        delta_warehouse = self._delta_warehouse()
         return {
             "source": "vendor_zip_overlay",
             "root": str(self._root),
@@ -388,13 +424,35 @@ class VendorZipOverlayProvider:
             "index_generated_at": str(self._index.get("generated_at", "")),
             "index_archives_total": _coerce_int(self._index.get("archives_total")),
             "symbols_total": len(self._symbols_mapping()),
-            "delta_db_path": str(self._warehouse.db_path),
-            "delta_db_exists": self._warehouse.db_path.exists(),
-            "delta_package_root": str(self._warehouse.package_root),
-            "delta_package_writes_enabled": self._warehouse.package_writes_enabled,
+            "delta_db_path": str(Path(self.delta_db_path).expanduser()),
+            "delta_db_exists": bool(
+                delta_warehouse is not None and delta_warehouse.db_path.exists()
+            ),
+            "delta_access_mode": self.delta_access_mode,
+            "delta_package_root": str(
+                delta_warehouse.package_root if delta_warehouse is not None else ""
+            ),
+            "delta_package_writes_enabled": bool(
+                delta_warehouse is not None and delta_warehouse.package_writes_enabled
+            ),
             "price_series_mode": self.price_series_mode,
             "intraday_enabled": bool(self.intraday_enabled),
         }
+
+    def _delta_warehouse(self) -> MarketWarehouse | None:
+        return self._warehouse
+
+    def enforce_read_only_delta(self) -> None:
+        """Flip the delta DuckDB access to read-only after construction.
+
+        Probes construct the overlay through the normal read-write wiring and
+        then guarantee immutability: the mode label and the underlying
+        warehouse are both switched, so no database file is created, no table
+        is written and the file's content/schema/mtime stay untouched.
+        """
+        self.delta_access_mode = "read_only"
+        if self._warehouse is not None:
+            self._warehouse.enforce_read_only()
 
     def _symbols_mapping(self) -> dict[str, object]:
         raw = self._index.get("symbols")

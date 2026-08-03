@@ -188,9 +188,7 @@ def build_label_conflict_shadow_report(
         )
         values = aligned[policy_labels.name or "label_soup_tp_before_sl"].to_numpy(dtype=float)
         baseline_aligned = baseline_labels.reindex(aligned.index)
-        delta_count = int(
-            np.sum(np.abs(values - baseline_aligned.to_numpy(dtype=float)) > 1e-9)
-        )
+        delta_count = int(np.sum(np.abs(values - baseline_aligned.to_numpy(dtype=float)) > 1e-9))
         conflict_values = policy_labels.reindex(conflict_mask.index[conflict_mask]).dropna()
         items.append(
             {
@@ -213,7 +211,14 @@ def build_label_conflict_shadow_report(
                 "train_samples": result.samples_train,
                 "calibration_samples": result.samples_calibration,
                 "test_samples": result.samples_test,
-                "embargo_days": result.samples_embargo,
+                "embargo_days": _as_int(
+                    result.metrics.get("embargo_days"),
+                    default=result.samples_embargo,
+                ),
+                "embargo_rows": _as_int(
+                    result.metrics.get("embargo_rows"),
+                    default=result.samples_embargo,
+                ),
                 "lgbm_backend": result.lgbm_backend,
                 "xgb_backend": result.xgb_backend,
                 "metrics": dict(result.metrics),
@@ -448,3 +453,16 @@ def _normalize_policies(*, configured: str, requested: list[str] | None) -> list
             if normalized and normalized not in active:
                 active.append(normalized)
     return active
+
+
+def _as_int(value: object, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return default
+    return default

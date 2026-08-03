@@ -486,3 +486,100 @@ def test_batch_asof_join_handles_empty_inputs() -> None:
     daily = _batch_daily_frame()
     assert apply_financial_snapshots_asof_batch(daily, pd.DataFrame()) is not None
     assert len(apply_financial_snapshots_asof_batch(pd.DataFrame(), _batch_snapshot_frame())) == 0
+
+
+def _daily_with_invalid_dates() -> pd.DataFrame:
+    daily = _batch_daily_frame().head(4).copy()
+    daily.loc[3, "date"] = pd.NaT
+    return daily
+
+
+def test_batch_asof_join_invalid_date_at_first_middle_and_last_row() -> None:
+    snaps = _batch_snapshot_frame()
+    # expected roe per output row for an invalid date at position 0 / 2 / 3:
+    # rows whose date is NaT stay untouched (NaN); every other row is filled
+    # at its original absolute position, never shifted.
+    expected_by_position = {
+        0: [np.nan, 0.15, 0.16, 0.16],
+        2: [np.nan, 0.15, np.nan, 0.16],
+        3: [np.nan, 0.15, 0.16, np.nan],
+    }
+    for position, expected in expected_by_position.items():
+        daily = _batch_daily_frame().head(4).copy()
+        daily.loc[position, "date"] = pd.NaT
+        out = apply_financial_snapshots_asof_batch(daily, snaps, only_fill_pending=True)
+        assert len(out) == 4
+        s1 = out[out["symbol"] == "600000"].reset_index(drop=True)
+        for index, expected_roe in enumerate(expected):
+            value = float(s1.iloc[index]["roe"])
+            if np.isnan(expected_roe):
+                assert np.isnan(value), f"position={position} row {index} expected NaN"
+            else:
+                assert value == pytest.approx(expected_roe), (
+                    f"position={position} row {index} misplaced"
+                )
+        # non-600000 rows keep their own (missing) values and are not shifted
+        s3 = out[out["symbol"] == "300750"].reset_index(drop=True)
+        assert all(np.isnan(float(v)) for v in s3["roe"])
+
+
+def test_batch_asof_join_with_duplicate_index_labels() -> None:
+    daily = _batch_daily_frame().head(4).copy()
+    daily.index = [7, 7, 7, 7]
+    snaps = _batch_snapshot_frame()
+    out = apply_financial_snapshots_asof_batch(daily, snaps, only_fill_pending=True)
+    assert list(out.index) == [7, 7, 7, 7]
+    s1 = out[out["symbol"] == "600000"].reset_index(drop=True)
+    assert np.isnan(float(s1.iloc[0]["roe"]))
+    assert float(s1.iloc[1]["roe"]) == pytest.approx(0.15)
+    assert float(s1.iloc[2]["roe"]) == pytest.approx(0.16)
+    assert float(s1.iloc[3]["roe"]) == pytest.approx(0.16)
+
+
+def test_batch_asof_join_missing_trust_level_treats_rows_as_pending() -> None:
+    daily = _batch_daily_frame().head(4).copy()
+    daily = daily.drop(columns=["financial_trust_level"])
+    snaps = _batch_snapshot_frame()
+    out = apply_financial_snapshots_asof_batch(daily, snaps, only_fill_pending=True)
+    s1 = out[out["symbol"] == "600000"].reset_index(drop=True)
+    assert float(s1.iloc[1]["roe"]) == pytest.approx(0.15)
+    assert s1.iloc[1]["financial_trust_level"] == "reported"
+
+
+def test_batch_asof_join_completes_missing_financial_columns() -> None:
+    daily = pd.DataFrame(
+        {
+            "symbol": ["600000", "600000", "600000", "600000"],
+            "date": pd.to_datetime(["2024-04-19", "2024-04-20", "2024-08-20", "2024-08-21"]),
+            "close": [10.2, 10.4, 11.0, 11.1],
+        }
+    )
+    snaps = _batch_snapshot_frame()
+    out = apply_financial_snapshots_asof_batch(daily, snaps, only_fill_pending=True)
+    assert "roe" in out.columns
+    assert "financial_trust_level" in out.columns
+    s1 = out[out["symbol"] == "600000"].reset_index(drop=True)
+    assert np.isnan(float(s1.iloc[0]["roe"]))
+    assert float(s1.iloc[1]["roe"]) == pytest.approx(0.15)
+    assert float(s1.iloc[2]["roe"]) == pytest.approx(0.16)
+    assert s1.iloc[0]["financial_source"] == "tushare_pending"
+
+
+def test_batch_asof_join_preserves_trusted_reported_and_derived_rows() -> None:
+    daily = _batch_daily_frame().head(4).copy()
+    daily.loc[0, "roe"] = 0.08
+    daily.loc[0, "debt_ratio"] = 0.55
+    daily.loc[0, "financial_data_complete"] = True
+    daily.loc[0, "financial_source"] = "tushare_fina_indicator"
+    daily.loc[0, "financial_trust_level"] = "reported"
+    daily.loc[1, "roe"] = 0.09
+    daily.loc[1, "debt_ratio"] = 0.50
+    daily.loc[1, "financial_data_complete"] = True
+    daily.loc[1, "financial_source"] = "tushare_fina_indicator"
+    daily.loc[1, "financial_trust_level"] = "derived"
+    snaps = _batch_snapshot_frame()
+    out = apply_financial_snapshots_asof_batch(daily, snaps, only_fill_pending=True)
+    s1 = out[out["symbol"] == "600000"].reset_index(drop=True)
+    assert float(s1.iloc[0]["roe"]) == pytest.approx(0.08)
+    assert float(s1.iloc[1]["roe"]) == pytest.approx(0.09)
+    assert float(s1.iloc[2]["roe"]) == pytest.approx(0.16)

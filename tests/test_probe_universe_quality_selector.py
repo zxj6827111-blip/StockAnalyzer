@@ -275,3 +275,29 @@ def test_cli_max_elapsed_ms_arg_is_enforced(
     assert payload["ok"] is False
     assert payload["elapsed_ms"] == 2000
     assert any("max_elapsed_ms" in failure for failure in payload.get("acceptance_failures", []))
+
+
+def test_probe_defaults_to_read_only_delta_access(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_sa_overrides(monkeypatch)
+    config_path = _write_synthetic_config(tmp_path)
+    probe = _load_probe()
+    exit_code = probe._main(["--config", str(config_path), "--target-size", "300"])  # type: ignore[attr-defined]
+    assert exit_code == 1  # synthetic config cannot pass the vendor-overlay gate
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["delta_access_mode"] == "read_only"
+
+
+def test_probe_allow_cache_write_reports_read_write(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_sa_overrides(monkeypatch)
+    config_path = _write_synthetic_config(tmp_path)
+    probe = _load_probe()
+    exit_code = probe._main(  # type: ignore[attr-defined]
+        ["--config", str(config_path), "--target-size", "300", "--allow-cache-write"]
+    )
+    assert exit_code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["delta_access_mode"] == "read_write"

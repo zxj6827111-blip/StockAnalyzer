@@ -51,6 +51,11 @@ class SignalPredictor:
         return cls.from_artifact(artifact, artifact_root=artifact_path.parent)
 
     def predict_row(self, features: pd.Series) -> dict[str, float]:
+        blocked = self.inference_blocked_reason()
+        if blocked:
+            raise ValueError(
+                f"predictor_rejected:{blocked}; refusing production inference on a legacy artifact"
+            )
         values = np.asarray(
             [float(features.get(col, 0.0)) for col in self.feature_columns],
             dtype=float,
@@ -61,9 +66,8 @@ class SignalPredictor:
         raw_xgb = self.xgb.predict_proba(matrix)
         lgbm_prob = float(self.lgbm_calibrator.predict(raw_lgbm)[0])
         xgb_prob = float(self.xgb_calibrator.predict(raw_xgb)[0])
-        meta = (
-            lgbm_prob * self.meta_weights.get("lgbm", 0.5)
-            + xgb_prob * self.meta_weights.get("xgb", 0.5)
+        meta = lgbm_prob * self.meta_weights.get("lgbm", 0.5) + xgb_prob * self.meta_weights.get(
+            "xgb", 0.5
         )
         return {
             "lgbm": _clamp_prob(lgbm_prob),
@@ -88,9 +92,8 @@ class SignalPredictor:
         }
         degraded_reason = ""
         if degraded_model_mode:
-            degraded_reason = (
-                f"native_backends_unavailable:lgbm={lgbm_backend},xgb={xgb_backend}"
-            )
+            degraded_reason = f"native_backends_unavailable:lgbm={lgbm_backend},xgb={xgb_backend}"
+        inference_blocked_reason = self.inference_blocked_reason()
         status_timestamp = datetime.now().isoformat()
         return {
             "predictor_mode": "artifact_loaded",
@@ -102,11 +105,29 @@ class SignalPredictor:
             "degraded_model_mode": degraded_model_mode,
             "degraded_reason": degraded_reason,
             "degraded_reason_at": status_timestamp if degraded_reason else "",
+            "inference_allowed": not bool(inference_blocked_reason),
+            "inference_blocked_reason": inference_blocked_reason,
             "status_timestamp": status_timestamp,
             "created_at": str(self.artifact_metadata.get("artifact_created_at", "")),
             "calibration_method": str(self.artifact_metadata.get("calibration_method", "")),
             "meta_blend_weights": dict(self.meta_weights),
         }
+
+    def inference_blocked_reason(self) -> str:
+        """Return a non-empty reason when production inference must be refused.
+
+        A legacy fallback artifact without a feature scaler is loadable for
+        diagnostics (``mode_details``) but must never produce predictions;
+        native backends and scaler-bearing fallback models return "".
+        """
+        reasons: list[str] = []
+        lgbm_blocked = self.lgbm.inference_blocked_reason()
+        xgb_blocked = self.xgb.inference_blocked_reason()
+        if lgbm_blocked:
+            reasons.append(f"lgbm:{lgbm_blocked}")
+        if xgb_blocked:
+            reasons.append(f"xgb:{xgb_blocked}")
+        return ";".join(reasons)
 
 
 def _normalize_meta_weights(raw_value: object) -> dict[str, float]:

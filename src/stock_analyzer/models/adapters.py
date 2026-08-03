@@ -98,6 +98,17 @@ class LightGBMAdapter:
             return cast(FloatArray, np.asarray(self._native_predict(x), dtype=float))
         return self._model.predict_proba(x)
 
+    def inference_blocked_reason(self) -> str:
+        """Return a non-empty reason when inference must be refused.
+
+        Fallback models backed by a legacy no-scaler payload are loadable for
+        diagnostics but must never produce predictions; native backends are
+        never blocked by this contract.
+        """
+        if self.backend.startswith("fallback"):
+            return str(self._model.inference_blocked_reason or "")
+        return ""
+
     def to_dict(self) -> dict[str, object]:
         if self.backend == "lightgbm":
             if self._native is None or not hasattr(self._native, "model_to_string"):
@@ -205,6 +216,12 @@ class XGBoostAdapter:
         if self.backend == "xgboost" and self._native_predict is not None:
             return cast(FloatArray, np.asarray(self._native_predict(x), dtype=float))
         return self._model.predict_proba(x)
+
+    def inference_blocked_reason(self) -> str:
+        """Return a non-empty reason when inference must be refused."""
+        if self.backend.startswith("fallback"):
+            return str(self._model.inference_blocked_reason or "")
+        return ""
 
     def to_dict(self) -> dict[str, object]:
         if self.backend == "xgboost":
