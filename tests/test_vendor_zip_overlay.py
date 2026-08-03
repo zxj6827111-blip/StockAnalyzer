@@ -792,3 +792,214 @@ def test_batch_quality_metrics_keeps_reported_delta_financials(tmp_path: Path) -
     # ZIP rows (local_vendor/missing) are filled from the snapshot table.
     zip_row = rows[rows["date"] == pd.Timestamp("2025-12-30")]
     assert float(zip_row.iloc[0]["roe"]) == pytest.approx(0.15)
+
+
+def _db_fingerprint(path: Path) -> dict[str, object]:
+    import hashlib
+
+    if not path.exists():
+        return {"exists": False}
+    stat = path.stat()
+    return {
+        "exists": True,
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def _db_schema(path: Path) -> list[tuple[str, str]]:
+    import duckdb
+
+    with duckdb.connect(str(path), read_only=True) as connection:
+        rows = connection.execute(
+            """
+            SELECT table_name, column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'main'
+            ORDER BY table_name, column_name
+            """
+        ).fetchall()
+    return [(f"{row[0]}", f"{row[1]}") for row in rows]
+
+
+def test_read_only_cold_cache_probe_never_creates_delta_db(tmp_path: Path) -> None:
+    index_path = _build_daily_fixture(tmp_path)
+    delta_db = tmp_path / "delta" / "market_delta.duckdb"
+    delta_package = tmp_path / "delta" / "package"
+    assert not delta_db.exists()
+
+    provider = VendorZipOverlayProvider(
+        data_root=str(tmp_path),
+        index_path=str(index_path),
+        delta_db_path=str(delta_db),
+        delta_package_root=str(delta_package),
+        delta_access_mode="read_only",
+    )
+    assert provider.delta_access_mode == "read_only"
+    assert provider._warehouse is not None
+    assert provider._warehouse.read_only is True
+
+    frame = provider.fetch_universe_quality_metrics(
+        symbols=["600000"],
+        lookback_days=10,
+    )
+
+    assert not frame.empty
+    assert not delta_db.exists()
+    assert not (tmp_path / "delta").exists()
+    assert _db_fingerprint(delta_db) == {"exists": False}
+
+
+def test_read_only_probe_does_not_modify_existing_delta_db(tmp_path: Path) -> None:
+    index_path = _build_daily_fixture(tmp_path)
+    delta_db = tmp_path / "delta" / "market_delta.duckdb"
+    delta_package = tmp_path / "delta" / "package"
+    warehouse = MarketWarehouse(db_path=delta_db, package_root=delta_package)
+    warehouse.ensure_schema()
+    warehouse.replace_daily_bars(
+        symbol="600000",
+        frame=_delta_frame(symbol="600000", dates=["2025-12-31"]),
+    )
+    before = _db_fingerprint(delta_db)
+    schema_before = _db_schema(delta_db)
+
+    provider = VendorZipOverlayProvider(
+        data_root=str(tmp_path),
+        index_path=str(index_path),
+        delta_db_path=str(delta_db),
+        delta_package_root=str(delta_package),
+        delta_access_mode="read_only",
+    )
+    _ = provider.fetch_universe_quality_metrics(symbols=["600000"], lookback_days=10)
+    _ = provider.latest_daily_dates(symbols=["600000"])
+
+    after = _db_fingerprint(delta_db)
+    schema_after = _db_schema(delta_db)
+    assert after["sha256"] == before["sha256"]
+    assert after["size"] == before["size"]
+    assert after["mtime_ns"] == before["mtime_ns"]
+    assert schema_after == schema_before
+
+
+def test_read_only_warehouse_refuses_schema_and_writes(tmp_path: Path) -> None:
+    warehouse = MarketWarehouse(
+        db_path=tmp_path / "delta" / "ro.duckdb",
+        package_root=tmp_path / "delta" / "package",
+        read_only=True,
+    )
+    assert warehouse.read_only is True
+    with pytest.raises(DataSourceError, match="read-only"):
+        warehouse.ensure_schema()
+    with pytest.raises(DataSourceError, match="read-only"):
+        warehouse.replace_daily_bars(
+            symbol="600000",
+            frame=_delta_frame(symbol="600000", dates=["2026-01-02"]),
+        )
+    assert not (tmp_path / "delta").exists()
+
+
+def test_delta_access_mode_disabled_reads_zip_only(tmp_path: Path) -> None:
+    index_path = _build_daily_fixture(tmp_path)
+    delta_db = tmp_path / "delta" / "market_delta.duckdb"
+    provider = VendorZipOverlayProvider(
+        data_root=str(tmp_path),
+        index_path=str(index_path),
+        delta_db_path=str(delta_db),
+        delta_access_mode="disabled",
+    )
+    assert provider._warehouse is None
+    bars = provider.fetch_daily_bars("600000", lookback_days=10)
+    assert list(bars.index.strftime("%Y-%m-%d")) == ["2025-12-30", "2025-12-31"]
+    assert not delta_db.exists()
+    status = provider.status()
+    assert status["delta_access_mode"] == "disabled"
+    assert status["delta_db_exists"] is False
+
+
+def test_unknown_delta_access_mode_rejected(tmp_path: Path) -> None:
+    index_path = _build_daily_fixture(tmp_path)
+    with pytest.raises(DataSourceError, match="delta_access_mode"):
+        VendorZipOverlayProvider(
+            data_root=str(tmp_path),
+            index_path=str(index_path),
+            delta_db_path=str(tmp_path / "delta.duckdb"),
+            delta_access_mode="read-write",
+        )
+
+
+def test_read_write_mode_still_writes_delta_cache(tmp_path: Path) -> None:
+    index_path = _build_daily_fixture(tmp_path)
+    delta_db = tmp_path / "delta" / "market_delta.duckdb"
+    provider = VendorZipOverlayProvider(
+        data_root=str(tmp_path),
+        index_path=str(index_path),
+        delta_db_path=str(delta_db),
+        delta_access_mode="read_write",
+    )
+    assert provider._warehouse is not None
+    assert provider._warehouse.read_only is False
+    warehouse = provider._warehouse
+    warehouse.ensure_schema()
+    warehouse.replace_daily_bars(
+        symbol="600000",
+        frame=_delta_frame(symbol="600000", dates=["2026-01-02"]),
+    )
+    assert delta_db.exists()
+    bars = provider.fetch_daily_bars("600000", lookback_days=10)
+    assert any(pd.Timestamp(ts).date().isoformat() == "2026-01-02" for ts in bars.index)
+
+
+def test_read_only_warm_cache_matches_zip_read_results(tmp_path: Path) -> None:
+    index_path = _build_daily_fixture(tmp_path)
+    delta_db = tmp_path / "delta" / "market_delta.duckdb"
+    warehouse = MarketWarehouse(db_path=delta_db, package_root=tmp_path / "delta" / "package")
+    warehouse.ensure_schema()
+    warehouse.replace_daily_bars(
+        symbol="600000",
+        frame=_delta_frame(symbol="600000", dates=["2026-01-02"]),
+    )
+
+    read_only = VendorZipOverlayProvider(
+        data_root=str(tmp_path),
+        index_path=str(index_path),
+        delta_db_path=str(delta_db),
+        delta_access_mode="read_only",
+    )
+    read_write = VendorZipOverlayProvider(
+        data_root=str(tmp_path),
+        index_path=str(index_path),
+        delta_db_path=str(delta_db),
+        delta_access_mode="read_write",
+    )
+
+    ro_frame = read_only.fetch_universe_quality_metrics(symbols=["600000"], lookback_days=10)
+    rw_frame = read_write.fetch_universe_quality_metrics(symbols=["600000"], lookback_days=10)
+    assert ro_frame.equals(rw_frame)
+
+
+def test_probe_enforce_read_only_flips_overlay_delta_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    index_path = _build_daily_fixture(tmp_path)
+    provider = VendorZipOverlayProvider(
+        data_root=str(tmp_path),
+        index_path=str(index_path),
+        delta_db_path=str(tmp_path / "delta" / "market_delta.duckdb"),
+    )
+    assert provider.delta_access_mode == "read_write"
+
+    import importlib.util
+
+    probe_path = (
+        Path(__file__).resolve().parents[1] / "scripts" / "probe_universe_quality_selector.py"
+    )
+    spec = importlib.util.spec_from_file_location("probe_module", probe_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    module._enforce_probe_read_only(provider)  # type: ignore[attr-defined]
+
+    assert provider.delta_access_mode == "read_only"
+    assert provider._warehouse is not None
+    assert provider._warehouse.read_only is True

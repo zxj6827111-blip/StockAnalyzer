@@ -264,9 +264,14 @@ def _build_test_execution_risk_artifact(path: Path) -> Path:
 
 
 def _build_logistic_model(*, weights: list[float], bias: float) -> dict[str, object]:
-    model = LogisticProbModel(learning_rate=0.05, epochs=16, l2=0.0, seed=7)
-    model.weights = np.asarray(weights, dtype=float)
-    model.bias = float(bias)
+    model = LogisticProbModel.with_weights(
+        weights=weights,
+        bias=bias,
+        learning_rate=0.05,
+        epochs=16,
+        l2=0.0,
+        seed=7,
+    )
     return model.to_dict()
 
 

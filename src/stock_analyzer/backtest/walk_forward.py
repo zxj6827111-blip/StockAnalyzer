@@ -260,11 +260,7 @@ class WalkForwardEngine:
                         side="sell",
                         slippage_ratio=slippage_ratio,
                     )
-                    gross_return = (
-                        (sell_fill - buy_fill) / buy_fill
-                        if buy_fill > 0
-                        else 0.0
-                    )
+                    gross_return = (sell_fill - buy_fill) / buy_fill if buy_fill > 0 else 0.0
                     round_trip_cost = _estimate_round_trip_cost(
                         matcher=self._matcher,
                         buy_price=buy_fill,
@@ -283,7 +279,12 @@ class WalkForwardEngine:
                     train_samples=len(train_slice),
                     calibration_samples=result.samples_calibration,
                     test_samples=result.samples_test,
-                    embargo_days=result.samples_embargo,
+                    embargo_days=int(
+                        _as_float(
+                            result.metrics.get("embargo_days"),
+                            default=result.samples_embargo,
+                        )
+                    ),
                     accuracy=round(accuracy, 6),
                     auc=_as_float(result.metrics.get("auc"), default=0.5),
                     brier=_as_float(result.metrics.get("brier"), default=0.0),

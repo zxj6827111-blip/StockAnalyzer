@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import TypeAlias
 
@@ -23,11 +23,11 @@ from stock_analyzer.feature.engineer import FeatureEngineer
 from stock_analyzer.feature.market_context import build_market_relative_frame
 from stock_analyzer.labels.soup import build_soup_labels
 from stock_analyzer.learning.dataset_manifest import DatasetManifestBuilder
+from stock_analyzer.learning.feature_schema_registry import FeatureSchemaRegistry
 from stock_analyzer.learning.feedback_weighting import (
     build_feedback_weight,
     summarize_feedback_weights,
 )
-from stock_analyzer.learning.feature_schema_registry import FeatureSchemaRegistry
 from stock_analyzer.learning.label_policy_registry import (
     LabelPolicyRecord,
     LabelPolicyRegistry,
@@ -72,10 +72,15 @@ class TrainResult:
 
 @dataclass(frozen=True, slots=True)
 class _TemporalSplit:
-    train_slice: slice
-    calibration_slice: slice
-    test_slice: slice
-    embargo_rows: int
+    train_mask: npt.NDArray[np.bool_]
+    calibration_mask: npt.NDArray[np.bool_]
+    test_mask: npt.NDArray[np.bool_]
+    embargo_mask: npt.NDArray[np.bool_]
+    embargo_days: int
+    train_dates: list[str]
+    calibration_dates: list[str]
+    test_dates: list[str]
+    embargo_dates: list[str]
 
 
 class ModelTrainer:
@@ -208,8 +213,7 @@ class ModelTrainer:
         manifest_items = store.list_manifest_items(manifest.dataset_manifest_id)
         if not manifest_items:
             raise ValueError(
-                "dataset manifest has no membership items: "
-                f"{manifest.dataset_manifest_id}"
+                f"dataset manifest has no membership items: {manifest.dataset_manifest_id}"
             )
 
         snapshot_ids = [item.snapshot_id for item in manifest_items]
@@ -363,19 +367,18 @@ class ModelTrainer:
         if sample_weight_array is not None and sample_weight_array.shape[0] != x.shape[0]:
             raise ValueError("row_weights length must match aligned dataset rows")
         if split_labels is None:
-            split = self._build_temporal_split(total_rows=len(aligned))
-            x_train = x[split.train_slice]
-            y_train = y[split.train_slice]
-            x_calibration = x[split.calibration_slice]
-            y_calibration = y[split.calibration_slice]
-            x_test = x[split.test_slice]
-            y_test = y[split.test_slice]
+            split = self._build_temporal_split(aligned=aligned)
+            x_train = x[split.train_mask]
+            y_train = y[split.train_mask]
+            x_calibration = x[split.calibration_mask]
+            y_calibration = y[split.calibration_mask]
+            x_test = x[split.test_mask]
+            y_test = y[split.test_mask]
             train_weight = (
-                sample_weight_array[split.train_slice]
-                if sample_weight_array is not None
-                else None
+                sample_weight_array[split.train_mask] if sample_weight_array is not None else None
             )
-            samples_embargo = int(split.embargo_rows)
+            samples_embargo = int(np.count_nonzero(split.embargo_mask))
+            embargo_trading_days = int(split.embargo_days)
             split_source = "temporal"
         else:
             x_train, y_train, x_calibration, y_calibration, x_test, y_test = (
@@ -390,6 +393,7 @@ class ModelTrainer:
                 else None
             )
             samples_embargo = 0
+            embargo_trading_days = 0
             split_source = "manifest"
         if len(x_train) == 0 or len(x_calibration) == 0 or len(x_test) == 0:
             raise ValueError("training split produced empty train/calibration/test set")
@@ -431,7 +435,12 @@ class ModelTrainer:
         metrics["time_gate_dropped_rows"] = _as_float(resolved_time_gate.get("dropped_rows"))
         metrics["calibration_samples"] = float(len(x_calibration))
         metrics["test_samples"] = float(len(x_test))
-        metrics["embargo_days"] = float(samples_embargo)
+        metrics["embargo_days"] = float(embargo_trading_days)
+        metrics["embargo_rows"] = float(samples_embargo)
+        if split_source == "temporal":
+            metrics["split_train_dates"] = float(len(split.train_dates))
+            metrics["split_calibration_dates"] = float(len(split.calibration_dates))
+            metrics["split_test_dates"] = float(len(split.test_dates))
         metrics["train_sample_weight_mean"] = (
             float(np.mean(train_weight)) if train_weight is not None and len(train_weight) else 1.0
         )
@@ -454,7 +463,8 @@ class ModelTrainer:
             "train_samples": int(len(x_train)),
             "calibration_samples": int(len(x_calibration)),
             "test_samples": int(len(x_test)),
-            "embargo_days": int(samples_embargo),
+            "embargo_days": int(embargo_trading_days),
+            "embargo_rows": int(samples_embargo),
             "dataset_split_strategy": split_source,
             "label_conflict_policy": self._labels.conflict_policy,
             "meta_blend_weights": meta_weights,
@@ -499,13 +509,11 @@ class ModelTrainer:
             record = feature_schema_registry.get_by_id(manifest.feature_schema_id)
             if record is None:
                 raise ValueError(
-                    "feature schema not found in registry: "
-                    f"{manifest.feature_schema_id}"
+                    f"feature schema not found in registry: {manifest.feature_schema_id}"
                 )
             if record.feature_schema_hash != manifest.feature_schema_hash:
                 raise ValueError(
-                    "feature schema hash mismatch for manifest: "
-                    f"{manifest.feature_schema_id}"
+                    f"feature schema hash mismatch for manifest: {manifest.feature_schema_id}"
                 )
             return list(record.feature_names)
 
@@ -534,14 +542,10 @@ class ModelTrainer:
         if label_policy_registry is not None:
             record = label_policy_registry.get_by_id(manifest.label_policy_id)
             if record is None:
-                raise ValueError(
-                    "label policy not found in registry: "
-                    f"{manifest.label_policy_id}"
-                )
+                raise ValueError(f"label policy not found in registry: {manifest.label_policy_id}")
             if record.label_policy_hash != manifest.label_policy_hash:
                 raise ValueError(
-                    "label policy hash mismatch for manifest: "
-                    f"{manifest.label_policy_id}"
+                    f"label policy hash mismatch for manifest: {manifest.label_policy_id}"
                 )
             return record
 
@@ -581,38 +585,148 @@ class ModelTrainer:
         result.artifact.save(path)
         return result
 
-    def _build_temporal_split(self, *, total_rows: int) -> _TemporalSplit:
+    def _build_temporal_split(self, *, aligned: pd.DataFrame) -> _TemporalSplit:
+        """Split a training frame by unique trading dates, never by row count.
+
+        - every row of the same trading date belongs to exactly one set;
+        - ``embargo_days`` excludes whole trading-date groups at BOTH
+          boundaries: between the train and calibration sets and between the
+          calibration and test sets;
+        - rows of the same date are selected through boolean masks, so the
+          frame does not need to be contiguous or sorted by date;
+        - a frame whose trading dates cannot be parsed fails loudly instead
+          of silently falling back to a row-count split.
+        """
+        date_values = _extract_trading_dates(aligned)
+        unique_dates = sorted(set(date_values))
+        if not unique_dates:
+            raise ValueError(
+                "unable to parse trading dates for temporal split; refusing row-count fallback"
+            )
+
         calibration_ratio, test_ratio = _resolve_split_ratios(self._training)
-        calibration_count = max(1, int(round(total_rows * calibration_ratio)))
-        test_count = max(1, int(round(total_rows * test_ratio)))
-        embargo_rows = max(
+        calibration_count = max(1, int(round(len(unique_dates) * calibration_ratio)))
+        test_count = max(1, int(round(len(unique_dates) * test_ratio)))
+        embargo_days = max(
             0,
             int(self._training.embargo_days)
             if int(self._training.embargo_days) > 0
             else int(self._labels.horizon_days + self._settlement_lag_days),
         )
 
-        test_start = total_rows - test_count
-        calibration_end = max(0, test_start - embargo_rows)
-        calibration_start = max(0, calibration_end - calibration_count)
-        train_end = max(0, calibration_start - embargo_rows)
-
-        while train_end <= 0 and (calibration_count > 1 or test_count > 1):
+        while calibration_count + test_count + 2 * embargo_days >= len(unique_dates):
             if calibration_count >= test_count and calibration_count > 1:
                 calibration_count -= 1
             elif test_count > 1:
                 test_count -= 1
-            test_start = total_rows - test_count
-            calibration_end = max(0, test_start - embargo_rows)
-            calibration_start = max(0, calibration_end - calibration_count)
-            train_end = max(0, calibration_start - embargo_rows)
+            else:
+                break
+
+        test_dates = unique_dates[-test_count:]
+        test_start_date = test_dates[0]
+        # Gap 1: whole trading-date groups between calibration and test.
+        gap1 = _dates_immediately_before(unique_dates, test_start_date, embargo_days)
+        calibration_candidates = [
+            item for item in unique_dates if item < min(gap1 or [test_start_date])
+        ]
+        calibration_dates = calibration_candidates[-calibration_count:]
+        if not calibration_dates:
+            raise ValueError(
+                "temporal split produced empty calibration set after date grouping; "
+                "reduce calibration/test ratios or embargo days"
+            )
+        # Gap 2: whole trading-date groups between train and calibration.
+        gap2 = _dates_immediately_before(
+            unique_dates,
+            calibration_dates[0],
+            embargo_days,
+        )
+        embargo_dates = gap1 + gap2
+        train_dates = [item for item in unique_dates if item < min(gap2 or [calibration_dates[0]])]
+
+        if not train_dates:
+            raise ValueError(
+                "temporal split produced empty train set after date grouping; "
+                "reduce calibration/test ratios or embargo days"
+            )
+
+        train_mask = np.asarray([item in set(train_dates) for item in date_values], dtype=bool)
+        calibration_mask = np.asarray(
+            [item in set(calibration_dates) for item in date_values], dtype=bool
+        )
+        test_mask = np.asarray([item in set(test_dates) for item in date_values], dtype=bool)
+        embargo_mask = np.asarray([item in set(embargo_dates) for item in date_values], dtype=bool)
+        if not train_mask.any() or not calibration_mask.any() or not test_mask.any():
+            raise ValueError(
+                "temporal split produced empty train/calibration/test set after date grouping"
+            )
 
         return _TemporalSplit(
-            train_slice=slice(0, train_end),
-            calibration_slice=slice(calibration_start, calibration_end),
-            test_slice=slice(test_start, total_rows),
-            embargo_rows=embargo_rows,
+            train_mask=train_mask,
+            calibration_mask=calibration_mask,
+            test_mask=test_mask,
+            embargo_mask=embargo_mask,
+            embargo_days=len(embargo_dates),
+            train_dates=[item.isoformat() for item in train_dates],
+            calibration_dates=[item.isoformat() for item in calibration_dates],
+            test_dates=[item.isoformat() for item in test_dates],
+            embargo_dates=[item.isoformat() for item in embargo_dates],
         )
+
+
+def _dates_immediately_before(
+    unique_dates: Sequence[date],
+    anchor: date,
+    count: int,
+) -> list[date]:
+    """Return up to ``count`` trading dates immediately before ``anchor``."""
+    if count <= 0:
+        return []
+    before = [item for item in unique_dates if item < anchor]
+    return before[-count:]
+
+
+def _extract_trading_dates(aligned: pd.DataFrame) -> list[date]:
+    """Resolve one trading date per row, failing loudly when unparseable.
+
+    Supported shapes:
+    - ``DatetimeIndex`` (single-symbol bar frames);
+    - ``MultiIndex`` with a ``decision_time`` or ``date`` level (panel rows);
+    - any other index that ``pd.to_datetime`` can fully coerce.
+    A row-count fallback is never attempted.
+    """
+    index = aligned.index
+    raw_index: pd.Index
+    if isinstance(index, pd.MultiIndex):
+        if "decision_time" in index.names:
+            raw_index = index.get_level_values("decision_time")
+        elif "date" in index.names:
+            raw_index = index.get_level_values("date")
+        else:
+            raise ValueError(
+                "unable to parse trading dates for temporal split: "
+                "MultiIndex has no decision_time/date level"
+            )
+    else:
+        raw_index = index
+    if getattr(raw_index, "dtype", None) is not None and raw_index.dtype.kind in "iu":
+        raise ValueError(
+            "unable to parse trading dates for temporal split: "
+            "integer index (e.g. RangeIndex) carries no trading dates; "
+            "refusing row-count fallback"
+        )
+    parsed = pd.to_datetime(raw_index, errors="coerce", format="ISO8601")
+    if parsed is None or len(parsed) != len(aligned):
+        raise ValueError("unable to parse trading dates for temporal split")
+    dates: list[date] = []
+    for item in parsed:
+        if isinstance(item, pd.Timestamp) and not pd.isna(item):
+            dates.append(item.date())
+        else:
+            raise ValueError(
+                "unable to parse trading dates for temporal split; refusing row-count fallback"
+            )
+    return dates
 
 
 def _resolve_split_ratios(training: TrainingConfig) -> tuple[float, float]:
@@ -787,14 +901,12 @@ def _label_from_outcome(
     outcome: OutcomeRecord,
     policy: LabelPolicyRecord,
 ) -> float | None:
-    take_profit_hit = (
-        outcome.max_favorable_excursion is not None
-        and float(outcome.max_favorable_excursion) >= float(policy.take_profit_pct)
-    )
-    stop_loss_hit = (
-        outcome.max_adverse_excursion is not None
-        and float(outcome.max_adverse_excursion) <= -float(policy.stop_loss_pct)
-    )
+    take_profit_hit = outcome.max_favorable_excursion is not None and float(
+        outcome.max_favorable_excursion
+    ) >= float(policy.take_profit_pct)
+    stop_loss_hit = outcome.max_adverse_excursion is not None and float(
+        outcome.max_adverse_excursion
+    ) <= -float(policy.stop_loss_pct)
     if take_profit_hit and stop_loss_hit:
         normalized_policy = policy.conflict_policy.strip().lower()
         if normalized_policy == "soft_label":

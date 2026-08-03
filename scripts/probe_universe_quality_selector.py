@@ -14,6 +14,10 @@ exits non-zero, so a NO-GO is never mistaken for PASS.
 Read-only guarantees:
 - does NOT start the scheduler;
 - does NOT modify the DuckDB, ZIP archives, index or named volumes;
+- the delta DuckDB is opened in ``read_only`` mode by default, so no database
+  file is created and no table is created or written even on a cold cache;
+  ``--allow-cache-write`` is an explicit opt-in that reverts to the normal
+  read-write delta cache;
 - does NOT run training or auto-promotion;
 - does NOT modify runtime state;
 - does NOT call any write API or persist the selection snapshot.
@@ -21,7 +25,7 @@ Read-only guarantees:
 Usage:
     python scripts/probe_universe_quality_selector.py [--config config/default.yaml]
         [--target-size 300] [--min-coverage 0.90] [--min-input-count 5000]
-        [--max-elapsed-ms 30000]
+        [--max-elapsed-ms 30000] [--allow-cache-write]
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ import sys
 import time
 from datetime import date
 from pathlib import Path
+from typing import Any, cast
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -44,6 +49,45 @@ def _now_iso() -> str:
     from datetime import datetime
 
     return datetime.now().isoformat()
+
+
+def _enforce_probe_read_only(provider: object) -> None:
+    """Recursively flip vendor ZIP overlay delta access to ``read_only``.
+
+    Probes must never create or mutate the delta DuckDB. ``read_only`` mode
+    opens the database read-only (a missing database file is left untouched
+    and simply yields no delta rows), matching the probe's documented
+    read-only guarantees.
+    """
+    pending = [provider]
+    seen: set[int] = set()
+    wrapper_attrs = (
+        "primary",
+        "backup",
+        "inner",
+        "base_provider",
+        "provider",
+        "_primary",
+        "_backup",
+        "_inner",
+        "_base_provider",
+        "_provider",
+    )
+    while pending:
+        current = pending.pop(0)
+        current_id = id(current)
+        if current_id in seen:
+            continue
+        seen.add(current_id)
+        if (
+            type(current).__module__.endswith("vendor_zip_overlay")
+            and type(current).__name__ == "VendorZipOverlayProvider"
+        ):
+            cast(Any, current).enforce_read_only_delta()
+        for attr in wrapper_attrs:
+            nested = getattr(current, attr, None)
+            if nested is not None:
+                pending.append(nested)
 
 
 def _resolve_universe_symbols(service: object) -> list[str]:
@@ -202,6 +246,12 @@ def _main(argv: list[str] | None = None) -> int:
         default=30_000,
         help="Selector SLA in ms (default 30000); 0 explicitly disables the check",
     )
+    parser.add_argument(
+        "--allow-cache-write",
+        action="store_true",
+        help="Opt-in: open the delta DuckDB read-write and allow cache writes "
+        "(default is read_only so the probe never creates or mutates the database)",
+    )
     args = parser.parse_args(argv)
 
     from stock_analyzer.config import load_config
@@ -220,6 +270,8 @@ def _main(argv: list[str] | None = None) -> int:
             runtime_data_source,
             synthetic_seed=2026,
         )
+        if not args.allow_cache_write:
+            _enforce_probe_read_only(provider)
         if bool(config.cache.enabled):
             from stock_analyzer.data.cached_provider import CachedProvider
             from stock_analyzer.infra.cache import InMemoryCache
@@ -255,6 +307,7 @@ def _main(argv: list[str] | None = None) -> int:
         fallback_warehouse = MarketWarehouse(
             db_path=runtime_data_source.warehouse_db_path,
             package_root=runtime_data_source.local_data_root,
+            read_only=not args.allow_cache_write,
         )
 
         class _WarehouseHost:
@@ -408,6 +461,7 @@ def _main(argv: list[str] | None = None) -> int:
         "trade_date": str(report.get("trade_date", trade_date)),
         "ruleset_id": str(report.get("ruleset_id", "")),
         "batch_source_module": type(batch_source).__module__,
+        "delta_access_mode": ("read_write" if args.allow_cache_write else "read_only"),
     }
     min_coverage = (
         args.min_coverage

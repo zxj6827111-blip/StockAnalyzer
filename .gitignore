@@ -5,6 +5,10 @@ config/llm.local.yaml
 .venv/
 .venv-codex312*/
 __pycache__/
+*.egg-info/
+*.egg-info
+build/
+dist/
 .pytest_cache/
 .pytest-tmp/
 .pytest-*/

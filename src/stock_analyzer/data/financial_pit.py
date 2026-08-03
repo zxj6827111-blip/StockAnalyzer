@@ -315,6 +315,20 @@ def apply_financial_snapshots_asof_batch(
     ``pd.merge_asof(by="symbol")`` so thousands of symbols are enriched in
     one pass instead of per-symbol loops. ``daily`` must carry a ``symbol``
     column and a ``date`` column.
+
+    Row-addressability contract:
+    - original absolute row positions are captured before any filtering or
+      sorting and every write-back uses those positions (never filtered
+      relative positions), so rows dropped for invalid dates can never shift
+      financial data onto the wrong quote row;
+    - the frame may carry duplicate index labels: positions are tracked as a
+      plain column, never via index-label alignment;
+    - ``only_fill_pending=True`` with no ``financial_trust_level`` column
+      treats every row as pending (matching the single-symbol path) instead
+      of skipping the whole frame;
+    - legal daily frames missing financial output columns are completed with
+      explicit defaults instead of failing at ``get_loc`` with a bare
+      ``KeyError``.
     """
     if daily is None or daily.empty:
         return daily
@@ -324,38 +338,25 @@ def apply_financial_snapshots_asof_batch(
     if "symbol" not in out.columns or "date" not in out.columns:
         return out
 
+    _ensure_batch_financial_columns(out)
+
     work = out.copy()
+    work["_row_pos"] = np.arange(len(work))
     work["date"] = pd.to_datetime(work["date"], errors="coerce")
-    work = work.dropna(subset=["date"])
-    if work.empty:
-        return out
 
-    snap = snapshots.copy()
-    snap["ann_date"] = pd.to_datetime(snap["ann_date"], errors="coerce")
-    if "end_date" in snap.columns:
-        snap["end_date"] = pd.to_datetime(snap["end_date"], errors="coerce")
-    if "update_flag" not in snap.columns:
-        snap["update_flag"] = 0
-    snap = snap.dropna(subset=["ann_date"]).copy()
-    if snap.empty:
-        return out
-
-    # PIT single-row-per-ann_date per symbol: later end_date then higher
-    # update_flag win on the same disclosure date.
-    snap = snap.sort_values(
-        by=["symbol", "ann_date", "end_date", "update_flag"],
-        ascending=[True, True, True, True],
-        kind="mergesort",
-    )
-    snap = snap.drop_duplicates(subset=["symbol", "ann_date"], keep="last")
-
-    fill_mask = pd.Series(True, index=work.index)
+    fill_mask: np.ndarray = np.ones(len(work), dtype=bool)
     if only_fill_pending:
-        fill_mask = pd.Series(False, index=work.index)
+        # Missing financial_trust_level: rows without an explicit trust level
+        # are treated as pending, exactly like the single-symbol path.
+        fill_mask = np.zeros(len(work), dtype=bool)
         if "financial_trust_level" in work.columns:
             trust = work["financial_trust_level"].astype(str).str.strip().str.lower()
-            source_col = work.get("financial_source", pd.Series("", index=work.index)).astype(str)
-            source = source_col.str.strip().str.lower()
+            source = (
+                work.get("financial_source", pd.Series("", index=work.index))
+                .astype(str)
+                .str.strip()
+                .str.lower()
+            )
             keep_trusted = trust.isin({"reported", "derived"}) & ~source.isin(
                 {
                     "",
@@ -368,20 +369,43 @@ def apply_financial_snapshots_asof_batch(
                     "efinance_default",
                 }
             )
-            fill_mask = ~keep_trusted
+            fill_mask = (~keep_trusted).to_numpy()
 
-    positions = np.flatnonzero(fill_mask.to_numpy())
-    if positions.size == 0:
+    work_fill = work[fill_mask].copy()
+    if work_fill.empty:
         return out
+    work_fill = work_fill.dropna(subset=["date"])
+    if work_fill.empty:
+        return out
+    # Absolute positions of the rows that are actually written back.
+    positions = work_fill["_row_pos"].to_numpy()
 
-    work_fill = work.loc[fill_mask]
     drop_cols = [col for col in _BATCH_FINANCIAL_COLUMNS if col in work_fill.columns]
     left = work_fill.drop(columns=drop_cols, errors="ignore")
     # merge_asof requires the on key to be globally sorted even when `by` is
     # used; per-symbol groups are handled by the `by` argument itself. The
-    # original work_fill order (== positions order) is restored afterwards.
-    left_sorted = left.sort_values("date")
-    right = snap.sort_values("ann_date")
+    # original row order is restored afterwards through the tracked positions.
+    left_sorted = left.sort_values("date", kind="mergesort")
+    right = snapshots.copy()
+    right["ann_date"] = pd.to_datetime(right["ann_date"], errors="coerce")
+    if "end_date" in right.columns:
+        right["end_date"] = pd.to_datetime(right["end_date"], errors="coerce")
+    if "update_flag" not in right.columns:
+        right["update_flag"] = 0
+    right = right.dropna(subset=["ann_date"]).copy()
+    if right.empty:
+        return out
+
+    # PIT single-row-per-ann_date per symbol: later end_date then higher
+    # update_flag win on the same disclosure date.
+    right = right.sort_values(
+        by=["symbol", "ann_date", "end_date", "update_flag"],
+        ascending=[True, True, True, True],
+        kind="mergesort",
+    )
+    right = right.drop_duplicates(subset=["symbol", "ann_date"], keep="last")
+    right = right.sort_values("ann_date")
+
     joined = pd.merge_asof(
         left_sorted,
         right,
@@ -391,13 +415,12 @@ def apply_financial_snapshots_asof_batch(
         direction="backward",
         allow_exact_matches=True,
     )
-    # merge_asof reorders output by `by` groups and resets the index to
-    # positional; restore the original daily row order via the sorted-left
-    # index labels so the fill below aligns with `positions`.
-    aligned = joined.copy()
-    aligned.index = left_sorted.index.to_numpy()
-    aligned = aligned.sort_index()
-    joined = aligned
+    # merge_asof returns exactly one output row per left input row in the
+    # left-sorted order; re-attach the original absolute positions and restore
+    # the original row order so the write-back below aligns with `positions`.
+    joined["_row_pos"] = left_sorted["_row_pos"].to_numpy()
+    joined = joined.sort_values("_row_pos", kind="mergesort")
+
     joined["roe"] = pd.to_numeric(joined.get("roe"), errors="coerce")
     joined["debt_ratio"] = pd.to_numeric(joined.get("debt_ratio"), errors="coerce")
     joined["financial_data_complete"] = (
@@ -428,9 +451,35 @@ def apply_financial_snapshots_asof_batch(
         joined.get("financial_completeness"), errors="coerce"
     ).fillna(0.0)
 
+    positions_list = [int(item) for item in positions]
     for col in _BATCH_FINANCIAL_COLUMNS:
-        out.iloc[positions, out.columns.get_loc(col)] = joined[col].to_numpy()
+        out.iloc[positions_list, out.columns.get_loc(col)] = joined[col].to_numpy()
     return out
+
+
+def _ensure_batch_financial_columns(frame: pd.DataFrame) -> None:
+    """Complete missing financial output columns with explicit defaults.
+
+    A legal daily frame may legitimately lack financial columns (for example
+    plain vendor bars before enrichment). Instead of failing at
+    ``DataFrame.get_loc`` with a bare ``KeyError``, the batch join completes
+    the frame with the same default values the single-symbol path would
+    produce for an un-enriched row.
+    """
+    defaults: dict[str, object] = {
+        "roe": float("nan"),
+        "debt_ratio": float("nan"),
+        "financial_data_complete": False,
+        "financial_missing_fields": "roe,debt_ratio",
+        "financial_source": "tushare_pending",
+        "financial_report_date": "",
+        "financial_as_of": "",
+        "financial_trust_level": "missing",
+        "financial_completeness": 0.0,
+    }
+    for column, default in defaults.items():
+        if column not in frame.columns:
+            frame[column] = default
 
 
 _BATCH_FINANCIAL_COLUMNS = (

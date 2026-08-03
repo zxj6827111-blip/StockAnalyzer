@@ -11,6 +11,7 @@ from typing import Any, cast
 import pandas as pd
 
 from stock_analyzer.data.intraday_summary import load_intraday_summary
+from stock_analyzer.data.provider import DataSourceError
 from stock_analyzer.data.tdx_offline_provider import (
     _SELECTED_COLUMNS,
     _normalize_frame,
@@ -101,7 +102,13 @@ _DAILY_STRING_COLUMNS = {
 
 
 class MarketWarehouse:
-    """Persist normalized market data into DuckDB and optionally export package files."""
+    """Persist normalized market data into DuckDB and optionally export package files.
+
+    ``read_only=True`` opens the DuckDB with ``read_only=True`` so reads can
+    never create the database file, alter its mtime/size/schema or write any
+    content. Read-only mode is intended for probes and audits that must
+    guarantee the warehouse stays byte-for-byte untouched.
+    """
 
     def __init__(
         self,
@@ -109,10 +116,26 @@ class MarketWarehouse:
         db_path: str | Path,
         package_root: str | Path,
         package_writes_enabled: bool = True,
+        read_only: bool = False,
     ) -> None:
         self._db_path = Path(db_path).expanduser()
         self._package_root = Path(package_root).expanduser()
         self._package_writes_enabled = bool(package_writes_enabled)
+        self._read_only = bool(read_only)
+
+    @property
+    def read_only(self) -> bool:
+        return self._read_only
+
+    def enforce_read_only(self) -> None:
+        """Switch this warehouse to read-only mode (probes/audits).
+
+        After this call the DuckDB is only ever opened with ``read_only=True``:
+        no file creation, schema mutation, writes or connection-level side
+        effects. Intended for probes that must guarantee the warehouse stays
+        untouched even when constructed through a read-write path.
+        """
+        self._read_only = True
 
     @property
     def db_path(self) -> Path:
@@ -127,6 +150,10 @@ class MarketWarehouse:
         return self._package_writes_enabled
 
     def ensure_schema(self) -> None:
+        if self._read_only:
+            raise DataSourceError(
+                f"market warehouse is read-only; refusing schema creation: {self._db_path}"
+            )
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect_write() as connection:
             connection.execute(
@@ -2221,6 +2248,8 @@ class MarketWarehouse:
         return bool(row and int(row[0]) > 0)
 
     def _connect_write(self) -> _DUCK_CONNECTION:
+        if self._read_only:
+            raise DataSourceError(f"market warehouse is read-only; refusing write: {self._db_path}")
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         return self._connect()
 
@@ -2230,6 +2259,13 @@ class MarketWarehouse:
     def _connect(self) -> _DUCK_CONNECTION:
         import duckdb
 
+        if self._read_only:
+            if not self._db_path.exists():
+                raise DataSourceError(f"read-only DuckDB does not exist: {self._db_path}")
+            return cast(
+                _DUCK_CONNECTION,
+                duckdb.connect(database=str(self._db_path), read_only=True),
+            )
         return cast(_DUCK_CONNECTION, duckdb.connect(database=str(self._db_path)))
 
 
