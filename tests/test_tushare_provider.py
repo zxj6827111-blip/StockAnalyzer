@@ -69,10 +69,68 @@ class _FakePro:
         return pd.DataFrame({"ts_code": [ts_code], "name": ["浦发银行"]})
 
 
-def test_to_ts_code_mapping() -> None:
-    assert _to_ts_code("600000") == "600000.SH"
-    assert _to_ts_code("000001") == "000001.SZ"
-    assert _to_ts_code("430047") == "430047.BJ"
+@pytest.mark.parametrize(
+    ("code6", "expected"),
+    [
+        ("920002", "920002.BJ"),
+        ("920099", "920099.BJ"),
+        ("920000", "920000.BJ"),
+        ("900901", "900901.SH"),
+        ("900957", "900957.SH"),
+        ("600000", "600000.SH"),
+        ("688001", "688001.SH"),
+        ("510300", "510300.SH"),
+        ("430047", "430047.BJ"),
+        ("830799", "830799.BJ"),
+        ("000001", "000001.SZ"),
+        ("300750", "300750.SZ"),
+        ("200002", "200002.SZ"),
+    ],
+)
+def test_to_ts_code_mapping(code6: str, expected: str) -> None:
+    assert _to_ts_code(code6) == expected
+
+
+class _RecordingFinaPro:
+    def __init__(self) -> None:
+        self.fina_ts_codes: list[str] = []
+
+    def fina_indicator(
+        self,
+        *,
+        ts_code: str = "",
+        start_date: str = "",
+        end_date: str = "",
+        fields: str = "",
+    ) -> pd.DataFrame:
+        self.fina_ts_codes.append(ts_code)
+        return pd.DataFrame(
+            {
+                "ts_code": [ts_code],
+                "ann_date": ["20250320"],
+                "end_date": ["20241231"],
+                "roe": [12.5],
+                "debt_to_assets": [40.0],
+                "update_flag": [0],
+            }
+        )
+
+
+def test_fetch_fina_indicator_sends_920_bj_and_900_sh() -> None:
+    pro = _RecordingFinaPro()
+    provider = TushareProvider(token="dummy", pro_api=pro, retry_delay_sec=0.0)
+
+    bj_frame = provider.fetch_fina_indicator(
+        symbol="920002", start_date=date(2024, 1, 1), end_date=date(2026, 1, 1)
+    )
+    assert not bj_frame.empty
+    assert pro.fina_ts_codes == ["920002.BJ"]
+    assert "920002.SH" not in pro.fina_ts_codes
+
+    provider.fetch_fina_indicator(
+        symbol="900901", start_date=date(2024, 1, 1), end_date=date(2026, 1, 1)
+    )
+    assert pro.fina_ts_codes == ["920002.BJ", "900901.SH"]
 
 
 def test_apply_price_adjust_qfq_scales_to_latest_factor() -> None:

@@ -421,6 +421,94 @@ def test_backfill_rate_limits_after_failures_too(
     assert len(sleeps) == 2
 
 
+def test_backfill_real_tushare_provider_maps_920_bj_and_empty_not_checkpointed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Wire the REAL TushareProvider through the backfill CLI.
+
+    Exercises the production fetch_fina_indicator -> _to_ts_code chain (no
+    mapping logic duplicated in the fake), and proves 920002 requests go to
+    Tushare as 920002.BJ, 900901 stays 900901.SH, and empty results are not
+    checkpointed so a later re-run re-fetches them.
+    """
+    from stock_analyzer.data.tushare_provider import TushareProvider
+
+    class _FinaPro:
+        def __init__(self) -> None:
+            self.ts_codes: list[str] = []
+            self.empty_ts_codes: set[str] = set()
+
+        def fina_indicator(
+            self,
+            *,
+            ts_code: str = "",
+            start_date: str = "",
+            end_date: str = "",
+            fields: str = "",
+        ) -> pd.DataFrame:
+            self.ts_codes.append(ts_code)
+            if ts_code in self.empty_ts_codes:
+                return pd.DataFrame()
+            return pd.DataFrame(
+                {
+                    "ts_code": [ts_code],
+                    "ann_date": ["20250320"],
+                    "end_date": ["20241231"],
+                    "roe": [12.5],
+                    "debt_to_assets": [40.0],
+                    "update_flag": [0],
+                }
+            )
+
+    pro = _FinaPro()
+    pro.empty_ts_codes = {"900901.SH"}
+    provider = TushareProvider(token="dummy", pro_api=pro, retry_delay_sec=0.0)
+    universe = tmp_path / "universe.txt"
+    universe.write_text("920002\n900901\n", encoding="utf-8")
+    checkpoint = tmp_path / "checkpoint.json"
+
+    exit_code, _ = _run_backfill(
+        monkeypatch,
+        root=tmp_path,
+        provider=provider,
+        args=[
+            "--config",
+            str(tmp_path / "config.yaml"),
+            "--universe-file",
+            str(universe),
+            "--checkpoint",
+            str(checkpoint),
+            "--strict",
+        ],
+    )
+    assert exit_code == 1
+    assert pro.ts_codes == ["900901.SH", "920002.BJ"]
+    assert "920002.SH" not in pro.ts_codes
+    stored = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert len(stored) == 1
+    assert any(key.endswith("|920002") for key in stored)
+    assert not any(key.endswith("|900901") for key in stored)
+
+    pro.empty_ts_codes = set()
+    exit_code, _ = _run_backfill(
+        monkeypatch,
+        root=tmp_path,
+        provider=provider,
+        args=[
+            "--config",
+            str(tmp_path / "config.yaml"),
+            "--universe-file",
+            str(universe),
+            "--checkpoint",
+            str(checkpoint),
+            "--resume",
+        ],
+    )
+    assert exit_code == 0
+    assert pro.ts_codes == ["900901.SH", "920002.BJ", "900901.SH"]
+
+
 def test_backfill_checkpoint_key_includes_start_date_and_provider(
     backfill: object,
     tmp_path: Path,
