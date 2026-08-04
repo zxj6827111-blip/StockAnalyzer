@@ -45,7 +45,11 @@ Tushare 增量 DuckDB（可写）
 - `YYYY(1).zip`：自动视为重复副本并忽略，优先使用标准 `YYYY.zip`。
 - 沪深、北交所 `1min` 和 `5min`：支持，按需读取并生成日内摘要。
 - `15min`、`30min`、`60min`：文件可以保留，但当前运行逻辑不读取。
-- `复权因子`：暂不使用。外挂模式固定采用 `raw` 价格，避免把不可信复权因子混入 Tushare 增量。
+- `复权因子/复权因子_前复权.zip`：支持（`price_series_mode=qfq` 时按需读取）。
+  外挂模式采用 `qfq` 价格：`price_qfq = price_raw × 前复权因子`，因子文件最新日期
+  恒为 `1.0`（锚定最新价）。整只股票缺少因子时直接报错，绝不静默混用 raw。
+  每晚由 `scripts/update_vendor_daily_from_tushare.py` 增量维护（日K raw 追加 +
+  因子全量重锚定重建），不要把复权因子 ZIP 混入 Tushare 增量 DuckDB。
 
 单位转换已经按这套本地数据格式配置：
 

@@ -23,6 +23,7 @@ from stock_analyzer.data.tdx_offline_provider import (
     _normalize_frame,
     _normalize_symbol,
 )
+from stock_analyzer.data.tushare_provider import _to_ts_code
 
 VENDOR_ZIP_INDEX_VERSION = 1
 _YEAR_ARCHIVE_RE = re.compile(r"^(?P<year>\d{4})(?:\((?P<copy>\d+)\))?\.zip$", re.I)
@@ -182,6 +183,7 @@ class VendorZipOverlayProvider:
     _intraday_cache: OrderedDict[str, pd.DataFrame] = field(default_factory=OrderedDict, init=False)
     _minute_archives: dict[str, list[Path]] = field(default_factory=dict, init=False)
     _minute_entry_index: dict[Path, dict[str, list[str]]] = field(default_factory=dict, init=False)
+    _factor_cache: dict[str, pd.Series] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
         self._root = Path(self.data_root).expanduser()
@@ -189,9 +191,9 @@ class VendorZipOverlayProvider:
             raise DataSourceError(f"vendor ZIP data root does not exist: {self._root}")
         self._index = load_vendor_zip_daily_index(self.index_path)
         normalized_mode = str(self.price_series_mode or "raw").strip().lower()
-        if normalized_mode != "raw":
+        if normalized_mode not in {"raw", "qfq"}:
             raise DataSourceError(
-                "vendor ZIP overlay currently supports only raw prices; "
+                "vendor ZIP overlay supports only raw or qfq prices; "
                 f"got: {self.price_series_mode}"
             )
         self.price_series_mode = normalized_mode
@@ -413,6 +415,7 @@ class VendorZipOverlayProvider:
     def clear_cache(self) -> None:
         self._daily_cache.clear()
         self._intraday_cache.clear()
+        self._factor_cache.clear()
 
     def status(self) -> dict[str, object]:
         delta_warehouse = self._delta_warehouse()
@@ -579,6 +582,64 @@ class VendorZipOverlayProvider:
             long_frames.append(frame)
         return long_frames
 
+    def _load_price_factors(self, symbol: str) -> pd.Series:
+        """Load the qfq factor series for ``symbol`` from the vendor archive.
+
+        Reads every ``*/<ts_code>.csv`` entry of ``复权因子/复权因子_前复权.zip``
+        (header ``股票代码,交易日期,复权因子``), merges them into one
+        piecewise-constant series indexed by trading date and caches it. The
+        vendor factor files are anchored at the latest date (latest factor is
+        exactly 1.0), so qfq price = raw price x factor directly.
+        """
+        cached = self._factor_cache.get(symbol)
+        if cached is not None:
+            return cached
+        factors_dir = self._root / "复权因子"
+        if not factors_dir.is_dir():
+            raise DataSourceError(
+                f"vendor factors directory missing for {symbol}: {factors_dir}"
+            )
+        archive_path = factors_dir / "复权因子_前复权.zip"
+        if not archive_path.exists():
+            raise DataSourceError(
+                f"vendor qfq factor archive missing for {symbol}: {archive_path}"
+            )
+        ts_code = _to_ts_code(symbol)
+        expected_name = f"{ts_code}.csv"
+        entries: list[str] = []
+        with zipfile.ZipFile(archive_path) as archive:
+            for name in archive.namelist():
+                if _is_zip_noise(name):
+                    continue
+                if Path(name.replace("\\", "/")).name.lower() == expected_name.lower():
+                    entries.append(name)
+            if not entries:
+                raise DataSourceError(
+                    f"vendor qfq factors missing for {symbol} ({ts_code}) in "
+                    f"{archive_path}"
+                )
+            frames: list[pd.Series] = []
+            for entry_name in entries:
+                try:
+                    with archive.open(entry_name) as stream:
+                        raw = pd.read_csv(stream)
+                except KeyError as exc:
+                    raise DataSourceError(
+                        f"vendor factor entry is missing: {archive_path}!{entry_name}"
+                    ) from exc
+                parsed = _parse_vendor_factor_frame(raw, symbol=symbol)
+                if not parsed.empty:
+                    frames.append(parsed)
+        if not frames:
+            raise DataSourceError(f"vendor qfq factors empty for {symbol} ({ts_code})")
+        merged = cast(pd.Series, pd.concat(frames, axis=0))
+        merged = merged[merged.index.notna()]
+        merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+        if merged.empty:
+            raise DataSourceError(f"vendor qfq factors empty for {symbol} ({ts_code})")
+        self._factor_cache[symbol] = merged
+        return merged
+
     def _normalize_vendor_daily(self, *, raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
         if raw.empty:
             return pd.DataFrame()
@@ -596,6 +657,19 @@ class VendorZipOverlayProvider:
                     f"vendor daily file missing required column for {symbol}: {column}"
                 )
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        if self.price_series_mode == "qfq":
+            factors = self._load_price_factors(symbol)
+            aligned = factors.reindex(frame["date"], method="ffill").bfill()
+            if aligned.isna().any():
+                raise DataSourceError(
+                    f"vendor qfq factors could not be aligned to daily bars for {symbol}"
+                )
+            factor_values = aligned.to_numpy(dtype=float)
+            for column in ("open", "high", "low", "close", "pre_close"):
+                if column in frame.columns:
+                    frame[column] = pd.to_numeric(
+                        frame[column], errors="coerce"
+                    ) * factor_values
         frame["volume"] = frame["volume"] * max(0.0, float(self.daily_volume_multiplier))
         if "amount" in frame.columns:
             frame["turnover"] = pd.to_numeric(frame["amount"], errors="coerce") * max(
@@ -623,11 +697,20 @@ class VendorZipOverlayProvider:
             "margin_financing_balance,northbound_net,dragon_tiger_flag"
         )
         frame["price_series_mode"] = self.price_series_mode
-        frame["adjustment_source"] = (
-            "local_vendor_raw" if self.price_series_mode == "raw" else "local_vendor_declared"
-        )
-        frame["adjustment_anchor_date"] = ""
-        frame["adjustment_anchor_factor"] = np.nan
+        if self.price_series_mode == "qfq":
+            factors = self._load_price_factors(symbol)
+            frame["adjustment_source"] = "local_vendor_qfq"
+            anchor_date = factors.index[-1]
+            frame["adjustment_anchor_date"] = (
+                anchor_date.date().isoformat()
+                if isinstance(anchor_date, pd.Timestamp)
+                else str(anchor_date)[:10]
+            )
+            frame["adjustment_anchor_factor"] = float(factors.iloc[-1])
+        else:
+            frame["adjustment_source"] = "local_vendor_raw"
+            frame["adjustment_anchor_date"] = ""
+            frame["adjustment_anchor_factor"] = np.nan
         return cast(pd.DataFrame, _normalize_frame(frame=frame, symbol=symbol))
 
     def _load_vendor_intraday_summary(
@@ -767,6 +850,47 @@ def _select_canonical_daily_archives(
         selected.append((year, preferred))
         ignored.extend(path for path in candidates if path != preferred)
     return selected, ignored
+
+
+def _parse_vendor_factor_frame(raw: pd.DataFrame, *, symbol: str) -> pd.Series:
+    """Parse one vendor factor CSV (``股票代码,交易日期,复权因子``) into a Series.
+
+    Returns a ``pd.Series`` of factors indexed by trading date, sorted,
+    de-duplicated (last wins) and filtered to strictly positive values. A
+    factor applies piecewise from its date forward; the caller fills gaps
+    with the nearest earlier factor.
+    """
+    if raw.empty:
+        return pd.Series(dtype=float)
+    frame = raw.copy()
+    date_column = next(
+        (name for name in ("交易日期", "trade_date", "date") if name in frame.columns),
+        "",
+    )
+    factor_column = next(
+        (name for name in ("复权因子", "adj_factor", "factor") if name in frame.columns),
+        "",
+    )
+    if not date_column or not factor_column:
+        raise DataSourceError(
+            f"vendor factor file missing date or factor column for {symbol}"
+        )
+    parsed = pd.to_datetime(
+        frame[date_column].astype(str), format="%Y%m%d", errors="coerce"
+    )
+    if parsed.isna().any():
+        inferred = pd.to_datetime(frame[date_column].astype(str), errors="coerce")
+        parsed = parsed.combine_first(inferred)
+    factor = pd.to_numeric(frame[factor_column], errors="coerce")
+    if bool((factor <= 0).any()):
+        raise DataSourceError(
+            f"vendor factor file contains non-positive factors for {symbol}"
+        )
+    series = pd.Series(factor.to_numpy(), index=pd.DatetimeIndex(parsed))
+    series = series.loc[pd.notna(series.index)]
+    series = series[series.notna()]
+    series = series[~series.index.duplicated(keep="last")].sort_index()
+    return series
 
 
 def _read_last_trade_date(*, archive: zipfile.ZipFile, entry_name: str) -> str:
