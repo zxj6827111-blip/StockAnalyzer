@@ -711,7 +711,7 @@ class VendorZipOverlayProvider:
             frame["adjustment_source"] = "local_vendor_raw"
             frame["adjustment_anchor_date"] = ""
             frame["adjustment_anchor_factor"] = np.nan
-        return _normalize_frame(frame=frame, symbol=symbol)
+        return cast(pd.DataFrame, _normalize_frame(frame=frame, symbol=symbol))
 
     def _load_vendor_intraday_summary(
         self,
