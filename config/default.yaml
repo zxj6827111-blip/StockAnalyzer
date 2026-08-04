@@ -14,7 +14,7 @@ data_source:
   # Optional read-only annual-ZIP history + writable DuckDB delta overlay.
   vendor_zip_index_path: ""
   vendor_zip_daily_dir: "全A日K"
-  vendor_zip_price_series_mode: "raw"
+  vendor_zip_price_series_mode: "qfq"
   vendor_zip_daily_volume_multiplier: 100.0
   vendor_zip_daily_turnover_multiplier: 1000.0
   vendor_zip_minute_volume_multiplier: 100.0

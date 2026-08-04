@@ -50,7 +50,7 @@ def test_load_default_config_values(monkeypatch: MonkeyPatch) -> None:
     assert config.data_source.warehouse_db_path == "artifacts/warehouse/market.duckdb"
     assert config.data_source.vendor_zip_index_path == ""
     assert config.data_source.vendor_zip_daily_dir == "全A日K"
-    assert config.data_source.vendor_zip_price_series_mode == "raw"
+    assert config.data_source.vendor_zip_price_series_mode == "qfq"
     assert config.data_source.vendor_zip_daily_volume_multiplier == 100.0
     assert config.data_source.vendor_zip_daily_turnover_multiplier == 1000.0
     assert config.data_source.vendor_zip_minute_volume_multiplier == 100.0

@@ -150,15 +150,216 @@ def test_provider_factory_builds_vendor_overlay(tmp_path: Path) -> None:
     assert isinstance(provider, VendorZipOverlayProvider)
 
 
-def test_vendor_overlay_rejects_unverified_adjusted_price_mode(tmp_path: Path) -> None:
-    index_path = _build_daily_fixture(tmp_path)
-    with pytest.raises(DataSourceError, match="supports only raw"):
+def _write_factors_zip(root: Path, entries: dict[str, str]) -> None:
+    """Write ``复权因子/复权因子_前复权.zip`` with ``YYYY/<ts_code>.csv`` entries.
+
+    Factor CSV header is ``股票代码,交易日期,复权因子``; dates are ``YYYYMMDD``.
+    """
+    _write_zip(root / "复权因子" / "复权因子_前复权.zip", entries)
+
+
+def _build_qfq_daily_fixture(root: Path) -> Path:
+    """Daily fixture with an ex-dividend gap: raw close 10.0 -> 9.0 on 12/31.
+
+    Factors: 0.9 up to 2025-12-30, then 1.0 from 2025-12-31 (latest anchor),
+    so the qfq close series is continuous (9.0, 9.0) while raw is not.
+    """
+    daily_csv = "\n".join(
+        [
+            "code,datetime,open,high,low,close,pre_close,change,pct_chg,volume,amount",
+            "600000.SH,2025-12-30,10,11,9,10,10.5,0,0,100,123.4",
+            "600000.SH,2025-12-31,9,9.5,8.5,9,10,0,0,200,234.5",
+        ]
+    )
+    _write_zip(root / "全A日K" / "2025.zip", {"2025/600000.SH.csv": daily_csv})
+    _write_factors_zip(
+        root,
+        {
+            "2025/600000.SH.csv": "\n".join(
+                [
+                    "股票代码,交易日期,复权因子",
+                    "600000.SH,20251201,0.9",
+                    "600000.SH,20251231,1.0",
+                ]
+            )
+        },
+    )
+    index_path = root / "index" / "daily_index.json"
+    write_vendor_zip_daily_index(root=root, output_path=index_path)
+    return index_path
+
+
+def _qfq_provider(root: Path, index_path: Path) -> VendorZipOverlayProvider:
+    return VendorZipOverlayProvider(
+        data_root=str(root),
+        index_path=str(index_path),
+        delta_db_path=str(root / "delta" / "market_delta.duckdb"),
+        delta_package_root=str(root / "delta" / "package"),
+        price_series_mode="qfq",
+    )
+
+
+def test_vendor_overlay_accepts_qfq_mode(tmp_path: Path) -> None:
+    index_path = _build_qfq_daily_fixture(tmp_path)
+    provider = _qfq_provider(tmp_path, index_path)
+
+    assert provider.price_series_mode == "qfq"
+    assert provider.status()["price_series_mode"] == "qfq"
+
+
+def test_vendor_overlay_rejects_unverified_hfq_price_mode(tmp_path: Path) -> None:
+    index_path = _build_qfq_daily_fixture(tmp_path)
+    with pytest.raises(DataSourceError, match="only raw or qfq"):
         VendorZipOverlayProvider(
             data_root=str(tmp_path),
             index_path=str(index_path),
             delta_db_path=str(tmp_path / "delta.duckdb"),
-            price_series_mode="qfq",
+            price_series_mode="hfq",
         )
+
+
+def test_vendor_overlay_qfq_multiplies_prices_keeps_volume_and_marks_metadata(
+    tmp_path: Path,
+) -> None:
+    index_path = _build_qfq_daily_fixture(tmp_path)
+    provider = _qfq_provider(tmp_path, index_path)
+
+    bars = provider.fetch_daily_bars("600000", lookback_days=10)
+
+    assert list(bars.index.strftime("%Y-%m-%d")) == ["2025-12-30", "2025-12-31"]
+    # qfq close = raw close x factor (0.9 then 1.0); open/high/low/pre_close too.
+    assert float(bars.loc["2025-12-30", "open"]) == pytest.approx(9.0)
+    assert float(bars.loc["2025-12-30", "high"]) == pytest.approx(9.9)
+    assert float(bars.loc["2025-12-30", "low"]) == pytest.approx(8.1)
+    assert float(bars.loc["2025-12-30", "close"]) == pytest.approx(9.0)
+    assert float(bars.loc["2025-12-31", "close"]) == pytest.approx(9.0)
+    # volume stays actual share count (not reverse-scaled).
+    assert float(bars.loc["2025-12-30", "volume"]) == 10_000.0
+    assert float(bars.loc["2025-12-31", "volume"]) == 20_000.0
+    # qfq metadata is explicit.
+    assert str(bars.loc["2025-12-31", "price_series_mode"]) == "qfq"
+    assert str(bars.loc["2025-12-31", "adjustment_source"]) == "local_vendor_qfq"
+    assert str(bars.loc["2025-12-31", "adjustment_anchor_date"]) == "2025-12-31"
+    assert float(bars.loc["2025-12-31", "adjustment_anchor_factor"]) == pytest.approx(1.0)
+    assert str(bars.loc["2025-12-31", "background_data_source"]) == "local_vendor_qfq"
+
+
+def test_vendor_overlay_qfq_removes_ex_dividend_gap_while_raw_keeps_it(
+    tmp_path: Path,
+) -> None:
+    index_path = _build_qfq_daily_fixture(tmp_path)
+    qfq = _qfq_provider(tmp_path, index_path).fetch_daily_bars("600000", lookback_days=10)
+    raw = _provider(tmp_path, index_path).fetch_daily_bars("600000", lookback_days=10)
+
+    qfq_closes = [float(value) for value in qfq["close"]]
+    raw_closes = [float(value) for value in raw["close"]]
+    # qfq is continuous across the ex-dividend date; raw has the fake gap.
+    assert qfq_closes == pytest.approx([9.0, 9.0])
+    assert raw_closes == pytest.approx([10.0, 9.0])
+    # qfq price == raw price x factor on every row.
+    assert float(qfq.loc["2025-12-30", "close"]) == pytest.approx(
+        float(raw.loc["2025-12-30", "close"]) * 0.9
+    )
+    assert float(qfq.loc["2025-12-31", "close"]) == pytest.approx(
+        float(raw.loc["2025-12-31", "close"]) * 1.0
+    )
+    # raw mode metadata stays exactly the current raw contract.
+    assert str(raw.loc["2025-12-31", "adjustment_source"]) == "local_vendor_raw"
+    assert str(raw.loc["2025-12-31", "price_series_mode"]) == "raw"
+
+
+def test_vendor_overlay_qfq_factor_gap_dates_use_nearest_prior_factor(
+    tmp_path: Path,
+) -> None:
+    daily_csv = "\n".join(
+        [
+            "code,datetime,open,high,low,close,volume,amount",
+            "600000.SH,2025-11-28,10,11,9,10,100,123.4",
+            "600000.SH,2025-12-29,10,11,9,10,100,123.4",
+            "600000.SH,2025-12-30,10,11,9,10,100,123.4",
+            "600000.SH,2025-12-31,10,11,9,10,100,123.4",
+        ]
+    )
+    _write_zip(tmp_path / "全A日K" / "2025.zip", {"2025/600000.SH.csv": daily_csv})
+    # Factors exist only on 2025-12-01 (0.8) and 2025-12-31 (1.0).
+    _write_factors_zip(
+        tmp_path,
+        {
+            "2025/600000.SH.csv": "\n".join(
+                [
+                    "股票代码,交易日期,复权因子",
+                    "600000.SH,20251201,0.8",
+                    "600000.SH,20251231,1.0",
+                ]
+            )
+        },
+    )
+    index_path = tmp_path / "index" / "daily_index.json"
+    write_vendor_zip_daily_index(root=tmp_path, output_path=index_path)
+    provider = _qfq_provider(tmp_path, index_path)
+
+    bars = provider.fetch_daily_bars("600000", lookback_days=10)
+
+    # 2025-12-29/30 have no factor row: they use the nearest prior factor 0.8.
+    assert float(bars.loc["2025-12-29", "close"]) == pytest.approx(8.0)
+    assert float(bars.loc["2025-12-30", "close"]) == pytest.approx(8.0)
+    # A date before the earliest factor still gets a factor (earliest, no silent raw).
+    assert float(bars.loc["2025-11-28", "close"]) == pytest.approx(8.0)
+    assert float(bars.loc["2025-12-31", "close"]) == pytest.approx(10.0)
+
+
+def test_vendor_overlay_qfq_missing_factor_archive_raises_with_symbol(
+    tmp_path: Path,
+) -> None:
+    index_path = _build_qfq_daily_fixture(tmp_path)
+    _ = index_path
+    # Remove the factor archive so qfq cannot resolve any factor.
+    import shutil
+
+    shutil.rmtree(tmp_path / "复权因子")
+    provider = _qfq_provider(tmp_path, index_path)
+
+    with pytest.raises(DataSourceError, match="600000"):
+        provider.fetch_daily_bars("600000", lookback_days=10)
+
+
+def test_vendor_overlay_qfq_missing_symbol_factors_raise_with_symbol(
+    tmp_path: Path,
+) -> None:
+    index_path = _build_qfq_daily_fixture(tmp_path)
+    _ = index_path
+    # Factor archive exists but has no entry for 600000.SH.
+    _write_factors_zip(
+        tmp_path,
+        {
+            "2025/000001.SZ.csv": "\n".join(
+                [
+                    "股票代码,交易日期,复权因子",
+                    "000001.SZ,20251231,1.0",
+                ]
+            )
+        },
+    )
+    provider = _qfq_provider(tmp_path, index_path)
+
+    with pytest.raises(DataSourceError, match="600000"):
+        provider.fetch_daily_bars("600000", lookback_days=10)
+
+
+def test_vendor_overlay_qfq_batch_quality_metrics_multiplies_prices(
+    tmp_path: Path,
+) -> None:
+    index_path = _build_qfq_daily_fixture(tmp_path)
+    provider = _qfq_provider(tmp_path, index_path)
+
+    frame = provider.fetch_universe_quality_metrics(symbols=["600000"], lookback_days=10)
+
+    rows = frame[frame["symbol"] == "600000"].sort_values("date")
+    assert len(rows) == 2
+    closes = [float(value) for value in rows["close"]]
+    assert closes == pytest.approx([9.0, 9.0])
+    volumes = [float(value) for value in rows["volume"]]
+    assert volumes == pytest.approx([10_000.0, 20_000.0])
 
 
 def test_runtime_universe_comes_from_provider_index(tmp_path: Path) -> None:
