@@ -429,6 +429,18 @@ def test_pipeline_uses_configured_fetch_and_analysis_lookbacks() -> None:
     )
 
 
+def test_pipeline_records_per_stage_wall_clock_breakdown() -> None:
+    config = _load_default_config()
+    pipeline = AnalyzerPipeline(config=config, provider=MinimalBarsProvider())
+    _ = pipeline.run_once(symbols=["600000", "000001"], strategy="trend", current_equity=1.0)
+    stages = pipeline._last_pipeline_stage_ms  # noqa: SLF001
+    assert set(stages.keys()) == {"fetch_bars_ms", "feature_engine_ms", "inference_ms"}
+    for value in stages.values():
+        assert value >= 0
+    # Two symbols were processed: per-symbol work must be aggregated, not reset.
+    assert stages["fetch_bars_ms"] > 0
+
+
 def test_pipeline_news_preview_returns_component_payload() -> None:
     config = _load_default_config()
     pipeline = AnalyzerPipeline(

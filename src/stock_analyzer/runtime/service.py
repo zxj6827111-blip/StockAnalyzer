@@ -8,6 +8,7 @@ import math
 import os
 import random
 import traceback
+from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
@@ -296,6 +297,12 @@ class StockAnalyzerService:
         self._last_week4_acceptance_report: dict[str, object] | None = None
         self._week5_scan_history: list[dict[str, object]] = []
         self._last_week5_scan_report: dict[str, object] | None = None
+        self._week5_bars_cache: OrderedDict[tuple[str, int], pd.DataFrame] = OrderedDict()
+        self._week5_bars_cache_maxsize = max(
+            1, _as_int(self._config.week5.week5_bars_cache_size, default=600)
+        )
+        self._week5_bars_cache_hits = 0
+        self._week5_bars_cache_misses = 0
         self._last_week5_market_radar_report: dict[str, object] | None = None
         self._market_radar_review_pool: list[dict[str, object]] = []
         self._week6_history: list[dict[str, object]] = []
@@ -3647,6 +3654,7 @@ class StockAnalyzerService:
         week6_execution: dict[str, object]
 
         pipeline_started = perf_counter()
+        pipeline_stage_ms: dict[str, int] | None = None
         if normalized_strategy == "multi":
             multi_payload = self._run_multi_strategy_pipeline(
                 symbols=symbol_list,
@@ -3679,6 +3687,7 @@ class StockAnalyzerService:
                 strategy=normalized_strategy,
                 current_equity=equity,
             )
+            pipeline_stage_ms = getattr(pipeline, "_last_pipeline_stage_ms", None)
             trace_id = report.trace_id
             timestamp = report.timestamp
             degraded_mode = report.degraded_mode
@@ -3944,7 +3953,7 @@ class StockAnalyzerService:
         payload["week6_execution"] = week6_payload
         payload["strategy_kill_switch"] = kill_switch_summary
         duration_ms = int((perf_counter() - started) * 1000)
-        payload["runtime"] = {
+        runtime_payload: dict[str, object] = {
             "duration_ms": duration_ms,
             "pipeline_ms": pipeline_ms,
             "post_pipeline_ms": post_pipeline_ms,
@@ -3957,6 +3966,9 @@ class StockAnalyzerService:
                 self._config.command_channel.state_persist_enabled
             ),
         }
+        if pipeline_stage_ms is not None:
+            runtime_payload["pipeline_stage_ms"] = pipeline_stage_ms
+        payload["runtime"] = runtime_payload
         self._record_run_summary(
             report=payload,
             current_equity=equity,
@@ -5422,6 +5434,27 @@ class StockAnalyzerService:
         symbol: str,
         lookback_days: int,
         allowed_exchanges: set[str],
+        _timings: list[tuple[str, float]] | None = None,
+    ) -> dict[str, object] | None:
+        """Prefilter one universe symbol, recording wall time for profiling."""
+        started = perf_counter()
+        try:
+            return self._prefilter_week5_universe_symbol_impl(
+                symbol=symbol,
+                lookback_days=lookback_days,
+                allowed_exchanges=allowed_exchanges,
+            )
+        finally:
+            if _timings is not None:
+                normalized = _normalize_a_share_symbol(symbol) or symbol
+                _timings.append((normalized, (perf_counter() - started) * 1000.0))
+
+    def _prefilter_week5_universe_symbol_impl(
+        self,
+        *,
+        symbol: str,
+        lookback_days: int,
+        allowed_exchanges: set[str],
     ) -> dict[str, object] | None:
         normalized = _normalize_a_share_symbol(symbol)
         if not normalized:
@@ -5429,7 +5462,7 @@ class StockAnalyzerService:
         exchange = _exchange_from_a_share_symbol(normalized)
         if allowed_exchanges and exchange and exchange not in allowed_exchanges:
             return None
-        bars = self._provider.fetch_daily_bars(symbol=normalized, lookback_days=lookback_days)
+        bars = self._fetch_week5_bars_cached(symbol=normalized, lookback_days=lookback_days)
         if not isinstance(bars, pd.DataFrame) or bars.empty:
             return None
         frame = bars if bars.index.is_monotonic_increasing else bars.sort_index()
@@ -5688,12 +5721,35 @@ class StockAnalyzerService:
             },
         }
 
+    def _fetch_week5_bars_cached(
+        self,
+        *,
+        symbol: str,
+        lookback_days: int,
+    ) -> pd.DataFrame | None:
+        """Fetch daily bars through the session-level LRU cache for week5 scans."""
+        cache_key = (symbol, lookback_days)
+        cached = self._week5_bars_cache.get(cache_key)
+        if cached is not None:
+            self._week5_bars_cache_hits += 1
+            return cached
+        bars = self._provider.fetch_daily_bars(symbol=symbol, lookback_days=lookback_days)
+        if isinstance(bars, pd.DataFrame) and not bars.empty:
+            self._week5_bars_cache[cache_key] = bars
+            while len(self._week5_bars_cache) > self._week5_bars_cache_maxsize:
+                self._week5_bars_cache.popitem(last=False)
+        self._week5_bars_cache_misses += 1
+        return bars
+
     def _prefilter_week5_universe_symbols(
         self,
         *,
         symbols: list[str],
         top_k_override: int | None = None,
     ) -> dict[str, object]:
+        self._week5_bars_cache.clear()
+        self._week5_bars_cache_hits = 0
+        self._week5_bars_cache_misses = 0
         lookback_days = max(
             120,
             _as_int(self._config.week5.universe_prefilter_lookback_days, default=240),
@@ -5722,6 +5778,7 @@ class StockAnalyzerService:
         candidates: list[dict[str, object]] = []
         errors: list[str] = []
         skipped = 0
+        timings: list[tuple[str, float]] = []
         max_workers = min(8, max(1, len(deduped_symbols)))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_map = {
@@ -5730,6 +5787,7 @@ class StockAnalyzerService:
                     symbol=symbol,
                     lookback_days=lookback_days,
                     allowed_exchanges=allowed_exchanges,
+                    _timings=timings,
                 ): symbol
                 for symbol in deduped_symbols
             }
@@ -5744,6 +5802,24 @@ class StockAnalyzerService:
                     skipped += 1
                     continue
                 candidates.append(candidate)
+
+        profile: dict[str, object] = {
+            "timed_symbols": len(timings),
+            "cache_hits": self._week5_bars_cache_hits,
+            "cache_misses": self._week5_bars_cache_misses,
+        }
+        if timings:
+            total_ms = sum(ms for _, ms in timings)
+            profile["total_seconds"] = round(total_ms / 1000.0, 4)
+            profile["per_symbol_avg_ms"] = round(total_ms / len(timings), 3)
+            slowest = sorted(timings, key=lambda item: item[1], reverse=True)[:5]
+            profile["slowest_symbols"] = [
+                {"symbol": symbol, "ms": round(ms, 3)} for symbol, ms in slowest
+            ]
+        else:
+            profile["total_seconds"] = 0.0
+            profile["per_symbol_avg_ms"] = 0.0
+            profile["slowest_symbols"] = []
 
         ranked = sorted(
             candidates,
@@ -5766,6 +5842,7 @@ class StockAnalyzerService:
             "errors": errors[:20],
             "shortlisted_count": len(shortlisted),
             "scoring_mode": "two_stage_funnel",
+            "profile": profile,
             "symbols": [
                 str(item.get("symbol", "")).strip()
                 for item in shortlisted

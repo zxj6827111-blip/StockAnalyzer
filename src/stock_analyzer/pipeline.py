@@ -113,6 +113,16 @@ class AnalyzerPipeline:
         self._last_probability_health: dict[str, object] = {"status": "not_observed"}
         self._runtime_config_hash = _stable_config_hash(config)
         self._latest_report: PipelineReport | None = None
+        self._stage_ms_accum: dict[str, float] = {
+            "fetch_bars_ms": 0.0,
+            "feature_engine_ms": 0.0,
+            "inference_ms": 0.0,
+        }
+        self._last_pipeline_stage_ms: dict[str, int] = {
+            "fetch_bars_ms": 0,
+            "feature_engine_ms": 0,
+            "inference_ms": 0,
+        }
         self._evolution_controls: dict[str, object] = {}
         self._news_preview_cache: dict[tuple[str, str], tuple[float, dict[str, object]]] = {}
         self._news_preview_cache_ttl_sec = 60.0
@@ -150,12 +160,23 @@ class AnalyzerPipeline:
     ) -> PipelineReport:
         trace_id = uuid4().hex[:16]
         signals: list[PipelineSignal] = []
+        self._stage_ms_accum = {
+            "fetch_bars_ms": 0.0,
+            "feature_engine_ms": 0.0,
+            "inference_ms": 0.0,
+        }
 
         for symbol in symbols:
             signal = self._process_symbol(
                 symbol=symbol, strategy=strategy, current_equity=current_equity
             )
             signals.append(signal)
+
+        self._last_pipeline_stage_ms = {
+            "fetch_bars_ms": int(self._stage_ms_accum["fetch_bars_ms"]),
+            "feature_engine_ms": int(self._stage_ms_accum["feature_engine_ms"]),
+            "inference_ms": int(self._stage_ms_accum["inference_ms"]),
+        }
 
         provider_status = self.provider_status()
         self._risk_controller.update_degraded_mode(
@@ -539,6 +560,7 @@ class AnalyzerPipeline:
             self._health_monitor.record(success=True, latency_sec=perf_counter() - start)
         except DataSourceError as exc:
             self._health_monitor.record(success=False, latency_sec=perf_counter() - start)
+            self._stage_ms_accum["fetch_bars_ms"] += (perf_counter() - start) * 1000.0
             return PipelineSignal(
                 symbol=symbol,
                 strategy=strategy,
@@ -549,6 +571,7 @@ class AnalyzerPipeline:
                 probabilities={"lgbm": 0.0, "xgb": 0.0, "meta": 0.0},
                 reasons=[f"data_source:{exc}"],
             )
+        self._stage_ms_accum["fetch_bars_ms"] += (perf_counter() - start) * 1000.0
         bars, bars_time_gate = apply_time_invariants_to_frame(
             bars,
             decision_time=decision_time,
@@ -581,6 +604,7 @@ class AnalyzerPipeline:
             )
         analysis_bars = self._clip_signal_analysis_bars(bars)
 
+        transform_started = perf_counter()
         intraday_1m, intraday_5m = self._fetch_intraday_summaries(
             symbol=symbol,
             lookback_days=max(120, len(analysis_bars) + 5),
@@ -592,6 +616,7 @@ class AnalyzerPipeline:
             intraday_5m=intraday_5m,
             market_index=market_index,
         )
+        self._stage_ms_accum["feature_engine_ms"] += (perf_counter() - transform_started) * 1000.0
         if features.empty:
             return PipelineSignal(
                 symbol=symbol,
@@ -625,9 +650,11 @@ class AnalyzerPipeline:
         features = ensure_feedback_feature_frame(features)
 
         latest_features = features.iloc[-1]
+        infer_started = perf_counter()
         try:
             raw_probabilities = self._infer_probabilities(latest_features)
         except ValueError as exc:
+            self._stage_ms_accum["inference_ms"] += (perf_counter() - infer_started) * 1000.0
             if not str(exc).startswith("predictor_rejected:"):
                 raise
             return PipelineSignal(
@@ -640,6 +667,7 @@ class AnalyzerPipeline:
                 probabilities={"lgbm": 0.0, "xgb": 0.0, "meta": 0.0},
                 reasons=[f"predictor_rejected:{exc}"],
             )
+        self._stage_ms_accum["inference_ms"] += (perf_counter() - infer_started) * 1000.0
         self._last_probability_health = self._probability_health.observe(raw_probabilities)
         probabilities = sanitize_probabilities(raw_probabilities)
         champion_auc = self._active_champion_auc()

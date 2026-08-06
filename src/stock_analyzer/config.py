@@ -321,6 +321,7 @@ class Week5Config(_StrictModel):
     universe_prefilter_lookback_days: int = 240
     universe_prefilter_top_k: int = 500
     universe_prefilter_shortlist_top_n: int = 50
+    week5_bars_cache_size: int = 600
     universe_quality_selector_enabled: bool = True
     universe_quality_target_size: int = 300
     universe_quality_min_history_days: int = 60

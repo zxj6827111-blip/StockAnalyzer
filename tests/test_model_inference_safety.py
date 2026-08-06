@@ -130,6 +130,71 @@ def test_scaler_fallback_artifact_still_predicts(tmp_path: Path) -> None:
         assert 0.0 <= value <= 1.0
 
 
+def test_predict_rows_matches_predict_row_per_row(tmp_path: Path) -> None:
+    artifact_path = tmp_path / "scaled_batch.json"
+    _artifact_from_payload(_fit_scaled_model(seed=19).to_dict(), path=artifact_path)
+    predictor = SignalPredictor.load(artifact_path)
+
+    # First frame drops f3 entirely: predict_rows must fill 0.0 exactly like
+    # predict_row does for a row without that column.
+    partial_rows = [
+        {"f0": 0.1, "f1": -0.2, "f2": 0.3},
+        {"f0": 0.5, "f1": 0.25, "f2": -0.4},
+        {"f0": -0.7, "f1": 0.1, "f2": 0.6},
+        {"f0": 0.2, "f1": -0.4, "f2": 0.0},
+    ]
+    partial_frame = pd.DataFrame(partial_rows)
+    partial_batch = predictor.predict_rows(partial_frame)
+    assert set(partial_batch.keys()) == {"lgbm", "xgb", "meta"}
+    assert all(len(values) == len(partial_frame) for values in partial_batch.values())
+    for index, row in enumerate(partial_rows):
+        single = predictor.predict_row(pd.Series(row))
+        for key in ("lgbm", "xgb", "meta"):
+            assert partial_batch[key][index] == single[key]
+
+    # Full feature frame must agree too, and extra columns must be ignored.
+    full_rows = [
+        {"f0": 0.1, "f1": -0.2, "f2": 0.3, "f3": 0.0},
+        {"f0": 0.5, "f1": 0.25, "f2": -0.4, "f3": 0.9},
+        {"f0": -0.7, "f1": 0.1, "f2": 0.6, "f3": -0.3},
+        {"f0": 0.2, "f1": -0.4, "f2": 0.0, "f3": 0.1},
+    ]
+    full_frame = pd.DataFrame(full_rows)
+    full_batch = predictor.predict_rows(full_frame)
+    assert all(len(values) == len(full_frame) for values in full_batch.values())
+    for index, row in enumerate(full_rows):
+        single = predictor.predict_row(pd.Series(row))
+        for key in ("lgbm", "xgb", "meta"):
+            assert full_batch[key][index] == single[key]
+    widened = full_frame.copy()
+    widened["unused_extra"] = 1.0
+    assert predictor.predict_rows(widened) == full_batch
+
+    # Every value stays a clamped probability.
+    for values in full_batch.values():
+        for value in values:
+            assert 0.0 <= value <= 1.0
+
+
+def test_predict_rows_rejects_legacy_artifact(tmp_path: Path) -> None:
+    artifact_path = tmp_path / "legacy_batch.json"
+    _artifact_from_payload(_legacy_payload(), path=artifact_path)
+
+    predictor = SignalPredictor.load(artifact_path)
+    frame = pd.DataFrame([_feature_row()])
+    with pytest.raises(ValueError, match="legacy_no_scaler"):
+        predictor.predict_rows(frame)
+
+
+def test_predict_rows_empty_frame_returns_empty_lists(tmp_path: Path) -> None:
+    artifact_path = tmp_path / "scaled_empty.json"
+    _artifact_from_payload(_fit_scaled_model(seed=23).to_dict(), path=artifact_path)
+
+    predictor = SignalPredictor.load(artifact_path)
+    batch = predictor.predict_rows(pd.DataFrame(columns=[f"f{i}" for i in range(4)]))
+    assert batch == {"lgbm": [], "xgb": [], "meta": []}
+
+
 def test_scaler_fallback_adapter_from_dict_roundtrip() -> None:
     serialized = {"backend": "fallback_logit", "payload": _fit_scaled_model(seed=3).to_dict()}
     lgbm = LightGBMAdapter.from_dict(serialized)

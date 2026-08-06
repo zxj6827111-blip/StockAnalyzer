@@ -3877,3 +3877,90 @@ def test_week5_quality_selector_passes_financial_gate_with_backfilled_snapshots(
     assert isinstance(rejected, dict)
     assert "financial" not in rejected
     assert rejected.get("stale", 0) == 0
+
+
+def test_week5_prefilter_symbol_fetch_goes_through_session_bars_cache() -> None:
+    config = _load_test_config()
+    config.week5.universe_prefilter_lookback_days = 240
+    provider = RecordingSyntheticProvider(seed_offset=2027)
+    service = _new_service(config, provider=provider)
+    lookback = max(120, int(config.week5.universe_prefilter_lookback_days))
+
+    first = service._prefilter_week5_universe_symbol(
+        symbol="600000",
+        lookback_days=lookback,
+        allowed_exchanges=set(),
+    )
+    second = service._prefilter_week5_universe_symbol(
+        symbol="600000",
+        lookback_days=lookback,
+        allowed_exchanges=set(),
+    )
+    assert first is not None
+    assert second is not None
+    # Second call is a cache hit: the provider was asked exactly once.
+    assert provider.lookback_requests.count(("600000", lookback)) == 1
+    assert len(provider.lookback_requests) == 1
+    assert service._week5_bars_cache_hits == 1
+    assert service._week5_bars_cache_misses == 1
+
+    # A different lookback is a distinct cache key and refetches.
+    service._prefilter_week5_universe_symbol(
+        symbol="600000",
+        lookback_days=120,
+        allowed_exchanges=set(),
+    )
+    assert provider.lookback_requests.count(("600000", 120)) == 1
+
+
+def test_week5_prefilter_reports_profiling_and_clears_cache_per_scan() -> None:
+    config = _load_test_config()
+    config.week5.universe_prefilter_lookback_days = 240
+    config.week5.universe_prefilter_top_k = 3
+    provider = RecordingSyntheticProvider(seed_offset=2027)
+    service = _new_service(config, provider=provider)
+    symbols = ["600000", "000001", "600519", "300750", "002594"]
+
+    report = _as_mapping(service._prefilter_week5_universe_symbols(symbols=symbols))
+    profile = _as_mapping(report["profile"])
+    assert _as_int(profile["timed_symbols"]) == 5
+    assert profile["total_seconds"] >= 0.0
+    assert profile["per_symbol_avg_ms"] >= 0.0
+    slowest = _as_mapping_list(profile["slowest_symbols"])
+    assert len(slowest) == 5
+    ms_values = [float(item["ms"]) for item in slowest]
+    assert ms_values == sorted(ms_values, reverse=True)
+    assert {str(item["symbol"]) for item in slowest} == set(symbols)
+    assert _as_int(profile["cache_misses"]) == 5
+    assert _as_int(profile["cache_hits"]) == 0
+    assert _as_int(report["universe_count"]) == 5
+
+    # A second scan refetches everything: the cache is cleared at scan start.
+    provider.lookback_requests.clear()
+    report2 = _as_mapping(service._prefilter_week5_universe_symbols(symbols=symbols))
+    profile2 = _as_mapping(report2["profile"])
+    assert _as_int(profile2["cache_misses"]) == 5
+    assert _as_int(profile2["cache_hits"]) == 0
+    assert len(provider.lookback_requests) == 5
+
+
+def test_service_run_pipeline_reports_pipeline_stage_ms() -> None:
+    config = _load_test_config()
+    provider = RecordingSyntheticProvider(seed_offset=2027)
+    service = _new_service(config, provider=provider)
+
+    payload = _as_mapping(
+        service.run_pipeline(
+            symbols=["600000"],
+            strategy="trend",
+            current_equity=1.0,
+            dry_run_execution=True,
+            notify_enabled=False,
+        )
+    )
+    runtime = _as_mapping(payload["runtime"])
+    stages = _as_mapping(runtime["pipeline_stage_ms"])
+    assert set(stages.keys()) == {"fetch_bars_ms", "feature_engine_ms", "inference_ms"}
+    assert _as_int(stages["fetch_bars_ms"]) >= 0
+    assert _as_int(stages["feature_engine_ms"]) >= 0
+    assert _as_int(stages["inference_ms"]) >= 0

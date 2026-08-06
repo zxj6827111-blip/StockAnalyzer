@@ -1456,6 +1456,10 @@ class RuntimeWeek5Service:
             job_name="week5_scan_monster",
         )
         trace_id = str(monster_report.get("trace_id", ""))
+        monster_runtime_payload: dict[str, object] = {}
+        monster_runtime = monster_report.get("runtime")
+        if isinstance(monster_runtime, dict):
+            monster_runtime_payload = dict(monster_runtime)
         raw_signals = monster_report.get("signals")
         signal_map: dict[str, dict[str, object]] = {}
         min_history_days = max(1, int(service._config.evolution.universe_spec.min_list_days))
@@ -1647,6 +1651,9 @@ class RuntimeWeek5Service:
                 ),
                 "provider": str(service._config.data_source.runtime_live_provider).strip()
                 or "offline",
+            },
+            "runtime": {
+                "monster_pipeline": monster_runtime_payload,
             },
             "monster_scan_controls": dict(monster_scan_controls),
             "first_board": {
