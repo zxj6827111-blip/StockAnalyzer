@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import UTC, datetime
 from functools import lru_cache
 from importlib import import_module
 from pathlib import Path
@@ -1896,21 +1896,42 @@ class RuntimeWeek5Service:
             snapshot_id = str(candidate.get("snapshot_id", "")).strip() or (
                 _extract_learning_snapshot_id(candidate)
             )
-            if not snapshot_id:
-                skipped_missing_snapshot += 1
-                candidate["execution_rerank_reason"] = "snapshot_id_missing"
-                continue
-            try:
-                snapshot = service._sample_store.get_snapshot(snapshot_id)
-            except Exception as exc:
-                skipped_snapshot_read_failed += 1
-                candidate["execution_rerank_reason"] = (
-                    f"snapshot_read_failed:{exc.__class__.__name__}"
-                )
-                continue
+            snapshot = None
+            if snapshot_id:
+                try:
+                    snapshot = service._sample_store.get_snapshot(snapshot_id)
+                except Exception as exc:
+                    skipped_snapshot_read_failed += 1
+                    candidate["execution_rerank_reason"] = (
+                        f"snapshot_read_failed:{exc.__class__.__name__}"
+                    )
+                    continue
             if snapshot is None:
-                skipped_snapshot_not_found += 1
-                candidate["execution_rerank_reason"] = "snapshot_not_found"
+                symbol = _normalize_a_share_symbol(
+                    str(candidate.get("symbol", "")).strip()
+                )
+                fallback_snapshot = None
+                if symbol:
+                    try:
+                        fallback_snapshot = (
+                            service._sample_store.latest_snapshot_for_symbol(
+                                symbol=symbol,
+                                before=datetime.now(UTC),
+                            )
+                        )
+                    except Exception:
+                        fallback_snapshot = None
+                if fallback_snapshot is not None:
+                    snapshot = fallback_snapshot
+                    snapshot_id = snapshot.snapshot_id
+                    candidate["execution_rerank_snapshot_fallback"] = True
+            if snapshot is None:
+                if not snapshot_id:
+                    skipped_missing_snapshot += 1
+                    candidate["execution_rerank_reason"] = "snapshot_id_missing"
+                else:
+                    skipped_snapshot_not_found += 1
+                    candidate["execution_rerank_reason"] = "snapshot_not_found"
                 continue
 
             raw_probabilities = candidate.get("probabilities")

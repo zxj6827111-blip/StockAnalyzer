@@ -7,6 +7,7 @@ import json
 import math
 import os
 import random
+import shutil
 import traceback
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
@@ -528,6 +529,55 @@ class StockAnalyzerService:
     def _resolve_learning_protocol_db_path(self) -> Path:
         bootstrap_root = self._training_bootstrap_state_path.parent
         return bootstrap_root / "learning_protocol.duckdb"
+
+    def _recover_corrupt_learning_protocol(self, error_text: str) -> dict[str, object]:
+        try:
+            db_path = self._training_bootstrap_state_path.parent / "learning_protocol.duckdb"
+            if not db_path.exists():
+                return {"recovered": False, "reason": "db_missing"}
+            now = datetime.now()
+            stamp = now.strftime("%Y%m%d-%H%M%S")
+            backup_path = db_path.with_name(f"learning_protocol.corrupt.{stamp}.duckdb")
+            suffix = 1
+            while backup_path.exists():
+                backup_path = db_path.with_name(
+                    f"learning_protocol.corrupt.{stamp}_{suffix}.duckdb"
+                )
+                suffix += 1
+            shutil.move(str(db_path), str(backup_path))
+            store = SampleStore(db_path=db_path)
+            store.counts()
+            self._training_bootstrap_state["completed"] = False
+            self._training_bootstrap_state["last_status"] = "db_recovered"
+            self._training_bootstrap_state[
+                "last_error"
+            ] = f"learning_protocol_recovered:{error_text}"
+            self._training_bootstrap_state["last_recovery_at"] = now.isoformat()
+            self._persist_training_bootstrap_state(self._training_bootstrap_state)
+            try:
+                self.notify(
+                    title=_push_title(
+                        priority="P1",
+                        category="learning",
+                        summary="learning protocol db recovered",
+                    ),
+                    content=(
+                        "学习协议数据库损坏已自动恢复并重建，损坏文件已备份为 "
+                        f"{backup_path.name}，训练引导需重新执行"
+                    ),
+                    level="warn",
+                )
+            except Exception:
+                # Notification must never turn a successful recovery into a
+                # reported failure (the state is already persisted above).
+                pass
+            return {
+                "recovered": True,
+                "backup_path": str(backup_path),
+                "error": error_text,
+            }
+        except Exception as exc:
+            return {"recovered": False, "reason": str(exc)}
 
     def _resolve_learning_manifest_artifact_path(
         self,
@@ -6776,6 +6826,17 @@ class StockAnalyzerService:
                         "requested_snapshot_count": 0,
                     }
                 steps["repair_learning_backfill"] = repair_payload
+                self._training_bootstrap_state["last_backfill_at"] = datetime.now(UTC).isoformat()
+                self._training_bootstrap_state["last_backfill_status"] = str(
+                    repair_payload.get("ok", False)
+                )
+                self._training_bootstrap_state["last_backfill_mode"] = str(
+                    repair_payload.get("mode", "")
+                )
+                self._training_bootstrap_state["last_backfill_repaired_count"] = int(
+                    repair_payload.get("repaired_snapshot_count", 0)
+                )
+                self._persist_training_bootstrap_state(self._training_bootstrap_state)
                 self._write_post_market_warehouse_followup_state(
                     stage="repair_learning_backfill",
                     status="completed",
@@ -6792,6 +6853,14 @@ class StockAnalyzerService:
                     "skipped": True,
                     "reason": "post_followup_run_learning_backfill_disabled",
                 }
+                self._training_bootstrap_state["last_backfill_at"] = datetime.now(
+                    UTC
+                ).isoformat()
+                self._training_bootstrap_state["last_backfill_status"] = "skipped"
+                self._training_bootstrap_state[
+                    "last_backfill_reason"
+                ] = "post_followup_run_learning_backfill_disabled"
+                self._persist_training_bootstrap_state(self._training_bootstrap_state)
 
             if bool(config.post_followup_run_training) and bool(
                 self._config.training.enabled
@@ -7638,13 +7707,26 @@ class StockAnalyzerService:
                 "protocol_fallback_reason": "",
             }
         except Exception as exc:
-            return {
+            error_text = f"learning_protocol_failed:{exc.__class__.__name__}"
+            recovery: dict[str, object] = {"recovered": False}
+            if exc.__class__.__name__ in {
+                "SerializationException",
+                "IOException",
+                "CatalogException",
+                "InternalException",
+            }:
+                recovery = self._recover_corrupt_learning_protocol(error_text=str(exc))
+            result: dict[str, object] = {
                 "attempted": True,
                 "ok": False,
-                "errors": [f"learning_protocol_failed:{exc.__class__.__name__}"],
+                "errors": [error_text],
                 "fallback_reason": f"learning_protocol_exception:{exc}",
                 "protocol_candidate_rows": 0,
             }
+            if bool(recovery.get("recovered", False)):
+                result["db_recovered"] = True
+                result["fallback_reason"] = "learning_protocol_db_corrupted_recovered"
+            return result
 
     def train_models(
         self,
@@ -17497,7 +17579,9 @@ class StockAnalyzerService:
         ]
         total_monster_position = sum(monster_positions)
         max_monster_position = max(monster_positions) if monster_positions else 0.0
-        sentiment_score = self._estimate_sentiment(monster_report=monster_report)
+        sentiment_score, sentiment_available = self._estimate_sentiment(
+            monster_report=monster_report
+        )
 
         reasons: list[str] = []
         soft_reasons: list[str] = []
@@ -17505,7 +17589,10 @@ class StockAnalyzerService:
             reasons.append("max_total_position")
         if max_monster_position >= self._config.monster_risk.max_stock_position:
             reasons.append("max_stock_position")
-        if sentiment_score < self._config.monster_risk.disable_if_sentiment_below:
+        if (
+            sentiment_available
+            and sentiment_score < self._config.monster_risk.disable_if_sentiment_below
+        ):
             if total_monster_position <= 0 and _as_int(
                 empty_signal.get("no_buy_streak"), default=0
             ) >= max(1, self._config.week5.empty_signal_no_buy_runs):
@@ -17528,25 +17615,31 @@ class StockAnalyzerService:
             "total_monster_position": round(total_monster_position, 4),
             "max_monster_position": round(max_monster_position, 4),
             "sentiment_score": round(sentiment_score, 2),
+            "sentiment_available": bool(sentiment_available),
         }
 
-    def _estimate_sentiment(self, monster_report: dict[str, object]) -> float:
+    def _estimate_sentiment(self, monster_report: dict[str, object]) -> tuple[float, bool]:
         raw_signals = monster_report.get("signals")
         scores: list[float] = []
         if isinstance(raw_signals, list):
             for item in raw_signals:
                 if not isinstance(item, dict):
                     continue
-                scores.append(_as_float(item.get("score"), default=0.0))
-        base = (sum(scores) / len(scores)) if scores else 50.0
+                score = _as_float_or_none(item.get("score"))
+                if score is None:
+                    continue
+                scores.append(score)
+        available = len(scores) > 0
+        base = (sum(scores) / len(scores)) if available else 50.0
 
-        risk = monster_report.get("risk", {})
-        risk_action = ""
-        if isinstance(risk, dict):
-            risk_action = str(risk.get("action", ""))
-        if risk_action in {"freeze", "degraded"}:
-            base -= 15.0
-        return _clamp(value=base, low=0.0, high=100.0)
+        if available:
+            risk = monster_report.get("risk", {})
+            risk_action = ""
+            if isinstance(risk, dict):
+                risk_action = str(risk.get("action", ""))
+            if risk_action in {"freeze", "degraded"}:
+                base -= 15.0
+        return _clamp(value=base, low=0.0, high=100.0), available
 
     @staticmethod
     def _build_cache(config: StockAnalyzerConfig) -> CacheStore:

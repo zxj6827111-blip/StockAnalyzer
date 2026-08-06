@@ -217,7 +217,11 @@ def _new_service(
     return service
 
 
-def _build_test_execution_risk_artifact(path: Path) -> Path:
+def _build_test_execution_risk_artifact(
+    path: Path,
+    *,
+    qualification_status: str = "qualified",
+) -> Path:
     feature_names = [
         "liquidity_score",
         "volatility_score",
@@ -256,7 +260,7 @@ def _build_test_execution_risk_artifact(path: Path) -> Path:
                 "calibrator": _build_identity_calibrator(),
             },
         },
-        qualification_status="qualified",
+        qualification_status=qualification_status,
         metadata={"test_artifact": True},
     )
     artifact.save(path)
@@ -361,6 +365,44 @@ def _build_week5_execution_rerank_pipeline() -> object:
                         "cross_review_gate": {"passed": True},
                         "financial_gate": {"allowed": True},
                     },
+                },
+            ],
+            "risk": {
+                "action": "monitor",
+                "drawdown_pct": 0.0,
+            },
+        }
+
+    return _fake_run_pipeline
+
+
+def _build_week5_execution_rerank_pipeline_without_snapshots() -> object:
+    def _fake_run_pipeline(**kwargs: object) -> dict[str, object]:
+        _ = kwargs
+        return {
+            "trace_id": "week5-execution-rerank-fallback",
+            "signals": [
+                {
+                    "symbol": "600000",
+                    "score": 92.0,
+                    "leader_score": 92.5,
+                    "action": "buy",
+                    "suggested_position": 0.08,
+                    "target_position": 0.08,
+                    "grade": "A",
+                    "reasons": ["high_score"],
+                    "probabilities": {"meta": 0.46, "lgbm": 0.45, "xgb": 0.47},
+                },
+                {
+                    "symbol": "000001",
+                    "score": 79.0,
+                    "leader_score": 79.5,
+                    "action": "buy",
+                    "suggested_position": 0.08,
+                    "target_position": 0.08,
+                    "grade": "A",
+                    "reasons": ["high_score"],
+                    "probabilities": {"meta": 0.73, "lgbm": 0.71, "xgb": 0.72},
                 },
             ],
             "risk": {
@@ -1093,6 +1135,173 @@ def test_service_week5_scan_applies_execution_aware_reranker_when_artifact_avail
     assert service.state.watchlist == ["000001", "600000"]
 
 
+def test_service_week5_scan_rerank_falls_back_to_latest_symbol_snapshot(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config()
+    config.training.bootstrap_state_path = str(tmp_path / "bootstrap_state.json")
+    config.week5.auto_sync_watchlist = True
+    config.week5.auto_sync_watchlist_top_k = 2
+    config.week5.auto_sync_watchlist_min_score = 0.0
+    service = _new_service(config)
+
+    artifact_path = _build_test_execution_risk_artifact(tmp_path / "execution_risk_artifact.json")
+    service._last_execution_risk_training = {  # noqa: SLF001
+        "artifact_path": str(artifact_path),
+        "dataset_id": "execution_risk_dataset_week5_test",
+    }
+    _write_week5_execution_snapshot(
+        service,
+        snapshot_id="snap-history-600000",
+        symbol="600000",
+        decision_time=datetime(2026, 3, 19, 14, 30, tzinfo=UTC),
+        liquidity_score=0.12,
+        volatility_score=0.91,
+        meta_probability=0.46,
+        degraded_mode=True,
+        data_quality_score=0.84,
+    )
+    _write_week5_execution_snapshot(
+        service,
+        snapshot_id="snap-history-000001",
+        symbol="000001",
+        decision_time=datetime(2026, 3, 19, 14, 31, tzinfo=UTC),
+        liquidity_score=0.94,
+        volatility_score=0.12,
+        meta_probability=0.73,
+        degraded_mode=False,
+        data_quality_score=0.98,
+    )
+
+    _patch_attr(
+        service,
+        "run_pipeline",
+        _build_week5_execution_rerank_pipeline_without_snapshots(),
+    )
+    _patch_attr(service, "_build_first_board_candidate", lambda **_: None)
+    _patch_attr(service, "_detect_symbol_anomaly", lambda **_: None)
+    _patch_attr(
+        service,
+        "_monster_isolation_gate",
+        lambda **_: {
+            "can_open_new_position": True,
+            "reasons": [],
+            "total_monster_position": 0.0,
+            "max_monster_position": 0.0,
+            "sentiment_score": 0.0,
+        },
+    )
+
+    report = _as_mapping(
+        service.run_week5_scan(
+            symbols=["600000", "000001"],
+            notify_enabled=False,
+            sync_watchlist=True,
+        )
+    )
+
+    signal_pool = _as_mapping(report["signal_pool"])
+    ranking = _as_mapping(signal_pool["ranking"])
+    execution_rerank = _as_mapping(ranking["execution_rerank"])
+    candidates = _as_mapping_list(signal_pool["candidates"])
+
+    assert ranking["score_key"] == "execution_reranked_score"
+    assert execution_rerank["applied"] is True
+    assert execution_rerank["applied_count"] == 2
+    assert execution_rerank["reason"] == "applied"
+    assert execution_rerank["skipped_missing_snapshot"] == 0
+    assert execution_rerank["skipped_snapshot_not_found"] == 0
+    assert [str(item["symbol"]) for item in candidates[:2]] == ["000001", "600000"]
+    assert candidates[0]["execution_rerank_snapshot_fallback"] is True
+    assert candidates[0]["snapshot_id"] == "snap-history-000001"
+    assert candidates[1]["execution_rerank_snapshot_fallback"] is True
+    assert candidates[1]["snapshot_id"] == "snap-history-600000"
+
+
+def test_service_week5_scan_rerank_symbol_fallback_respects_shadow_only(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config()
+    config.training.bootstrap_state_path = str(tmp_path / "bootstrap_state.json")
+    config.week5.auto_sync_watchlist_top_k = 2
+    config.week5.auto_sync_watchlist_min_score = 0.0
+    service = _new_service(config)
+
+    artifact_path = _build_test_execution_risk_artifact(
+        tmp_path / "execution_risk_artifact_shadow.json",
+        qualification_status="shadow_only",
+    )
+    service._last_execution_risk_training = {  # noqa: SLF001
+        "artifact_path": str(artifact_path),
+        "dataset_id": "execution_risk_dataset_week5_test",
+    }
+    _write_week5_execution_snapshot(
+        service,
+        snapshot_id="snap-history-600000",
+        symbol="600000",
+        decision_time=datetime(2026, 3, 19, 14, 30, tzinfo=UTC),
+        liquidity_score=0.12,
+        volatility_score=0.91,
+        meta_probability=0.46,
+        degraded_mode=True,
+        data_quality_score=0.84,
+    )
+    _write_week5_execution_snapshot(
+        service,
+        snapshot_id="snap-history-000001",
+        symbol="000001",
+        decision_time=datetime(2026, 3, 19, 14, 31, tzinfo=UTC),
+        liquidity_score=0.94,
+        volatility_score=0.12,
+        meta_probability=0.73,
+        degraded_mode=False,
+        data_quality_score=0.98,
+    )
+
+    _patch_attr(
+        service,
+        "run_pipeline",
+        _build_week5_execution_rerank_pipeline_without_snapshots(),
+    )
+    _patch_attr(service, "_build_first_board_candidate", lambda **_: None)
+    _patch_attr(service, "_detect_symbol_anomaly", lambda **_: None)
+    _patch_attr(
+        service,
+        "_monster_isolation_gate",
+        lambda **_: {
+            "can_open_new_position": True,
+            "reasons": [],
+            "total_monster_position": 0.0,
+            "max_monster_position": 0.0,
+            "sentiment_score": 0.0,
+        },
+    )
+
+    report = _as_mapping(
+        service.run_week5_scan(
+            symbols=["600000", "000001"],
+            notify_enabled=False,
+            sync_watchlist=False,
+        )
+    )
+
+    signal_pool = _as_mapping(report["signal_pool"])
+    ranking = _as_mapping(signal_pool["ranking"])
+    execution_rerank = _as_mapping(ranking["execution_rerank"])
+    candidates = _as_mapping_list(signal_pool["candidates"])
+
+    assert ranking["score_key"] == "shortlist_score"
+    assert execution_rerank["applied"] is False
+    assert execution_rerank["applied_count"] == 2
+    assert execution_rerank["coverage_ratio"] == 1.0
+    assert execution_rerank["reason"] == "artifact_shadow_only"
+    assert [str(item["symbol"]) for item in candidates[:2]] == ["600000", "000001"]
+    assert candidates[0]["execution_rerank_snapshot_fallback"] is True
+    assert candidates[0]["snapshot_id"] == "snap-history-600000"
+    assert candidates[0]["execution_rerank_applied"] is False
+    assert candidates[0]["execution_rerank_reason"] == "artifact_shadow_only"
+
+
 def test_service_week5_scan_falls_back_to_shortlist_order_without_execution_risk_artifact(
     tmp_path: Path,
 ) -> None:
@@ -1750,6 +1959,65 @@ def test_service_monster_isolation_treats_no_buy_streak_as_soft_warning() -> Non
     assert isolation["reasons"] == []
     assert "empty_signal_soft" in _as_text_list(isolation["soft_reasons"])
     assert "low_sentiment_recovery_soft" in _as_text_list(isolation["soft_reasons"])
+
+
+def test_service_monster_isolation_skips_sentiment_block_when_no_signal_scores() -> None:
+    config = _load_test_config()
+    service = _new_service(config)
+
+    empty_signal = {
+        "triggered": False,
+        "reasons": [],
+        "no_buy_streak": 0,
+        "buy_signals": 0,
+        "drawdown_pct": 0.0,
+        "risk_action": "monitor",
+    }
+
+    isolation = _as_mapping(
+        service._monster_isolation_gate(  # noqa: SLF001
+            monster_report={
+                "signals": [],
+                "risk": {"action": "degraded", "drawdown_pct": 0.0},
+            },
+            empty_signal=empty_signal,
+        )
+    )
+
+    assert isolation["sentiment_available"] is False
+    assert isolation["sentiment_score"] == 50.0
+    assert isolation["can_open_new_position"] is True
+    assert _as_text_list(isolation["reasons"]) == []
+    assert "low_sentiment" not in _as_text_list(isolation["reasons"])
+    assert "low_sentiment_recovery_soft" not in _as_text_list(isolation["soft_reasons"])
+
+
+def test_service_monster_isolation_marks_sentiment_unavailable_without_score_keys() -> None:
+    config = _load_test_config()
+    service = _new_service(config)
+
+    empty_signal = {
+        "triggered": False,
+        "reasons": [],
+        "no_buy_streak": 0,
+        "buy_signals": 0,
+        "drawdown_pct": 0.0,
+        "risk_action": "monitor",
+    }
+
+    isolation = _as_mapping(
+        service._monster_isolation_gate(  # noqa: SLF001
+            monster_report={
+                "signals": [{"action": "hold"}, {"action": "sell"}],
+                "risk": {"action": "freeze", "drawdown_pct": 0.0},
+            },
+            empty_signal=empty_signal,
+        )
+    )
+
+    assert isolation["sentiment_available"] is False
+    assert isolation["sentiment_score"] == 50.0
+    assert "low_sentiment" not in _as_text_list(isolation["reasons"])
 
 
 def test_service_week5_scan_auto_syncs_watchlist() -> None:
@@ -3877,7 +4145,6 @@ def test_week5_quality_selector_passes_financial_gate_with_backfilled_snapshots(
     assert isinstance(rejected, dict)
     assert "financial" not in rejected
     assert rejected.get("stale", 0) == 0
-
 
 def test_week5_prefilter_symbol_fetch_goes_through_session_bars_cache() -> None:
     config = _load_test_config()
