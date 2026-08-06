@@ -310,7 +310,7 @@ def _update_last_date_index(
     archives = _select_canonical_daily_archives(daily_root)
     for code in sorted(updated_symbols):
         latest: date | None = None
-        for year, archive_path in reversed(archives):
+        for _year, archive_path in reversed(archives):
             entry_pattern = re.compile(re.escape(code) + r"\.csv$", re.I)
             found = False
             for entry_name in _zip_entries_matching(archive_path, entry_pattern):
@@ -757,7 +757,7 @@ def _fetch_market_wide_by_date(
     while True:
         part = _as_frame(
             api._call_with_retry(
-                lambda: pro.daily(
+                lambda offset=offset: pro.daily(
                     trade_date=trade_date,
                     offset=offset,
                     limit=_TUSHARE_PAGE_LIMIT,
@@ -888,7 +888,8 @@ def _merge_factor_rows_scaled(
     calls per night) and the stored series is rescaled by the anchor ratio:
 
       qfq_new(T) = qfq_old(T) * adj(T_old) / adj(T_new),  qfq_new(T_new) = 1.0
-      hfq_new(T) = hfq_old(T),                            hfq_new(T_new) = hfq_old(T_old) * adj(T_new)/adj(T_old)
+      hfq_new(T) = hfq_old(T),
+      hfq_new(T_new) = hfq_old(T_old) * adj(T_new) / adj(T_old)
 
     which is mathematically identical to re-anchoring the full history.
     """
@@ -1047,8 +1048,6 @@ def _run_batch(
     if not trade_dates:
         trade_dates = [end_s]
 
-    index = _load_last_date_index(index_path) if index_path.strip() else None
-
     updates_by_year: dict[int, dict[str, pd.DataFrame]] = {}
     factor_updates: dict[str, pd.DataFrame] = {}
     dates_failed: list[str] = []
@@ -1060,7 +1059,7 @@ def _run_batch(
             continue
         try:
             day = _fetch_market_wide_by_date(api=api, trade_date=trade_date)
-        except Exception as exc:  # pragma: no cover - network dependent
+        except Exception:  # pragma: no cover - network dependent
             dates_failed.append(trade_date)
             continue
         if day["daily"].empty:

@@ -9,6 +9,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, cast
 
+from stock_analyzer.learning.feedback_features import (
+    has_feedback_feature_columns,
+    merge_feedback_feature_vector,
+)
 from stock_analyzer.learning.sample_schema import (
     BackfillFidelityTier,
     DatasetManifest,
@@ -18,10 +22,6 @@ from stock_analyzer.learning.sample_schema import (
     MaturityStatus,
     OutcomeRecord,
     SignalSnapshot,
-)
-from stock_analyzer.learning.feedback_features import (
-    has_feedback_feature_columns,
-    merge_feedback_feature_vector,
 )
 
 
