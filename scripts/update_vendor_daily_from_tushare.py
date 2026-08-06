@@ -77,6 +77,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import cast
 
 import pandas as pd
 
@@ -149,6 +150,18 @@ BASIC_SAME_NAME = [
     "total_mv",
     "circ_mv",
 ]
+
+# Tushare single-call row cap used by the batch paging guard.  When a
+# trade_date-wide call returns exactly this many rows the caller must page
+# with ``offset`` to avoid silent truncation.  (Real cap depends on account
+# tier; 6000 is the documented single-response limit.)
+_TUSHARE_PAGE_LIMIT = 6000
+
+DAILY_BASIC_FIELDS = (
+    "ts_code,trade_date,turnover_rate,turnover_rate_f,volume_ratio,"
+    "pe,pe_ttm,pb,ps,ps_ttm,dv_ratio,dv_ttm,total_share,float_share,"
+    "free_share,total_mv,circ_mv"
+)
 
 
 def _is_zip_noise(name: str) -> bool:
@@ -233,8 +246,112 @@ def _read_last_line_date(archive_path: Path, entry_name: str) -> date | None:
     return parsed.max().date()
 
 
-def _symbol_daily_last_date(daily_root: Path, ts_code: str) -> date | None:
+def _read_last_date_fast(archive_path: Path, entry_name: str) -> date | None:
+    """Read the last trade date of one ZIP entry without a full pandas parse.
+
+    The vendor daily CSV layout is ``code,datetime,...`` with rows ascending
+    by date, so only the last non-empty line is inspected.
+    """
+    if not archive_path.exists():
+        return None
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            with archive.open(entry_name) as stream:
+                last_line: bytes | None = None
+                for line in stream:
+                    if line.strip():
+                        last_line = line
+                if last_line is None:
+                    return None
+    except (KeyError, zipfile.BadZipFile):
+        return None
+    parts = last_line.decode("utf-8-sig", errors="replace").strip().split(",")
+    if len(parts) < 2:
+        return None
+    parsed = pd.to_datetime(parts[1].strip(), errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return parsed.date()
+
+
+def _load_last_date_index(path: str | Path) -> dict[str, object] | None:
+    """Load the vendor daily last-date index (vendor_zip_overlay format).
+
+    Returns ``None`` when missing/corrupt so callers fall back to a full scan.
+    """
+    target = Path(path)
+    if not target.exists():
+        return None
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("symbols"), dict):
+        return None
+    return payload
+
+
+def _update_last_date_index(
+    *,
+    index_path: str | Path,
+    daily_root: Path,
+    updated_symbols: set[str],
+) -> dict[str, object]:
+    """Incrementally refresh ``latest_date`` for the updated symbols.
+
+    Only the latest-year entry of each updated symbol is re-read; the rest of
+    the index is preserved verbatim.  Missing index or entries fall back to a
+    full archive scan for the affected symbol only.
+    """
+    payload = _load_last_date_index(index_path)
+    if payload is None:
+        return {"updated": False, "reason": "index_missing"}
+    symbols = cast("dict[str, object]", payload["symbols"])
+    archives = _select_canonical_daily_archives(daily_root)
+    for code in sorted(updated_symbols):
+        latest: date | None = None
+        for year, archive_path in reversed(archives):
+            entry_pattern = re.compile(re.escape(code) + r"\.csv$", re.I)
+            found = False
+            for entry_name in _zip_entries_matching(archive_path, entry_pattern):
+                found = True
+                entry_date = _read_last_date_fast(archive_path, entry_name)
+                if entry_date is not None and (latest is None or entry_date > latest):
+                    latest = entry_date
+            if found and latest is not None:
+                break
+        if latest is not None:
+            existing = symbols.get(code)
+            if isinstance(existing, dict):
+                existing["latest_date"] = latest.isoformat()
+            else:
+                symbols[code] = {"latest_date": latest.isoformat(), "entries": []}
+    target = Path(index_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(f"{target.suffix}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(target)
+    return {"updated": True, "symbols": len(updated_symbols)}
+
+
+def _symbol_daily_last_date(
+    daily_root: Path,
+    ts_code: str,
+    index: dict[str, object] | None = None,
+) -> date | None:
     """Max trade date across the symbol's entries in all annual daily ZIPs."""
+    if index is not None:
+        symbols = index.get("symbols")
+        if isinstance(symbols, dict):
+            entry = symbols.get(ts_code)
+            if isinstance(entry, dict):
+                raw = str(entry.get("latest_date", "")).strip()
+                parsed = _coerce_date(raw)
+                if parsed is not None:
+                    return parsed
     latest: date | None = None
     entry_pattern = re.compile(re.escape(ts_code) + r"\.csv$", re.I)
     for _, archive_path in _select_canonical_daily_archives(daily_root):
@@ -459,7 +576,11 @@ def _rebuild_zip(
         archive_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = archive_path.with_name(f"{archive_path.name}.{os.getpid()}.tmp")
     old_names: set[str] = set()
-    with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as output:
+    # compresslevel=1: the NAS host CPU is the bottleneck; level 1 is 3-5x
+    # faster than the default 6 at a modest size cost (vendor data is read-only).
+    with zipfile.ZipFile(
+        temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1
+    ) as output:
         if archive_path.exists():
             with zipfile.ZipFile(archive_path) as source:
                 old_names = {
@@ -545,10 +666,11 @@ def _fetch_symbol(
     factors_root: Path,
     skip_factors: bool,
     dry_run: bool,
+    index: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Phase A worker: decide by ZIP contents and fetch only missing data."""
     ts_code = _to_ts_code(symbol)
-    daily_last = _symbol_daily_last_date(daily_root, ts_code)
+    daily_last = _symbol_daily_last_date(daily_root, ts_code, index=index)
     factor_last = None if skip_factors else _symbol_factor_last_date(factors_root, ts_code)
     need_daily = daily_last is None or daily_last < end_date
     need_factors = (not skip_factors) and (factor_last is None or factor_last < end_date)
@@ -619,6 +741,504 @@ def _as_frame(raw: object) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def _fetch_market_wide_by_date(
+    api: TushareProvider,
+    trade_date: str,
+) -> dict[str, pd.DataFrame]:
+    """Fetch one full-market trading day via trade_date-wide calls.
+
+    ``pro.daily`` is paged defensively with ``offset``; daily_basic and
+    adj_factor single calls are assumed to fit the whole market for one day
+    (verified by scripts/verify_tushare_batch_permission.py).
+    """
+    pro = api._resolve_pro_api()
+    daily_parts: list[pd.DataFrame] = []
+    offset = 0
+    while True:
+        part = _as_frame(
+            api._call_with_retry(
+                lambda: pro.daily(
+                    trade_date=trade_date,
+                    offset=offset,
+                    limit=_TUSHARE_PAGE_LIMIT,
+                )
+            )
+        )
+        if part.empty:
+            break
+        daily_parts.append(part)
+        if len(part) < _TUSHARE_PAGE_LIMIT:
+            break
+        offset += len(part)
+    daily = (
+        pd.concat(daily_parts, ignore_index=True) if daily_parts else pd.DataFrame()
+    )
+    basic = _as_frame(
+        api._call_with_retry(
+            lambda: pro.daily_basic(
+                trade_date=trade_date,
+                fields=DAILY_BASIC_FIELDS,
+            )
+        )
+    )
+    adj = _as_frame(
+        api._call_with_retry(lambda: pro.adj_factor(trade_date=trade_date))
+    )
+    return {"daily": daily, "basic": basic, "adj": adj}
+
+
+def _distribute_batch_day(
+    *,
+    daily: pd.DataFrame,
+    basic: pd.DataFrame,
+    adj: pd.DataFrame,
+    updates_by_year: dict[int, dict[str, pd.DataFrame]],
+    factor_updates: dict[str, pd.DataFrame],
+    skip_factors: bool,
+) -> None:
+    """Split one full-market day into per-symbol year buckets (25-col format)."""
+    if daily is None or daily.empty or "ts_code" not in daily.columns:
+        return
+    for ts_code, group in daily.groupby("ts_code"):
+        code = str(ts_code)
+        basic_group: pd.DataFrame | None = None
+        if basic is not None and not basic.empty and "ts_code" in basic.columns:
+            subset = basic[basic["ts_code"] == ts_code]
+            basic_group = subset if not subset.empty else None
+        try:
+            frame = _daily_to_25_columns(ts_code=code, daily=group, basic=basic_group)
+        except DataSourceError:
+            continue
+        if frame is None or frame.empty:
+            continue
+        year_groups = frame.groupby(
+            pd.to_datetime(frame["datetime"], format="%Y%m%d", errors="coerce").dt.year
+        )
+        for year, year_frame in year_groups:
+            if pd.isna(year):
+                continue
+            year_key = int(year)
+            previous = updates_by_year.setdefault(year_key, {}).get(code)
+            updates_by_year[year_key][code] = (
+                pd.concat([previous, year_frame], ignore_index=True)
+                if previous is not None
+                else year_frame
+            )
+    if skip_factors:
+        return
+    if adj is None or adj.empty or "ts_code" not in adj.columns:
+        return
+    for ts_code, group in adj.groupby("ts_code"):
+        code = str(ts_code)
+        previous = factor_updates.get(code)
+        factor_updates[code] = (
+            pd.concat([previous, group], ignore_index=True)
+            if previous is not None
+            else group
+        )
+
+
+def _seed_factor_rows(
+    *,
+    ts_code: str,
+    new_rows: pd.DataFrame,
+    anchor: str,
+) -> pd.DataFrame | None:
+    """Seed a factor series from freshly fetched rows when no history exists.
+
+    Used when the stored series is missing entirely or the anchor-day value is
+    unavailable (e.g. the stock was suspended on the anchor day); in the
+    latter case the archive temporarily holds only the new window until the
+    next run re-anchors against the full history.
+    """
+    seed_series = new_rows.sort_values("trade_date").drop_duplicates(
+        subset=["trade_date"], keep="last"
+    )
+    if seed_series.empty:
+        return None
+    if anchor == "latest":
+        scale = float(seed_series["adj_factor"].iloc[-1])
+    else:
+        scale = float(seed_series["adj_factor"].iloc[0])
+    if scale <= 0:
+        return None
+    return pd.DataFrame(
+        {
+            "股票代码": ts_code,
+            "交易日期": seed_series["trade_date"],
+            "复权因子": seed_series["adj_factor"] / scale,
+        }
+    )
+
+
+def _merge_factor_rows_scaled(
+    *,
+    ts_code: str,
+    adj_new_day: pd.DataFrame,
+    adj_old_day: pd.DataFrame,
+    factors_root: Path,
+    archive_name: str,
+    anchor: str,
+) -> pd.DataFrame | None:
+    """Re-anchor the stored factor series with only the two anchor-day values.
+
+    The vendor factor files store the *normalised* series (qfq latest = 1.0 /
+    hfq earliest = 1.0), so the raw adjustment factor scale is not recoverable
+    from them.  Instead both anchor days are fetched market-wide (two batch
+    calls per night) and the stored series is rescaled by the anchor ratio:
+
+      qfq_new(T) = qfq_old(T) * adj(T_old) / adj(T_new),  qfq_new(T_new) = 1.0
+      hfq_new(T) = hfq_old(T),                            hfq_new(T_new) = hfq_old(T_old) * adj(T_new)/adj(T_old)
+
+    which is mathematically identical to re-anchoring the full history.
+    """
+    if adj_new_day is None or adj_new_day.empty:
+        return None
+    new_rows = adj_new_day.copy()
+    new_rows["trade_date"] = (
+        new_rows["trade_date"].astype(str).str.replace("-", "", regex=False)
+    )
+    new_rows = new_rows[new_rows["trade_date"].str.fullmatch(r"\d{8}", na=False)]
+    new_rows["adj_factor"] = pd.to_numeric(new_rows["adj_factor"], errors="coerce")
+    new_rows = new_rows.dropna(subset=["trade_date", "adj_factor"])
+    new_rows = new_rows[new_rows["adj_factor"] > 0]
+    if new_rows.empty:
+        return None
+
+    old_scale: float | None = None
+    if adj_old_day is not None and not adj_old_day.empty:
+        old_rows = adj_old_day.copy()
+        old_rows["trade_date"] = (
+            old_rows["trade_date"].astype(str).str.replace("-", "", regex=False)
+        )
+        old_rows["adj_factor"] = pd.to_numeric(old_rows["adj_factor"], errors="coerce")
+        old_rows = old_rows.dropna(subset=["adj_factor"])
+        old_rows = old_rows[old_rows["adj_factor"] > 0]
+        if not old_rows.empty:
+            old_scale = float(old_rows["adj_factor"].iloc[0])
+    if old_scale is None or old_scale <= 0:
+        # Anchor-day value unavailable (e.g. the stock was suspended on the
+        # anchor day).  Fall back to seeding from the freshly fetched days so
+        # the factor archive never lags the daily archive.
+        return _seed_factor_rows(ts_code=ts_code, new_rows=new_rows, anchor=anchor)
+
+    new_scale = float(new_rows["adj_factor"].iloc[-1])
+    if new_scale <= 0:
+        return None
+    ratio = new_scale / old_scale  # adj(T_new) / adj(T_old)
+
+    archive_path = factors_root / archive_name
+    old_dates: list[str] = []
+    old_values: list[float] = []
+    if archive_path.exists():
+        with zipfile.ZipFile(archive_path) as archive:
+            for info in archive.infolist():
+                if info.is_dir() or _is_zip_noise(info.filename):
+                    continue
+                if re.search(re.escape(ts_code) + r"\.csv$", info.filename, re.I) is None:
+                    continue
+                try:
+                    with archive.open(info.filename) as stream:
+                        old_frame = pd.read_csv(stream)
+                except (KeyError, ValueError, OSError):
+                    continue
+                if "交易日期" not in old_frame.columns or "复权因子" not in old_frame.columns:
+                    continue
+                old_frame = old_frame[
+                    ["交易日期", "复权因子"]
+                ].dropna()
+                old_dates.extend(old_frame["交易日期"].astype(str).tolist())
+                old_values.extend(
+                    pd.to_numeric(old_frame["复权因子"], errors="coerce").fillna(0.0).tolist()
+                )
+
+    if not old_dates:
+        # No stored history: seed from the new day only.
+        return _seed_factor_rows(ts_code=ts_code, new_rows=new_rows, anchor=anchor)
+
+    stored = pd.DataFrame(
+        {"trade_date": old_dates, "value": old_values}
+    ).drop_duplicates(subset=["trade_date"], keep="last")
+    stored = stored[stored["value"] > 0].sort_values("trade_date")
+    new_day = new_rows.sort_values("trade_date").drop_duplicates(
+        subset=["trade_date"], keep="last"
+    )
+    new_by_date = {
+        str(row["trade_date"]): float(row["adj_factor"])
+        for _, row in new_day.iterrows()
+    }
+
+    merged_dates: list[str] = []
+    merged_values: list[float] = []
+    for _, row in stored.iterrows():
+        merged_dates.append(str(row["trade_date"]))
+        if anchor == "latest":
+            merged_values.append(float(row["value"]) / ratio)
+        else:
+            merged_values.append(float(row["value"]))
+    existing_dates = set(merged_dates)
+    last_old = float(stored["value"].iloc[-1]) if not stored.empty else 1.0
+    for trade_date in sorted(new_by_date):
+        if trade_date in existing_dates:
+            continue
+        merged_dates.append(trade_date)
+        if anchor == "latest":
+            # qfq(T) = adj(T)/adj(T_end); only the newest day equals 1.0.
+            merged_values.append(float(new_by_date[trade_date]) / new_scale)
+        else:
+            # hfq(T) = hfq_old(T_old) * adj(T)/adj(T_old); history is unchanged.
+            merged_values.append(last_old * float(new_by_date[trade_date]) / old_scale)
+
+    merged = pd.DataFrame(
+        {"交易日期": merged_dates, "复权因子": merged_values}
+    ).sort_values("交易日期").drop_duplicates(subset=["交易日期"], keep="last")
+    merged = merged[merged["复权因子"] > 0]
+    if merged.empty:
+        return None
+    merged.insert(0, "股票代码", ts_code)
+    return merged
+
+
+def _run_batch(
+    *,
+    api: TushareProvider,
+    end_date: date,
+    daily_root: Path,
+    factors_root: Path,
+    skip_factors: bool,
+    dry_run: bool,
+    index_path: str,
+) -> dict[str, object]:
+    """Batch nightly update: one full-market call per trade date."""
+    pro = api._resolve_pro_api() if not dry_run else None
+    end_s = end_date.strftime("%Y%m%d")
+
+    trade_dates: list[str] = []
+    if not dry_run:
+        probe_start = (end_date - timedelta(days=5)).strftime("%Y%m%d")
+        try:
+            raw_cal = api._call_with_retry(
+                lambda: pro.trade_cal(
+                    exchange="SSE",
+                    is_open="1",
+                    start_date=probe_start,
+                    end_date=end_s,
+                )
+            )
+            cal = _as_frame(raw_cal)
+            if not cal.empty and "cal_date" in cal.columns:
+                trade_dates = sorted(
+                    {
+                        str(item)
+                        for item in cal["cal_date"].astype(str).tolist()
+                        if str(item).isdigit() and len(str(item)) == 8
+                    }
+                )
+        except Exception as exc:  # pragma: no cover - network dependent
+            return {
+                "attempted": True,
+                "ok": False,
+                "mode": "batch",
+                "errors": [f"trade_cal_failed:{exc.__class__.__name__}:{exc}"],
+                "dates_processed": 0,
+                "dates_failed": [],
+                "symbols_updated": 0,
+            }
+    if not trade_dates:
+        trade_dates = [end_s]
+
+    index = _load_last_date_index(index_path) if index_path.strip() else None
+
+    updates_by_year: dict[int, dict[str, pd.DataFrame]] = {}
+    factor_updates: dict[str, pd.DataFrame] = {}
+    dates_failed: list[str] = []
+    updated_codes: set[str] = set()
+    fetched_symbols = 0
+
+    for trade_date in trade_dates:
+        if dry_run:
+            continue
+        try:
+            day = _fetch_market_wide_by_date(api=api, trade_date=trade_date)
+        except Exception as exc:  # pragma: no cover - network dependent
+            dates_failed.append(trade_date)
+            continue
+        if day["daily"].empty:
+            dates_failed.append(trade_date)
+            continue
+        _distribute_batch_day(
+            daily=day["daily"],
+            basic=day["basic"],
+            adj=day["adj"],
+            updates_by_year=updates_by_year,
+            factor_updates=factor_updates,
+            skip_factors=skip_factors,
+        )
+        for code in day["daily"]["ts_code"].astype(str).tolist():
+            updated_codes.add(code)
+        fetched_symbols += len(day["daily"])
+
+    rebuild_reports: list[dict[str, object]] = []
+    if not dry_run:
+        for year in sorted(updates_by_year):
+            rebuild_reports.append(
+                _rebuild_daily_year_zip(daily_root, year, updates_by_year[year])
+            )
+        if not skip_factors and factor_updates:
+            # Two market-wide anchor calls replace the per-symbol full history.
+            adj_old_day: pd.DataFrame = pd.DataFrame()
+            adj_new_day: pd.DataFrame = pd.DataFrame()
+            try:
+                adj_new_day = _as_frame(
+                    api._call_with_retry(
+                        lambda: pro.adj_factor(trade_date=end_s)
+                    )
+                )
+                previous_factor_date = _latest_factor_anchor_date(
+                    factors_root=factors_root,
+                    trade_dates=trade_dates,
+                    api=api,
+                )
+                if previous_factor_date is not None:
+                    adj_old_day = _as_frame(
+                        api._call_with_retry(
+                            lambda: pro.adj_factor(trade_date=previous_factor_date)
+                        )
+                    )
+            except Exception as exc:  # pragma: no cover - network dependent
+                rebuild_reports.append(
+                    {
+                        "archive": "factors",
+                        "error": f"factor_anchor_fetch_failed:{exc.__class__.__name__}",
+                    }
+                )
+            if not adj_new_day.empty:
+                qfq_updates: dict[str, pd.DataFrame] = {}
+                hfq_updates: dict[str, pd.DataFrame] = {}
+                for code in sorted(factor_updates):
+                    merged_qfq = _merge_factor_rows_scaled(
+                        ts_code=code,
+                        adj_new_day=factor_updates[code],
+                        adj_old_day=(
+                            adj_old_day[adj_old_day["ts_code"] == code]
+                            if not adj_old_day.empty
+                            else None
+                        ),
+                        factors_root=factors_root,
+                        archive_name=FACTORS_QFQ_ARCHIVE,
+                        anchor="latest",
+                    )
+                    merged_hfq = _merge_factor_rows_scaled(
+                        ts_code=code,
+                        adj_new_day=factor_updates[code],
+                        adj_old_day=(
+                            adj_old_day[adj_old_day["ts_code"] == code]
+                            if not adj_old_day.empty
+                            else None
+                        ),
+                        factors_root=factors_root,
+                        archive_name=FACTORS_HFQ_ARCHIVE,
+                        anchor="earliest",
+                    )
+                    if merged_qfq is not None:
+                        qfq_updates[code] = merged_qfq
+                    if merged_hfq is not None:
+                        hfq_updates[code] = merged_hfq
+                if qfq_updates:
+                    rebuild_reports.append(
+                        _rebuild_factor_zip(factors_root, FACTORS_QFQ_ARCHIVE, qfq_updates)
+                    )
+                if hfq_updates:
+                    rebuild_reports.append(
+                        _rebuild_factor_zip(factors_root, FACTORS_HFQ_ARCHIVE, hfq_updates)
+                    )
+
+    index_report: dict[str, object] = {"updated": False, "reason": "not_enabled"}
+    if not dry_run and index_path.strip() and updated_codes:
+        index_report = _update_last_date_index(
+            index_path=index_path,
+            daily_root=daily_root,
+            updated_symbols=updated_codes,
+        )
+
+    return {
+        "attempted": True,
+        "ok": not dates_failed,
+        "mode": "batch",
+        "trade_dates": trade_dates,
+        "dates_processed": len(trade_dates) - len(dates_failed),
+        "dates_failed": dates_failed,
+        "symbols_fetched": fetched_symbols,
+        "symbols_updated": len(updated_codes),
+        "zip_rebuilds": rebuild_reports,
+        "index": index_report,
+    }
+
+
+def _latest_factor_anchor_date(
+    *,
+    factors_root: Path,
+    trade_dates: list[str],
+    api: TushareProvider,
+) -> str | None:
+    """Best-effort previous trading day for the qfq anchor rescale."""
+    archive_path = factors_root / FACTORS_QFQ_ARCHIVE
+    if archive_path.exists():
+        latest: str = ""
+        with zipfile.ZipFile(archive_path) as archive:
+            for info in archive.infolist():
+                if info.is_dir() or _is_zip_noise(info.filename):
+                    continue
+                if not info.filename.endswith(".csv"):
+                    continue
+                try:
+                    with archive.open(info.filename) as stream:
+                        last_line = b""
+                        for line in stream:
+                            if line.strip():
+                                last_line = line
+                except KeyError:
+                    continue
+                if not last_line:
+                    continue
+                parts = last_line.decode("utf-8-sig", errors="replace").strip().split(",")
+                if len(parts) >= 2 and len(parts[1].strip()) == 8 and parts[1].strip().isdigit():
+                    candidate = parts[1].strip()
+                    if candidate > latest:
+                        latest = candidate
+        if latest:
+            return latest
+    if len(trade_dates) >= 2:
+        return trade_dates[-2]
+    try:
+        probe_from = (
+            pd.to_datetime(trade_dates[0], format="%Y%m%d") - pd.Timedelta(days=10)
+        ).strftime("%Y%m%d") if trade_dates else "20260101"
+        cal = _as_frame(
+            api._call_with_retry(
+                lambda: api._resolve_pro_api().trade_cal(
+                    exchange="SSE",
+                    is_open="1",
+                    start_date=probe_from,
+                    end_date=trade_dates[0] if trade_dates else "",
+                )
+            )
+        )
+        if not cal.empty and "cal_date" in cal.columns:
+            dates = sorted(
+                {
+                    str(item)
+                    for item in cal["cal_date"].astype(str).tolist()
+                    if str(item).isdigit() and len(str(item)) == 8
+                }
+            )
+            if len(dates) >= 2:
+                return dates[-2]
+    except Exception:
+        pass
+    return None
+
+
 def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -687,6 +1307,26 @@ def _main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Do not fetch adj_factor and do not rebuild the factor ZIPs",
     )
+    parser.add_argument(
+        "--batch",
+        action="store_true",
+        help="Batch mode: one full-market trade_date call instead of per-symbol "
+        "API calls (requires full-market permission, see "
+        "scripts/verify_tushare_batch_permission.py)",
+    )
+    parser.add_argument(
+        "--batch-trade-date",
+        default="",
+        help="Batch mode: single trade date to fetch (YYYY-MM-DD); "
+        "defaults to --end-date",
+    )
+    parser.add_argument(
+        "--index-path",
+        default="",
+        help="Last-date index JSON (vendor_zip_overlay format) used to skip "
+        "annual-ZIP scans; incrementally updated after a successful run. "
+        "Must live OUTSIDE the vendor directory (e.g. /vol1/docker/tools/).",
+    )
     args = parser.parse_args(argv)
 
     vendor_root = Path(args.vendor_root).expanduser()
@@ -727,13 +1367,14 @@ def _main(argv: list[str] | None = None) -> int:
         if re.fullmatch(r"\d{6}", item)
     }
     symbols = sorted(normalized)
-    if not symbols:
-        print("empty universe: nothing to update", file=sys.stderr)
-        return 2
 
     limit = max(0, int(args.limit))
     if limit:
         symbols = symbols[:limit]
+
+    if not args.batch and not symbols:
+        print("empty universe: nothing to update", file=sys.stderr)
+        return 2
 
     token = str(os.environ.get("TUSHARE_TOKEN", "") or "").strip() or str(
         os.environ.get("SA__MARKET_WAREHOUSE__TUSHARE_TOKEN", "") or ""
@@ -758,6 +1399,35 @@ def _main(argv: list[str] | None = None) -> int:
 
     results: list[dict[str, object]] = []
     failures: list[str] = []
+    index = _load_last_date_index(args.index_path) if args.index_path.strip() else None
+
+    if args.batch:
+        batch_end_date = _coerce_date(args.batch_trade_date) or end_date
+        batch_payload = _run_batch(
+            api=api,  # type: ignore[arg-type]
+            end_date=batch_end_date,
+            daily_root=daily_root,
+            factors_root=factors_root,
+            skip_factors=bool(args.skip_factors),
+            dry_run=bool(args.dry_run),
+            index_path=args.index_path,
+        )
+        summary = {
+            "tool": "update_vendor_daily_from_tushare",
+            "finished_at": datetime.now().isoformat(timespec="seconds"),
+            "vendor_root": str(vendor_root),
+            "daily_dir": str(daily_root),
+            "factors_dir": str(factors_root),
+            "end_date": end_date.isoformat(),
+            "symbols_total": len(symbols),
+            "dry_run": bool(args.dry_run),
+            "skip_factors": bool(args.skip_factors),
+            "checkpoint": str(checkpoint_path) if checkpoint_path is not None else "",
+            **batch_payload,
+        }
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return 0 if bool(batch_payload.get("ok", False)) else 1
+
     max_workers = max(1, int(args.max_workers))
     if len(symbols) == 1 or max_workers == 1 or api is None:
         for symbol in symbols:
@@ -771,6 +1441,7 @@ def _main(argv: list[str] | None = None) -> int:
                         factors_root=factors_root,
                         skip_factors=bool(args.skip_factors),
                         dry_run=bool(args.dry_run),
+                        index=index,
                     )
                 )
             except Exception as exc:
@@ -787,6 +1458,7 @@ def _main(argv: list[str] | None = None) -> int:
                     factors_root=factors_root,
                     skip_factors=bool(args.skip_factors),
                     dry_run=bool(args.dry_run),
+                    index=index,
                 ): symbol
                 for symbol in symbols
             }
@@ -850,6 +1522,20 @@ def _main(argv: list[str] | None = None) -> int:
                     _rebuild_factor_zip(factors_root, FACTORS_HFQ_ARCHIVE, hfq_updates)
                 )
 
+    index_report: dict[str, object] = {"updated": False, "reason": "not_enabled"}
+    if not args.dry_run and args.index_path.strip() and ok_results:
+        updated_codes = {
+            str(result.get("ts_code"))
+            for result in ok_results
+            if str(result.get("ts_code"))
+        }
+        if updated_codes:
+            index_report = _update_last_date_index(
+                index_path=args.index_path,
+                daily_root=daily_root,
+                updated_symbols=updated_codes,
+            )
+
     summary = {
         "tool": "update_vendor_daily_from_tushare",
         "finished_at": datetime.now().isoformat(timespec="seconds"),
@@ -866,6 +1552,7 @@ def _main(argv: list[str] | None = None) -> int:
         "skip_factors": bool(args.skip_factors),
         "checkpoint": str(checkpoint_path) if checkpoint_path is not None else "",
         "zip_rebuilds": rebuild_reports,
+        "index": index_report,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     if failures:
