@@ -148,3 +148,62 @@ def test_feature_engineer_handles_nan_background_fields() -> None:
     features = FeatureEngineer().transform(bars)
     assert features.shape[0] > 0
     assert np.isfinite(features.to_numpy(dtype=float)).all()
+
+
+_STANDARD_INTRADAY_COLUMNS = [
+    "minute_count",
+    "session_return",
+    "session_range_pct",
+    "realized_vol",
+    "vwap_gap",
+    "am_return",
+    "pm_return",
+    "am_pm_diff",
+    "last30_return",
+    "last30_volume_share",
+    "tail30_volume_share",
+    "morning30_volume_share",
+    "positive_bar_ratio",
+    "close_position",
+    "above_vwap_ratio",
+    "price_efficiency",
+    "am_pm_reversal_strength",
+    "tail_volatility_ratio",
+    "close_vwap_stability",
+    "intraday_pullback_ratio",
+]
+
+
+def test_transform_column_set_stable_without_intraday() -> None:
+    bars = _bars()
+
+    features_without = FeatureEngineer().transform(bars)
+
+    expected_intraday_columns = [
+        f"i1m_{column}" for column in _STANDARD_INTRADAY_COLUMNS
+    ] + [f"i5m_{column}" for column in _STANDARD_INTRADAY_COLUMNS]
+    for column in expected_intraday_columns:
+        assert column in features_without.columns
+    assert (features_without[expected_intraday_columns] == 0.0).all().all()
+
+    intraday = pd.DataFrame(
+        {
+            "session_return": np.linspace(0.01, 0.30, num=len(bars.index)),
+            "realized_vol": np.linspace(0.02, 0.10, num=len(bars.index)),
+            "am_pm_diff": np.linspace(-0.05, 0.05, num=len(bars.index)),
+        },
+        index=bars.index.copy(),
+    )
+    features_with = FeatureEngineer().transform(
+        bars,
+        intraday_1m=intraday,
+        intraday_5m=intraday,
+    )
+
+    assert set(features_without.columns) == set(features_with.columns)
+    assert len(
+        [c for c in features_with.columns if c.startswith("i1m_")]
+    ) == len(_STANDARD_INTRADAY_COLUMNS)
+    assert len(
+        [c for c in features_with.columns if c.startswith("i5m_")]
+    ) == len(_STANDARD_INTRADAY_COLUMNS)

@@ -85,6 +85,11 @@ class ArtifactNewsSignalProvider:
             return self._fallback_score
         return _clamp_01(weighted_score)
 
+    def available(self, symbol: str = "") -> bool:
+        """返回新闻数据是否可用（有非空记录且不是纯 fallback）。"""
+        _ = symbol
+        return bool(self._load_records())
+
     def _load_records(self) -> list[dict[str, object]]:
         try:
             stat = self._path.stat()

@@ -122,6 +122,24 @@ class FixedProbabilityPredictor:
         return dict(self._probabilities)
 
 
+class DegradedModePredictor:
+    def predict_row(self, feature_row: pd.Series) -> dict[str, float]:
+        _ = feature_row
+        return {"lgbm": 0.1355, "xgb": 0.1355, "meta": 0.1355}
+
+    def mode_details(self) -> dict[str, object]:
+        return {"degraded_model_mode": True}
+
+
+class HealthyModePredictor:
+    def predict_row(self, feature_row: pd.Series) -> dict[str, float]:
+        _ = feature_row
+        return {"lgbm": 0.8, "xgb": 0.8, "meta": 0.8}
+
+    def mode_details(self) -> dict[str, object]:
+        return {"degraded_model_mode": False}
+
+
 class ErrorNewsProvider:
     def score(
         self,
@@ -313,6 +331,11 @@ def test_pipeline_penalizes_trend_instead_of_blocking_under_score_penalty_mode()
 
 def test_pipeline_opens_model_disagreement_probe_from_raw_score() -> None:
     config = _load_default_config()
+    # C1: transform now emits the full fixed intraday column set; without
+    # intraday data the extra zero columns push the feature-quality score
+    # below the gate threshold, so disable the gate to keep exercising the
+    # model-disagreement probe path this test targets.
+    config.models.feature_quality.enabled = False
     config.financial_filter.enabled = True
     config.financial_filter.apply_to = ["trend"]
     config.financial_filter.trend_mode = "score_penalty"
@@ -384,7 +407,7 @@ def test_pipeline_news_component_is_injected_into_score() -> None:
     )
 
 
-def test_pipeline_news_provider_failure_falls_back_to_neutral() -> None:
+def test_pipeline_news_provider_failure_excludes_news_component() -> None:
     config = _load_default_config()
     provider = MinimalBarsProvider()
     neutral_pipeline = AnalyzerPipeline(
@@ -397,13 +420,18 @@ def test_pipeline_news_provider_failure_falls_back_to_neutral() -> None:
         provider=provider,
         news_provider=ErrorNewsProvider(),
     )
-    neutral_score = neutral_pipeline.run_once(
+    neutral_signal = neutral_pipeline.run_once(
         symbols=["600000"], strategy="trend", current_equity=1.0
-    ).signals[0].score
-    error_score = error_pipeline.run_once(
+    ).signals[0]
+    error_signal = error_pipeline.run_once(
         symbols=["600000"], strategy="trend", current_equity=1.0
-    ).signals[0].score
-    assert error_score == neutral_score
+    ).signals[0]
+    neutral_components = _as_mapping(neutral_signal.decision_trace["score"]["components"])
+    error_components = _as_mapping(error_signal.decision_trace["score"]["components"])
+    assert "news" in neutral_components
+    assert "news" not in error_components
+    assert "news_component_unavailable" in error_signal.reasons
+    assert error_signal.score != neutral_signal.score
 
 
 def test_pipeline_uses_configured_fetch_and_analysis_lookbacks() -> None:
@@ -534,3 +562,39 @@ def test_pipeline_news_preview_cache_state_and_clear() -> None:
     assert _as_int(clear_payload["cleared"]) >= 1
     state_after = _as_mapping(pipeline.news_preview_cache_state())
     assert _as_int(state_after["entries"]) == 0
+
+
+def test_pipeline_fallback_model_falls_back_to_heuristic() -> None:
+    config = _load_default_config()
+    # C1: with no intraday data the fixed zero columns lower the
+    # feature-quality score below the gate threshold (0.48 < 0.5); disable
+    # the gate so the healthy branch still exercises predictor passthrough
+    # instead of silently degrading to heuristic probabilities.
+    config.models.feature_quality.enabled = False
+    provider = MinimalBarsProvider()
+
+    degraded_pipeline = AnalyzerPipeline(config=config, provider=provider)
+    degraded_pipeline._predictor = DegradedModePredictor()  # noqa: SLF001
+    degraded_pipeline._predictor_status = {"predictor_mode": "artifact_loaded"}  # noqa: SLF001
+    degraded_report = degraded_pipeline.run_once(
+        symbols=["600000"], strategy="trend", current_equity=1.0
+    )
+    degraded_signal = degraded_report.signals[0]
+    degraded_health = _as_mapping(degraded_signal.decision_trace["probability_health"])
+    assert degraded_health.get("predictor_degraded_model_mode") is True
+    degraded_probs = _as_mapping(degraded_signal.decision_trace["score"]["probabilities"])
+    assert not all(abs(float(value) - 0.1355) < 1e-9 for value in degraded_probs.values())
+
+    healthy_pipeline = AnalyzerPipeline(config=config, provider=provider)
+    healthy_pipeline._predictor = HealthyModePredictor()  # noqa: SLF001
+    healthy_pipeline._predictor_status = {"predictor_mode": "artifact_loaded"}  # noqa: SLF001
+    healthy_report = healthy_pipeline.run_once(
+        symbols=["600000"], strategy="trend", current_equity=1.0
+    )
+    healthy_signal = healthy_report.signals[0]
+    healthy_health = _as_mapping(healthy_signal.decision_trace["probability_health"])
+    assert healthy_health.get("predictor_degraded_model_mode") is False
+    healthy_probs = _as_mapping(healthy_signal.decision_trace["score"]["probabilities"])
+    assert abs(float(healthy_probs["lgbm"]) - 0.8) < 1e-9
+    assert abs(float(healthy_probs["xgb"]) - 0.8) < 1e-9
+    assert abs(float(healthy_probs["meta"]) - 0.8) < 1e-9

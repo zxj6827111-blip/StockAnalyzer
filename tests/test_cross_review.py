@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from stock_analyzer.config import CrossReviewConfig
 from stock_analyzer.signal.cross_review import evaluate_cross_review
 
@@ -61,3 +63,38 @@ def test_cross_review_tightens_thresholds_when_active_champion_is_strong() -> No
     assert result.passed is False
     assert "lgbm<0.63" in result.reasons
     assert "meta<0.59" in result.reasons
+
+
+def test_dynamic_thresholds_uses_quantile_when_history_sufficient() -> None:
+    config = CrossReviewConfig()
+    history = [
+        {
+            "lgbm": 0.2 + 0.2 * (i / 49),
+            "xgb": 0.2 + 0.18 * (i / 49),
+            "meta": 0.2 + 0.16 * (i / 49),
+        }
+        for i in range(50)
+    ]
+    result = evaluate_cross_review(0.35, 0.34, 0.33, config, dynamic_history=history)
+    assert result.passed is True
+    assert result.dynamic is True
+    assert result.thresholds["p_lgbm_min"] == pytest.approx(0.34, abs=0.01)
+    assert result.thresholds["p_xgb_min"] > 0.30
+    assert result.thresholds["p_meta_min"] > 0.30
+    assert result.thresholds["max_diff"] == config.max_diff
+
+    fallback = evaluate_cross_review(0.35, 0.34, 0.33, config)
+    assert fallback.passed is False
+    assert fallback.dynamic is False
+
+
+def test_dynamic_thresholds_falls_back_when_history_insufficient() -> None:
+    config = CrossReviewConfig()
+    short_history = [{"lgbm": 0.25, "xgb": 0.24, "meta": 0.23} for _ in range(5)]
+    result = evaluate_cross_review(0.35, 0.34, 0.33, config, dynamic_history=short_history)
+    assert result.passed is False
+    assert result.dynamic is False
+    assert result.thresholds["p_lgbm_min"] == config.p_lgbm_min
+    assert result.thresholds["p_xgb_min"] == config.p_xgb_min
+    assert result.thresholds["p_meta_min"] == config.p_meta_min
+    assert result.thresholds["max_diff"] == config.max_diff

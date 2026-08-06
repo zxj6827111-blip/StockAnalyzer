@@ -446,14 +446,45 @@ def _decrease_streak(series: pd.Series) -> pd.Series:
     return pd.Series(streak, index=series.index, dtype=float)
 
 
+_STANDARD_INTRADAY_SUMMARY_COLUMNS = (
+    "minute_count",
+    "session_return",
+    "session_range_pct",
+    "realized_vol",
+    "vwap_gap",
+    "am_return",
+    "pm_return",
+    "am_pm_diff",
+    "last30_return",
+    "last30_volume_share",
+    "tail30_volume_share",
+    "morning30_volume_share",
+    "positive_bar_ratio",
+    "close_position",
+    "above_vwap_ratio",
+    "price_efficiency",
+    "am_pm_reversal_strength",
+    "tail_volatility_ratio",
+    "close_vwap_stability",
+    "intraday_pullback_ratio",
+)
+
+
 def _prepare_intraday_summary(
     *,
     frame: pd.DataFrame | None,
     prefix: str,
     target_index: pd.Index,
 ) -> pd.DataFrame:
+    standard_columns = [
+        f"{prefix}_{column}" for column in _STANDARD_INTRADAY_SUMMARY_COLUMNS
+    ]
     if frame is None or frame.empty:
-        return pd.DataFrame(index=target_index)
+        return pd.DataFrame(
+            np.nan,
+            index=target_index,
+            columns=standard_columns,
+        )
 
     prepared = frame.copy()
     if "symbol" in prepared.columns:
@@ -462,7 +493,11 @@ def _prepare_intraday_summary(
         prepared.index = pd.to_datetime(prepared.index, errors="coerce")
     prepared = prepared[prepared.index.notna()].sort_index()
     if prepared.empty:
-        return pd.DataFrame(index=target_index)
+        return pd.DataFrame(
+            np.nan,
+            index=target_index,
+            columns=standard_columns,
+        )
 
     numeric_columns: list[str] = []
     for column in prepared.columns:
@@ -471,10 +506,17 @@ def _prepare_intraday_summary(
             prepared[column] = series.astype(float)
             numeric_columns.append(column)
     if not numeric_columns:
-        return pd.DataFrame(index=target_index)
+        return pd.DataFrame(
+            np.nan,
+            index=target_index,
+            columns=standard_columns,
+        )
 
     prepared = prepared[numeric_columns]
-    prepared = prepared.rename(columns={column: f"{prefix}_{column}" for column in numeric_columns})
+    prepared = prepared.rename(
+        columns={column: f"{prefix}_{column}" for column in numeric_columns}
+    )
+    prepared = prepared.reindex(columns=standard_columns)
     return prepared.reindex(target_index)
 
 
