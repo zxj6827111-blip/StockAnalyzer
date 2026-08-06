@@ -288,12 +288,13 @@ def _normalize_tx_hist_frame(
     frame["name"] = ""
     frame["is_st"] = False
     frame["is_delisting_risk"] = False
-    frame["roe"] = 0.08
-    frame["debt_ratio"] = 0.55
-    frame["financial_data_complete"] = True
-    frame["financial_missing_fields"] = ""
+    frame["roe"] = np.nan
+    frame["debt_ratio"] = np.nan
+    frame["financial_data_complete"] = False
+    frame["financial_missing_fields"] = "roe,debt_ratio"
     frame["financial_source"] = "akshare_tx_default"
     frame["financial_report_date"] = ""
+    frame["financial_trust_level"] = "missing"
     frame["holder_count"] = _DEFAULT_HOLDER_COUNT
     frame["block_trade_net"] = 0.0
     frame["financing_balance"] = _DEFAULT_FINANCING_BALANCE
@@ -326,6 +327,7 @@ def _select_output_columns(frame: pd.DataFrame) -> pd.DataFrame:
             "financial_missing_fields",
             "financial_source",
             "financial_report_date",
+            "financial_trust_level",
             "holder_count",
             "block_trade_net",
             "financing_balance",

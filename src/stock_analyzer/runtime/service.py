@@ -7,7 +7,9 @@ import json
 import math
 import os
 import random
+import shutil
 import traceback
+from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
@@ -296,6 +298,12 @@ class StockAnalyzerService:
         self._last_week4_acceptance_report: dict[str, object] | None = None
         self._week5_scan_history: list[dict[str, object]] = []
         self._last_week5_scan_report: dict[str, object] | None = None
+        self._week5_bars_cache: OrderedDict[tuple[str, int], pd.DataFrame] = OrderedDict()
+        self._week5_bars_cache_maxsize = max(
+            1, _as_int(self._config.week5.week5_bars_cache_size, default=600)
+        )
+        self._week5_bars_cache_hits = 0
+        self._week5_bars_cache_misses = 0
         self._last_week5_market_radar_report: dict[str, object] | None = None
         self._market_radar_review_pool: list[dict[str, object]] = []
         self._week6_history: list[dict[str, object]] = []
@@ -521,6 +529,55 @@ class StockAnalyzerService:
     def _resolve_learning_protocol_db_path(self) -> Path:
         bootstrap_root = self._training_bootstrap_state_path.parent
         return bootstrap_root / "learning_protocol.duckdb"
+
+    def _recover_corrupt_learning_protocol(self, error_text: str) -> dict[str, object]:
+        try:
+            db_path = self._training_bootstrap_state_path.parent / "learning_protocol.duckdb"
+            if not db_path.exists():
+                return {"recovered": False, "reason": "db_missing"}
+            now = datetime.now()
+            stamp = now.strftime("%Y%m%d-%H%M%S")
+            backup_path = db_path.with_name(f"learning_protocol.corrupt.{stamp}.duckdb")
+            suffix = 1
+            while backup_path.exists():
+                backup_path = db_path.with_name(
+                    f"learning_protocol.corrupt.{stamp}_{suffix}.duckdb"
+                )
+                suffix += 1
+            shutil.move(str(db_path), str(backup_path))
+            store = SampleStore(db_path=db_path)
+            store.counts()
+            self._training_bootstrap_state["completed"] = False
+            self._training_bootstrap_state["last_status"] = "db_recovered"
+            self._training_bootstrap_state[
+                "last_error"
+            ] = f"learning_protocol_recovered:{error_text}"
+            self._training_bootstrap_state["last_recovery_at"] = now.isoformat()
+            self._persist_training_bootstrap_state(self._training_bootstrap_state)
+            try:
+                self.notify(
+                    title=_push_title(
+                        priority="P1",
+                        category="learning",
+                        summary="learning protocol db recovered",
+                    ),
+                    content=(
+                        "学习协议数据库损坏已自动恢复并重建，损坏文件已备份为 "
+                        f"{backup_path.name}，训练引导需重新执行"
+                    ),
+                    level="warn",
+                )
+            except Exception:
+                # Notification must never turn a successful recovery into a
+                # reported failure (the state is already persisted above).
+                pass
+            return {
+                "recovered": True,
+                "backup_path": str(backup_path),
+                "error": error_text,
+            }
+        except Exception as exc:
+            return {"recovered": False, "reason": str(exc)}
 
     def _resolve_learning_manifest_artifact_path(
         self,
@@ -3647,6 +3704,7 @@ class StockAnalyzerService:
         week6_execution: dict[str, object]
 
         pipeline_started = perf_counter()
+        pipeline_stage_ms: dict[str, int] | None = None
         if normalized_strategy == "multi":
             multi_payload = self._run_multi_strategy_pipeline(
                 symbols=symbol_list,
@@ -3679,6 +3737,7 @@ class StockAnalyzerService:
                 strategy=normalized_strategy,
                 current_equity=equity,
             )
+            pipeline_stage_ms = getattr(pipeline, "_last_pipeline_stage_ms", None)
             trace_id = report.trace_id
             timestamp = report.timestamp
             degraded_mode = report.degraded_mode
@@ -3944,7 +4003,7 @@ class StockAnalyzerService:
         payload["week6_execution"] = week6_payload
         payload["strategy_kill_switch"] = kill_switch_summary
         duration_ms = int((perf_counter() - started) * 1000)
-        payload["runtime"] = {
+        runtime_payload: dict[str, object] = {
             "duration_ms": duration_ms,
             "pipeline_ms": pipeline_ms,
             "post_pipeline_ms": post_pipeline_ms,
@@ -3957,6 +4016,9 @@ class StockAnalyzerService:
                 self._config.command_channel.state_persist_enabled
             ),
         }
+        if pipeline_stage_ms is not None:
+            runtime_payload["pipeline_stage_ms"] = pipeline_stage_ms
+        payload["runtime"] = runtime_payload
         self._record_run_summary(
             report=payload,
             current_equity=equity,
@@ -5422,6 +5484,27 @@ class StockAnalyzerService:
         symbol: str,
         lookback_days: int,
         allowed_exchanges: set[str],
+        _timings: list[tuple[str, float]] | None = None,
+    ) -> dict[str, object] | None:
+        """Prefilter one universe symbol, recording wall time for profiling."""
+        started = perf_counter()
+        try:
+            return self._prefilter_week5_universe_symbol_impl(
+                symbol=symbol,
+                lookback_days=lookback_days,
+                allowed_exchanges=allowed_exchanges,
+            )
+        finally:
+            if _timings is not None:
+                normalized = _normalize_a_share_symbol(symbol) or symbol
+                _timings.append((normalized, (perf_counter() - started) * 1000.0))
+
+    def _prefilter_week5_universe_symbol_impl(
+        self,
+        *,
+        symbol: str,
+        lookback_days: int,
+        allowed_exchanges: set[str],
     ) -> dict[str, object] | None:
         normalized = _normalize_a_share_symbol(symbol)
         if not normalized:
@@ -5429,7 +5512,7 @@ class StockAnalyzerService:
         exchange = _exchange_from_a_share_symbol(normalized)
         if allowed_exchanges and exchange and exchange not in allowed_exchanges:
             return None
-        bars = self._provider.fetch_daily_bars(symbol=normalized, lookback_days=lookback_days)
+        bars = self._fetch_week5_bars_cached(symbol=normalized, lookback_days=lookback_days)
         if not isinstance(bars, pd.DataFrame) or bars.empty:
             return None
         frame = bars if bars.index.is_monotonic_increasing else bars.sort_index()
@@ -5688,12 +5771,35 @@ class StockAnalyzerService:
             },
         }
 
+    def _fetch_week5_bars_cached(
+        self,
+        *,
+        symbol: str,
+        lookback_days: int,
+    ) -> pd.DataFrame | None:
+        """Fetch daily bars through the session-level LRU cache for week5 scans."""
+        cache_key = (symbol, lookback_days)
+        cached = self._week5_bars_cache.get(cache_key)
+        if cached is not None:
+            self._week5_bars_cache_hits += 1
+            return cached
+        bars = self._provider.fetch_daily_bars(symbol=symbol, lookback_days=lookback_days)
+        if isinstance(bars, pd.DataFrame) and not bars.empty:
+            self._week5_bars_cache[cache_key] = bars
+            while len(self._week5_bars_cache) > self._week5_bars_cache_maxsize:
+                self._week5_bars_cache.popitem(last=False)
+        self._week5_bars_cache_misses += 1
+        return bars
+
     def _prefilter_week5_universe_symbols(
         self,
         *,
         symbols: list[str],
         top_k_override: int | None = None,
     ) -> dict[str, object]:
+        self._week5_bars_cache.clear()
+        self._week5_bars_cache_hits = 0
+        self._week5_bars_cache_misses = 0
         lookback_days = max(
             120,
             _as_int(self._config.week5.universe_prefilter_lookback_days, default=240),
@@ -5722,6 +5828,7 @@ class StockAnalyzerService:
         candidates: list[dict[str, object]] = []
         errors: list[str] = []
         skipped = 0
+        timings: list[tuple[str, float]] = []
         max_workers = min(8, max(1, len(deduped_symbols)))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_map = {
@@ -5730,6 +5837,7 @@ class StockAnalyzerService:
                     symbol=symbol,
                     lookback_days=lookback_days,
                     allowed_exchanges=allowed_exchanges,
+                    _timings=timings,
                 ): symbol
                 for symbol in deduped_symbols
             }
@@ -5744,6 +5852,24 @@ class StockAnalyzerService:
                     skipped += 1
                     continue
                 candidates.append(candidate)
+
+        profile: dict[str, object] = {
+            "timed_symbols": len(timings),
+            "cache_hits": self._week5_bars_cache_hits,
+            "cache_misses": self._week5_bars_cache_misses,
+        }
+        if timings:
+            total_ms = sum(ms for _, ms in timings)
+            profile["total_seconds"] = round(total_ms / 1000.0, 4)
+            profile["per_symbol_avg_ms"] = round(total_ms / len(timings), 3)
+            slowest = sorted(timings, key=lambda item: item[1], reverse=True)[:5]
+            profile["slowest_symbols"] = [
+                {"symbol": symbol, "ms": round(ms, 3)} for symbol, ms in slowest
+            ]
+        else:
+            profile["total_seconds"] = 0.0
+            profile["per_symbol_avg_ms"] = 0.0
+            profile["slowest_symbols"] = []
 
         ranked = sorted(
             candidates,
@@ -5766,6 +5892,7 @@ class StockAnalyzerService:
             "errors": errors[:20],
             "shortlisted_count": len(shortlisted),
             "scoring_mode": "two_stage_funnel",
+            "profile": profile,
             "symbols": [
                 str(item.get("symbol", "")).strip()
                 for item in shortlisted
@@ -6699,6 +6826,17 @@ class StockAnalyzerService:
                         "requested_snapshot_count": 0,
                     }
                 steps["repair_learning_backfill"] = repair_payload
+                self._training_bootstrap_state["last_backfill_at"] = datetime.now(UTC).isoformat()
+                self._training_bootstrap_state["last_backfill_status"] = str(
+                    repair_payload.get("ok", False)
+                )
+                self._training_bootstrap_state["last_backfill_mode"] = str(
+                    repair_payload.get("mode", "")
+                )
+                self._training_bootstrap_state["last_backfill_repaired_count"] = int(
+                    repair_payload.get("repaired_snapshot_count", 0)
+                )
+                self._persist_training_bootstrap_state(self._training_bootstrap_state)
                 self._write_post_market_warehouse_followup_state(
                     stage="repair_learning_backfill",
                     status="completed",
@@ -6715,6 +6853,14 @@ class StockAnalyzerService:
                     "skipped": True,
                     "reason": "post_followup_run_learning_backfill_disabled",
                 }
+                self._training_bootstrap_state["last_backfill_at"] = datetime.now(
+                    UTC
+                ).isoformat()
+                self._training_bootstrap_state["last_backfill_status"] = "skipped"
+                self._training_bootstrap_state[
+                    "last_backfill_reason"
+                ] = "post_followup_run_learning_backfill_disabled"
+                self._persist_training_bootstrap_state(self._training_bootstrap_state)
 
             if bool(config.post_followup_run_training) and bool(
                 self._config.training.enabled
@@ -7561,13 +7707,26 @@ class StockAnalyzerService:
                 "protocol_fallback_reason": "",
             }
         except Exception as exc:
-            return {
+            error_text = f"learning_protocol_failed:{exc.__class__.__name__}"
+            recovery: dict[str, object] = {"recovered": False}
+            if exc.__class__.__name__ in {
+                "SerializationException",
+                "IOException",
+                "CatalogException",
+                "InternalException",
+            }:
+                recovery = self._recover_corrupt_learning_protocol(error_text=str(exc))
+            result: dict[str, object] = {
                 "attempted": True,
                 "ok": False,
-                "errors": [f"learning_protocol_failed:{exc.__class__.__name__}"],
+                "errors": [error_text],
                 "fallback_reason": f"learning_protocol_exception:{exc}",
                 "protocol_candidate_rows": 0,
             }
+            if bool(recovery.get("recovered", False)):
+                result["db_recovered"] = True
+                result["fallback_reason"] = "learning_protocol_db_corrupted_recovered"
+            return result
 
     def train_models(
         self,
@@ -17420,7 +17579,9 @@ class StockAnalyzerService:
         ]
         total_monster_position = sum(monster_positions)
         max_monster_position = max(monster_positions) if monster_positions else 0.0
-        sentiment_score = self._estimate_sentiment(monster_report=monster_report)
+        sentiment_score, sentiment_available = self._estimate_sentiment(
+            monster_report=monster_report
+        )
 
         reasons: list[str] = []
         soft_reasons: list[str] = []
@@ -17428,7 +17589,10 @@ class StockAnalyzerService:
             reasons.append("max_total_position")
         if max_monster_position >= self._config.monster_risk.max_stock_position:
             reasons.append("max_stock_position")
-        if sentiment_score < self._config.monster_risk.disable_if_sentiment_below:
+        if (
+            sentiment_available
+            and sentiment_score < self._config.monster_risk.disable_if_sentiment_below
+        ):
             if total_monster_position <= 0 and _as_int(
                 empty_signal.get("no_buy_streak"), default=0
             ) >= max(1, self._config.week5.empty_signal_no_buy_runs):
@@ -17451,25 +17615,31 @@ class StockAnalyzerService:
             "total_monster_position": round(total_monster_position, 4),
             "max_monster_position": round(max_monster_position, 4),
             "sentiment_score": round(sentiment_score, 2),
+            "sentiment_available": bool(sentiment_available),
         }
 
-    def _estimate_sentiment(self, monster_report: dict[str, object]) -> float:
+    def _estimate_sentiment(self, monster_report: dict[str, object]) -> tuple[float, bool]:
         raw_signals = monster_report.get("signals")
         scores: list[float] = []
         if isinstance(raw_signals, list):
             for item in raw_signals:
                 if not isinstance(item, dict):
                     continue
-                scores.append(_as_float(item.get("score"), default=0.0))
-        base = (sum(scores) / len(scores)) if scores else 50.0
+                score = _as_float_or_none(item.get("score"))
+                if score is None:
+                    continue
+                scores.append(score)
+        available = len(scores) > 0
+        base = (sum(scores) / len(scores)) if available else 50.0
 
-        risk = monster_report.get("risk", {})
-        risk_action = ""
-        if isinstance(risk, dict):
-            risk_action = str(risk.get("action", ""))
-        if risk_action in {"freeze", "degraded"}:
-            base -= 15.0
-        return _clamp(value=base, low=0.0, high=100.0)
+        if available:
+            risk = monster_report.get("risk", {})
+            risk_action = ""
+            if isinstance(risk, dict):
+                risk_action = str(risk.get("action", ""))
+            if risk_action in {"freeze", "degraded"}:
+                base -= 15.0
+        return _clamp(value=base, low=0.0, high=100.0), available
 
     @staticmethod
     def _build_cache(config: StockAnalyzerConfig) -> CacheStore:

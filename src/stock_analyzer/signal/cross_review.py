@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+
+import numpy as np
+
 from stock_analyzer.config import CrossReviewConfig
 from stock_analyzer.types import CrossReviewResult
 
@@ -10,18 +14,51 @@ def _clamp_probability(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
+def dynamic_thresholds(
+    config: CrossReviewConfig,
+    history: Sequence[Mapping[str, float]] | None,
+) -> dict[str, float] | None:
+    """基于历史概率分位数的动态门槛；历史不足/未启用返回 None 表示回退绝对门槛。"""
+    if not config.dynamic_enabled or not history or len(history) < config.dynamic_min_history:
+        return None
+    complete = [
+        item for item in history if isinstance(item, Mapping) and all(
+            key in item for key in ("lgbm", "xgb", "meta")
+        )
+    ]
+    if len(complete) < config.dynamic_min_history:
+        return None
+    lgbm_values = [float(item["lgbm"]) for item in complete]
+    xgb_values = [float(item["xgb"]) for item in complete]
+    meta_values = [float(item["meta"]) for item in complete]
+    quantile = float(config.dynamic_quantile) * 100.0
+    p_lgbm_min = max(float(np.percentile(lgbm_values, quantile)), float(config.dynamic_floor))
+    p_xgb_min = max(float(np.percentile(xgb_values, quantile)), float(config.dynamic_floor))
+    p_meta_min = max(float(np.percentile(meta_values, quantile)), float(config.dynamic_floor))
+    diff_values = [abs(a - b) for a, b in zip(lgbm_values, xgb_values, strict=True)]
+    max_diff = max(float(config.max_diff), float(np.percentile(diff_values, quantile)))
+    return {
+        "p_lgbm_min": p_lgbm_min,
+        "p_xgb_min": p_xgb_min,
+        "p_meta_min": p_meta_min,
+        "max_diff": max_diff,
+    }
+
+
 def evaluate_cross_review(
     lgbm_prob: float,
     xgb_prob: float,
     meta_prob: float,
     config: CrossReviewConfig,
     champion_auc: float | None = None,
+    dynamic_history: Sequence[Mapping[str, float]] | None = None,
 ) -> CrossReviewResult:
     lgbm = _clamp_probability(lgbm_prob)
     xgb = _clamp_probability(xgb_prob)
     meta = _clamp_probability(meta_prob)
     reasons: list[str] = []
-    thresholds = _effective_thresholds(config=config, champion_auc=champion_auc)
+    dynamic = dynamic_thresholds(config, dynamic_history)
+    thresholds = dynamic or _effective_thresholds(config=config, champion_auc=champion_auc)
 
     if lgbm < thresholds["p_lgbm_min"]:
         reasons.append(f"lgbm<{thresholds['p_lgbm_min']:.2f}")
@@ -51,6 +88,7 @@ def evaluate_cross_review(
         mode=mode,
         degraded_consensus=degraded_consensus,
         thresholds={key: round(value, 4) for key, value in thresholds.items()},
+        dynamic=dynamic is not None,
     )
 
 

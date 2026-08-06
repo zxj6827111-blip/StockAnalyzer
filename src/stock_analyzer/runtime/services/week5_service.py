@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import UTC, datetime
 from functools import lru_cache
 from importlib import import_module
 from pathlib import Path
@@ -1456,6 +1456,10 @@ class RuntimeWeek5Service:
             job_name="week5_scan_monster",
         )
         trace_id = str(monster_report.get("trace_id", ""))
+        monster_runtime_payload: dict[str, object] = {}
+        monster_runtime = monster_report.get("runtime")
+        if isinstance(monster_runtime, dict):
+            monster_runtime_payload = dict(monster_runtime)
         raw_signals = monster_report.get("signals")
         signal_map: dict[str, dict[str, object]] = {}
         min_history_days = max(1, int(service._config.evolution.universe_spec.min_list_days))
@@ -1647,6 +1651,9 @@ class RuntimeWeek5Service:
                 ),
                 "provider": str(service._config.data_source.runtime_live_provider).strip()
                 or "offline",
+            },
+            "runtime": {
+                "monster_pipeline": monster_runtime_payload,
             },
             "monster_scan_controls": dict(monster_scan_controls),
             "first_board": {
@@ -1889,21 +1896,42 @@ class RuntimeWeek5Service:
             snapshot_id = str(candidate.get("snapshot_id", "")).strip() or (
                 _extract_learning_snapshot_id(candidate)
             )
-            if not snapshot_id:
-                skipped_missing_snapshot += 1
-                candidate["execution_rerank_reason"] = "snapshot_id_missing"
-                continue
-            try:
-                snapshot = service._sample_store.get_snapshot(snapshot_id)
-            except Exception as exc:
-                skipped_snapshot_read_failed += 1
-                candidate["execution_rerank_reason"] = (
-                    f"snapshot_read_failed:{exc.__class__.__name__}"
-                )
-                continue
+            snapshot = None
+            if snapshot_id:
+                try:
+                    snapshot = service._sample_store.get_snapshot(snapshot_id)
+                except Exception as exc:
+                    skipped_snapshot_read_failed += 1
+                    candidate["execution_rerank_reason"] = (
+                        f"snapshot_read_failed:{exc.__class__.__name__}"
+                    )
+                    continue
             if snapshot is None:
-                skipped_snapshot_not_found += 1
-                candidate["execution_rerank_reason"] = "snapshot_not_found"
+                symbol = _normalize_a_share_symbol(
+                    str(candidate.get("symbol", "")).strip()
+                )
+                fallback_snapshot = None
+                if symbol:
+                    try:
+                        fallback_snapshot = (
+                            service._sample_store.latest_snapshot_for_symbol(
+                                symbol=symbol,
+                                before=datetime.now(UTC),
+                            )
+                        )
+                    except Exception:
+                        fallback_snapshot = None
+                if fallback_snapshot is not None:
+                    snapshot = fallback_snapshot
+                    snapshot_id = snapshot.snapshot_id
+                    candidate["execution_rerank_snapshot_fallback"] = True
+            if snapshot is None:
+                if not snapshot_id:
+                    skipped_missing_snapshot += 1
+                    candidate["execution_rerank_reason"] = "snapshot_id_missing"
+                else:
+                    skipped_snapshot_not_found += 1
+                    candidate["execution_rerank_reason"] = "snapshot_not_found"
                 continue
 
             raw_probabilities = candidate.get("probabilities")

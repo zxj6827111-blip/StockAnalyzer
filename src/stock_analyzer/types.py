@@ -17,6 +17,7 @@ class CrossReviewResult:
     mode: str = "strict"
     degraded_consensus: bool = False
     thresholds: dict[str, float] = field(default_factory=dict)
+    dynamic: bool = False
 
 
 @dataclass(slots=True)

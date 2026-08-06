@@ -189,3 +189,84 @@ def test_sample_store_enriches_snapshot_contexts_without_overwriting_existing_va
     reloaded = store.get_snapshot("snap-enrich")
     assert reloaded is not None
     assert reloaded.model_dump() == updated.model_dump()
+
+
+def _make_symbol_snapshot(
+    *,
+    snapshot_id: str,
+    symbol: str,
+    decision_time: datetime,
+) -> SignalSnapshot:
+    return SignalSnapshot(
+        snapshot_id=snapshot_id,
+        code_version="git:abc123",
+        symbol=symbol,
+        strategy="trend",
+        decision_time=decision_time,
+        feature_vector={"ret_1d": 0.01},
+        feature_schema_id="feature_schema_v1_abc",
+        feature_schema_hash="feature_hash_1",
+        runtime_config_hash="runtime_hash_1",
+        label_policy_id="label_policy_v1_abc",
+        label_policy_hash="label_hash_1",
+    )
+
+
+def test_sample_store_latest_snapshot_for_symbol_returns_most_recent_snapshot(
+    tmp_path: Path,
+) -> None:
+    store = SampleStore(db_path=tmp_path / "sample_store.duckdb")
+    base = datetime(2026, 3, 25, 14, 50, tzinfo=UTC)
+    store.write_snapshot(
+        _make_symbol_snapshot(snapshot_id="snap-600519-old", symbol="600519", decision_time=base)
+    )
+    store.write_snapshot(
+        _make_symbol_snapshot(snapshot_id="snap-600000-1", symbol="600000", decision_time=base)
+    )
+    store.write_snapshot(
+        _make_symbol_snapshot(
+            snapshot_id="snap-600519-new",
+            symbol="600519",
+            decision_time=base.replace(hour=15),
+        )
+    )
+
+    latest = store.latest_snapshot_for_symbol("600519")
+    assert latest is not None
+    assert latest.snapshot_id == "snap-600519-new"
+    other = store.latest_snapshot_for_symbol("600000")
+    assert other is not None
+    assert other.snapshot_id == "snap-600000-1"
+    assert store.latest_snapshot_for_symbol("000001") is None
+    assert store.latest_snapshot_for_symbol("") is None
+
+
+def test_sample_store_latest_snapshot_for_symbol_respects_before_cutoff(
+    tmp_path: Path,
+) -> None:
+    store = SampleStore(db_path=tmp_path / "sample_store.duckdb")
+    base = datetime(2026, 3, 25, 14, 50, tzinfo=UTC)
+    store.write_snapshot(
+        _make_symbol_snapshot(snapshot_id="snap-old-1", symbol="600519", decision_time=base)
+    )
+    store.write_snapshot(
+        _make_symbol_snapshot(
+            snapshot_id="snap-new-1",
+            symbol="600519",
+            decision_time=base.replace(hour=15),
+        )
+    )
+
+    before_latest = store.latest_snapshot_for_symbol(
+        "600519",
+        before=base.replace(hour=14, minute=59),
+    )
+    assert before_latest is not None
+    assert before_latest.snapshot_id == "snap-old-1"
+    assert (
+        store.latest_snapshot_for_symbol(
+            "600519",
+            before=base.replace(hour=13),
+        )
+        is None
+    )

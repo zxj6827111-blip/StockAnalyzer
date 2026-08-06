@@ -105,6 +105,9 @@ class FinancialRiskFilter:
         trust_level = str(snapshot.get("trust_level", "")).strip().lower()
         if not trust_level:
             trust_level = "reported" if roe is not None or debt_ratio is not None else "missing"
+        # P3: levels outside {reported, derived} (synthetic/heuristic/default/missing)
+        # are never trusted; numeric roe/debt_ratio under those levels fall into the
+        # `not trusted_financials` branches below and yield untrusted_financial_provenance.
         trusted_financials = trust_level in {"reported", "derived"} and complete_flag is not False
         missing_policy = self._config.missing_data_policy.strip().lower()
 

@@ -9,6 +9,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, cast
 
+from stock_analyzer.learning.feedback_features import (
+    has_feedback_feature_columns,
+    merge_feedback_feature_vector,
+)
 from stock_analyzer.learning.sample_schema import (
     BackfillFidelityTier,
     DatasetManifest,
@@ -18,10 +22,6 @@ from stock_analyzer.learning.sample_schema import (
     MaturityStatus,
     OutcomeRecord,
     SignalSnapshot,
-)
-from stock_analyzer.learning.feedback_features import (
-    has_feedback_feature_columns,
-    merge_feedback_feature_vector,
 )
 
 
@@ -94,6 +94,35 @@ class SampleStore:
                 f"SELECT {', '.join(_SNAPSHOT_COLUMNS)} "
                 "FROM signal_snapshots WHERE snapshot_id = ? LIMIT 1",
                 [snapshot_id],
+            ).fetchone()
+            return None if row is None else _row_to_snapshot(row)
+        finally:
+            conn.close()
+
+    def latest_snapshot_for_symbol(
+        self,
+        symbol: str,
+        *,
+        before: datetime | None = None,
+    ) -> SignalSnapshot | None:
+        """按 symbol 返回最近一条快照（可选 before 截止时间），用于 rerank 回退匹配。"""
+
+        normalized_symbol = str(symbol).strip()
+        if not normalized_symbol:
+            return None
+        conditions = ["symbol = ?"]
+        parameters: list[object] = [normalized_symbol]
+        if before is not None:
+            conditions.append("decision_time <= ?")
+            parameters.append(_dump_datetime(before))
+        conn = self._connect()
+        try:
+            self._ensure_schema(conn)
+            row = conn.execute(
+                f"SELECT {', '.join(_SNAPSHOT_COLUMNS)} "
+                f"FROM signal_snapshots WHERE {' AND '.join(conditions)} "
+                "ORDER BY decision_time DESC, created_at DESC LIMIT 1",
+                parameters,
             ).fetchone()
             return None if row is None else _row_to_snapshot(row)
         finally:

@@ -5,7 +5,7 @@ import json
 import math
 from collections.abc import Mapping
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from time import perf_counter
 from typing import Protocol
@@ -113,6 +113,16 @@ class AnalyzerPipeline:
         self._last_probability_health: dict[str, object] = {"status": "not_observed"}
         self._runtime_config_hash = _stable_config_hash(config)
         self._latest_report: PipelineReport | None = None
+        self._stage_ms_accum: dict[str, float] = {
+            "fetch_bars_ms": 0.0,
+            "feature_engine_ms": 0.0,
+            "inference_ms": 0.0,
+        }
+        self._last_pipeline_stage_ms: dict[str, int] = {
+            "fetch_bars_ms": 0,
+            "feature_engine_ms": 0,
+            "inference_ms": 0,
+        }
         self._evolution_controls: dict[str, object] = {}
         self._news_preview_cache: dict[tuple[str, str], tuple[float, dict[str, object]]] = {}
         self._news_preview_cache_ttl_sec = 60.0
@@ -150,12 +160,23 @@ class AnalyzerPipeline:
     ) -> PipelineReport:
         trace_id = uuid4().hex[:16]
         signals: list[PipelineSignal] = []
+        self._stage_ms_accum = {
+            "fetch_bars_ms": 0.0,
+            "feature_engine_ms": 0.0,
+            "inference_ms": 0.0,
+        }
 
         for symbol in symbols:
             signal = self._process_symbol(
                 symbol=symbol, strategy=strategy, current_equity=current_equity
             )
             signals.append(signal)
+
+        self._last_pipeline_stage_ms = {
+            "fetch_bars_ms": int(self._stage_ms_accum["fetch_bars_ms"]),
+            "feature_engine_ms": int(self._stage_ms_accum["feature_engine_ms"]),
+            "inference_ms": int(self._stage_ms_accum["inference_ms"]),
+        }
 
         provider_status = self.provider_status()
         self._risk_controller.update_degraded_mode(
@@ -353,7 +374,7 @@ class AnalyzerPipeline:
             }
             self._news_preview_cache[cache_key] = (now_perf, deepcopy(payload))
             return payload
-        news_component = self._score_news_component(
+        news_component, news_available = self._score_news_component(
             symbol=normalized_symbol,
             bars=analysis_bars,
             features=features,
@@ -367,6 +388,8 @@ class AnalyzerPipeline:
         if bars_dropped_rows > 0:
             reasons.append(f"bars_time_gate_dropped_rows:{bars_dropped_rows}")
         reasons.append(f"news_component:{news_component:.3f}")
+        if not news_available:
+            reasons.append("news_component_unavailable")
         payload = {
             "symbol": normalized_symbol,
             "strategy": normalized_strategy,
@@ -539,6 +562,7 @@ class AnalyzerPipeline:
             self._health_monitor.record(success=True, latency_sec=perf_counter() - start)
         except DataSourceError as exc:
             self._health_monitor.record(success=False, latency_sec=perf_counter() - start)
+            self._stage_ms_accum["fetch_bars_ms"] += (perf_counter() - start) * 1000.0
             return PipelineSignal(
                 symbol=symbol,
                 strategy=strategy,
@@ -549,6 +573,7 @@ class AnalyzerPipeline:
                 probabilities={"lgbm": 0.0, "xgb": 0.0, "meta": 0.0},
                 reasons=[f"data_source:{exc}"],
             )
+        self._stage_ms_accum["fetch_bars_ms"] += (perf_counter() - start) * 1000.0
         bars, bars_time_gate = apply_time_invariants_to_frame(
             bars,
             decision_time=decision_time,
@@ -581,6 +606,7 @@ class AnalyzerPipeline:
             )
         analysis_bars = self._clip_signal_analysis_bars(bars)
 
+        transform_started = perf_counter()
         intraday_1m, intraday_5m = self._fetch_intraday_summaries(
             symbol=symbol,
             lookback_days=max(120, len(analysis_bars) + 5),
@@ -592,6 +618,7 @@ class AnalyzerPipeline:
             intraday_5m=intraday_5m,
             market_index=market_index,
         )
+        self._stage_ms_accum["feature_engine_ms"] += (perf_counter() - transform_started) * 1000.0
         if features.empty:
             return PipelineSignal(
                 symbol=symbol,
@@ -625,9 +652,25 @@ class AnalyzerPipeline:
         features = ensure_feedback_feature_frame(features)
 
         latest_features = features.iloc[-1]
+        feature_quality_score = _estimate_data_quality_score(features)
+        quality_cfg = self._config.models.feature_quality
+        feature_quality_degraded = bool(
+            quality_cfg.enabled
+            and feature_quality_score < quality_cfg.min_data_quality_score
+            and quality_cfg.fallback_to_heuristic
+        )
+        infer_started = perf_counter()
         try:
-            raw_probabilities = self._infer_probabilities(latest_features)
+            if self._predictor is not None:
+                blocked = str(getattr(self._predictor, "inference_blocked_reason", lambda: "")())
+                if blocked:
+                    raise ValueError(f"predictor_rejected:{blocked}")
+            if feature_quality_degraded:
+                raw_probabilities = _controlled_heuristic_probabilities(latest_features)
+            else:
+                raw_probabilities = self._infer_probabilities(latest_features)
         except ValueError as exc:
+            self._stage_ms_accum["inference_ms"] += (perf_counter() - infer_started) * 1000.0
             if not str(exc).startswith("predictor_rejected:"):
                 raise
             return PipelineSignal(
@@ -640,8 +683,36 @@ class AnalyzerPipeline:
                 probabilities={"lgbm": 0.0, "xgb": 0.0, "meta": 0.0},
                 reasons=[f"predictor_rejected:{exc}"],
             )
+        self._stage_ms_accum["inference_ms"] += (perf_counter() - infer_started) * 1000.0
         self._last_probability_health = self._probability_health.observe(raw_probabilities)
+        self._last_probability_health["feature_quality_degraded"] = feature_quality_degraded
+        self._last_probability_health["feature_quality_score"] = round(feature_quality_score, 4)
+        mode_details_fn = getattr(self._predictor, "mode_details", None)
+        if callable(mode_details_fn):
+            try:
+                details = mode_details_fn()
+                self._last_probability_health["predictor_degraded_model_mode"] = bool(
+                    isinstance(details, dict) and details.get("degraded_model_mode", False)
+                )
+            except Exception:
+                pass
         probabilities = sanitize_probabilities(raw_probabilities)
+        dynamic_history = None
+        if self._config.models.cross_review.dynamic_enabled and self._sample_store is not None:
+            try:
+                window_start = decision_time - timedelta(
+                    days=int(self._config.models.cross_review.dynamic_lookup_days)
+                )
+                recent_snapshots = self._sample_store.list_snapshots(
+                    time_window_start=window_start, time_window_end=decision_time
+                )
+                dynamic_history = [
+                    dict(s.model_outputs)
+                    for s in recent_snapshots
+                    if getattr(s, "model_outputs", None)
+                ]
+            except Exception:
+                dynamic_history = None
         champion_auc = self._active_champion_auc()
         cross_review = evaluate_cross_review(
             lgbm_prob=probabilities["lgbm"],
@@ -649,8 +720,9 @@ class AnalyzerPipeline:
             meta_prob=probabilities["meta"],
             config=self._config.models.cross_review,
             champion_auc=champion_auc,
+            dynamic_history=dynamic_history,
         )
-        news_component = self._score_news_component(
+        news_value, news_available = self._score_news_component(
             symbol=symbol,
             bars=analysis_bars,
             features=features,
@@ -666,10 +738,11 @@ class AnalyzerPipeline:
             "lgbm": probabilities["lgbm"],
             "xgb": probabilities["xgb"],
             "meta": probabilities["meta"],
-            "news": news_component,
             "board": board_component,
             "completion": completion_component,
         }
+        if news_available:
+            components["news"] = news_value
         bar_t1 = bars.iloc[-2] if len(bars) >= 2 else bars.iloc[-1]
         scored = self._score_engine.score(components=components, strategy=strategy)
         raw_score = scored.total_score
@@ -763,7 +836,9 @@ class AnalyzerPipeline:
         reasons.extend(financial_decision.reasons)
         if not bool(self._last_probability_health.get("promotion_allowed", True)):
             reasons.append("model_probability_unhealthy")
-        reasons.append(f"news_component:{news_component:.3f}")
+        reasons.append(f"news_component:{news_value:.3f}")
+        if not news_available:
+            reasons.append("news_component_unavailable")
         reasons.append(f"board_component:{board_component:.3f}")
         reasons.append(f"completion_component:{completion_component:.3f}")
         if fall_then_rise_decision.applied:
@@ -818,8 +893,15 @@ class AnalyzerPipeline:
                 "mode": str(cross_review.mode),
                 "degraded_consensus": bool(cross_review.degraded_consensus),
                 "thresholds": dict(cross_review.thresholds),
+                "dynamic": bool(cross_review.dynamic),
+                "dynamic_history_count": len(dynamic_history) if dynamic_history else 0,
             },
             "probability_health": dict(self._last_probability_health),
+            "feature_quality": {
+                "data_quality_score": round(feature_quality_score, 4),
+                "min_data_quality_score": float(quality_cfg.min_data_quality_score),
+                "degraded_to_heuristic": bool(feature_quality_degraded),
+            },
             "financial_gate": {
                 "allowed": bool(financial_decision.allowed),
                 "penalty_score": round(float(financial_decision.penalty_score), 2),
@@ -972,6 +1054,18 @@ class AnalyzerPipeline:
             blocked = str(getattr(self._predictor, "inference_blocked_reason", lambda: "")())
             if blocked:
                 raise ValueError(f"predictor_rejected:{blocked}")
+            mode_details_fn = getattr(self._predictor, "mode_details", None)
+            predictor_degraded = False
+            if callable(mode_details_fn):
+                try:
+                    details = mode_details_fn()
+                    predictor_degraded = bool(
+                        isinstance(details, dict) and details.get("degraded_model_mode", False)
+                    )
+                except Exception:
+                    predictor_degraded = False
+            if predictor_degraded:
+                return _controlled_heuristic_probabilities(feature_row)
             return self._predictor.predict_row(feature_row)
         return _controlled_heuristic_probabilities(feature_row)
 
@@ -1077,8 +1171,11 @@ class AnalyzerPipeline:
         bars: pd.DataFrame,
         features: pd.DataFrame,
         strategy: str,
-    ) -> float:
+    ) -> tuple[float, bool]:
+        availability_check = getattr(self._news_provider, "available", lambda symbol="": True)
         try:
+            if not bool(availability_check(symbol=symbol)):
+                return 0.50, False
             raw_value = self._news_provider.score(
                 symbol=symbol,
                 bars=bars,
@@ -1087,10 +1184,10 @@ class AnalyzerPipeline:
             )
             value = float(raw_value)
         except Exception:
-            return 0.50
+            return 0.50, False
         if not math.isfinite(value):
-            return 0.50
-        return max(0.0, min(1.0, value))
+            return 0.50, False
+        return max(0.0, min(1.0, value)), True
 
 
 def _liquidity_check(bar_t1: pd.Series, config: LiquidityFilterConfig) -> bool:

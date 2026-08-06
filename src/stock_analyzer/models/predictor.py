@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 from stock_analyzer.models.adapters import LightGBMAdapter, XGBoostAdapter
@@ -51,28 +50,38 @@ class SignalPredictor:
         return cls.from_artifact(artifact, artifact_root=artifact_path.parent)
 
     def predict_row(self, features: pd.Series) -> dict[str, float]:
+        batch = self.predict_rows(pd.DataFrame([features.to_dict()]))
+        return {key: values[0] for key, values in batch.items()}
+
+    def predict_rows(self, features: pd.DataFrame) -> dict[str, list[float]]:
+        """Vectorized inference for a matrix of engineered features.
+
+        Missing feature columns are filled with 0.0, mirroring ``predict_row``.
+        Returns per-column lists ``{"lgbm": [...], "xgb": [...], "meta": [...]}``.
+        """
         blocked = self.inference_blocked_reason()
         if blocked:
             raise ValueError(
                 f"predictor_rejected:{blocked}; refusing production inference on a legacy artifact"
             )
-        values = np.asarray(
-            [float(features.get(col, 0.0)) for col in self.feature_columns],
-            dtype=float,
-        )
-        matrix = values.reshape(1, -1)
+        if features.empty:
+            return {"lgbm": [], "xgb": [], "meta": []}
+        frame = features
+        if any(column not in frame.columns for column in self.feature_columns):
+            frame = frame.reindex(columns=self.feature_columns, fill_value=0.0)
+        matrix = frame[self.feature_columns].to_numpy(dtype=float)
 
         raw_lgbm = self.lgbm.predict_proba(matrix)
         raw_xgb = self.xgb.predict_proba(matrix)
-        lgbm_prob = float(self.lgbm_calibrator.predict(raw_lgbm)[0])
-        xgb_prob = float(self.xgb_calibrator.predict(raw_xgb)[0])
-        meta = lgbm_prob * self.meta_weights.get("lgbm", 0.5) + xgb_prob * self.meta_weights.get(
-            "xgb", 0.5
-        )
+        lgbm_probs = self.lgbm_calibrator.predict(raw_lgbm)
+        xgb_probs = self.xgb_calibrator.predict(raw_xgb)
+        lgbm_weight = self.meta_weights.get("lgbm", 0.5)
+        xgb_weight = self.meta_weights.get("xgb", 0.5)
+        meta_probs = lgbm_probs * lgbm_weight + xgb_probs * xgb_weight
         return {
-            "lgbm": _clamp_prob(lgbm_prob),
-            "xgb": _clamp_prob(xgb_prob),
-            "meta": _clamp_prob(meta),
+            "lgbm": [_clamp_prob(float(value)) for value in lgbm_probs],
+            "xgb": [_clamp_prob(float(value)) for value in xgb_probs],
+            "meta": [_clamp_prob(float(value)) for value in meta_probs],
         }
 
     def mode_details(self) -> dict[str, object]:

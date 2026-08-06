@@ -231,11 +231,23 @@ class CrossReviewConfig(_StrictModel):
     degraded_xgb_min: float = 0.36
     degraded_meta_min: float = 0.56
     degraded_merged_min: float = 0.62
+    dynamic_enabled: bool = True
+    dynamic_quantile: float = 0.70
+    dynamic_min_history: int = 20
+    dynamic_lookup_days: int = 60
+    dynamic_floor: float = 0.30
+
+
+class FeatureQualityConfig(_StrictModel):
+    enabled: bool = True
+    min_data_quality_score: float = 0.5
+    fallback_to_heuristic: bool = True
 
 
 class ModelsConfig(_StrictModel):
     calibration: str = "isotonic"
     cross_review: CrossReviewConfig
+    feature_quality: FeatureQualityConfig = Field(default_factory=FeatureQualityConfig)
     overfit_gap_threshold: float = 0.15
     include_random_feature_baseline: bool = True
     recent_data_weight_years: int = 3
@@ -321,6 +333,7 @@ class Week5Config(_StrictModel):
     universe_prefilter_lookback_days: int = 240
     universe_prefilter_top_k: int = 500
     universe_prefilter_shortlist_top_n: int = 50
+    week5_bars_cache_size: int = 600
     universe_quality_selector_enabled: bool = True
     universe_quality_target_size: int = 300
     universe_quality_min_history_days: int = 60

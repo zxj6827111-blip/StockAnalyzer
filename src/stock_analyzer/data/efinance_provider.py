@@ -91,12 +91,13 @@ class EfinanceProvider:
         trimmed["name"] = name
         trimmed["is_st"] = is_st
         trimmed["is_delisting_risk"] = is_delisting_risk
-        trimmed["roe"] = 0.08
-        trimmed["debt_ratio"] = 0.55
-        trimmed["financial_data_complete"] = True
-        trimmed["financial_missing_fields"] = ""
+        trimmed["roe"] = np.nan
+        trimmed["debt_ratio"] = np.nan
+        trimmed["financial_data_complete"] = False
+        trimmed["financial_missing_fields"] = "roe,debt_ratio"
         trimmed["financial_source"] = "efinance_default"
         trimmed["financial_report_date"] = ""
+        trimmed["financial_trust_level"] = "missing"
         trimmed["holder_count"] = _DEFAULT_HOLDER_COUNT
         trimmed["block_trade_net"] = 0.0
         trimmed["financing_balance"] = _DEFAULT_FINANCING_BALANCE
@@ -125,6 +126,7 @@ class EfinanceProvider:
                 "financial_missing_fields",
                 "financial_source",
                 "financial_report_date",
+                "financial_trust_level",
                 "holder_count",
                 "block_trade_net",
                 "financing_balance",

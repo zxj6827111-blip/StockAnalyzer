@@ -14,7 +14,12 @@ class ScoreEngine:
 
     def score(self, components: dict[str, float], strategy: str) -> ScoredSignal:
         weights, thresholds = self._resolve_profile(strategy)
-        normalized_weights = _normalize_weights(weights)
+        present_weights = {
+            name: weight for name, weight in weights.items() if name in components
+        }
+        if not present_weights:
+            present_weights = dict(weights)
+        normalized_weights = _normalize_weights(present_weights)
 
         total = 0.0
         normalized_components: dict[str, float] = {}
