@@ -22,6 +22,10 @@ from stock_analyzer.evolution.execution_aware_scoring import (
     normalize_execution_model_outputs,
     normalize_execution_risk_payload,
 )
+from stock_analyzer.feature.snapshot import (
+    load_feature_snapshot,
+    snapshot_is_current,
+)
 from stock_analyzer.learning.execution_risk_labels import build_execution_risk_feature_vector
 from stock_analyzer.models.execution_risk_predictor import ExecutionRiskPredictor
 from stock_analyzer.runtime.services.week5_notification_service import (
@@ -1046,6 +1050,31 @@ class RuntimeWeek5Service:
             return blocked
 
         now = timestamp or datetime.now()
+        snapshot_manifest = None
+        snapshot_frame = None
+        snapshot_current = False
+        if bool(service._config.week5.feature_snapshot_enabled):
+            try:
+                snapshot_manifest, snapshot_frame = load_feature_snapshot(service._config)
+                if snapshot_manifest is not None and snapshot_frame is not None:
+                    snapshot_current = snapshot_is_current(
+                        snapshot_manifest, service._config, now
+                    )
+            except Exception:
+                snapshot_manifest = None
+                snapshot_frame = None
+                snapshot_current = False
+        snapshot_mode = bool(
+            snapshot_manifest is not None
+            and snapshot_frame is not None
+            and snapshot_current
+        )
+        data_gate = service._build_data_gate(
+            snapshot_manifest=snapshot_manifest,
+            snapshot_current=snapshot_current,
+            latest_trade_date=str(snapshot_manifest.trade_date) if snapshot_manifest else "",
+            now=now,
+        )
         intraday_scheduler_mode = self._is_intraday_scheduler_week5_scan(
             now=now,
             sync_reason=sync_reason,
@@ -1255,10 +1284,25 @@ class RuntimeWeek5Service:
 
         symbol_list = [str(item).strip() for item in raw_symbols if str(item).strip()]
         if should_scan_universe and symbol_list and prefilter_enabled:
-            prefilter_report = service._prefilter_week5_universe_symbols(
-                symbols=symbol_list,
-                top_k_override=configured_prefilter_top_k,
-            )
+            if snapshot_mode:
+                light_target = max(
+                    1, int(service._config.week5.light_candidate_target)
+                )
+                allowed_exchanges_for_light = {
+                    str(item).strip().upper()
+                    for item in service._config.evolution.universe_spec.board_scope
+                    if str(item).strip()
+                }
+                prefilter_report = service._light_stage_from_snapshot(
+                    frame=snapshot_frame,
+                    target=light_target,
+                    allowed_exchanges=allowed_exchanges_for_light,
+                )
+            else:
+                prefilter_report = service._prefilter_week5_universe_symbols(
+                    symbols=symbol_list,
+                    top_k_override=configured_prefilter_top_k,
+                )
             prefilter_report["reason"] = "universe_scan"
             prefilter_report["universe_source"] = symbol_source
             if isinstance(universe_board_quota, dict):
@@ -1281,8 +1325,32 @@ class RuntimeWeek5Service:
                     for normalized in [_normalize_a_share_symbol(item.get("symbol"))]
                     if normalized
                 }
-            symbol_list = _string_list(prefilter_report.get("symbols", []))
+            prefilter_symbols = _string_list(prefilter_report.get("symbols", []))
+            if not prefilter_symbols:
+                prefilter_symbols = [
+                    str(item.get("symbol", "")).strip()
+                    for item in raw_shortlisted
+                    if isinstance(item, dict) and str(item.get("symbol", "")).strip()
+                ]
+            symbol_list = prefilter_symbols
             symbol_source = f"{symbol_source}:prefilter"
+
+        deep_report: dict[str, object] = {}
+        if snapshot_mode:
+            deep_report = service._deep_stage_from_snapshot(
+                frame=snapshot_frame,
+                target=max(1, int(service._config.week5.deep_candidate_target)),
+                light_report=prefilter_report,
+            )
+            deep_symbols = [
+                str(item.get("symbol", "")).strip()
+                for item in deep_report.get("selected", [])
+                if isinstance(item, dict) and str(item.get("symbol", "")).strip()
+            ]
+            if deep_symbols:
+                symbol_list = deep_symbols
+                symbol_source = f"{symbol_source}:snapshot_deep"
+            prefilter_report["deep_stage"] = deep_report
 
         quality_selector_mode = (
             str(quality_selection_report.get("selector_mode", "")).strip()
@@ -1517,6 +1585,11 @@ class RuntimeWeek5Service:
             item["shortlist_rank"] = index + 1
             item["shortlist_selected"] = index < shortlist_top_n
 
+        final_selector = service._final_signal_selector(
+            signals=signal_pool_candidates,
+            data_gate_status=str(data_gate.get("status", "ok")),
+        )
+
         shortlist_preview = [
             {
                 "symbol": str(item.get("symbol", "")).strip(),
@@ -1643,6 +1716,31 @@ class RuntimeWeek5Service:
             "symbol_source": symbol_source,
             "scan_profile": scan_profile.strip() or "default",
             "prefilter": prefilter_report,
+            "data_snapshot_id": str(snapshot_manifest.data_snapshot_id)
+            if snapshot_manifest is not None
+            else "",
+            "data_gate": dict(data_gate),
+            "funnel": {
+                "mode": "snapshot" if snapshot_mode else "direct",
+                "light_candidate_target": max(
+                    1, int(service._config.week5.light_candidate_target)
+                ),
+                "deep_candidate_target": max(
+                    1, int(service._config.week5.deep_candidate_target)
+                ),
+                "final_signal_cap": max(
+                    0, int(service._config.week5.final_signal_cap)
+                ),
+                "allow_zero_signal": bool(service._config.week5.allow_zero_signal),
+                "light_count": _as_int(
+                    prefilter_report.get("shortlisted_count", 0), default=0
+                ),
+                "deep_count": len(symbol_list),
+                "final_count": _as_int(
+                    final_selector.get("selected_count", 0), default=0
+                ),
+                "final_selection": dict(final_selector),
+            },
             "runtime_source": {
                 "mode": (
                     "realtime_overlay"

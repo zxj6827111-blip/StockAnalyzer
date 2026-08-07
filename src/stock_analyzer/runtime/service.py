@@ -52,6 +52,7 @@ from stock_analyzer.evolution.shadow_dataset_builder import ShadowDatasetBuilder
 from stock_analyzer.evolution.shadow_online_v2_report import ShadowOnlineV2ReportBuilder
 from stock_analyzer.feature.engineer import FeatureEngineer
 from stock_analyzer.feature.market_context import build_market_relative_frame
+from stock_analyzer.feature.snapshot import RAW_SNAPSHOT_COLUMNS as _FEATURE_SNAPSHOT_RAW_COLUMNS
 from stock_analyzer.infra.cache import CacheStore, InMemoryCache, RedisCache
 from stock_analyzer.labels.soup import build_soup_labels
 from stock_analyzer.learning.backfill import LearningBackfillEngine
@@ -122,6 +123,7 @@ from stock_analyzer.runtime.services.week6_service import RuntimeWeek6Service
 from stock_analyzer.runtime.services.week7_sim_broker_service import (
     RuntimeWeek7SimBrokerService,
 )
+from stock_analyzer.signal.cross_review import evaluate_cross_review
 from stock_analyzer.stress.scenarios import run_default_stress_suite
 from stock_analyzer.types import PipelineSignal, SignalAction
 from stock_analyzer.week6.engines import (
@@ -5769,6 +5771,486 @@ class StockAnalyzerService:
                 },
                 "reason_codes": stage1_reasons,
             },
+        }
+
+    def _prefilter_week5_from_snapshot_row(
+        self,
+        row: object,
+    ) -> dict[str, object] | None:
+        """Light-stage scoring from one feature-snapshot row.
+
+        Mirrors ``_prefilter_week5_universe_symbol``'s baseline score using the
+        raw snapshot columns, so snapshot mode and direct-bars mode rank
+        identically.
+        """
+        try:
+            data = pd.Series(row) if not isinstance(row, pd.Series) else row
+        except Exception:
+            return None
+        symbol = str(data.get("symbol", "")).strip()
+        normalized = _normalize_a_share_symbol(symbol)
+        if not normalized:
+            return None
+        exchange = _exchange_from_a_share_symbol(normalized)
+        if _coerce_bool(data.get("suspended", False)):
+            return None
+        if _coerce_bool(data.get("is_st", False)) or _coerce_bool(
+            data.get("is_delisting_risk", False)
+        ):
+            return None
+
+        latest_close = _as_float(data.get("latest_close"), default=0.0)
+        ma20 = _as_float(data.get("ma20"), default=0.0)
+        ma60 = _as_float(data.get("ma60"), default=0.0)
+        ma120 = _as_float(data.get("ma120"), default=0.0)
+        ma240 = _as_float(data.get("ma240"), default=0.0)
+        ret20 = _as_float(data.get("ret20"), default=0.0)
+        ret60 = _as_float(data.get("ret60"), default=0.0)
+        ret120 = _as_float(data.get("ret120"), default=0.0)
+        recent_high = _as_float(data.get("recent_high"), default=latest_close)
+        avg_turnover20 = _as_float(data.get("avg_turnover_20"), default=0.0)
+        avg_turnover60 = _as_float(data.get("avg_turnover_60"), default=0.0)
+        heat_ratio = avg_turnover20 / max(avg_turnover60, 1.0)
+        volatility20 = _as_float(data.get("volatility_20d"), default=0.0)
+        atr20 = _as_float(data.get("atr_20d"), default=0.0)
+        atr60 = _as_float(data.get("atr_60d"), default=atr20)
+        volume5 = _as_float(data.get("volume_5d"), default=0.0)
+        volume20 = _as_float(data.get("volume_20d"), default=0.0)
+        volume_expansion = volume5 / max(volume20, 1.0)
+        latest_float_market_cap = _as_float(data.get("float_market_cap"), default=0.0)
+        turnover_rate20 = _as_float(data.get("turnover_rate_20d"), default=0.0)
+        holder_count_chg60 = _as_float(data.get("holder_count_chg_60d"), default=0.0)
+        northbound_net20 = _as_float(data.get("northbound_net_20d"), default=0.0)
+        northbound_flow_ratio20 = northbound_net20 / max(avg_turnover20 * 20.0, 1.0)
+        dragon_tiger_freq20 = _as_float(data.get("dragon_tiger_freq_20d"), default=0.0)
+        financial_complete = _coerce_bool(data.get("financial_data_complete", True))
+        background_complete = _coerce_bool(data.get("background_data_complete", True))
+
+        ma_alignment = (
+            0.30 * float(latest_close >= ma20)
+            + 0.30 * float(latest_close >= ma60)
+            + 0.25 * float(latest_close >= ma120)
+            + 0.15 * float(latest_close >= ma240)
+        )
+        momentum_component = (
+            0.40 * _clip01(ret20 / 0.18)
+            + 0.35 * _clip01(ret60 / 0.35)
+            + 0.25 * _clip01(ret120 / 0.60)
+        )
+        breakout_component = _clip01((latest_close / max(recent_high, 1e-9) - 0.82) / 0.18)
+        trend_component = _clip01(
+            0.45 * ma_alignment + 0.35 * momentum_component + 0.20 * breakout_component
+        )
+
+        holder_component = _clip01((0.05 - holder_count_chg60) / 0.10)
+        northbound_component = _clip01((northbound_flow_ratio20 + 0.02) / 0.04)
+        dragon_tiger_component = 0.30 + 0.70 * _clip01(dragon_tiger_freq20 / 0.08)
+        capital_flow_component = _clip01(
+            0.45 * holder_component + 0.35 * northbound_component + 0.20 * dragon_tiger_component
+        )
+
+        atr_compression = _clip01((1.10 - atr20 / max(atr60, 1e-6)) / 0.40)
+        volume_expansion_component = _clip01((volume_expansion - 0.90) / 0.90)
+        heat_component = _clip01((heat_ratio - 0.85) / 0.65)
+        price_volume_component = _clip01(
+            0.40 * volume_expansion_component + 0.30 * atr_compression + 0.30 * heat_component
+        )
+
+        turnover_component = _clip01(math.log10(max(avg_turnover20, 1.0)) / 9.0)
+        market_cap_component = _clip01(math.log10(max(latest_float_market_cap, 1.0)) / 11.0)
+        turnover_rate_component = _clip01((turnover_rate20 - 0.001) / 0.02)
+        quality_component = 0.50 * (1.0 if financial_complete else 0.35) + 0.50 * (
+            1.0 if background_complete else 0.35
+        )
+        background_completion_score = float(
+            np.mean(
+                [
+                    1.0 if _coerce_bool(data.get("bg_holder_present", False)) else 0.0,
+                    1.0 if _coerce_bool(data.get("bg_block_trade_present", False)) else 0.0,
+                    1.0 if _coerce_bool(data.get("bg_financing_present", False)) else 0.0,
+                    1.0 if _coerce_bool(data.get("bg_northbound_present", False)) else 0.0,
+                    1.0 if _coerce_bool(data.get("bg_dragon_tiger_present", False)) else 0.0,
+                    1.0 if _coerce_bool(data.get("bg_roe_present", False)) else 0.0,
+                    1.0 if _coerce_bool(data.get("bg_debt_ratio_present", False)) else 0.0,
+                    1.0 if background_complete else 0.0,
+                ]
+            )
+        )
+        liquidity_component = _clip01(
+            0.45 * turnover_component
+            + 0.25 * market_cap_component
+            + 0.15 * turnover_rate_component
+            + 0.15 * quality_component
+        )
+
+        drawdown_from_high = max(0.0, 1.0 - latest_close / max(recent_high, 1e-9))
+        volatility_penalty = _clip01(max(volatility20 - 0.05, 0.0) / 0.10)
+        drawdown_penalty = _clip01(max(drawdown_from_high - 0.08, 0.0) / 0.22)
+        risk_penalty = _clip01(0.65 * volatility_penalty + 0.35 * drawdown_penalty)
+
+        baseline_score = round(
+            100.0
+            * _clip01(
+                0.40 * trend_component
+                + 0.25 * capital_flow_component
+                + 0.15 * price_volume_component
+                + 0.10 * liquidity_component
+                - 0.10 * risk_penalty
+            ),
+            4,
+        )
+
+        stage1_reasons: list[str] = []
+        if latest_close >= ma60:
+            stage1_reasons.append("trend_above_ma60")
+        if ret60 > 0.08:
+            stage1_reasons.append("ret60_positive")
+        if capital_flow_component >= 0.55:
+            stage1_reasons.append("capital_flow_support")
+        if price_volume_component >= 0.55:
+            stage1_reasons.append("price_volume_support")
+        if liquidity_component >= 0.55:
+            stage1_reasons.append("liquidity_ok")
+        if risk_penalty >= 0.45:
+            stage1_reasons.append("risk_penalty_high")
+        if not financial_complete:
+            stage1_reasons.append("financial_data_partial")
+        if not background_complete:
+            stage1_reasons.append("background_data_partial")
+
+        return {
+            "symbol": normalized,
+            "exchange": exchange,
+            "score": baseline_score,
+            "baseline_score": baseline_score,
+            "history_days": 0,
+            "avg_turnover_20": round(avg_turnover20, 2),
+            "avg_turnover_60": round(avg_turnover60, 2),
+            "ret_20d": round(ret20, 6),
+            "ret_60d": round(ret60, 6),
+            "ret_120d": round(ret120, 6),
+            "heat_ratio": round(heat_ratio, 6),
+            "volatility_20d": round(volatility20, 6),
+            "float_market_cap": round(latest_float_market_cap, 2),
+            "turnover_rate_20d": round(turnover_rate20, 6),
+            "holder_count_chg_60d": round(holder_count_chg60, 6),
+            "northbound_net_20d": round(northbound_net20, 2),
+            "dragon_tiger_freq_20d": round(dragon_tiger_freq20, 6),
+            "volume_expansion_5d_20d": round(volume_expansion, 6),
+            "atr_20d": round(atr20, 6),
+            "atr_60d": round(atr60, 6),
+            "atr_compression": round(atr_compression, 6),
+            "financial_data_complete": financial_complete,
+            "background_data_complete": background_complete,
+            "background_completion_score": round(background_completion_score, 6),
+            "stage1": {
+                "score": baseline_score,
+                "score_key": "baseline_score",
+                "factors": {
+                    "trend": round(trend_component, 6),
+                    "capital_flow": round(capital_flow_component, 6),
+                    "price_volume": round(price_volume_component, 6),
+                    "liquidity": round(liquidity_component, 6),
+                    "risk_penalty": round(risk_penalty, 6),
+                },
+                "reason_codes": stage1_reasons,
+            },
+        }
+
+    def _light_stage_from_snapshot(
+        self,
+        *,
+        frame: pd.DataFrame,
+        target: int,
+        allowed_exchanges: set[str],
+    ) -> dict[str, object]:
+        """Funnel light stage: rank the snapshot universe by baseline score."""
+        candidates: list[dict[str, object]] = []
+        skipped = 0
+        for _, row in frame.iterrows():
+            candidate = self._prefilter_week5_from_snapshot_row(row)
+            if candidate is None:
+                skipped += 1
+                continue
+            exchange = str(candidate.get("exchange", "")).strip()
+            if allowed_exchanges and exchange and exchange not in allowed_exchanges:
+                skipped += 1
+                continue
+            candidates.append(candidate)
+        ranked = sorted(
+            candidates,
+            key=lambda item: (
+                -_as_float(item.get("baseline_score"), default=0.0),
+                -_as_float(item.get("avg_turnover_20"), default=0.0),
+                str(item.get("symbol", "")),
+            ),
+        )
+        shortlisted = ranked[: max(1, int(target))]
+        return {
+            "enabled": True,
+            "applied": True,
+            "mode": "snapshot_light",
+            "universe_count": len(candidates) + skipped,
+            "eligible_count": len(candidates),
+            "skipped_count": skipped,
+            "shortlisted_count": len(shortlisted),
+            "shortlisted": shortlisted,
+        }
+
+    def _deep_stage_from_snapshot(
+        self,
+        *,
+        frame: pd.DataFrame,
+        target: int,
+        light_report: dict[str, object],
+    ) -> dict[str, object]:
+        """Funnel deep stage: model batch inference + cross-review, keep target."""
+        shortlisted = _snapshot_shortlist(light_report)
+        if not shortlisted:
+            return {
+                "applied": True,
+                "mode": "snapshot_deep",
+                "input_count": 0,
+                "selected_count": 0,
+                "selected": [],
+                "cross_review_passed": 0,
+            }
+        symbols = [
+            str(item.get("symbol", "")).strip() for item in shortlisted if str(item.get("symbol"))
+        ]
+        by_symbol = {
+            str(item.get("symbol", "")).strip(): item for item in shortlisted if str(item.get("symbol"))
+        }
+        rows = frame[frame["symbol"].isin(symbols)]
+        feature_columns = [
+            column
+            for column in rows.columns
+            if column
+            not in {
+                "symbol",
+                "trade_date",
+                *_FEATURE_SNAPSHOT_RAW_COLUMNS,
+            }
+        ]
+        probabilities: dict[str, list[float]] | None = None
+        predictor = getattr(self._pipeline, "_predictor", None)
+        if predictor is not None and callable(getattr(predictor, "predict_rows", None)):
+            try:
+                probabilities = predictor.predict_rows(rows[feature_columns])
+            except Exception:
+                probabilities = None
+
+        champion_auc = None
+        model_registry = getattr(self, "_model_registry", None)
+        if model_registry is not None:
+            try:
+                champion = model_registry.active_champion(suppress_read_errors=True)
+                if champion is not None:
+                    metrics = getattr(champion, "metrics_summary", {})
+                    if isinstance(metrics, dict):
+                        try:
+                            champion_auc = float(metrics.get("auc"))
+                        except (TypeError, ValueError):
+                            champion_auc = None
+            except Exception:
+                champion_auc = None
+
+        selected: list[dict[str, object]] = []
+        cross_review_passed = 0
+        for index, row in rows.iterrows():
+            symbol = str(row.get("symbol", "")).strip()
+            light = by_symbol.get(symbol)
+            if light is None:
+                continue
+            lgbm = xgb = meta = 0.5
+            if probabilities is not None:
+                position = list(rows.index).index(index)
+                lgbm = float(probabilities["lgbm"][position])
+                xgb = float(probabilities["xgb"][position])
+                meta = float(probabilities["meta"][position])
+            cross_review = evaluate_cross_review(
+                lgbm_prob=lgbm,
+                xgb_prob=xgb,
+                meta_prob=meta,
+                config=self._config.models.cross_review,
+                champion_auc=champion_auc,
+            )
+            if cross_review.passed:
+                cross_review_passed += 1
+            baseline = _as_float(light.get("baseline_score"), default=0.0)
+            funnel_score = round(
+                100.0
+                * _clip01(
+                    0.55 * max(lgbm, xgb, meta)
+                    + 0.45 * _clip01(baseline / 100.0)
+                ),
+                4,
+            )
+            selected.append(
+                {
+                    "symbol": symbol,
+                    "baseline_score": baseline,
+                    "funnel_score": funnel_score,
+                    "lgbm": round(lgbm, 4),
+                    "xgb": round(xgb, 4),
+                    "meta": round(meta, 4),
+                    "cross_review_passed": bool(cross_review.passed),
+                    "cross_review_reasons": list(cross_review.reasons),
+                }
+            )
+        selected.sort(
+            key=lambda item: (
+                -_as_float(item.get("funnel_score"), default=0.0),
+                -_as_float(item.get("baseline_score"), default=0.0),
+                str(item.get("symbol", "")),
+            )
+        )
+        capped = selected[: max(1, int(target))]
+        return {
+            "applied": True,
+            "mode": "snapshot_deep",
+            "input_count": len(selected),
+            "cross_review_passed": cross_review_passed,
+            "selected_count": len(capped),
+            "selected": capped,
+        }
+
+    def _final_signal_selector(
+        self,
+        *,
+        signals: list[object],
+        data_gate_status: str,
+    ) -> dict[str, object]:
+        """Funnel final stage: gates + threshold -> at most ``final_signal_cap``."""
+        cap = max(0, int(self._config.week5.final_signal_cap))
+        allow_zero = bool(self._config.week5.allow_zero_signal)
+        min_threshold = _as_float(self._config.week5.final_signal_min_threshold, default=70.0)
+        selected: list[dict[str, object]] = []
+        rejected: list[dict[str, object]] = []
+        for signal in signals:
+            if not isinstance(signal, dict):
+                continue
+            symbol = str(signal.get("symbol", "")).strip()
+            score = _as_float(signal.get("score"), default=0.0)
+            action = str(signal.get("action", "")).strip()
+            trace = _coerce_object_mapping(signal.get("decision_trace"))
+            risk_gate = _coerce_object_mapping(trace.get("risk_gate"))
+            cross_review_gate = _coerce_object_mapping(trace.get("cross_review_gate"))
+            reasons: list[str] = []
+            if data_gate_status != "ok":
+                reasons.append(f"data_gate:{data_gate_status}")
+            if not bool(risk_gate.get("passed", False)):
+                reasons.append("risk_gate_failed")
+            if not bool(cross_review_gate.get("passed", False)):
+                reasons.append("cross_review_failed")
+            if score < min_threshold:
+                reasons.append("below_min_threshold")
+            if any(reason.startswith("predictor_rejected:") for reason in _string_list(signal.get("reasons"))):
+                reasons.append("predictor_rejected")
+            if not reasons:
+                selected.append(
+                    {
+                        "symbol": symbol,
+                        "score": round(score, 4),
+                        "action": action,
+                        "final_signal_reasons": reasons,
+                    }
+                )
+            else:
+                rejected.append(
+                    {
+                        "symbol": symbol,
+                        "score": round(score, 4),
+                        "action": action,
+                        "reject_reasons": reasons,
+                    }
+                )
+        selected.sort(
+            key=lambda item: (-_as_float(item.get("score"), default=0.0), str(item.get("symbol", "")))
+        )
+        capped = selected[:cap] if cap > 0 else []
+        return {
+            "applied": True,
+            "mode": "final_selection",
+            "input_count": len(signals),
+            "final_signal_cap": cap,
+            "allow_zero_signal": allow_zero,
+            "min_threshold": min_threshold,
+            "selected_count": len(capped),
+            "rejected_count": len(rejected),
+            "final_signals": capped,
+            "rejected": rejected,
+        }
+
+    def _build_data_gate(
+        self,
+        *,
+        snapshot_manifest: object,
+        snapshot_current: bool,
+        latest_trade_date: str,
+        now: object | None = None,
+    ) -> dict[str, object]:
+        """Data trust gate: ok / watch_only / blocked with reasons."""
+        status = "ok"
+        reasons: list[str] = []
+        current = now or datetime.now(UTC)
+
+        provider_status = {}
+        status_fn = getattr(self._provider, "status", None)
+        if callable(status_fn):
+            try:
+                provider_status = status_fn()
+            except Exception:
+                provider_status = {}
+        if isinstance(provider_status, dict):
+            if bool(provider_status.get("degraded_mode", False)):
+                reasons.append("provider_degraded")
+            if bool(provider_status.get("hard_degraded_mode", False)):
+                reasons.append("provider_hard_degraded")
+            provider_key = str(
+                provider_status.get("provider_key", provider_status.get("provider_mode", ""))
+            ).lower()
+            if provider_key and "synthetic" in provider_key:
+                reasons.append("provider_synthetic")
+
+        if str(latest_trade_date).strip():
+            parsed_date = _parse_iso_date(latest_trade_date)
+            if parsed_date is not None:
+                staleness = (current.date() - parsed_date).days
+                max_staleness = max(
+                    0,
+                    _as_int(self._config.week5.max_data_staleness_days, default=3),
+                )
+                if staleness > max_staleness:
+                    reasons.append(f"data_stale:{staleness}d")
+
+        snapshot_enabled = bool(self._config.week5.feature_snapshot_enabled)
+        require_current = bool(self._config.week5.feature_snapshot_require_current)
+        if snapshot_enabled and require_current:
+            if snapshot_manifest is None or not snapshot_current:
+                reasons.append("feature_snapshot_stale")
+
+        if any(reason.startswith("provider_") or reason.startswith("feature_snapshot") for reason in reasons):
+            status = "blocked"
+        elif reasons:
+            status = "watch_only"
+
+        source_trust_levels: dict[str, object] = {
+            "provider": str(provider_status.get("provider_mode", "")),
+            "degraded_mode": bool(provider_status.get("degraded_mode", False)),
+            "synthetic_fallback_allowed": bool(
+                self._config.data_source.synthetic_fallback_allowed
+            ),
+            "synthetic": bool(provider_status and "synthetic" in str(
+                provider_status.get("provider_key", provider_status.get("provider_mode", ""))
+            ).lower()),
+        }
+        financial_trust_level = "missing"
+        return {
+            "status": status,
+            "reasons": reasons,
+            "source_trust_levels": source_trust_levels,
+            "financial_trust_level": financial_trust_level,
         }
 
     def _fetch_week5_bars_cached(
@@ -20348,6 +20830,35 @@ def _extract_intraday_record_fields(
             _as_float(latest.get(column), default=0.0) if column in latest.index else None
         )
     return payload
+
+
+def _parse_iso_date(value: object) -> date | None:
+    """Best-effort YYYY-MM-DD / YYYYMMDD / ISO datetime -> date."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if len(text) == 8 and text.isdigit():
+        try:
+            return datetime.strptime(text, "%Y%m%d").date()
+        except ValueError:
+            return None
+    try:
+        return datetime.fromisoformat(text[:10]).date()
+    except ValueError:
+        return None
+
+
+def _snapshot_shortlist(report: object) -> list[dict[str, object]]:
+    if not isinstance(report, dict):
+        return []
+    raw = report.get("shortlisted")
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, dict)]
 
 
 def _string_list(value: object) -> list[str]:
