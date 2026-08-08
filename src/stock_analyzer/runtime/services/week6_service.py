@@ -135,7 +135,12 @@ class RuntimeWeek6Service:
             )
 
         coverage_by_field = {
-            field: round(field_valid_counts.get(field, 0) / max(success, 1), 4)
+            # Denominator is the FULL watchlist (success + failed): a symbol
+            # that returned no bars contributes zero coverage, so partial
+            # failures cannot masquerade as a healthy 1.0 coverage ratio.
+            field: round(
+                field_valid_counts.get(field, 0) / max(success + failed, 1), 4
+            )
             for field in quality_fields
         }
         overall_coverage = 0.0
@@ -145,6 +150,7 @@ class RuntimeWeek6Service:
             coverage_by_field[field] for field in core_fields if field in coverage_by_field
         ]
         core_coverage_min = min(core_coverage_values) if core_coverage_values else overall_coverage
+        failed_ratio = round(failed / max(success + failed, 1), 4)
 
         warn_threshold = _clamp(service._config.week6.data_quality_warn_threshold, 0.0, 1.0)
         critical_threshold = _clamp(
@@ -174,6 +180,7 @@ class RuntimeWeek6Service:
             "overall_coverage_ratio": round(overall_coverage, 4),
             "success_symbols": success,
             "failed_symbols": failed,
+            "failed_ratio": failed_ratio,
             "coverage_by_field": coverage_by_field,
             "core_coverage_min": round(core_coverage_min, 4),
             "warn_threshold": round(warn_threshold, 4),
@@ -194,6 +201,7 @@ class RuntimeWeek6Service:
                 "core_coverage_min": report["core_coverage_min"],
                 "success_symbols": success,
                 "failed_symbols": failed,
+                "failed_ratio": failed_ratio,
                 "warn_fields": warn_fields,
                 "critical_fields": critical_fields,
             },
