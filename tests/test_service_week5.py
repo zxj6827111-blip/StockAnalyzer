@@ -147,6 +147,11 @@ def _load_test_config() -> StockAnalyzerConfig:
     config.command_channel.history_archive_enabled = False
     config.week5.auto_notify = False
     config.week5.first_board_windows = ["09:30-09:31"]
+    # These tests exercise the funnel/rerank logic, not the snapshot gate; the
+    # gate itself is covered in test_feature_snapshot.  Without this, the
+    # default require_current=True would block every scan for the missing
+    # snapshot and starve the funnel tests of signals.
+    config.week5.feature_snapshot_require_current = False
     # Default to legacy universe path for existing tests; tests that exercise the
     # quality selector enable it explicitly via _enable_universe_quality_selector.
     config.week5.universe_quality_selector_enabled = False

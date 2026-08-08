@@ -336,7 +336,7 @@ class Week5Config(_StrictModel):
     universe_prefilter_shortlist_top_n: int = 50
     week5_bars_cache_size: int = 600
     # Candidate funnel: full market -> light -> deep -> final (0..cap).
-    light_candidate_target: int = 150
+    light_candidate_target: int = 100
     deep_candidate_target: int = 20
     final_signal_cap: int = 5
     allow_zero_signal: bool = True
@@ -347,15 +347,16 @@ class Week5Config(_StrictModel):
     feature_snapshot_lookback_days: int = 250
     feature_snapshot_max_age_days: int = 3
     feature_snapshot_require_current: bool = True
-    # A snapshot whose last refresh left more than (1 - ratio) of the dirty
-    # symbols failed is not published as fully current.
-    feature_snapshot_min_coverage_ratio: float = 0.95
+    # Strict fail-close: any symbol that failed the last snapshot refresh
+    # makes the snapshot NOT fully current (no signals rather than wrong
+    # signals).
+    feature_snapshot_min_coverage_ratio: float = 1.0
     # Data-quality gate thresholds (week6 prewarm coverage score).
     data_quality_pass_threshold: float = 0.88
     data_quality_watch_threshold: float = 0.72
     max_data_staleness_days: int = 3
     universe_quality_selector_enabled: bool = True
-    universe_quality_target_size: int = 300
+    universe_quality_target_size: int = 100
     universe_quality_min_history_days: int = 60
     universe_quality_min_avg_turnover_20: float = 5_000_000.0
     universe_quality_min_float_market_cap: float = 300_000_000.0

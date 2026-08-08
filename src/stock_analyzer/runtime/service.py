@@ -14422,6 +14422,7 @@ class StockAnalyzerService:
         universe_max_symbols_override: int | None = None,
         pinned_symbols: list[str] | None = None,
         scan_profile: str = "",
+        recovery_mode: bool = False,
     ) -> dict[str, object]:
         return self._week5_service.run_week5_scan(
             symbols=symbols,
@@ -14436,6 +14437,7 @@ class StockAnalyzerService:
             universe_max_symbols_override=universe_max_symbols_override,
             pinned_symbols=pinned_symbols,
             scan_profile=scan_profile,
+            recovery_mode=recovery_mode,
         )
 
     def _build_week5_scan_notification_content(

@@ -1055,6 +1055,7 @@ class RuntimeWeek5Service:
         universe_max_symbols_override: int | None = None,
         pinned_symbols: list[str] | None = None,
         scan_profile: str = "",
+        recovery_mode: bool = False,
     ) -> dict[str, object]:
         service = self._service
         if service._bootstrap_runtime_blocked():
@@ -1665,23 +1666,32 @@ class RuntimeWeek5Service:
             item["shortlist_rank"] = index + 1
             item["shortlist_selected"] = index < shortlist_top_n
 
-        # The funnel's final selector only rejects signals on data-trust
-        # problems (degraded/synthetic provider, low data-quality score).  A
-        # blocked gate caused solely by a missing/stale snapshot is a
-        # performance-contract issue: the scheduler path already fail-closes
-        # at the universe-scan entry, while manual recovery scans may still
-        # run (emergency full scan) against direct bars.
+        # The funnel's final selector rejects signals on data-trust problems
+        # (degraded/synthetic provider, low data-quality score).  A blocked
+        # gate caused solely by a missing/stale snapshot is a
+        # performance-contract issue: the scheduler path fail-closes at the
+        # universe-scan entry.  Only an EXPLICIT recovery run may proceed
+        # against direct bars, and even then it is advisory only — its output
+        # never feeds final_signals or the watchlist.
         gate_reasons = [str(item) for item in (data_gate.get("reasons") or [])]
         snapshot_only_blocked = bool(gate_reasons) and all(
             reason.startswith("feature_snapshot") for reason in gate_reasons
         )
+        recovery_direct_scan = bool(recovery_mode) and snapshot_only_blocked
         final_selector_gate_status = (
-            "ok" if snapshot_only_blocked else str(data_gate.get("status", "ok"))
+            "ok" if recovery_direct_scan else str(data_gate.get("status", "ok"))
         )
         final_selector = service._final_signal_selector(
             signals=signal_pool_candidates,
             data_gate_status=final_selector_gate_status,
         )
+        if recovery_direct_scan:
+            # Advisory only: the output is inspected, never treated as a
+            # production signal source.
+            final_selector["advisory_only"] = True
+            for item in final_selector.get("final_signals", []):
+                if isinstance(item, dict):
+                    item["advisory"] = True
 
         shortlist_preview = [
             {
@@ -1808,6 +1818,8 @@ class RuntimeWeek5Service:
             "watchlist_size": len(symbol_list),
             "symbol_source": symbol_source,
             "scan_profile": scan_profile.strip() or "default",
+            "emergency_direct_scan": recovery_direct_scan,
+            "recovery_mode": bool(recovery_mode),
             "prefilter": prefilter_report,
             "data_snapshot_id": str(snapshot_manifest.data_snapshot_id)
             if snapshot_manifest is not None
@@ -1905,6 +1917,10 @@ class RuntimeWeek5Service:
             else (symbols is None and bool(service._config.week5.auto_sync_watchlist))
         )
         should_sync_watchlist = requested_watchlist_sync and not intraday_scheduler_mode
+        # An explicit recovery run is advisory only: it must not mutate the
+        # watchlist or feed production signal channels.
+        if recovery_mode:
+            should_sync_watchlist = False
         watchlist_sync: dict[str, object] = {
             "enabled": requested_watchlist_sync,
             "updated": False,

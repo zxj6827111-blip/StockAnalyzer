@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import zipfile
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -257,12 +258,10 @@ def snapshot_is_current(
         and current_factor_hash != manifest.factor_archive_hash
     ):
         return False
-    # Completeness: a refresh that left dirty symbols failed must NOT be
-    # published as fully current (stale rows would be served silently).
-    min_coverage = _clamp01(
-        float(getattr(config.week5, "feature_snapshot_min_coverage_ratio", 1.0))
-    )
-    if manifest.coverage_ratio < min_coverage:
+    # Completeness: any symbol that failed the last refresh must NOT be
+    # published as fully current (stale rows would be served silently and the
+    # failures would be hidden).  Strict fail-close: zero tolerance.
+    if manifest.failed_symbols > 0:
         return False
     return True
 
@@ -367,40 +366,56 @@ def build_feature_snapshot(
         provider_status=provider_status,
     )
 
+    # Parallel full build: thread pool for the I/O-bound fetch, process pool
+    # for the CPU-bound feature engineering (max_workers is real here too).
+    workers = max(1, min(8, int(max_workers)))
+
+    def _fetch_full(symbol: str) -> tuple[str, pd.DataFrame | None]:
+        try:
+            bars = provider.fetch_daily_bars(symbol=symbol, lookback_days=lookback)
+            if bars is not None and isinstance(bars, pd.DataFrame) and not bars.empty:
+                return symbol, bars
+        except Exception:
+            pass
+        return symbol, None
+
+    bars_by_symbol: dict[str, pd.DataFrame] = {}
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for symbol, bars in executor.map(_fetch_full, normalized_symbols):
+            if bars is not None:
+                bars_by_symbol[symbol] = bars
+    failed = [symbol for symbol in normalized_symbols if symbol not in bars_by_symbol]
+
+    payloads = [
+        (symbol, bars_by_symbol[symbol].reset_index().to_dict("list"), engineer)
+        for symbol in bars_by_symbol
+    ]
     rows: list[pd.DataFrame] = []
-    failed: list[str] = []
-    bar_fingerprints: dict[str, str] = {}
-    tails_by_symbol: dict[str, pd.DataFrame] = {}
-    for index in range(0, len(normalized_symbols), 500):
-        batch = normalized_symbols[index : index + 500]
-        batch_rows: list[pd.DataFrame] = []
-        for symbol in batch:
-            try:
-                bars = provider.fetch_daily_bars(symbol=symbol, lookback_days=lookback)
-            except Exception:
-                failed.append(symbol)
-                continue
-            if bars is None or not isinstance(bars, pd.DataFrame) or bars.empty:
-                failed.append(symbol)
-                continue
-            row = _snapshot_row_for_symbol(
-                bars=bars,
-                symbol=symbol,
-                engineer=engineer,
-            )
-            if row is not None:
-                batch_rows.append(row)
-                bar_fingerprints[symbol] = _bar_tail_fingerprint(bars)
-                tails_by_symbol[symbol] = bars.tail(lookback)
-        if batch_rows:
-            rows.append(pd.concat(batch_rows, ignore_index=True))
-        if callable(on_progress):
-            on_progress(min(index + 500, len(normalized_symbols)), len(normalized_symbols))
+    if payloads and workers > 1:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            for _symbol, row_dict in executor.map(_transform_row_worker, payloads):
+                if row_dict is not None:
+                    rows.append(pd.DataFrame([row_dict]))
+                if callable(on_progress):
+                    on_progress(len(rows), len(payloads))
+    else:
+        for symbol, bars_dict, _engineer in payloads:
+            _symbol, row_dict = _transform_row_worker((symbol, bars_dict, engineer))
+            if row_dict is not None:
+                rows.append(pd.DataFrame([row_dict]))
+            if callable(on_progress):
+                on_progress(len(rows), len(payloads))
 
     if not rows:
         return {"ok": False, "skipped": False, "errors": ["no_rows"], "root": str(root)}
 
     frame = pd.concat(rows, ignore_index=True)
+    tails_by_symbol = {
+        symbol: bars.tail(lookback) for symbol, bars in bars_by_symbol.items()
+    }
+    bar_fingerprints = {
+        symbol: _bar_tail_fingerprint(bars) for symbol, bars in bars_by_symbol.items()
+    }
     snapshot_id = _new_snapshot_id(latest_date)
     target_dir = root / snapshot_id
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -545,12 +560,45 @@ def _write_snapshot_tails(
     """Persist the per-symbol rolling bar windows used by later increments."""
     if not tails_by_symbol:
         return
+    combined = _tails_long_table(tails_by_symbol)
+    combined.to_parquet(target_dir / TAILS_FILENAME, index=False)
+
+
+def _tails_long_table(tails_by_symbol: dict[str, pd.DataFrame]) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
     for symbol, bars in tails_by_symbol.items():
         frame = bars.reset_index().copy()
         frame["symbol"] = symbol
         frames.append(frame)
-    combined = pd.concat(frames, ignore_index=True)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def _write_snapshot_tails_inherited(
+    *,
+    target_dir: Path,
+    old_tails: pd.DataFrame | None,
+    refreshed_tails: dict[str, pd.DataFrame],
+) -> None:
+    """Write the next snapshot's tails as ``old tails + dirty overrides``.
+
+    Clean symbols keep their inherited tail window; only symbols that were
+    refreshed this run get their window replaced.
+    """
+    clean_rows = pd.DataFrame()
+    if old_tails is not None and not old_tails.empty and refreshed_tails:
+        clean_rows = old_tails[~old_tails["symbol"].isin(set(refreshed_tails))]
+    pieces: list[pd.DataFrame] = []
+    if not clean_rows.empty:
+        pieces.append(clean_rows)
+    refreshed_long = _tails_long_table(refreshed_tails)
+    if not refreshed_long.empty:
+        pieces.append(refreshed_long)
+    if not pieces:
+        _write_snapshot_tails(target_dir, refreshed_tails)
+        return
+    combined = pd.concat(pieces, ignore_index=True)
     combined.to_parquet(target_dir / TAILS_FILENAME, index=False)
 
 
@@ -712,7 +760,8 @@ def _incremental_snapshot_build(
 
     # Refresh: build each dirty symbol's window from tail + probe, then run
     # feature engineering on the process pool.
-    tails = _tail_by_symbol_index(load_snapshot_tails(root, old_manifest.data_snapshot_id))
+    old_tails = load_snapshot_tails(root, old_manifest.data_snapshot_id)
+    tails = _tail_by_symbol_index(old_tails)
 
     def _window_for_symbol(symbol: str) -> tuple[str, pd.DataFrame]:
         probe = probes.get(symbol)
@@ -771,13 +820,20 @@ def _incremental_snapshot_build(
     target_dir.mkdir(parents=True, exist_ok=True)
     merged.to_parquet(target_dir / SNAPSHOT_FILENAME, index=False)
 
-    # Persist the refreshed tail windows for the next incremental run.
+    # Persist tail windows: inherit ALL old tails and override with the dirty
+    # symbols' refreshed windows.  Without inheritance, clean symbols lose
+    # their tail and the next run falls back to full-window fetches for them,
+    # degrading incremental performance over consecutive days.
     refreshed_tails: dict[str, pd.DataFrame] = {}
     for symbol in dirty:
         window = windows.get(symbol)
         if window is not None and not window.empty:
             refreshed_tails[symbol] = window.tail(lookback)
-    _write_snapshot_tails(target_dir, refreshed_tails)
+    _write_snapshot_tails_inherited(
+        target_dir=target_dir,
+        old_tails=old_tails,
+        refreshed_tails=refreshed_tails,
+    )
 
     bar_fingerprints = {
         symbol: _bar_tail_fingerprint(windows[symbol])
@@ -785,7 +841,11 @@ def _incremental_snapshot_build(
         if windows.get(symbol) is not None and not windows[symbol].empty
     }
     per_symbol = dict(old_manifest.per_symbol)
-    per_symbol.update(_per_symbol_entries(merged, bar_fingerprints))
+    # Only the dirty symbols' entries are rebuilt; clean symbols keep their
+    # old latest_date AND fingerprint so same-day revision detection keeps
+    # working for them on future runs.
+    refreshed_rows = new_rows if rows else pd.DataFrame()
+    per_symbol.update(_per_symbol_entries(refreshed_rows, bar_fingerprints))
 
     # Advance the market trade date to the freshest actually-refreshed row;
     # do not reuse the old manifest date when dirty symbols progressed.
@@ -886,7 +946,13 @@ def _bar_tail_fingerprint(bars: pd.DataFrame) -> str:
 
 
 def _factor_archive_hash(config: StockAnalyzerConfig) -> str:
-    """Fingerprint of the vendor factor ZIPs (qfq/hfq), or "" when absent."""
+    """Content fingerprint of the vendor factor ZIPs (qfq/hfq), or "" if absent.
+
+    Uses the entry-level (name, size, CRC32) metadata from the ZIP central
+    directory — deliberately NOT the archive mtime: the factor ZIPs are
+    rebuilt every night and an unchanged-content rebuild must not invalidate
+    the snapshot (which would force a full rebuild every day).
+    """
     candidates: list[Path] = []
     index_path = str(config.data_source.vendor_zip_index_path).strip()
     if index_path:
@@ -902,14 +968,20 @@ def _factor_archive_hash(config: StockAnalyzerConfig) -> str:
             continue
         for archive in sorted(factors_dir.glob("*.zip")):
             try:
-                stat = archive.stat()
-                key = f"{archive.name}:{stat.st_size}"
-            except OSError:
+                with zipfile.ZipFile(archive) as zf:
+                    entries = sorted(
+                        (info.filename, info.file_size, info.CRC)
+                        for info in zf.infolist()
+                        if not info.is_dir()
+                    )
+            except Exception:
                 continue
+            digest = hashlib.sha256(repr(entries).encode("utf-8")).hexdigest()[:16]
+            key = f"{archive.name}:{digest}"
             if key in seen:
                 continue
             seen.add(key)
-            parts.append(f"{key}:{stat.st_mtime_ns}")
+            parts.append(key)
     if not parts:
         return ""
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]

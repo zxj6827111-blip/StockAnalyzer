@@ -414,6 +414,81 @@ def test_snapshot_factor_archive_change_triggers_rebuild(
     assert rebuild["skipped"] is False
 
 
+def test_snapshot_factor_rebuild_same_content_stays_current(tmp_path: Path) -> None:
+    """Nightly factor-ZIP rebuilds with UNCHANGED content must not invalidate
+    the snapshot (the hash is content-based, not mtime-based)."""
+    import os
+    import zipfile
+
+    service, _root = _make_service(tmp_path)
+    vendor_root = tmp_path / "vendor"
+    factors_dir = vendor_root / "复权因子"
+    factors_dir.mkdir(parents=True)
+    archive = factors_dir / "复权因子_前复权.zip"
+    content = "code,datetime,adj_factor\n600519,20250101,1.0\n"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("2025/600519.csv", content)
+    service._config.data_source.vendor_zip_index_path = str(vendor_root / "index.json")
+    provider = SyntheticProvider(seed_offset=2026)
+    build_feature_snapshot(
+        service._config, provider, symbols=_SYMBOLS, lookback_days=250, force=True
+    )
+    manifest, _ = load_feature_snapshot(service._config)
+    assert manifest is not None
+    assert snapshot_is_current(manifest, service._config) is True
+
+    # Simulate the nightly rebuild with identical content (mtime changes only).
+    os.utime(archive, None)
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("2025/600519.csv", content)
+    assert snapshot_is_current(manifest, service._config) is True
+
+
+def test_snapshot_incremental_preserves_clean_tails_and_fingerprints(
+    tmp_path: Path,
+) -> None:
+    """Clean symbols keep their tail window AND their stored fingerprint
+    across an incremental refresh, so later revisions/refreshes do not fall
+    back to full-window reads or miss same-day revisions."""
+    from datetime import date, timedelta
+
+    from stock_analyzer.feature.snapshot import (
+        load_snapshot_tails,
+    )
+
+    service, root = _make_service(tmp_path)
+    provider = SyntheticProvider(seed_offset=2026)
+    fetch_log: list[tuple[str, int]] = []
+    tracked = _DateTrackingProvider(provider, latest_dates={}, fetch_log=fetch_log)
+    build_feature_snapshot(
+        service._config, tracked, symbols=_SYMBOLS, lookback_days=250, force=True
+    )
+    manifest, _ = load_feature_snapshot(service._config)
+    assert manifest is not None
+    baseline = {
+        symbol: date.fromisoformat(manifest.per_symbol[symbol]["latest_date"])
+        for symbol in _SYMBOLS
+    }
+    tracked._latest_dates = dict(baseline)
+    tracked._latest_dates["600519"] = baseline["600519"] + timedelta(days=1)
+    clean_fp_before = manifest.per_symbol["300750"]["fingerprint"]
+
+    report = build_feature_snapshot(
+        service._config, tracked, symbols=_SYMBOLS, lookback_days=250
+    )
+    assert report["incremental"] is True
+    assert report["dirty_symbols"] == 1
+
+    manifest2, _ = load_feature_snapshot(service._config)
+    assert manifest2 is not None
+    # Clean symbol's fingerprint is preserved (not blanked out).
+    assert manifest2.per_symbol["300750"]["fingerprint"] == clean_fp_before
+    # The new snapshot inherits ALL old tails (clean symbols included).
+    tails = load_snapshot_tails(root, manifest2.data_snapshot_id)
+    assert tails is not None
+    assert {"300750", "601318", "000858", "600000"} <= set(tails["symbol"])
+
+
 def test_snapshot_missing_blocks_scheduler_scan(tmp_path: Path) -> None:
     service, root = _make_service(tmp_path)  # require_current=True, no snapshot yet
     assert not (root / "current.json").exists()
@@ -535,6 +610,39 @@ def test_snapshot_same_day_revision_detected(tmp_path: Path) -> None:
     revised_fp = manifest2.per_symbol["600519"]["fingerprint"]
     assert revised_fp != "" and revised_fp != stored_fp
     assert manifest2.per_symbol["600519"]["latest_date"] == baseline["600519"].isoformat()
+
+
+def test_recovery_mode_is_advisory_only(tmp_path: Path) -> None:
+    """An explicit recovery scan with a missing snapshot runs against direct
+    bars but is advisory only: it marks emergency_direct_scan, never mutates
+    the watchlist, and its final selection carries the advisory flag."""
+    service, root = _make_service(tmp_path)
+    service._config.week5.feature_snapshot_require_current = True
+    assert not (root / "current.json").exists()
+
+    # Ordinary manual scan (no recovery flag) must NOT bypass the gate.
+    ordinary = service.run_week5_scan(
+        symbols=["600000", "000001"],
+        sync_reason="manual_cli",
+        notify_enabled=False,
+    )
+    assert str(ordinary.get("emergency_direct_scan", False)) != "True"
+    assert ordinary.get("recovery_mode") is not True
+
+    # Explicit recovery run: advisory only.
+    report = service.run_week5_scan(
+        symbols=["600000", "000001"],
+        sync_reason="manual_cli",
+        notify_enabled=False,
+        recovery_mode=True,
+    )
+    assert report.get("emergency_direct_scan") is True
+    assert report.get("recovery_mode") is True
+    funnel = report.get("funnel") or {}
+    final_selection = funnel.get("final_selection") or {}
+    assert final_selection.get("advisory_only") is True
+    watchlist_sync = report.get("watchlist_sync") or {}
+    assert watchlist_sync.get("updated", False) is False
 
 
 def test_data_gate_applies_week6_quality_thresholds(tmp_path: Path) -> None:
