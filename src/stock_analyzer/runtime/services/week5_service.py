@@ -989,6 +989,58 @@ class RuntimeWeek5Service:
         ]
         return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
 
+    def _build_gate_blocked_report(
+        self,
+        *,
+        service: object,
+        now: datetime,
+        reasons: list[str],
+        data_snapshot_id: str,
+        snapshot_current: bool,
+    ) -> dict[str, object]:
+        """Fail-closed week5 scan report when the data gate is blocked."""
+        watchlist_size = len(service._state.watchlist)
+        return {
+            "timestamp": now.isoformat(),
+            "trace_id": "",
+            "status": "blocked_data_gate",
+            "watchlist_size": watchlist_size,
+            "symbol_source": "blocked",
+            "scan_profile": "default",
+            "first_board": {"candidate_count": 0, "candidates": [], "leaders": []},
+            "signal_pool": {"candidate_count": 0, "candidates": []},
+            "anomalies": {"event_count": 0, "events": []},
+            "empty_signal": {
+                "triggered": True,
+                "reasons": ["data_gate_blocked"] + reasons,
+                "no_buy_streak": 0,
+                "buy_signals": 0,
+                "drawdown_pct": 0.0,
+                "risk_action": "blocked",
+            },
+            "monster_isolation": {
+                "can_open_new_position": False,
+                "reasons": ["data_gate_blocked"],
+                "total_monster_position": 0.0,
+                "max_monster_position": 0.0,
+                "sentiment_score": 0.0,
+            },
+            "summary": {
+                "first_board_candidates": 0,
+                "leaders": 0,
+                "anomalies": 0,
+                "empty_signal_triggered": True,
+                "can_open_monster": False,
+                "watchlist_synced": False,
+            },
+            "data_gate": {
+                "status": "blocked",
+                "reasons": reasons,
+                "data_snapshot_id": data_snapshot_id,
+                "snapshot_current": snapshot_current,
+            },
+        }
+
     def run_week5_scan(
         self,
         symbols: list[str] | None = None,
@@ -1075,6 +1127,7 @@ class RuntimeWeek5Service:
             latest_trade_date=str(snapshot_manifest.trade_date) if snapshot_manifest else "",
             now=now,
         )
+        gate_status = str(data_gate.get("status", "ok"))
         intraday_scheduler_mode = self._is_intraday_scheduler_week5_scan(
             now=now,
             sync_reason=sync_reason,
@@ -1299,6 +1352,33 @@ class RuntimeWeek5Service:
                     allowed_exchanges=allowed_exchanges_for_light,
                 )
             else:
+                if gate_status == "blocked" and sync_reason.strip().lower().startswith(
+                    "scheduler_"
+                ):
+                    # Fail-closed: the nightly scheduled universe scan must NOT
+                    # silently fall back to the heavy direct-scan path
+                    # (top_k=500 full market) when the feature snapshot is
+                    # missing/stale.  Manual recovery runs override this by
+                    # passing an explicit non-scheduler sync reason.
+                    gate_reasons = [
+                        str(item) for item in (data_gate.get("reasons") or [])
+                    ]
+                    blocked_payload = self._build_gate_blocked_report(
+                        service=service,
+                        now=now,
+                        reasons=gate_reasons,
+                        data_snapshot_id=str(snapshot_manifest.data_snapshot_id)
+                        if snapshot_manifest
+                        else "",
+                        snapshot_current=snapshot_current,
+                    )
+                    self._state_service.store_week5_scan_report(blocked_payload)
+                    service._record_audit_event(
+                        event_type="week5_scan_blocked_data_gate",
+                        level="warn",
+                        payload={"reasons": gate_reasons},
+                    )
+                    return blocked_payload
                 prefilter_report = service._prefilter_week5_universe_symbols(
                     symbols=symbol_list,
                     top_k_override=configured_prefilter_top_k,

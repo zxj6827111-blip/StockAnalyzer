@@ -571,7 +571,12 @@ def _rebuild_zip(
     archive_path: Path,
     replace_entries: dict[str, str],
 ) -> dict[str, object]:
-    """Atomically rebuild one ZIP with the given entries replaced wholesale."""
+    """Atomically rebuild one ZIP with the given entries replaced wholesale.
+
+    Validation happens against the *temporary* archive BEFORE the atomic
+    ``os.replace``, so a failed rebuild never destroys the previous ZIP: the
+    old file stays byte-identical unless the new archive fully validates.
+    """
     if not archive_path.parent.exists():
         archive_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = archive_path.with_name(f"{archive_path.name}.{os.getpid()}.tmp")
@@ -594,31 +599,44 @@ def _rebuild_zip(
                     output.writestr(info, source.read(info.filename))
         for name, content in replace_entries.items():
             output.writestr(name, content)
-    os.replace(temporary, archive_path)
 
-    written_names: list[str] = []
-    with zipfile.ZipFile(archive_path) as check:
-        written_names = [
-            info.filename for info in check.infolist() if not info.is_dir()
-        ]
-        for name in replace_entries:
-            if name not in written_names:
-                raise DataSourceError(
-                    f"vendor ZIP rebuild lost entry: {archive_path}!{name}"
-                )
-    duplicate_names = sorted(
-        {name for name in written_names if written_names.count(name) > 1}
-    )
-    if duplicate_names:
-        raise DataSourceError(
-            f"vendor ZIP rebuild produced duplicate entries: {archive_path}: "
-            f"{duplicate_names}"
+    try:
+        # Validate the temporary archive before swapping it in.  Opening it
+        # (raises BadZipFile on corruption) plus entry checks cover both
+        # readability and completeness.
+        written_names: list[str] = []
+        with zipfile.ZipFile(temporary) as check:
+            written_names = [
+                info.filename for info in check.infolist() if not info.is_dir()
+            ]
+            for name in replace_entries:
+                if name not in written_names:
+                    raise DataSourceError(
+                        f"vendor ZIP rebuild lost entry: {archive_path}!{name}"
+                    )
+            for name in written_names:
+                check.read(name)
+        duplicate_names = sorted(
+            {name for name in written_names if written_names.count(name) > 1}
         )
-    missing_names = sorted(old_names - set(written_names))
-    if missing_names:
-        raise DataSourceError(
-            f"vendor ZIP rebuild dropped entries: {archive_path}: {missing_names}"
-        )
+        if duplicate_names:
+            raise DataSourceError(
+                f"vendor ZIP rebuild produced duplicate entries: {archive_path}: "
+                f"{duplicate_names}"
+            )
+        missing_names = sorted(old_names - set(written_names))
+        if missing_names:
+            raise DataSourceError(
+                f"vendor ZIP rebuild dropped entries: {archive_path}: {missing_names}"
+            )
+    except Exception:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+    os.replace(temporary, archive_path)
     return {
         "archive": str(archive_path),
         "entries_total": len(written_names),

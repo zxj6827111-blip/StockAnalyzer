@@ -84,12 +84,27 @@ class FeatureSnapshotManifest:
     source_signature: str = ""
     format_version: int = FORMAT_VERSION
     source_provider: str = ""
+    # Per-symbol incremental bookkeeping: {symbol: {"latest_date", "fingerprint"}}.
+    per_symbol: dict[str, dict[str, str]] = field(default_factory=dict)
+    # Fingerprint of the vendor factor archives (qfq/hfq ZIPs); empty when no
+    # factor source is configured (comparison is skipped in that case).
+    factor_archive_hash: str = ""
 
     @classmethod
     def from_payload(cls, payload: object) -> FeatureSnapshotManifest | None:
         if not isinstance(payload, dict):
             return None
         try:
+            raw_per_symbol = payload.get("per_symbol") or {}
+            per_symbol: dict[str, dict[str, str]] = {}
+            if isinstance(raw_per_symbol, dict):
+                for symbol, entry in raw_per_symbol.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    per_symbol[str(symbol)] = {
+                        "latest_date": str(entry.get("latest_date", "")),
+                        "fingerprint": str(entry.get("fingerprint", "")),
+                    }
             return cls(
                 data_snapshot_id=str(payload["data_snapshot_id"]),
                 trade_date=str(payload["trade_date"]),
@@ -100,6 +115,8 @@ class FeatureSnapshotManifest:
                 source_signature=str(payload.get("source_signature", "")),
                 format_version=int(payload.get("format_version", FORMAT_VERSION)),
                 source_provider=str(payload.get("source_provider", "")),
+                per_symbol=per_symbol,
+                factor_archive_hash=str(payload.get("factor_archive_hash", "")),
             )
         except (KeyError, TypeError, ValueError):
             return None
@@ -108,21 +125,31 @@ class FeatureSnapshotManifest:
         return asdict(self)
 
 
-def _data_root_fingerprint(config: StockAnalyzerConfig) -> str:
-    """Cheap fingerprint of the data roots that feed the snapshot."""
+def _data_root_layout_fingerprint(config: StockAnalyzerConfig) -> str:
+    """Structural fingerprint of the data roots that feed the snapshot.
+
+    Intentionally ignores file mtimes so routine nightly content updates do
+    not invalidate the snapshot; only layout changes (missing directories,
+    renamed/new year archives) count as a structural anomaly.
+    """
     parts: list[str] = []
     data_root = str(config.data_source.local_data_root).strip()
     if data_root:
         root = Path(data_root)
         if root.exists():
-            digests: list[str] = []
+            layout: list[str] = []
             for child in sorted(root.iterdir()):
                 try:
                     stat = child.stat()
-                    digests.append(f"{child.name}:{stat.st_mtime_ns}")
                 except OSError:
                     continue
-            parts.append("|".join(digests[-64:]))
+                suffix = "/" if child.is_dir() else ""
+                layout.append(f"{child.name}{suffix}:{stat.st_size if not child.is_dir() else ''}")
+            parts.append("|".join(layout[-256:]))
+    index_path = str(config.data_source.vendor_zip_index_path).strip()
+    if index_path:
+        index = Path(index_path).expanduser()
+        parts.append(f"index:{index.exists()}:{index.stat().st_size if index.exists() else 0}")
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
@@ -130,13 +157,16 @@ def compute_source_signature(
     config: StockAnalyzerConfig,
     provider_status: dict[str, object] | None = None,
 ) -> str:
-    """Signature of everything the snapshot depends on."""
+    """Structural signature of everything the snapshot depends on.
+
+    Deliberately excludes the data's latest trade date: a routine trading-day
+    update must NOT invalidate the snapshot (incremental rebuild handles it).
+    """
     status = provider_status or {}
     parts = [
-        str(status.get("data_latest_trade_date", "")),
         str(status.get("provider_key", status.get("provider_mode", ""))),
         str(config.evolution.code_commit_id or ""),
-        _data_root_fingerprint(config),
+        _data_root_layout_fingerprint(config),
     ]
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
 
@@ -192,6 +222,23 @@ def snapshot_is_current(
     expected_signature = compute_source_signature(config)
     if manifest.source_signature and manifest.source_signature != expected_signature:
         return False
+    # Schema drift: recompute the current feature-schema hash and compare.
+    # A change in the engineered column set or feature logic must invalidate
+    # the snapshot so stale features are never reused.
+    try:
+        current_schema_hash = _feature_schema_hash(FeatureEngineer())
+    except Exception:
+        return False
+    if manifest.feature_schema_hash and manifest.feature_schema_hash != current_schema_hash:
+        return False
+    # Factor-version drift: vendor factor archives changed -> full rebuild.
+    current_factor_hash = _factor_archive_hash(config)
+    if (
+        current_factor_hash
+        and manifest.factor_archive_hash
+        and current_factor_hash != manifest.factor_archive_hash
+    ):
+        return False
     return True
 
 
@@ -206,14 +253,35 @@ def build_feature_snapshot(
     force: bool = False,
     on_progress: object | None = None,
 ) -> dict[str, object]:
-    """Build (or skip) the full-market feature snapshot.
+    """Build (or incrementally refresh) the full-market feature snapshot.
+
+    Incremental semantics: when a structurally-compatible snapshot exists
+    (same schema hash, factor archives, provider and data-root layout), only
+    dirty symbols -- those missing from the manifest or with a newer provider
+    trade date -- are re-fetched and re-engineered, then merged into the old
+    parquet (replacing the touched rows).  A full rebuild happens on first
+    build, on schema/factor/signature drift, or with ``force``.
 
     Skips when a current snapshot already exists and ``force`` is false.
     Returns a report dict; ``ok`` indicates the snapshot is ready for reads.
     """
     root = resolve_snapshot_root(config)
-    manifest, _ = load_feature_snapshot(config)
-    if manifest is not None and snapshot_is_current(manifest, config) and not force:
+    manifest, frame = load_feature_snapshot(config)
+    dirty = (
+        _compute_dirty_symbols(
+            provider=provider,
+            symbols=_normalize_symbols(symbols),
+            manifest=manifest,
+        )
+        if manifest is not None and frame is not None
+        else []
+    )
+    if (
+        manifest is not None
+        and snapshot_is_current(manifest, config)
+        and not dirty
+        and not force
+    ):
         return {
             "ok": True,
             "skipped": True,
@@ -229,13 +297,41 @@ def build_feature_snapshot(
     fetched_status = getattr(provider, "status", None)
     provider_status = fetched_status() if callable(fetched_status) else {}
 
+    schema_hash = _feature_schema_hash(engineer)
+    signature = compute_source_signature(config, provider_status)
+    factor_hash = _factor_archive_hash(config)
+
+    # Incremental path: structurally-compatible old snapshot present.
+    if (
+        not force
+        and manifest is not None
+        and frame is not None
+        and manifest.feature_schema_hash == schema_hash
+        and manifest.factor_archive_hash == factor_hash
+        and manifest.source_signature == signature
+    ):
+        return _incremental_snapshot_build(
+            config=config,
+            provider=provider,
+            engineer=engineer,
+            old_manifest=manifest,
+            old_frame=frame,
+            dirty=dirty,
+            normalized_symbols=normalized_symbols,
+            latest_date=manifest.trade_date,
+            schema_hash=schema_hash,
+            signature=signature,
+            factor_hash=factor_hash,
+            lookback=lookback,
+            root=root,
+            on_progress=on_progress,
+        )
+
     latest_date = _resolve_latest_trade_date(
         provider=provider,
         normalized_symbols=normalized_symbols,
         provider_status=provider_status,
     )
-    schema_hash = _feature_schema_hash(engineer)
-    signature = compute_source_signature(config, provider_status)
 
     rows: list[pd.DataFrame] = []
     failed: list[str] = []
@@ -281,13 +377,10 @@ def build_feature_snapshot(
         columns=[str(column) for column in frame.columns],
         source_signature=signature,
         source_provider=str(provider_status.get("provider_mode", "")),
+        per_symbol=_per_symbol_entries(frame),
+        factor_archive_hash=factor_hash,
     )
-    temporary = root / "current.json.tmp"
-    temporary.write_text(
-        json.dumps(manifest.to_payload(), ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    temporary.replace(root / "current.json")
+    _atomic_write_json(root / "current.json", manifest.to_payload())
 
     # Prune old snapshot directories (keep the previous one for rollback).
     _prune_old_snapshots(root, keep=2)
@@ -301,6 +394,218 @@ def build_feature_snapshot(
         "failed_symbols": len(failed),
         "root": str(root),
     }
+
+
+def _compute_dirty_symbols(
+    *,
+    provider: object,
+    symbols: list[str],
+    manifest: FeatureSnapshotManifest,
+) -> list[str]:
+    """Symbols whose provider trade date is newer than the snapshot's entry.
+
+    Providers without a ``latest_daily_dates`` interface cannot drive the
+    incremental check; an empty result then delegates the skip/rebuild
+    decision to the structural signature checks.
+    """
+    latest_dates_fn = getattr(provider, "latest_daily_dates", None)
+    if not callable(latest_dates_fn):
+        return []
+    try:
+        current_dates = latest_dates_fn(symbols=symbols) or {}
+    except Exception:
+        return []
+    if not isinstance(current_dates, dict):
+        return []
+    dirty: list[str] = []
+    for symbol in symbols:
+        entry = manifest.per_symbol.get(symbol)
+        if entry is None:
+            dirty.append(symbol)
+            continue
+        current_date = current_dates.get(symbol)
+        if current_date is None:
+            # Provider has no record -> be conservative and recompute.
+            dirty.append(symbol)
+            continue
+        try:
+            current_iso = current_date.isoformat()
+        except AttributeError:
+            current_iso = str(current_date)
+        latest = str(entry.get("latest_date", "")).strip()
+        if current_iso > latest:
+            dirty.append(symbol)
+    return dirty
+
+
+def _incremental_snapshot_build(
+    *,
+    config: StockAnalyzerConfig,
+    provider: object,
+    engineer: FeatureEngineer,
+    old_manifest: FeatureSnapshotManifest,
+    old_frame: pd.DataFrame,
+    dirty: list[str],
+    normalized_symbols: list[str],
+    latest_date: str,
+    schema_hash: str,
+    signature: str,
+    factor_hash: str,
+    lookback: int,
+    root: Path,
+    on_progress: object | None = None,
+) -> dict[str, object]:
+    """Recompute only dirty symbols and merge them into the old parquet."""
+    if not dirty:
+        # Nothing to recompute; refresh the freshness stamp so age-based
+        # expiry (e.g. after a long holiday) does not force a wasted rebuild.
+        refreshed = dict(old_manifest.to_payload())
+        refreshed["built_at"] = datetime.now(UTC).isoformat(timespec="seconds")
+        _atomic_write_json(root / "current.json", refreshed)
+        return {
+            "ok": True,
+            "skipped": False,
+            "touched": True,
+            "data_snapshot_id": old_manifest.data_snapshot_id,
+            "trade_date": latest_date,
+            "symbol_count": int(len(old_frame)),
+            "dirty_symbols": 0,
+            "failed_symbols": 0,
+            "root": str(root),
+        }
+
+    rows: list[pd.DataFrame] = []
+    failed: list[str] = []
+    for symbol in dirty:
+        try:
+            bars = provider.fetch_daily_bars(symbol=symbol, lookback_days=lookback)
+        except Exception:
+            failed.append(symbol)
+            continue
+        if bars is None or not isinstance(bars, pd.DataFrame) or bars.empty:
+            failed.append(symbol)
+            continue
+        row = _snapshot_row_for_symbol(bars=bars, symbol=symbol, engineer=engineer)
+        if row is not None:
+            rows.append(row)
+        if callable(on_progress):
+            on_progress(len(rows), len(dirty))
+
+    if rows:
+        new_rows = pd.concat(rows, ignore_index=True)
+        keep = old_frame[~old_frame["symbol"].isin(set(new_rows["symbol"]))]
+        merged = pd.concat([keep, new_rows], ignore_index=True).reset_index(drop=True)
+    else:
+        merged = old_frame.reset_index(drop=True)
+
+    snapshot_id = _new_snapshot_id(latest_date)
+    target_dir = root / snapshot_id
+    target_dir.mkdir(parents=True, exist_ok=True)
+    merged.to_parquet(target_dir / SNAPSHOT_FILENAME, index=False)
+
+    per_symbol = dict(old_manifest.per_symbol)
+    per_symbol.update(_per_symbol_entries(merged))
+
+    new_manifest = FeatureSnapshotManifest(
+        data_snapshot_id=snapshot_id,
+        trade_date=latest_date,
+        built_at=datetime.now(UTC).isoformat(timespec="seconds"),
+        feature_schema_hash=schema_hash,
+        symbol_count=int(len(merged)),
+        columns=[str(column) for column in merged.columns],
+        source_signature=signature,
+        source_provider=str(
+            getattr(provider, "status", lambda: {})().get("provider_mode", "")
+            if callable(getattr(provider, "status", None))
+            else ""
+        ),
+        per_symbol=per_symbol,
+        factor_archive_hash=factor_hash,
+    )
+    _atomic_write_json(root / "current.json", new_manifest.to_payload())
+    _prune_old_snapshots(root, keep=2)
+
+    return {
+        "ok": True,
+        "skipped": False,
+        "data_snapshot_id": snapshot_id,
+        "trade_date": latest_date,
+        "symbol_count": int(len(merged)),
+        "incremental": True,
+        "dirty_symbols": len(dirty),
+        "failed_symbols": len(failed),
+        "root": str(root),
+    }
+
+
+def _per_symbol_entries(frame: pd.DataFrame) -> dict[str, dict[str, str]]:
+    """Build the per-symbol incremental bookkeeping map from a snapshot frame."""
+    entries: dict[str, dict[str, str]] = {}
+    for _, row in frame.iterrows():
+        symbol = str(row.get("symbol", "")).strip()
+        if not symbol:
+            continue
+        entries[symbol] = {
+            "latest_date": str(row.get("trade_date", "")),
+            "fingerprint": _row_fingerprint(row),
+        }
+    return entries
+
+
+def _row_fingerprint(row: pd.Series) -> str:
+    """Content fingerprint of one snapshot row's latest bar (close/flow/volume)."""
+    parts: list[str] = []
+    for column in ("latest_close", "ret20", "volume_5d", "avg_turnover_20"):
+        value = row.get(column)
+        try:
+            numeric = float(value)
+            if pd.isna(numeric):
+                numeric = 0.0
+        except (TypeError, ValueError):
+            numeric = 0.0
+        parts.append(f"{numeric:.4f}")
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:12]
+
+
+def _factor_archive_hash(config: StockAnalyzerConfig) -> str:
+    """Fingerprint of the vendor factor ZIPs (qfq/hfq), or "" when absent."""
+    candidates: list[Path] = []
+    index_path = str(config.data_source.vendor_zip_index_path).strip()
+    if index_path:
+        candidates.append(Path(index_path).expanduser().parent)
+    data_root = str(config.data_source.local_data_root).strip()
+    if data_root:
+        candidates.append(Path(data_root).expanduser())
+    seen: set[str] = set()
+    parts: list[str] = []
+    for candidate in candidates:
+        factors_dir = candidate / "复权因子"
+        if not factors_dir.is_dir():
+            continue
+        for archive in sorted(factors_dir.glob("*.zip")):
+            try:
+                stat = archive.stat()
+                key = f"{archive.name}:{stat.st_size}"
+            except OSError:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            parts.append(f"{key}:{stat.st_mtime_ns}")
+    if not parts:
+        return ""
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
+    """Atomic JSON write via a sibling temp file + rename."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
 
 
 def _snapshot_row_for_symbol(
@@ -500,12 +805,59 @@ def _resolve_latest_trade_date(
 
 
 def _feature_schema_hash(engineer: FeatureEngineer) -> str:
-    """Stable hash over the engineer identity (fixed 208-column output)."""
-    payload = (
-        f"{type(engineer).__name__}:{getattr(engineer, 'code_version', '')}:"
-        "t1_shifted:fill_zero_after_shift"
-    )
+    """Stable hash over the engineered output schema (column set).
+
+    Probes the real feature pipeline with a synthetic bar frame so any change
+    to the feature column definitions or compute logic changes the hash and
+    invalidates existing snapshots.
+    """
+    try:
+        probe = _dummy_bars()
+        features = engineer.transform(probe)
+        columns: list[str] = []
+        if features is not None and not features.empty:
+            columns = [str(column) for column in features.columns]
+    except Exception:
+        columns = []
+    payload = f"{type(engineer).__name__}:{columns}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _dummy_bars() -> pd.DataFrame:
+    """Minimal deterministic bar frame accepted by FeatureEngineer.transform."""
+    rng = np.random.default_rng(7)
+    dates = pd.bdate_range(end="2026-01-30", periods=60)
+    close = np.cumprod(1 + rng.normal(0.0005, 0.01, size=len(dates))) * 10
+    open_price = close * (1 + rng.normal(0, 0.002, size=len(dates)))
+    high = np.maximum(open_price, close) * 1.01
+    low = np.minimum(open_price, close) * 0.99
+    volume = rng.integers(1_000_000, 8_000_000, size=len(dates)).astype(float)
+    turnover = volume * close
+    float_market_cap = np.full(len(dates), 10_000_000_000.0)
+    frame = pd.DataFrame(
+        {
+            "open": open_price,
+            "high": high,
+            "low": low,
+            "close": close,
+            "volume": volume,
+            "turnover": turnover,
+            "float_market_cap": float_market_cap,
+            "suspended": False,
+            "is_st": False,
+            "is_delisting_risk": False,
+            "roe": np.nan,
+            "debt_ratio": np.nan,
+            "holder_count": np.full(len(dates), 50_000.0),
+            "block_trade_net": np.zeros(len(dates)),
+            "margin_financing_balance": np.full(len(dates), 2_000_000_000.0),
+            "northbound_net": np.zeros(len(dates)),
+            "dragon_tiger_flag": np.zeros(len(dates)),
+        },
+        index=dates,
+    )
+    frame.index.name = "date"
+    return frame
 
 
 def _new_snapshot_id(trade_date: str) -> str:

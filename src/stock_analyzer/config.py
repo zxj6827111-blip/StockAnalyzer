@@ -346,7 +346,7 @@ class Week5Config(_StrictModel):
     feature_snapshot_root: str = "artifacts/features_light"
     feature_snapshot_lookback_days: int = 250
     feature_snapshot_max_age_days: int = 3
-    feature_snapshot_require_current: bool = False
+    feature_snapshot_require_current: bool = True
     max_data_staleness_days: int = 3
     universe_quality_selector_enabled: bool = True
     universe_quality_target_size: int = 300
