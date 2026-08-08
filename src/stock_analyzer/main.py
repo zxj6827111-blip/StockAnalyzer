@@ -1853,6 +1853,11 @@ class Week5ScanRunRequest(BaseModel):
     notify_enabled: bool | None = None
     sync_watchlist: bool | None = None
     sync_reason: str = ""
+    recovery_mode: bool = Field(
+        default=False,
+        description="Explicit emergency recovery scan: advisory only, never "
+        "feeds final signals/watchlist; bypasses a stale-snapshot block",
+    )
 
 
 class Week6RunRequest(BaseModel):
@@ -4398,6 +4403,7 @@ def week5_scan_run(
         notify_enabled=request.notify_enabled,
         sync_watchlist=request.sync_watchlist,
         sync_reason=request.sync_reason,
+        recovery_mode=request.recovery_mode,
     )
 
 

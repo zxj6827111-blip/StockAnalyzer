@@ -80,20 +80,6 @@ class RuntimeWeek5StateService:
                 if symbols:
                     return _dedupe_preserve_order(symbols)[:top_k]
 
-        signal_pool = latest.get("signal_pool")
-        if isinstance(signal_pool, dict):
-            ranking = signal_pool.get("ranking")
-            if isinstance(ranking, dict):
-                raw_selected = ranking.get("selected_symbols")
-                if isinstance(raw_selected, list):
-                    selected = [
-                        symbol
-                        for symbol in (_normalize_a_share_symbol(item) for item in raw_selected)
-                        if symbol
-                    ]
-                    if selected:
-                        return _dedupe_preserve_order(selected)[:top_k]
-
         derived = self.derive_watchlist_candidates_from_week5(
             report=latest,
             top_k_override=top_k_override,
@@ -119,68 +105,35 @@ class RuntimeWeek5StateService:
         if not allowed_actions:
             allowed_actions = {"buy", "watch"}
 
-        candidates: list[tuple[float, float, str]] = []
-        first_board = report.get("first_board")
-        if isinstance(first_board, dict):
-            for key in ("leaders", "candidates"):
-                rows = first_board.get(key)
-                if not isinstance(rows, list):
-                    continue
-                for item in rows:
-                    if not isinstance(item, dict):
-                        continue
-                    symbol = _normalize_a_share_symbol(item.get("symbol"))
-                    if not symbol:
-                        continue
-                    if _candidate_has_hard_blockers(item):
-                        continue
-                    action = str(item.get("action", "")).strip().lower()
-                    if action not in allowed_actions:
-                        continue
-                    if bool(item.get("isolated", False)):
-                        continue
-                    score = _as_float(item.get("score"), default=0.0)
-                    if score < min_score:
-                        continue
-                    leader_score = _as_float(item.get("leader_score"), default=score)
-                    candidates.append((leader_score, score, symbol))
+        # Watchlist candidates come EXCLUSIVELY from the funnel's final
+        # selection: every symbol here already passed the final gates
+        # (risk / cross-review / threshold) and the final cap.  Stocks that
+        # only made the signal pool must never be promoted here.
+        funnel = report.get("funnel")
+        final_selection = (
+            funnel.get("final_selection") if isinstance(funnel, dict) else None
+        )
+        final_signals = (
+            final_selection.get("final_signals")
+            if isinstance(final_selection, dict)
+            else None
+        )
 
-        signal_pool = report.get("signal_pool")
-        if isinstance(signal_pool, dict):
-            ranking = signal_pool.get("ranking")
-            ranking_score_key = (
-                str(ranking.get("score_key", "")).strip() if isinstance(ranking, dict) else ""
-            )
-            if not ranking_score_key:
-                ranking_score_key = "shortlist_score"
-            signal_rows = signal_pool.get("candidates")
-            if isinstance(signal_rows, list):
-                for item in signal_rows:
-                    if not isinstance(item, dict):
-                        continue
-                    symbol = _normalize_a_share_symbol(item.get("symbol"))
-                    if not symbol:
-                        continue
-                    if _candidate_has_hard_blockers(item):
-                        continue
-                    action = str(item.get("action", "")).strip().lower()
-                    if action not in allowed_actions:
-                        continue
-                    ranking_score = _as_float(
-                        item.get(ranking_score_key),
-                        default=_as_float(
-                            item.get("shortlist_score"),
-                            default=_as_float(item.get("score"), default=0.0),
-                        ),
-                    )
-                    shortlist_score = _as_float(
-                        item.get("shortlist_score"),
-                        default=_as_float(item.get("score"), default=0.0),
-                    )
-                    if ranking_score < min_score:
-                        continue
-                    raw_score = _as_float(item.get("score"), default=shortlist_score)
-                    candidates.append((ranking_score, raw_score, symbol))
+        candidates: list[tuple[float, float, str]] = []
+        if isinstance(final_signals, list):
+            for item in final_signals:
+                if not isinstance(item, dict):
+                    continue
+                symbol = _normalize_a_share_symbol(item.get("symbol"))
+                if not symbol:
+                    continue
+                action = str(item.get("action", "")).strip().lower()
+                if action not in allowed_actions:
+                    continue
+                score = _as_float(item.get("score"), default=0.0)
+                if score < min_score:
+                    continue
+                candidates.append((score, score, symbol))
 
         if not candidates:
             return []

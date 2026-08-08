@@ -147,6 +147,11 @@ def _load_test_config() -> StockAnalyzerConfig:
     config.command_channel.history_archive_enabled = False
     config.week5.auto_notify = False
     config.week5.first_board_windows = ["09:30-09:31"]
+    # These tests exercise the funnel/rerank logic, not the snapshot gate; the
+    # gate itself is covered in test_feature_snapshot.  Without this, the
+    # default require_current=True would block every scan for the missing
+    # snapshot and starve the funnel tests of signals.
+    config.week5.feature_snapshot_require_current = False
     # Default to legacy universe path for existing tests; tests that exercise the
     # quality selector enable it explicitly via _enable_universe_quality_selector.
     config.week5.universe_quality_selector_enabled = False
@@ -664,6 +669,11 @@ def _build_lightweight_week5_pipeline(
                 "target_position": 0.08 if index == 0 else 0.04,
                 "grade": "A" if index == 0 else "B",
                 "reasons": ["high_score"] if index == 0 else ["watch_signal"],
+                "decision_trace": {
+                    "risk_gate": {"passed": True},
+                    "cross_review_gate": {"passed": True},
+                    "financial_gate": {"allowed": True},
+                },
             }
             for index, symbol in enumerate(symbol_list[:2])
         ]
@@ -1132,7 +1142,9 @@ def test_service_week5_scan_applies_execution_aware_reranker_when_artifact_avail
     assert float(candidates[0]["execution_reranked_score"]) > float(
         candidates[1]["execution_reranked_score"]
     )
-    assert service.state.watchlist == ["000001", "600000"]
+    # Watchlist syncs only from the funnel's final selection, ordered by
+    # final score (600000=92 > 000001=79), not from the reranked pool order.
+    assert service.state.watchlist == ["600000", "000001"]
 
 
 def test_service_week5_scan_rerank_falls_back_to_latest_symbol_snapshot(
@@ -2042,7 +2054,9 @@ def test_service_week5_scan_auto_syncs_watchlist() -> None:
     assert len(service.state.watchlist) <= 2
 
 
-def test_service_week5_auto_sync_watchlist_falls_back_to_selected_symbols() -> None:
+def test_service_week5_auto_sync_watchlist_keeps_old_when_zero_final_signals() -> None:
+    """Zero final signals must preserve the old watchlist, never top up from
+    the signal pool (stocks there never passed the final gates)."""
     config = _load_test_config()
     config.week5.auto_sync_watchlist = True
     config.week5.auto_sync_watchlist_top_k = 3
@@ -2052,6 +2066,9 @@ def test_service_week5_auto_sync_watchlist_falls_back_to_selected_symbols() -> N
     sync = _as_mapping(
         service._auto_sync_watchlist_from_week5_report(
             {
+                "timestamp": "2026-05-26T20:43:59",
+                # Signal pool has plenty of candidates, but the funnel's final
+                # selection is empty -> nothing may be promoted.
                 "signal_pool": {
                     "candidates": [
                         {"symbol": "600000", "action": "hold", "score": 40.0},
@@ -2061,14 +2078,17 @@ def test_service_week5_auto_sync_watchlist_falls_back_to_selected_symbols() -> N
                         "selected_symbols": ["600519", "000001", "300750", "002594"],
                     },
                 },
+                "funnel": {"final_selection": {"final_signals": []}},
             },
-            reason="test_selected_symbols_fallback",
+            reason="test_zero_final_signals",
+            allow_signal_pool_fallback=False,
         )
     )
 
-    assert sync["updated"] is True
-    assert "signal_pool_fallback" in str(sync["reason"])
-    assert service.state.watchlist == ["600519", "000001", "300750"]
+    assert sync["updated"] is False
+    assert "signal_pool_fallback" not in str(sync["reason"])
+    # Old watchlist preserved; no pool stock was added.
+    assert service.state.watchlist == ["600000"]
 
 
 def test_service_week5_auto_sync_reports_empty_keep_diagnostics() -> None:

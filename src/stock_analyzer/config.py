@@ -88,6 +88,7 @@ class DataSourceConfig(_StrictModel):
     switch_after_failures: int = 3
     request_interval_sec: float = 0.5
     degrade_stops_new_buy: bool = True
+    synthetic_fallback_allowed: bool = False
     runtime_live_enabled: bool = True
     runtime_live_provider: str = "sina"
     runtime_live_interval_priority: list[str] = Field(default_factory=lambda: ["1m", "5m"])
@@ -334,8 +335,28 @@ class Week5Config(_StrictModel):
     universe_prefilter_top_k: int = 500
     universe_prefilter_shortlist_top_n: int = 50
     week5_bars_cache_size: int = 600
+    # Candidate funnel: full market -> light -> deep -> final (0..cap).
+    light_candidate_target: int = 100
+    deep_candidate_target: int = 20
+    final_signal_cap: int = 5
+    allow_zero_signal: bool = True
+    final_signal_min_threshold: float = 70.0
+    # Incremental feature snapshot layer.
+    feature_snapshot_enabled: bool = True
+    feature_snapshot_root: str = "artifacts/features_light"
+    feature_snapshot_lookback_days: int = 250
+    feature_snapshot_max_age_days: int = 3
+    feature_snapshot_require_current: bool = True
+    # Strict fail-close: any symbol that failed the last snapshot refresh
+    # makes the snapshot NOT fully current (no signals rather than wrong
+    # signals).
+    feature_snapshot_min_coverage_ratio: float = 1.0
+    # Data-quality gate thresholds (week6 prewarm coverage score).
+    data_quality_pass_threshold: float = 0.88
+    data_quality_watch_threshold: float = 0.72
+    max_data_staleness_days: int = 3
     universe_quality_selector_enabled: bool = True
-    universe_quality_target_size: int = 300
+    universe_quality_target_size: int = 100
     universe_quality_min_history_days: int = 60
     universe_quality_min_avg_turnover_20: float = 5_000_000.0
     universe_quality_min_float_market_cap: float = 300_000_000.0

@@ -6,7 +6,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from stock_analyzer.config import get_config
+from stock_analyzer.config import StockAnalyzerConfig, get_config
+from stock_analyzer.data.provider_factory import build_runtime_provider
+from stock_analyzer.feature.snapshot import (
+    build_feature_snapshot,
+    load_feature_snapshot,
+    snapshot_is_current,
+)
 from stock_analyzer.learning.sample_schema import MaturityStatus
 from stock_analyzer.runtime.service import StockAnalyzerService
 
@@ -50,6 +56,86 @@ def _pending_snapshot_ids(service: StockAnalyzerService) -> list[str]:
     )
 
 
+def _run_feature_snapshot_step(
+    service: StockAnalyzerService,
+    config: StockAnalyzerConfig,
+) -> dict[str, Any]:
+    """Build the incremental feature snapshot ahead of the week5 scan.
+
+    Failures are recorded but non-fatal: the scan falls back to the direct
+    bars path unless ``week5.feature_snapshot_require_current`` is set, in
+    which case the data preflight blocks the scan.
+    """
+    try:
+        provider = build_runtime_provider(config.data_source)
+        symbols: list[str] = []
+        list_symbols = getattr(provider, "list_symbols", None)
+        if callable(list_symbols):
+            try:
+                symbols = [str(item) for item in list_symbols()]
+            except Exception:
+                symbols = []
+        report = build_feature_snapshot(
+            config,
+            provider,
+            symbols=symbols,
+            max_workers=4,
+            force=False,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "fail",
+            "error": {"type": exc.__class__.__name__, "message": str(exc)},
+        }
+
+    summary: dict[str, Any] = {
+        "ok": bool(report.get("ok", False)),
+        "skipped": bool(report.get("skipped", False)),
+        "data_snapshot_id": str(report.get("data_snapshot_id", "")),
+        "symbol_count": int(report.get("symbol_count", 0)),
+        "errors": [str(item) for item in (report.get("errors", []) or [])],
+    }
+    if summary["ok"]:
+        summary["status"] = "skipped" if summary["skipped"] else "completed"
+    else:
+        summary["status"] = "skipped_warning"
+    return summary
+
+
+def _run_data_preflight(service: StockAnalyzerService, now: datetime) -> dict[str, Any]:
+    """Pre-scan data gate: trade-date freshness, provider trust and snapshot currency.
+
+    Returns ``{"status": "ok"|"watch_only"|"blocked", "reasons": [...]}``.
+    A blocked status makes the caller skip the week5 scan.
+    """
+    manifest, _frame = load_feature_snapshot(service._config)  # noqa: SLF001
+    snapshot_current = False
+    if manifest is not None:
+        snapshot_current = snapshot_is_current(manifest, service._config, now)  # noqa: SLF001
+    try:
+        gate = service._build_data_gate(  # noqa: SLF001
+            snapshot_manifest=manifest,
+            snapshot_current=snapshot_current,
+            latest_trade_date=str(manifest.trade_date) if manifest else "",
+            now=now,
+        )
+    except Exception as exc:
+        return {
+            "status": "blocked",
+            "reasons": ["data_preflight_error"],
+            "data_snapshot_id": str(manifest.data_snapshot_id) if manifest else "",
+            "snapshot_current": snapshot_current,
+            "error": {"type": exc.__class__.__name__, "message": str(exc)},
+        }
+    return {
+        "status": str(gate.get("status", "watch_only")),
+        "reasons": [str(item) for item in (gate.get("reasons", []) or [])],
+        "data_snapshot_id": str(manifest.data_snapshot_id) if manifest else "",
+        "snapshot_current": snapshot_current,
+    }
+
+
 def main() -> int:
     result: dict[str, Any] = {
         "started_at": _now_iso(),
@@ -63,29 +149,78 @@ def main() -> int:
         service = StockAnalyzerService(config=config)
 
         _write_state(
-            stage="week5_scan",
+            stage="build_feature_snapshot",
             status="running",
-            payload={"sync_top_k_override": 50, "force_universe_scan": True},
         )
-        week5_payload = service.run_week5_scan(
-            symbols=None,
-            notify_enabled=False,
-            sync_watchlist=True,
-            sync_reason=f"post_warehouse_full_refresh_{datetime.now().strftime('%Y%m%d')}",
-            sync_top_k_override=50,
-            force_universe_scan=True,
-            scan_profile="post_warehouse_full_refresh",
-        )
-        result["steps"]["week5_scan"] = week5_payload
+        snapshot_payload = _run_feature_snapshot_step(service, config)
+        result["steps"]["build_feature_snapshot"] = snapshot_payload
         _write_state(
-            stage="week5_scan",
-            status="completed",
+            stage="build_feature_snapshot",
+            status=str(snapshot_payload.get("status", "completed")),
             payload={
-                "watchlist_synced": True,
-                "sync_top_k_override": 50,
-                "signal_count": int(len(week5_payload.get("signals", []) or [])),
+                "data_snapshot_id": str(snapshot_payload.get("data_snapshot_id", "")),
+                "symbol_count": int(snapshot_payload.get("symbol_count", 0)),
+                "errors": list(snapshot_payload.get("errors", []) or []),
             },
         )
+
+        _write_state(
+            stage="data_preflight",
+            status="running",
+        )
+        preflight_payload = _run_data_preflight(service, datetime.now(UTC))
+        result["steps"]["data_preflight"] = preflight_payload
+        _write_state(
+            stage="data_preflight",
+            status=str(preflight_payload["status"]),
+            payload={
+                "reasons": list(preflight_payload.get("reasons", []) or []),
+                "data_snapshot_id": str(preflight_payload.get("data_snapshot_id", "")),
+            },
+        )
+        scan_blocked = str(preflight_payload.get("status", "")) == "blocked"
+        if scan_blocked:
+            result["steps"]["week5_scan"] = {
+                "ok": False,
+                "skipped": True,
+                "reason": "skipped: data_preflight_blocked",
+                "data_preflight_reasons": list(preflight_payload.get("reasons", []) or []),
+            }
+
+        if not scan_blocked:
+            _write_state(
+                stage="week5_scan",
+                status="running",
+                payload={"sync_top_k_override": 50, "force_universe_scan": True},
+            )
+            week5_payload = service.run_week5_scan(
+                symbols=None,
+                notify_enabled=False,
+                sync_watchlist=True,
+                sync_reason=f"post_warehouse_full_refresh_{datetime.now().strftime('%Y%m%d')}",
+                sync_top_k_override=50,
+                force_universe_scan=True,
+                scan_profile="post_warehouse_full_refresh",
+            )
+            result["steps"]["week5_scan"] = week5_payload
+            _write_state(
+                stage="week5_scan",
+                status="completed",
+                payload={
+                    "watchlist_synced": True,
+                    "sync_top_k_override": 50,
+                    "signal_count": int(len(week5_payload.get("signals", []) or [])),
+                },
+            )
+        else:
+            _write_state(
+                stage="week5_scan",
+                status="blocked",
+                payload={
+                    "reason": "skipped: data_preflight_blocked",
+                    "reasons": list(preflight_payload.get("reasons", []) or []),
+                },
+            )
 
         pending_ids = _pending_snapshot_ids(service)
         _write_state(

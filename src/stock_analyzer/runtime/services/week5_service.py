@@ -22,6 +22,10 @@ from stock_analyzer.evolution.execution_aware_scoring import (
     normalize_execution_model_outputs,
     normalize_execution_risk_payload,
 )
+from stock_analyzer.feature.snapshot import (
+    load_feature_snapshot,
+    snapshot_is_current,
+)
 from stock_analyzer.learning.execution_risk_labels import build_execution_risk_feature_vector
 from stock_analyzer.models.execution_risk_predictor import ExecutionRiskPredictor
 from stock_analyzer.runtime.services.week5_notification_service import (
@@ -985,6 +989,58 @@ class RuntimeWeek5Service:
         ]
         return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
 
+    def _build_gate_blocked_report(
+        self,
+        *,
+        service: object,
+        now: datetime,
+        reasons: list[str],
+        data_snapshot_id: str,
+        snapshot_current: bool,
+    ) -> dict[str, object]:
+        """Fail-closed week5 scan report when the data gate is blocked."""
+        watchlist_size = len(service._state.watchlist)
+        return {
+            "timestamp": now.isoformat(),
+            "trace_id": "",
+            "status": "blocked_data_gate",
+            "watchlist_size": watchlist_size,
+            "symbol_source": "blocked",
+            "scan_profile": "default",
+            "first_board": {"candidate_count": 0, "candidates": [], "leaders": []},
+            "signal_pool": {"candidate_count": 0, "candidates": []},
+            "anomalies": {"event_count": 0, "events": []},
+            "empty_signal": {
+                "triggered": True,
+                "reasons": ["data_gate_blocked"] + reasons,
+                "no_buy_streak": 0,
+                "buy_signals": 0,
+                "drawdown_pct": 0.0,
+                "risk_action": "blocked",
+            },
+            "monster_isolation": {
+                "can_open_new_position": False,
+                "reasons": ["data_gate_blocked"],
+                "total_monster_position": 0.0,
+                "max_monster_position": 0.0,
+                "sentiment_score": 0.0,
+            },
+            "summary": {
+                "first_board_candidates": 0,
+                "leaders": 0,
+                "anomalies": 0,
+                "empty_signal_triggered": True,
+                "can_open_monster": False,
+                "watchlist_synced": False,
+            },
+            "data_gate": {
+                "status": "blocked",
+                "reasons": reasons,
+                "data_snapshot_id": data_snapshot_id,
+                "snapshot_current": snapshot_current,
+            },
+        }
+
     def run_week5_scan(
         self,
         symbols: list[str] | None = None,
@@ -999,6 +1055,7 @@ class RuntimeWeek5Service:
         universe_max_symbols_override: int | None = None,
         pinned_symbols: list[str] | None = None,
         scan_profile: str = "",
+        recovery_mode: bool = False,
     ) -> dict[str, object]:
         service = self._service
         if service._bootstrap_runtime_blocked():
@@ -1046,6 +1103,32 @@ class RuntimeWeek5Service:
             return blocked
 
         now = timestamp or datetime.now()
+        snapshot_manifest = None
+        snapshot_frame = None
+        snapshot_current = False
+        if bool(service._config.week5.feature_snapshot_enabled):
+            try:
+                snapshot_manifest, snapshot_frame = load_feature_snapshot(service._config)
+                if snapshot_manifest is not None and snapshot_frame is not None:
+                    snapshot_current = snapshot_is_current(
+                        snapshot_manifest, service._config, now
+                    )
+            except Exception:
+                snapshot_manifest = None
+                snapshot_frame = None
+                snapshot_current = False
+        snapshot_mode = bool(
+            snapshot_manifest is not None
+            and snapshot_frame is not None
+            and snapshot_current
+        )
+        data_gate = service._build_data_gate(
+            snapshot_manifest=snapshot_manifest,
+            snapshot_current=snapshot_current,
+            latest_trade_date=str(snapshot_manifest.trade_date) if snapshot_manifest else "",
+            now=now,
+        )
+        gate_status = str(data_gate.get("status", "ok"))
         intraday_scheduler_mode = self._is_intraday_scheduler_week5_scan(
             now=now,
             sync_reason=sync_reason,
@@ -1255,10 +1338,52 @@ class RuntimeWeek5Service:
 
         symbol_list = [str(item).strip() for item in raw_symbols if str(item).strip()]
         if should_scan_universe and symbol_list and prefilter_enabled:
-            prefilter_report = service._prefilter_week5_universe_symbols(
-                symbols=symbol_list,
-                top_k_override=configured_prefilter_top_k,
-            )
+            if snapshot_mode:
+                light_target = max(
+                    1, int(service._config.week5.light_candidate_target)
+                )
+                allowed_exchanges_for_light = {
+                    str(item).strip().upper()
+                    for item in service._config.evolution.universe_spec.board_scope
+                    if str(item).strip()
+                }
+                prefilter_report = service._light_stage_from_snapshot(
+                    frame=snapshot_frame,
+                    target=light_target,
+                    allowed_exchanges=allowed_exchanges_for_light,
+                )
+            else:
+                if gate_status == "blocked" and sync_reason.strip().lower().startswith(
+                    "scheduler_"
+                ):
+                    # Fail-closed: the nightly scheduled universe scan must NOT
+                    # silently fall back to the heavy direct-scan path
+                    # (top_k=500 full market) when the feature snapshot is
+                    # missing/stale.  Manual recovery runs override this by
+                    # passing an explicit non-scheduler sync reason.
+                    gate_reasons = [
+                        str(item) for item in (data_gate.get("reasons") or [])
+                    ]
+                    blocked_payload = self._build_gate_blocked_report(
+                        service=service,
+                        now=now,
+                        reasons=gate_reasons,
+                        data_snapshot_id=str(snapshot_manifest.data_snapshot_id)
+                        if snapshot_manifest
+                        else "",
+                        snapshot_current=snapshot_current,
+                    )
+                    self._state_service.store_week5_scan_report(blocked_payload)
+                    service._record_audit_event(
+                        event_type="week5_scan_blocked_data_gate",
+                        level="warn",
+                        payload={"reasons": gate_reasons},
+                    )
+                    return blocked_payload
+                prefilter_report = service._prefilter_week5_universe_symbols(
+                    symbols=symbol_list,
+                    top_k_override=configured_prefilter_top_k,
+                )
             prefilter_report["reason"] = "universe_scan"
             prefilter_report["universe_source"] = symbol_source
             if isinstance(universe_board_quota, dict):
@@ -1281,8 +1406,32 @@ class RuntimeWeek5Service:
                     for normalized in [_normalize_a_share_symbol(item.get("symbol"))]
                     if normalized
                 }
-            symbol_list = _string_list(prefilter_report.get("symbols", []))
+            prefilter_symbols = _string_list(prefilter_report.get("symbols", []))
+            if not prefilter_symbols:
+                prefilter_symbols = [
+                    str(item.get("symbol", "")).strip()
+                    for item in raw_shortlisted
+                    if isinstance(item, dict) and str(item.get("symbol", "")).strip()
+                ]
+            symbol_list = prefilter_symbols
             symbol_source = f"{symbol_source}:prefilter"
+
+        deep_report: dict[str, object] = {}
+        if snapshot_mode:
+            deep_report = service._deep_stage_from_snapshot(
+                frame=snapshot_frame,
+                target=max(1, int(service._config.week5.deep_candidate_target)),
+                light_report=prefilter_report,
+            )
+            deep_symbols = [
+                str(item.get("symbol", "")).strip()
+                for item in deep_report.get("selected", [])
+                if isinstance(item, dict) and str(item.get("symbol", "")).strip()
+            ]
+            if deep_symbols:
+                symbol_list = deep_symbols
+                symbol_source = f"{symbol_source}:snapshot_deep"
+            prefilter_report["deep_stage"] = deep_report
 
         quality_selector_mode = (
             str(quality_selection_report.get("selector_mode", "")).strip()
@@ -1517,6 +1666,37 @@ class RuntimeWeek5Service:
             item["shortlist_rank"] = index + 1
             item["shortlist_selected"] = index < shortlist_top_n
 
+        # The funnel's final selector rejects signals on data-trust problems
+        # (degraded/synthetic provider, low data-quality score).  A blocked
+        # gate caused solely by a missing/stale snapshot is a
+        # performance-contract issue: the scheduler path fail-closes at the
+        # universe-scan entry.  Only an EXPLICIT recovery run may proceed
+        # against direct bars, and even then it is advisory only — its output
+        # never feeds final_signals or the watchlist.
+        gate_reasons = [str(item) for item in (data_gate.get("reasons") or [])]
+        snapshot_only_blocked = bool(gate_reasons) and all(
+            reason.startswith("feature_snapshot") for reason in gate_reasons
+        )
+        recovery_direct_scan = bool(recovery_mode) and snapshot_only_blocked
+        final_selector_gate_status = (
+            "ok" if recovery_direct_scan else str(data_gate.get("status", "ok"))
+        )
+        final_selector = service._final_signal_selector(
+            signals=signal_pool_candidates,
+            data_gate_status=final_selector_gate_status,
+        )
+        if recovery_direct_scan:
+            # Advisory only: the output is inspected, never treated as a
+            # production signal source.
+            advisory_signals = list(final_selector.get("final_signals", []))
+            for item in advisory_signals:
+                if isinstance(item, dict):
+                    item["advisory"] = True
+            final_selector["advisory_only"] = True
+            final_selector["advisory_signals"] = advisory_signals
+            final_selector["final_signals"] = []
+            final_selector["selected_count"] = 0
+
         shortlist_preview = [
             {
                 "symbol": str(item.get("symbol", "")).strip(),
@@ -1642,7 +1822,34 @@ class RuntimeWeek5Service:
             "watchlist_size": len(symbol_list),
             "symbol_source": symbol_source,
             "scan_profile": scan_profile.strip() or "default",
+            "emergency_direct_scan": recovery_direct_scan,
+            "recovery_mode": bool(recovery_mode),
             "prefilter": prefilter_report,
+            "data_snapshot_id": str(snapshot_manifest.data_snapshot_id)
+            if snapshot_manifest is not None
+            else "",
+            "data_gate": dict(data_gate),
+            "funnel": {
+                "mode": "snapshot" if snapshot_mode else "direct",
+                "light_candidate_target": max(
+                    1, int(service._config.week5.light_candidate_target)
+                ),
+                "deep_candidate_target": max(
+                    1, int(service._config.week5.deep_candidate_target)
+                ),
+                "final_signal_cap": max(
+                    0, int(service._config.week5.final_signal_cap)
+                ),
+                "allow_zero_signal": bool(service._config.week5.allow_zero_signal),
+                "light_count": _as_int(
+                    prefilter_report.get("shortlisted_count", 0), default=0
+                ),
+                "deep_count": len(symbol_list),
+                "final_count": _as_int(
+                    final_selector.get("selected_count", 0), default=0
+                ),
+                "final_selection": dict(final_selector),
+            },
             "runtime_source": {
                 "mode": (
                     "realtime_overlay"
@@ -1714,6 +1921,10 @@ class RuntimeWeek5Service:
             else (symbols is None and bool(service._config.week5.auto_sync_watchlist))
         )
         should_sync_watchlist = requested_watchlist_sync and not intraday_scheduler_mode
+        # An explicit recovery run is advisory only: it must not mutate the
+        # watchlist or feed production signal channels.
+        if recovery_mode:
+            should_sync_watchlist = False
         watchlist_sync: dict[str, object] = {
             "enabled": requested_watchlist_sync,
             "updated": False,
@@ -1727,11 +1938,15 @@ class RuntimeWeek5Service:
             "symbols": list(service._state.watchlist),
         }
         if should_sync_watchlist:
+            # Watchlist must only be synced from the final selection.  When
+            # the funnel yields zero final signals, the old watchlist is
+            # preserved (keep_if_empty) instead of topping up from the signal
+            # pool with stocks that never passed the final gates.
             watchlist_sync = self._state_service.auto_sync_watchlist_from_week5_report(
                 report=report,
                 reason=sync_reason or f"week5_scan:{symbol_source}",
                 top_k_override=sync_top_k_override,
-                allow_signal_pool_fallback=True,
+                allow_signal_pool_fallback=False,
             )
         else:
             watchlist_sync["diagnostics"] = (

@@ -285,13 +285,56 @@ class RuntimeIdleQueueFileStrategyService:
         if not candidates:
             return None
         candidates.sort(key=lambda item: item[0], reverse=True)
+        parsed: list[tuple[str, int, dict[str, object]]] = []
         for trade_date, path in candidates:
             if path.suffix.lower() != ".json":
-                return {"trade_date": trade_date, "path": str(path), "payload": {"path": str(path)}}
+                continue
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
             if isinstance(payload, dict):
-                return {"trade_date": trade_date, "path": str(path), "payload": payload}
-        return None
+                parsed.append((trade_date, _report_data_rank(payload), payload))
+        if not parsed:
+            return None
+        # Prefer reports that actually carry data over empty/degraded ones;
+        # tie-break by the most recent trade date.
+        parsed.sort(key=lambda item: (item[1], item[0]), reverse=True)
+        best_trade_date, _rank, best_payload = parsed[0]
+        return {
+            "trade_date": best_trade_date,
+            "path": str(
+                next(path for _, path in candidates if path.parts[-4] == best_trade_date)
+                if subdir
+                else next(path for _, path in candidates if path.parts[-3] == best_trade_date)
+            ),
+            "payload": best_payload,
+        }
+
+
+def _report_data_rank(payload: object) -> int:
+    """Quality rank of a stored task report: 2 = healthy with data, 0 = empty."""
+    if not isinstance(payload, dict):
+        return 0
+    dq = payload.get("data_quality")
+    if not isinstance(dq, dict):
+        dq = payload
+    inner = dq.get("data_quality") if isinstance(dq, dict) else None
+    if isinstance(inner, dict):
+        dq = inner
+    # status lives on the outer envelope in healthy reports and on the
+    # payload layer in fallback files; check both.
+    status = str(dq.get("status", "")).strip().lower()
+    if not status:
+        status = str(payload.get("status", "")).strip().lower()
+    symbols = dq.get("symbols")
+    watchlist_size = dq.get("watchlist_size")
+    has_symbols = (
+        isinstance(symbols, list) and len(symbols) > 0
+    ) or (isinstance(watchlist_size, (int, float)) and float(watchlist_size) > 0)
+    healthy = status in {"healthy", "ok", "completed"}
+    if healthy and has_symbols:
+        return 2
+    if has_symbols or healthy:
+        return 1
+    return 0

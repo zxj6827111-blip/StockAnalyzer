@@ -2399,6 +2399,11 @@ def week5_scan_run(
         help="Whether to sync week5 selection result into runtime watchlist",
     ),
     sync_reason: str = typer.Option("", help="Optional sync reason for audit trail"),
+    recovery_mode: bool = typer.Option(
+        False,
+        help="Explicit emergency recovery scan: advisory only, never feeds "
+        "final signals/watchlist; bypasses a stale-snapshot block",
+    ),
 ) -> None:
     config = get_config()
     service = StockAnalyzerService(config=config)
@@ -2408,6 +2413,7 @@ def week5_scan_run(
         notify_enabled=notify_enabled,
         sync_watchlist=sync_watchlist,
         sync_reason=sync_reason,
+        recovery_mode=recovery_mode,
     )
     typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
 

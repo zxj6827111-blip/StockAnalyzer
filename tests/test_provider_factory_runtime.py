@@ -21,7 +21,7 @@ from stock_analyzer.data.tdx_offline_provider import TdxOfflineProvider
 
 
 def test_build_runtime_provider_uses_efinance_as_online_backup_for_akshare() -> None:
-    config = DataSourceConfig(primary="akshare")
+    config = DataSourceConfig(primary="akshare", synthetic_fallback_allowed=True)
     provider = build_runtime_provider(config)
     assert isinstance(provider, ResilientProvider)
     assert isinstance(provider.backup, ResilientProvider)
@@ -31,7 +31,7 @@ def test_build_runtime_provider_uses_efinance_as_online_backup_for_akshare() -> 
 
 
 def test_build_runtime_provider_uses_akshare_as_online_backup_for_efinance() -> None:
-    config = DataSourceConfig(primary="efinance")
+    config = DataSourceConfig(primary="efinance", synthetic_fallback_allowed=True)
     provider = build_runtime_provider(config)
     assert isinstance(provider, ResilientProvider)
     assert isinstance(provider.backup, ResilientProvider)
@@ -43,7 +43,7 @@ def test_build_runtime_provider_container_mode_uses_fast_synthetic_failover(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("STOCK_ANALYZER_CONTAINERIZED", "1")
-    config = DataSourceConfig(primary="efinance")
+    config = DataSourceConfig(primary="efinance", synthetic_fallback_allowed=True)
 
     provider = build_runtime_provider(config)
 
@@ -60,6 +60,7 @@ def test_build_realtime_runtime_provider_wraps_tdx_offline_with_live_overlay(
         primary="tdx_offline",
         local_data_root=str(tmp_path),
         runtime_live_cache_ttl_sec=15,
+        synthetic_fallback_allowed=True,
     )
 
     provider = build_realtime_runtime_provider(config, timezone="Asia/Shanghai")
@@ -128,3 +129,64 @@ def test_build_market_depth_provider_uses_cached_chain() -> None:
     provider = build_market_depth_provider(config)
 
     assert isinstance(provider, CachedMarketDepthProvider)
+
+
+def _provider_chain_types(provider: object) -> list[type]:
+    collected: list[type] = []
+    stack: list[object] = [provider]
+    while stack:
+        node = stack.pop()
+        collected.append(type(node))
+        if isinstance(node, ResilientProvider):
+            stack.append(node.primary)
+            if node.backup is not None:
+                stack.append(node.backup)
+        base = getattr(node, "base_provider", None)
+        if base is not None:
+            stack.append(base)
+    return collected
+
+
+def test_runtime_provider_never_falls_back_to_synthetic_by_default(
+    tmp_path: Path,
+) -> None:
+    config = DataSourceConfig(
+        primary="market_warehouse",
+        warehouse_db_path=str(tmp_path / "warehouse" / "missing.duckdb"),
+    )
+
+    provider = build_runtime_provider(config)
+
+    assert isinstance(provider, ResilientProvider)
+    assert isinstance(provider.primary, MarketWarehouse)
+    assert SyntheticProvider not in _provider_chain_types(provider)
+
+    realtime_provider = build_realtime_runtime_provider(config, timezone="Asia/Shanghai")
+    assert SyntheticProvider not in _provider_chain_types(realtime_provider)
+
+    no_online_backup_config = DataSourceConfig(primary="tushare")
+    direct = build_runtime_provider(no_online_backup_config)
+    assert isinstance(direct, ResilientProvider)
+    assert direct.backup is None
+    assert SyntheticProvider not in _provider_chain_types(direct)
+
+
+def test_runtime_provider_allows_synthetic_when_configured() -> None:
+    config = DataSourceConfig(primary="akshare", synthetic_fallback_allowed=True)
+
+    provider = build_runtime_provider(config)
+
+    assert isinstance(provider, ResilientProvider)
+    assert isinstance(provider.backup, ResilientProvider)
+    assert isinstance(provider.backup.backup, SyntheticProvider)
+
+
+def test_runtime_provider_explicit_synthetic_primary_ok() -> None:
+    config = DataSourceConfig(primary="synthetic", synthetic_fallback_allowed=False)
+
+    provider = build_runtime_provider(config)
+
+    assert isinstance(provider, SyntheticProvider)
+
+    realtime_provider = build_realtime_runtime_provider(config)
+    assert isinstance(realtime_provider, SyntheticProvider)

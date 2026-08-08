@@ -11,14 +11,15 @@ import pandas as pd
 import pytest
 
 from scripts.update_vendor_daily_from_tushare import (
+    _daily_to_25_columns,
     _distribute_batch_day,
     _fetch_market_wide_by_date,
+    _load_factor_entry_map,
     _merge_factor_rows_scaled,
     _read_last_date_fast,
     _rebuild_daily_year_zip,
     _symbol_daily_last_date,
     _update_last_date_index,
-    _daily_to_25_columns,
 )
 
 
@@ -384,3 +385,69 @@ def test_merge_factor_rows_scaled_hfq_keeps_history(tmp_path: Path) -> None:
     assert by_date["20260729"] == pytest.approx(1.0)
     assert by_date["20260730"] == pytest.approx(1.02)
     assert by_date["20260731"] == pytest.approx(1.02 * 3.0 / 2.5)
+
+
+def test_load_factor_entry_map_groups_years(tmp_path: Path) -> None:
+    factors_root = tmp_path / "复权因子"
+    factors_root.mkdir()
+    with zipfile.ZipFile(factors_root / "复权因子_前复权.zip", "w") as archive:
+        archive.writestr(
+            "2025/000001.SZ.csv",
+            "股票代码,交易日期,复权因子\n"
+            "000001.SZ,20251225,0.90\n"
+            "000001.SZ,20251228,0.95\n",
+        )
+        archive.writestr(
+            "2026/000001.SZ.csv",
+            "股票代码,交易日期,复权因子\n"
+            "000001.SZ,20260105,0.98\n"
+            "000001.SZ,20251228,0.97\n",
+        )
+        archive.writestr(
+            "2026/600519.SH.csv",
+            "股票代码,交易日期,复权因子\n" "600519.SH,20260105,1.00\n",
+        )
+        archive.writestr("__MACOSX/._000001.SZ.csv", "noise\n")
+        archive.writestr("2026/not_a_code.csv", "股票代码,交易日期,复权因子\n")
+
+    stored_map = _load_factor_entry_map(factors_root, "复权因子_前复权.zip")
+    assert set(stored_map) == {"000001.SZ", "600519.SH"}
+    frame = stored_map["000001.SZ"]
+    assert frame["交易日期"].astype(str).tolist() == ["20251225", "20251228", "20260105"]
+    by_date = dict(zip(frame["交易日期"].astype(str), frame["复权因子"], strict=True))
+    # Duplicate date across year entries resolved with the later entry winning.
+    assert by_date["20251228"] == pytest.approx(0.97)
+    assert by_date["20251225"] == pytest.approx(0.90)
+    assert by_date["20260105"] == pytest.approx(0.98)
+    assert stored_map["600519.SH"]["复权因子"].iloc[0] == pytest.approx(1.0)
+
+
+def test_merge_factor_rows_scaled_uses_stored_map(tmp_path: Path) -> None:
+    factors_root = _build_factor_fixture(
+        tmp_path,
+        {"20260729": 0.98, "20260730": 1.00},
+    )
+    adj_new = _fake_adj_frame(["000001.SZ"], "20260731", 3.0)
+    adj_old = _fake_adj_frame(["000001.SZ"], "20260730", 2.5)
+
+    without_map = _merge_factor_rows_scaled(
+        ts_code="000001.SZ",
+        adj_new_day=adj_new,
+        adj_old_day=adj_old,
+        factors_root=factors_root,
+        archive_name="复权因子_前复权.zip",
+        anchor="latest",
+    )
+    stored_map = _load_factor_entry_map(factors_root, "复权因子_前复权.zip")
+    with_map = _merge_factor_rows_scaled(
+        ts_code="000001.SZ",
+        adj_new_day=adj_new,
+        adj_old_day=adj_old,
+        factors_root=factors_root,
+        archive_name="复权因子_前复权.zip",
+        anchor="latest",
+        stored_map=stored_map,
+    )
+    assert with_map is not None
+    assert without_map is not None
+    pd.testing.assert_frame_equal(with_map, without_map)

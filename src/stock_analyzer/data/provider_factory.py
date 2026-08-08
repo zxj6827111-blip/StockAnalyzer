@@ -177,8 +177,15 @@ def build_runtime_provider(
     if config.primary.strip().lower() in {"synthetic", "synthetic_test"}:
         return SyntheticProvider(seed_offset=synthetic_seed)
     primary_provider = build_primary_provider(config)
-    synthetic_backup = SyntheticProvider(seed_offset=synthetic_seed)
     online_backup = build_online_backup_provider(config)
+    if not config.synthetic_fallback_allowed:
+        # Production gate: never degrade to synthetic when primary is real.
+        return ResilientProvider(
+            primary=primary_provider,
+            backup=online_backup,
+            config=config,
+        )
+    synthetic_backup = SyntheticProvider(seed_offset=synthetic_seed)
     fallback: MarketDataProvider = synthetic_backup
     if online_backup is not None:
         fallback = ResilientProvider(
@@ -228,8 +235,15 @@ def build_realtime_runtime_provider(
             live_timeout_sec=max(1, int(config.runtime_live_timeout_sec)),
             live_cache_ttl_sec=max(1.0, float(config.runtime_live_cache_ttl_sec)),
         )
-    synthetic_backup = SyntheticProvider(seed_offset=synthetic_seed)
     online_backup = build_online_backup_provider(config)
+    if not config.synthetic_fallback_allowed:
+        # Production gate: never degrade to synthetic when primary is real.
+        return ResilientProvider(
+            primary=primary_provider,
+            backup=online_backup,
+            config=config,
+        )
+    synthetic_backup = SyntheticProvider(seed_offset=synthetic_seed)
     fallback: MarketDataProvider = synthetic_backup
     if online_backup is not None:
         fallback = ResilientProvider(

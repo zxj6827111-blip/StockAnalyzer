@@ -205,6 +205,52 @@ def test_rebuild_zip_replaces_entries_copies_others_and_verifies(
     assert not list(tmp_path.glob("*.tmp"))
 
 
+def test_zip_rebuild_validation_failure_preserves_old_archive(
+    updater: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rebuild whose post-write validation fails must keep the old ZIP."""
+    target = tmp_path / "2025.zip"
+    _write_zip(target, {"2025/600000.SH.csv": "old content\n"})
+    original_bytes = target.read_bytes()
+    real_zipfile = updater.zipfile.ZipFile
+    open_count = {"n": 0}
+
+    class _FlakyZipFile:
+        def __init__(self, file, mode="r", *args, **kwargs):
+            self._zf = real_zipfile(file, mode, *args, **kwargs)
+            open_count["n"] += 1
+            self._flaky = open_count["n"] >= 2  # validation open is the 2nd
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self._zf.__exit__(*args)
+
+        def infolist(self):
+            return self._zf.infolist()
+
+        def read(self, name):
+            if self._flaky:
+                raise updater.zipfile.BadZipFile("corrupt probe")
+            return self._zf.read(name)
+
+        def writestr(self, *args, **kwargs):
+            return self._zf.writestr(*args, **kwargs)
+
+        def close(self):
+            return self._zf.close()
+
+    monkeypatch.setattr(updater.zipfile, "ZipFile", _FlakyZipFile)
+    with pytest.raises(updater.zipfile.BadZipFile):
+        updater._rebuild_zip(
+            target, {"2025/600000.SH.csv": "new content\n"}
+        )
+    # The official archive is byte-identical: validation failed before replace.
+    assert target.read_bytes() == original_bytes
+    assert not list(tmp_path.glob("*.tmp"))  # temp cleaned up on failure
+
+
 def test_rebuild_daily_year_zip_merges_old_and_new_rows(updater: object, tmp_path: Path) -> None:
     _write_zip(
         tmp_path / "全A日K" / "2025.zip",

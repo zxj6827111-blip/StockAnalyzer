@@ -571,7 +571,12 @@ def _rebuild_zip(
     archive_path: Path,
     replace_entries: dict[str, str],
 ) -> dict[str, object]:
-    """Atomically rebuild one ZIP with the given entries replaced wholesale."""
+    """Atomically rebuild one ZIP with the given entries replaced wholesale.
+
+    Validation happens against the *temporary* archive BEFORE the atomic
+    ``os.replace``, so a failed rebuild never destroys the previous ZIP: the
+    old file stays byte-identical unless the new archive fully validates.
+    """
     if not archive_path.parent.exists():
         archive_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = archive_path.with_name(f"{archive_path.name}.{os.getpid()}.tmp")
@@ -594,31 +599,44 @@ def _rebuild_zip(
                     output.writestr(info, source.read(info.filename))
         for name, content in replace_entries.items():
             output.writestr(name, content)
-    os.replace(temporary, archive_path)
 
-    written_names: list[str] = []
-    with zipfile.ZipFile(archive_path) as check:
-        written_names = [
-            info.filename for info in check.infolist() if not info.is_dir()
-        ]
-        for name in replace_entries:
-            if name not in written_names:
-                raise DataSourceError(
-                    f"vendor ZIP rebuild lost entry: {archive_path}!{name}"
-                )
-    duplicate_names = sorted(
-        {name for name in written_names if written_names.count(name) > 1}
-    )
-    if duplicate_names:
-        raise DataSourceError(
-            f"vendor ZIP rebuild produced duplicate entries: {archive_path}: "
-            f"{duplicate_names}"
+    try:
+        # Validate the temporary archive before swapping it in.  Opening it
+        # (raises BadZipFile on corruption) plus entry checks cover both
+        # readability and completeness.
+        written_names: list[str] = []
+        with zipfile.ZipFile(temporary) as check:
+            written_names = [
+                info.filename for info in check.infolist() if not info.is_dir()
+            ]
+            for name in replace_entries:
+                if name not in written_names:
+                    raise DataSourceError(
+                        f"vendor ZIP rebuild lost entry: {archive_path}!{name}"
+                    )
+            for name in written_names:
+                check.read(name)
+        duplicate_names = sorted(
+            {name for name in written_names if written_names.count(name) > 1}
         )
-    missing_names = sorted(old_names - set(written_names))
-    if missing_names:
-        raise DataSourceError(
-            f"vendor ZIP rebuild dropped entries: {archive_path}: {missing_names}"
-        )
+        if duplicate_names:
+            raise DataSourceError(
+                f"vendor ZIP rebuild produced duplicate entries: {archive_path}: "
+                f"{duplicate_names}"
+            )
+        missing_names = sorted(old_names - set(written_names))
+        if missing_names:
+            raise DataSourceError(
+                f"vendor ZIP rebuild dropped entries: {archive_path}: {missing_names}"
+            )
+    except Exception:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+    os.replace(temporary, archive_path)
     return {
         "archive": str(archive_path),
         "entries_total": len(written_names),
@@ -871,6 +889,40 @@ def _seed_factor_rows(
     )
 
 
+def _load_factor_entry_map(factors_root: Path, archive_name: str) -> dict[str, pd.DataFrame]:
+    """一次遍历 ZIP 全部 entry，建立 {ts_code: 历史因子 DataFrame} 映射。"""
+    archive_path = factors_root / archive_name
+    if not archive_path.exists():
+        return {}
+    grouped: dict[str, list[pd.DataFrame]] = {}
+    with zipfile.ZipFile(archive_path) as archive:
+        for info in archive.infolist():
+            if info.is_dir() or _is_zip_noise(info.filename):
+                continue
+            name = info.filename.replace("\\", "/")
+            if DAILY_ENTRY_RE.search(name) is None:
+                continue
+            ts_code = name.rsplit("/", 1)[-1][: -len(".csv")]
+            try:
+                with archive.open(info.filename) as stream:
+                    frame = pd.read_csv(stream)
+            except (KeyError, ValueError, OSError):
+                continue
+            if "交易日期" not in frame.columns or "复权因子" not in frame.columns:
+                continue
+            frame = frame[["交易日期", "复权因子"]].dropna()
+            if frame.empty:
+                continue
+            grouped.setdefault(ts_code, []).append(frame)
+    stored_map: dict[str, pd.DataFrame] = {}
+    for ts_code, parts in grouped.items():
+        merged = pd.concat(parts, axis=0, sort=False, ignore_index=True)
+        merged = merged.drop_duplicates(subset=["交易日期"], keep="last")
+        merged = merged.sort_values("交易日期")
+        stored_map[ts_code] = merged
+    return stored_map
+
+
 def _merge_factor_rows_scaled(
     *,
     ts_code: str,
@@ -879,8 +931,13 @@ def _merge_factor_rows_scaled(
     factors_root: Path,
     archive_name: str,
     anchor: str,
+    stored_map: dict[str, pd.DataFrame] | None = None,
 ) -> pd.DataFrame | None:
     """Re-anchor the stored factor series with only the two anchor-day values.
+
+    ``stored_map`` (from ``_load_factor_entry_map``) supplies the stored
+    series without rescanning the ZIP per symbol; when omitted the archive is
+    opened and scanned as before.
 
     The vendor factor files store the *normalised* series (qfq latest = 1.0 /
     hfq earliest = 1.0), so the raw adjustment factor scale is not recoverable
@@ -931,7 +988,16 @@ def _merge_factor_rows_scaled(
     archive_path = factors_root / archive_name
     old_dates: list[str] = []
     old_values: list[float] = []
-    if archive_path.exists():
+    if stored_map is not None:
+        stored_frame = stored_map.get(ts_code)
+        if stored_frame is not None and not stored_frame.empty:
+            old_dates = stored_frame["交易日期"].astype(str).tolist()
+            old_values = (
+                pd.to_numeric(stored_frame["复权因子"], errors="coerce")
+                .fillna(0.0)
+                .tolist()
+            )
+    elif archive_path.exists():
         with zipfile.ZipFile(archive_path) as archive:
             for info in archive.infolist():
                 if info.is_dir() or _is_zip_noise(info.filename):
@@ -1112,6 +1178,8 @@ def _run_batch(
                     }
                 )
             if not adj_new_day.empty:
+                qfq_stored = _load_factor_entry_map(factors_root, FACTORS_QFQ_ARCHIVE)
+                hfq_stored = _load_factor_entry_map(factors_root, FACTORS_HFQ_ARCHIVE)
                 qfq_updates: dict[str, pd.DataFrame] = {}
                 hfq_updates: dict[str, pd.DataFrame] = {}
                 for code in sorted(factor_updates):
@@ -1126,6 +1194,7 @@ def _run_batch(
                         factors_root=factors_root,
                         archive_name=FACTORS_QFQ_ARCHIVE,
                         anchor="latest",
+                        stored_map=qfq_stored,
                     )
                     merged_hfq = _merge_factor_rows_scaled(
                         ts_code=code,
@@ -1138,6 +1207,7 @@ def _run_batch(
                         factors_root=factors_root,
                         archive_name=FACTORS_HFQ_ARCHIVE,
                         anchor="earliest",
+                        stored_map=hfq_stored,
                     )
                     if merged_qfq is not None:
                         qfq_updates[code] = merged_qfq

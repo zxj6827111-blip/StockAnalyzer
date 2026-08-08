@@ -182,3 +182,45 @@ def test_week6_data_quality_scan_flags_missing_fields() -> None:
     assert _as_int(events["records"]) >= 1
     latest = _as_mapping_list(events["events"])[-1]
     assert _as_text(latest["level"]) == "warn"
+
+
+class _PartialFailureProvider:
+    """Returns complete fields for some symbols and raises for the rest."""
+
+    def __init__(self, healthy: _HealthyFieldsProvider, failing: set[str]) -> None:
+        self._healthy = healthy
+        self._failing = set(failing)
+
+    def fetch_daily_bars(self, symbol: str, lookback_days: int = 120) -> pd.DataFrame:
+        if symbol in self._failing:
+            raise RuntimeError("source_down_for_symbol")
+        return self._healthy.fetch_daily_bars(symbol=symbol, lookback_days=lookback_days)
+
+
+_SHARED_PARTIAL_WEEK6_QUALITY_SERVICE = StockAnalyzerService(config=_load_test_config())
+_patch_attr(
+    _SHARED_PARTIAL_WEEK6_QUALITY_SERVICE,
+    "_provider",
+    _PartialFailureProvider(_HealthyFieldsProvider(), failing={"000001", "300750"}),
+)
+
+
+def test_week6_partial_failure_must_not_report_healthy() -> None:
+    """Partial symbol failures must degrade the status instead of hiding them."""
+    service = _SHARED_PARTIAL_WEEK6_QUALITY_SERVICE
+    _reset_shared_week6_quality_service(service)
+
+    report = service.run_week6_data_prewarm(
+        symbols=["600000", "000001", "300750"],
+        lookback_days=60,
+        notify_enabled=False,
+        source_trace_id="test-week6-quality-partial",
+    )
+    assert _as_int(report["success_symbols"]) == 1
+    assert _as_int(report["failed_symbols"]) == 2
+    # Coverage is computed over the full watchlist, so 2 failing symbols
+    # drag the ratio down below the healthy threshold.
+    assert abs(_as_float(report["failed_ratio"]) - 2 / 3) < 1e-3
+    assert _as_float(report["overall_coverage_ratio"]) < 1.0
+    assert _as_text(report["status"]) in {"warn", "critical"}
+    assert _as_text(report["status"]) != "healthy"

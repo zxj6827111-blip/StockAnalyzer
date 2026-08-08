@@ -52,7 +52,15 @@ class RuntimeIdleQueueWorkdayService:
                 fallback_source_trade_date = str(stale.get("trade_date", ""))
                 stale_payload = stale.get("payload", {})
                 if isinstance(stale_payload, dict):
-                    report = stale_payload
+                    # Unwrap to the data-quality payload layer: the stored
+                    # report.json carries the load under ``data_quality``, and
+                    # older fallback files may nest it one level deeper.
+                    inner = stale_payload.get("data_quality")
+                    if isinstance(inner, dict):
+                        inner_inner = inner.get("data_quality")
+                        report = inner_inner if isinstance(inner_inner, dict) else inner
+                    else:
+                        report = stale_payload
 
         payload = {
             "task_id": "WD-P0-01",
