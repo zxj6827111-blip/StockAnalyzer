@@ -93,7 +93,7 @@ def test_load_default_config_values(monkeypatch: MonkeyPatch) -> None:
     assert config.week5.universe_prefilter_top_k == 500
     assert config.week5.universe_prefilter_shortlist_top_n == 50
     assert config.week5.universe_quality_selector_enabled is True
-    assert config.week5.universe_quality_target_size == 300
+    assert config.week5.universe_quality_target_size == 100
     assert config.week5.universe_quality_min_history_days == 60
     assert config.week5.universe_quality_min_avg_turnover_20 == 5_000_000.0
     assert config.week5.universe_quality_min_float_market_cap == 300_000_000.0

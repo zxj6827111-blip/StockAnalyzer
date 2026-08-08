@@ -279,7 +279,7 @@ week5:
   universe_prefilter_top_k: 500
   universe_prefilter_shortlist_top_n: 50
   universe_quality_selector_enabled: true
-  universe_quality_target_size: 300
+  universe_quality_target_size: 100
   universe_quality_min_history_days: 60
   universe_quality_min_avg_turnover_20: 5000000.0
   universe_quality_min_float_market_cap: 300000000.0

@@ -69,11 +69,7 @@ class _BenchProvider:
         # The cache is generated far enough into the future; the current date
         # offset decides how much of it is "published" — so a normal trading
         # day appends new bars and an unchanged day returns the same tail.
-        last_trade = pd.bdate_range(
-            end=pd.Timestamp.today().normalize()
-            + pd.Timedelta(days=self.date_offset_days),
-            periods=1,
-        )[0]
+        last_trade = _latest_business_day(self.date_offset_days)
         window = self._bar_cache[symbol].loc[
             self._bar_cache[symbol].index <= last_trade
         ]
@@ -114,15 +110,19 @@ class _BenchProvider:
         return frame
 
     def latest_daily_dates(self, symbols=None):
-        last_trade = pd.bdate_range(
-            end=pd.Timestamp.today().normalize()
-            + pd.Timedelta(days=self.date_offset_days),
-            periods=1,
-        )[0].date()
+        last_trade = _latest_business_day(self.date_offset_days).date()
         return {symbol: last_trade for symbol in (symbols or self.symbols)}
 
     def status(self) -> dict[str, object]:
         return {}
+
+
+def _latest_business_day(offset_days: int) -> pd.Timestamp:
+    """Resolve a published trade date even when the benchmark runs on a weekend."""
+    target = pd.Timestamp.today().normalize() + pd.Timedelta(days=int(offset_days))
+    if target.weekday() >= 5:
+        target = target - pd.offsets.BDay(1)
+    return target
 
 
 def _report(label: str, seconds: float, provider: _BenchProvider, payload: dict) -> None:

@@ -1688,10 +1688,14 @@ class RuntimeWeek5Service:
         if recovery_direct_scan:
             # Advisory only: the output is inspected, never treated as a
             # production signal source.
-            final_selector["advisory_only"] = True
-            for item in final_selector.get("final_signals", []):
+            advisory_signals = list(final_selector.get("final_signals", []))
+            for item in advisory_signals:
                 if isinstance(item, dict):
                     item["advisory"] = True
+            final_selector["advisory_only"] = True
+            final_selector["advisory_signals"] = advisory_signals
+            final_selector["final_signals"] = []
+            final_selector["selected_count"] = 0
 
         shortlist_preview = [
             {

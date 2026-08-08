@@ -61,6 +61,41 @@ def test_snapshot_build_skip_and_load(tmp_path: Path) -> None:
     assert report2["data_snapshot_id"] == report["data_snapshot_id"]
 
 
+def test_full_snapshot_transform_failure_is_not_current(tmp_path: Path, monkeypatch) -> None:
+    service, root = _make_service(tmp_path)
+    provider = SyntheticProvider(seed_offset=2026)
+
+    import stock_analyzer.feature.snapshot as snapshot_module
+
+    original_worker = snapshot_module._transform_row_worker
+
+    def _fail_one(payload):
+        if payload[0] == "000001":
+            return payload[0], None
+        return original_worker(payload)
+
+    monkeypatch.setattr(snapshot_module, "_transform_row_worker", _fail_one)
+    report = build_feature_snapshot(
+        service._config,
+        provider,
+        symbols=["600519", "000001", "601318"],
+        lookback_days=250,
+        force=True,
+        max_workers=1,
+    )
+
+    manifest, frame = load_feature_snapshot(service._config)
+    assert report["ok"] is False
+    assert report["failed_symbols"] == 1
+    assert report["failed_symbols_list"] == ["000001"]
+    assert manifest is not None and frame is not None
+    assert manifest.symbol_count == 2
+    assert manifest.failed_symbols == 1
+    assert manifest.failed_symbols_list == ["000001"]
+    assert snapshot_is_current(manifest, service._config) is False
+    assert (root / "current.json").exists()
+
+
 def test_snapshot_goes_stale_when_data_root_layout_changes(tmp_path: Path) -> None:
     service, root = _make_service(tmp_path)
     data_root = tmp_path / "data_root"
@@ -641,6 +676,11 @@ def test_recovery_mode_is_advisory_only(tmp_path: Path) -> None:
     funnel = report.get("funnel") or {}
     final_selection = funnel.get("final_selection") or {}
     assert final_selection.get("advisory_only") is True
+    assert final_selection.get("final_signals") == []
+    assert all(
+        bool(item.get("advisory"))
+        for item in (final_selection.get("advisory_signals") or [])
+    )
     watchlist_sync = report.get("watchlist_sync") or {}
     assert watchlist_sync.get("updated", False) is False
 

@@ -394,21 +394,34 @@ def build_feature_snapshot(
     if payloads and workers > 1:
         with ProcessPoolExecutor(max_workers=workers) as executor:
             for _symbol, row_dict in executor.map(_transform_row_worker, payloads):
-                if row_dict is not None:
-                    rows.append(pd.DataFrame([row_dict]))
+                if row_dict is None:
+                    failed.append(str(_symbol))
+                    continue
+                rows.append(pd.DataFrame([row_dict]))
                 if callable(on_progress):
                     on_progress(len(rows), len(payloads))
     else:
         for symbol, bars_dict, _engineer in payloads:
             _symbol, row_dict = _transform_row_worker((symbol, bars_dict, engineer))
-            if row_dict is not None:
-                rows.append(pd.DataFrame([row_dict]))
+            if row_dict is None:
+                failed.append(str(_symbol))
+                continue
+            rows.append(pd.DataFrame([row_dict]))
             if callable(on_progress):
                 on_progress(len(rows), len(payloads))
 
     if not rows:
-        return {"ok": False, "skipped": False, "errors": ["no_rows"], "root": str(root)}
+        failed = _dedupe_preserve_order(failed)
+        return {
+            "ok": False,
+            "skipped": False,
+            "errors": ["no_rows"],
+            "failed_symbols": len(failed),
+            "failed_symbols_list": failed,
+            "root": str(root),
+        }
 
+    failed = _dedupe_preserve_order(failed)
     frame = pd.concat(rows, ignore_index=True)
     tails_by_symbol = {
         symbol: bars.tail(lookback) for symbol, bars in bars_by_symbol.items()
@@ -446,12 +459,13 @@ def build_feature_snapshot(
     _prune_old_snapshots(root, keep=2)
 
     return {
-        "ok": True,
+        "ok": not failed,
         "skipped": False,
         "data_snapshot_id": snapshot_id,
         "trade_date": latest_date,
         "symbol_count": int(len(frame)),
         "failed_symbols": len(failed),
+        "failed_symbols_list": failed,
         "root": str(root),
     }
 
