@@ -50,5 +50,6 @@ artifacts/*
 codex_pytest_*/
 output/
 staging/tdx_probe/
+staging/idle_cache/
 tmp_*/
 .workbuddy/
