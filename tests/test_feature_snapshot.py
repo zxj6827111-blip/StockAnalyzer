@@ -20,6 +20,10 @@ from stock_analyzer.runtime.service import StockAnalyzerService
 _SYMBOLS = ["600519", "000001", "601318", "000858", "600000", "300750"]
 
 
+def _patch_attr(target: object, name: str, value: object) -> None:
+    object.__setattr__(target, name, value)
+
+
 def _make_service(tmp_path: Path) -> tuple[StockAnalyzerService, Path]:
     config = load_config("config/default.yaml")
     config.data_source.primary = "synthetic"
@@ -206,21 +210,31 @@ def test_deep_stage_selects_capped_target(tmp_path: Path) -> None:
 
 
 class _DateTrackingProvider:
-    """SyntheticProvider wrapper that tracks fetch calls and reports dates."""
+    """SyntheticProvider wrapper that tracks fetch calls and reports dates.
+
+    The underlying synthetic sequence is cached per symbol so probes (small
+    lookback) observe the SAME bars as the full-window build — mirroring real
+    vendor data where ``fetch(250)`` and ``fetch(5)`` agree on the tail.
+    """
 
     def __init__(
         self,
         inner: SyntheticProvider,
         latest_dates: dict[str, object],
-        fetch_log: list[str],
+        fetch_log: list[tuple[str, int]],
     ) -> None:
         self._inner = inner
         self._latest_dates = latest_dates
         self._fetch_log = fetch_log
+        self._cache: dict[str, pd.DataFrame] = {}
 
     def fetch_daily_bars(self, symbol: str, lookback_days: int = 120, **kwargs):
-        self._fetch_log.append(symbol)
-        return self._inner.fetch_daily_bars(symbol=symbol, lookback_days=lookback_days, **kwargs)
+        self._fetch_log.append((symbol, int(lookback_days)))
+        if symbol not in self._cache:
+            self._cache[symbol] = self._inner.fetch_daily_bars(
+                symbol=symbol, lookback_days=250, **kwargs
+            )
+        return self._cache[symbol].tail(max(1, int(lookback_days)))
 
     def latest_daily_dates(self, symbols=None):
         requested = set(symbols or [])
@@ -245,13 +259,14 @@ def test_snapshot_incremental_refetches_only_dirty_symbols(tmp_path: Path) -> No
 
     service, _root = _make_service(tmp_path)
     provider = SyntheticProvider(seed_offset=2026)
-    fetch_log: list[str] = []
+    fetch_log: list[tuple[str, int]] = []
     tracked = _DateTrackingProvider(provider, latest_dates={}, fetch_log=fetch_log)
     first = build_feature_snapshot(
         service._config, tracked, symbols=_SYMBOLS, lookback_days=250, force=True
     )
     assert first["ok"] is True
-    assert set(fetch_log) == set(_SYMBOLS)  # full build fetches everything
+    # Full build fetches every symbol (plus one probe for the trade date).
+    assert set(symbol for symbol, _ in fetch_log) == set(_SYMBOLS)
 
     # Baseline dates come from the freshly built manifest (real bar dates).
     manifest, _ = load_feature_snapshot(service._config)
@@ -272,7 +287,14 @@ def test_snapshot_incremental_refetches_only_dirty_symbols(tmp_path: Path) -> No
     assert second["ok"] is True
     assert second["incremental"] is True
     assert second["dirty_symbols"] == 2
-    assert sorted(fetch_log) == ["000001", "600519"]  # only dirty refetched
+    # Rolling increment: NO full-window (250-day) refetch happens at all — the
+    # refresh is served from the stored tail + a short probe, and only the
+    # dirty symbols are re-engineered.
+    full_window_fetches = [symbol for symbol, lookback in fetch_log if lookback >= 240]
+    assert full_window_fetches == []
+    # Every symbol is probed lightly (revision detection), dirty ones rebuilt.
+    probed = {symbol for symbol, lookback in fetch_log if lookback < 240}
+    assert {"600519", "000001"} <= probed
 
     manifest, frame = load_feature_snapshot(service._config)
     assert manifest is not None and frame is not None
@@ -414,3 +436,134 @@ def test_snapshot_missing_blocks_scheduler_scan(tmp_path: Path) -> None:
     )
     # The scan must not have fallen into the heavy prefilter path.
     assert (report.get("prefilter") or {}).get("shortlisted_count", 0) == 0
+
+
+def test_snapshot_partial_refresh_failure_is_not_current(tmp_path: Path) -> None:
+    from datetime import date, timedelta
+
+    service, _root = _make_service(tmp_path)
+    provider = SyntheticProvider(seed_offset=2026)
+    fetch_log: list[str] = []
+    tracked = _DateTrackingProvider(provider, latest_dates={}, fetch_log=fetch_log)
+    first = build_feature_snapshot(
+        service._config, tracked, symbols=_SYMBOLS, lookback_days=250, force=True
+    )
+    assert first["ok"] is True
+    manifest, _ = load_feature_snapshot(service._config)
+    assert manifest is not None
+    baseline = {
+        symbol: date.fromisoformat(manifest.per_symbol[symbol]["latest_date"])
+        for symbol in _SYMBOLS
+    }
+    tracked._latest_dates = dict(baseline)
+    tracked._latest_dates["600519"] = baseline["600519"] + timedelta(days=1)
+    tracked._latest_dates["000001"] = baseline["000001"] + timedelta(days=1)
+
+    original_fetch = tracked.fetch_daily_bars
+
+    def flaky_fetch(symbol: str, lookback_days: int = 120, **kwargs):
+        if symbol == "000001":
+            raise RuntimeError("source_down_for_symbol")
+        return original_fetch(symbol=symbol, lookback_days=lookback_days, **kwargs)
+
+    tracked.fetch_daily_bars = flaky_fetch  # type: ignore[method-assign]
+    refresh = build_feature_snapshot(
+        service._config, tracked, symbols=_SYMBOLS, lookback_days=250
+    )
+    assert refresh["ok"] is True
+    assert refresh["failed_symbols"] == 1
+    assert refresh["coverage_ratio"] == 0.5  # 1 of 2 dirty refreshed
+    manifest, _ = load_feature_snapshot(service._config)
+    assert manifest is not None
+    # A partial-failure refresh is NOT fully current.
+    assert snapshot_is_current(manifest, service._config) is False
+    assert "000001" in manifest.failed_symbols_list
+    # The market date advances to the freshest successfully refreshed row
+    # (the real bar date of the refreshed symbol, not the old manifest date).
+    assert manifest.trade_date == str(
+        original_fetch(symbol="600519", lookback_days=10).index[-1].date()
+    )
+
+    # Source recovers -> the failed symbol is retried and the snapshot heals.
+    tracked.fetch_daily_bars = original_fetch  # type: ignore[method-assign]
+    healed = build_feature_snapshot(
+        service._config, tracked, symbols=_SYMBOLS, lookback_days=250
+    )
+    assert healed["ok"] is True
+    manifest2, _ = load_feature_snapshot(service._config)
+    assert manifest2 is not None
+    assert manifest2.failed_symbols == 0
+    assert snapshot_is_current(manifest2, service._config) is True
+
+
+def test_snapshot_same_day_revision_detected(tmp_path: Path) -> None:
+    """A same-day content revision must be detected and rebuilt, even though
+    the provider trade date does not advance."""
+    from datetime import date
+
+    service, _root = _make_service(tmp_path)
+    provider = SyntheticProvider(seed_offset=2026)
+    fetch_log: list[tuple[str, int]] = []
+    tracked = _DateTrackingProvider(provider, latest_dates={}, fetch_log=fetch_log)
+    build_feature_snapshot(
+        service._config, tracked, symbols=_SYMBOLS, lookback_days=250, force=True
+    )
+    manifest, _ = load_feature_snapshot(service._config)
+    assert manifest is not None
+    baseline = {
+        symbol: date.fromisoformat(manifest.per_symbol[symbol]["latest_date"])
+        for symbol in _SYMBOLS
+    }
+    tracked._latest_dates = dict(baseline)  # dates unchanged
+
+    # Same-day revision: mutate the latest bar's close in the cached series.
+    frame = tracked._cache["600519"]
+    frame.loc[frame.index[-1], "close"] *= 1.05
+    stored_fp = manifest.per_symbol["600519"]["fingerprint"]
+
+    report = build_feature_snapshot(
+        service._config, tracked, symbols=_SYMBOLS, lookback_days=250
+    )
+    assert report["ok"] is True
+    assert report["incremental"] is True
+    assert report["dirty_symbols"] == 1  # only the revised symbol
+    assert report["refreshed_count"] == 1
+    assert report["failed_symbols"] == 0
+
+    manifest2, frame2 = load_feature_snapshot(service._config)
+    assert manifest2 is not None and frame2 is not None
+    revised_fp = manifest2.per_symbol["600519"]["fingerprint"]
+    assert revised_fp != "" and revised_fp != stored_fp
+    assert manifest2.per_symbol["600519"]["latest_date"] == baseline["600519"].isoformat()
+
+
+def test_data_gate_applies_week6_quality_thresholds(tmp_path: Path) -> None:
+    from datetime import date
+
+    service, _root = _make_service(tmp_path)
+    service._config.week5.feature_snapshot_require_current = False  # isolate quality
+    today = date.today().isoformat()
+
+    def _gate(score: float | None) -> dict[str, object]:
+        _patch_attr(
+            service,
+            "_last_week6_data_quality_report",
+            {"overall_coverage_ratio": score} if score is not None else None,
+        )
+        return service._build_data_gate(
+            snapshot_manifest=None,
+            snapshot_current=False,
+            latest_trade_date=today,
+        )
+
+    ok_gate = _gate(0.95)
+    assert ok_gate["status"] == "ok"
+    watch_gate = _gate(0.80)
+    assert watch_gate["status"] == "watch_only"
+    assert any("data_quality_watch" in str(r) for r in watch_gate["reasons"])
+    blocked_gate = _gate(0.50)
+    assert blocked_gate["status"] == "blocked"
+    assert any("data_quality_blocked" in str(r) for r in blocked_gate["reasons"])
+    # Missing quality report -> no quality judgement (other gates still apply).
+    no_report = _gate(None)
+    assert no_report["status"] == "ok"

@@ -6230,7 +6230,34 @@ class StockAnalyzerService:
             if snapshot_manifest is None or not snapshot_current:
                 reasons.append("feature_snapshot_stale")
 
-        if any(reason.startswith("provider_") or reason.startswith("feature_snapshot") for reason in reasons):
+        # Data-quality gate: strict thresholds over the week6 prewarm coverage
+        # score (overall_coverage_ratio across the full watchlist).  A score
+        # below the watch threshold blocks signal generation entirely; between
+        # watch and pass the scan may run but is flagged watch_only.
+        quality_score: float | None = None
+        try:
+            quality_report = self.latest_week6_data_quality_report()
+            if isinstance(quality_report, dict):
+                raw_score = quality_report.get("overall_coverage_ratio")
+                quality_score = _as_float(raw_score, default=None)
+        except Exception:
+            quality_score = None
+        if quality_score is not None:
+            pass_threshold = _clip01(
+                _as_float(self._config.week5.data_quality_pass_threshold, default=0.88)
+            )
+            watch_threshold = _clip01(
+                _as_float(self._config.week5.data_quality_watch_threshold, default=0.72)
+            )
+            if quality_score < watch_threshold:
+                reasons.append(f"data_quality_blocked:{quality_score:.3f}")
+            elif quality_score < pass_threshold:
+                reasons.append(f"data_quality_watch:{quality_score:.3f}")
+
+        if any(
+            reason.startswith(("provider_", "feature_snapshot", "data_quality_blocked"))
+            for reason in reasons
+        ):
             status = "blocked"
         elif reasons:
             status = "watch_only"
@@ -6249,6 +6276,7 @@ class StockAnalyzerService:
         return {
             "status": status,
             "reasons": reasons,
+            "data_quality_score": quality_score,
             "source_trust_levels": source_trust_levels,
             "financial_trust_level": financial_trust_level,
         }

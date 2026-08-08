@@ -347,6 +347,12 @@ class Week5Config(_StrictModel):
     feature_snapshot_lookback_days: int = 250
     feature_snapshot_max_age_days: int = 3
     feature_snapshot_require_current: bool = True
+    # A snapshot whose last refresh left more than (1 - ratio) of the dirty
+    # symbols failed is not published as fully current.
+    feature_snapshot_min_coverage_ratio: float = 0.95
+    # Data-quality gate thresholds (week6 prewarm coverage score).
+    data_quality_pass_threshold: float = 0.88
+    data_quality_watch_threshold: float = 0.72
     max_data_staleness_days: int = 3
     universe_quality_selector_enabled: bool = True
     universe_quality_target_size: int = 300

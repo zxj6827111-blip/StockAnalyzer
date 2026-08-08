@@ -1665,9 +1665,22 @@ class RuntimeWeek5Service:
             item["shortlist_rank"] = index + 1
             item["shortlist_selected"] = index < shortlist_top_n
 
+        # The funnel's final selector only rejects signals on data-trust
+        # problems (degraded/synthetic provider, low data-quality score).  A
+        # blocked gate caused solely by a missing/stale snapshot is a
+        # performance-contract issue: the scheduler path already fail-closes
+        # at the universe-scan entry, while manual recovery scans may still
+        # run (emergency full scan) against direct bars.
+        gate_reasons = [str(item) for item in (data_gate.get("reasons") or [])]
+        snapshot_only_blocked = bool(gate_reasons) and all(
+            reason.startswith("feature_snapshot") for reason in gate_reasons
+        )
+        final_selector_gate_status = (
+            "ok" if snapshot_only_blocked else str(data_gate.get("status", "ok"))
+        )
         final_selector = service._final_signal_selector(
             signals=signal_pool_candidates,
-            data_gate_status=str(data_gate.get("status", "ok")),
+            data_gate_status=final_selector_gate_status,
         )
 
         shortlist_preview = [
@@ -1905,11 +1918,15 @@ class RuntimeWeek5Service:
             "symbols": list(service._state.watchlist),
         }
         if should_sync_watchlist:
+            # Watchlist must only be synced from the final selection.  When
+            # the funnel yields zero final signals, the old watchlist is
+            # preserved (keep_if_empty) instead of topping up from the signal
+            # pool with stocks that never passed the final gates.
             watchlist_sync = self._state_service.auto_sync_watchlist_from_week5_report(
                 report=report,
                 reason=sync_reason or f"week5_scan:{symbol_source}",
                 top_k_override=sync_top_k_override,
-                allow_signal_pool_fallback=True,
+                allow_signal_pool_fallback=False,
             )
         else:
             watchlist_sync["diagnostics"] = (
