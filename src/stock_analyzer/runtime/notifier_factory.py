@@ -10,6 +10,7 @@ from stock_analyzer.notify.channels import (
     BroadcastNotifier,
     ConsoleNotifier,
     CustomWebhookNotifier,
+    DingTalkNotifier,
     EmailNotifier,
     FailoverNotifier,
     FeishuAppNotifier,
@@ -18,6 +19,7 @@ from stock_analyzer.notify.channels import (
     Notifier,
     PushPlusNotifier,
     RequiredSuccessBroadcastNotifier,
+    SmsNotifier,
     TelegramNotifier,
     WeComNotifier,
 )
@@ -108,6 +110,22 @@ def build_channel(config: StockAnalyzerConfig, channel_name: str) -> Notifier:
         return CustomWebhookNotifier(
             webhook_url=config.notifications.custom_webhook_url,
             bearer_token=config.notifications.custom_webhook_bearer_token,
+            timeout_sec=config.notifications.timeout_sec,
+        )
+    if channel_name == "dingtalk":
+        return DingTalkNotifier(
+            webhook=config.notifications.dingtalk_webhook,
+            secret=config.notifications.dingtalk_secret,
+            timeout_sec=config.notifications.timeout_sec,
+        )
+    if channel_name == "sms":
+        return SmsNotifier(
+            url=config.notifications.sms_url,
+            app_key=config.notifications.sms_app_key,
+            app_secret=config.notifications.sms_app_secret,
+            sign_name=config.notifications.sms_sign_name,
+            template_id=config.notifications.sms_template_id,
+            phone_numbers=config.notifications.sms_phone_numbers,
             timeout_sec=config.notifications.timeout_sec,
         )
     return ConsoleNotifier()
