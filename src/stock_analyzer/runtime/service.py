@@ -80,12 +80,14 @@ from stock_analyzer.notify.filter import NotificationFilter, is_quiet_time
 from stock_analyzer.pipeline import AnalyzerPipeline
 from stock_analyzer.portfolio.book import PortfolioBook
 from stock_analyzer.research import (
+    compute_ic_decay_report,
     export_qlib_bridge_bundle,
     persist_alphalens_sidecar_report,
     persist_catboost_shadow_report,
     persist_finbert_sidecar_report,
     persist_finrl_sidecar_report,
     persist_heavy_ts_shadow_report,
+    persist_ic_decay_report,
     persist_shap_sidecar_report,
     persist_tabular_deep_shadow_report,
     persist_tft_sidecar_report,
@@ -1238,6 +1240,60 @@ class StockAnalyzerService:
         }
         target = Path(output_path or self._default_phase_d_report_path("alphalens_sidecar"))
         payload["output_path"] = persist_alphalens_sidecar_report(report=payload, output_path=target)
+        self._record_phase_d_research_event(payload=payload)
+        return payload
+
+    def build_phase_d_ic_decay_report(
+        self,
+        *,
+        model_id: str = "",
+        split_names: Sequence[str] | None = None,
+        max_rows: int | None = None,
+        factor_columns: Sequence[str] | None = None,
+        horizon: int = 5,
+        lookback_months: int | None = None,
+        min_months: int | None = None,
+        healthy_threshold: float | None = None,
+        slope_threshold: float | None = None,
+        output_path: str | None = None,
+    ) -> dict[str, object]:
+        lifecycle_config = self._config.factor_lifecycle
+        dataset_meta, records, _ = self._build_phase_d_research_dataset(
+            model_id=model_id,
+            split_names=split_names,
+            max_rows=max_rows,
+        )
+        report = compute_ic_decay_report(
+            records=records,
+            factor_columns=factor_columns,
+            horizon=horizon,
+            lookback_months=(
+                lifecycle_config.ic_decay_lookback_months
+                if lookback_months is None
+                else lookback_months
+            ),
+            min_months=(
+                lifecycle_config.ic_decay_min_months if min_months is None else min_months
+            ),
+            healthy_threshold=(
+                lifecycle_config.ic_decay_healthy_threshold
+                if healthy_threshold is None
+                else healthy_threshold
+            ),
+            slope_threshold=(
+                lifecycle_config.ic_decay_slope_threshold
+                if slope_threshold is None
+                else slope_threshold
+            ),
+        )
+        payload = {
+            "research_id": "ic_decay_report",
+            "delivery_mode": "research_sidecar",
+            **dataset_meta,
+            **report,
+        }
+        target = Path(output_path or self._default_phase_d_report_path("ic_decay_report"))
+        payload["output_path"] = persist_ic_decay_report(report=payload, output_path=target)
         self._record_phase_d_research_event(payload=payload)
         return payload
 
@@ -15897,6 +15953,19 @@ class StockAnalyzerService:
                 interval_minutes=interval_minutes,
                 callback=self._job_week7_cloud_backup_watchdog,
             )
+        if (
+            self._config.factor_lifecycle.enabled
+            and self._config.factor_lifecycle.ic_decay_report == "monthly"
+            and str(self._config.factor_lifecycle.ic_decay_report_time).strip()
+        ):
+            self._scheduler.register(
+                name="factor_ic_decay_report",
+                trigger_hhmm=self._config.factor_lifecycle.ic_decay_report_time,
+                callback=self._job_factor_ic_decay_report,
+                latest_hhmm="23:59",
+                weekdays=trading_weekdays,
+                date_predicate=_last_trading_day_of_month,
+            )
 
     def _job_premarket_scan(self) -> dict[str, object]:
         global_snapshot_report = self._collect_global_market_snapshot(source_trace_id="premarket")
@@ -17190,6 +17259,10 @@ class StockAnalyzerService:
 
     def _job_week4_acceptance(self) -> dict[str, object]:
         return self._acceptance_service._job_week4_acceptance()
+
+    def _job_factor_ic_decay_report(self) -> dict[str, object]:
+        report = self.build_phase_d_ic_decay_report()
+        return {"report": report}
 
     def _job_tdx_offline_sync(self) -> dict[str, object]:
         report = self.run_tdx_offline_sync(
@@ -19529,6 +19602,20 @@ def _normalize_year_month(value: str) -> str:
     except ValueError:
         return ""
     return parsed.strftime("%Y-%m")
+
+
+def _last_trading_day_of_month(value: date) -> bool:
+    if not is_a_share_trading_day(value):
+        return False
+    year = value.year
+    month = value.month
+    next_month_first = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    cursor = value + timedelta(days=1)
+    while cursor < next_month_first:
+        if is_a_share_trading_day(cursor):
+            return False
+        cursor += timedelta(days=1)
+    return True
 
 
 def _normalize_factor_features(raw_features: list[dict[str, object]]) -> list[dict[str, object]]:

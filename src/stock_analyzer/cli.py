@@ -1873,6 +1873,32 @@ def phase_d_alphalens(
     typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
 
 
+@app.command("phase-d-ic-decay")
+def phase_d_ic_decay(
+    model_id: str = typer.Option("", help="Optional registered model id, default active champion"),
+    split_names: str = typer.Option("", help="Optional comma separated split names"),
+    max_rows: int = typer.Option(0, help="Optional row cap"),
+    factor_columns: str = typer.Option("", help="Optional comma separated factor columns"),
+    horizon: int = typer.Option(5, help="Forward return horizon in trading days"),
+    lookback_months: int = typer.Option(0, help="Monthly lookback window (0 = config default)"),
+    min_months: int = typer.Option(0, help="Min months for health verdict (0 = config default)"),
+    output_path: str = typer.Option("", help="Optional output report path"),
+) -> None:
+    config = get_config()
+    service = StockAnalyzerService(config=config)
+    result = service.build_phase_d_ic_decay_report(
+        model_id=model_id,
+        split_names=_parse_csv_list(split_names) or None,
+        max_rows=max_rows if max_rows > 0 else None,
+        factor_columns=_parse_csv_list(factor_columns) or None,
+        horizon=horizon,
+        lookback_months=lookback_months if lookback_months > 0 else None,
+        min_months=min_months if min_months > 0 else None,
+        output_path=output_path or None,
+    )
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
+
 @app.command("phase-d-shap")
 def phase_d_shap(
     model_id: str = typer.Option("", help="Optional registered model id, default active champion"),
