@@ -440,6 +440,12 @@ factor_lifecycle:
   history_limit: 240
   graveyard_enabled: true
   graveyard_observation_months: 2
+  ic_decay_report: monthly
+  ic_decay_report_time: "21:00"
+  ic_decay_lookback_months: 12
+  ic_decay_min_months: 3
+  ic_decay_healthy_threshold: 0.03
+  ic_decay_slope_threshold: -0.005
 
 sim_broker_weekly:
   enabled: true
@@ -481,6 +487,14 @@ notifications:
   email_receivers: []
   custom_webhook_url: ""
   custom_webhook_bearer_token: ""
+  dingtalk_webhook: ""
+  dingtalk_secret: ""
+  sms_url: ""
+  sms_app_key: ""
+  sms_app_secret: ""
+  sms_sign_name: ""
+  sms_template_id: ""
+  sms_phone_numbers: []
   timeout_sec: 5
 
 wecom_interaction:

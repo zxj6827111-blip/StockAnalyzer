@@ -65,6 +65,18 @@ def _normalize_nonempty_string(value: object, default: str = "") -> str:
     return normalized or default
 
 
+_IC_DECAY_REPORT_MODES = frozenset({"monthly"})
+
+
+def _normalize_ic_decay_report_mode(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized in {"", "off", "none", "disabled", "false"}:
+        return ""
+    if normalized in _IC_DECAY_REPORT_MODES:
+        return normalized
+    raise ValueError(f"unsupported ic_decay_report: {value} (supported: monthly, off)")
+
+
 class AppConfig(_StrictModel):
     timezone: str = "Asia/Shanghai"
     mode: str = "simulation"
@@ -548,6 +560,17 @@ class FactorLifecycleConfig(_StrictModel):
     history_limit: int = 240
     graveyard_enabled: bool = True
     graveyard_observation_months: int = 2
+    ic_decay_report: str = "monthly"
+    ic_decay_report_time: str = "21:00"
+    ic_decay_lookback_months: int = 12
+    ic_decay_min_months: int = 3
+    ic_decay_healthy_threshold: float = 0.03
+    ic_decay_slope_threshold: float = -0.005
+
+    @field_validator("ic_decay_report")
+    @classmethod
+    def _validate_ic_decay_report(cls, value: str) -> str:
+        return _normalize_ic_decay_report_mode(value)
 
 
 class SimBrokerWeeklyConfig(_StrictModel):
@@ -606,6 +629,14 @@ class NotificationsConfig(_StrictModel):
     email_receivers: list[str] = Field(default_factory=list)
     custom_webhook_url: str = ""
     custom_webhook_bearer_token: str = ""
+    dingtalk_webhook: str = ""
+    dingtalk_secret: str = ""
+    sms_url: str = ""
+    sms_app_key: str = ""
+    sms_app_secret: str = ""
+    sms_sign_name: str = ""
+    sms_template_id: str = ""
+    sms_phone_numbers: list[str] = Field(default_factory=list)
     timeout_sec: int = 5
 
     @field_validator("primary", "backup")
@@ -632,6 +663,8 @@ class NotificationsConfig(_StrictModel):
             "custom",
             "webhook",
             "custom_webhook",
+            "dingtalk",
+            "sms",
         }
         if normalized not in supported:
             supported_text = ",".join(sorted(supported))
