@@ -171,6 +171,32 @@ def test_auth_disabled_allows_all() -> None:
         assert response.status_code == 200
 
 
+def test_auth_force_enabled_when_env_not_explicit(monkeypatch: MonkeyPatch) -> None:
+    """Without an explicit SA__SECURITY__API_AUTH_ENABLED env var, dangerous
+    endpoints must fail closed even when the config flag is False."""
+    monkeypatch.delenv("SA__SECURITY__API_AUTH_ENABLED", raising=False)
+    client = TestClient(app, raise_server_exceptions=False)
+    with _FakeAuthConfig(enabled=False):
+        response = client.post(
+            "/notify/test",
+            json={"title": "force-check", "content": "force-check"},
+        )
+        assert response.status_code == 401
+        assert response.json()["detail"] == "missing_api_token"
+
+
+def test_auth_force_enabled_empty_token_fails_closed(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Force-enabled auth with an empty token must reject every request (500)."""
+    monkeypatch.delenv("SA__SECURITY__API_AUTH_ENABLED", raising=False)
+    client = TestClient(app, raise_server_exceptions=False)
+    with _FakeAuthConfig(enabled=False, token=""):
+        response = client.post("/notify/test", json={})
+        assert response.status_code == 500
+        assert "api_token is empty" in response.json().get("detail", "")
+
+
 def test_auth_enabled_empty_token_fails_closed() -> None:
     """When api_auth_enabled=true but api_token is empty, every request must be
     rejected (fail-closed), not silently allowed through."""

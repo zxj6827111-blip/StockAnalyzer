@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -88,6 +89,13 @@ async def _app_lifespan(_app: FastAPI) -> Any:
             "SECURITY: security.api_auth_enabled is true but api_token is empty. "
             "API auth will not protect endpoints."
         )
+    if _api_auth_force_enabled() and not _config.security.api_auth_enabled:
+        _startup_log.critical(
+            "SECURITY: SA__SECURITY__API_AUTH_ENABLED was not explicitly set, "
+            "so API auth is force-enabled (fail-closed): dangerous POST endpoints "
+            "reject unauthenticated requests. Set SA__SECURITY__API_AUTH_ENABLED=true "
+            "and a strong SA__SECURITY__API_TOKEN to configure it explicitly."
+        )
     _prewarm_feishu_app_access_token_if_needed()
     _start_feishu_long_connection_if_needed()
     try:
@@ -97,6 +105,16 @@ async def _app_lifespan(_app: FastAPI) -> Any:
 
 
 app = FastAPI(title="StockAnalyzer API", version="0.1.0", lifespan=_app_lifespan)
+
+
+_SA_AUTH_ENABLED_ENV = "SA__SECURITY__API_AUTH_ENABLED"
+
+
+def _api_auth_force_enabled() -> bool:
+    """Fail-closed default: when the operator never explicitly set
+    SA__SECURITY__API_AUTH_ENABLED, dangerous endpoints require auth no matter
+    what the config file says."""
+    return os.getenv(_SA_AUTH_ENABLED_ENV) is None
 
 
 def _verify_api_auth(
@@ -109,7 +127,7 @@ def _verify_api_auth(
     Returns 401 when no credential is provided, 403 when the credential is wrong.
     """
     sec = _config.security
-    if not sec.api_auth_enabled:
+    if not (sec.api_auth_enabled or _api_auth_force_enabled()):
         return
     expected = sec.api_token.strip()
     if not expected:
