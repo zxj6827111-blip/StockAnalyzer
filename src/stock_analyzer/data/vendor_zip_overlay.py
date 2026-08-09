@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import re
 import zipfile
 from collections import OrderedDict
@@ -26,6 +27,7 @@ from stock_analyzer.data.tdx_offline_provider import (
 from stock_analyzer.data.tushare_provider import _to_ts_code
 
 VENDOR_ZIP_INDEX_VERSION = 1
+logger = logging.getLogger(__name__)
 _YEAR_ARCHIVE_RE = re.compile(r"^(?P<year>\d{4})(?:\((?P<copy>\d+)\))?\.zip$", re.I)
 _DAILY_ENTRY_RE = re.compile(r"(?P<code>\d{6})\.(?:SH|SZ|BJ)\.csv$", re.I)
 _MINUTE_ARCHIVE_RE = re.compile(r"^(?P<year>\d{4})(?:-(?P<month>\d{2}))?", re.I)
@@ -36,6 +38,8 @@ _MINUTE_ARCHIVE_RE = re.compile(r"^(?P<year>\d{4})(?:-(?P<month>\d{2}))?", re.I)
 #   never be created, mutated or have its schema touched;
 # - disabled: no delta DuckDB at all, the overlay reads ZIP archives only.
 _DELTA_ACCESS_MODES = frozenset({"read_write", "read_only", "disabled"})
+_QFQ_FACTORS_DIR_NAME = "复权因子"
+_QFQ_FACTORS_ARCHIVE_NAME = "复权因子_前复权.zip"
 
 
 def build_vendor_zip_daily_index(
@@ -510,7 +514,24 @@ class VendorZipOverlayProvider:
         annual archives newest year first and stopping per symbol once
         ``limit`` rows have been accumulated. Each annual ZIP archive is
         opened at most once.
+
+        In qfq mode, symbols whose factor data is missing or corrupted
+        (``_load_price_factors`` or factor parsing raises ``DataSourceError``)
+        are skipped with a WARNING instead of failing the whole batch: this
+        path is tolerant because the quality selector is backed by a coverage
+        gate (coverage >= 0.90). Structural daily-file errors (missing
+        date/OHLCV columns) still raise ``DataSourceError``, and the
+        single-symbol path (``fetch_daily_bars`` -> ``_load_vendor_daily``)
+        is unaffected, still failing closed on missing factors.
         """
+        if self.price_series_mode == "qfq":
+            factor_archive = (
+                self._root / _QFQ_FACTORS_DIR_NAME / _QFQ_FACTORS_ARCHIVE_NAME
+            )
+            if not factor_archive.exists():
+                raise DataSourceError(
+                    f"vendor qfq factor archive missing for batch: {factor_archive}"
+                )
         entries_by_symbol: dict[str, list[dict[str, object]]] = {}
         for symbol in symbols:
             raw_symbol = self._symbols_mapping().get(symbol)
@@ -544,6 +565,7 @@ class VendorZipOverlayProvider:
             symbol: max(0, limit - sum(len(frame) for frame in frames))
             for symbol, frames in accumulated.items()
         }
+        skipped: set[str] = set()
         archive_order = sorted(archive_years, key=lambda path: archive_years[path], reverse=True)
         for relative_zip in archive_order:
             refs = by_archive[relative_zip]
@@ -563,11 +585,33 @@ class VendorZipOverlayProvider:
                         raise DataSourceError(
                             f"vendor ZIP entry is missing: {archive_path}!{entry_name}"
                         ) from exc
-                    normalized = self._normalize_vendor_daily(raw=raw, symbol=symbol)
-                    if not normalized.empty:
-                        frames = accumulated[symbol]
-                        frames.append(normalized)
-                        remaining[symbol] = max(0, remaining[symbol] - len(normalized))
+                    normalized = self._normalize_vendor_daily(
+                        raw=raw, symbol=symbol, strict_factors=False
+                    )
+                    if normalized.empty:
+                        if raw.empty:
+                            logger.debug(
+                                f"batch empty vendor daily for {symbol} in {relative_zip}; "
+                                "continuing with older years"
+                            )
+                            continue
+                        if self.price_series_mode == "qfq":
+                            if symbol not in skipped:
+                                skipped.add(symbol)
+                                logger.warning(
+                                    f"batch skipping symbol {symbol} (missing/unreadable qfq "
+                                    f"factors); {len(skipped)} skipped so far"
+                                )
+                            remaining[symbol] = 0
+                        else:
+                            logger.debug(
+                                f"batch empty vendor daily for {symbol} in {relative_zip}; "
+                                "continuing with older years"
+                            )
+                        continue
+                    frames = accumulated[symbol]
+                    frames.append(normalized)
+                    remaining[symbol] = max(0, remaining[symbol] - len(normalized))
 
         long_frames: list[pd.DataFrame] = []
         for symbol in symbols:
@@ -594,12 +638,12 @@ class VendorZipOverlayProvider:
         cached = self._factor_cache.get(symbol)
         if cached is not None:
             return cached
-        factors_dir = self._root / "复权因子"
+        factors_dir = self._root / _QFQ_FACTORS_DIR_NAME
         if not factors_dir.is_dir():
             raise DataSourceError(
                 f"vendor factors directory missing for {symbol}: {factors_dir}"
             )
-        archive_path = factors_dir / "复权因子_前复权.zip"
+        archive_path = factors_dir / _QFQ_FACTORS_ARCHIVE_NAME
         if not archive_path.exists():
             raise DataSourceError(
                 f"vendor qfq factor archive missing for {symbol}: {archive_path}"
@@ -640,7 +684,9 @@ class VendorZipOverlayProvider:
         self._factor_cache[symbol] = merged
         return merged
 
-    def _normalize_vendor_daily(self, *, raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    def _normalize_vendor_daily(
+        self, *, raw: pd.DataFrame, symbol: str, strict_factors: bool = True
+    ) -> pd.DataFrame:
         if raw.empty:
             return pd.DataFrame()
         frame = raw.copy()
@@ -657,19 +703,25 @@ class VendorZipOverlayProvider:
                     f"vendor daily file missing required column for {symbol}: {column}"
                 )
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        factors: pd.Series | None = None
         if self.price_series_mode == "qfq":
-            factors = self._load_price_factors(symbol)
-            aligned = factors.reindex(frame["date"], method="ffill").bfill()
-            if aligned.isna().any():
-                raise DataSourceError(
-                    f"vendor qfq factors could not be aligned to daily bars for {symbol}"
-                )
-            factor_values = aligned.to_numpy(dtype=float)
-            for column in ("open", "high", "low", "close", "pre_close"):
-                if column in frame.columns:
-                    frame[column] = pd.to_numeric(
-                        frame[column], errors="coerce"
-                    ) * factor_values
+            try:
+                factors = self._load_price_factors(symbol)
+                aligned = factors.reindex(frame["date"], method="ffill").bfill()
+                if aligned.isna().any():
+                    raise DataSourceError(
+                        f"vendor qfq factors could not be aligned to daily bars for {symbol}"
+                    )
+                factor_values = aligned.to_numpy(dtype=float)
+                for column in ("open", "high", "low", "close", "pre_close"):
+                    if column in frame.columns:
+                        frame[column] = pd.to_numeric(
+                            frame[column], errors="coerce"
+                        ) * factor_values
+            except DataSourceError:
+                if not strict_factors:
+                    return pd.DataFrame()
+                raise
         frame["volume"] = frame["volume"] * max(0.0, float(self.daily_volume_multiplier))
         if "amount" in frame.columns:
             frame["turnover"] = pd.to_numeric(frame["amount"], errors="coerce") * max(
@@ -698,15 +750,15 @@ class VendorZipOverlayProvider:
         )
         frame["price_series_mode"] = self.price_series_mode
         if self.price_series_mode == "qfq":
-            factors = self._load_price_factors(symbol)
+            factor_series = cast(pd.Series, factors)
             frame["adjustment_source"] = "local_vendor_qfq"
-            anchor_date = factors.index[-1]
+            anchor_date = factor_series.index[-1]
             frame["adjustment_anchor_date"] = (
                 anchor_date.date().isoformat()
                 if isinstance(anchor_date, pd.Timestamp)
                 else str(anchor_date)[:10]
             )
-            frame["adjustment_anchor_factor"] = float(factors.iloc[-1])
+            frame["adjustment_anchor_factor"] = float(factor_series.iloc[-1])
         else:
             frame["adjustment_source"] = "local_vendor_raw"
             frame["adjustment_anchor_date"] = ""
