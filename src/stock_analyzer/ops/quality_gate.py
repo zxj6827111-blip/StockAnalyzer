@@ -162,6 +162,14 @@ _SLOW_TEST_FILES = (
     "tests/test_intraday_factors.py",
 )
 
+# Full-suite stage: run every test under testpaths (except the slow files that
+# are exercised by the non-blocking slow-report stage) in parallel and enforce
+# a coverage floor. Threshold is a conservative baseline: a full local run on
+# Python 3.11 reports ~79% line coverage after excluding the slow files, so a
+# 75% floor leaves headroom for runner-to-runner variance.
+_FULL_COVERAGE_FLOOR = 75
+_FULL_PARALLEL_WORKERS = "2"
+
 
 def build_stage_specs(stage: str) -> list[QualityCommandSpec]:
     """Build the command list for a quality gate stage."""
@@ -224,6 +232,28 @@ def build_stage_specs(stage: str) -> list[QualityCommandSpec]:
                 log_name="pytest_slow_report.log",
             )
         ]
+    if normalized == "full":
+        return [
+            QualityCommandSpec(
+                name="pytest_full_suite",
+                command=(
+                    python,
+                    "-m",
+                    "pytest",
+                    "tests",
+                    *(f"--ignore={path}" for path in _SLOW_TEST_FILES),
+                    "-n",
+                    _FULL_PARALLEL_WORKERS,
+                    "--cov=stock_analyzer",
+                    "--cov-report=term",
+                    "--cov-report=xml:artifacts/coverage/coverage.xml",
+                    f"--cov-fail-under={_FULL_COVERAGE_FLOOR}",
+                    "--durations=20",
+                    "-q",
+                ),
+                log_name="pytest_full_suite.log",
+            )
+        ]
     if normalized == "all":
         return (
             build_stage_specs("clean-scope")
@@ -243,6 +273,7 @@ def run_quality_gate(
     started_at = datetime.now()
     log_root = root / "artifacts" / "quality"
     log_root.mkdir(parents=True, exist_ok=True)
+    (root / "artifacts" / "coverage").mkdir(parents=True, exist_ok=True)
 
     results: list[QualityCommandResult] = []
     blocking_failures: list[str] = []
