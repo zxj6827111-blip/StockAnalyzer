@@ -720,6 +720,125 @@ def test_batch_quality_metrics_unknown_symbols_yield_no_rows(tmp_path: Path) -> 
     assert frame.empty
 
 
+def test_batch_quality_metrics_skips_missing_qfq_factor_symbol(tmp_path: Path) -> None:
+    index_path = _build_multi_year_daily_fixture(tmp_path)
+    # Only 000001.SZ has qfq factors; 600000.SH must be skipped, not raised.
+    _write_factors_zip(
+        tmp_path,
+        {
+            "2025/000001.SZ.csv": "\n".join(
+                [
+                    "股票代码,交易日期,复权因子",
+                    "000001.SZ,20251231,1.0",
+                ]
+            )
+        },
+    )
+    provider = _qfq_provider(tmp_path, index_path)
+
+    frame = provider.fetch_universe_quality_metrics(
+        symbols=["600000", "000001"],
+        lookback_days=10,
+    )
+
+    assert sorted(frame["symbol"].unique()) == ["000001"]
+    assert _UNIVERSE_QUALITY_REQUIRED_COLUMNS <= set(frame.columns)
+    assert "600000" not in frame["symbol"].tolist()
+
+
+def test_batch_quality_metrics_qfq_empty_year_csv_falls_back_to_older_year(
+    tmp_path: Path,
+) -> None:
+    index_path = _build_multi_year_daily_fixture(tmp_path)
+    # Rewrite 2025.zip: 600000.SH is header-only (no data rows), so the batch
+    # path must fall back to its 2024 rows instead of zeroing/skipping the
+    # symbol as a missing-factor case.
+    _write_zip(
+        tmp_path / "全A日K" / "2025.zip",
+        {
+            "bars/600000.SH.csv": "code,datetime,open,high,low,close,volume,amount,circ_mv",
+            "bars/000001.SZ.csv": _daily_csv(
+                symbol="000001.SZ", dates=["2025-12-29", "2025-12-30", "2025-12-31"]
+            ),
+        },
+    )
+    # Factor rows anchor 2024 (ffill covers the 2024 archive dates) and 2025.
+    _write_factors_zip(
+        tmp_path,
+        {
+            "2025/600000.SH.csv": "\n".join(
+                [
+                    "股票代码,交易日期,复权因子",
+                    "600000.SH,20240102,1.0",
+                    "600000.SH,20251231,1.0",
+                ]
+            ),
+            "2025/000001.SZ.csv": "\n".join(
+                [
+                    "股票代码,交易日期,复权因子",
+                    "000001.SZ,20240102,1.0",
+                    "000001.SZ,20251231,1.0",
+                ]
+            ),
+        },
+    )
+    index_path = tmp_path / "index" / "daily_index.json"
+    write_vendor_zip_daily_index(root=tmp_path, output_path=index_path)
+    provider = _qfq_provider(tmp_path, index_path)
+
+    frame = provider.fetch_universe_quality_metrics(
+        symbols=["600000", "000001"],
+        lookback_days=10,
+    )
+
+    # 600000 is kept via its 2024 annual archive; the empty 2025 CSV is an
+    # empty year, not a factor failure, so no skip/zero happens.
+    assert sorted(frame["symbol"].unique()) == ["000001", "600000"]
+    assert _UNIVERSE_QUALITY_REQUIRED_COLUMNS <= set(frame.columns)
+    six_hundred = frame[frame["symbol"] == "600000"]
+    assert six_hundred["date"].max().year == 2024
+    assert len(six_hundred) == 2
+
+
+def test_batch_quality_metrics_structural_error_still_raises(tmp_path: Path) -> None:
+    bad_csv = "\n".join(
+        [
+            "code,datetime",
+            "600000.SH,2025-12-30",
+            "600000.SH,2025-12-31",
+        ]
+    )
+    _write_zip(
+        tmp_path / "全A日K" / "2025.zip",
+        {
+            "bars/600000.SH.csv": bad_csv,
+            "bars/000001.SZ.csv": _daily_csv(
+                symbol="000001.SZ", dates=["2025-12-29", "2025-12-30", "2025-12-31"]
+            ),
+        },
+    )
+    _write_factors_zip(
+        tmp_path,
+        {
+            "2025/000001.SZ.csv": "\n".join(
+                [
+                    "股票代码,交易日期,复权因子",
+                    "000001.SZ,20251231,1.0",
+                ]
+            )
+        },
+    )
+    index_path = tmp_path / "index" / "daily_index.json"
+    write_vendor_zip_daily_index(root=tmp_path, output_path=index_path)
+    provider = _qfq_provider(tmp_path, index_path)
+
+    with pytest.raises(DataSourceError, match="missing required column"):
+        provider.fetch_universe_quality_metrics(
+            symbols=["600000", "000001"],
+            lookback_days=10,
+        )
+
+
 def test_batch_quality_metrics_delta_only_symbols_still_returned(tmp_path: Path) -> None:
     index_path = _build_multi_year_daily_fixture(tmp_path)
     delta_db = tmp_path / "delta" / "market_delta.duckdb"
