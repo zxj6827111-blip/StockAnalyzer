@@ -58,7 +58,7 @@ tdx_sync:
   notify_on_failure: true
 
 market_warehouse:
-  enabled: true
+  enabled: false
   auto_run: true
   run_time: "21:45"
   post_followup_enabled: true
