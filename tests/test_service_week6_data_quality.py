@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import tempfile
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -56,7 +58,11 @@ def _load_test_config() -> StockAnalyzerConfig:
     config.notifications.backup = "console"
     config.week6.auto_notify = False
     config.week6.data_quality_notify = False
-    config.training.artifact_path = str(root / "artifacts" / "nonexistent_test_model.json")
+    config.training.artifact_path = str(
+        Path(tempfile.gettempdir())
+        / f"stock_analyzer_service_week6_data_quality_{time.time_ns()}"
+        / "nonexistent_test_model.json"
+    )
     return config
 
 

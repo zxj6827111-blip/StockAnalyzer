@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -180,7 +181,9 @@ def test_service_single_symbol_training_includes_intraday_summary_features(tmp_p
 def test_week5_signal_pool_candidates_expose_acceptance_trace_fields() -> None:
     config = _load_test_config()
     config.training.artifact_path = str(
-        Path(__file__).resolve().parents[1] / "artifacts" / "nonexistent_test_model.json"
+        Path(tempfile.gettempdir())
+        / f"stock_analyzer_service_v13_training_acceptance_{time.time_ns()}"
+        / "nonexistent_test_model.json"
     )
     service = _new_service(config, provider=SyntheticProvider(seed_offset=2027))
 

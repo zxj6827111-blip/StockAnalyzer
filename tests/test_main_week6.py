@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -34,7 +35,11 @@ def _load_test_config() -> StockAnalyzerConfig:
     config.liquidity_filter_monster.max_turnover_rate = 1.0
     config.week5.auto_notify = False
     config.week6.auto_notify = False
-    config.training.artifact_path = str(root / "artifacts" / "nonexistent_test_model.json")
+    config.training.artifact_path = str(
+        Path(tempfile.gettempdir())
+        / f"stock_analyzer_main_week6_{time.time_ns()}"
+        / "nonexistent_test_model.json"
+    )
     config.training.bootstrap_auto_seed_watchlist = False
     temp_root = Path(tempfile.gettempdir()) / "stock_analyzer_tests"
     config.training.bootstrap_state_path = str(temp_root / "test_bootstrap_state_main_week6.json")

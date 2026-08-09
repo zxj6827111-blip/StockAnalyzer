@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import tempfile
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -33,7 +35,11 @@ def _load_test_config(tmp_path: Path) -> StockAnalyzerConfig:
     config.evolution.auto_run = False
     config.acceptance.auto_run = False
     config.cloud_backup.enabled = False
-    config.training.artifact_path = str(root / "artifacts" / "nonexistent_test_model.json")
+    config.training.artifact_path = str(
+        Path(tempfile.gettempdir())
+        / f"stock_analyzer_service_universe_fallback_{time.time_ns()}"
+        / "nonexistent_test_model.json"
+    )
     config.training.bootstrap_auto_run_on_first_start = False
     config.training.bootstrap_require_completion_for_runtime = False
     config.training.bootstrap_state_path = str(tmp_path / "bootstrap_state.json")
