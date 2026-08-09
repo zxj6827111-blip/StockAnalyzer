@@ -7,10 +7,10 @@ from typing import cast
 
 import pandas as pd
 
-from stock_analyzer.config import StockAnalyzerConfig, load_config
+from stock_analyzer.config import LiquidityFilterConfig, StockAnalyzerConfig, load_config
 from stock_analyzer.data.provider import DataSourceError, SyntheticProvider
 from stock_analyzer.data.resilient_provider import ResilientProvider
-from stock_analyzer.pipeline import AnalyzerPipeline
+from stock_analyzer.pipeline import AnalyzerPipeline, _liquidity_check
 
 
 class AlwaysFailProvider:
@@ -95,6 +95,54 @@ class WeakFundamentalsBarsProvider(MinimalBarsProvider):
         frame["financial_source"] = "unit_test_financials"
         frame["financial_report_date"] = "2026-03-31"
         return frame
+
+
+class LiquidityOverrideBarsProvider(MinimalBarsProvider):
+    """MinimalBarsProvider with explicit liquidity metrics for gate testing."""
+
+    def __init__(
+        self,
+        *,
+        turnover: float | None = None,
+        float_market_cap: float | None = None,
+    ) -> None:
+        self._turnover = turnover
+        self._float_market_cap = float_market_cap
+
+    def fetch_daily_bars(self, symbol: str, lookback_days: int = 120) -> pd.DataFrame:
+        frame = super().fetch_daily_bars(symbol=symbol, lookback_days=lookback_days)
+        if self._turnover is not None:
+            frame["turnover"] = float(self._turnover)
+        if self._float_market_cap is not None:
+            frame["float_market_cap"] = float(self._float_market_cap)
+        return frame
+
+
+class ToggleFailBarsProvider(MinimalBarsProvider):
+    """Fails on every provider call while ``fail`` is True, succeeds otherwise.
+
+    The flag controls whole runs (daily + intraday), so degraded mode stays
+    set for the duration of a failing run and resets on the next successful one.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail = False
+
+    def fetch_daily_bars(self, symbol: str, lookback_days: int = 120) -> pd.DataFrame:
+        if self.fail:
+            raise DataSourceError("forced failure")
+        return super().fetch_daily_bars(symbol=symbol, lookback_days=lookback_days)
+
+    def fetch_intraday_summary(
+        self,
+        symbol: str,
+        interval: str,
+        lookback_days: int = 120,
+    ) -> pd.DataFrame:
+        if self.fail:
+            raise DataSourceError("forced intraday failure")
+        return pd.DataFrame()
 
 
 class ConstantNewsProvider:
@@ -598,3 +646,102 @@ def test_pipeline_fallback_model_falls_back_to_heuristic() -> None:
     assert abs(float(healthy_probs["lgbm"]) - 0.8) < 1e-9
     assert abs(float(healthy_probs["xgb"]) - 0.8) < 1e-9
     assert abs(float(healthy_probs["meta"]) - 0.8) < 1e-9
+
+
+def test_pipeline_filters_symbol_below_min_daily_turnover() -> None:
+    # MinimalBarsProvider yields turnover ~3e7, below the trend threshold 8e7;
+    # keep the default (non-zero) liquidity thresholds so the gate must reject.
+    config = _load_default_config()
+    pipeline = AnalyzerPipeline(config=config, provider=MinimalBarsProvider())
+    report = pipeline.run_once(symbols=["600000"], strategy="trend", current_equity=1.0)
+    signal = report.signals[0]
+    assert signal.action == "hold"
+    assert signal.target_position == 0.0
+    assert any(reason == "liquidity_filter" for reason in signal.reasons)
+    liquidity_gate = _as_mapping(signal.decision_trace["liquidity_gate"])
+    assert liquidity_gate["passed"] is False
+    assert liquidity_gate["min_daily_turnover"] == 80_000_000
+    assert float(liquidity_gate["turnover"]) < 80_000_000
+
+
+def test_pipeline_filters_symbol_below_min_float_market_cap() -> None:
+    config = _load_default_config()
+    provider = LiquidityOverrideBarsProvider(
+        turnover=500_000_000.0,
+        float_market_cap=5_000_000_000.0,
+    )
+    pipeline = AnalyzerPipeline(config=config, provider=provider)
+    report = pipeline.run_once(symbols=["600000"], strategy="trend", current_equity=1.0)
+    signal = report.signals[0]
+    assert signal.action == "hold"
+    assert any(reason == "liquidity_filter" for reason in signal.reasons)
+    liquidity_gate = _as_mapping(signal.decision_trace["liquidity_gate"])
+    assert liquidity_gate["passed"] is False
+    assert liquidity_gate["min_float_market_cap"] == 8_000_000_000
+    # turnover/rate satisfy the other two thresholds: only cap is violated.
+    assert float(liquidity_gate["turnover"]) >= liquidity_gate["min_daily_turnover"]
+    assert float(liquidity_gate["turnover_rate"]) <= liquidity_gate["max_turnover_rate"]
+
+
+def test_pipeline_filters_symbol_above_max_turnover_rate() -> None:
+    config = _load_default_config()
+    provider = LiquidityOverrideBarsProvider(
+        turnover=2_000_000_000.0,
+        float_market_cap=10_000_000_000.0,
+    )
+    pipeline = AnalyzerPipeline(config=config, provider=provider)
+    report = pipeline.run_once(symbols=["600000"], strategy="trend", current_equity=1.0)
+    signal = report.signals[0]
+    assert signal.action == "hold"
+    assert any(reason == "liquidity_filter" for reason in signal.reasons)
+    liquidity_gate = _as_mapping(signal.decision_trace["liquidity_gate"])
+    assert liquidity_gate["passed"] is False
+    assert liquidity_gate["max_turnover_rate"] == 0.15
+    # turnover/cap satisfy the other two thresholds: only rate is violated.
+    assert float(liquidity_gate["turnover"]) >= liquidity_gate["min_daily_turnover"]
+    assert float(liquidity_gate["float_market_cap"]) >= liquidity_gate["min_float_market_cap"]
+    assert float(liquidity_gate["turnover_rate"]) > liquidity_gate["max_turnover_rate"]
+
+
+def test_liquidity_check_passes_when_turnover_equals_min_threshold() -> None:
+    config = LiquidityFilterConfig(
+        min_daily_turnover=80_000_000,
+        min_float_market_cap=8_000_000_000,
+        max_turnover_rate=0.15,
+    )
+    # turnover == min_daily_turnover exactly; rate = 8e7/8e9 = 0.01 <= 0.15.
+    bar = pd.Series({"turnover": 80_000_000.0, "float_market_cap": 8_000_000_000.0})
+    assert _liquidity_check(bar, config) is True
+
+
+def test_pipeline_resumes_new_buy_after_provider_recovers() -> None:
+    # First run: every provider call fails -> degraded mode stops new buys.
+    # Second run: provider recovers -> degraded mode resets, new buys reopen.
+    config = _load_default_config()
+    config.data_source.switch_after_failures = 1
+    primary = ToggleFailBarsProvider()
+    primary.fail = True
+    provider = ResilientProvider(
+        primary=primary,
+        backup=SyntheticProvider(seed_offset=88),
+        config=config.data_source,
+    )
+    pipeline = AnalyzerPipeline(config=config, provider=provider)
+
+    first = pipeline.run_once(symbols=["600000"], strategy="trend", current_equity=1.0)
+    assert first.degraded_mode is True
+    assert first.risk.hard_degraded_mode is True
+    assert first.risk.can_open_new_position is False
+    assert first.risk.reason == "degraded_stop_new_buy"
+    assert first.signals[0].action == "hold"
+
+    primary.fail = False
+    second = pipeline.run_once(symbols=["600000"], strategy="trend", current_equity=1.0)
+    assert second.degraded_mode is False
+    assert second.risk.hard_degraded_mode is False
+    assert second.risk.can_open_new_position is True
+    assert second.risk.reason != "degraded_stop_new_buy"
+    status = provider.status()
+    assert status["degraded_mode"] is False
+    assert status["consecutive_failures"] == 0
+    assert status["last_error"] == ""
