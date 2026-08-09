@@ -46,7 +46,15 @@ def _load_test_config() -> StockAnalyzerConfig:
     config.liquidity_filter_trend.min_float_market_cap = 0.0
     config.liquidity_filter_trend.max_turnover_rate = 1.0
     config.soup_strategy.max_holdings = 1
-    config.training.artifact_path = str(root / "artifacts" / "nonexistent_test_model.json")
+    # Point at a guaranteed-missing artifact so the pipeline falls back to
+    # controlled-heuristic probabilities regardless of what a developer's
+    # artifacts/ directory may contain (a real model artifact may exist at
+    # artifacts/nonexistent_test_model.json after production training runs).
+    config.training.artifact_path = str(
+        Path(tempfile.gettempdir())
+        / f"stock_analyzer_service_portfolio_{time.time_ns()}"
+        / "nonexistent_test_model.json"
+    )
 
     if "trend" in config.strategy_scores:
         config.strategy_scores["trend"].thresholds.s = 0.0
