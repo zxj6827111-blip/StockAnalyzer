@@ -70,6 +70,7 @@ class _TushareProApi(Protocol):
         self,
         *,
         ts_code: str = "",
+        list_status: str = "",
         fields: str = "",
     ) -> object: ...
 
@@ -254,8 +255,19 @@ class _HttpTushareProApi:
             is_open=is_open,
         )
 
-    def stock_basic(self, *, ts_code: str = "", fields: str = "") -> object:
-        return self._call("stock_basic", ts_code=ts_code, fields=fields)
+    def stock_basic(
+        self,
+        *,
+        ts_code: str = "",
+        list_status: str = "",
+        fields: str = "",
+    ) -> object:
+        return self._call(
+            "stock_basic",
+            ts_code=ts_code,
+            list_status=list_status,
+            fields=fields,
+        )
 
     def fina_indicator(
         self,
@@ -1013,6 +1025,18 @@ class TushareProvider:
         except Exception as exc:
             raise DataSourceError(f"tushare index_daily failed for {index_code}: {exc}") from exc
         return _normalize_index_daily(_coerce_frame(raw), index_code=index_code)
+
+    def fetch_delisted_stock_basic(self) -> pd.DataFrame:
+        """Fetch ``stock_basic(list_status='D')`` — delisted A-share symbols.
+
+        Raises :class:`DataSourceError` when no tushare token is configured so
+        callers can fall back to a local delisted-symbol list file.
+        """
+        pro = self._resolve_pro_api()
+        raw = self._call_with_retry(
+            lambda: pro.stock_basic(list_status="D", fields="ts_code,name,delist_date")
+        )
+        return _coerce_frame(raw)
 
     def _resolve_pro_api(self) -> _TushareProApi:
         if self._pro_api is not None:

@@ -64,8 +64,14 @@ class _FakePro:
         _ = (exchange, start_date, end_date, is_open)
         return self._trade_cal
 
-    def stock_basic(self, *, ts_code: str = "", fields: str = "") -> object:
-        _ = (ts_code, fields)
+    def stock_basic(
+        self,
+        *,
+        ts_code: str = "",
+        list_status: str = "",
+        fields: str = "",
+    ) -> object:
+        _ = (ts_code, list_status, fields)
         return pd.DataFrame({"ts_code": [ts_code], "name": ["浦发银行"]})
 
 
