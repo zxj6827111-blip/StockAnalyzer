@@ -128,12 +128,21 @@ def _client_with_config(monkeypatch: Any) -> TestClient:
 
 def test_settings_blacklist_get_returns_current_state(monkeypatch: Any) -> None:
     client = _client_with_config(monkeypatch)
-    response = client.get("/settings/blacklist")
+    response = client.get(
+        "/settings/blacklist",
+        headers={"X-SA-API-Key": "test-blacklist-token"},
+    )
     assert response.status_code == 200
     body = response.json()
     assert body["enabled"] is False
     assert body["symbols"] == []
     assert body["count"] == 0
+
+
+def test_settings_blacklist_get_requires_auth(monkeypatch: Any) -> None:
+    client = _client_with_config(monkeypatch)
+    response = client.get("/settings/blacklist")
+    assert response.status_code == 401
 
 
 def test_settings_blacklist_add_and_remove(monkeypatch: Any) -> None:
@@ -187,7 +196,7 @@ def test_settings_blacklist_add_and_remove(monkeypatch: Any) -> None:
     assert missing.status_code == 200
     assert missing.json()["removed"] is False
 
-    get_after = client.get("/settings/blacklist")
+    get_after = client.get("/settings/blacklist", headers=headers)
     assert get_after.json()["symbols"] == ["688*"]
 
 

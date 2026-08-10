@@ -228,3 +228,66 @@ def test_concurrent_acquire_exactly_one_wins(tmp_path: Path) -> None:
 
     assert sum(1 for result in results if result) == 1
     assert len(winners) == 1
+
+
+def test_stale_takeover_owner_verification(tmp_path: Path) -> None:
+    """A takeover must win the lock exclusively and protect it from the
+    previous owner (owner-token verification on acquire/release)."""
+    lock_path = tmp_path / "scheduler_leader.lock"
+    first = DistributedFileLock(lock_path, stale_after_sec=1, owner_token="owner-1")
+    second = DistributedFileLock(lock_path, stale_after_sec=1, owner_token="owner-2")
+
+    assert first.acquire() is True
+    first.release()  # simulate crash: no release would happen, but the file remains
+
+    # Simulate a stale lock left behind by a dead holder.
+    lock_path.touch()
+    old = time.time() - 10
+    import os
+
+    os.utime(lock_path, (old, old))
+    assert first.is_stale() is True
+
+    # Second process takes over the stale lock.
+    assert second.acquire() is True
+    assert _read_payload(lock_path)["owner_token"] == "owner-2"
+
+    # First process must not re-acquire while the new lock is fresh, and must
+    # not remove the foreign lock on release.
+    assert first.acquire() is False
+    first.release()
+    assert lock_path.exists()
+    assert _read_payload(lock_path)["owner_token"] == "owner-2"
+    assert second.is_held() is True
+
+    second.release()
+    assert not lock_path.exists()
+
+
+def test_release_after_foreign_takeover_resets_held(tmp_path: Path) -> None:
+    """release() after the lock was taken over must reset _held so a later
+    acquire() does not falsely report success."""
+    lock_path = tmp_path / "scheduler_leader.lock"
+    first = DistributedFileLock(lock_path, stale_after_sec=1, owner_token="owner-1")
+    second = DistributedFileLock(lock_path, stale_after_sec=1, owner_token="owner-2")
+
+    assert first.acquire() is True
+    # Stop the heartbeat so the lock goes stale naturally.
+    first._stop_heartbeat()  # noqa: SLF001
+    lock_path.touch()
+    old = time.time() - 10
+    import os
+
+    os.utime(lock_path, (old, old))
+
+    assert second.acquire() is True  # takeover
+    assert first.is_held() is True  # first still believes it holds the lock
+
+    first.release()  # must reset held even though the file is foreign
+    assert first.is_held() is False
+
+    # A subsequent acquire must actually try the filesystem again.
+    second.release()
+    assert first.acquire() is True
+    assert _read_payload(lock_path)["owner_token"] == "owner-1"
+    first.release()

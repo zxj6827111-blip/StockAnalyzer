@@ -1389,7 +1389,9 @@ class BlacklistConfig(_StrictModel):
         normalized = symbol.strip()
         if not normalized:
             return None
-        for pattern in self.symbols:
+        # Iterate a snapshot: runtime mutations replace the list wholesale
+        # (copy-on-write), so a snapshot is always internally consistent.
+        for pattern in tuple(self.symbols):
             candidate = str(pattern).strip()
             if not candidate:
                 continue

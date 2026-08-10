@@ -32,7 +32,9 @@ def _blacklist_payload() -> dict[str, object]:
 
 
 @router.get("/settings/blacklist")
-def settings_blacklist_get() -> dict[str, object]:
+def settings_blacklist_get(
+    _auth: None = Depends(get_verify_api_auth()),
+) -> dict[str, object]:
     return _blacklist_payload()
 
 
@@ -48,7 +50,9 @@ def settings_blacklist_add(
     blacklist = get_config().blacklist
     added = symbol not in blacklist.symbols
     if added:
-        blacklist.symbols.append(symbol)
+        # Copy-on-write: replace the list wholesale so concurrent readers
+        # iterating the config never observe a mid-mutation list.
+        blacklist.symbols = [*blacklist.symbols, symbol]
     payload = _blacklist_payload()
     payload["added"] = added
     return payload
@@ -66,7 +70,8 @@ def settings_blacklist_remove(
     blacklist = get_config().blacklist
     removed = symbol in blacklist.symbols
     if removed:
-        blacklist.symbols.remove(symbol)
+        # Copy-on-write replacement (see add endpoint note).
+        blacklist.symbols = [s for s in blacklist.symbols if s != symbol]
     payload = _blacklist_payload()
     payload["removed"] = removed
     return payload

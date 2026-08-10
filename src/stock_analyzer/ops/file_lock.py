@@ -11,14 +11,17 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import socket
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
 DEFAULT_STALE_AFTER_SEC = 300
 _ACQUIRE_RETRIES = 3
+_TAKEOVER_JITTER_MAX_SEC = 0.1
 
 
 def _hostname() -> str:
@@ -112,6 +115,10 @@ class DistributedFileLock:
                     continue
                 except OSError:
                     return False
+                # Give a concurrent takeover a random head start so two
+                # processes that both observed the same stale lock do not
+                # race each other on the re-creation (see TOCTOU note).
+                time.sleep(random.uniform(0.0, _TAKEOVER_JITTER_MAX_SEC))
                 continue
             except OSError:
                 raise
@@ -127,6 +134,13 @@ class DistributedFileLock:
                 except OSError:
                     pass
                 raise
+            # Verify ownership after creation: another process may have
+            # unlinked our freshly created file (it observed the same stale
+            # lock) and re-created its own in between.  In that case the
+            # file on disk belongs to them, our handle points at an orphaned
+            # inode, and we must NOT report success.
+            if str(self._read_payload().get("owner_token", "")).strip() != self._owner_token:
+                return False
             self._held = True
             self._start_heartbeat()
             return True
@@ -153,6 +167,9 @@ class DistributedFileLock:
         self._stop_heartbeat()
         current = self._read_payload()
         if current and str(current.get("owner_token", "")).strip() != self._owner_token:
+            # The lock was taken over by another owner; this instance no
+            # longer holds it, so reset the held flag regardless.
+            self._held = False
             return
         try:
             self._path.unlink()
