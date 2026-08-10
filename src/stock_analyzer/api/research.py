@@ -4,7 +4,10 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter, BackgroundTasks, Depends, Query
+from pydantic import BaseModel
 
 from stock_analyzer.api.deps import get_service, get_verify_api_auth
 from stock_analyzer.api.models import (
@@ -22,6 +25,68 @@ from stock_analyzer.api.models import (
 from stock_analyzer.ops.background_tasks import submit_background_task
 
 router = APIRouter()
+
+_report_kwarg_keys: tuple[str, ...] = (
+    "split_names",
+    "factor_columns",
+    "feature_columns",
+)
+_path_kwarg_keys: tuple[str, ...] = ("output_path", "output_dir")
+
+
+def _phase_d_request_kwargs(request: BaseModel) -> dict[str, object]:
+    """Translate a phase-D report body into the service method's kwargs.
+
+    Mirrors the historical per-endpoint translation: empty collections and
+    empty path strings become ``None``, and an empty ``horizons`` list falls
+    back to the default horizon set.
+    """
+    kwargs = dict(request.model_dump())
+    for key in _report_kwarg_keys:
+        if key in kwargs and not kwargs[key]:
+            kwargs[key] = None
+    for key in _path_kwarg_keys:
+        if key in kwargs and not kwargs[key]:
+            kwargs[key] = None
+    if "horizons" in kwargs and not kwargs["horizons"]:
+        kwargs["horizons"] = (1, 5, 10)
+    return kwargs
+
+
+def _register_report_endpoint(
+    *,
+    path: str,
+    request_model: type[Any],
+    task_name: str,
+    service_method: str,
+) -> None:
+    """Register one 202-async phase-D report endpoint (POST).
+
+    The endpoint defers ``get_service()`` resolution into the background task
+    and keeps the historical route name/auth/status-code semantics; only the
+    request-model annotation is substituted at registration time.
+    """
+
+    def _endpoint(
+        request: BaseModel,
+        background_tasks: BackgroundTasks,
+        _auth: None = Depends(get_verify_api_auth()),
+    ) -> dict[str, object]:
+        return submit_background_task(
+            background_tasks,
+            name=task_name,
+            fn=lambda: getattr(get_service(), service_method)(**_phase_d_request_kwargs(request)),
+        )
+
+    _endpoint.__annotations__["request"] = request_model
+    _endpoint.__name__ = service_method
+    router.add_api_route(
+        path,
+        _endpoint,
+        methods=["POST"],
+        status_code=202,
+        name=service_method,
+    )
 
 
 @router.post("/research/signal-quality/run", status_code=202)
@@ -52,200 +117,60 @@ def signal_quality_audit_history(
     return get_service().signal_quality_audit_history(limit=limit)
 
 
-@router.post("/research/alphalens/report", status_code=202)
-def build_phase_d_alphalens_report(
-    request: PhaseDAlphalensReportRequest,
-    background_tasks: BackgroundTasks,
-    _auth: None = Depends(get_verify_api_auth()),
-) -> dict[str, object]:
-    return submit_background_task(
-        background_tasks,
-        name="phase_d_alphalens",
-        fn=lambda: get_service().build_phase_d_alphalens_report(
-            model_id=request.model_id,
-            split_names=request.split_names or None,
-            max_rows=request.max_rows,
-            factor_columns=request.factor_columns or None,
-            horizons=request.horizons or (1, 5, 10),
-            quantiles=request.quantiles,
-            output_path=request.output_path or None,
-        ),
-    )
-
-
-@router.post("/research/shap/report", status_code=202)
-def build_phase_d_shap_report(
-    request: PhaseDShapReportRequest,
-    background_tasks: BackgroundTasks,
-    _auth: None = Depends(get_verify_api_auth()),
-) -> dict[str, object]:
-    return submit_background_task(
-        background_tasks,
-        name="phase_d_shap",
-        fn=lambda: get_service().build_phase_d_shap_report(
-            model_id=request.model_id,
-            split_names=request.split_names or None,
-            max_rows=request.max_rows,
-            prediction_column=request.prediction_column,
-            baseline_importance=request.baseline_importance,
-            drift_threshold=request.drift_threshold,
-            top_k=request.top_k,
-            output_path=request.output_path or None,
-        ),
-    )
-
-
-@router.post("/research/catboost-shadow/report", status_code=202)
-def build_phase_d_catboost_shadow_report(
-    request: PhaseDCatBoostShadowReportRequest,
-    background_tasks: BackgroundTasks,
-    _auth: None = Depends(get_verify_api_auth()),
-) -> dict[str, object]:
-    return submit_background_task(
-        background_tasks,
-        name="phase_d_catboost_shadow",
-        fn=lambda: get_service().build_phase_d_catboost_shadow_report(
-            model_id=request.model_id,
-            split_names=request.split_names or None,
-            max_rows=request.max_rows,
-            feature_columns=request.feature_columns or None,
-            label_column=request.label_column,
-            baseline_probability_column=request.baseline_probability_column,
-            test_ratio=request.test_ratio,
-            random_seed=request.random_seed,
-            output_path=request.output_path or None,
-        ),
-    )
-
-
-@router.post("/research/finbert/report", status_code=202)
-def build_phase_d_finbert_report(
-    request: PhaseDFinbertReportRequest,
-    background_tasks: BackgroundTasks,
-    _auth: None = Depends(get_verify_api_auth()),
-) -> dict[str, object]:
-    return submit_background_task(
-        background_tasks,
-        name="phase_d_finbert",
-        fn=lambda: get_service().build_phase_d_finbert_report(
-            records=request.records,
-            model_path=request.model_path,
-            include_neutral=request.include_neutral,
-            output_path=request.output_path or None,
-        ),
-    )
-
-
-@router.post("/research/qlib-bridge/report", status_code=202)
-def build_phase_d_qlib_bridge_report(
-    request: PhaseDQlibBridgeReportRequest,
-    background_tasks: BackgroundTasks,
-    _auth: None = Depends(get_verify_api_auth()),
-) -> dict[str, object]:
-    return submit_background_task(
-        background_tasks,
-        name="phase_d_qlib_bridge",
-        fn=lambda: get_service().build_phase_d_qlib_bridge_report(
-            model_id=request.model_id,
-            split_names=request.split_names or None,
-            max_rows=request.max_rows,
-            feature_columns=request.feature_columns or None,
-            label_column=request.label_column,
-            train_ratio=request.train_ratio,
-            valid_ratio=request.valid_ratio,
-            output_dir=request.output_dir or None,
-        ),
-    )
-
-
-@router.post("/research/tabular-deep/report", status_code=202)
-def build_phase_d_tabular_deep_report(
-    request: PhaseDTabularDeepReportRequest,
-    background_tasks: BackgroundTasks,
-    _auth: None = Depends(get_verify_api_auth()),
-) -> dict[str, object]:
-    return submit_background_task(
-        background_tasks,
-        name="phase_d_tabular_deep",
-        fn=lambda: get_service().build_phase_d_tabular_deep_report(
-            model_id=request.model_id,
-            split_names=request.split_names or None,
-            max_rows=request.max_rows,
-            feature_columns=request.feature_columns or None,
-            label_column=request.label_column,
-            baseline_probability_column=request.baseline_probability_column,
-            test_ratio=request.test_ratio,
-            random_seed=request.random_seed,
-            output_path=request.output_path or None,
-        ),
-    )
-
-
-@router.post("/research/tft/report", status_code=202)
-def build_phase_d_tft_report(
-    request: PhaseDTftReportRequest,
-    background_tasks: BackgroundTasks,
-    _auth: None = Depends(get_verify_api_auth()),
-) -> dict[str, object]:
-    return submit_background_task(
-        background_tasks,
-        name="phase_d_tft",
-        fn=lambda: get_service().build_phase_d_tft_report(
-            model_id=request.model_id,
-            split_names=request.split_names or None,
-            max_rows=request.max_rows,
-            horizon=request.horizon,
-            encoder_length=request.encoder_length,
-            train_ratio=request.train_ratio,
-            output_path=request.output_path or None,
-        ),
-    )
-
-
-@router.post("/research/finrl/report", status_code=202)
-def build_phase_d_finrl_report(
-    request: PhaseDFinrlReportRequest,
-    background_tasks: BackgroundTasks,
-    _auth: None = Depends(get_verify_api_auth()),
-) -> dict[str, object]:
-    return submit_background_task(
-        background_tasks,
-        name="phase_d_finrl",
-        fn=lambda: get_service().build_phase_d_finrl_report(
-            model_id=request.model_id,
-            split_names=request.split_names or None,
-            max_rows=request.max_rows,
-            feature_columns=request.feature_columns or None,
-            reward_column=request.reward_column,
-            baseline_probability_column=request.baseline_probability_column,
-            test_ratio=request.test_ratio,
-            random_seed=request.random_seed,
-            action_threshold=request.action_threshold,
-            output_path=request.output_path or None,
-        ),
-    )
-
-
-@router.post("/research/heavy-ts/report", status_code=202)
-def build_phase_d_heavy_ts_report(
-    request: PhaseDHeavyTsReportRequest,
-    background_tasks: BackgroundTasks,
-    _auth: None = Depends(get_verify_api_auth()),
-) -> dict[str, object]:
-    return submit_background_task(
-        background_tasks,
-        name="phase_d_heavy_ts",
-        fn=lambda: get_service().build_phase_d_heavy_ts_report(
-            model_id=request.model_id,
-            split_names=request.split_names or None,
-            max_rows=request.max_rows,
-            horizon=request.horizon,
-            lookback=request.lookback,
-            test_ratio=request.test_ratio,
-            random_seed=request.random_seed,
-            output_path=request.output_path or None,
-        ),
-    )
+_register_report_endpoint(
+    path="/research/alphalens/report",
+    request_model=PhaseDAlphalensReportRequest,
+    task_name="phase_d_alphalens",
+    service_method="build_phase_d_alphalens_report",
+)
+_register_report_endpoint(
+    path="/research/shap/report",
+    request_model=PhaseDShapReportRequest,
+    task_name="phase_d_shap",
+    service_method="build_phase_d_shap_report",
+)
+_register_report_endpoint(
+    path="/research/catboost-shadow/report",
+    request_model=PhaseDCatBoostShadowReportRequest,
+    task_name="phase_d_catboost_shadow",
+    service_method="build_phase_d_catboost_shadow_report",
+)
+_register_report_endpoint(
+    path="/research/finbert/report",
+    request_model=PhaseDFinbertReportRequest,
+    task_name="phase_d_finbert",
+    service_method="build_phase_d_finbert_report",
+)
+_register_report_endpoint(
+    path="/research/qlib-bridge/report",
+    request_model=PhaseDQlibBridgeReportRequest,
+    task_name="phase_d_qlib_bridge",
+    service_method="build_phase_d_qlib_bridge_report",
+)
+_register_report_endpoint(
+    path="/research/tabular-deep/report",
+    request_model=PhaseDTabularDeepReportRequest,
+    task_name="phase_d_tabular_deep",
+    service_method="build_phase_d_tabular_deep_report",
+)
+_register_report_endpoint(
+    path="/research/tft/report",
+    request_model=PhaseDTftReportRequest,
+    task_name="phase_d_tft",
+    service_method="build_phase_d_tft_report",
+)
+_register_report_endpoint(
+    path="/research/finrl/report",
+    request_model=PhaseDFinrlReportRequest,
+    task_name="phase_d_finrl",
+    service_method="build_phase_d_finrl_report",
+)
+_register_report_endpoint(
+    path="/research/heavy-ts/report",
+    request_model=PhaseDHeavyTsReportRequest,
+    task_name="phase_d_heavy_ts",
+    service_method="build_phase_d_heavy_ts_report",
+)
 
 
 @router.get("/research/d6/registry")

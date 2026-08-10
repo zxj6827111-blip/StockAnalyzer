@@ -10,6 +10,7 @@ from typing import cast
 from fastapi.testclient import TestClient
 
 import stock_analyzer.main as main_module
+from stock_analyzer.api.research import router as research_router
 from stock_analyzer.config import StockAnalyzerConfig, load_config
 from stock_analyzer.data.provider import SyntheticProvider
 from stock_analyzer.learning.sample_schema import (
@@ -304,3 +305,25 @@ def test_main_phase_d_research_endpoints_run_with_service_backing(
     )
     assert qlib["research_id"] == "qlib_bridge"
     assert Path(str(_as_mapping(qlib["bundle_paths"])["manifest_path"])).exists() is True
+
+
+def test_phase_d_report_endpoint_routes_conserved() -> None:
+    """The 9 phase-D report POST routes must stay registered after refactors."""
+    report_paths = sorted(
+        str(route.path)
+        for route in research_router.routes
+        if str(getattr(route, "path", "")).startswith("/research/")
+        and str(getattr(route, "path", "")).endswith("/report")
+    )
+    assert report_paths == [
+        "/research/alphalens/report",
+        "/research/catboost-shadow/report",
+        "/research/finbert/report",
+        "/research/finrl/report",
+        "/research/heavy-ts/report",
+        "/research/qlib-bridge/report",
+        "/research/shap/report",
+        "/research/tabular-deep/report",
+        "/research/tft/report",
+    ]
+    assert len(report_paths) == 9
