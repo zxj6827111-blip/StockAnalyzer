@@ -568,6 +568,9 @@ scheduler:
   close_reconcile_time: "15:10"
   week4_acceptance_time: "20:35"
   week6_daily_time: "15:25"
+  leader_lock_enabled: true
+  leader_lock_stale_after_sec: 300
+  leader_lock_path: "artifacts/runtime/scheduler_leader.lock"
 
 labels:
   primary: "soup_10d_tp8_before_sl5"
@@ -932,6 +935,11 @@ idle_queue:
   universe_cache_path: "artifacts/universe/a_share_symbols.json"
   universe_cache_max_age_hours: 24
   universe_min_symbols: 500
+  # P2-#27 阶段一：universe 构建排除退市股（幸存者偏差）。名单来源：
+  # tushare stock_basic(list_status='D')（token 可用时拉取并落盘），
+  # 否则回退本地 delisted_symbols_path 文件；文件缺失/损坏按空集处理。
+  exclude_delisted: true
+  delisted_symbols_path: "artifacts/universe/delisted.json"
 
 dashboard:
   default_total_asset: 100000.0

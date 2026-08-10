@@ -290,6 +290,8 @@ def test_load_default_config_values(monkeypatch: MonkeyPatch) -> None:
     ]
     assert config.idle_queue.history_memory_limit == 500
     assert config.idle_queue.history_disk_limit == 5000
+    assert config.idle_queue.exclude_delisted is True
+    assert config.idle_queue.delisted_symbols_path == "artifacts/universe/delisted.json"
     assert config.dashboard.default_total_asset == 100000.0
 
 

@@ -58,6 +58,7 @@ _RUFF_TARGETS = (
     "src/stock_analyzer/data/market_warehouse.py",
     "src/stock_analyzer/data/vendor_zip_overlay.py",
     "src/stock_analyzer/runtime/service.py",
+    "src/stock_analyzer/runtime/scheduler_worker.py",
     "src/stock_analyzer/runtime/universe_candidate_selector.py",
     "src/stock_analyzer/runtime/services",
     "src/stock_analyzer/ops",
@@ -77,6 +78,9 @@ _RUFF_TARGETS = (
     "tests/test_probe_universe_quality_selector.py",
     "tests/test_backfill_financial_snapshots.py",
     "tests/test_financial_pit.py",
+    "tests/test_file_lock.py",
+    "tests/test_scheduler_worker.py",
+    "tests/test_main_scheduler_run_due.py",
     "tests/test_market_warehouse.py",
 )
 
@@ -99,6 +103,8 @@ _MYPY_BLOCKING_TARGETS = (
     "src/stock_analyzer/ops/release_smoke.py",
     "src/stock_analyzer/ops/staging_rehearsal.py",
     "src/stock_analyzer/ops/release_snapshot.py",
+    "src/stock_analyzer/ops/file_lock.py",
+    "src/stock_analyzer/runtime/scheduler_worker.py",
 )
 
 _MYPY_INFORMATIONAL_TARGETS = (

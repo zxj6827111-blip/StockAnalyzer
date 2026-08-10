@@ -829,6 +829,13 @@ class SchedulerConfig(_StrictModel):
     close_reconcile_time: str = "15:30"
     week4_acceptance_time: str = "20:35"
     week6_daily_time: str = "15:25"
+    # Leader election across scheduler replicas: the poll worker and the
+    # manual run_due endpoint both take this file lock before executing
+    # scheduler jobs (audit P2-#20). The path is relative to the shared
+    # artifacts volume mount.
+    leader_lock_enabled: bool = True
+    leader_lock_stale_after_sec: int = 300
+    leader_lock_path: str = "artifacts/runtime/scheduler_leader.lock"
 
 
 class LabelsConfig(_StrictModel):
@@ -1281,6 +1288,11 @@ class IdleQueueConfig(_StrictModel):
     universe_cache_path: str = "artifacts/universe/a_share_symbols.json"
     universe_cache_max_age_hours: int = 24
     universe_min_symbols: int = 500
+    # P2-#27 phase 1: exclude delisted symbols from universe construction to
+    # avoid survivorship bias. List source: tushare stock_basic(list_status='D')
+    # when the token is available, else the local delisted_symbols_path file.
+    exclude_delisted: bool = True
+    delisted_symbols_path: str = "artifacts/universe/delisted.json"
 
 
 class DashboardConfig(_StrictModel):
