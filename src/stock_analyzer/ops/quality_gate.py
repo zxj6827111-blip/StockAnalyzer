@@ -54,6 +54,7 @@ class QualityGateReport:
 
 _RUFF_TARGETS = (
     "src/stock_analyzer/main.py",
+    "src/stock_analyzer/api",
     "src/stock_analyzer/data/market_warehouse.py",
     "src/stock_analyzer/data/vendor_zip_overlay.py",
     "src/stock_analyzer/runtime/service.py",
@@ -80,6 +81,8 @@ _RUFF_TARGETS = (
 )
 
 _MYPY_BLOCKING_TARGETS = (
+    "src/stock_analyzer/main.py",
+    "src/stock_analyzer/api",
     "src/stock_analyzer/data/market_warehouse.py",
     "src/stock_analyzer/data/vendor_zip_overlay.py",
     "src/stock_analyzer/runtime/services/market_sync_service.py",
