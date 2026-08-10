@@ -136,4 +136,4 @@ def is_query_frozen(query: str) -> bool:
     config = get_config().param_freeze
     if query not in config.frozen_queries:
         return False
-    return is_params_frozen(config=config)
+    return bool(is_params_frozen(config=config))
