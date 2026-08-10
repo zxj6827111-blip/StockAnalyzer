@@ -103,6 +103,7 @@ def build_primary_provider(config: DataSourceConfig) -> MarketDataProvider:
             minute_amount_multiplier=config.vendor_zip_minute_amount_multiplier,
             intraday_enabled=config.vendor_zip_intraday_enabled,
             memory_cache_symbols=config.vendor_zip_memory_cache_symbols,
+            delta_max_staleness_days=config.vendor_zip_delta_max_staleness_days,
         )
     if primary in {
         "market_warehouse",

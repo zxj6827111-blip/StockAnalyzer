@@ -180,6 +180,7 @@ class VendorZipOverlayProvider:
     intraday_enabled: bool = True
     memory_cache_symbols: int = 32
     delta_access_mode: str = "read_write"
+    delta_max_staleness_days: int = 3
     _root: Path = field(init=False)
     _index: dict[str, object] = field(init=False)
     _warehouse: MarketWarehouse | None = field(init=False)
@@ -223,6 +224,7 @@ class VendorZipOverlayProvider:
                 read_only=access_mode == "read_only",
             )
         self.memory_cache_symbols = max(1, int(self.memory_cache_symbols))
+        self.delta_max_staleness_days = max(1, int(self.delta_max_staleness_days))
 
     def list_symbols(self) -> list[str]:
         symbols = self._symbols_mapping()
@@ -293,7 +295,7 @@ class VendorZipOverlayProvider:
         symbols: list[str],
         lookback_days: int,
     ) -> pd.DataFrame:
-        """Batch-fetch per-symbol daily history (ZIP baseline + delta overlay).
+        """Batch-fetch per-symbol daily history (delta-first, ZIP for the rest).
 
         Single call covering the whole requested universe, mirroring
         ``MarketWarehouse.fetch_universe_quality_metrics`` so the Week5
@@ -302,6 +304,15 @@ class VendorZipOverlayProvider:
         I/O rules:
         - requested symbols are normalized, de-duplicated and sorted;
         - the delta DuckDB is queried exactly once;
+        - the delta serves a symbol only when it can return the full
+          ``lookback_days`` rows; symbols missing from the delta or with
+          shallower history are read from the ZIP archives (newly listed
+          symbols, partially imported baselines), so a partial delta never
+          silently degrades history depth;
+        - when the whole delta is stale by more than
+          ``delta_max_staleness_days`` behind the ZIP index, every symbol is
+          read from the ZIPs (correctness fallback — the selector's own
+          staleness gate would otherwise reject the entire batch);
         - ZIP entries are grouped by annual archive and each annual archive is
           opened at most once per call, newest year first;
         - per symbol, reading stops once ``lookback_days`` rows accumulated,
@@ -332,7 +343,13 @@ class VendorZipOverlayProvider:
             if not delta.empty:
                 delta = delta[delta["symbol"].isin(normalized)]
 
-        zip_frames = self._load_vendor_daily_batch(symbols=normalized, limit=limit)
+        zip_symbols = self._zip_symbols_needed(
+            delta_warehouse=delta_warehouse,
+            delta=delta,
+            symbols=normalized,
+            limit=limit,
+        )
+        zip_frames = self._load_vendor_daily_batch(symbols=zip_symbols, limit=limit)
         pieces = [frame for frame in zip_frames if not frame.empty]
         if not delta.empty:
             pieces.append(delta)
@@ -351,6 +368,51 @@ class VendorZipOverlayProvider:
         combined = combined.sort_values(["symbol", "date"]).reset_index(drop=True)
         combined = self._apply_financial_snapshots_batch(combined, symbols=normalized)
         return combined
+
+    def _zip_symbols_needed(
+        self,
+        *,
+        delta_warehouse: MarketWarehouse | None,
+        delta: pd.DataFrame,
+        symbols: list[str],
+        limit: int,
+    ) -> list[str]:
+        """Symbols the delta cannot fully serve for this batch call.
+
+        The delta serves a symbol only when it returns the full ``limit``
+        rows; symbols missing from the delta or with shallower history are
+        read from the ZIPs and merged with the usual "delta row wins" rule,
+        so a partially imported delta never silently degrades history depth.
+        When the whole delta is stale by more than
+        ``delta_max_staleness_days`` behind the ZIP index, every symbol is
+        read from the ZIPs (correctness fallback; the selector's own
+        staleness gate would otherwise reject the entire batch).
+        """
+        if delta_warehouse is None or delta.empty:
+            return list(symbols)
+        delta_symbols = delta["symbol"].astype(str)
+        delta_row_counts = delta_symbols.value_counts()
+        shallow = set(delta_row_counts[delta_row_counts < limit].index)
+        needed = (set(symbols) - set(delta_symbols.unique())) | shallow
+        index_latest = self._zip_index_latest_date(symbols)
+        delta_latest = delta["date"].max()
+        if (
+            index_latest is not None
+            and (index_latest - delta_latest.date()).days > self.delta_max_staleness_days
+        ):
+            return list(symbols)
+        return sorted(needed)
+
+    def _zip_index_latest_date(self, symbols: list[str]) -> date | None:
+        latest: date | None = None
+        for symbol in symbols:
+            raw_symbol = self._symbols_mapping().get(symbol)
+            if not isinstance(raw_symbol, dict):
+                continue
+            parsed = _coerce_date(raw_symbol.get("latest_date"))
+            if parsed is not None and (latest is None or parsed > latest):
+                latest = parsed
+        return latest
 
     def _apply_financial_snapshots_batch(
         self,
