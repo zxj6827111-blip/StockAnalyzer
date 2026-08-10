@@ -50,6 +50,7 @@ from stock_analyzer.evolution.modules.m6_counterparty import evaluate_m6_counter
 from stock_analyzer.evolution.orchestrator import OffhoursEvolutionOrchestrator
 from stock_analyzer.evolution.shadow_dataset_builder import ShadowDatasetBuilder
 from stock_analyzer.evolution.shadow_online_v2_report import ShadowOnlineV2ReportBuilder
+from stock_analyzer.execution.engine import ExecutionEngine
 from stock_analyzer.feature.engineer import FeatureEngineer
 from stock_analyzer.feature.market_context import build_market_relative_frame
 from stock_analyzer.feature.snapshot import RAW_SNAPSHOT_COLUMNS as _FEATURE_SNAPSHOT_RAW_COLUMNS
@@ -81,6 +82,7 @@ from stock_analyzer.pipeline import AnalyzerPipeline
 from stock_analyzer.portfolio.book import PortfolioBook
 from stock_analyzer.research import (
     compute_ic_decay_report,
+    compute_monthly_review_report,
     export_qlib_bridge_bundle,
     persist_alphalens_sidecar_report,
     persist_catboost_shadow_report,
@@ -88,6 +90,7 @@ from stock_analyzer.research import (
     persist_finrl_sidecar_report,
     persist_heavy_ts_shadow_report,
     persist_ic_decay_report,
+    persist_monthly_review_report,
     persist_shap_sidecar_report,
     persist_tabular_deep_shadow_report,
     persist_tft_sidecar_report,
@@ -321,6 +324,8 @@ class StockAnalyzerService:
         self._last_market_warehouse_progress: dict[str, object] | None = None
         self._week7_sim_broker_history: list[dict[str, object]] = []
         self._last_week7_sim_broker_report: dict[str, object] | None = None
+        self._monthly_review_history: list[dict[str, object]] = []
+        self._last_monthly_review_report: dict[str, object] | None = None
         self._global_market_snapshot: dict[str, float] = {}
         self._global_market_history: list[dict[str, object]] = []
         self._regulatory_watchlist: dict[str, dict[str, object]] = {}
@@ -13029,11 +13034,38 @@ class StockAnalyzerService:
     def _simulation_account_name(self) -> str:
         return "sim_auto"
 
+    def _shared_execution_engine(self) -> ExecutionEngine:
+        engine = getattr(self, "_execution_engine_shared", None)
+        if engine is None:
+            engine = ExecutionEngine(
+                config=self._config.backtest_matcher,
+                limit_rule=self._config.limit_rule,
+            )
+            self._execution_engine_shared = engine
+        return engine
+
+    def _apply_shared_slippage(
+        self,
+        *,
+        side: str,
+        strategy: str,
+        price: float,
+        price_source: str,
+    ) -> tuple[float, str]:
+        if price <= 0 or not bool(self._config.backtest_matcher.apply_dynamic_slippage_live):
+            return price, price_source
+        engine = self._shared_execution_engine()
+        adjusted = engine.apply_slippage(
+            price=price,
+            side=side,
+            slippage_ratio=engine.static_slippage_ratio(strategy=strategy),
+        )
+        if adjusted <= 0:
+            return price, price_source
+        return adjusted, f"{price_source}+slip"
+
     def _simulation_lot_size(self) -> int:
-        rounding_rule = str(self._config.backtest_matcher.share_rounding_rule).strip().lower()
-        if "100" in rounding_rule:
-            return 100
-        return 100
+        return self._shared_execution_engine().share_rounding_unit()
 
     def _simulation_cash_available(self) -> float:
         cash = self._simulation_initial_cash()
@@ -13064,22 +13096,20 @@ class StockAnalyzerService:
         *,
         side: str,
         notional: float,
+        trade_date: datetime | date | None = None,
     ) -> float:
         if notional <= 0:
             return 0.0
-        matcher = self._config.backtest_matcher
-        commission = max(
-            notional * _as_float(matcher.commission_rate, default=0.0),
-            _as_float(matcher.min_commission_per_order, default=0.0),
+        engine = self._shared_execution_engine()
+        return round(
+            engine.estimate_cost(
+                side=side,
+                price=notional,
+                quantity=1,
+                trade_date=trade_date,
+            ),
+            2,
         )
-        transfer = notional * _as_float(matcher.transfer_fee_rate, default=0.0)
-        stamp = 0.0
-        if (
-            side.strip().lower() == "sell"
-            and str(matcher.stamp_tax_apply_on).strip().lower() == "sell_only"
-        ):
-            stamp = notional * _as_float(matcher.stamp_tax_rate, default=0.0)
-        return round(commission + transfer + stamp, 2)
 
     def _select_simulated_trade_price(
         self,
@@ -13284,6 +13314,12 @@ class StockAnalyzerService:
                 side="sell",
                 market_payload=market_payload,
             )
+            trade_price, price_source = self._apply_shared_slippage(
+                side="sell",
+                strategy=str(item.get("strategy", "")).strip() or "trend",
+                price=trade_price,
+                price_source=price_source,
+            )
             exit_quantity = current_quantity
             if current_quantity > 0 and current_target > 0 and next_target < current_target:
                 remaining_ratio = max(0.0, min(1.0, next_target / current_target))
@@ -13297,6 +13333,7 @@ class StockAnalyzerService:
                 self._estimate_simulated_trade_fee(
                     side="sell",
                     notional=trade_price * fee_base_quantity,
+                    trade_date=timestamp,
                 )
                 if trade_price > 0 and fee_base_quantity > 0
                 else 0.0
@@ -13401,11 +13438,18 @@ class StockAnalyzerService:
                     side="sell",
                     market_payload=market_payload,
                 )
+                trade_price, price_source = self._apply_shared_slippage(
+                    side="sell",
+                    strategy=str(signal.strategy).strip() or "trend",
+                    price=trade_price,
+                    price_source=price_source,
+                )
                 quantity = _as_int(existing.get("quantity"), default=0)
                 fee = (
                     self._estimate_simulated_trade_fee(
                         side="sell",
                         notional=trade_price * quantity,
+                        trade_date=timestamp,
                     )
                     if trade_price > 0 and quantity > 0
                     else 0.0
@@ -13516,6 +13560,12 @@ class StockAnalyzerService:
                 side="buy",
                 market_payload=market_payload,
             )
+            trade_price, price_source = self._apply_shared_slippage(
+                side="buy",
+                strategy=str(signal.strategy).strip() or "trend",
+                price=trade_price,
+                price_source=price_source,
+            )
             lot_size = self._simulation_lot_size()
             if trade_price <= 0 or desired_cash < trade_price * lot_size:
                 skipped_no_cash += 1
@@ -13543,12 +13593,20 @@ class StockAnalyzerService:
                 )
                 continue
             notional = trade_price * quantity
-            fee = self._estimate_simulated_trade_fee(side="buy", notional=notional)
+            fee = self._estimate_simulated_trade_fee(
+                side="buy",
+                notional=notional,
+                trade_date=timestamp,
+            )
             total_cost = notional + fee
             while quantity > 0 and total_cost > available_cash:
                 quantity -= lot_size
                 notional = trade_price * quantity
-                fee = self._estimate_simulated_trade_fee(side="buy", notional=notional)
+                fee = self._estimate_simulated_trade_fee(
+                    side="buy",
+                    notional=notional,
+                    trade_date=timestamp,
+                )
                 total_cost = notional + fee
             if quantity <= 0:
                 skipped_no_cash += 1
@@ -14374,6 +14432,138 @@ class StockAnalyzerService:
 
     def week7_sim_broker_history(self, limit: int = 20) -> dict[str, object]:
         return self._week7_sim_broker_service.week7_sim_broker_history(limit=limit)
+
+
+    def build_monthly_review_report(
+        self,
+        *,
+        year_month: str = "",
+        output_path: str | None = None,
+    ) -> dict[str, object]:
+        review_config = self._config.monthly_review
+        month = _normalize_year_month(year_month) or datetime.now().strftime("%Y-%m")
+        trades = self.portfolio_trades(limit=10_000)
+        positions = self._portfolio.positions()
+        signals = self._collect_review_signal_records()
+        outcomes = self._collect_review_outcome_records()
+        reconcile = self.reconcile_weekly_report(days=31)
+        report = compute_monthly_review_report(
+            year_month=month,
+            trades=trades,
+            positions=positions,
+            signals=signals,
+            outcomes=outcomes,
+            reconcile=reconcile,
+            min_closed_trades=review_config.min_closed_trades,
+            over_position_threshold=review_config.over_position_threshold,
+            stop_loss_threshold=review_config.stop_loss_threshold,
+            take_profit_trigger=review_config.take_profit_trigger,
+            discipline_pass_threshold=review_config.discipline_pass_threshold,
+            position_cut_ratio=review_config.position_cut_ratio,
+        )
+        payload = {
+            "research_id": "monthly_review_report",
+            "delivery_mode": "monthly_review",
+            "month": month,
+            **report,
+        }
+        target = Path(output_path or self._default_phase_d_report_path("monthly_review_report"))
+        payload["output_path"] = persist_monthly_review_report(report=payload, output_path=target)
+        report["output_path"] = str(payload["output_path"])
+        self._last_monthly_review_report = report
+        self._monthly_review_history.append(report)
+        history_limit = max(1, review_config.history_limit)
+        if len(self._monthly_review_history) > history_limit:
+            overflow = len(self._monthly_review_history) - history_limit
+            if overflow > 0:
+                self._monthly_review_history = self._monthly_review_history[overflow:]
+        verdict = report.get("verdict", {})
+        verdict_map = verdict if isinstance(verdict, Mapping) else {}
+        self._record_audit_event(
+            event_type="monthly_review_report_built",
+            level="warn" if not bool(verdict_map.get("passed", True)) else "info",
+            message="monthly review report built",
+            payload={
+                "month": month,
+                "status": str(report.get("status", "")),
+                "score": _as_float(verdict_map.get("score"), default=0.0),
+                "grade": str(verdict_map.get("grade", "")),
+                "position_cut_next_month": bool(
+                    verdict_map.get("position_cut_next_month", False)
+                ),
+                "output_path": str(payload.get("output_path", "")),
+            },
+        )
+        if (
+            review_config.auto_notify
+            and str(report.get("status", "")) == "ok"
+            and not bool(verdict_map.get("passed", True))
+        ):
+            self.notify(
+                title=_push_title(priority="P1", category="monthly", summary="execution discipline"),
+                content=_notification_message_zh(
+                    trigger=(
+                        f"{month} 月度复盘完成，执行纪律评分低于阈值，"
+                        "已触发次月降仓建议。"
+                    ),
+                    impact=(
+                        "纪律评分低于 85 分时按 PRD §15 次月自动降仓 10%，"
+                        "以控制人工干预与违规操作带来的回撤风险。"
+                    ),
+                    action="请查看月度复盘报告中的纪律扣分明细，"
+                    "针对手动干预、随意改单、超仓、止损违背等项目逐项整改。",
+                    details=[
+                        f"月度评分：{_as_float(verdict_map.get('score'), default=0.0):.2f}",
+                        f"评级：{str(verdict_map.get('grade', '')) or '-'}",
+                        f"次月降仓比例：{_as_float(verdict_map.get('position_cut_ratio'), default=0.0) * 100:.0f}%",
+                        f"报告路径：{str(payload.get('output_path', ''))}",
+                    ],
+                    detail_title="纪律扣分明细",
+                ),
+                level="warn",
+                trace_id="",
+            )
+        return report
+
+    def latest_monthly_review_report(self) -> dict[str, object] | None:
+        return self._last_monthly_review_report
+
+    def monthly_review_history(self, limit: int = 20) -> dict[str, object]:
+        capped_limit = max(1, min(int(limit), max(1, self._config.monthly_review.history_limit)))
+        recent = self._monthly_review_history[-capped_limit:]
+        return {"records": len(recent), "reports": recent}
+
+    def _collect_review_signal_records(self) -> list[dict[str, object]]:
+        records: list[dict[str, object]] = []
+        for event in reversed(self._audit_events):
+            raw_signals = event.get("payload", {}).get("signals")
+            if not isinstance(raw_signals, list):
+                continue
+            for item in raw_signals:
+                if isinstance(item, Mapping):
+                    record = dict(item)
+                    if "symbol" in record and str(record.get("symbol", "")).strip():
+                        records.append(record)
+            if len(records) >= 10_000:
+                break
+        return records
+
+    def _collect_review_outcome_records(self) -> list[dict[str, object]]:
+        try:
+            outcomes = self._sample_store.list_outcomes()
+        except Exception:
+            return []
+        records: list[dict[str, object]] = []
+        for item in outcomes:
+            dump = getattr(item, "model_dump", None)
+            if callable(dump):
+                try:
+                    records.append(dump(mode="json"))
+                except Exception:
+                    records.append(dict(item.__dict__))
+            else:
+                records.append(dict(item.__dict__))
+        return records
 
 
     def _build_week7_sim_broker_drilldown(
@@ -15966,6 +16156,18 @@ class StockAnalyzerService:
                 weekdays=trading_weekdays,
                 date_predicate=_last_trading_day_of_month,
             )
+        if (
+            self._config.monthly_review.enabled
+            and str(self._config.monthly_review.report_time).strip()
+        ):
+            self._scheduler.register(
+                name="monthly_review_report",
+                trigger_hhmm=self._config.monthly_review.report_time,
+                callback=self._job_monthly_review_report,
+                latest_hhmm="23:59",
+                weekdays=trading_weekdays,
+                date_predicate=_last_trading_day_of_month,
+            )
 
     def _job_premarket_scan(self) -> dict[str, object]:
         global_snapshot_report = self._collect_global_market_snapshot(source_trace_id="premarket")
@@ -17262,6 +17464,10 @@ class StockAnalyzerService:
 
     def _job_factor_ic_decay_report(self) -> dict[str, object]:
         report = self.build_phase_d_ic_decay_report()
+        return {"report": report}
+
+    def _job_monthly_review_report(self) -> dict[str, object]:
+        report = self.build_monthly_review_report()
         return {"report": report}
 
     def _job_tdx_offline_sync(self) -> dict[str, object]:
