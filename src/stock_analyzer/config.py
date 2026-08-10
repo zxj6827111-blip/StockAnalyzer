@@ -109,6 +109,7 @@ class DataSourceConfig(_StrictModel):
     vendor_zip_minute_amount_multiplier: float = 1.0
     vendor_zip_intraday_enabled: bool = True
     vendor_zip_memory_cache_symbols: int = 32
+    vendor_zip_delta_max_staleness_days: int = 3
     enable_cache_fallback: bool = True
     switch_after_failures: int = 3
     request_interval_sec: float = 0.5

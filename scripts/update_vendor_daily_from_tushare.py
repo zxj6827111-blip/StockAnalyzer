@@ -1396,6 +1396,13 @@ def _main(argv: list[str] | None = None) -> int:
         "annual-ZIP scans; incrementally updated after a successful run. "
         "Must live OUTSIDE the vendor directory (e.g. /vol1/docker/tools/).",
     )
+    parser.add_argument(
+        "--sync-vendor-delta",
+        default="",
+        help="Delta DuckDB path to incrementally sync after a successful run "
+        "(import_vendor_zip_to_delta.py --incremental); requires --index-path. "
+        "Example: /app/artifacts/vendor_delta/market_delta.duckdb",
+    )
     args = parser.parse_args(argv)
 
     vendor_root = Path(args.vendor_root).expanduser()
@@ -1605,6 +1612,62 @@ def _main(argv: list[str] | None = None) -> int:
                 updated_symbols=updated_codes,
             )
 
+    # Delta baseline incremental sync: after the ZIPs and the last-date index
+    # are updated, mirror the new rows into the delta DuckDB so the Week5
+    # batch keeps reading the fast DuckDB path.
+    delta_sync_report: dict[str, object] = {"updated": False, "reason": "not_enabled"}
+    if (
+        not args.dry_run
+        and args.sync_vendor_delta.strip()
+        and args.index_path.strip()
+        and ok_results
+    ):
+        try:
+            # 显式按路径加载同目录脚本，不依赖 sys.path 恰好包含 scripts/：
+            # ``python -m`` 方式运行本脚本时 sys.path[0] 是 CWD，裸 import
+            # 会 ModuleNotFoundError（虽然被降级，但钩子将永远不生效）。
+            import contextlib
+            import importlib.util
+            import io
+
+            _delta_script = (
+                Path(__file__).resolve().parent / "import_vendor_zip_to_delta.py"
+            )
+            _spec = importlib.util.spec_from_file_location(
+                "import_vendor_zip_to_delta", _delta_script
+            )
+            assert _spec is not None and _spec.loader is not None
+            _delta_module = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_delta_module)
+
+            # import 脚本的 JSON 报告走自己的 stdout：不重定向会污染本脚本
+            # 的 summary 输出（下游解析会失败），把它收进 delta_sync 报告。
+            _captured = io.StringIO()
+            with contextlib.redirect_stdout(_captured):
+                sync_rc = _delta_module._main(  # noqa: SLF001
+                    [
+                        "--data-root",
+                        str(vendor_root),
+                        "--index-path",
+                        args.index_path,
+                        "--delta-db-path",
+                        args.sync_vendor_delta,
+                        "--incremental",
+                    ]
+                )
+            delta_sync_report = {"updated": sync_rc == 0, "exit_code": sync_rc}
+            _delta_output = _captured.getvalue().strip()
+            if _delta_output:
+                try:
+                    delta_sync_report["import_report"] = json.loads(_delta_output)
+                except json.JSONDecodeError:
+                    delta_sync_report["import_output"] = _delta_output
+        except Exception as exc:
+            delta_sync_report = {
+                "updated": False,
+                "reason": f"{type(exc).__name__}:{exc}",
+            }
+
     summary = {
         "tool": "update_vendor_daily_from_tushare",
         "finished_at": datetime.now().isoformat(timespec="seconds"),
@@ -1622,6 +1685,7 @@ def _main(argv: list[str] | None = None) -> int:
         "checkpoint": str(checkpoint_path) if checkpoint_path is not None else "",
         "zip_rebuilds": rebuild_reports,
         "index": index_report,
+        "delta_sync": delta_sync_report,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     if failures:

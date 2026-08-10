@@ -176,9 +176,11 @@ _SLOW_TEST_FILES = (
 # are exercised by the non-blocking slow-report stage) in parallel and enforce
 # a coverage floor. Threshold is a conservative baseline: a full local run on
 # Python 3.11 reports ~79% line coverage after excluding the slow files, so a
-# 75% floor leaves headroom for runner-to-runner variance.
+# 75% floor leaves headroom for runner-to-runner variance. Workers match the
+# GitHub-hosted ubuntu-latest runner (4 vCPU); -n 2 previously left half the
+# cores idle (~476s local full suite -> ~4x less with -n 4).
 _FULL_COVERAGE_FLOOR = 75
-_FULL_PARALLEL_WORKERS = "2"
+_FULL_PARALLEL_WORKERS = "4"
 
 
 def build_stage_specs(stage: str) -> list[QualityCommandSpec]:
@@ -191,25 +193,37 @@ def build_stage_specs(stage: str) -> list[QualityCommandSpec]:
                 name="ruff_clean_scope",
                 command=(python, "-m", "ruff", "check", *_RUFF_TARGETS),
                 log_name="ruff_clean_scope.log",
-            )
-        ]
-        specs.extend(
+            ),
+            # mypy 合并为单次调用：按 target 逐个起进程时，每次都要加载解释器
+            # 与类型检查器（本地 24 进程串行 ~11s vs 合并单次 ~3s；CI 冷环境
+            # 差异更大）。blocking 与 informational 保持两个进程，避免把
+            # 非阻塞目标的失败升级为阻塞。
             QualityCommandSpec(
-                name=f"mypy_{Path(target).stem}",
-                command=(python, "-m", "mypy", target, "--follow-imports", "skip"),
-                log_name=f"mypy_{Path(target).stem}.log",
-            )
-            for target in _MYPY_BLOCKING_TARGETS
-        )
-        specs.extend(
+                name="mypy_blocking",
+                command=(
+                    python,
+                    "-m",
+                    "mypy",
+                    *_MYPY_BLOCKING_TARGETS,
+                    "--follow-imports",
+                    "skip",
+                ),
+                log_name="mypy_blocking.log",
+            ),
             QualityCommandSpec(
-                name=f"mypy_{Path(target).stem}",
-                command=(python, "-m", "mypy", target, "--follow-imports", "skip"),
-                log_name=f"mypy_{Path(target).stem}.log",
+                name="mypy_informational",
+                command=(
+                    python,
+                    "-m",
+                    "mypy",
+                    *_MYPY_INFORMATIONAL_TARGETS,
+                    "--follow-imports",
+                    "skip",
+                ),
+                log_name="mypy_informational.log",
                 blocking=False,
-            )
-            for target in _MYPY_INFORMATIONAL_TARGETS
-        )
+            ),
+        ]
         return specs
     if normalized == "smoke":
         return [
@@ -236,6 +250,8 @@ def build_stage_specs(stage: str) -> list[QualityCommandSpec]:
                     "-m",
                     "pytest",
                     *_SLOW_TEST_FILES,
+                    "-n",
+                    _FULL_PARALLEL_WORKERS,
                     "--durations=20",
                     "-q",
                 ),

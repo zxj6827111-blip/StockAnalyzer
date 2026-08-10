@@ -27,6 +27,8 @@ data_source:
   vendor_zip_minute_amount_multiplier: 1.0
   vendor_zip_intraday_enabled: true
   vendor_zip_memory_cache_symbols: 32
+  # 批量读取时 delta 相对 ZIP 索引整体滞后的最大天数；超过则整批回退 ZIP 全量。
+  vendor_zip_delta_max_staleness_days: 3
   enable_cache_fallback: true
   switch_after_failures: 2
   request_interval_sec: 0.6
