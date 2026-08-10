@@ -43,21 +43,32 @@ from stock_analyzer.main import (
 # ---------------------------------------------------------------------------
 
 # Endpoints with their own auth mechanism — must NOT get the unified auth.
-_OWN_AUTH_PATHS: frozenset[str] = frozenset({
-    "/wecom/callback",
-    "/feishu/callback",
-    "/command/execute",
-})
+_OWN_AUTH_PATHS: frozenset[str] = frozenset(
+    {
+        "/wecom/callback",
+        "/feishu/callback",
+        "/command/execute",
+    }
+)
 
 
 def _discover_protected_post_paths() -> list[str]:
-    """Return every @app.post path that should carry unified auth.
+    """Return every POST path that should carry unified auth.
 
-    Reads the source file directly so the list is always in sync with main.py.
+    Reads the router source files directly so the list is always in sync with
+    the code. Route handlers live in ``stock_analyzer.api.*`` after the
+    main.py split; ``main.py`` itself only assembles the app.
     """
-    main_py = Path(__file__).resolve().parents[1] / "src" / "stock_analyzer" / "main.py"
+    src_root = Path(__file__).resolve().parents[1] / "src" / "stock_analyzer"
+    all_post_paths: list[str] = []
+    for module_file in sorted(src_root.glob("api/*.py")):
+        if module_file.name == "__init__.py":
+            continue
+        text = module_file.read_text(encoding="utf-8")
+        all_post_paths.extend(re.findall(r'@router\.post\("([^"]+)"\)', text))
+    main_py = src_root / "main.py"
     text = main_py.read_text(encoding="utf-8")
-    all_post_paths = re.findall(r'@app\.post\("([^"]+)"\)', text)
+    all_post_paths.extend(re.findall(r'@app\.post\("([^"]+)"\)', text))
     return [p for p in all_post_paths if p not in _OWN_AUTH_PATHS]
 
 
@@ -103,8 +114,7 @@ def test_unauthenticated_protected_post_returns_error() -> None:
         for path in _PROTECTED_POST_PATHS:
             response = client.post(path, json={})
             assert response.status_code in (401, 403, 422), (
-                f"POST {path} without token returned {response.status_code}; "
-                "expected 401/403/422"
+                f"POST {path} without token returned {response.status_code}; expected 401/403/422"
             )
 
 
@@ -225,8 +235,13 @@ def test_health_endpoint_not_protected() -> None:
 # ---------------------------------------------------------------------------
 
 _WEAK_SECRETS = [
-    "", "change-me", "replace_with_strong_secret",
-    "secret", "password", "default", "test",
+    "",
+    "change-me",
+    "replace_with_strong_secret",
+    "secret",
+    "password",
+    "default",
+    "test",
 ]
 
 
@@ -296,6 +311,7 @@ def _make_feishu_event(
     user_id: str = "uid_123",
 ) -> object:
     from stock_analyzer.command.feishu_interaction import FeishuMessageEvent
+
     return FeishuMessageEvent(
         event_id="ev1",
         event_type="im.message.receive_v1",
@@ -315,7 +331,9 @@ def test_wecom_empty_users_deny_by_default(monkeypatch: MonkeyPatch) -> None:
     """When allowed_users is empty and allow_all_users_for_local_dev is False,
     all users must be denied."""
     monkeypatch.setattr(
-        main_module._config.wecom_interaction, "allowed_users", [],
+        main_module._config.wecom_interaction,
+        "allowed_users",
+        [],
     )
     monkeypatch.setattr(
         main_module._config.wecom_interaction,
@@ -330,7 +348,9 @@ def test_wecom_empty_users_allow_with_local_dev_flag(
 ) -> None:
     """When allow_all_users_for_local_dev=True, empty allowed_users allows all."""
     monkeypatch.setattr(
-        main_module._config.wecom_interaction, "allowed_users", [],
+        main_module._config.wecom_interaction,
+        "allowed_users",
+        [],
     )
     monkeypatch.setattr(
         main_module._config.wecom_interaction,
@@ -363,7 +383,9 @@ def test_feishu_empty_users_deny_by_default(monkeypatch: MonkeyPatch) -> None:
     """When allowed_users is empty and allow_all_users_for_local_dev is False,
     all users must be denied."""
     monkeypatch.setattr(
-        main_module._config.feishu_interaction, "allowed_users", [],
+        main_module._config.feishu_interaction,
+        "allowed_users",
+        [],
     )
     monkeypatch.setattr(
         main_module._config.feishu_interaction,
@@ -379,7 +401,9 @@ def test_feishu_empty_users_allow_with_local_dev_flag(
 ) -> None:
     """When allow_all_users_for_local_dev=True, empty allowed_users allows all."""
     monkeypatch.setattr(
-        main_module._config.feishu_interaction, "allowed_users", [],
+        main_module._config.feishu_interaction,
+        "allowed_users",
+        [],
     )
     monkeypatch.setattr(
         main_module._config.feishu_interaction,
@@ -396,7 +420,9 @@ def test_feishu_configured_users_allows_whitelisted(
     """Configured allowed_users should allow users matching
     open_id/user_id/union_id."""
     monkeypatch.setattr(
-        main_module._config.feishu_interaction, "allowed_users", ["ou_xxx"],
+        main_module._config.feishu_interaction,
+        "allowed_users",
+        ["ou_xxx"],
     )
     monkeypatch.setattr(
         main_module._config.feishu_interaction,
@@ -449,21 +475,16 @@ def test_feishu_token_from_header() -> None:
 
 def test_docker_compose_runtime_auto_promotion_defaults_to_false() -> None:
     """docker-compose.runtime.yml should default auto_promotion to false."""
-    compose_path = (
-        Path(__file__).resolve().parents[1] / "docker-compose.runtime.yml"
-    )
+    compose_path = Path(__file__).resolve().parents[1] / "docker-compose.runtime.yml"
     content = compose_path.read_text(encoding="utf-8")
     assert "${SA__AUTO_PROMOTION__ENABLED:-false}" in content, (
-        "docker-compose.runtime.yml should default "
-        "SA__AUTO_PROMOTION__ENABLED to false"
+        "docker-compose.runtime.yml should default SA__AUTO_PROMOTION__ENABLED to false"
     )
 
 
 def test_docker_compose_runtime_api_auth_defaults_to_fail_closed() -> None:
     """Runtime compose should require API auth by default for dangerous POST APIs."""
-    compose_path = (
-        Path(__file__).resolve().parents[1] / "docker-compose.runtime.yml"
-    )
+    compose_path = Path(__file__).resolve().parents[1] / "docker-compose.runtime.yml"
     content = compose_path.read_text(encoding="utf-8")
     assert "${SA__SECURITY__API_AUTH_ENABLED:-true}" in content
     assert "${SA__SECURITY__API_TOKEN:-}" in content
@@ -497,20 +518,10 @@ def test_docker_build_commit_identity_is_build_time_and_exposed_to_health() -> N
     assert "LABEL org.opencontainers.image.revision=${STOCK_ANALYZER_BUILD_COMMIT}" in dockerfile
     assert "ENV STOCK_ANALYZER_BUILD_COMMIT=${STOCK_ANALYZER_BUILD_COMMIT}" in dockerfile
     assert "STOCK_ANALYZER_BUILD_COMMIT: ${STOCK_ANALYZER_BUILD_COMMIT:-unknown}" in compose
-    assert compose.count('SA__APP__MODE: simulation') == 2
+    assert compose.count("SA__APP__MODE: simulation") == 2
     assert compose.count('SA__APP__ADVISORY_ONLY: "true"') == 2
-    assert (
-        compose.count(
-            "SA__TRAINING__ENABLED: ${SA__TRAINING__ENABLED:-false}"
-        )
-        == 2
-    )
-    assert (
-        compose.count(
-            "SA__AUTO_PROMOTION__ENABLED: ${SA__AUTO_PROMOTION__ENABLED:-false}"
-        )
-        == 2
-    )
+    assert compose.count("SA__TRAINING__ENABLED: ${SA__TRAINING__ENABLED:-false}") == 2
+    assert compose.count("SA__AUTO_PROMOTION__ENABLED: ${SA__AUTO_PROMOTION__ENABLED:-false}") == 2
 
 
 # ---------------------------------------------------------------------------
