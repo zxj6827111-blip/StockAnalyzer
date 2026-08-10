@@ -14,18 +14,16 @@ def test_quality_gate_builds_clean_scope_and_slow_specs() -> None:
     assert clean_specs
     assert any(spec.name == "ruff_clean_scope" for spec in clean_specs)
     assert all(spec.command[0] == sys.executable for spec in clean_specs + slow_specs)
-    assert any(
-        spec.name == "mypy_acceptance_service" and spec.blocking is False for spec in clean_specs
+    # mypy 合并为单次调用：blocking 与 informational 分开，失败语义不变。
+    blocking = next(spec for spec in clean_specs if spec.name == "mypy_blocking")
+    assert blocking.blocking is True
+    assert "src/stock_analyzer/main.py" in blocking.command
+    assert "src/stock_analyzer/runtime/services/market_sync_service.py" in blocking.command
+    informational = next(
+        spec for spec in clean_specs if spec.name == "mypy_informational"
     )
-    assert any(
-        spec.name == "mypy_market_sync_service" and spec.blocking is True for spec in clean_specs
-    )
-    assert any(
-        spec.name == "mypy_main" and spec.blocking is True for spec in clean_specs
-    )
-    assert any(
-        spec.name == "mypy_api" and spec.blocking is True for spec in clean_specs
-    )
+    assert informational.blocking is False
+    assert "src/stock_analyzer/runtime/services/acceptance_service.py" in informational.command
     assert any(spec.name == "ruff_clean_scope" for spec in clean_specs)
     ruff_targets = next(
         spec.command for spec in clean_specs if spec.name == "ruff_clean_scope"

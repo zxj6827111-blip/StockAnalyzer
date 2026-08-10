@@ -196,6 +196,9 @@ def _build_sample_package(root: Path) -> None:
 def _load_test_config(package_root: Path, db_path: Path) -> StockAnalyzerConfig:
     root = Path(__file__).resolve().parents[1]
     config = load_config(root / "config" / "default.yaml")
+    # default.yaml 默认禁用 market_warehouse（NAS 部署语义）；本文件全部用例
+    # 都在测同步/引导流程，必须显式启用，否则服务直接返回 market_warehouse_disabled。
+    config.market_warehouse.enabled = True
     config.data_source.local_data_root = str(package_root)
     config.market_warehouse.package_root = str(package_root)
     config.market_warehouse.bootstrap_source_root = str(package_root)
