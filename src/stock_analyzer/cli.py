@@ -2727,6 +2727,38 @@ def week7_sim_broker_history(
     typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
 
 
+@app.command("monthly-review")
+def monthly_review(
+    year_month: str = typer.Option("", help="Report month, e.g. 2026-03 (default current month)"),
+    output_path: str = typer.Option("", help="Optional output report path"),
+) -> None:
+    config = get_config()
+    service = StockAnalyzerService(config=config)
+    result = service.build_monthly_review_report(
+        year_month=year_month,
+        output_path=output_path or None,
+    )
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+@app.command("monthly-review-latest")
+def monthly_review_latest() -> None:
+    config = get_config()
+    service = StockAnalyzerService(config=config)
+    report = service.latest_monthly_review_report()
+    typer.echo(json.dumps({"report": report}, ensure_ascii=False, indent=2))
+
+
+@app.command("monthly-review-history")
+def monthly_review_history(
+    limit: int = typer.Option(20, help="Max number of monthly review reports"),
+) -> None:
+    config = get_config()
+    service = StockAnalyzerService(config=config)
+    report = service.monthly_review_history(limit=limit)
+    typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+
+
 @app.command("audit-events")
 def audit_events(
     limit: int = typer.Option(200, help="Max number of returned events"),
