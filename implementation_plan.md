@@ -490,15 +490,39 @@ SLA（降级模式）：暂停首板新开仓指标考核，仅考核风控告�
 
 ## 18. 部署与容灾
 
+> **实现现状**：PRD 原设计用 Celery Worker + Celery Beat 承载后台任务；实现阶段有意取舍，
+> 未引入 Celery，改用**自研 `DailyScheduler`**（`src/stock_analyzer/runtime/scheduler.py`），
+> 功能等价（定点触发/补跑/交易日与月末谓词/心跳状态），详见下方"调度器实现现状"。
+> `redis` 仅作缓存，不作为任务队列。
+
 ```yaml
 # Docker Compose on Mac Mini
 services:
-  api:        # FastAPI（含持仓API+指令回调）
-  worker:     # Celery Worker
-  scheduler:  # Celery Beat
-  redis:      # 任务队列+行情缓存
-  dashboard:  # Next.js + ECharts
+  api:        # FastAPI（含持仓API+指令回调）→ uvicorn stock_analyzer.main:app
+  worker:     # Celery Worker（PRD 愿景；实现：无独立 worker，任务在 api/scheduler 进程内执行）
+  scheduler:  # Celery Beat（PRD 愿景；实现：scheduler_worker 轮询进程，见下方现状）
+  redis:      # 任务队列+行情缓存（实现：仅行情/状态缓存）
+  dashboard:  # Next.js + ECharts（实现：前端静态资源由 api 服务直接托管 /ui）
 ```
+
+### 调度器实现现状（自研 DailyScheduler，替代 Celery Worker/Beat）
+
+- **注册模式**：`DailyScheduler.register(name, trigger_hhmm, callback, latest_hhmm, weekdays,
+  date_predicate)` 注册定点任务；`register_interval(name, window_start_hhmm, window_end_hhmm,
+  interval_minutes, ...)` 注册窗口内间隔任务。全部任务在 `StockAnalyzerService` 初始化时按配置注册
+  （`runtime/service.py::_register_scheduled_jobs`）。
+- **执行模式**：`scheduler` 容器运行 `python -m stock_analyzer.runtime.scheduler_worker`
+  （轮询间隔 `SCHEDULER_POLL_SEC=30`，异常指数退避），循环调用 `service.run_due_jobs()`；
+  API 进程内也可通过 `POST /scheduler/run_due` 手动触发。定点任务单日只执行一次
+  （错过触发点后在 `latest_hhmm` 前补跑），间隔任务按最近槽位每轮最多补一个。
+- **月末任务**：`factor_ic_decay_report`（因子 IC 衰减月报，`factor_lifecycle.ic_decay_report_time`，
+  默认 21:00）与 `monthly_review_report`（月度复盘报告，`monthly_review.report_time`）均以
+  `date_predicate=_last_trading_day_of_month` 注册，在每月最后一个交易日触发。
+- **闲时队列**：`idle_queue_tick` 按 `idle_queue.dispatch_interval_minutes` 间隔轮询调度
+  工作日晚间链与周末 WE-P0/P1/P2 任务；`POST /idle/run`、`GET /idle/state`、
+  `POST /idle/ack` 提供手动触发与观测。
+- **取舍说明**：单机/容器部署下与 Celery Worker+Beat 功能等价，免去 broker 依赖与运维面；
+  如需多机水平扩展，可将 `scheduler_worker` 替换为 Celery。
 
 ### 云冷备（新增 — Grok/DS3.2）
 - 阿里云/腾讯云Serverless每10分钟ping Mac Mini
@@ -516,7 +540,10 @@ app:
   mode: simulation
 
 data_source:
-  primary: akshare
+  primary: vendor_zip_overlay        # 实现现状：NAS 线上 primary（docker-compose.vendor-overlay.yml
+                                     # 注入 SA__DATA_SOURCE__PRIMARY=vendor_zip_overlay：只读年度 ZIP 历史
+                                     # + 可写 DuckDB delta overlay）。仓库默认 config/default.yaml 中
+                                     # market_warehouse.enabled=false（nightly 同步已禁用）。
   enable_cache_fallback: true
   switch_after_failures: 3
   request_interval_sec: 0.5
