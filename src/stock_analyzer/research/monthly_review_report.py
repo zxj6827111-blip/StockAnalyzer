@@ -355,6 +355,7 @@ def _compute_trading_stats(
     trades: list[Mapping[str, object]],
     *,
     month: str,
+    label_key: str = "month",
 ) -> dict[str, object]:
     open_trades = [
         item for item in trades if str(item.get("side", "")).strip().lower() == "buy"
@@ -379,7 +380,7 @@ def _compute_trading_stats(
     )
 
     return {
-        "month": month,
+        label_key: month,
         "open_trades": len(open_trades),
         "close_trades": len(close_trades),
         "total_trades": len(trades),

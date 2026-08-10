@@ -8,6 +8,10 @@ from stock_analyzer.research.catboost_shadow import (
     persist_catboost_shadow_report,
     run_catboost_shadow,
 )
+from stock_analyzer.research.daily_review_report import (
+    compute_daily_review_report,
+    persist_daily_review_report,
+)
 from stock_analyzer.research.finbert_sidecar import (
     persist_finbert_sidecar_report,
     run_finbert_sidecar,
@@ -39,6 +43,7 @@ from stock_analyzer.research.tft_sidecar import persist_tft_sidecar_report, run_
 
 __all__ = [
     "bucket_ic_series_by_month",
+    "compute_daily_review_report",
     "compute_discipline_score",
     "compute_factor_ic_series",
     "compute_ic_decay_from_monthly_ics",
@@ -47,6 +52,7 @@ __all__ = [
     "export_qlib_bridge_bundle",
     "persist_alphalens_sidecar_report",
     "persist_catboost_shadow_report",
+    "persist_daily_review_report",
     "persist_finbert_sidecar_report",
     "persist_finrl_sidecar_report",
     "persist_heavy_ts_shadow_report",
