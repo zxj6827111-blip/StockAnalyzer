@@ -1,4 +1,9 @@
-"""Polling worker that executes due scheduler jobs continuously."""
+"""Polling worker that executes due scheduler jobs continuously.
+
+Only one scheduler instance runs ``run_due_jobs`` at a time: every poll
+cycle first tries to take the scheduler-leader file lock (shared artifacts
+volume) and skips the cycle when another replica holds it (audit P2-#20).
+"""
 
 from __future__ import annotations
 
@@ -10,7 +15,8 @@ from pathlib import Path
 from uuid import uuid4
 
 from stock_analyzer.build_identity import get_build_manifest
-from stock_analyzer.config import get_config
+from stock_analyzer.config import StockAnalyzerConfig, get_config
+from stock_analyzer.ops.file_lock import DistributedFileLock
 from stock_analyzer.runtime.service import StockAnalyzerService
 
 
@@ -21,20 +27,14 @@ def main() -> None:
     while True:
         now = datetime.now()
         try:
+            config = get_config()
             if service is None:
-                service = StockAnalyzerService(config=get_config())
-            results = service.run_due_jobs(now=now)
-            executed = [item for item in results if bool(item.get("ran", False))]
+                service = StockAnalyzerService(config=config)
+            payload = run_once(service=service, config=config, now=now)
             consecutive_failures = 0
-            payload = {
-                "timestamp": now.isoformat(),
-                "status": "ok",
-                "executed": executed,
-                "scheduler_state": service._scheduler.export_state(),
-                "build": get_build_manifest(),
-            }
             _write_heartbeat(payload)
-            if executed:
+            executed = payload.get("executed")
+            if isinstance(executed, list) and executed:
                 print(json.dumps(payload, ensure_ascii=False))
             time.sleep(interval_sec)
         except Exception as exc:
@@ -53,6 +53,53 @@ def main() -> None:
             _write_heartbeat(payload)
             print(json.dumps(payload, ensure_ascii=False), flush=True)
             time.sleep(backoff_sec)
+
+
+def run_once(
+    *,
+    service: StockAnalyzerService,
+    config: StockAnalyzerConfig,
+    now: datetime,
+) -> dict[str, object]:
+    """Run one poll cycle: take the leader lock, run due jobs, release.
+
+    Returns the heartbeat payload for the cycle.  When another scheduler
+    instance holds the leader lock the cycle is skipped (``leader`` False,
+    ``run_due_jobs`` never invoked) instead of executing in parallel.
+    """
+    lock = _build_leader_lock(config)
+    if lock is not None and not lock.acquire():
+        return {
+            "timestamp": now.isoformat(),
+            "status": "ok",
+            "leader": False,
+            "executed": [],
+            "build": get_build_manifest(),
+        }
+    try:
+        results = service.run_due_jobs(now=now)
+        executed = [item for item in results if bool(item.get("ran", False))]
+        return {
+            "timestamp": now.isoformat(),
+            "status": "ok",
+            "leader": True,
+            "executed": executed,
+            "scheduler_state": service._scheduler.export_state(),
+            "build": get_build_manifest(),
+        }
+    finally:
+        if lock is not None:
+            lock.release()
+
+
+def _build_leader_lock(config: StockAnalyzerConfig) -> DistributedFileLock | None:
+    scheduler_config = config.scheduler
+    if not scheduler_config.leader_lock_enabled:
+        return None
+    return DistributedFileLock(
+        scheduler_config.leader_lock_path,
+        stale_after_sec=scheduler_config.leader_lock_stale_after_sec,
+    )
 
 
 def _write_heartbeat(payload: dict[str, object]) -> None:

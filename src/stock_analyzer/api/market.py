@@ -6,9 +6,9 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 
-from stock_analyzer.api.deps import get_service, get_verify_api_auth
+from stock_analyzer.api.deps import get_config, get_service, get_verify_api_auth
 from stock_analyzer.api.models import (
     PipelineRunRequest,
     SchedulerRunRequest,
@@ -16,6 +16,7 @@ from stock_analyzer.api.models import (
     WarehouseSyncRunRequest,
 )
 from stock_analyzer.ops.background_tasks import registry, submit_background_task
+from stock_analyzer.ops.file_lock import DistributedFileLock
 
 router = APIRouter()
 
@@ -68,7 +69,27 @@ def run_scheduler(
 ) -> dict[str, object]:
     now_dt = datetime.fromisoformat(request.now) if request.now else None
     selected_jobs = [request.job, *request.jobs]
-    return {"results": get_service().run_due_jobs(now=now_dt, only_jobs=selected_jobs)}
+    lock = _scheduler_leader_lock()
+    if lock is not None and not lock.acquire():
+        raise HTTPException(
+            status_code=409,
+            detail="another scheduler instance is running; retry later",
+        )
+    try:
+        return {"results": get_service().run_due_jobs(now=now_dt, only_jobs=selected_jobs)}
+    finally:
+        if lock is not None:
+            lock.release()
+
+
+def _scheduler_leader_lock() -> DistributedFileLock | None:
+    scheduler_config = get_config().scheduler
+    if not scheduler_config.leader_lock_enabled:
+        return None
+    return DistributedFileLock(
+        scheduler_config.leader_lock_path,
+        stale_after_sec=scheduler_config.leader_lock_stale_after_sec,
+    )
 
 
 @router.post("/tdx/sync/run", status_code=202)
