@@ -274,7 +274,8 @@ def test_latest_signals_api_contains_recommendation_id() -> None:
         "/run/pipeline",
         json={"symbols": ["600000", "000001"], "strategy": "trend", "current_equity": 1.0},
     )
-    assert run_response.status_code == 200
+    assert run_response.status_code == 202
+    assert run_response.json()["status"] == "queued"
 
     latest_response = client.get("/signals/latest")
     assert latest_response.status_code == 200
@@ -335,16 +336,24 @@ def test_run_pipeline_api_accepts_live_runtime_flag(monkeypatch) -> None:
         },
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "queued"
+    task_response = client.get(f"/tasks/{body['task_id']}")
+    assert task_response.status_code == 200
+    task_payload = task_response.json()
+    assert task_payload["status"] == "succeeded", task_payload.get("error")
+    result = task_payload["result"]
+
     assert captured["symbols"] == ["600000"]
     assert captured["strategy"] == "trend"
     assert captured["current_equity"] == 1.0
     assert captured["use_live_runtime"] is True
     assert captured["dry_run_execution"] is True
     assert captured["notify_enabled"] is False
-    assert response.json()["use_live_runtime"] is True
-    assert response.json()["dry_run_execution"] is True
-    assert response.json()["notify_enabled"] is False
+    assert result["use_live_runtime"] is True
+    assert result["dry_run_execution"] is True
+    assert result["notify_enabled"] is False
 
 
 def test_dashboard_ops_toggle_disables_quick_command() -> None:

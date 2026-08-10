@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, Query
 
 from stock_analyzer.api.deps import get_service, get_verify_api_auth
 from stock_analyzer.api.models import (
@@ -23,22 +23,28 @@ from stock_analyzer.api.models import (
     EvolutionReleaseTicketRollbackRequest,
     EvolutionRunRequest,
 )
+from stock_analyzer.ops.background_tasks import submit_background_task
 
 router = APIRouter()
 
 
-@router.post("/evolution/run")
+@router.post("/evolution/run", status_code=202)
 def evolution_run(
     request: EvolutionRunRequest,
+    background_tasks: BackgroundTasks,
     _auth: None = Depends(get_verify_api_auth()),
 ) -> dict[str, object]:
     now_dt = datetime.fromisoformat(request.now) if request.now else None
     symbols = request.symbols if request.symbols else None
-    return get_service().run_evolution_offhours(
-        symbols=symbols,
-        timestamp=now_dt,
-        dry_run=request.dry_run,
-        source_trace_id=request.source_trace_id,
+    return submit_background_task(
+        background_tasks,
+        name="evolution_run",
+        fn=lambda: get_service().run_evolution_offhours(
+            symbols=symbols,
+            timestamp=now_dt,
+            dry_run=request.dry_run,
+            source_trace_id=request.source_trace_id,
+        ),
     )
 
 
@@ -116,17 +122,22 @@ def evolution_m8_suggest(
     )
 
 
-@router.post("/evolution/release/attempt")
+@router.post("/evolution/release/attempt", status_code=202)
 def evolution_release_attempt(
     request: EvolutionReleaseAttemptRequest,
+    background_tasks: BackgroundTasks,
     _auth: None = Depends(get_verify_api_auth()),
 ) -> dict[str, object]:
     now_dt = datetime.fromisoformat(request.now) if request.now else None
-    return get_service().attempt_evolution_release(
-        days=request.days,
-        min_runs=request.min_runs,
-        now=now_dt,
-        source_trace_id=request.source_trace_id,
+    return submit_background_task(
+        background_tasks,
+        name="evolution_release_attempt",
+        fn=lambda: get_service().attempt_evolution_release(
+            days=request.days,
+            min_runs=request.min_runs,
+            now=now_dt,
+            source_trace_id=request.source_trace_id,
+        ),
     )
 
 
@@ -187,19 +198,24 @@ def evolution_release_ticket(
     )
 
 
-@router.post("/evolution/release/ticket/execute")
+@router.post("/evolution/release/ticket/execute", status_code=202)
 def evolution_release_ticket_execute(
     request: EvolutionReleaseTicketExecuteRequest,
+    background_tasks: BackgroundTasks,
     _auth: None = Depends(get_verify_api_auth()),
 ) -> dict[str, object]:
     now_dt = datetime.fromisoformat(request.now) if request.now else None
-    return get_service().execute_evolution_release_ticket(
-        executor=request.executor,
-        ticket_id=request.ticket_id,
-        note=request.note,
-        confirm_window=request.confirm_window,
-        timestamp=now_dt,
-        source_trace_id=request.source_trace_id,
+    return submit_background_task(
+        background_tasks,
+        name="evolution_release_ticket_execute",
+        fn=lambda: get_service().execute_evolution_release_ticket(
+            executor=request.executor,
+            ticket_id=request.ticket_id,
+            note=request.note,
+            confirm_window=request.confirm_window,
+            timestamp=now_dt,
+            source_trace_id=request.source_trace_id,
+        ),
     )
 
 

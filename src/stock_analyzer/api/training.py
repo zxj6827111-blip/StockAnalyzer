@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, Query
 
 from stock_analyzer.api.deps import get_service, get_verify_api_auth, parse_optional_datetime
 from stock_analyzer.api.models import (
@@ -15,134 +15,165 @@ from stock_analyzer.api.models import (
     LearningManifestTrainingRequest,
     TrainModelsRequest,
 )
+from stock_analyzer.ops.background_tasks import submit_background_task
 
 router = APIRouter()
 
 
-@router.post("/train/models")
+@router.post("/train/models", status_code=202)
 def train_models(
     request: TrainModelsRequest,
+    background_tasks: BackgroundTasks,
     _auth: None = Depends(get_verify_api_auth()),
 ) -> dict[str, object]:
-    return get_service().train_models(
-        symbol=request.symbol,
-        lookback_days=request.lookback_days,
-        artifact_path=request.artifact_path,
-        full_market=request.full_market,
-        max_symbols=request.max_symbols,
+    return submit_background_task(
+        background_tasks,
+        name="train_models",
+        fn=lambda: get_service().train_models(
+            symbol=request.symbol,
+            lookback_days=request.lookback_days,
+            artifact_path=request.artifact_path,
+            full_market=request.full_market,
+            max_symbols=request.max_symbols,
+        ),
     )
 
 
-@router.post("/train/learning-manifest")
+@router.post("/train/learning-manifest", status_code=202)
 def train_learning_manifest(
     request: LearningManifestTrainingRequest,
+    background_tasks: BackgroundTasks,
     _auth: None = Depends(get_verify_api_auth()),
 ) -> dict[str, object]:
-    return get_service().train_learning_manifest(
-        dataset_manifest_id=request.dataset_manifest_id,
-        artifact_path=request.artifact_path,
-        load_predictor=request.load_predictor,
-        register_model=request.register_model,
+    return submit_background_task(
+        background_tasks,
+        name="train_learning_manifest",
+        fn=lambda: get_service().train_learning_manifest(
+            dataset_manifest_id=request.dataset_manifest_id,
+            artifact_path=request.artifact_path,
+            load_predictor=request.load_predictor,
+            register_model=request.register_model,
+        ),
     )
 
 
-@router.post("/train/learning-manifest/shadow-validate")
+@router.post("/train/learning-manifest/shadow-validate", status_code=202)
 def train_learning_manifest_shadow_validate(
     request: LearningManifestShadowValidationRequest,
+    background_tasks: BackgroundTasks,
     _auth: None = Depends(get_verify_api_auth()),
 ) -> dict[str, object]:
-    return get_service().run_learning_manifest_shadow_validation(
-        dataset_manifest_id=request.dataset_manifest_id,
-        artifact_path=request.artifact_path,
-        champion_model_id=request.champion_model_id,
-        split_names=request.split_names or None,
-        max_rows=request.max_rows,
-        include_rows=request.include_rows,
-        preview_limit=request.preview_limit,
-        max_samples=request.max_samples,
-        min_samples=request.min_samples,
-        learning_rate=request.learning_rate,
-        signal_threshold=request.signal_threshold,
-        load_predictor=request.load_predictor,
-        mark_shadow_validated=request.mark_shadow_validated,
+    return submit_background_task(
+        background_tasks,
+        name="train_learning_manifest_shadow_validate",
+        fn=lambda: get_service().run_learning_manifest_shadow_validation(
+            dataset_manifest_id=request.dataset_manifest_id,
+            artifact_path=request.artifact_path,
+            champion_model_id=request.champion_model_id,
+            split_names=request.split_names or None,
+            max_rows=request.max_rows,
+            include_rows=request.include_rows,
+            preview_limit=request.preview_limit,
+            max_samples=request.max_samples,
+            min_samples=request.min_samples,
+            learning_rate=request.learning_rate,
+            signal_threshold=request.signal_threshold,
+            load_predictor=request.load_predictor,
+            mark_shadow_validated=request.mark_shadow_validated,
+        ),
     )
 
 
-@router.post("/train/learning-manifest/shadow-promote")
+@router.post("/train/learning-manifest/shadow-promote", status_code=202)
 def train_learning_manifest_shadow_promote(
     request: LearningManifestShadowPromotionGateRequest,
+    background_tasks: BackgroundTasks,
     _auth: None = Depends(get_verify_api_auth()),
 ) -> dict[str, object]:
-    return get_service().run_learning_manifest_shadow_promotion_gate(
-        dataset_manifest_id=request.dataset_manifest_id,
-        artifact_path=request.artifact_path,
-        champion_model_id=request.champion_model_id,
-        split_names=request.split_names or None,
-        max_rows=request.max_rows,
-        include_rows=request.include_rows,
-        preview_limit=request.preview_limit,
-        max_samples=request.max_samples,
-        min_samples=request.min_samples,
-        learning_rate=request.learning_rate,
-        signal_threshold=request.signal_threshold,
-        load_predictor=request.load_predictor,
-        mark_shadow_validated=request.mark_shadow_validated,
-        min_shadow_v2_minus_champion_return=request.min_shadow_v2_minus_champion_return,
-        max_shadow_v2_brier_delta=request.max_shadow_v2_brier_delta,
-        max_shadow_v2_logloss_delta=request.max_shadow_v2_logloss_delta,
-        max_signal_divergence_ratio=request.max_signal_divergence_ratio,
-        approve_if_passed=request.approve_if_passed,
-        block_if_failed=request.block_if_failed,
+    return submit_background_task(
+        background_tasks,
+        name="train_learning_manifest_shadow_promote",
+        fn=lambda: get_service().run_learning_manifest_shadow_promotion_gate(
+            dataset_manifest_id=request.dataset_manifest_id,
+            artifact_path=request.artifact_path,
+            champion_model_id=request.champion_model_id,
+            split_names=request.split_names or None,
+            max_rows=request.max_rows,
+            include_rows=request.include_rows,
+            preview_limit=request.preview_limit,
+            max_samples=request.max_samples,
+            min_samples=request.min_samples,
+            learning_rate=request.learning_rate,
+            signal_threshold=request.signal_threshold,
+            load_predictor=request.load_predictor,
+            mark_shadow_validated=request.mark_shadow_validated,
+            min_shadow_v2_minus_champion_return=request.min_shadow_v2_minus_champion_return,
+            max_shadow_v2_brier_delta=request.max_shadow_v2_brier_delta,
+            max_shadow_v2_logloss_delta=request.max_shadow_v2_logloss_delta,
+            max_signal_divergence_ratio=request.max_signal_divergence_ratio,
+            approve_if_passed=request.approve_if_passed,
+            block_if_failed=request.block_if_failed,
+        ),
     )
 
 
-@router.post("/train/learning-manifest/shadow-proposal")
+@router.post("/train/learning-manifest/shadow-proposal", status_code=202)
 def train_learning_manifest_shadow_proposal(
     request: LearningManifestShadowProposalRequest,
+    background_tasks: BackgroundTasks,
     _auth: None = Depends(get_verify_api_auth()),
 ) -> dict[str, object]:
-    return get_service().run_learning_manifest_shadow_proposal(
-        dataset_manifest_id=request.dataset_manifest_id,
-        artifact_path=request.artifact_path,
-        champion_model_id=request.champion_model_id,
-        split_names=request.split_names or None,
-        max_rows=request.max_rows,
-        include_rows=request.include_rows,
-        preview_limit=request.preview_limit,
-        max_samples=request.max_samples,
-        min_samples=request.min_samples,
-        learning_rate=request.learning_rate,
-        signal_threshold=request.signal_threshold,
-        load_predictor=request.load_predictor,
-        mark_shadow_validated=request.mark_shadow_validated,
-        min_shadow_v2_minus_champion_return=request.min_shadow_v2_minus_champion_return,
-        max_shadow_v2_brier_delta=request.max_shadow_v2_brier_delta,
-        max_shadow_v2_logloss_delta=request.max_shadow_v2_logloss_delta,
-        max_signal_divergence_ratio=request.max_signal_divergence_ratio,
-        approve_if_passed=request.approve_if_passed,
-        block_if_failed=request.block_if_failed,
-        allow_warn_status=request.allow_warn_status,
-        source_trace_id=request.source_trace_id,
+    return submit_background_task(
+        background_tasks,
+        name="train_learning_manifest_shadow_proposal",
+        fn=lambda: get_service().run_learning_manifest_shadow_proposal(
+            dataset_manifest_id=request.dataset_manifest_id,
+            artifact_path=request.artifact_path,
+            champion_model_id=request.champion_model_id,
+            split_names=request.split_names or None,
+            max_rows=request.max_rows,
+            include_rows=request.include_rows,
+            preview_limit=request.preview_limit,
+            max_samples=request.max_samples,
+            min_samples=request.min_samples,
+            learning_rate=request.learning_rate,
+            signal_threshold=request.signal_threshold,
+            load_predictor=request.load_predictor,
+            mark_shadow_validated=request.mark_shadow_validated,
+            min_shadow_v2_minus_champion_return=request.min_shadow_v2_minus_champion_return,
+            max_shadow_v2_brier_delta=request.max_shadow_v2_brier_delta,
+            max_shadow_v2_logloss_delta=request.max_shadow_v2_logloss_delta,
+            max_signal_divergence_ratio=request.max_signal_divergence_ratio,
+            approve_if_passed=request.approve_if_passed,
+            block_if_failed=request.block_if_failed,
+            allow_warn_status=request.allow_warn_status,
+            source_trace_id=request.source_trace_id,
+        ),
     )
 
 
-@router.post("/train/execution-risk")
+@router.post("/train/execution-risk", status_code=202)
 def train_execution_risk(
     request: ExecutionRiskTrainRequest,
+    background_tasks: BackgroundTasks,
     _auth: None = Depends(get_verify_api_auth()),
 ) -> dict[str, object]:
-    return get_service().train_execution_risk_model(
-        artifact_path=request.artifact_path,
-        maturity_statuses=request.maturity_statuses or None,
-        max_rows=request.max_rows,
-        min_samples_per_target=request.min_samples_per_target,
-        calibration_ratio=request.calibration_ratio,
-        test_ratio=request.test_ratio,
-        epochs=request.epochs,
-        learning_rate=request.learning_rate,
-        l2=request.l2,
-        seed=request.seed,
-        now=parse_optional_datetime(request.now or ""),
+    return submit_background_task(
+        background_tasks,
+        name="train_execution_risk",
+        fn=lambda: get_service().train_execution_risk_model(
+            artifact_path=request.artifact_path,
+            maturity_statuses=request.maturity_statuses or None,
+            max_rows=request.max_rows,
+            min_samples_per_target=request.min_samples_per_target,
+            calibration_ratio=request.calibration_ratio,
+            test_ratio=request.test_ratio,
+            epochs=request.epochs,
+            learning_rate=request.learning_rate,
+            l2=request.l2,
+            seed=request.seed,
+            now=parse_optional_datetime(request.now or ""),
+        ),
     )
 
 

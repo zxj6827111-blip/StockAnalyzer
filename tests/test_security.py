@@ -65,7 +65,9 @@ def _discover_protected_post_paths() -> list[str]:
         if module_file.name == "__init__.py":
             continue
         text = module_file.read_text(encoding="utf-8")
-        all_post_paths.extend(re.findall(r'@router\.post\("([^"]+)"\)', text))
+        # Matches both plain and decorated forms, e.g. ``@router.post("/x")``
+        # and ``@router.post("/x", status_code=202)``.
+        all_post_paths.extend(re.findall(r'@router\.post\("([^"]+)"', text))
     main_py = src_root / "main.py"
     text = main_py.read_text(encoding="utf-8")
     all_post_paths.extend(re.findall(r'@app\.post\("([^"]+)"\)', text))

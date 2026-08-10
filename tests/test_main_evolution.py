@@ -1,28 +1,46 @@
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi.testclient import TestClient
 
-from stock_analyzer.main import app
 from stock_analyzer.evolution.m3_vector_profile import (
     build_default_m3_vector_profile,
     build_m3_vector_from_record,
 )
+from stock_analyzer.main import app
+
+
+def _run_task_and_get_result(
+    client: TestClient,
+    url: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """POST a heavy endpoint (202 + task_id), then fetch the recorded result."""
+    response = client.post(url, json=payload)
+    assert response.status_code == 202, f"{url} -> {response.status_code}: {response.text}"
+    body = response.json()
+    assert body["status"] == "queued", url
+    task_response = client.get(f"/tasks/{body['task_id']}")
+    assert task_response.status_code == 200
+    task_payload = task_response.json()
+    assert task_payload["status"] == "succeeded", f"{url}: {task_payload.get('error')}"
+    return task_payload["result"]
 
 
 def test_evolution_endpoints_run_latest_and_history() -> None:
     client = TestClient(app)
 
-    run_response = client.post(
+    run_payload = _run_task_and_get_result(
+        client,
         "/evolution/run",
-        json={
+        {
             "symbols": ["600000", "000001"],
             "dry_run": True,
             "now": "2026-03-02T20:40:00",
             "source_trace_id": "api-evo-run",
         },
     )
-    assert run_response.status_code == 200
-    run_payload = run_response.json()
     assert "proposal" in run_payload
     assert run_payload["dry_run"] is True
     assert "m4" in run_payload["modules"]
@@ -92,16 +110,17 @@ def test_evolution_m3_maintenance_endpoint() -> None:
 
 def test_evolution_m3_search_endpoint() -> None:
     client = TestClient(app)
-    seed_response = client.post(
+    seed_payload = _run_task_and_get_result(
+        client,
         "/evolution/run",
-        json={
+        {
             "symbols": ["600000", "000001"],
             "dry_run": True,
             "now": "2026-03-02T20:42:00",
             "source_trace_id": "api-evo-seed-for-m3",
         },
     )
-    assert seed_response.status_code == 200
+    assert seed_payload["dry_run"] is True
     vector = build_m3_vector_from_record(
         {
             "open": 10.0,
@@ -173,12 +192,11 @@ def test_evolution_m8_suggest_endpoint_uses_config_default_top_k() -> None:
 def test_evolution_release_gate_endpoints() -> None:
     client = TestClient(app)
 
-    attempt_response = client.post(
+    attempt_payload = _run_task_and_get_result(
+        client,
         "/evolution/release/attempt",
-        json={"days": 10, "min_runs": 1},
+        {"days": 10, "min_runs": 1},
     )
-    assert attempt_response.status_code == 200
-    attempt_payload = attempt_response.json()
     assert "accepted" in attempt_payload
     assert "gate" in attempt_payload
 
@@ -248,16 +266,15 @@ def test_evolution_release_approval_and_ticket_endpoints() -> None:
     timeline_payload = timeline_response.json()
     assert "tickets" in timeline_payload
 
-    execute_response = client.post(
+    execute_payload = _run_task_and_get_result(
+        client,
         "/evolution/release/ticket/execute",
-        json={
+        {
             "executor": "api-operator",
             "confirm_window": True,
             "note": "close-out",
         },
     )
-    assert execute_response.status_code == 200
-    execute_payload = execute_response.json()
     assert "accepted" in execute_payload
 
     confirm_response = client.post(
