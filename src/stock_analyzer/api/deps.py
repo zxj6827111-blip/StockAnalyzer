@@ -17,7 +17,14 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import Any, cast
 
+from fastapi import HTTPException, Request
+
 from stock_analyzer.config import StockAnalyzerConfig
+from stock_analyzer.param_freeze import (
+    PARAMS_FROZEN_CODE,
+    PARAMS_FROZEN_STATUS,
+    is_params_frozen,
+)
 from stock_analyzer.runtime.service import StockAnalyzerService
 
 
@@ -100,3 +107,33 @@ def dashboard_ops_enabled() -> bool:
 def set_dashboard_ops_enabled(value: bool) -> None:
     global _dashboard_ops_enabled
     _dashboard_ops_enabled = value
+
+
+def ensure_params_not_frozen(request: Request) -> None:
+    """FastAPI dependency: reject trading-parameter mutations inside the PRD
+    §8.7 freeze window (default 09:15-15:00 on trading days).
+
+    Only paths listed in ``param_freeze.frozen_paths`` are guarded. GET
+    queries, report generation, scheduler tasks and the signed command
+    channel never resolve this dependency. Returns 423 Locked with detail
+    ``params_frozen`` while frozen.
+    """
+    config = get_config().param_freeze
+    if request.url.path not in config.frozen_paths:
+        return
+    if not is_params_frozen(config=config):
+        return
+    raise HTTPException(status_code=PARAMS_FROZEN_STATUS, detail=PARAMS_FROZEN_CODE)
+
+
+def is_query_frozen(query: str) -> bool:
+    """Whether an interaction-channel mutation query is frozen right now.
+
+    Used by the wecom/feishu command-processing layer for queries such as
+    ``execution_mode_set`` (the advisory_only toggle) that are not routed
+    through the REST dependency above.
+    """
+    config = get_config().param_freeze
+    if query not in config.frozen_queries:
+        return False
+    return is_params_frozen(config=config)

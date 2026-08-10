@@ -8,7 +8,11 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, Query
 
-from stock_analyzer.api.deps import get_service, get_verify_api_auth
+from stock_analyzer.api.deps import (
+    ensure_params_not_frozen,
+    get_service,
+    get_verify_api_auth,
+)
 from stock_analyzer.api.models import (
     Week7CloudBackupCheckRequest,
     Week7CloudBackupPingRequest,
@@ -54,6 +58,7 @@ def week7_kill_switch_status(strategy: str = Query(default="")) -> dict[str, obj
 def week7_kill_switch_reset(
     request: Week7KillSwitchResetRequest,
     _auth: None = Depends(get_verify_api_auth()),
+    _frozen: None = Depends(ensure_params_not_frozen),
 ) -> dict[str, object]:
     return get_service().reset_strategy_kill_switch(
         strategy=request.strategy,

@@ -6,7 +6,12 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query
 
-from stock_analyzer.api.deps import get_service, get_verify_api_auth, parse_optional_datetime
+from stock_analyzer.api.deps import (
+    ensure_params_not_frozen,
+    get_service,
+    get_verify_api_auth,
+    parse_optional_datetime,
+)
 from stock_analyzer.api.models import (
     BootstrapActiveChampionRequest,
     ChampionShadowReportBuildRequest,
@@ -82,6 +87,7 @@ def register_model_artifact(
 def bootstrap_active_champion(
     request: BootstrapActiveChampionRequest,
     _auth: None = Depends(get_verify_api_auth()),
+    _frozen: None = Depends(ensure_params_not_frozen),
 ) -> dict[str, object]:
     return get_service().bootstrap_active_champion_from_artifact(
         artifact_path=request.artifact_path,
@@ -95,6 +101,7 @@ def bootstrap_active_champion(
 def update_model_registry_lifecycle(
     request: ModelRegistryLifecycleRequest,
     _auth: None = Depends(get_verify_api_auth()),
+    _frozen: None = Depends(ensure_params_not_frozen),
 ) -> dict[str, object]:
     return get_service().update_model_registry_lifecycle(
         model_id=request.model_id,
@@ -108,6 +115,7 @@ def update_model_registry_lifecycle(
 def update_model_registry_role(
     request: ModelRegistryRoleRequest,
     _auth: None = Depends(get_verify_api_auth()),
+    _frozen: None = Depends(ensure_params_not_frozen),
 ) -> dict[str, object]:
     return get_service().update_model_registry_role(
         model_id=request.model_id,

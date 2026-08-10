@@ -26,6 +26,7 @@ from stock_analyzer.api.deps import (
     as_int,
     get_config,
     get_service,
+    is_query_frozen,
     main_module,
     record_service_audit_event,
 )
@@ -54,6 +55,7 @@ from stock_analyzer.command.wecom_interaction import (
     verify_wecom_signature,
 )
 from stock_analyzer.notify.channels import NotificationMessage
+from stock_analyzer.param_freeze import PARAMS_FROZEN_CODE, freeze_window_label
 
 router = APIRouter()
 
@@ -614,6 +616,11 @@ def _wecom_handle_command(parsed: WeComParsedCommand, source_user: str) -> str:
             mode_text = "advisory_only" if advisory else "portfolio_auto_apply"
             return f"execution_mode={mode_text} advisory_only={str(advisory).lower()}"
         if parsed.query == "execution_mode_set":
+            if is_query_frozen("execution_mode_set"):
+                return (
+                    f"{PARAMS_FROZEN_CODE}: execution_mode_set 在交易时段冻结 "
+                    f"({freeze_window_label(_config.param_freeze)})，收盘后生效"
+                )
             advisory = bool(parsed.payload.get("advisory_only", False))
             _config.app.advisory_only = advisory
             mode_text = "advisory_only" if advisory else "portfolio_auto_apply"

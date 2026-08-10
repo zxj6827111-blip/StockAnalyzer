@@ -6,7 +6,12 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query
 
-from stock_analyzer.api.deps import get_service, get_verify_api_auth, parse_optional_datetime
+from stock_analyzer.api.deps import (
+    ensure_params_not_frozen,
+    get_service,
+    get_verify_api_auth,
+    parse_optional_datetime,
+)
 from stock_analyzer.api.models import (
     LearningModelProposalApprovalRequest,
     LearningModelProposalRequest,
@@ -73,6 +78,7 @@ def learning_model_proposal_history(
 def learning_model_proposal_approval(
     request: LearningModelProposalApprovalRequest,
     _auth: None = Depends(get_verify_api_auth()),
+    _frozen: None = Depends(ensure_params_not_frozen),
 ) -> dict[str, object]:
     return get_service().record_learning_model_proposal_approval(
         approver=request.approver,
@@ -88,6 +94,7 @@ def learning_model_proposal_approval(
 def learning_model_proposal_revoke(
     request: LearningModelProposalRevokeRequest,
     _auth: None = Depends(get_verify_api_auth()),
+    _frozen: None = Depends(ensure_params_not_frozen),
 ) -> dict[str, object]:
     return get_service().revoke_learning_model_proposal(
         revoked_by=request.revoked_by,
@@ -132,6 +139,7 @@ def learning_model_release_ticket_issue(
 def learning_model_release_ticket_execute(
     request: LearningModelReleaseTicketExecuteRequest,
     _auth: None = Depends(get_verify_api_auth()),
+    _frozen: None = Depends(ensure_params_not_frozen),
 ) -> dict[str, object]:
     return get_service().execute_learning_model_release_ticket(
         executor=request.executor,
@@ -147,6 +155,7 @@ def learning_model_release_ticket_execute(
 def learning_model_release_ticket_confirm(
     request: LearningModelReleaseTicketConfirmRequest,
     _auth: None = Depends(get_verify_api_auth()),
+    _frozen: None = Depends(ensure_params_not_frozen),
 ) -> dict[str, object]:
     return get_service().confirm_learning_model_release_ticket(
         confirmer=request.confirmer,
@@ -161,6 +170,7 @@ def learning_model_release_ticket_confirm(
 def learning_model_release_ticket_rollback(
     request: LearningModelReleaseTicketRollbackRequest,
     _auth: None = Depends(get_verify_api_auth()),
+    _frozen: None = Depends(ensure_params_not_frozen),
 ) -> dict[str, object]:
     return get_service().rollback_learning_model_release_ticket(
         rollback_by=request.rollback_by,
@@ -175,6 +185,7 @@ def learning_model_release_ticket_rollback(
 def learning_model_release_confirmation_watchdog(
     request: LearningModelReleaseConfirmationWatchdogRequest,
     _auth: None = Depends(get_verify_api_auth()),
+    _frozen: None = Depends(ensure_params_not_frozen),
 ) -> dict[str, object]:
     return get_service().run_learning_model_release_confirmation_watchdog(
         now=parse_optional_datetime(request.now or ""),

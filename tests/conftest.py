@@ -22,5 +22,8 @@ os.environ.setdefault("SA__IDLE_QUEUE__RESOURCE_PAUSE_ENABLED", "false")
 # Tests start with authentication disabled unless a test explicitly overrides it.
 os.environ["SA__SECURITY__API_AUTH_ENABLED"] = "false"
 os.environ["SA__SECURITY__API_TOKEN"] = ""
+# PRD §8.7 trading-parameter freeze is disabled for tests by default so the
+# suite stays green at any wall-clock time; freeze tests enable it explicitly.
+os.environ["SA__PARAM_FREEZE__ENABLED"] = "false"
 # Use a strong secret for tests so command channel is not rejected by weak-secret guard.
 os.environ.setdefault("SA__COMMAND_CHANNEL__SECRET_KEY", "test-strong-secret-for-pytest-only")
