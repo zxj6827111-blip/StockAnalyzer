@@ -288,6 +288,113 @@ def test_service_live_auto_execution_opens_simulated_position() -> None:
     assert service.state.current_equity > 0
 
 
+def test_service_live_auto_execution_applies_shared_slippage_and_tick_when_enabled() -> None:
+    config = _load_test_config()
+    config.backtest_matcher.apply_dynamic_slippage_live = True
+    service = StockAnalyzerService(config=config)
+
+    _patch_attr(service, "_build_week5_symbol_market_payload", lambda **kwargs: {
+        "last_price": 10.08,
+        "open_price": 10.0,
+        "prev_close": 9.9,
+        "ask_levels": [{"level": 1, "price": 10.1, "volume": 5000}],
+        "bid_levels": [{"level": 1, "price": 10.0, "volume": 4000}],
+    })
+    _patch_attr(service, "_fetch_market_depth_snapshots", lambda **kwargs: {
+        "600000": {
+            "available": True,
+            "ask_levels": [{"level": 1, "price": 10.1, "volume": 5000}],
+            "bid_levels": [{"level": 1, "price": 10.0, "volume": 4000}],
+        }
+    })
+
+    signal = PipelineSignal(
+        symbol="600000",
+        strategy="monster",
+        score=86.0,
+        grade="S",
+        action="buy",
+        target_position=0.10,
+        probabilities={"lgbm": 0.8, "xgb": 0.8, "meta": 0.8},
+        reasons=["soup_entry"],
+    )
+    update = service._apply_live_auto_portfolio_signals(
+        trace_id="trace-live-slippage-buy",
+        timestamp=datetime.fromisoformat("2026-03-11T09:35:00"),
+        signals=[signal],
+        use_live_runtime=True,
+    )
+
+    assert update["status"] == "simulated_auto_applied"
+    assert update["opened"] == 1
+    position = service.portfolio_positions()[0]
+    assert position["entry_price"] == 10.13
+    assert position["quantity"] == 900
+    execution = next(
+        item for item in _as_mapping_list(update["executions"]) if item["side"] == "buy"
+    )
+    assert execution["price"] == 10.13
+    assert execution["price_source"] == "五档卖1+slip"
+    assert execution["fee"] == pytest.approx(5.09)
+
+
+def test_service_live_auto_execution_applies_shared_slippage_on_sell_when_enabled() -> None:
+    config = _load_test_config()
+    config.backtest_matcher.apply_dynamic_slippage_live = True
+    service = StockAnalyzerService(config=config)
+    opened_at = datetime.fromisoformat("2026-03-10T09:35:00")
+    _ = service._portfolio.set_manual_position(
+        symbol="600000",
+        strategy="trend",
+        target_position=0.10,
+        timestamp=opened_at,
+        trace_id="seed-live-slippage-sell",
+        reason="auto_simulated_buy",
+        manual_fill={"entry_price": 10.0, "quantity": 900},
+    )
+    _patch_attr(service, "_build_c3_position_management_items", lambda **kwargs: [])
+    _patch_attr(service, "_build_week5_symbol_market_payload", lambda **kwargs: {
+        "last_price": 10.58,
+        "open_price": 10.5,
+        "prev_close": 10.4,
+        "ask_levels": [{"level": 1, "price": 10.6, "volume": 5000}],
+        "bid_levels": [{"level": 1, "price": 10.55, "volume": 5000}],
+    })
+    _patch_attr(service, "_fetch_market_depth_snapshots", lambda **kwargs: {
+        "600000": {
+            "available": True,
+            "ask_levels": [{"level": 1, "price": 10.6, "volume": 5000}],
+            "bid_levels": [{"level": 1, "price": 10.55, "volume": 5000}],
+        }
+    })
+
+    signal = PipelineSignal(
+        symbol="600000",
+        strategy="trend",
+        score=30.0,
+        grade="C",
+        action="sell",
+        target_position=0.0,
+        probabilities={"lgbm": 0.2, "xgb": 0.2, "meta": 0.2},
+        reasons=["sell_signal"],
+    )
+    update = service._apply_live_auto_portfolio_signals(
+        trace_id="trace-live-slippage-sell",
+        timestamp=datetime.fromisoformat("2026-03-11T14:50:00"),
+        signals=[signal],
+        use_live_runtime=True,
+    )
+
+    assert update["status"] == "simulated_auto_applied"
+    assert update["closed_signals"] == 1
+    execution = next(
+        item for item in _as_mapping_list(update["executions"]) if item["side"] == "sell"
+    )
+    assert execution["price"] == 10.53
+    assert execution["price_source"] == "五档买1+slip"
+    assert execution["quantity"] == 900
+
+
 def test_service_live_auto_execution_skips_unchanged_adjustment() -> None:
     config = _load_test_config()
     config.soup_strategy.max_holdings = 5
