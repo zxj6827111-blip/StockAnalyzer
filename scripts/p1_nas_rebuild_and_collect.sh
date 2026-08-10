@@ -23,7 +23,6 @@ release_stage="${RELEASE_STAGE:-stage-a-consistency}"
 compose_files=(
   -f docker-compose.yml
   -f docker-compose.runtime.yml
-  -f docker-compose.runtime.localvol.yml
   -f docker-compose.advisory.yml
 )
 

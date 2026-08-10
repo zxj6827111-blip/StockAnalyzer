@@ -5,7 +5,7 @@
 # Prerequisites:
 # - This directory is a git clone of StockAnalyzer
 # - .env exists here and is NOT committed
-# - runtime data lives in named volumes (docker-compose.runtime.localvol.yml)
+# - runtime data lives in named volumes (docker-compose.runtime.yml)
 #   OR in ./artifacts (bind mount). Both are safe with git pull because
 #   artifacts/ and .env are gitignored.
 #
@@ -124,7 +124,6 @@ echo "build_commit=${COMMIT}"
 COMPOSE=(docker compose --env-file "${ROOT}/.env"
   -f docker-compose.yml
   -f docker-compose.runtime.yml
-  -f docker-compose.runtime.localvol.yml
   -f docker-compose.advisory.yml
   -f docker-compose.vendor-overlay.yml
 )

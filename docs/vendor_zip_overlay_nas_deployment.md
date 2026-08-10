@@ -113,7 +113,6 @@ sa_compose() {
   docker compose \
     -f docker-compose.yml \
     -f docker-compose.runtime.yml \
-    -f docker-compose.runtime.localvol.yml \
     -f docker-compose.advisory.yml \
     -f docker-compose.vendor-overlay.yml \
     "$@"

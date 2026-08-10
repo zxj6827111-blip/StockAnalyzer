@@ -9,8 +9,7 @@ $projectRoot = Split-Path -Parent $scriptRoot
 
 $composeFiles = @(
     (Join-Path $projectRoot "docker-compose.yml"),
-    (Join-Path $projectRoot "docker-compose.runtime.yml"),
-    (Join-Path $projectRoot "docker-compose.runtime.localvol.yml")
+    (Join-Path $projectRoot "docker-compose.runtime.yml")
 )
 
 $runtimeArtifactsVolume = "stock_analyzer_runtime_artifacts"

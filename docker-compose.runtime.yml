@@ -1,3 +1,9 @@
+# Runtime overlay for production/NAS deployments.
+# Combines the runtime environment defaults with the named-volume runtime layout
+# (previously docker-compose.runtime.localvol.yml): api/scheduler read and write
+# artifacts/ + suggestions/ through the external named volumes
+# stock_analyzer_runtime_artifacts / stock_analyzer_runtime_suggestions so that
+# code updates do not depend on project-directory bind mounts.
 services:
   api:
     environment:
@@ -16,6 +22,9 @@ services:
       SA__ACCEPTANCE__AUTO_NOTIFY: "true"
       SA__NOTIFICATION_FILTER__QUIET_WINDOWS: '["23:00-08:30"]'
       SA__TDX_SYNC__AUTO_RUN: "false"
+    volumes:
+      - runtime_artifacts:/app/artifacts
+      - runtime_suggestions:/app/suggestions
 
   scheduler:
     environment:
@@ -35,3 +44,14 @@ services:
       SA__NOTIFICATION_FILTER__QUIET_WINDOWS: '["23:00-08:30"]'
       SA__TDX_SYNC__AUTO_RUN: "false"
       SCHEDULER_POLL_SEC: "30"
+    volumes:
+      - runtime_artifacts:/app/artifacts
+      - runtime_suggestions:/app/suggestions
+
+volumes:
+  runtime_artifacts:
+    external: true
+    name: stock_analyzer_runtime_artifacts
+  runtime_suggestions:
+    external: true
+    name: stock_analyzer_runtime_suggestions

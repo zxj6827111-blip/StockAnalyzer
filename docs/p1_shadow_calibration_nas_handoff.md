@@ -98,14 +98,12 @@ docker compose \
   --env-file /vol1/docker/StockAnalyzer/.env \
   -f docker-compose.yml \
   -f docker-compose.runtime.yml \
-  -f docker-compose.runtime.localvol.yml \
   -f docker-compose.advisory.yml \
   build api
 docker compose \
   --env-file /vol1/docker/StockAnalyzer/.env \
   -f docker-compose.yml \
   -f docker-compose.runtime.yml \
-  -f docker-compose.runtime.localvol.yml \
   -f docker-compose.advisory.yml \
   up -d --no-build --force-recreate api scheduler
 ```

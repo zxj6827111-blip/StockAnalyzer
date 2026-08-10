@@ -40,27 +40,24 @@ SA__EVOLUTION__STRICT_DEPENDENCY_CHECK=false
 
 ---
 
-## 三、 修改 Docker 配置（防数据丢失 & 保证时间准确）
+## 三、 Docker 配置说明（防数据丢失 & 保证时间准确）
 
-在构建前，请务必修改根目录下的 `docker-compose.yml`，补上**北京时区**和**硬盘持久化目录**，否则一旦断电或更新代码，辛辛苦苦积攒的机器智能记忆全丢！
+仓库自带的 `docker-compose.yml` **已内置**以下关键配置，**无需手工修改**：
 
-请将您的 `api` 和 `scheduler` 服务做如下修改（**特别是环境变量 `TZ` 和挂载卷 `volumes`**）：
+- `api` / `scheduler` 均已设置 `TZ=Asia/Shanghai`（北京时间），保证 TimeGuard 时间窗判断正确；
+- `api` / `scheduler` 已挂载持久化卷：
+  - `./artifacts:/app/artifacts`（运行态、验收报告、冠军模型、合规库等全部工件）
+  - `./suggestions:/app/suggestions`（M8/M3 等模块推举的高分种子策略）
+- 容器默认使用 `SA__DATA_SOURCE__PRIMARY=market_warehouse` 数据源，默认 `SA__APP__ADVISORY_ONLY=true` 研究模式。
 
-```yaml
-services:
-  api:
-    build: .
-    # ... (原有配置不变)
-    environment:
-      # （原有环境变量保留即可），下面是必须增加的：
-      - TZ=Asia/Shanghai                 # 确保时区正确！否则时间窗守护神(TimeGuard)会严重误判
-      - SA__DATA_SOURCE__PRIMARY=efinance # 容器默认优先使用更稳定的模拟盘在线数据源
-    volumes:
-      - ./artifacts:/app/artifacts           # 持久化运行态、验收报告、冠军模型、合规库等全部工件
-      - ./suggestions:/app/suggestions       # 记录 M8/M3 等模块推举的高分种子策略
-    # ...
+**生产/NAS 部署**：推荐在 `docker-compose.yml` 基础上叠加 `docker-compose.runtime.yml`（提供企微/飞书通知默认值、API 鉴权、验收自动运行，并把运行态切换到 Docker 命名卷 `stock_analyzer_runtime_artifacts` / `stock_analyzer_runtime_suggestions`）：
+
+```bash
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.runtime.yml \
+  up -d --build api scheduler
 ```
-同样的，也给 `scheduler` 服务加上 `TZ=Asia/Shanghai` 和 `volumes`。
 
 > **小贴士**：当前仓库内的 `Dockerfile` 已默认安装 `cpulimit`；如果您自定义过镜像，请确认该库仍然存在，否则 `evolution preflight` 会因为严格依赖检查而阻塞。
 

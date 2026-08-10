@@ -1,8 +1,8 @@
-# 飞牛 NAS 部署指南（当前版 / runtime localvol）
+# 飞牛 NAS 部署指南（当前版 / runtime 命名卷）
 
 适用范围：
 
-- 当前仓库已经切到 `market_warehouse + runtime localvol` 运行方式
+- 当前仓库已经切到 `market_warehouse + runtime 命名卷` 运行方式
 - 需要把现有本地运行态迁移到飞牛 NAS
 - 需要保留 `artifacts/`、`suggestions/`、运行状态、训练产物、市场主库
 
@@ -15,11 +15,10 @@
 
 - `docker-compose.yml`
 - `docker-compose.runtime.yml`
-- `docker-compose.runtime.localvol.yml`
 
 其中：
 
-- `docker-compose.runtime.localvol.yml` 负责把运行态切到 Docker 命名卷
+- `docker-compose.runtime.yml` 负责提供运行时环境默认值，并把运行态切到 Docker 命名卷
 - `docker-compose.yml` 已支持通过 `SA_API_HOST_PORT` 调整 API 暴露端口
 - 飞牛 NAS 建议把 `SA_API_HOST_PORT` 设为 `18001`，避免和系统管理端口冲突
 
@@ -94,7 +93,6 @@ powershell -ExecutionPolicy Bypass -File scripts/export_runtime_from_local_volum
 - `.env.example`
 - `docker-compose.yml`
 - `docker-compose.runtime.yml`
-- `docker-compose.runtime.localvol.yml`
 - `Dockerfile`
 - `pyproject.toml`
 - `README.md`
@@ -168,7 +166,6 @@ docker run --rm \
 docker compose \
   -f docker-compose.yml \
   -f docker-compose.runtime.yml \
-  -f docker-compose.runtime.localvol.yml \
   up -d --build api scheduler
 ```
 
@@ -185,7 +182,6 @@ docker compose \
 docker compose \
   -f docker-compose.yml \
   -f docker-compose.runtime.yml \
-  -f docker-compose.runtime.localvol.yml \
   ps
 ```
 
@@ -195,13 +191,11 @@ docker compose \
 docker compose \
   -f docker-compose.yml \
   -f docker-compose.runtime.yml \
-  -f docker-compose.runtime.localvol.yml \
   logs api --tail=120
 
 docker compose \
   -f docker-compose.yml \
   -f docker-compose.runtime.yml \
-  -f docker-compose.runtime.localvol.yml \
   logs scheduler --tail=120
 ```
 
@@ -238,7 +232,6 @@ curl "http://127.0.0.1:${SA_API_HOST_PORT:-18001}/acceptance/week4/latest"
 docker compose \
   -f docker-compose.yml \
   -f docker-compose.runtime.yml \
-  -f docker-compose.runtime.localvol.yml \
   up -d --build api scheduler
 ```
 
@@ -248,7 +241,6 @@ docker compose \
 docker compose \
   -f docker-compose.yml \
   -f docker-compose.runtime.yml \
-  -f docker-compose.runtime.localvol.yml \
   up -d api scheduler
 ```
 
@@ -280,7 +272,6 @@ docker load -i stock-analyzer-latest.tar
 docker compose \
   -f docker-compose.yml \
   -f docker-compose.runtime.yml \
-  -f docker-compose.runtime.localvol.yml \
   up -d api scheduler
 ```
 
@@ -293,7 +284,6 @@ cd /vol1/docker/StockAnalyzer
 docker compose \
   -f docker-compose.yml \
   -f docker-compose.runtime.yml \
-  -f docker-compose.runtime.localvol.yml \
   exec api \
   python /app/scripts/export_support_bundle.py \
   --base-url "http://127.0.0.1:8000" \
