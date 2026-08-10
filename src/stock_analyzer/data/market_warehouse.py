@@ -1730,6 +1730,103 @@ class MarketWarehouse:
             )
             connection.unregister("daily_stage_df")
 
+    def upsert_daily_bars(
+        self,
+        *,
+        frame: pd.DataFrame,
+        overwrite_existing: bool = False,
+    ) -> int:
+        """Idempotent batch upsert of normalized daily bars. Returns rows stored.
+
+        ``frame`` must carry ``symbol`` and ``date`` columns plus any subset
+        of the daily_bars columns; columns the caller cannot provide are
+        stored as NULL instead of being fabricated (e.g. the vendor ZIP
+        baseline never fabricates tushare-only fields like roe or
+        holder_count).
+
+        Default semantics (``overwrite_existing=False``) leave already-present
+        (symbol, date) rows untouched, mirroring the overlay merge rule where
+        the delta row wins: a full ZIP baseline import therefore never
+        downgrades rows that tushare-based writers already enriched. Pass
+        ``overwrite_existing=True`` to replace existing rows with the incoming
+        values (used by the qfq factor-drift refresh path). Read-only
+        warehouses refuse with ``DataSourceError``.
+        """
+        if frame is None or frame.empty:
+            return 0
+        payload = frame.copy()
+        if "symbol" not in payload.columns or "date" not in payload.columns:
+            raise DataSourceError("upsert_daily_bars requires symbol and date columns")
+        payload["symbol"] = (
+            payload["symbol"]
+            .astype(str)
+            .str.strip()
+            .str.upper()
+            .str.replace(r"\.(SH|SZ|BJ)$", "", regex=True)
+        )
+        payload = payload[payload["symbol"].str.fullmatch(r"\d{6}")]
+        payload["date"] = pd.to_datetime(payload["date"], errors="coerce").dt.date
+        payload = payload.dropna(subset=["date"])
+        if payload.empty:
+            return 0
+        for column in _SELECTED_COLUMNS:
+            if column not in payload.columns:
+                if column in _DAILY_NUMERIC_COLUMNS:
+                    payload[column] = float("nan")
+                elif column in _DAILY_BOOLEAN_COLUMNS:
+                    payload[column] = False
+                else:
+                    payload[column] = ""
+        columns = ["symbol", "date", *_SELECTED_COLUMNS]
+        self.ensure_schema()
+        with self._connect_write() as connection:
+            connection.register("daily_stage_df", payload)
+            try:
+                if overwrite_existing:
+                    connection.execute(
+                        f"""
+                        DELETE FROM {_DAILY_TABLE}
+                        WHERE (symbol, date) IN (
+                            SELECT symbol, date FROM daily_stage_df
+                        )
+                        """
+                    )
+                    connection.execute(
+                        f"""
+                        INSERT INTO {_DAILY_TABLE} ({", ".join(columns)})
+                        SELECT {", ".join(columns)}
+                        FROM daily_stage_df
+                        ORDER BY date
+                        """
+                    )
+                    stored = len(payload)
+                else:
+                    stored = int(
+                        connection.execute(
+                            f"""
+                            SELECT COUNT(*)
+                            FROM daily_stage_df AS stage
+                            ANTI JOIN {_DAILY_TABLE} AS existing
+                              ON existing.symbol = stage.symbol
+                             AND existing.date = stage.date
+                            """
+                        ).fetchone()[0]
+                    )
+                    connection.execute(
+                        f"""
+                        INSERT INTO {_DAILY_TABLE} ({", ".join(columns)})
+                        SELECT {", ".join(columns)}
+                        FROM daily_stage_df AS stage
+                        ANTI JOIN {_DAILY_TABLE} AS existing
+                          ON existing.symbol = stage.symbol
+                         AND existing.date = stage.date
+                        ORDER BY date
+                        """
+                    )
+            finally:
+                connection.unregister("daily_stage_df")
+        return stored
+
     def replace_intraday_summary(
         self,
         *,

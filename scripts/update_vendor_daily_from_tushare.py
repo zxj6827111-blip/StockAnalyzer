@@ -1396,6 +1396,13 @@ def _main(argv: list[str] | None = None) -> int:
         "annual-ZIP scans; incrementally updated after a successful run. "
         "Must live OUTSIDE the vendor directory (e.g. /vol1/docker/tools/).",
     )
+    parser.add_argument(
+        "--sync-vendor-delta",
+        default="",
+        help="Delta DuckDB path to incrementally sync after a successful run "
+        "(import_vendor_zip_to_delta.py --incremental); requires --index-path. "
+        "Example: /app/artifacts/vendor_delta/market_delta.duckdb",
+    )
     args = parser.parse_args(argv)
 
     vendor_root = Path(args.vendor_root).expanduser()
@@ -1605,6 +1612,37 @@ def _main(argv: list[str] | None = None) -> int:
                 updated_symbols=updated_codes,
             )
 
+    # Delta baseline incremental sync: after the ZIPs and the last-date index
+    # are updated, mirror the new rows into the delta DuckDB so the Week5
+    # batch keeps reading the fast DuckDB path.
+    delta_sync_report: dict[str, object] = {"updated": False, "reason": "not_enabled"}
+    if (
+        not args.dry_run
+        and args.sync_vendor_delta.strip()
+        and args.index_path.strip()
+        and ok_results
+    ):
+        try:
+            from import_vendor_zip_to_delta import _main as _run_delta_sync
+
+            sync_rc = _run_delta_sync(
+                [
+                    "--data-root",
+                    str(vendor_root),
+                    "--index-path",
+                    args.index_path,
+                    "--delta-db-path",
+                    args.sync_vendor_delta,
+                    "--incremental",
+                ]
+            )
+            delta_sync_report = {"updated": sync_rc == 0, "exit_code": sync_rc}
+        except Exception as exc:
+            delta_sync_report = {
+                "updated": False,
+                "reason": f"{type(exc).__name__}:{exc}",
+            }
+
     summary = {
         "tool": "update_vendor_daily_from_tushare",
         "finished_at": datetime.now().isoformat(timespec="seconds"),
@@ -1622,6 +1660,7 @@ def _main(argv: list[str] | None = None) -> int:
         "checkpoint": str(checkpoint_path) if checkpoint_path is not None else "",
         "zip_rebuilds": rebuild_reports,
         "index": index_report,
+        "delta_sync": delta_sync_report,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     if failures:
