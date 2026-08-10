@@ -3,8 +3,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import zipfile
+from datetime import date, timedelta
 from pathlib import Path
 
+import duckdb
 import pandas as pd
 import pytest
 
@@ -605,3 +607,236 @@ def test_batch_delta_lagging_without_shallow_still_returns_latest_zip_rows(
     assert frame[frame["symbol"] == "600000"]["date"].max().strftime(
         "%Y-%m-%d"
     ) == "2025-12-31"
+
+
+# ---------------------------------------------------------------------------
+# 审查修复验证：事务回滚 / entry_index 年度 / 漂移重算深度 / 因子归档单次打开
+# ---------------------------------------------------------------------------
+
+
+def test_upsert_overwrite_rolls_back_on_insert_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """overwrite 的 DELETE+INSERT 同事务：INSERT 失败时 DELETE 必须回滚。"""
+    db_path = tmp_path / "delta" / "market_delta.duckdb"
+    warehouse = MarketWarehouse(
+        db_path=db_path, package_root=tmp_path / "delta" / "package"
+    )
+    warehouse.upsert_daily_bars(
+        frame=pd.DataFrame(
+            {
+                "symbol": ["600000"],
+                "date": ["2025-12-31"],
+                "open": [10.0],
+                "high": [11.0],
+                "low": [9.0],
+                "close": [10.5],
+                "volume": [100.0],
+                "turnover": [1234.0],
+            }
+        )
+    )
+    assert len(warehouse.fetch_all_daily_bars(symbol="600000")) == 1
+
+    class _FailingConnection:
+        """转发真实连接，但 INSERT 语句模拟失败（如 DuckDB 内部错误）。"""
+
+        def __init__(self, inner: duckdb.DuckDBPyConnection) -> None:
+            self._inner = inner
+
+        def __enter__(self) -> _FailingConnection:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def register(self, name: str, frame: pd.DataFrame) -> None:
+            self._inner.register(name, frame)
+
+        def unregister(self, name: str) -> None:
+            self._inner.unregister(name)
+
+        def execute(self, sql: str, *args: object) -> object:
+            if "INSERT INTO daily_bars" in sql:
+                raise RuntimeError("simulated insert failure")
+            return self._inner.execute(sql, *args)
+
+    real = duckdb.connect(str(db_path))
+    try:
+        monkeypatch.setattr(
+            warehouse, "_connect_write", lambda: _FailingConnection(real)
+        )
+        with pytest.raises(RuntimeError):
+            warehouse.upsert_daily_bars(
+                frame=pd.DataFrame(
+                    {
+                        "symbol": ["600000"],
+                        "date": ["2025-12-30"],
+                        "open": [9.0],
+                        "high": [10.0],
+                        "low": [8.0],
+                        "close": [9.5],
+                        "volume": [50.0],
+                        "turnover": [600.0],
+                    }
+                ),
+                overwrite_existing=True,
+            )
+    finally:
+        real.close()
+
+    # DELETE 已随事务回滚：旧行保留，新行未写入。
+    frame = warehouse.fetch_all_daily_bars(symbol="600000")
+    assert len(frame) == 1
+    assert float(frame["close"].iloc[-1]) == 10.5
+
+
+def test_entry_index_keeps_newest_year_entry(tmp_path: Path) -> None:
+    """多年度同名因子条目：映射保留最新年度，不依赖 namelist 顺序。"""
+    archive = tmp_path / "factors.zip"
+    _write_zip(
+        archive,
+        {
+            # 乱序写入：2025 在前、2024 在后（归档重建后 namelist 顺序不定）。
+            "2025/600000.SH.csv": "股票代码,交易日期,复权因子\n600000.SH,20251231,1.0\n",
+            "2024/600000.SH.csv": "股票代码,交易日期,复权因子\n600000.SH,20241231,1.0\n",
+            "2025/000001.SZ.csv": "股票代码,交易日期,复权因子\n000001.SZ,20251231,1.0\n",
+        },
+    )
+    with zipfile.ZipFile(archive) as opened:
+        mapping = delta_import._factor_entry_index(opened)
+    assert mapping["600000.SH"] == "2025/600000.SH.csv"
+    assert mapping["000001.SZ"] == "2025/000001.SZ.csv"
+
+
+def _deep_daily_csv(*, symbol: str, days: int = 70, base_close: float = 11.0) -> str:
+    """``days`` 个连续交易日（2025-01-02 起，跳过周末）的 ZIP CSV。"""
+    rows = ["code,datetime,open,high,low,close,volume,amount,circ_mv"]
+    day = date(2025, 1, 2)
+    added = 0
+    while added < days:
+        if day.weekday() < 5:
+            close = base_close + added * 0.1
+            rows.append(
+                f"{symbol},{day.isoformat()},10,11,9.5,{close:.1f},100,123.4,200000"
+            )
+            added += 1
+        day += timedelta(days=1)
+    return "\n".join(rows)
+
+
+def _deep_factor_csv(*, ts_code: str, days: int = 70, factor: float = 1.0) -> str:
+    rows = ["股票代码,交易日期,复权因子"]
+    day = date(2025, 1, 2)
+    added = 0
+    while added < days:
+        if day.weekday() < 5:
+            rows.append(f"{ts_code},{day.strftime('%Y%m%d')},{factor}")
+            added += 1
+        day += timedelta(days=1)
+    return "\n".join(rows)
+
+
+def _deep_qfq_fixture(root: Path) -> Path:
+    """两符号 × 70 个交易日（2025 单年度）的 qfq fixture。"""
+    _write_zip(
+        root / "全A日K" / "2025.zip",
+        {
+            "2025/600000.SH.csv": _deep_daily_csv(symbol="600000.SH"),
+            "2025/000001.SZ.csv": _deep_daily_csv(symbol="000001.SZ"),
+        },
+    )
+    _write_factors_zip(
+        root,
+        {
+            "2025/600000.SH.csv": _deep_factor_csv(ts_code="600000.SH"),
+            "2025/000001.SZ.csv": _deep_factor_csv(ts_code="000001.SZ"),
+        },
+    )
+    index_path = root / "index" / "daily_index.json"
+    write_vendor_zip_daily_index(root=root, output_path=index_path)
+    return index_path
+
+
+def test_incremental_drift_refresh_covers_full_baseline_depth(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """漂移重算深度 = delta 基线实际深度，而非 --limit-days 窗口。"""
+    index_path = _deep_qfq_fixture(tmp_path)
+    args = [
+        "--data-root",
+        str(tmp_path),
+        "--index-path",
+        str(index_path),
+        "--delta-db-path",
+        str(tmp_path / "delta" / "market_delta.duckdb"),
+        "--price-series-mode",
+        "qfq",
+    ]
+    _run(args + ["--limit-days", "400"], capsys)  # 基线：70 行/符号
+
+    # 除权重标定：2025 全年因子 1.0 → 2.0（影响全部历史）。
+    _write_factors_zip(
+        tmp_path,
+        {
+            "2025/600000.SH.csv": _deep_factor_csv(ts_code="600000.SH", factor=2.0),
+            "2025/000001.SZ.csv": _deep_factor_csv(ts_code="000001.SZ", factor=2.0),
+        },
+    )
+
+    # 捕获漂移重算的读取深度（--limit-days 60 会被 clamp 到 60）。
+    limits: list[int] = []
+    original = VendorZipOverlayProvider._load_vendor_daily_batch
+
+    def spy(
+        self: VendorZipOverlayProvider, *, symbols: list[str], limit: int
+    ) -> list[pd.DataFrame]:
+        limits.append(limit)
+        return original(self, symbols=symbols, limit=limit)
+
+    monkeypatch.setattr(VendorZipOverlayProvider, "_load_vendor_daily_batch", spy)
+    report = _run(args + ["--incremental", "--limit-days", "60"], capsys)
+
+    assert report["drift_refreshed_symbol_count"] == 2
+    assert limits == [70]  # 深度取 delta 基线 70 行，而非 60
+
+    # 最老行（70 天前）也被整段重算：close = raw × 2.0。
+    warehouse = MarketWarehouse(
+        db_path=tmp_path / "delta" / "market_delta.duckdb",
+        package_root=tmp_path / "delta" / "package",
+    )
+    frame = warehouse.fetch_all_daily_bars(symbol="600000")
+    assert len(frame) == 70
+    assert float(frame.iloc[0]["close"]) == pytest.approx(11.0 * 2.0)
+
+
+def test_incremental_drift_scan_opens_factor_zip_once(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """漂移扫描复用已打开的因子归档：不逐符号重复解析中央目录。"""
+    index_path = _qfq_fixture(tmp_path)
+    args = [
+        "--data-root",
+        str(tmp_path),
+        "--index-path",
+        str(index_path),
+        "--delta-db-path",
+        str(tmp_path / "delta" / "market_delta.duckdb"),
+        "--price-series-mode",
+        "qfq",
+    ]
+    _run(args + ["--limit-days", "400"], capsys)
+
+    opened: list[str] = []
+
+    class _CountingZipFile(zipfile.ZipFile):
+        def __init__(self, file: object, *args: object, **kwargs: object) -> None:
+            opened.append(str(file))
+            super().__init__(file, *args, **kwargs)
+
+    monkeypatch.setattr(zipfile, "ZipFile", _CountingZipFile)
+    report = _run(args + ["--incremental"], capsys)
+
+    factor_opens = [path for path in opened if "复权因子" in path]
+    assert len(factor_opens) == 1  # 仅建索引一次，逐符号检测复用同一实例
+    assert report["drift_refreshed_symbol_count"] == 0

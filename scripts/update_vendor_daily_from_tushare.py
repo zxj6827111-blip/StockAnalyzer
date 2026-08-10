@@ -1623,20 +1623,45 @@ def _main(argv: list[str] | None = None) -> int:
         and ok_results
     ):
         try:
-            from import_vendor_zip_to_delta import _main as _run_delta_sync
+            # 显式按路径加载同目录脚本，不依赖 sys.path 恰好包含 scripts/：
+            # ``python -m`` 方式运行本脚本时 sys.path[0] 是 CWD，裸 import
+            # 会 ModuleNotFoundError（虽然被降级，但钩子将永远不生效）。
+            import contextlib
+            import importlib.util
+            import io
 
-            sync_rc = _run_delta_sync(
-                [
-                    "--data-root",
-                    str(vendor_root),
-                    "--index-path",
-                    args.index_path,
-                    "--delta-db-path",
-                    args.sync_vendor_delta,
-                    "--incremental",
-                ]
+            _delta_script = (
+                Path(__file__).resolve().parent / "import_vendor_zip_to_delta.py"
             )
+            _spec = importlib.util.spec_from_file_location(
+                "import_vendor_zip_to_delta", _delta_script
+            )
+            assert _spec is not None and _spec.loader is not None
+            _delta_module = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_delta_module)
+
+            # import 脚本的 JSON 报告走自己的 stdout：不重定向会污染本脚本
+            # 的 summary 输出（下游解析会失败），把它收进 delta_sync 报告。
+            _captured = io.StringIO()
+            with contextlib.redirect_stdout(_captured):
+                sync_rc = _delta_module._main(  # noqa: SLF001
+                    [
+                        "--data-root",
+                        str(vendor_root),
+                        "--index-path",
+                        args.index_path,
+                        "--delta-db-path",
+                        args.sync_vendor_delta,
+                        "--incremental",
+                    ]
+                )
             delta_sync_report = {"updated": sync_rc == 0, "exit_code": sync_rc}
+            _delta_output = _captured.getvalue().strip()
+            if _delta_output:
+                try:
+                    delta_sync_report["import_report"] = json.loads(_delta_output)
+                except json.JSONDecodeError:
+                    delta_sync_report["import_output"] = _delta_output
         except Exception as exc:
             delta_sync_report = {
                 "updated": False,

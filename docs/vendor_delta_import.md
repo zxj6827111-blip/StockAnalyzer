@@ -62,7 +62,12 @@ python scripts/update_vendor_daily_from_tushare.py --vendor-root /data \
 ```
 
 `stock_updater.sh` 只需在现有 python 调用行追加该参数即可接入。结果里
-`delta_sync.updated` 为同步结果。
+`delta_sync.updated` 为同步结果（`delta_sync.import_report` 含增量导入明细）。
+
+注意：`--index-path` 指向的索引文件必须是由
+`build_vendor_zip_daily_index.py` 生成的完整索引（updater 只在其上增量刷新
+`latest_date`）；缺失或精简格式会导致钩子降级（`delta_sync.updated=false`），
+updater 主流程不受影响。
 
 ### 方式 B：独立增量命令
 
@@ -80,6 +85,9 @@ python scripts/import_vendor_zip_to_delta.py \
 - delta 缺失的符号（新股等）自动按全量补齐；
 - **qfq 因子漂移检测**：除权导致因子重标定时，历史 qfq 价格整体变化；通过
   delta 锚点日期的因子值（≠1.0 即漂移）检出，该符号整段重算并覆盖；
+  重算深度自动取 delta 基线实际深度（与 `--limit-days` 无关），保证比基线
+  更早的行不会保留旧因子；因子归档只打开一次，全市场漂移扫描不逐符号
+  重复解析 ZIP 中央目录；
 - 每日预计 1~5 分钟（NAS）。
 
 ## 3. 验收

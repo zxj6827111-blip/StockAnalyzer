@@ -555,3 +555,126 @@ def test_main_dry_run_summary_json(
     assert summary["symbols_total"] == 1
     assert summary["fetched"] == 1
     assert summary["zip_rebuilds"] == []
+
+
+# ---------------------------------------------------------------------------
+# --sync-vendor-delta 钩子（审查修复：显式路径加载 + 集成覆盖）
+# ---------------------------------------------------------------------------
+
+
+def _main_with_fake_api(
+    updater: object,
+    monkeypatch: pytest.MonkeyPatch,
+    argv: list[str],
+) -> tuple[int, dict[str, object]]:
+    """跑 updater._main，tushare API 用 fake（无网络），捕获 stdout JSON。"""
+    class _FakeTushareProvider:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def _resolve_pro_api(self) -> object:
+            return _fake_pro()
+
+        def _call_with_retry(self, fn: object) -> object:
+            return fn()
+
+    monkeypatch.setattr(updater, "TushareProvider", _FakeTushareProvider)
+    monkeypatch.setenv("TUSHARE_TOKEN", "test-token")
+    output: list[str] = []
+
+    class _Stdout:
+        def write(self, text: str) -> int:
+            output.append(text)
+            return len(text)
+
+        def flush(self) -> None:
+            return None
+
+    monkeypatch.setattr(updater.sys, "stdout", _Stdout())
+    exit_code = updater._main(argv)
+    summary = json.loads("".join(output))
+    return exit_code, summary
+
+
+def _full_daily_index(root: Path) -> Path:
+    """用 build_vendor_zip_daily_index 生成完整 index（updater 增量更新的对象）。"""
+    from stock_analyzer.data.vendor_zip_overlay import write_vendor_zip_daily_index
+
+    index_path = root / "index" / "daily_index.json"
+    write_vendor_zip_daily_index(root=root, output_path=index_path)
+    return index_path
+
+
+def test_main_sync_vendor_delta_runs_incremental_import(
+    updater: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """钩子成功路径：ZIP+索引更新后自动增量同步 delta 库。"""
+    _daily_fixture(tmp_path)
+    _factor_fixture(tmp_path)
+    index_path = _full_daily_index(tmp_path)
+    delta_db = tmp_path / "delta" / "market_delta.duckdb"
+
+    exit_code, summary = _main_with_fake_api(
+        updater,
+        monkeypatch,
+        [
+            "--vendor-root",
+            str(tmp_path),
+            "--end-date",
+            "2025-07-20",
+            "--interval-sec",
+            "0",
+            "--index-path",
+            str(index_path),
+            "--sync-vendor-delta",
+            str(delta_db),
+        ],
+    )
+
+    assert exit_code == 0
+    assert summary["delta_sync"]["updated"] is True
+    assert summary["delta_sync"]["exit_code"] == 0
+    # delta 库已含 600000 的两行（07-17 旧行 + 07-20 新行）。
+    from stock_analyzer.data.market_warehouse import MarketWarehouse
+
+    warehouse = MarketWarehouse(
+        db_path=delta_db, package_root=tmp_path / "delta" / "package"
+    )
+    frame = warehouse.fetch_all_daily_bars(symbol="600000")
+    assert len(frame) == 2
+    # qfq 最新因子锚定 07-20（=1.0）：新行 close 保持 raw 值 9.5。
+    assert float(frame["close"].iloc[-1]) == pytest.approx(9.5)
+
+
+def test_main_sync_vendor_delta_degraded_on_import_failure(
+    updater: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """钩子失败降级：updated=False + exit_code，updater 主流程不受影响。"""
+    _daily_fixture(tmp_path)
+    _factor_fixture(tmp_path)
+    # index 文件缺失：updater 主流程回退全扫描不失败，但 import 脚本
+    # 构造 provider 时需要加载 index → 钩子降级（exit_code != 0）。
+    missing_index = tmp_path / "index" / "daily_index.json"
+    delta_db = tmp_path / "delta" / "market_delta.duckdb"
+
+    exit_code, summary = _main_with_fake_api(
+        updater,
+        monkeypatch,
+        [
+            "--vendor-root",
+            str(tmp_path),
+            "--end-date",
+            "2025-07-20",
+            "--interval-sec",
+            "0",
+            "--index-path",
+            str(missing_index),
+            "--sync-vendor-delta",
+            str(delta_db),
+        ],
+    )
+
+    assert exit_code == 0
+    assert summary["delta_sync"]["updated"] is False
+    assert summary["delta_sync"]["exit_code"] != 0
+    assert not delta_db.exists()  # 同步未写入任何数据

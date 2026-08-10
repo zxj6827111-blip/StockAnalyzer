@@ -44,13 +44,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 import time
 import zipfile
+from contextlib import nullcontext
 from datetime import date
 from pathlib import Path
 
 import pandas as pd
+
+logger = logging.getLogger("import_vendor_zip_to_delta")
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -161,27 +165,84 @@ def _delta_latest_dates(
     return warehouse.latest_daily_dates(symbols=symbols)
 
 
-def _factor_entry_index(factor_archive: Path) -> dict[str, str]:
-    """Map ``<ts_code>.csv`` -> entry name (one namelist pass, then direct lookups)."""
+def _delta_max_history_depth(
+    warehouse: MarketWarehouse,
+    symbols: list[str],
+) -> int:
+    """Max per-symbol row count stored in the delta for ``symbols``.
+
+    The qfq drift refresh must rewrite at least as many rows as the baseline
+    holds — a re-anchoring shifts ALL history, so rows older than
+    ``--limit-days`` would otherwise keep stale factors after the refresh.
+    Returns 0 when the table is missing or unreadable (caller falls back to
+    the plain ``--limit-days`` depth).
+    """
+    if warehouse is None or not warehouse.db_path.exists():
+        return 0
+    from stock_analyzer.data.market_warehouse import _DAILY_TABLE
+
+    if not warehouse._table_exists(_DAILY_TABLE):  # noqa: SLF001
+        return 0
+    placeholders = ", ".join("?" for _ in symbols)
+    query = f"""
+        SELECT MAX(cnt) FROM (
+            SELECT symbol, COUNT(*) AS cnt
+            FROM {_DAILY_TABLE}
+            WHERE symbol IN ({placeholders})
+            GROUP BY symbol
+        )
+    """
+    try:
+        with warehouse._connect_readonly() as connection:  # noqa: SLF001
+            row = connection.execute(query, symbols).fetchone()
+    except Exception as exc:
+        logger.debug("delta depth query failed; drift refresh uses --limit-days: %s", exc)
+        return 0
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def _entry_year(name: str) -> int:
+    """Leading path segment of a factor ZIP entry (the calendar year)."""
+    head = name.replace("\\", "/").split("/", 1)[0]
+    try:
+        return int(head)
+    except ValueError:
+        return 0
+
+
+def _factor_entry_index(archive: zipfile.ZipFile) -> dict[str, str]:
+    """Map ``<ts_code>.csv`` -> entry name (one namelist pass, then direct lookups).
+
+    The factor ZIP keeps one entry per year (``<year>/<ts_code>.csv``); the
+    mapping keeps the newest year only, because the drift check needs the
+    factor value on the delta anchor date, and namelist order across years is
+    not guaranteed after an archive rebuild. ``archive`` must be the already
+    open factor ZIP (the caller opens it once for the whole scan).
+    """
     mapping: dict[str, str] = {}
-    with zipfile.ZipFile(factor_archive) as archive:
-        for name in archive.namelist():
-            if _is_zip_noise(name):
-                continue
-            file_name = Path(name.replace("\\", "/")).name
-            if file_name.lower().endswith(".csv"):
-                mapping[file_name[:-4].upper()] = name
+    for name in archive.namelist():
+        if _is_zip_noise(name):
+            continue
+        file_name = Path(name.replace("\\", "/")).name
+        if file_name.lower().endswith(".csv"):
+            ts_code = file_name[:-4].upper()
+            previous = mapping.get(ts_code)
+            if previous is None or _entry_year(name) > _entry_year(previous):
+                mapping[ts_code] = name
     return mapping
 
 
 def _factor_value_on_anchor(
-    factor_archive: Path,
+    archive: zipfile.ZipFile,
     entry_index: dict[str, str],
     symbol: str,
     anchor_date: date,
 ) -> float | None:
     """Factor value on the delta anchor date, or None when undecidable.
 
+    ``archive`` must be the already-open qfq factor ZIP (the caller opens it
+    once for the whole drift scan — re-opening it per symbol would re-parse
+    the ~80k-entry central directory for every one of thousands of symbols).
     None means "no drift signal": the symbol has no factor entry at all or
     the anchor date is not a factor trading day. A value != 1.0 (beyond
     tolerance) means the qfq series was re-anchored since the baseline.
@@ -190,12 +251,11 @@ def _factor_value_on_anchor(
     entry_name = entry_index.get(ts_code.upper())
     if entry_name is None:
         return None
-    with zipfile.ZipFile(factor_archive) as archive:
-        try:
-            with archive.open(entry_name) as stream:
-                raw = pd.read_csv(stream)
-        except KeyError:
-            return None
+    try:
+        with archive.open(entry_name) as stream:
+            raw = pd.read_csv(stream)
+    except KeyError:
+        return None
     try:
         series = _parse_vendor_factor_frame(raw, symbol=symbol)
     except DataSourceError:
@@ -233,8 +293,17 @@ def _delta_anchor_dates(
     try:
         with warehouse._connect_readonly() as connection:  # noqa: SLF001
             rows = connection.execute(query, symbols).fetchall()
-    except Exception:
-        # 旧库没有 adjustment_anchor_date 列：无法检测漂移，保守跳过。
+    except Exception as exc:
+        # 旧库没有 adjustment_anchor_date 列：无法检测漂移，保守跳过。但这也会
+        # 掩盖真正的读失败（锁冲突/文件损坏），所以区分并打日志，避免漂移
+        # 检测静默失效时无从排查。
+        message = str(exc).lower()
+        if "no such column" in message or "does not exist" in message or "binder" in message:
+            logger.debug("delta anchor column missing; drift detection skipped: %s", exc)
+        else:
+            logger.warning(
+                "delta anchor query failed; drift detection skipped: %s", exc
+            )
         return {}
     anchors: dict[str, date] = {}
     for raw_symbol, raw_date in rows:
@@ -376,39 +445,48 @@ def _main(argv: list[str] | None = None) -> int:
             factor_archive = (
                 provider._root / _QFQ_FACTORS_DIR_NAME / _QFQ_FACTORS_ARCHIVE_NAME
             )
-            entry_index = (
-                _factor_entry_index(factor_archive)
-                if provider.price_series_mode == "qfq" and factor_archive.exists()
-                else {}
-            )
             fresh_symbols: list[str] = []
             full_import_symbols: list[str] = []
             drift_symbols: list[str] = []
-            for symbol in symbols:
-                delta_date = delta_latest.get(symbol)
-                if delta_date is None:
-                    full_import_symbols.append(symbol)
-                    continue
-                # 因子漂移检测覆盖所有已有 delta 基线的符号：即使当日无新
-                # 数据（停牌），除权也会重标定全部历史，需要整段重算。
-                anchor_date = anchors.get(symbol)
-                if anchor_date is not None and entry_index:
-                    factor_value = _factor_value_on_anchor(
-                        factor_archive,
-                        entry_index,
-                        symbol,
-                        anchor_date,
-                    )
-                    if (
-                        factor_value is not None
-                        and abs(factor_value - 1.0) > _QFQ_ANCHOR_TOLERANCE
-                    ):
-                        drift_symbols.append(symbol)
+            # 因子归档只打开一次（建索引 + 逐符号漂移检测共用）：逐符号重建
+            # ZipFile 会反复解析 ~8 万条中央目录，是全市场增量运行的主要耗时。
+            archive_context: object
+            if provider.price_series_mode == "qfq" and factor_archive.exists():
+                archive_context = zipfile.ZipFile(factor_archive)
+            else:
+                archive_context = nullcontext()
+            with archive_context as factor_zip:
+                entry_index = (
+                    _factor_entry_index(factor_zip)
+                    if factor_zip is not None
+                    else {}
+                )
+                for symbol in symbols:
+                    delta_date = delta_latest.get(symbol)
+                    if delta_date is None:
+                        full_import_symbols.append(symbol)
                         continue
-                zip_date = index_latest.get(symbol)
-                if zip_date is None or zip_date <= delta_date:
-                    continue
-                fresh_symbols.append(symbol)
+                    # 因子漂移检测覆盖所有已有 delta 基线的符号：即使当日无新
+                    # 数据（停牌），除权也会重标定全部历史，需要整段重算。
+                    anchor_date = anchors.get(symbol)
+                    if anchor_date is not None and entry_index:
+                        assert factor_zip is not None
+                        factor_value = _factor_value_on_anchor(
+                            factor_zip,
+                            entry_index,
+                            symbol,
+                            anchor_date,
+                        )
+                        if (
+                            factor_value is not None
+                            and abs(factor_value - 1.0) > _QFQ_ANCHOR_TOLERANCE
+                        ):
+                            drift_symbols.append(symbol)
+                            continue
+                    zip_date = index_latest.get(symbol)
+                    if zip_date is None or zip_date <= delta_date:
+                        continue
+                    fresh_symbols.append(symbol)
 
             fresh_frames: list[pd.DataFrame] = []
             fresh_rows = 0
@@ -426,8 +504,13 @@ def _main(argv: list[str] | None = None) -> int:
                 )
             drift_frames: list[pd.DataFrame] = []
             if drift_symbols:
+                # 重算深度覆盖 delta 基线实际深度：除权重标定的是全部历史，
+                # 只重算 --limit-days 窗口会让比基线更早的行保留旧因子。
+                drift_limit = max(
+                    limit, _delta_max_history_depth(warehouse, drift_symbols)
+                )
                 drift_frames = provider._load_vendor_daily_batch(  # noqa: SLF001
-                    symbols=drift_symbols, limit=limit
+                    symbols=drift_symbols, limit=drift_limit
                 )
 
             all_frames = fresh_frames + full_frames + drift_frames

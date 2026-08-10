@@ -1783,22 +1783,30 @@ class MarketWarehouse:
             connection.register("daily_stage_df", payload)
             try:
                 if overwrite_existing:
-                    connection.execute(
-                        f"""
-                        DELETE FROM {_DAILY_TABLE}
-                        WHERE (symbol, date) IN (
-                            SELECT symbol, date FROM daily_stage_df
+                    # DELETE + INSERT 必须同事务：两步之间进程崩溃会把已删
+                    # 未插的缺口留在库里（重跑可自愈，但中间态无日志可查）。
+                    connection.execute("BEGIN TRANSACTION")
+                    try:
+                        connection.execute(
+                            f"""
+                            DELETE FROM {_DAILY_TABLE}
+                            WHERE (symbol, date) IN (
+                                SELECT symbol, date FROM daily_stage_df
+                            )
+                            """
                         )
-                        """
-                    )
-                    connection.execute(
-                        f"""
-                        INSERT INTO {_DAILY_TABLE} ({", ".join(columns)})
-                        SELECT {", ".join(columns)}
-                        FROM daily_stage_df
-                        ORDER BY date
-                        """
-                    )
+                        connection.execute(
+                            f"""
+                            INSERT INTO {_DAILY_TABLE} ({", ".join(columns)})
+                            SELECT {", ".join(columns)}
+                            FROM daily_stage_df
+                            ORDER BY date
+                            """
+                        )
+                    except Exception:
+                        connection.execute("ROLLBACK")
+                        raise
+                    connection.execute("COMMIT")
                     stored = len(payload)
                 else:
                     stored = int(
