@@ -1,27 +1,21 @@
 """#31 pre-holiday position reduction (CalendarFactorEngine) acceptance tests.
 
-These tests directly exercise the date-triggered branch of
-``CalendarFactorEngine.evaluate``, which the existing week6 execution tests
-(test_service_week6_execution.py) only reach indirectly through the
-position-multiplier scaling path.
+PRD semantics: the last ``pre_holiday_reduce_days`` (default 3) trading days
+before a long holiday —— 春节/国庆/五一/清明/中秋 blocks with >= 3 consecutive
+closed days —— get ``position_multiplier = max_position_multiplier`` (0.5);
+every other date keeps 1.0.
 
-ACTUAL IMPLEMENTATION SEMANTICS (vs PRD):
-- PRD (#31): 长假（春节/国庆）前 3 个交易日自动降仓 50%。
-- Implementation (week6/engines.py:145-166): 降仓触发条件是
-  ``days_to_weekend = max(0, 4 - weekday) <= pre_holiday_reduce_days``，
-  即「距本周五的天数 ≤ 3」的周内近似，与真实长假（春节/国庆）日期无关。
-  默认配置（pre_holiday_reduce_days=3）下，每周二至周五（以及周末）都会触发
-  0.5 倍降仓——比 PRD 的「前 3 个交易日」多覆盖周二（4 个交易日），
-  且普通周同样降仓，不感知春节/国庆长假日历。
-
-The assertions below follow the implemented algorithm (per audit instruction);
-the divergence from the PRD is intentional and documented in the docstrings.
+The engine detects long holidays via
+``stock_analyzer.market_calendar.is_a_share_trading_day``; the dates asserted
+below follow that calendar's 2026 A-share schedule (spring festival closed
+2026-02-15..02-23, qingming 04-04..04-06, labor day 05-01..05-05, mid-autumn
+09-25..09-27, national day 10-01..10-07).
 """
 
 from __future__ import annotations
 
 from datetime import date
-from typing import Any, cast
+from typing import cast
 
 import pytest
 
@@ -61,94 +55,128 @@ def _evaluate(day: date, config: HolidayRiskConfig = _DEFAULT_CONFIG) -> dict[st
 
 
 @pytest.mark.parametrize(
-    ("day", "expected_days_to_weekend"),
+    ("day", "expected_days_until_holiday"),
     [
-        # Tue=3d to weekend, Wed=2d, Thu=1d, Fri=0d - implementation's
-        # "pre-holiday window" covers the last 4 trading days of the week
-        # (PRD says the last 3 trading days before a long holiday).
-        (date(2026, 3, 3), 3),
-        (date(2026, 3, 4), 2),
-        (date(2026, 3, 5), 1),
-        (date(2026, 3, 6), 0),
-        # Weekend days are also treated as pre-holiday (not trading days, but
-        # the implementation does not exclude them).
-        (date(2026, 3, 7), 0),
-        (date(2026, 3, 8), 0),
+        # 春节 2026: 放假 02-15..02-23，前最后 3 个交易日为 02-13/02-12/02-11
+        (date(2026, 2, 13), 1),
+        (date(2026, 2, 12), 2),
+        (date(2026, 2, 11), 3),
+        # 国庆 2026: 放假 10-01..10-07，前最后 3 个交易日为 09-30/09-29/09-28
+        (date(2026, 9, 30), 1),
+        (date(2026, 9, 29), 2),
+        (date(2026, 9, 28), 3),
+        # 清明 2026: 放假 04-04..04-06，前最后 3 个交易日为 04-03/04-02/04-01
+        (date(2026, 4, 3), 1),
+        (date(2026, 4, 2), 2),
+        (date(2026, 4, 1), 3),
+        # 五一 2026: 放假 05-01..05-05，前最后 3 个交易日为 04-30/04-29/04-28
+        (date(2026, 4, 30), 1),
+        (date(2026, 4, 29), 2),
+        (date(2026, 4, 28), 3),
+        # 中秋 2026: 放假 09-25..09-27（3 天连休，同样视为长假）
+        (date(2026, 9, 24), 1),
     ],
 )
-def test_calendar_factor_pre_holiday_window_reduces_position_to_half(
+def test_calendar_factor_long_holiday_last_trading_days_reduce_to_half(
     day: date,
-    expected_days_to_weekend: int,
+    expected_days_until_holiday: int,
 ) -> None:
-    """Days within `pre_holiday_reduce_days` of the weekend get multiplier 0.5.
-
-    PRD semantic: 长假（春节/国庆）前第 1/2/3 个交易日 → 0.5。
-    Actual semantic: 距本周五天数 ≤ 3（每周二至周五+周末）→ 0.5，与真实长假无关。
-    """
+    """长假前第 1/2/3 个交易日 → position_multiplier=0.5。"""
     result = _evaluate(day)
 
     assert _as_bool(result["pre_holiday_reduce"]) is True
     assert _as_float(result["position_multiplier"]) == 0.5
-    assert _as_int(result["days_to_weekend"]) == expected_days_to_weekend
+    assert _as_int(result["days_until_holiday"]) == expected_days_until_holiday
+
+
+@pytest.mark.parametrize(
+    ("day", "expected_days_until_holiday"),
+    [
+        # 春节前第 4/5 个交易日（及更早）→ 1.0
+        (date(2026, 2, 10), 4),
+        (date(2026, 2, 9), 5),
+        # 国庆前（中间隔着中秋假期）第 4 个交易日及更早 → 1.0
+        (date(2026, 9, 21), 4),
+        # 清明前第 4 个交易日 → 1.0
+        (date(2026, 3, 31), 4),
+        # 五一前第 4 个交易日 → 1.0
+        (date(2026, 4, 27), 4),
+    ],
+)
+def test_calendar_factor_long_holiday_earlier_trading_days_keep_full(
+    day: date,
+    expected_days_until_holiday: int,
+) -> None:
+    """长假前第 4 个交易日及更早 → position_multiplier=1.0。"""
+    result = _evaluate(day)
+
+    assert _as_bool(result["pre_holiday_reduce"]) is False
+    assert _as_float(result["position_multiplier"]) == 1.0
+    assert _as_int(result["days_until_holiday"]) == expected_days_until_holiday
 
 
 @pytest.mark.parametrize(
     "day",
     [
-        date(2026, 3, 2),  # Monday = 4 trading days before the weekend (4th day or earlier)
-        date(2026, 3, 9),  # ordinary Monday
-        date(2026, 3, 16),  # ordinary Monday
+        date(2026, 3, 2),  # 普通周一
+        date(2026, 3, 3),  # 普通周二（旧周内近似下会误降仓）
+        date(2026, 3, 4),  # 普通周三
+        date(2026, 3, 5),  # 普通周四
+        date(2026, 3, 6),  # 普通周五
+        date(2026, 8, 10),  # 无长假时段内的普通交易日
     ],
 )
-def test_calendar_factor_outside_pre_holiday_window_keeps_full_position(day: date) -> None:
-    """Days with days_to_weekend > pre_holiday_reduce_days keep multiplier 1.0.
-
-    PRD semantic: 长假前第 4 个交易日或更早 → 1.0（不降仓）；普通日期 → 1.0。
-    Actual semantic: 周一（距周末 4 天）→ 1.0。
-    """
+def test_calendar_factor_ordinary_week_keeps_full_position(day: date) -> None:
+    """普通周（无长假临近）任何交易日 → 1.0。"""
     result = _evaluate(day)
 
     assert _as_bool(result["pre_holiday_reduce"]) is False
     assert _as_float(result["position_multiplier"]) == 1.0
-    assert _as_int(result["days_to_weekend"]) == 4
+    assert _as_int(result["days_until_holiday"]) == 0
 
 
-def test_calendar_factor_reduce_days_zero_triggers_only_on_weekend_eve() -> None:
-    """pre_holiday_reduce_days=0 narrows the window to days_to_weekend==0 (Friday).
+@pytest.mark.parametrize(
+    "day",
+    [
+        date(2026, 2, 14),  # 春节前最后一个周六（非交易日）
+        date(2026, 2, 17),  # 春节假期中
+        date(2026, 3, 7),  # 普通周六
+        date(2026, 3, 8),  # 普通周日
+        date(2026, 10, 1),  # 国庆假期中
+    ],
+)
+def test_calendar_factor_non_trading_days_keep_full_position(day: date) -> None:
+    """非交易日不降仓 → 1.0（PRD：其他日期 1.0）。"""
+    result = _evaluate(day)
 
-    Documents the configurable boundary: with a 0-day window only the weekend
-    eve (Friday, plus weekends) is treated as pre-holiday.
-    """
+    assert _as_bool(result["pre_holiday_reduce"]) is False
+    assert _as_float(result["position_multiplier"]) == 1.0
+    assert _as_int(result["days_until_holiday"]) == 0
+
+
+def test_calendar_factor_reduce_days_zero_triggers_only_on_last_trading_day() -> None:
+    """pre_holiday_reduce_days=0 时仅长假前最后 1 个交易日触发（边界语义）。"""
     config = HolidayRiskConfig(pre_holiday_reduce_days=0, max_position_multiplier=0.5)
 
-    monday = _evaluate(date(2026, 3, 2), config=config)
-    thursday = _evaluate(date(2026, 3, 5), config=config)
-    friday = _evaluate(date(2026, 3, 6), config=config)
+    last_trading_day = _evaluate(date(2026, 2, 13), config=config)
+    second_to_last = _evaluate(date(2026, 2, 12), config=config)
+    third_to_last = _evaluate(date(2026, 2, 11), config=config)
+    ordinary_friday = _evaluate(date(2026, 3, 6), config=config)
 
-    assert _as_float(monday["position_multiplier"]) == 1.0
-    assert _as_bool(monday["pre_holiday_reduce"]) is False
-    assert _as_float(thursday["position_multiplier"]) == 1.0
-    assert _as_bool(thursday["pre_holiday_reduce"]) is False
-    assert _as_float(friday["position_multiplier"]) == 0.5
-    assert _as_bool(friday["pre_holiday_reduce"]) is True
+    assert _as_float(last_trading_day["position_multiplier"]) == 0.5
+    assert _as_bool(last_trading_day["pre_holiday_reduce"]) is True
+    assert _as_float(second_to_last["position_multiplier"]) == 1.0
+    assert _as_bool(second_to_last["pre_holiday_reduce"]) is False
+    assert _as_float(third_to_last["position_multiplier"]) == 1.0
+    assert _as_bool(third_to_last["pre_holiday_reduce"]) is False
+    assert _as_float(ordinary_friday["position_multiplier"]) == 1.0
+    assert _as_bool(ordinary_friday["pre_holiday_reduce"]) is False
 
 
-def test_calendar_factor_divergence_from_prd_long_holiday_dates() -> None:
-    """Documents the divergence between PRD long-holiday semantics and the
-    weekday-based approximation (asserts the implementation, not the PRD).
+def test_calendar_factor_max_position_multiplier_is_configurable() -> None:
+    """max_position_multiplier 可配置：长假前交易日按其值降仓。"""
+    config = HolidayRiskConfig(pre_holiday_reduce_days=3, max_position_multiplier=0.4)
 
-    - 2026-02-10 is the 4th trading day before 春节 (CNY 2026-02-17 is a
-      Tuesday; pre-holiday trading days are 02-11/02-12/02-13). PRD says the
-      4th trading day must NOT reduce, but the implementation reduces (0.5)
-      because it is a Tuesday (days_to_weekend=3).
-    - 2026-03-03 is an ordinary Tuesday far away from any long holiday. PRD
-      says ordinary dates must keep 1.0, but the implementation reduces (0.5)
-      purely based on the weekday.
-    """
-    pre_cny_4th_trading_day = _evaluate(date(2026, 2, 10))
-    ordinary_tuesday = _evaluate(date(2026, 3, 3))
-
-    assert _as_float(pre_cny_4th_trading_day["position_multiplier"]) == 0.5
-    assert _as_bool(pre_cny_4th_trading_day["pre_holiday_reduce"]) is True
-    assert _as_float(ordinary_tuesday["position_multiplier"]) == 0.5
-    assert _as_bool(ordinary_tuesday["pre_holiday_reduce"]) is True
+    result = _evaluate(date(2026, 2, 13), config=config)
+    assert _as_float(result["position_multiplier"]) == 0.4
+    assert _as_bool(result["pre_holiday_reduce"]) is True
