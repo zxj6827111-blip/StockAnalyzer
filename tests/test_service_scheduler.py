@@ -1070,6 +1070,39 @@ def test_week7_cloud_backup_watchdog_reads_shared_runtime_state() -> None:
     assert status["is_offline"] is False
 
 
+def test_week7_sim_broker_weekly_job_runs_only_on_friday_trigger() -> None:
+    config = _load_test_config()
+    config.scheduler.premarket_time = "23:59"
+    config.scheduler.auction_report_time = "23:59"
+    config.scheduler.close_reconcile_time = "23:59"
+    config.scheduler.week4_acceptance_time = "23:59"
+    config.sim_broker_weekly.run_time = "17:00"
+    service = _new_service(config)
+
+    calls: list[dict[str, object]] = []
+
+    def _fake_weekly(**kwargs: object) -> dict[str, object]:
+        calls.append(dict(kwargs))
+        return {"status": "healthy", "score": 95.0}
+
+    _patch_attr(service, "run_week7_sim_broker_weekly", _fake_weekly)
+
+    thursday = service.run_due_jobs(now=datetime.fromisoformat("2026-03-05T17:00:00"))
+    thursday_job = _job_result(thursday, "sim_broker_weekly")
+    assert _as_bool(thursday_job["ran"]) is False
+    assert thursday_job["detail"] == "not_scheduled_today"
+
+    friday = service.run_due_jobs(now=datetime.fromisoformat("2026-03-06T17:00:00"))
+    friday_job = _job_result(friday, "sim_broker_weekly")
+    assert _as_bool(friday_job["ran"]) is True
+    assert _as_bool(friday_job["success"]) is True
+    assert calls == [{"days": 7, "source_trace_id": "scheduler-sim-broker-weekly"}]
+
+    duplicate = service.run_due_jobs(now=datetime.fromisoformat("2026-03-06T17:30:00"))
+    duplicate_job = _job_result(duplicate, "sim_broker_weekly")
+    assert _as_bool(duplicate_job["ran"]) is False
+
+
 def test_scheduler_blocked_when_bootstrap_required_and_incomplete(tmp_path: Path) -> None:
     config = _load_test_config()
     config.training.bootstrap_auto_run_on_first_start = False

@@ -16168,6 +16168,18 @@ class StockAnalyzerService:
                 weekdays=trading_weekdays,
                 date_predicate=_last_trading_day_of_month,
             )
+        if (
+            self._config.sim_broker_weekly.enabled
+            and str(self._config.sim_broker_weekly.run_time).strip()
+        ):
+            self._scheduler.register(
+                name="sim_broker_weekly",
+                trigger_hhmm=self._config.sim_broker_weekly.run_time,
+                callback=self._job_sim_broker_weekly,
+                latest_hhmm="23:59",
+                weekdays=(4,),
+                date_predicate=trading_day_filter,
+            )
 
     def _job_premarket_scan(self) -> dict[str, object]:
         global_snapshot_report = self._collect_global_market_snapshot(source_trace_id="premarket")
@@ -17468,6 +17480,13 @@ class StockAnalyzerService:
 
     def _job_monthly_review_report(self) -> dict[str, object]:
         report = self.build_monthly_review_report()
+        return {"report": report}
+
+    def _job_sim_broker_weekly(self) -> dict[str, object]:
+        report = self.run_week7_sim_broker_weekly(
+            days=7,
+            source_trace_id="scheduler-sim-broker-weekly",
+        )
         return {"report": report}
 
     def _job_tdx_offline_sync(self) -> dict[str, object]:

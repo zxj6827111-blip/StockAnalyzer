@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 from stock_analyzer.command.channel import CommandEnvelope, SignedCommandProcessor
@@ -144,3 +144,42 @@ def test_week7_sim_broker_weekly_disabled_returns_code() -> None:
     report = service.run_week7_sim_broker_weekly(days=7)
     assert report["accepted"] is False
     assert _as_text(report["code"]) == "disabled"
+
+
+def test_week7_sim_broker_weekly_job_registered_with_weekly_trigger() -> None:
+    config = _load_test_config()
+    assert _as_text(config.sim_broker_weekly.run_time) == "17:00"
+    service = StockAnalyzerService(config=config)
+
+    job = service._scheduler._jobs.get("sim_broker_weekly")
+    assert job is not None
+    assert job.trigger_time.isoformat() == "17:00:00"
+    assert job.weekdays == frozenset({4})
+    assert job.date_predicate is not None
+    assert job.date_predicate(date(2026, 3, 6)) is True
+    assert job.date_predicate(date(2026, 3, 7)) is False
+
+
+def test_week7_sim_broker_weekly_job_not_registered_when_disabled() -> None:
+    config = _load_test_config()
+    config.sim_broker_weekly.enabled = False
+    service = StockAnalyzerService(config=config)
+
+    assert "sim_broker_weekly" not in service._scheduler._jobs
+
+
+def test_week7_sim_broker_weekly_job_callback_invokes_weekly_report() -> None:
+    config = _load_test_config()
+    service = StockAnalyzerService(config=config)
+    calls: list[dict[str, object]] = []
+
+    def _fake_run_weekly(**kwargs: object) -> dict[str, object]:
+        calls.append(dict(kwargs))
+        return {"status": "healthy", "score": 95.0}
+
+    service.run_week7_sim_broker_weekly = _fake_run_weekly  # type: ignore[method-assign]
+
+    payload = service._job_sim_broker_weekly()
+    report = _as_mapping(payload["report"])
+    assert _as_text(report["status"]) == "healthy"
+    assert calls == [{"days": 7, "source_trace_id": "scheduler-sim-broker-weekly"}]
