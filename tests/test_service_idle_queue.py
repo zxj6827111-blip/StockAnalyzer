@@ -21,6 +21,7 @@ class _MockProvider:
 def _load_test_config(tmp_path: Path) -> StockAnalyzerConfig:
     root = Path(__file__).resolve().parents[1]
     config = load_config(root / "config" / "default.yaml")
+    config.command_channel.state_persist_path = str(tmp_path / "runtime_state.json")
     config.scheduler.premarket_time = "08:30"
     config.scheduler.auction_report_time = "23:59"
     config.scheduler.close_reconcile_time = "23:59"

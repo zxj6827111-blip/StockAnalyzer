@@ -35,6 +35,7 @@ def _build_client(monkeypatch: Any, tmp_path: Path) -> tuple[TestClient, _FakeSe
     config.scheduler.leader_lock_enabled = True
     config.scheduler.leader_lock_stale_after_sec = 300
     config.scheduler.leader_lock_path = str(tmp_path / "scheduler_leader.lock")
+    config.command_channel.state_persist_path = str(tmp_path / "runtime_state.json")
     monkeypatch.setattr(main_module, "_config", config)
     service = _FakeService()
     monkeypatch.setattr(main_module, "_service", service)

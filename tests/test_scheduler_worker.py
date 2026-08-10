@@ -42,6 +42,7 @@ def _test_config(lock_path: Path, *, leader_lock_enabled: bool = True) -> StockA
     config.scheduler.leader_lock_enabled = leader_lock_enabled
     config.scheduler.leader_lock_stale_after_sec = 300
     config.scheduler.leader_lock_path = str(lock_path)
+    config.command_channel.state_persist_path = str(lock_path.parent / "runtime_state.json")
     return config
 
 
