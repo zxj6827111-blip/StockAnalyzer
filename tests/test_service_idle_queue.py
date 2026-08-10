@@ -460,6 +460,7 @@ def test_idle_queue_we_learn_01_blocks_stale_market_warehouse_report(
     tmp_path: Path,
 ) -> None:
     config = _load_test_config(tmp_path)
+    config.market_warehouse.enabled = True
     config.auto_promotion.notify_on_training_summary = False
     service = StockAnalyzerService(config=config)
     service._evolution_project_root = tmp_path

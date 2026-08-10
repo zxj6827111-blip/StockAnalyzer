@@ -26,6 +26,7 @@ def _as_int(value: object) -> int:
 def test_service_can_generate_baseline_report(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[1]
     config = load_config(root / "config" / "default.yaml")
+    config.data_source.primary = "synthetic"
     config.training.artifact_path = str(tmp_path / "missing_model.json")
     config.training.min_samples = 40
     output_path = tmp_path / "artifacts" / "acceptance" / "baseline_report.json"
@@ -51,6 +52,7 @@ def test_service_can_generate_baseline_report(tmp_path: Path) -> None:
 def test_service_baseline_report_uses_native_backends_after_training(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[1]
     config = load_config(root / "config" / "default.yaml")
+    config.data_source.primary = "synthetic"
     artifact_path = tmp_path / "model.json"
     output_path = tmp_path / "artifacts" / "acceptance" / "baseline_report.json"
     config.training.artifact_path = str(artifact_path)
@@ -95,6 +97,7 @@ def test_service_restart_preserves_native_sidecar_backends(tmp_path: Path) -> No
 
     root = Path(__file__).resolve().parents[1]
     config = load_config(root / "config" / "default.yaml")
+    config.data_source.primary = "synthetic"
     artifact_path = tmp_path / "model.json"
     config.training.artifact_path = str(artifact_path)
     config.training.min_samples = 40

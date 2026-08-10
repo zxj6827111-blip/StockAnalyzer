@@ -160,6 +160,7 @@ _SLOW_TEST_FILES = (
     "tests/test_main_news_preview.py",
     "tests/test_service_news_preview.py",
     "tests/test_intraday_factors.py",
+    "tests/test_universe_candidate_selector.py",
 )
 
 # Full-suite stage: run every test under testpaths (except the slow files that
