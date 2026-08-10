@@ -12,7 +12,7 @@ def test_p1_nas_rebuild_wrapper_forces_advisory_compose_override() -> None:
 
     assert "docker-compose.advisory.yml" in script
     assert "docker-compose.runtime.yml" in script
-    assert "docker-compose.runtime.localvol.yml" in script
+    assert "docker-compose.runtime.localvol.yml" not in script
     assert "SKIP_GIT_FETCH" in script
     assert "required_head" in script
     assert "git merge-base --is-ancestor" in script

@@ -12,6 +12,11 @@ make test
 uvicorn stock_analyzer.main:app --reload
 ```
 
+完整上手流程（环境准备 / 安装 / .env 配置 / 启动 / 首次扫描与报告 / CLI 常用命令）见
+[docs/quickstart.md](docs/quickstart.md)；常见问题（认证 401/403、参数冻结 423、
+202 任务查询、artifacts 污染、覆盖率门禁、数据源降级等）见
+[docs/troubleshooting.md](docs/troubleshooting.md)。
+
 ## V1.3 Ops Docs
 
 - `docs/v13_deployment_guide.md`
@@ -116,120 +121,320 @@ SA__NOTIFICATIONS__FEISHU_APP_SECRET=xxx
 
 ## API
 
-- `GET /health`
-- `GET /dashboard` (lightweight web panel)
-- `POST /run/pipeline`
-- `GET /risk/status`
-- `GET /signals/latest`
-- `GET /news/score?symbol=600000&strategy=trend`
-- `GET /news/score/batch?symbols=600000&symbols=000001&strategy=trend`
-- `GET /news/score/watchlist?strategy=trend&limit=20`
-- `GET /news/score/history?limit=50&symbol=&strategy=`
-- `GET /news/score/cache/state`
-- `POST /news/score/cache/clear`
-- `POST /notify/test` (protected when `SA__SECURITY__API_AUTH_ENABLED=true`; disabled
-  unless `SA__SECURITY__NOTIFY_TEST_ENABLED=true`)
-  - Bare `test` / `t` / `c` notification payloads are suppressed by default via
-    `SA__SECURITY__SUPPRESS_PLAIN_TEST_NOTIFICATIONS=true`.
-- `POST /command/execute`
-- `GET /command/state`
-- `GET /wecom/callback` (URL verification in WeCom callback plain/safe mode)
-- `POST /wecom/callback` (receive WeCom text command and execute signed internal command)
-- `GET /feishu/long_connection/status`
-- `POST /feishu/callback` (Feishu webhook mode only; long-connection mode does not require a public callback URL)
-- Text commands include: `help`, `positions`, `trades`, `news`, `newslist`, `newscache state`, `newscache clear [symbol] [strategy]`, `newshistory [limit] [symbol] [strategy]`, `mode`, `mode advisory on/off`, `lifecycle [status] [limit]`, `recstatus <symbol> <recommended|bought|watching|dropped> [note]`, `holdingalerts [warn|info]`, `bias [days] [limit]`
-- `POST /scheduler/run_due` (protected; accepts `job` / `jobs` selectors for targeted runs)
-- `POST /idle/run`
-- `GET /idle/latest`
-- `GET /idle/history?limit=20`
-- `GET /idle/state`
-- `POST /idle/ack`
-- `POST /evolution/run`
-- `POST /evolution/drill`
-- `GET /evolution/latest`
-- `GET /evolution/history?limit=20`
-- `GET /evolution/preflight`
-- `GET /evolution/window_report?days=10&min_runs=5`
-- `POST /evolution/release/attempt`
-- `GET /evolution/release/latest`
-- `GET /evolution/release/history?limit=20`
-- `POST /evolution/release/approval`
-- `GET /evolution/release/approval/latest`
-- `GET /evolution/release/approval/history?limit=20`
-- `POST /evolution/release/ticket`
-- `POST /evolution/release/ticket/execute`
-- `POST /evolution/release/ticket/confirm`
-- `POST /evolution/release/ticket/rollback`
-- `POST /evolution/release/confirmation/watchdog`
-- `GET /evolution/release/ticket/latest`
-- `GET /evolution/release/ticket/history?limit=20`
-- `GET /evolution/release/ticket/timeline?ticket_id=&status=&limit=200`
-- `POST /learning/models/proposal`
-- `POST /train/learning-manifest/shadow-proposal`
-- `GET /learning/models/proposal/latest`
-- `GET /learning/models/proposal/history?limit=20&proposal_id=&status=`
-- `POST /learning/models/proposal/approval`
-- `POST /learning/models/proposal/revoke`
-- `GET /learning/models/proposal/approval/latest`
-- `GET /learning/models/proposal/approval/history?limit=20`
-- `POST /learning/models/release/ticket`
-- `POST /learning/models/release/ticket/execute`
-- `POST /learning/models/release/ticket/confirm`
-- `POST /learning/models/release/ticket/rollback`
-- `POST /learning/models/release/confirmation/watchdog`
-- `GET /learning/models/release/ticket/latest`
-- `GET /learning/models/release/ticket/history?limit=20`
-- `GET /learning/models/release/ticket/timeline?ticket_id=&status=&limit=200`
-- `GET /learning/models/governance/status?proposal_limit=20&ticket_limit=20`
-- `POST /train/models`
-- `POST /backtest/walk_forward`
-- `POST /stress/run`
-- `GET /portfolio/positions`
-- `GET /portfolio/trades?limit=100`
-- `GET /recommendations/lifecycle?status=&limit=120`
-- `GET /portfolio/execution_bias?days=30&limit=200`
-- `POST /portfolio/broker_snapshot`
-- `POST /portfolio/reconcile/run`
-- `GET /portfolio/reconcile/latest`
-- `GET /portfolio/reconcile/weekly?days=7`
-- `GET /dashboard/portfolio?days=7&trade_limit=120`
-- `GET /runtime/sla?recent_runs=50`
-- `GET /runtime/history/archive/status?limit=20`
-- `POST /runtime/history/archive/run`
-- `POST /acceptance/week4/run`
-- `GET /acceptance/week4/latest`
-- `GET /acceptance/week4/history?limit=20`
-- `POST /week5/scan/run`
-- `GET /week5/scan/latest`
-- `GET /week5/scan/history?limit=20`
-- `POST /week6/run`
-- `GET /week6/latest`
-- `GET /week6/history?limit=20`
-- `POST /week6/global/snapshot`
-- `GET /week6/global/snapshot`
-- `GET /week6/global/history?limit=50`
-- `POST /week6/regulatory/watchlist`
-- `GET /week6/regulatory/watchlist`
-- `POST /week7/kill-switch/performance`
-- `GET /week7/kill-switch/history?strategy=&limit=60`
-- `GET /week7/kill-switch/status?strategy=`
-- `POST /week7/kill-switch/reset`
-- `POST /week7/cloud-backup/ping`
-- `GET /week7/cloud-backup/status`
-- `POST /week7/cloud-backup/check`
-- `POST /week7/factor-lifecycle/record`
-- `GET /week7/factor-lifecycle/status?strategy=`
-- `GET /week7/factor-lifecycle/history?strategy=&limit=60`
-- `POST /week7/factor-lifecycle/reset`
-- `POST /week7/sim-broker/run`
-- `GET /week7/sim-broker/latest`
-- `GET /week7/sim-broker/history?limit=20`
-- `GET /dashboard/ops/state`
-- `POST /dashboard/ops/toggle`
-- `POST /dashboard/command/quick`
-- `POST /dashboard/reconcile/quick`
-- `GET /audit/events?limit=200&event_type=&trace_id=`
-- `GET /audit/trace/{trace_id}`
+路由处理器按领域拆分在 `src/stock_analyzer/api/`（20 个路由模块 + `deps.py` 共享依赖 +
+`models.py` 请求模型），`src/stock_analyzer/main.py` 只负责组装 app、挂载 router 与
+前端静态页。总计 **183 个路由**（`api/` 180 个 + `main.py` 的 `/ui` 静态页 3 个）。
+
+认证与约定：
+
+- 写操作端点（POST）经统一依赖 `_verify_api_auth` 鉴权，支持
+  `Authorization: Bearer <token>` 或 `X-SA-API-Key: <token>`（无凭证 401、凭证错误 403；
+  未显式设置 `SA__SECURITY__API_AUTH_ENABLED` 时 fail-closed 强制开启）。
+- 例外：`POST /command/execute` 走签名指令通道（HMAC + 幂等）；`GET/POST /wecom/callback`、
+  `POST /feishu/callback` 使用企微/飞书平台签名与 Token 校验。
+- GET 端点只读、公开；Dashboard 页面端点与 `/ui` 静态页 `include_in_schema=False`，
+  不出现在 `/docs`。
+- **202 异步端点**：长耗时写端点（`POST /run/pipeline`、`POST /evolution/run`、
+  `POST /train/*`、`POST /research/*/report`、`POST /tdx/sync/run`、
+  `POST /warehouse/sync/run` 等）经 FastAPI `BackgroundTasks` 异步执行，立即返回
+  `202 Accepted` + `task_id`（`src/stock_analyzer/ops/background_tasks.py` 注册表，
+  状态 `queued/running/succeeded/failed`），任务状态经 `GET /tasks` /
+  `GET /tasks/{task_id}` 轮询。异步化按模块陆续落地中，未列出的端点仍为同步响应。
+
+### health（`api/health.py`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/health` | 存活探针（版本/构建信息） |
+| GET | `/health/deep` | 深度健康检查（关键依赖与子系统状态） |
+
+### dashboard（`api/dashboard.py`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/dashboard`、`/dashboard/` | Dashboard 网页（`include_in_schema=False`） |
+| GET | `/dashboard/recommendations` | 推荐生命周期网页（`include_in_schema=False`） |
+| GET | `/dashboard/stage` | 阶段状态网页（`include_in_schema=False`） |
+| GET | `/dashboard/portfolio?days=7&trade_limit=120` | 组合快照（持仓/净值曲线/执行质量） |
+| GET | `/dashboard/training-overview?history_limit=6` | 训练进度总览 |
+| GET | `/dashboard/ops/state` | 运维开关状态 |
+| POST | `/dashboard/ops/toggle` | 一键暂停/恢复新买等运维开关 |
+| POST | `/dashboard/command/quick` | 快速指令（暂停买入/清仓/人工持仓等） |
+| POST | `/dashboard/reconcile/quick` | 快速对账录入 |
+
+### news（`api/news.py`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/news/score?symbol=600000&strategy=trend` | 单标的新闻情绪评分预览 |
+| GET | `/news/score/batch?symbols=600000&symbols=000001&strategy=trend` | 批量评分预览 |
+| GET | `/news/score/watchlist?strategy=trend&limit=20` | 关注池评分预览 |
+| GET | `/news/briefing/latest` | 最新早报摘要 |
+| GET | `/news/score/history?limit=50&symbol=&strategy=` | 评分历史 |
+| GET | `/news/score/cache/state` | 评分缓存状态 |
+| POST | `/news/score/cache/clear` | 清空评分缓存 |
+
+### notifications（`api/notifications.py`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/notify/test` | 测试通知通道（需 `SA__SECURITY__NOTIFY_TEST_ENABLED=true`） |
+
+> `POST /notify/test` 在 `SA__SECURITY__API_AUTH_ENABLED=true` 时受 API 鉴权保护；
+> 裸 `test` / `t` / `c` 通知负载默认被
+> `SA__SECURITY__SUPPRESS_PLAIN_TEST_NOTIFICATIONS=true` 抑制。
+
+### commands（`api/commands.py`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/command/execute` | 执行签名指令（HMAC 指令通道，非 API 鉴权） |
+| GET | `/command/state` | 指令通道状态 |
+
+### messaging（`api/messaging.py`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/wecom/callback` | 企微回调 URL 校验（plain/safe 模式，平台签名校验） |
+| POST | `/wecom/callback` | 接收企微文本指令并执行（平台签名校验） |
+| GET | `/feishu/long_connection/status` | 飞书长连接状态 |
+| POST | `/feishu/callback` | 飞书 webhook 回调（仅 webhook 模式，Token 校验） |
+
+企微文本指令：`help`、`positions`、`trades`、`news`、`newslist`、`newscache state`、
+`newscache clear [symbol] [strategy]`、`newshistory [limit] [symbol] [strategy]`、
+`mode`、`mode advisory on/off`、`lifecycle [status] [limit]`、
+`recstatus <symbol> <recommended|bought|watching|dropped> [note]`、
+`holdingalerts [warn|info]`、`bias [days] [limit]`。
+
+### market（`api/market.py`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/run/pipeline` | 运行分析流水线（symbols/策略） |
+| GET | `/risk/status` | 风控状态（降级/熔断/暂停买入） |
+| GET | `/signals/latest` | 最新信号 |
+| POST | `/scheduler/run_due` | 手动触发到期调度任务（`job`/`jobs` 选择器） |
+| POST | `/tdx/sync/run` | 手动触发 TDX 离线包同步 |
+| GET | `/tdx/sync/latest` | 最近一次 TDX 同步结果 |
+| GET | `/tdx/sync/history?limit=20` | TDX 同步历史 |
+| POST | `/warehouse/sync/run` | 手动触发市场仓库同步 |
+| GET | `/warehouse/sync/latest` | 最近一次仓库同步结果 |
+| GET | `/warehouse/sync/status` | 仓库同步状态 |
+| GET | `/warehouse/background/status` | 仓库后台任务状态 |
+| GET | `/warehouse/sync/history?limit=20` | 仓库同步历史 |
+| GET | `/tasks?limit=50` | 最近提交的后台任务列表（新→旧） |
+| GET | `/tasks/{task_id}` | 后台任务生命周期条目（404 表示不存在） |
+
+### idle（`api/idle.py`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/idle/run` | 手动触发闲时任务队列 |
+| GET | `/idle/latest` | 最近一次闲时运行结果 |
+| GET | `/idle/history?limit=20` | 闲时运行历史 |
+| GET | `/idle/state` | 闲时队列状态（观察性） |
+| POST | `/idle/ack` | 手动确认任务（`WD-P0-01` 等） |
+
+### evolution（`api/evolution.py`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/evolution/run` | 运行进化干跑 |
+| POST | `/evolution/drill` | 进化演练 |
+| GET | `/evolution/latest` | 最近进化结果 |
+| GET | `/evolution/history?limit=20` | 进化历史 |
+| GET | `/evolution/preflight` | 生产前置检查 |
+| GET | `/evolution/window_report?days=10&min_runs=5` | 验证窗口报告 |
+| POST | `/evolution/m3/maintenance` | M3 模式记忆维护 |
+| POST | `/evolution/m3/search` | M3 记忆检索 |
+| POST | `/evolution/m8/suggest` | M8 六门增强建议 |
+| POST | `/evolution/release/attempt` | 发布门禁尝试 |
+| GET | `/evolution/release/latest` | 最近发布尝试 |
+| GET | `/evolution/release/history?limit=20` | 发布尝试历史 |
+| POST | `/evolution/release/approval` | 发布审批 |
+| GET | `/evolution/release/approval/latest` | 最近审批 |
+| GET | `/evolution/release/approval/history?limit=20` | 审批历史 |
+| POST | `/evolution/release/ticket` | 创建发布工单 |
+| POST | `/evolution/release/ticket/execute` | 执行发布工单 |
+| POST | `/evolution/release/ticket/confirm` | 确认发布工单 |
+| POST | `/evolution/release/ticket/rollback` | 回滚发布工单 |
+| POST | `/evolution/release/confirmation/watchdog` | 发布确认看门狗 |
+| GET | `/evolution/release/ticket/latest` | 最近发布工单 |
+| GET | `/evolution/release/ticket/history?limit=20` | 发布工单历史 |
+| GET | `/evolution/release/ticket/timeline?ticket_id=&status=&limit=200` | 发布工单时间线 |
+
+### training（`api/training.py`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/train/models` | 训练模型 |
+| POST | `/train/learning-manifest` | 执行学习清单 |
+| POST | `/train/learning-manifest/shadow-validate` | 影子验证 |
+| POST | `/train/learning-manifest/shadow-promote` | 影子晋级 |
+| POST | `/train/learning-manifest/shadow-proposal` | 影子提案 |
+| POST | `/train/execution-risk` | 执行风险评分 |
+| GET | `/train/execution-risk/status` | 执行风险状态 |
+| GET | `/train/execution-risk/history` | 执行风险历史 |
+| GET | `/train/bootstrap/status` | 引导模型就绪状态 |
+
+### learning（`api/learning.py`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/learning/models/proposal` | 创建模型提案 |
+| GET | `/learning/models/proposal/latest` | 最近提案 |
+| GET | `/learning/models/proposal/history?limit=20&proposal_id=&status=` | 提案历史 |
+| POST | `/learning/models/proposal/approval` | 提案审批 |
+| POST | `/learning/models/proposal/revoke` | 提案撤销 |
+| GET | `/learning/models/proposal/approval/latest` | 最近审批 |
+| GET | `/learning/models/proposal/approval/history?limit=20` | 审批历史 |
+| POST | `/learning/models/release/ticket` | 创建发布工单 |
+| POST | `/learning/models/release/ticket/execute` | 执行发布工单 |
+| POST | `/learning/models/release/ticket/confirm` | 确认发布工单 |
+| POST | `/learning/models/release/ticket/rollback` | 回滚发布工单 |
+| POST | `/learning/models/release/confirmation/watchdog` | 发布确认看门狗 |
+| GET | `/learning/models/release/ticket/latest` | 最近发布工单 |
+| GET | `/learning/models/release/ticket/history?limit=20` | 发布工单历史 |
+| GET | `/learning/models/release/ticket/timeline?ticket_id=&status=&limit=200` | 发布工单时间线 |
+| GET | `/learning/models/governance/status?proposal_limit=20&ticket_limit=20` | 治理状态汇总 |
+| POST | `/learning/runtime-history/bootstrap` | 运行时历史引导 |
+| GET | `/learning/status` | 学习状态 |
+| GET | `/learning/store/status` | 学习存储状态 |
+| GET | `/learning/store/metrics` | 学习存储指标 |
+| GET | `/learning/manifests/status` | 清单状态 |
+
+### model_registry（`api/model_registry.py`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/models/registry/promotion-gate` | 模型晋级门禁 |
+| GET | `/models/registry` | 注册表条目 |
+| GET | `/models/registry/status` | 注册表状态 |
+| POST | `/models/registry/register` | 注册模型工件 |
+| POST | `/models/registry/bootstrap-active-champion` | 引导活跃冠军 |
+| POST | `/models/registry/lifecycle` | 更新模型生命周期 |
+| POST | `/models/registry/role` | 更新模型角色 |
+| GET | `/models/registry/{model_id}` | 单模型条目 |
+| POST | `/models/shadow-dataset` | 构建影子数据集 |
+| POST | `/models/champion-shadow-report` | 冠军 vs 影子报告 |
+| POST | `/models/shadow-online-v2-report` | 线上 v2 影子报告 |
+| GET | `/shadow/v2/status` | 影子 v2 状态 |
+| POST | `/models/execution-aware-report` | 执行感知报告 |
+
+### research（`api/research.py`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/research/signal-quality/run` | 信号质量审计 |
+| GET | `/research/signal-quality/latest` | 最近信号质量审计 |
+| GET | `/research/signal-quality/history` | 信号质量审计历史 |
+| POST | `/research/alphalens/report` | Alphalens 归因报告 |
+| POST | `/research/shap/report` | SHAP 稳定性报告 |
+| POST | `/research/catboost-shadow/report` | CatBoost 影子报告 |
+| POST | `/research/finbert/report` | FinBERT 情绪报告 |
+| POST | `/research/qlib-bridge/report` | Qlib 桥接报告 |
+| POST | `/research/tabular-deep/report` | 表格深度模型报告 |
+| POST | `/research/tft/report` | TFT 时序报告 |
+| POST | `/research/finrl/report` | FinRL 强化学习报告 |
+| POST | `/research/heavy-ts/report` | Heavy-TS 时序报告 |
+| GET | `/research/d6/registry` | Phase-D 研究注册表 |
+
+### acceptance（`api/acceptance.py`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/backtest/walk_forward` | Walk-Forward 回测 |
+| POST | `/acceptance/baseline` | 基线报告 |
+| POST | `/acceptance/phase_checkpoint` | 阶段检查点 |
+| POST | `/acceptance/v13` | V1.3 验收 |
+| POST | `/acceptance/v13/bundle` | V1.3 组合验收 |
+| POST | `/stress/run` | 压力测试 |
+| POST | `/acceptance/week4/run` | Week4 验收自动运行 |
+| GET | `/acceptance/week4/latest` | 最近 Week4 验收 |
+| GET | `/acceptance/week4/history?limit=20` | Week4 验收历史 |
+
+### portfolio（`api/portfolio.py`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/portfolio/positions` | 持仓 |
+| GET | `/portfolio/trades?limit=100` | 成交记录 |
+| GET | `/recommendations/lifecycle?status=&limit=120` | 推荐生命周期 |
+| GET | `/portfolio/execution_bias?days=30&limit=200` | 执行偏差分析 |
+| POST | `/portfolio/broker_snapshot` | 提交券商快照 |
+| POST | `/portfolio/reconcile/run` | 触发对账 |
+| GET | `/portfolio/reconcile/latest` | 最近对账 |
+| GET | `/portfolio/reconcile/weekly?days=7` | 对账周报 |
+
+### runtime（`api/runtime.py`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/runtime/sla?recent_runs=50` | SLA 指标 |
+| GET | `/runtime/stage` | 运行时阶段 |
+| GET | `/runtime/stage/deep` | 深度阶段状态 |
+| GET | `/runtime/history/archive/status?limit=20` | 历史归档状态 |
+| POST | `/runtime/history/archive/run` | 触发历史归档 |
+| GET | `/m3/profile/status` | M3 画像状态 |
+
+### week5（`api/week5.py`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/week5/scan/run` | 首板扫描运行 |
+| GET | `/week5/scan/latest` | 最近扫描 |
+| GET | `/week5/scan/history?limit=20` | 扫描历史 |
+| GET | `/week5/signal-pool/live` | 实时信号池 |
+| GET | `/week5/signal-pool/symbol/live` | 单标的实时信号 |
+
+### week6（`api/week6.py`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/week6/run` | Week6 因子运行 |
+| GET | `/week6/latest` | 最近运行 |
+| GET | `/week6/history?limit=20` | 运行历史 |
+| POST | `/week6/data-quality/run` | 数据质量检查 |
+| GET | `/week6/data-quality/latest` | 最近数据质量 |
+| GET | `/week6/data-quality/history` | 数据质量历史 |
+| POST | `/week6/global/snapshot` | 设置全球市场快照 |
+| GET | `/week6/global/snapshot` | 获取全球市场快照 |
+| GET | `/week6/global/history?limit=50` | 全球快照历史 |
+| POST | `/week6/regulatory/watchlist` | 设置监管关注池 |
+| GET | `/week6/regulatory/watchlist` | 获取监管关注池 |
+
+### week7（`api/week7.py`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/week7/kill-switch/performance` | 录入月度绩效 |
+| GET | `/week7/kill-switch/history?strategy=&limit=60` | 策略自毁开关历史 |
+| GET | `/week7/kill-switch/status?strategy=` | 策略自毁开关状态 |
+| POST | `/week7/kill-switch/reset` | 重置自毁开关 |
+| POST | `/week7/cloud-backup/ping` | 云冷备心跳 |
+| GET | `/week7/cloud-backup/status` | 云冷备状态 |
+| POST | `/week7/cloud-backup/check` | 云冷备离线检查 |
+| POST | `/week7/factor-lifecycle/record` | 因子生命周期录入 |
+| GET | `/week7/factor-lifecycle/status?strategy=` | 因子生命周期状态 |
+| GET | `/week7/factor-lifecycle/history?strategy=&limit=60` | 因子生命周期历史 |
+| GET | `/week7/factor-lifecycle/graveyard` | 因子坟墓（下架因子） |
+| POST | `/week7/factor-lifecycle/reset` | 重置因子生命周期 |
+| POST | `/week7/sim-broker/run` | 模拟盘 vs 券商周报 |
+| GET | `/week7/sim-broker/latest` | 最近周报 |
+| GET | `/week7/sim-broker/history?limit=20` | 周报历史 |
+
+### audit（`api/audit.py`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/audit/events?limit=200&event_type=&trace_id=` | 审计事件流 |
+| GET | `/audit/trace/{trace_id}` | 审计链路回放 |
+
+### main 静态页（`src/stock_analyzer/main.py`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/ui`、`/ui/`、`/ui/{path:path}` | 前端静态页（`include_in_schema=False`） |
 
 `POST /dashboard/command/quick` supports manual fill fields when `action=SET_POSITION`:
 

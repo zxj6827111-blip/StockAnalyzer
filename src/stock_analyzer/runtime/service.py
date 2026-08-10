@@ -32,6 +32,11 @@ from stock_analyzer.command.channel import (
 )
 from stock_analyzer.config import DataSourceConfig, StockAnalyzerConfig
 from stock_analyzer.data.cached_provider import CachedProvider
+from stock_analyzer.data.delisted_symbols import (
+    DelistedSymbolMap,
+    fetch_delisted_symbols_from_provider,
+    load_delisted_symbols,
+)
 from stock_analyzer.data.market_depth import MarketDepthProvider
 from stock_analyzer.data.market_warehouse import MarketWarehouse
 from stock_analyzer.data.provider import MarketDataProvider
@@ -50,6 +55,7 @@ from stock_analyzer.evolution.modules.m6_counterparty import evaluate_m6_counter
 from stock_analyzer.evolution.orchestrator import OffhoursEvolutionOrchestrator
 from stock_analyzer.evolution.shadow_dataset_builder import ShadowDatasetBuilder
 from stock_analyzer.evolution.shadow_online_v2_report import ShadowOnlineV2ReportBuilder
+from stock_analyzer.execution.engine import ExecutionEngine
 from stock_analyzer.feature.engineer import FeatureEngineer
 from stock_analyzer.feature.market_context import build_market_relative_frame
 from stock_analyzer.feature.snapshot import RAW_SNAPSHOT_COLUMNS as _FEATURE_SNAPSHOT_RAW_COLUMNS
@@ -80,12 +86,18 @@ from stock_analyzer.notify.filter import NotificationFilter, is_quiet_time
 from stock_analyzer.pipeline import AnalyzerPipeline
 from stock_analyzer.portfolio.book import PortfolioBook
 from stock_analyzer.research import (
+    compute_daily_review_report,
+    compute_ic_decay_report,
+    compute_monthly_review_report,
     export_qlib_bridge_bundle,
     persist_alphalens_sidecar_report,
     persist_catboost_shadow_report,
+    persist_daily_review_report,
     persist_finbert_sidecar_report,
     persist_finrl_sidecar_report,
     persist_heavy_ts_shadow_report,
+    persist_ic_decay_report,
+    persist_monthly_review_report,
     persist_shap_sidecar_report,
     persist_tabular_deep_shadow_report,
     persist_tft_sidecar_report,
@@ -319,6 +331,10 @@ class StockAnalyzerService:
         self._last_market_warehouse_progress: dict[str, object] | None = None
         self._week7_sim_broker_history: list[dict[str, object]] = []
         self._last_week7_sim_broker_report: dict[str, object] | None = None
+        self._monthly_review_history: list[dict[str, object]] = []
+        self._last_monthly_review_report: dict[str, object] | None = None
+        self._daily_review_history: list[dict[str, object]] = []
+        self._last_daily_review_report: dict[str, object] | None = None
         self._global_market_snapshot: dict[str, float] = {}
         self._global_market_history: list[dict[str, object]] = []
         self._regulatory_watchlist: dict[str, dict[str, object]] = {}
@@ -406,6 +422,10 @@ class StockAnalyzerService:
         self._universe_cache_path = self._resolve_evolution_path(
             self._config.idle_queue.universe_cache_path
         )
+        self._delisted_symbols_path = self._resolve_evolution_path(
+            self._config.idle_queue.delisted_symbols_path
+        )
+        self._delisted_symbols_cache: DelistedSymbolMap | None = None
         self._tdx_sync_history_path = self._resolve_evolution_path(
             "artifacts/runtime/tdx_sync_history.jsonl"
         )
@@ -1230,16 +1250,66 @@ class StockAnalyzerService:
             horizons=horizons,
             quantiles=quantiles,
         )
-        payload = {
-            "research_id": "alphalens_sidecar",
-            "delivery_mode": "research_sidecar",
-            **dataset_meta,
-            **report,
-        }
-        target = Path(output_path or self._default_phase_d_report_path("alphalens_sidecar"))
-        payload["output_path"] = persist_alphalens_sidecar_report(report=payload, output_path=target)
-        self._record_phase_d_research_event(payload=payload)
-        return payload
+        return self._finalize_phase_d_research_payload(
+            research_id="alphalens_sidecar",
+            dataset_meta=dataset_meta,
+            report=report,
+            output_path=output_path,
+            default_path=self._default_phase_d_report_path("alphalens_sidecar"),
+            persist=persist_alphalens_sidecar_report,
+        )
+
+    def build_phase_d_ic_decay_report(
+        self,
+        *,
+        model_id: str = "",
+        split_names: Sequence[str] | None = None,
+        max_rows: int | None = None,
+        factor_columns: Sequence[str] | None = None,
+        horizon: int = 5,
+        lookback_months: int | None = None,
+        min_months: int | None = None,
+        healthy_threshold: float | None = None,
+        slope_threshold: float | None = None,
+        output_path: str | None = None,
+    ) -> dict[str, object]:
+        lifecycle_config = self._config.factor_lifecycle
+        dataset_meta, records, _ = self._build_phase_d_research_dataset(
+            model_id=model_id,
+            split_names=split_names,
+            max_rows=max_rows,
+        )
+        report = compute_ic_decay_report(
+            records=records,
+            factor_columns=factor_columns,
+            horizon=horizon,
+            lookback_months=(
+                lifecycle_config.ic_decay_lookback_months
+                if lookback_months is None
+                else lookback_months
+            ),
+            min_months=(
+                lifecycle_config.ic_decay_min_months if min_months is None else min_months
+            ),
+            healthy_threshold=(
+                lifecycle_config.ic_decay_healthy_threshold
+                if healthy_threshold is None
+                else healthy_threshold
+            ),
+            slope_threshold=(
+                lifecycle_config.ic_decay_slope_threshold
+                if slope_threshold is None
+                else slope_threshold
+            ),
+        )
+        return self._finalize_phase_d_research_payload(
+            research_id="ic_decay_report",
+            dataset_meta=dataset_meta,
+            report=report,
+            output_path=output_path,
+            default_path=self._default_phase_d_report_path("ic_decay_report"),
+            persist=persist_ic_decay_report,
+        )
 
     def build_phase_d_shap_report(
         self,
@@ -1265,16 +1335,14 @@ class StockAnalyzerService:
             drift_threshold=drift_threshold,
             top_k=top_k,
         )
-        payload = {
-            "research_id": "shap_sidecar",
-            "delivery_mode": "research_sidecar",
-            **dataset_meta,
-            **report,
-        }
-        target = Path(output_path or self._default_phase_d_report_path("shap_sidecar"))
-        payload["output_path"] = persist_shap_sidecar_report(report=payload, output_path=target)
-        self._record_phase_d_research_event(payload=payload)
-        return payload
+        return self._finalize_phase_d_research_payload(
+            research_id="shap_sidecar",
+            dataset_meta=dataset_meta,
+            report=report,
+            output_path=output_path,
+            default_path=self._default_phase_d_report_path("shap_sidecar"),
+            persist=persist_shap_sidecar_report,
+        )
 
     def build_phase_d_catboost_shadow_report(
         self,
@@ -1302,16 +1370,14 @@ class StockAnalyzerService:
             test_ratio=test_ratio,
             random_seed=random_seed,
         )
-        payload = {
-            "research_id": "catboost_shadow",
-            "delivery_mode": "research_sidecar",
-            **dataset_meta,
-            **report,
-        }
-        target = Path(output_path or self._default_phase_d_report_path("catboost_shadow"))
-        payload["output_path"] = persist_catboost_shadow_report(report=payload, output_path=target)
-        self._record_phase_d_research_event(payload=payload)
-        return payload
+        return self._finalize_phase_d_research_payload(
+            research_id="catboost_shadow",
+            dataset_meta=dataset_meta,
+            report=report,
+            output_path=output_path,
+            default_path=self._default_phase_d_report_path("catboost_shadow"),
+            persist=persist_catboost_shadow_report,
+        )
 
     def build_phase_d_finbert_report(
         self,
@@ -1326,16 +1392,15 @@ class StockAnalyzerService:
             model_path=model_path,
             include_neutral=include_neutral,
         )
-        payload = {
-            "research_id": "finbert_sidecar",
-            "delivery_mode": "research_sidecar",
-            "record_source": "manual_records",
-            **report,
-        }
-        target = Path(output_path or self._default_phase_d_report_path("finbert_sidecar"))
-        payload["output_path"] = persist_finbert_sidecar_report(report=payload, output_path=target)
-        self._record_phase_d_research_event(payload=payload)
-        return payload
+        return self._finalize_phase_d_research_payload(
+            research_id="finbert_sidecar",
+            dataset_meta=None,
+            report=report,
+            header={"record_source": "manual_records"},
+            output_path=output_path,
+            default_path=self._default_phase_d_report_path("finbert_sidecar"),
+            persist=persist_finbert_sidecar_report,
+        )
 
     def build_phase_d_qlib_bridge_report(
         self,
@@ -1368,16 +1433,15 @@ class StockAnalyzerService:
             feature_columns=feature_columns,
             label_column=label_column,
         )
-        payload = {
-            "research_id": "qlib_bridge",
-            "delivery_mode": "research_sidecar",
-            **dataset_meta,
-            **report,
-            "bundle_paths": bundle_paths,
-            "output_path": str(bundle_paths.get("manifest_path", "")),
-        }
-        self._record_phase_d_research_event(payload=payload)
-        return payload
+        return self._finalize_phase_d_research_payload(
+            research_id="qlib_bridge",
+            dataset_meta=dataset_meta,
+            report=report,
+            extra={
+                "bundle_paths": bundle_paths,
+                "output_path": str(bundle_paths.get("manifest_path", "")),
+            },
+        )
 
     def build_phase_d_tabular_deep_report(
         self,
@@ -1405,19 +1469,14 @@ class StockAnalyzerService:
             test_ratio=test_ratio,
             random_seed=random_seed,
         )
-        payload = {
-            "research_id": "tabnet_ft_transformer",
-            "delivery_mode": "research_sidecar",
-            **dataset_meta,
-            **report,
-        }
-        target = Path(output_path or self._default_phase_d_report_path("tabular_deep_shadow"))
-        payload["output_path"] = persist_tabular_deep_shadow_report(
-            report=payload,
-            output_path=target,
+        return self._finalize_phase_d_research_payload(
+            research_id="tabnet_ft_transformer",
+            dataset_meta=dataset_meta,
+            report=report,
+            output_path=output_path,
+            default_path=self._default_phase_d_report_path("tabular_deep_shadow"),
+            persist=persist_tabular_deep_shadow_report,
         )
-        self._record_phase_d_research_event(payload=payload)
-        return payload
 
     def build_phase_d_tft_report(
         self,
@@ -1442,16 +1501,14 @@ class StockAnalyzerService:
             encoder_length=encoder_length,
             train_ratio=train_ratio,
         )
-        payload = {
-            "research_id": "tft_sidecar",
-            "delivery_mode": "research_sidecar",
-            **dataset_meta,
-            **report,
-        }
-        target = Path(output_path or self._default_phase_d_report_path("tft_sidecar"))
-        payload["output_path"] = persist_tft_sidecar_report(report=payload, output_path=target)
-        self._record_phase_d_research_event(payload=payload)
-        return payload
+        return self._finalize_phase_d_research_payload(
+            research_id="tft_sidecar",
+            dataset_meta=dataset_meta,
+            report=report,
+            output_path=output_path,
+            default_path=self._default_phase_d_report_path("tft_sidecar"),
+            persist=persist_tft_sidecar_report,
+        )
 
     def build_phase_d_finrl_report(
         self,
@@ -1481,16 +1538,14 @@ class StockAnalyzerService:
             random_seed=random_seed,
             action_threshold=action_threshold,
         )
-        payload = {
-            "research_id": "finrl_sidecar",
-            "delivery_mode": "research_sidecar",
-            **dataset_meta,
-            **report,
-        }
-        target = Path(output_path or self._default_phase_d_report_path("finrl_sidecar"))
-        payload["output_path"] = persist_finrl_sidecar_report(report=payload, output_path=target)
-        self._record_phase_d_research_event(payload=payload)
-        return payload
+        return self._finalize_phase_d_research_payload(
+            research_id="finrl_sidecar",
+            dataset_meta=dataset_meta,
+            report=report,
+            output_path=output_path,
+            default_path=self._default_phase_d_report_path("finrl_sidecar"),
+            persist=persist_finrl_sidecar_report,
+        )
 
     def build_phase_d_heavy_ts_report(
         self,
@@ -1517,16 +1572,14 @@ class StockAnalyzerService:
             test_ratio=test_ratio,
             random_seed=random_seed,
         )
-        payload = {
-            "research_id": "heavy_ts_shadow",
-            "delivery_mode": "research_sidecar",
-            **dataset_meta,
-            **report,
-        }
-        target = Path(output_path or self._default_phase_d_report_path("heavy_ts_shadow"))
-        payload["output_path"] = persist_heavy_ts_shadow_report(report=payload, output_path=target)
-        self._record_phase_d_research_event(payload=payload)
-        return payload
+        return self._finalize_phase_d_research_payload(
+            research_id="heavy_ts_shadow",
+            dataset_meta=dataset_meta,
+            report=report,
+            output_path=output_path,
+            default_path=self._default_phase_d_report_path("heavy_ts_shadow"),
+            persist=persist_heavy_ts_shadow_report,
+        )
 
     def train_execution_risk_model(
         self,
@@ -5200,6 +5253,39 @@ class StockAnalyzerService:
         }
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    def _delisted_symbol_map(self) -> DelistedSymbolMap:
+        """Load the delisted-symbol exclusion list (P2-#27 phase 1).
+
+        Prefers a live tushare ``stock_basic(list_status='D')`` fetch when a
+        provider in the runtime graph exposes the capability (token
+        configured); a successful fetch is persisted to
+        ``idle_queue.delisted_symbols_path`` for offline reuse. On any
+        failure (token missing / fetch error / empty result) the local list
+        file is loaded instead; a missing or corrupt file yields an empty
+        map. The result is cached per service instance.
+        """
+        cached = self._delisted_symbols_cache
+        if cached is not None:
+            return cached
+        symbols: DelistedSymbolMap = {}
+        provider = next(
+            (
+                item
+                for item in self._iter_market_data_provider_graph()
+                if callable(getattr(item, "fetch_delisted_stock_basic", None))
+            ),
+            None,
+        )
+        if provider is not None:
+            symbols = fetch_delisted_symbols_from_provider(
+                provider,
+                persist_path=self._delisted_symbols_path,
+            )
+        if not symbols:
+            symbols = load_delisted_symbols(self._delisted_symbols_path)
+        self._delisted_symbols_cache = symbols
+        return symbols
+
     def _resolve_symbol_universe(
         self,
         *,
@@ -5345,6 +5431,16 @@ class StockAnalyzerService:
                 source = "bootstrap_seed_fallback"
                 errors.append("fallback_to_bootstrap_seed_symbols")
 
+        excluded_delisted = 0
+        if bool(self._config.idle_queue.exclude_delisted):
+            delisted = self._delisted_symbol_map()
+            if delisted:
+                kept = [symbol for symbol in selected if symbol not in delisted]
+                excluded_delisted = len(selected) - len(kept)
+                if excluded_delisted:
+                    selected = kept
+                    errors.append(f"excluded_delisted:{excluded_delisted}")
+
         if cap > 0:
             seed_trade_date = self._resolve_universe_seed_trade_date()
             selected, quota_meta = _quota_sample_universe(
@@ -5372,6 +5468,7 @@ class StockAnalyzerService:
             },
             "errors": errors,
             "cache_path": str(self._universe_cache_path),
+            "excluded_delisted_count": excluded_delisted,
             "board_quota": quota_meta,
         }
 
@@ -8905,6 +9002,44 @@ class StockAnalyzerService:
                 "output_path": str(payload.get("output_path", "")),
             },
         )
+
+    def _finalize_phase_d_research_payload(
+        self,
+        *,
+        research_id: str,
+        dataset_meta: Mapping[str, object] | None,
+        report: Mapping[str, object],
+        header: Mapping[str, object] | None = None,
+        extra: Mapping[str, object] | None = None,
+        output_path: str | None = None,
+        default_path: str = "",
+        persist: Callable[..., str] | None = None,
+    ) -> dict[str, object]:
+        """Assemble, persist and audit a phase-D research payload.
+
+        Keeps the historical merge order: base header, dataset metadata,
+        optional per-report header fields, the sidecar report, then optional
+        trailing fields (e.g. bundle paths); persistence and the audit event
+        are shared by every phase-D report builder.
+        """
+        payload: dict[str, object] = {
+            "research_id": research_id,
+            "delivery_mode": "research_sidecar",
+        }
+        if dataset_meta is not None:
+            payload.update(dataset_meta)
+        if header is not None:
+            payload.update(header)
+        payload.update(report)
+        if extra is not None:
+            payload.update(extra)
+        if persist is not None:
+            payload["output_path"] = persist(
+                report=payload,
+                output_path=Path(output_path or default_path),
+            )
+        self._record_phase_d_research_event(payload=payload)
+        return payload
 
     def _enrich_phase_d_research_records_with_market_fields(
         self,
@@ -12973,11 +13108,38 @@ class StockAnalyzerService:
     def _simulation_account_name(self) -> str:
         return "sim_auto"
 
+    def _shared_execution_engine(self) -> ExecutionEngine:
+        engine = getattr(self, "_execution_engine_shared", None)
+        if engine is None:
+            engine = ExecutionEngine(
+                config=self._config.backtest_matcher,
+                limit_rule=self._config.limit_rule,
+            )
+            self._execution_engine_shared = engine
+        return engine
+
+    def _apply_shared_slippage(
+        self,
+        *,
+        side: str,
+        strategy: str,
+        price: float,
+        price_source: str,
+    ) -> tuple[float, str]:
+        if price <= 0 or not bool(self._config.backtest_matcher.apply_dynamic_slippage_live):
+            return price, price_source
+        engine = self._shared_execution_engine()
+        adjusted = engine.apply_slippage(
+            price=price,
+            side=side,
+            slippage_ratio=engine.static_slippage_ratio(strategy=strategy),
+        )
+        if adjusted <= 0:
+            return price, price_source
+        return adjusted, f"{price_source}+slip"
+
     def _simulation_lot_size(self) -> int:
-        rounding_rule = str(self._config.backtest_matcher.share_rounding_rule).strip().lower()
-        if "100" in rounding_rule:
-            return 100
-        return 100
+        return self._shared_execution_engine().share_rounding_unit()
 
     def _simulation_cash_available(self) -> float:
         cash = self._simulation_initial_cash()
@@ -13008,22 +13170,20 @@ class StockAnalyzerService:
         *,
         side: str,
         notional: float,
+        trade_date: datetime | date | None = None,
     ) -> float:
         if notional <= 0:
             return 0.0
-        matcher = self._config.backtest_matcher
-        commission = max(
-            notional * _as_float(matcher.commission_rate, default=0.0),
-            _as_float(matcher.min_commission_per_order, default=0.0),
+        engine = self._shared_execution_engine()
+        return round(
+            engine.estimate_cost(
+                side=side,
+                price=notional,
+                quantity=1,
+                trade_date=trade_date,
+            ),
+            2,
         )
-        transfer = notional * _as_float(matcher.transfer_fee_rate, default=0.0)
-        stamp = 0.0
-        if (
-            side.strip().lower() == "sell"
-            and str(matcher.stamp_tax_apply_on).strip().lower() == "sell_only"
-        ):
-            stamp = notional * _as_float(matcher.stamp_tax_rate, default=0.0)
-        return round(commission + transfer + stamp, 2)
 
     def _select_simulated_trade_price(
         self,
@@ -13228,6 +13388,12 @@ class StockAnalyzerService:
                 side="sell",
                 market_payload=market_payload,
             )
+            trade_price, price_source = self._apply_shared_slippage(
+                side="sell",
+                strategy=str(item.get("strategy", "")).strip() or "trend",
+                price=trade_price,
+                price_source=price_source,
+            )
             exit_quantity = current_quantity
             if current_quantity > 0 and current_target > 0 and next_target < current_target:
                 remaining_ratio = max(0.0, min(1.0, next_target / current_target))
@@ -13241,6 +13407,7 @@ class StockAnalyzerService:
                 self._estimate_simulated_trade_fee(
                     side="sell",
                     notional=trade_price * fee_base_quantity,
+                    trade_date=timestamp,
                 )
                 if trade_price > 0 and fee_base_quantity > 0
                 else 0.0
@@ -13345,11 +13512,18 @@ class StockAnalyzerService:
                     side="sell",
                     market_payload=market_payload,
                 )
+                trade_price, price_source = self._apply_shared_slippage(
+                    side="sell",
+                    strategy=str(signal.strategy).strip() or "trend",
+                    price=trade_price,
+                    price_source=price_source,
+                )
                 quantity = _as_int(existing.get("quantity"), default=0)
                 fee = (
                     self._estimate_simulated_trade_fee(
                         side="sell",
                         notional=trade_price * quantity,
+                        trade_date=timestamp,
                     )
                     if trade_price > 0 and quantity > 0
                     else 0.0
@@ -13460,6 +13634,12 @@ class StockAnalyzerService:
                 side="buy",
                 market_payload=market_payload,
             )
+            trade_price, price_source = self._apply_shared_slippage(
+                side="buy",
+                strategy=str(signal.strategy).strip() or "trend",
+                price=trade_price,
+                price_source=price_source,
+            )
             lot_size = self._simulation_lot_size()
             if trade_price <= 0 or desired_cash < trade_price * lot_size:
                 skipped_no_cash += 1
@@ -13487,12 +13667,20 @@ class StockAnalyzerService:
                 )
                 continue
             notional = trade_price * quantity
-            fee = self._estimate_simulated_trade_fee(side="buy", notional=notional)
+            fee = self._estimate_simulated_trade_fee(
+                side="buy",
+                notional=notional,
+                trade_date=timestamp,
+            )
             total_cost = notional + fee
             while quantity > 0 and total_cost > available_cash:
                 quantity -= lot_size
                 notional = trade_price * quantity
-                fee = self._estimate_simulated_trade_fee(side="buy", notional=notional)
+                fee = self._estimate_simulated_trade_fee(
+                    side="buy",
+                    notional=notional,
+                    trade_date=timestamp,
+                )
                 total_cost = notional + fee
             if quantity <= 0:
                 skipped_no_cash += 1
@@ -14318,6 +14506,197 @@ class StockAnalyzerService:
 
     def week7_sim_broker_history(self, limit: int = 20) -> dict[str, object]:
         return self._week7_sim_broker_service.week7_sim_broker_history(limit=limit)
+
+
+    def build_monthly_review_report(
+        self,
+        *,
+        year_month: str = "",
+        output_path: str | None = None,
+    ) -> dict[str, object]:
+        review_config = self._config.monthly_review
+        month = _normalize_year_month(year_month) or datetime.now().strftime("%Y-%m")
+        trades = self.portfolio_trades(limit=10_000)
+        positions = self._portfolio.positions()
+        signals = self._collect_review_signal_records()
+        outcomes = self._collect_review_outcome_records()
+        reconcile = self.reconcile_weekly_report(days=31)
+        report = compute_monthly_review_report(
+            year_month=month,
+            trades=trades,
+            positions=positions,
+            signals=signals,
+            outcomes=outcomes,
+            reconcile=reconcile,
+            min_closed_trades=review_config.min_closed_trades,
+            over_position_threshold=review_config.over_position_threshold,
+            stop_loss_threshold=review_config.stop_loss_threshold,
+            take_profit_trigger=review_config.take_profit_trigger,
+            discipline_pass_threshold=review_config.discipline_pass_threshold,
+            position_cut_ratio=review_config.position_cut_ratio,
+        )
+        payload = {
+            "research_id": "monthly_review_report",
+            "delivery_mode": "monthly_review",
+            "month": month,
+            **report,
+        }
+        target = Path(output_path or self._default_phase_d_report_path("monthly_review_report"))
+        payload["output_path"] = persist_monthly_review_report(report=payload, output_path=target)
+        report["output_path"] = str(payload["output_path"])
+        self._last_monthly_review_report = report
+        self._monthly_review_history.append(report)
+        history_limit = max(1, review_config.history_limit)
+        if len(self._monthly_review_history) > history_limit:
+            overflow = len(self._monthly_review_history) - history_limit
+            if overflow > 0:
+                self._monthly_review_history = self._monthly_review_history[overflow:]
+        verdict = report.get("verdict", {})
+        verdict_map = verdict if isinstance(verdict, Mapping) else {}
+        self._record_audit_event(
+            event_type="monthly_review_report_built",
+            level="warn" if not bool(verdict_map.get("passed", True)) else "info",
+            message="monthly review report built",
+            payload={
+                "month": month,
+                "status": str(report.get("status", "")),
+                "score": _as_float(verdict_map.get("score"), default=0.0),
+                "grade": str(verdict_map.get("grade", "")),
+                "position_cut_next_month": bool(
+                    verdict_map.get("position_cut_next_month", False)
+                ),
+                "output_path": str(payload.get("output_path", "")),
+            },
+        )
+        if (
+            review_config.auto_notify
+            and str(report.get("status", "")) == "ok"
+            and not bool(verdict_map.get("passed", True))
+        ):
+            self.notify(
+                title=_push_title(priority="P1", category="monthly", summary="execution discipline"),
+                content=_notification_message_zh(
+                    trigger=(
+                        f"{month} 月度复盘完成，执行纪律评分低于阈值，"
+                        "已触发次月降仓建议。"
+                    ),
+                    impact=(
+                        "纪律评分低于 85 分时按 PRD §15 次月自动降仓 10%，"
+                        "以控制人工干预与违规操作带来的回撤风险。"
+                    ),
+                    action="请查看月度复盘报告中的纪律扣分明细，"
+                    "针对手动干预、随意改单、超仓、止损违背等项目逐项整改。",
+                    details=[
+                        f"月度评分：{_as_float(verdict_map.get('score'), default=0.0):.2f}",
+                        f"评级：{str(verdict_map.get('grade', '')) or '-'}",
+                        f"次月降仓比例：{_as_float(verdict_map.get('position_cut_ratio'), default=0.0) * 100:.0f}%",
+                        f"报告路径：{str(payload.get('output_path', ''))}",
+                    ],
+                    detail_title="纪律扣分明细",
+                ),
+                level="warn",
+                trace_id="",
+            )
+        return report
+
+    def latest_monthly_review_report(self) -> dict[str, object] | None:
+        return self._last_monthly_review_report
+
+    def monthly_review_history(self, limit: int = 20) -> dict[str, object]:
+        capped_limit = max(1, min(int(limit), max(1, self._config.monthly_review.history_limit)))
+        recent = self._monthly_review_history[-capped_limit:]
+        return {"records": len(recent), "reports": recent}
+
+    def build_daily_review_report(
+        self,
+        *,
+        date: str = "",
+        output_path: str | None = None,
+    ) -> dict[str, object]:
+        review_config = self._config.monthly_review
+        day = _normalize_review_date(date) or datetime.now().strftime("%Y-%m-%d")
+        trades = self.portfolio_trades(limit=10_000)
+        positions = self._portfolio.positions()
+        signals = self._collect_review_signal_records()
+        outcomes = self._collect_review_outcome_records()
+        reconcile = self.reconcile_weekly_report(days=7)
+        report = compute_daily_review_report(
+            date=day,
+            trades=trades,
+            positions=positions,
+            signals=signals,
+            outcomes=outcomes,
+            reconcile=reconcile,
+            over_position_threshold=review_config.over_position_threshold,
+            stop_loss_threshold=review_config.stop_loss_threshold,
+            take_profit_trigger=review_config.take_profit_trigger,
+            discipline_pass_threshold=review_config.discipline_pass_threshold,
+        )
+        payload = {
+            "research_id": "daily_review_report",
+            "delivery_mode": "daily_review",
+            "date": day,
+            **report,
+        }
+        target = Path(output_path or self._default_phase_d_report_path("daily_review_report"))
+        payload["output_path"] = persist_daily_review_report(report=payload, output_path=target)
+        report["output_path"] = str(payload["output_path"])
+        self._last_daily_review_report = report
+        self._daily_review_history.append(report)
+        if len(self._daily_review_history) > _DAILY_REVIEW_HISTORY_LIMIT:
+            overflow = len(self._daily_review_history) - _DAILY_REVIEW_HISTORY_LIMIT
+            self._daily_review_history = self._daily_review_history[overflow:]
+        self._record_audit_event(
+            event_type="daily_review_report_built",
+            level="info",
+            message="daily review report built",
+            payload={
+                "date": day,
+                "status": str(report.get("status", "")),
+                "output_path": str(payload.get("output_path", "")),
+            },
+        )
+        return report
+
+    def latest_daily_review_report(self) -> dict[str, object] | None:
+        return self._last_daily_review_report
+
+    def daily_review_history(self, limit: int = 20) -> dict[str, object]:
+        capped_limit = max(1, min(int(limit), _DAILY_REVIEW_HISTORY_LIMIT))
+        recent = self._daily_review_history[-capped_limit:]
+        return {"records": len(recent), "reports": recent}
+
+    def _collect_review_signal_records(self) -> list[dict[str, object]]:
+        records: list[dict[str, object]] = []
+        for event in reversed(self._audit_events):
+            raw_signals = event.get("payload", {}).get("signals")
+            if not isinstance(raw_signals, list):
+                continue
+            for item in raw_signals:
+                if isinstance(item, Mapping):
+                    record = dict(item)
+                    if "symbol" in record and str(record.get("symbol", "")).strip():
+                        records.append(record)
+            if len(records) >= 10_000:
+                break
+        return records
+
+    def _collect_review_outcome_records(self) -> list[dict[str, object]]:
+        try:
+            outcomes = self._sample_store.list_outcomes()
+        except Exception:
+            return []
+        records: list[dict[str, object]] = []
+        for item in outcomes:
+            dump = getattr(item, "model_dump", None)
+            if callable(dump):
+                try:
+                    records.append(dump(mode="json"))
+                except Exception:
+                    records.append(dict(item.__dict__))
+            else:
+                records.append(dict(item.__dict__))
+        return records
 
 
     def _build_week7_sim_broker_drilldown(
@@ -15897,6 +16276,43 @@ class StockAnalyzerService:
                 interval_minutes=interval_minutes,
                 callback=self._job_week7_cloud_backup_watchdog,
             )
+        if (
+            self._config.factor_lifecycle.enabled
+            and self._config.factor_lifecycle.ic_decay_report == "monthly"
+            and str(self._config.factor_lifecycle.ic_decay_report_time).strip()
+        ):
+            self._scheduler.register(
+                name="factor_ic_decay_report",
+                trigger_hhmm=self._config.factor_lifecycle.ic_decay_report_time,
+                callback=self._job_factor_ic_decay_report,
+                latest_hhmm="23:59",
+                weekdays=trading_weekdays,
+                date_predicate=_last_trading_day_of_month,
+            )
+        if (
+            self._config.monthly_review.enabled
+            and str(self._config.monthly_review.report_time).strip()
+        ):
+            self._scheduler.register(
+                name="monthly_review_report",
+                trigger_hhmm=self._config.monthly_review.report_time,
+                callback=self._job_monthly_review_report,
+                latest_hhmm="23:59",
+                weekdays=trading_weekdays,
+                date_predicate=_last_trading_day_of_month,
+            )
+        if (
+            self._config.sim_broker_weekly.enabled
+            and str(self._config.sim_broker_weekly.run_time).strip()
+        ):
+            self._scheduler.register(
+                name="sim_broker_weekly",
+                trigger_hhmm=self._config.sim_broker_weekly.run_time,
+                callback=self._job_sim_broker_weekly,
+                latest_hhmm="23:59",
+                weekdays=(4,),
+                date_predicate=trading_day_filter,
+            )
 
     def _job_premarket_scan(self) -> dict[str, object]:
         global_snapshot_report = self._collect_global_market_snapshot(source_trace_id="premarket")
@@ -17190,6 +17606,21 @@ class StockAnalyzerService:
 
     def _job_week4_acceptance(self) -> dict[str, object]:
         return self._acceptance_service._job_week4_acceptance()
+
+    def _job_factor_ic_decay_report(self) -> dict[str, object]:
+        report = self.build_phase_d_ic_decay_report()
+        return {"report": report}
+
+    def _job_monthly_review_report(self) -> dict[str, object]:
+        report = self.build_monthly_review_report()
+        return {"report": report}
+
+    def _job_sim_broker_weekly(self) -> dict[str, object]:
+        report = self.run_week7_sim_broker_weekly(
+            days=7,
+            source_trace_id="scheduler-sim-broker-weekly",
+        )
+        return {"report": report}
 
     def _job_tdx_offline_sync(self) -> dict[str, object]:
         report = self.run_tdx_offline_sync(
@@ -19529,6 +19960,38 @@ def _normalize_year_month(value: str) -> str:
     except ValueError:
         return ""
     return parsed.strftime("%Y-%m")
+
+
+_DAILY_REVIEW_HISTORY_LIMIT = 60
+
+
+def _normalize_review_date(value: str) -> str:
+    raw = value.strip()
+    if not raw:
+        return ""
+    for fmt in ("%Y-%m-%d", "%Y%m%d"):
+        try:
+            return datetime.strptime(raw[:10], fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(raw[:19]).strftime("%Y-%m-%d")
+    except ValueError:
+        return ""
+
+
+def _last_trading_day_of_month(value: date) -> bool:
+    if not is_a_share_trading_day(value):
+        return False
+    year = value.year
+    month = value.month
+    next_month_first = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    cursor = value + timedelta(days=1)
+    while cursor < next_month_first:
+        if is_a_share_trading_day(cursor):
+            return False
+        cursor += timedelta(days=1)
+    return True
 
 
 def _normalize_factor_features(raw_features: list[dict[str, object]]) -> list[dict[str, object]]:

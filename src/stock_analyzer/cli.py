@@ -1873,6 +1873,32 @@ def phase_d_alphalens(
     typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
 
 
+@app.command("phase-d-ic-decay")
+def phase_d_ic_decay(
+    model_id: str = typer.Option("", help="Optional registered model id, default active champion"),
+    split_names: str = typer.Option("", help="Optional comma separated split names"),
+    max_rows: int = typer.Option(0, help="Optional row cap"),
+    factor_columns: str = typer.Option("", help="Optional comma separated factor columns"),
+    horizon: int = typer.Option(5, help="Forward return horizon in trading days"),
+    lookback_months: int = typer.Option(0, help="Monthly lookback window (0 = config default)"),
+    min_months: int = typer.Option(0, help="Min months for health verdict (0 = config default)"),
+    output_path: str = typer.Option("", help="Optional output report path"),
+) -> None:
+    config = get_config()
+    service = StockAnalyzerService(config=config)
+    result = service.build_phase_d_ic_decay_report(
+        model_id=model_id,
+        split_names=_parse_csv_list(split_names) or None,
+        max_rows=max_rows if max_rows > 0 else None,
+        factor_columns=_parse_csv_list(factor_columns) or None,
+        horizon=horizon,
+        lookback_months=lookback_months if lookback_months > 0 else None,
+        min_months=min_months if min_months > 0 else None,
+        output_path=output_path or None,
+    )
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
+
 @app.command("phase-d-shap")
 def phase_d_shap(
     model_id: str = typer.Option("", help="Optional registered model id, default active champion"),
@@ -2698,6 +2724,70 @@ def week7_sim_broker_history(
     config = get_config()
     service = StockAnalyzerService(config=config)
     report = service.week7_sim_broker_history(limit=limit)
+    typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+@app.command("monthly-review")
+def monthly_review(
+    year_month: str = typer.Option("", help="Report month, e.g. 2026-03 (default current month)"),
+    output_path: str = typer.Option("", help="Optional output report path"),
+) -> None:
+    config = get_config()
+    service = StockAnalyzerService(config=config)
+    result = service.build_monthly_review_report(
+        year_month=year_month,
+        output_path=output_path or None,
+    )
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+@app.command("monthly-review-latest")
+def monthly_review_latest() -> None:
+    config = get_config()
+    service = StockAnalyzerService(config=config)
+    report = service.latest_monthly_review_report()
+    typer.echo(json.dumps({"report": report}, ensure_ascii=False, indent=2))
+
+
+@app.command("monthly-review-history")
+def monthly_review_history(
+    limit: int = typer.Option(20, help="Max number of monthly review reports"),
+) -> None:
+    config = get_config()
+    service = StockAnalyzerService(config=config)
+    report = service.monthly_review_history(limit=limit)
+    typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+@app.command("daily-review")
+def daily_review(
+    date: str = typer.Option("", help="Report date, e.g. 2026-03-10 (default today)"),
+    output_path: str = typer.Option("", help="Optional output report path"),
+) -> None:
+    config = get_config()
+    service = StockAnalyzerService(config=config)
+    result = service.build_daily_review_report(
+        date=date,
+        output_path=output_path or None,
+    )
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+@app.command("daily-review-latest")
+def daily_review_latest() -> None:
+    config = get_config()
+    service = StockAnalyzerService(config=config)
+    report = service.latest_daily_review_report()
+    typer.echo(json.dumps({"report": report}, ensure_ascii=False, indent=2))
+
+
+@app.command("daily-review-history")
+def daily_review_history(
+    limit: int = typer.Option(20, help="Max number of daily review reports"),
+) -> None:
+    config = get_config()
+    service = StockAnalyzerService(config=config)
+    report = service.daily_review_history(limit=limit)
     typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
 
 

@@ -37,6 +37,19 @@ def test_risk_controller_keeps_new_buy_open_under_soft_degraded_mode() -> None:
     assert status.reason == "soft_degraded_monitoring"
 
 
+def test_risk_controller_hard_degraded_monitoring_keeps_new_buy_when_stop_disabled() -> None:
+    config = _load_default()
+    config.data_source.degrade_stops_new_buy = False
+    risk = RiskController(config)
+    risk.update_degraded_mode(hard_degraded_mode=True, soft_degraded_mode=False)
+    status = risk.evaluate(current_equity=1.0)
+    assert status.hard_degraded_mode is True
+    assert status.degraded_mode is True
+    assert status.can_open_new_position is True
+    assert status.action == "degraded"
+    assert status.reason == "hard_degraded_monitoring"
+
+
 def test_risk_controller_freezes_on_large_drawdown() -> None:
     config = _load_default()
     risk = RiskController(config)

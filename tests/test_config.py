@@ -70,7 +70,7 @@ def test_load_default_config_values(monkeypatch: MonkeyPatch) -> None:
     assert config.market_depth.timeout_sec == 5
     assert config.market_depth.max_symbols_per_poll == 100
     assert config.market_depth.poll_scopes == ["watchlist", "signal_pool"]
-    assert config.market_warehouse.enabled is True
+    assert config.market_warehouse.enabled is False
     assert config.market_warehouse.auto_run is True
     assert config.market_warehouse.run_time == "21:45"
     assert config.market_warehouse.db_path == "artifacts/warehouse/market.duckdb"
@@ -290,6 +290,8 @@ def test_load_default_config_values(monkeypatch: MonkeyPatch) -> None:
     ]
     assert config.idle_queue.history_memory_limit == 500
     assert config.idle_queue.history_disk_limit == 5000
+    assert config.idle_queue.exclude_delisted is True
+    assert config.idle_queue.delisted_symbols_path == "artifacts/universe/delisted.json"
     assert config.dashboard.default_total_asset == 100000.0
 
 

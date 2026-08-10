@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 import pandas as pd
@@ -15,6 +15,10 @@ from stock_analyzer.config import (
     Week6AllocationProfilesConfig,
     Week6MainForceConfig,
 )
+from stock_analyzer.market_calendar import is_a_share_trading_day
+
+_LONG_HOLIDAY_SCAN_WINDOW_DAYS = 15
+_LONG_HOLIDAY_MIN_CLOSED_DAYS = 3
 
 
 @dataclass(slots=True)
@@ -144,7 +148,6 @@ class CalendarFactorEngine:
 
     def evaluate(self, now: date) -> dict[str, object]:
         month = now.month
-        weekday = now.weekday()  # Monday=0
         season_tag = "neutral"
         threshold_adjust = 0.0
         if month in {2, 3, 4}:
@@ -154,16 +157,47 @@ class CalendarFactorEngine:
             season_tag = "year_end_risk"
             threshold_adjust = -2.0
 
-        days_to_weekend = max(0, 4 - weekday) if weekday <= 4 else 0
-        pre_holiday = days_to_weekend <= max(0, self.config.pre_holiday_reduce_days)
+        days_until_holiday = _trading_days_until_long_holiday(now)
+        pre_holiday = 1 <= days_until_holiday <= max(1, self.config.pre_holiday_reduce_days)
         position_multiplier = self.config.max_position_multiplier if pre_holiday else 1.0
         return {
             "season_tag": season_tag,
             "threshold_adjust": threshold_adjust,
             "pre_holiday_reduce": pre_holiday,
             "position_multiplier": round(position_multiplier, 4),
-            "days_to_weekend": days_to_weekend,
+            "days_until_holiday": days_until_holiday,
         }
+
+
+def _is_long_holiday_start(day: date) -> bool:
+    """True when ``day`` starts a run of >=3 consecutive non-trading days."""
+    if is_a_share_trading_day(day):
+        return False
+    return all(
+        not is_a_share_trading_day(day + timedelta(days=offset))
+        for offset in range(1, _LONG_HOLIDAY_MIN_CLOSED_DAYS)
+    )
+
+
+def _trading_days_until_long_holiday(day: date) -> int:
+    """Trading days from ``day`` (inclusive) until the next long holiday.
+
+    A long holiday is a run of >= ``_LONG_HOLIDAY_MIN_CLOSED_DAYS`` consecutive
+    non-trading days (春节/国庆/五一/清明/中秋 blocks); ordinary 2-day weekends
+    do not count. Returns 0 when ``day`` itself is not a trading day, or when
+    no long holiday starts within ``_LONG_HOLIDAY_SCAN_WINDOW_DAYS`` natural
+    days ahead.
+    """
+    if not is_a_share_trading_day(day):
+        return 0
+    for offset in range(1, _LONG_HOLIDAY_SCAN_WINDOW_DAYS + 1):
+        holiday_start = day + timedelta(days=offset)
+        if _is_long_holiday_start(holiday_start):
+            return sum(
+                int(is_a_share_trading_day(day + timedelta(days=idx)))
+                for idx in range(offset)
+            )
+    return 0
 
 
 @dataclass(slots=True)

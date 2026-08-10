@@ -191,6 +191,23 @@ def test_service_phase_d6_reports_run_and_persist(tmp_path: Path) -> None:
     assert int(audit["records"]) >= 4
 
 
+def _run_task_and_get_result(
+    client: TestClient,
+    url: str,
+    payload: dict[str, object],
+) -> Mapping[str, object]:
+    """POST a heavy endpoint (202 + task_id), then fetch the recorded result."""
+    response = client.post(url, json=payload)
+    assert response.status_code == 202, f"{url} -> {response.status_code}: {response.text}"
+    body = response.json()
+    assert body["status"] == "queued", url
+    task_response = client.get(f"/tasks/{body['task_id']}")
+    assert task_response.status_code == 200
+    task_payload = _as_mapping(task_response.json())
+    assert task_payload["status"] == "succeeded", f"{url}: {task_payload.get('error')}"
+    return _as_mapping(task_payload["result"])
+
+
 def test_main_phase_d6_endpoints_run_with_service_backing(
     tmp_path: Path,
     monkeypatch,
@@ -199,27 +216,30 @@ def test_main_phase_d6_endpoints_run_with_service_backing(
     monkeypatch.setattr(main_module, "_service", service)
     client = TestClient(main_module.app)
 
-    tabular = client.post("/research/tabular-deep/report", json={"split_names": ["test"]})
-    assert tabular.status_code == 200
-    assert tabular.json()["research_id"] == "tabnet_ft_transformer"
+    tabular = _run_task_and_get_result(
+        client,
+        "/research/tabular-deep/report",
+        {"split_names": ["test"]},
+    )
+    assert tabular["research_id"] == "tabnet_ft_transformer"
 
-    tft = client.post(
+    tft = _run_task_and_get_result(
+        client,
         "/research/tft/report",
-        json={"split_names": ["test"], "horizon": 1, "encoder_length": 4},
+        {"split_names": ["test"], "horizon": 1, "encoder_length": 4},
     )
-    assert tft.status_code == 200
-    assert tft.json()["research_id"] == "tft_sidecar"
+    assert tft["research_id"] == "tft_sidecar"
 
-    finrl = client.post(
+    finrl = _run_task_and_get_result(
+        client,
         "/research/finrl/report",
-        json={"split_names": ["test"], "action_threshold": 0.5},
+        {"split_names": ["test"], "action_threshold": 0.5},
     )
-    assert finrl.status_code == 200
-    assert finrl.json()["research_id"] == "finrl_sidecar"
+    assert finrl["research_id"] == "finrl_sidecar"
 
-    heavy_ts = client.post(
+    heavy_ts = _run_task_and_get_result(
+        client,
         "/research/heavy-ts/report",
-        json={"split_names": ["test"], "horizon": 2, "lookback": 5},
+        {"split_names": ["test"], "horizon": 2, "lookback": 5},
     )
-    assert heavy_ts.status_code == 200
-    assert heavy_ts.json()["research_id"] == "heavy_ts_shadow"
+    assert heavy_ts["research_id"] == "heavy_ts_shadow"

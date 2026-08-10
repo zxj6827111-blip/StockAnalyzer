@@ -10,6 +10,7 @@ from typing import cast
 from fastapi.testclient import TestClient
 
 import stock_analyzer.main as main_module
+from stock_analyzer.api.research import router as research_router
 from stock_analyzer.config import StockAnalyzerConfig, load_config
 from stock_analyzer.data.provider import SyntheticProvider
 from stock_analyzer.learning.sample_schema import (
@@ -235,6 +236,23 @@ def test_service_phase_d_finbert_report_runs_and_persists(tmp_path: Path) -> Non
     assert int(payload["symbol_coverage"]) >= 2
 
 
+def _run_task_and_get_result(
+    client: TestClient,
+    url: str,
+    payload: dict[str, object],
+) -> Mapping[str, object]:
+    """POST a heavy endpoint (202 + task_id), then fetch the recorded result."""
+    response = client.post(url, json=payload)
+    assert response.status_code == 202, f"{url} -> {response.status_code}: {response.text}"
+    body = response.json()
+    assert body["status"] == "queued", url
+    task_response = client.get(f"/tasks/{body['task_id']}")
+    assert task_response.status_code == 200
+    task_payload = _as_mapping(task_response.json())
+    assert task_payload["status"] == "succeeded", f"{url}: {task_payload.get('error')}"
+    return _as_mapping(task_payload["result"])
+
+
 def test_main_phase_d_research_endpoints_run_with_service_backing(
     tmp_path: Path,
     monkeypatch,
@@ -243,27 +261,31 @@ def test_main_phase_d_research_endpoints_run_with_service_backing(
     monkeypatch.setattr(main_module, "_service", service)
     client = TestClient(main_module.app)
 
-    alphalens = client.post(
+    alphalens = _run_task_and_get_result(
+        client,
         "/research/alphalens/report",
-        json={"split_names": ["test"], "horizons": [1, 2], "quantiles": 3},
+        {"split_names": ["test"], "horizons": [1, 2], "quantiles": 3},
     )
-    assert alphalens.status_code == 200
-    assert alphalens.json()["research_id"] == "alphalens_sidecar"
+    assert alphalens["research_id"] == "alphalens_sidecar"
 
-    shap = client.post("/research/shap/report", json={"split_names": ["test"], "top_k": 2})
-    assert shap.status_code == 200
-    assert shap.json()["research_id"] == "shap_sidecar"
+    shap = _run_task_and_get_result(
+        client,
+        "/research/shap/report",
+        {"split_names": ["test"], "top_k": 2},
+    )
+    assert shap["research_id"] == "shap_sidecar"
 
-    catboost = client.post(
+    catboost = _run_task_and_get_result(
+        client,
         "/research/catboost-shadow/report",
-        json={"split_names": ["test"], "test_ratio": 0.25},
+        {"split_names": ["test"], "test_ratio": 0.25},
     )
-    assert catboost.status_code == 200
-    assert catboost.json()["research_id"] == "catboost_shadow"
+    assert catboost["research_id"] == "catboost_shadow"
 
-    finbert = client.post(
+    finbert = _run_task_and_get_result(
+        client,
         "/research/finbert/report",
-        json={
+        {
             "records": [
                 {
                     "symbol": "600000.SH",
@@ -274,11 +296,34 @@ def test_main_phase_d_research_endpoints_run_with_service_backing(
             ]
         },
     )
-    assert finbert.status_code == 200
-    assert finbert.json()["research_id"] == "finbert_sidecar"
+    assert finbert["research_id"] == "finbert_sidecar"
 
-    qlib = client.post("/research/qlib-bridge/report", json={"split_names": ["test"]})
-    assert qlib.status_code == 200
-    qlib_payload = qlib.json()
-    assert qlib_payload["research_id"] == "qlib_bridge"
-    assert Path(str(_as_mapping(qlib_payload["bundle_paths"])["manifest_path"])).exists() is True
+    qlib = _run_task_and_get_result(
+        client,
+        "/research/qlib-bridge/report",
+        {"split_names": ["test"]},
+    )
+    assert qlib["research_id"] == "qlib_bridge"
+    assert Path(str(_as_mapping(qlib["bundle_paths"])["manifest_path"])).exists() is True
+
+
+def test_phase_d_report_endpoint_routes_conserved() -> None:
+    """The 9 phase-D report POST routes must stay registered after refactors."""
+    report_paths = sorted(
+        str(route.path)
+        for route in research_router.routes
+        if str(getattr(route, "path", "")).startswith("/research/")
+        and str(getattr(route, "path", "")).endswith("/report")
+    )
+    assert report_paths == [
+        "/research/alphalens/report",
+        "/research/catboost-shadow/report",
+        "/research/finbert/report",
+        "/research/finrl/report",
+        "/research/heavy-ts/report",
+        "/research/qlib-bridge/report",
+        "/research/shap/report",
+        "/research/tabular-deep/report",
+        "/research/tft/report",
+    ]
+    assert len(report_paths) == 9

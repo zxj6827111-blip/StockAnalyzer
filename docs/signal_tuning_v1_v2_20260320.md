@@ -117,7 +117,6 @@ cd /vol1/docker/StockAnalyzer
 docker compose \
   -f docker-compose.yml \
   -f docker-compose.runtime.yml \
-  -f docker-compose.runtime.localvol.yml \
   exec api \
   python /app/scripts/export_support_bundle.py \
   --base-url "http://127.0.0.1:8000" \
@@ -145,7 +144,6 @@ cd /vol1/docker/StockAnalyzer
 docker compose \
   -f docker-compose.yml \
   -f docker-compose.runtime.yml \
-  -f docker-compose.runtime.localvol.yml \
   up -d --build api scheduler
 ```
 
@@ -175,7 +173,6 @@ curl -X POST "http://127.0.0.1:${SA_API_HOST_PORT:-18001}/notify/test" \
 docker compose \
   -f docker-compose.yml \
   -f docker-compose.runtime.yml \
-  -f docker-compose.runtime.localvol.yml \
   exec api \
   python /app/scripts/export_support_bundle.py \
   --base-url "http://127.0.0.1:8000" \

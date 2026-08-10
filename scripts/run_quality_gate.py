@@ -19,7 +19,7 @@ def main() -> int:
     parser.add_argument(
         "--stage",
         default="all",
-        choices=("clean-scope", "smoke", "integration", "slow-report", "all"),
+        choices=("clean-scope", "smoke", "integration", "slow-report", "full", "all"),
         help="Quality-gate stage to run",
     )
     parser.add_argument(

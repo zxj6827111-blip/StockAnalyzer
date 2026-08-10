@@ -65,6 +65,31 @@ def _normalize_nonempty_string(value: object, default: str = "") -> str:
     return normalized or default
 
 
+_IC_DECAY_REPORT_MODES = frozenset({"monthly"})
+
+
+def _normalize_ic_decay_report_mode(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized in {"", "off", "none", "disabled", "false"}:
+        return ""
+    if normalized in _IC_DECAY_REPORT_MODES:
+        return normalized
+    raise ValueError(f"unsupported ic_decay_report: {value} (supported: monthly, off)")
+
+
+def _normalize_hhmm(value: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        return ""
+    try:
+        hours, minutes = normalized.split(":", maxsplit=1)
+        if not (0 <= int(hours) <= 23 and 0 <= int(minutes) <= 59):
+            raise ValueError
+    except (ValueError, AttributeError):
+        raise ValueError(f"invalid hhmm time: {value} (expected HH:MM)") from None
+    return f"{int(hours):02d}:{int(minutes):02d}"
+
+
 class AppConfig(_StrictModel):
     timezone: str = "Asia/Shanghai"
     mode: str = "simulation"
@@ -548,14 +573,60 @@ class FactorLifecycleConfig(_StrictModel):
     history_limit: int = 240
     graveyard_enabled: bool = True
     graveyard_observation_months: int = 2
+    ic_decay_report: str = "monthly"
+    ic_decay_report_time: str = "21:00"
+    ic_decay_lookback_months: int = 12
+    ic_decay_min_months: int = 3
+    ic_decay_healthy_threshold: float = 0.03
+    ic_decay_slope_threshold: float = -0.005
+
+    @field_validator("ic_decay_report")
+    @classmethod
+    def _validate_ic_decay_report(cls, value: str) -> str:
+        return _normalize_ic_decay_report_mode(value)
 
 
 class SimBrokerWeeklyConfig(_StrictModel):
     enabled: bool = True
+    run_time: str = "17:00"
     history_limit: int = 240
     export_enabled: bool = True
     export_dir: str = "artifacts/week7/sim_broker_weekly"
     auto_notify: bool = True
+
+    @field_validator("run_time")
+    @classmethod
+    def _validate_sim_broker_weekly_run_time(cls, value: str) -> str:
+        return _normalize_hhmm(value)
+
+
+class MonthlyReviewConfig(_StrictModel):
+    enabled: bool = True
+    report_time: str = "21:30"
+    export_dir: str = "artifacts/review/monthly"
+    history_limit: int = 24
+    min_closed_trades: int = 3
+    over_position_threshold: float = 0.5
+    stop_loss_threshold: float = -0.08
+    take_profit_trigger: float = 0.10
+    discipline_pass_threshold: float = 85.0
+    position_cut_ratio: float = 0.10
+    auto_notify: bool = True
+
+    @field_validator("report_time")
+    @classmethod
+    def _validate_monthly_review_report_time(cls, value: str) -> str:
+        return _normalize_hhmm(value)
+
+    @field_validator("discipline_pass_threshold", "position_cut_ratio")
+    @classmethod
+    def _validate_monthly_review_ranges(cls, value: float) -> float:
+        return max(0.0, float(value))
+
+    @field_validator("over_position_threshold")
+    @classmethod
+    def _validate_over_position_threshold(cls, value: float) -> float:
+        return max(0.0, min(1.0, float(value)))
 
 
 class FeishuAppTargetConfig(_StrictModel):
@@ -606,6 +677,14 @@ class NotificationsConfig(_StrictModel):
     email_receivers: list[str] = Field(default_factory=list)
     custom_webhook_url: str = ""
     custom_webhook_bearer_token: str = ""
+    dingtalk_webhook: str = ""
+    dingtalk_secret: str = ""
+    sms_url: str = ""
+    sms_app_key: str = ""
+    sms_app_secret: str = ""
+    sms_sign_name: str = ""
+    sms_template_id: str = ""
+    sms_phone_numbers: list[str] = Field(default_factory=list)
     timeout_sec: int = 5
 
     @field_validator("primary", "backup")
@@ -632,6 +711,8 @@ class NotificationsConfig(_StrictModel):
             "custom",
             "webhook",
             "custom_webhook",
+            "dingtalk",
+            "sms",
         }
         if normalized not in supported:
             supported_text = ",".join(sorted(supported))
@@ -748,6 +829,13 @@ class SchedulerConfig(_StrictModel):
     close_reconcile_time: str = "15:30"
     week4_acceptance_time: str = "20:35"
     week6_daily_time: str = "15:25"
+    # Leader election across scheduler replicas: the poll worker and the
+    # manual run_due endpoint both take this file lock before executing
+    # scheduler jobs (audit P2-#20). The path is relative to the shared
+    # artifacts volume mount.
+    leader_lock_enabled: bool = True
+    leader_lock_stale_after_sec: int = 300
+    leader_lock_path: str = "artifacts/runtime/scheduler_leader.lock"
 
 
 class LabelsConfig(_StrictModel):
@@ -850,6 +938,7 @@ class BacktestMatcherConfig(_StrictModel):
     price_tick_rule: str = "exchange_tick"
     min_notional_per_order: float = 5000.0
     residual_order_policy: str = "day_cancel_then_recalc"
+    apply_dynamic_slippage_live: bool = False
 
 
 class WalkForwardConfig(_StrictModel):
@@ -1199,10 +1288,83 @@ class IdleQueueConfig(_StrictModel):
     universe_cache_path: str = "artifacts/universe/a_share_symbols.json"
     universe_cache_max_age_hours: int = 24
     universe_min_symbols: int = 500
+    # P2-#27 phase 1: exclude delisted symbols from universe construction to
+    # avoid survivorship bias. List source: tushare stock_basic(list_status='D')
+    # when the token is available, else the local delisted_symbols_path file.
+    exclude_delisted: bool = True
+    delisted_symbols_path: str = "artifacts/universe/delisted.json"
 
 
 class DashboardConfig(_StrictModel):
     default_total_asset: float = 0.0
+
+
+class ParamFreezeWindowConfig(_StrictModel):
+    start: str = "09:15"
+    end: str = "15:00"
+
+    @field_validator("start", "end")
+    @classmethod
+    def _validate_window_bound(cls, value: str) -> str:
+        return _normalize_hhmm(value)
+
+
+class ParamFreezeConfig(_StrictModel):
+    """PRD §8.7 parameter freeze: trading-parameter mutations are rejected
+    inside the freeze windows (default 09:15-15:00 on A-share trading days).
+
+    ``frozen_paths`` is the endpoint blacklist guarded by the
+    ``ensure_params_not_frozen`` FastAPI dependency; ``frozen_queries`` lists
+    interaction-channel mutation queries (e.g. wecom/feishu
+    ``execution_mode_set``) handled at the command-processing layer.
+    """
+
+    enabled: bool = True
+    timezone: str = "Asia/Shanghai"
+    freeze_windows: list[ParamFreezeWindowConfig] = Field(
+        default_factory=lambda: [ParamFreezeWindowConfig()]
+    )
+    frozen_paths: list[str] = Field(
+        default_factory=lambda: [
+            "/week7/kill-switch/reset",
+            "/settings/blacklist/add",
+            "/settings/blacklist/remove",
+            "/models/registry/lifecycle",
+            "/models/registry/role",
+            "/models/registry/bootstrap-active-champion",
+            "/learning/models/proposal/approval",
+            "/learning/models/proposal/revoke",
+            "/learning/models/release/ticket/execute",
+            "/learning/models/release/ticket/confirm",
+            "/learning/models/release/ticket/rollback",
+            "/learning/models/release/confirmation/watchdog",
+        ]
+    )
+    frozen_queries: list[str] = Field(default_factory=lambda: ["execution_mode_set"])
+
+    @field_validator("freeze_windows")
+    @classmethod
+    def _validate_freeze_windows(
+        cls, value: list[ParamFreezeWindowConfig]
+    ) -> list[ParamFreezeWindowConfig]:
+        for window in value:
+            if window.start >= window.end:
+                raise ValueError(
+                    f"freeze window start must be before end: {window.start}-{window.end}"
+                )
+        return value
+
+    @field_validator("timezone")
+    @classmethod
+    def _validate_timezone(cls, value: str) -> str:
+        normalized = value.strip() or "Asia/Shanghai"
+        try:
+            from zoneinfo import ZoneInfo
+
+            ZoneInfo(normalized)
+        except Exception as exc:
+            raise ValueError(f"invalid param_freeze timezone: {value}") from exc
+        return normalized
 
 
 class SecurityConfig(_StrictModel):
@@ -1212,10 +1374,45 @@ class SecurityConfig(_StrictModel):
     suppress_plain_test_notifications: bool = True
 
 
+class BlacklistConfig(_StrictModel):
+    """Per-symbol blacklist that suppresses trading signals for listed targets.
+
+    Patterns are exact symbols (``600000``) or prefix wildcards (``688*``);
+    matching is case-sensitive on the stripped symbol string.
+    """
+
+    enabled: bool = False
+    symbols: list[str] = Field(default_factory=list)
+
+    def matches(self, symbol: str) -> str | None:
+        """Return the first pattern matching ``symbol``, or ``None``."""
+        normalized = symbol.strip()
+        if not normalized:
+            return None
+        # Iterate a snapshot: runtime mutations replace the list wholesale
+        # (copy-on-write), so a snapshot is always internally consistent.
+        for pattern in tuple(self.symbols):
+            candidate = str(pattern).strip()
+            if not candidate:
+                continue
+            if candidate.endswith("*"):
+                if normalized.startswith(candidate[:-1]):
+                    return candidate
+            elif candidate == normalized:
+                return candidate
+        return None
+
+    def is_blacklisted(self, symbol: str) -> bool:
+        if not self.enabled:
+            return False
+        return self.matches(symbol) is not None
+
+
 class StockAnalyzerConfig(_StrictModel):
     app: AppConfig
     data_source: DataSourceConfig
     security: SecurityConfig = Field(default_factory=SecurityConfig)
+    blacklist: BlacklistConfig = Field(default_factory=BlacklistConfig)
     market_depth: MarketDepthConfig = Field(default_factory=MarketDepthConfig)
     tdx_sync: TdxSyncConfig = Field(default_factory=TdxSyncConfig)
     market_warehouse: MarketWarehouseConfig = Field(default_factory=MarketWarehouseConfig)
@@ -1242,6 +1439,7 @@ class StockAnalyzerConfig(_StrictModel):
     cloud_backup: CloudBackupConfig = Field(default_factory=CloudBackupConfig)
     factor_lifecycle: FactorLifecycleConfig = Field(default_factory=FactorLifecycleConfig)
     sim_broker_weekly: SimBrokerWeeklyConfig = Field(default_factory=SimBrokerWeeklyConfig)
+    monthly_review: MonthlyReviewConfig = Field(default_factory=MonthlyReviewConfig)
     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
     wecom_interaction: WeComInteractionConfig = Field(default_factory=WeComInteractionConfig)
     feishu_interaction: FeishuInteractionConfig = Field(default_factory=FeishuInteractionConfig)
@@ -1261,6 +1459,7 @@ class StockAnalyzerConfig(_StrictModel):
     evolution: EvolutionConfig = Field(default_factory=EvolutionConfig)
     idle_queue: IdleQueueConfig = Field(default_factory=IdleQueueConfig)
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
+    param_freeze: ParamFreezeConfig = Field(default_factory=ParamFreezeConfig)
 
 
 def _parse_env_value(raw: str) -> Any:

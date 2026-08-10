@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import tempfile
+import time
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
@@ -26,7 +28,11 @@ def _load_test_config() -> StockAnalyzerConfig:
     config.liquidity_filter_trend.min_daily_turnover = 0.0
     config.liquidity_filter_trend.min_float_market_cap = 0.0
     config.liquidity_filter_trend.max_turnover_rate = 1.0
-    config.training.artifact_path = str(root / "artifacts" / "nonexistent_test_model.json")
+    config.training.artifact_path = str(
+        Path(tempfile.gettempdir())
+        / f"stock_analyzer_service_week6_execution_{time.time_ns()}"
+        / "nonexistent_test_model.json"
+    )
     config.week6.auto_notify = False
     config.week5.auto_notify = False
     config.strategy_kill_switch.enabled = False

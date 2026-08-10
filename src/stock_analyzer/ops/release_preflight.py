@@ -242,6 +242,13 @@ def _notification_channel_ready(config: StockAnalyzerConfig, channel: str) -> bo
         )
     if channel in {"custom", "webhook", "custom_webhook"}:
         return bool(config.notifications.custom_webhook_url.strip())
+    if channel == "dingtalk":
+        return bool(config.notifications.dingtalk_webhook.strip())
+    if channel == "sms":
+        return bool(
+            config.notifications.sms_url.strip()
+            and config.notifications.sms_phone_numbers
+        )
     return False
 
 
@@ -265,6 +272,10 @@ def _notification_channel_detail(channel: str, *, passed: bool) -> str:
         return "requires smtp host, sender, password, and receivers"
     if channel in {"custom", "webhook", "custom_webhook"}:
         return "requires notifications.custom_webhook_url"
+    if channel == "dingtalk":
+        return "requires notifications.dingtalk_webhook"
+    if channel == "sms":
+        return "requires notifications.sms_url and notifications.sms_phone_numbers"
     return f"unsupported channel: {channel}"
 
 

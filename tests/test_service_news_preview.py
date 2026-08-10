@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import tempfile
+import time
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
@@ -56,7 +58,11 @@ def _load_test_config() -> StockAnalyzerConfig:
     config.command_channel.history_archive_enabled = False
     config.notifications.primary = "console"
     config.notifications.backup = "console"
-    config.training.artifact_path = str(root / "artifacts" / "nonexistent_test_model.json")
+    config.training.artifact_path = str(
+        Path(tempfile.gettempdir())
+        / f"stock_analyzer_service_news_preview_{time.time_ns()}"
+        / "nonexistent_test_model.json"
+    )
     config.notification_filter.enabled = False
     return config
 

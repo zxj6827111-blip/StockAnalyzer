@@ -19,7 +19,6 @@ function New-ComposeArgs {
     $composeFiles = @(
         (Join-Path $Root "docker-compose.yml"),
         (Join-Path $Root "docker-compose.runtime.yml"),
-        (Join-Path $Root "docker-compose.runtime.localvol.yml"),
         (Join-Path $Root "docker-compose.notifications.local.yml")
     )
 

@@ -54,9 +54,11 @@ class QualityGateReport:
 
 _RUFF_TARGETS = (
     "src/stock_analyzer/main.py",
+    "src/stock_analyzer/api",
     "src/stock_analyzer/data/market_warehouse.py",
     "src/stock_analyzer/data/vendor_zip_overlay.py",
     "src/stock_analyzer/runtime/service.py",
+    "src/stock_analyzer/runtime/scheduler_worker.py",
     "src/stock_analyzer/runtime/universe_candidate_selector.py",
     "src/stock_analyzer/runtime/services",
     "src/stock_analyzer/ops",
@@ -76,10 +78,15 @@ _RUFF_TARGETS = (
     "tests/test_probe_universe_quality_selector.py",
     "tests/test_backfill_financial_snapshots.py",
     "tests/test_financial_pit.py",
+    "tests/test_file_lock.py",
+    "tests/test_scheduler_worker.py",
+    "tests/test_main_scheduler_run_due.py",
     "tests/test_market_warehouse.py",
 )
 
 _MYPY_BLOCKING_TARGETS = (
+    "src/stock_analyzer/main.py",
+    "src/stock_analyzer/api",
     "src/stock_analyzer/data/market_warehouse.py",
     "src/stock_analyzer/data/vendor_zip_overlay.py",
     "src/stock_analyzer/runtime/services/market_sync_service.py",
@@ -96,6 +103,8 @@ _MYPY_BLOCKING_TARGETS = (
     "src/stock_analyzer/ops/release_smoke.py",
     "src/stock_analyzer/ops/staging_rehearsal.py",
     "src/stock_analyzer/ops/release_snapshot.py",
+    "src/stock_analyzer/ops/file_lock.py",
+    "src/stock_analyzer/runtime/scheduler_worker.py",
 )
 
 _MYPY_INFORMATIONAL_TARGETS = (
@@ -160,7 +169,16 @@ _SLOW_TEST_FILES = (
     "tests/test_main_news_preview.py",
     "tests/test_service_news_preview.py",
     "tests/test_intraday_factors.py",
+    "tests/test_universe_candidate_selector.py",
 )
+
+# Full-suite stage: run every test under testpaths (except the slow files that
+# are exercised by the non-blocking slow-report stage) in parallel and enforce
+# a coverage floor. Threshold is a conservative baseline: a full local run on
+# Python 3.11 reports ~79% line coverage after excluding the slow files, so a
+# 75% floor leaves headroom for runner-to-runner variance.
+_FULL_COVERAGE_FLOOR = 75
+_FULL_PARALLEL_WORKERS = "2"
 
 
 def build_stage_specs(stage: str) -> list[QualityCommandSpec]:
@@ -224,6 +242,28 @@ def build_stage_specs(stage: str) -> list[QualityCommandSpec]:
                 log_name="pytest_slow_report.log",
             )
         ]
+    if normalized == "full":
+        return [
+            QualityCommandSpec(
+                name="pytest_full_suite",
+                command=(
+                    python,
+                    "-m",
+                    "pytest",
+                    "tests",
+                    *(f"--ignore={path}" for path in _SLOW_TEST_FILES),
+                    "-n",
+                    _FULL_PARALLEL_WORKERS,
+                    "--cov=stock_analyzer",
+                    "--cov-report=term",
+                    "--cov-report=xml:artifacts/coverage/coverage.xml",
+                    f"--cov-fail-under={_FULL_COVERAGE_FLOOR}",
+                    "--durations=20",
+                    "-q",
+                ),
+                log_name="pytest_full_suite.log",
+            )
+        ]
     if normalized == "all":
         return (
             build_stage_specs("clean-scope")
@@ -243,6 +283,7 @@ def run_quality_gate(
     started_at = datetime.now()
     log_root = root / "artifacts" / "quality"
     log_root.mkdir(parents=True, exist_ok=True)
+    (root / "artifacts" / "coverage").mkdir(parents=True, exist_ok=True)
 
     results: list[QualityCommandResult] = []
     blocking_failures: list[str] = []

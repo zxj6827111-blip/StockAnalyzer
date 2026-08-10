@@ -32,7 +32,6 @@ TRACKED_FILES = (
     "config/default.yaml",
     "docker-compose.yml",
     "docker-compose.runtime.yml",
-    "docker-compose.runtime.localvol.yml",
 )
 
 HTTP_ENDPOINTS = {

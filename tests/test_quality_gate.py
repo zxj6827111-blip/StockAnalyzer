@@ -20,6 +20,17 @@ def test_quality_gate_builds_clean_scope_and_slow_specs() -> None:
     assert any(
         spec.name == "mypy_market_sync_service" and spec.blocking is True for spec in clean_specs
     )
+    assert any(
+        spec.name == "mypy_main" and spec.blocking is True for spec in clean_specs
+    )
+    assert any(
+        spec.name == "mypy_api" and spec.blocking is True for spec in clean_specs
+    )
+    assert any(spec.name == "ruff_clean_scope" for spec in clean_specs)
+    ruff_targets = next(
+        spec.command for spec in clean_specs if spec.name == "ruff_clean_scope"
+    )
+    assert "src/stock_analyzer/api" in ruff_targets
     assert len(slow_specs) == 1
     assert slow_specs[0].name == "pytest_slow_report"
 

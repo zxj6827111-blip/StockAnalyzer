@@ -552,6 +552,26 @@ class AnalyzerPipeline:
         return frame.sort_index()
 
     def _process_symbol(self, symbol: str, strategy: str, current_equity: float) -> PipelineSignal:
+        blacklist = self._config.blacklist
+        matched_blacklist_pattern = blacklist.matches(symbol) if blacklist.enabled else None
+        if matched_blacklist_pattern is not None:
+            return PipelineSignal(
+                symbol=symbol,
+                strategy=strategy,
+                score=0.0,
+                grade="C",
+                action="hold",
+                target_position=0.0,
+                probabilities={"lgbm": 0.0, "xgb": 0.0, "meta": 0.0},
+                reasons=["blacklist"],
+                decision_trace={
+                    "blacklist_gate": {
+                        "passed": False,
+                        "enabled": True,
+                        "matched_pattern": matched_blacklist_pattern,
+                    }
+                },
+            )
         decision_time = datetime.now()
         start = perf_counter()
         try:

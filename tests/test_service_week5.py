@@ -155,7 +155,11 @@ def _load_test_config() -> StockAnalyzerConfig:
     # Default to legacy universe path for existing tests; tests that exercise the
     # quality selector enable it explicitly via _enable_universe_quality_selector.
     config.week5.universe_quality_selector_enabled = False
-    config.training.artifact_path = str(root / "artifacts" / "nonexistent_test_model.json")
+    config.training.artifact_path = str(
+        Path(tempfile.gettempdir())
+        / f"stock_analyzer_service_week5_{time.time_ns()}"
+        / "nonexistent_test_model.json"
+    )
     config.training.bootstrap_auto_run_on_first_start = False
     config.training.bootstrap_require_completion_for_runtime = False
     config.training.bootstrap_auto_seed_watchlist = False

@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
+import logging
 import re
 import smtplib
 import ssl
@@ -13,6 +17,8 @@ from dataclasses import asdict, dataclass, field
 from email.message import EmailMessage
 from typing import ClassVar, Protocol
 from urllib import parse, request
+
+_logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -161,6 +167,41 @@ class ConsoleNotifier:
             f"content={message.content}"
         )
         return NotificationResult(success=True, channel="console")
+
+
+@dataclass(slots=True)
+class DingTalkNotifier:
+    """DingTalk custom robot webhook with optional HMAC-SHA256 signing."""
+
+    webhook: str
+    secret: str = ""
+    timeout_sec: int = 5
+
+    def send(self, message: NotificationMessage) -> NotificationResult:
+        webhook = self.webhook.strip()
+        if not webhook:
+            _logger.warning("dingtalk notifier missing webhook; skipping send")
+            return NotificationResult(success=False, channel="dingtalk", error="missing_webhook")
+        body = {
+            "msgtype": "markdown",
+            "markdown": {
+                "title": message.title.strip() or "StockAnalyzer 通知",
+                "text": _format_dingtalk_message(message),
+            },
+        }
+        url = webhook
+        secret = self.secret.strip()
+        if secret:
+            timestamp_ms = str(int(time.time() * 1000))
+            sign = _dingtalk_signature(secret=secret, timestamp_ms=timestamp_ms)
+            separator = "&" if "?" in webhook else "?"
+            url = f"{webhook}{separator}timestamp={timestamp_ms}&sign={sign}"
+        return _post_dingtalk_json(
+            channel="dingtalk",
+            url=url,
+            body=body,
+            timeout_sec=self.timeout_sec,
+        )
 
 
 @dataclass(slots=True)
@@ -785,6 +826,71 @@ class CustomWebhookNotifier:
         )
 
 
+class SmsGateway(Protocol):
+    def send(self, body: Mapping[str, object], timeout_sec: int) -> NotificationResult:
+        """Send SMS payload to the gateway and return delivery result."""
+
+
+@dataclass(slots=True)
+class HttpSmsGateway:
+    """Generic HTTP JSON SMS gateway sender."""
+
+    url: str
+    app_key: str = ""
+    app_secret: str = ""
+
+    def send(self, body: Mapping[str, object], timeout_sec: int) -> NotificationResult:
+        if not self.url.strip():
+            return NotificationResult(success=False, channel="sms", error="missing_url")
+        return _post_json(
+            channel="sms",
+            url=self.url,
+            body=body,
+            timeout_sec=timeout_sec,
+        )
+
+
+@dataclass(slots=True)
+class SmsNotifier:
+    """SMS channel built on an injectable SmsGateway (default: HttpSmsGateway)."""
+
+    url: str = ""
+    app_key: str = ""
+    app_secret: str = ""
+    sign_name: str = ""
+    template_id: str = ""
+    phone_numbers: Sequence[str] = field(default_factory=list)
+    timeout_sec: int = 5
+    gateway: SmsGateway | None = None
+
+    def send(self, message: NotificationMessage) -> NotificationResult:
+        phones = _normalize_string_list(self.phone_numbers)
+        if not phones:
+            _logger.warning("sms notifier missing phone numbers; skipping send")
+            return NotificationResult(
+                success=False,
+                channel="sms",
+                error="missing_phone_numbers",
+            )
+        if not self.url.strip():
+            _logger.warning("sms notifier missing gateway url; skipping send")
+            return NotificationResult(success=False, channel="sms", error="missing_url")
+        gateway = self.gateway or HttpSmsGateway(
+            url=self.url,
+            app_key=self.app_key,
+            app_secret=self.app_secret,
+        )
+        body: dict[str, object] = {
+            "app_key": self.app_key,
+            "app_secret": self.app_secret,
+            "sign_name": self.sign_name,
+            "template_id": self.template_id,
+            "phones": phones,
+            "content": _format_plain_message(message),
+        }
+        return gateway.send(body=body, timeout_sec=self.timeout_sec)
+
+
 @dataclass(slots=True)
 class FailoverNotifier:
     """Try primary channel first, then fallback channel."""
@@ -821,18 +927,67 @@ def _post_json(
     headers = {"Content-Type": "application/json"}
     if extra_headers:
         headers.update(dict(extra_headers))
-    req = request.Request(
-        url=url,
-        data=encoded,
-        method="POST",
-        headers=headers,
-    )
     try:
+        req = request.Request(
+            url=url,
+            data=encoded,
+            method="POST",
+            headers=headers,
+        )
         with request.urlopen(req, timeout=timeout_sec) as resp:
             ok = 200 <= resp.status < 300
             return NotificationResult(success=ok, channel=channel, error="" if ok else "non_2xx")
     except Exception as exc:  # pragma: no cover - network dependent.
         return NotificationResult(success=False, channel=channel, error=str(exc))
+
+
+def _post_dingtalk_json(
+    channel: str,
+    url: str,
+    body: Mapping[str, object],
+    timeout_sec: int,
+) -> NotificationResult:
+    encoded = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    try:
+        req = request.Request(
+            url=url,
+            data=encoded,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with request.urlopen(req, timeout=timeout_sec) as resp:
+            if not (200 <= resp.status < 300):
+                return NotificationResult(success=False, channel=channel, error="non_2xx")
+            payload = _read_json_mapping(resp.read())
+            errcode = _mapping_int(payload, "errcode", default=0)
+            if errcode != 0:
+                return NotificationResult(
+                    success=False,
+                    channel=channel,
+                    error=str(payload.get("errmsg", "dingtalk_error")),
+                )
+            return NotificationResult(success=True, channel=channel)
+    except Exception as exc:  # pragma: no cover - network dependent.
+        return NotificationResult(success=False, channel=channel, error=str(exc))
+
+
+def _dingtalk_signature(*, secret: str, timestamp_ms: str) -> str:
+    secret_enc = secret.encode("utf-8")
+    string_to_sign = f"{timestamp_ms}\n{secret}".encode()
+    digest = hmac.new(secret_enc, string_to_sign, digestmod=hashlib.sha256).digest()
+    return parse.quote_plus(base64.b64encode(digest))
+
+
+def _format_dingtalk_message(message: NotificationMessage) -> str:
+    title = message.title.strip()
+    content = message.content.strip()
+    if title and content:
+        return f"## {title}\n\n{content}"
+    if content:
+        return content
+    if title:
+        return f"## {title}"
+    return f"[{message.level.upper()}]"
 
 
 def _post_telegram_json(

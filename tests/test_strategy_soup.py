@@ -112,3 +112,39 @@ def test_soup_strategy_rejects_probe_when_raw_score_is_too_low() -> None:
 
     assert decision.action == "hold"
     assert decision.reason == "cross_review"
+
+
+def test_soup_strategy_holds_when_liquidity_filter_fails() -> None:
+    strategy = SoupStrategy(SoupStrategyConfig())
+    features = pd.Series({"atr_ratio": 0.2})
+    scored = ScoredSignal(total_score=92.0, grade="S", components={})
+
+    decision = strategy.recommend(
+        scored=scored,
+        latest_features=features,
+        can_open_new_position=True,
+        liquidity_pass=False,
+        cross_review_pass=True,
+    )
+
+    assert decision.action == "hold"
+    assert decision.target_position == 0.0
+    assert decision.reason == "liquidity_filter"
+
+
+def test_soup_strategy_holds_when_risk_gate_blocks() -> None:
+    strategy = SoupStrategy(SoupStrategyConfig())
+    features = pd.Series({"atr_ratio": 0.2})
+    scored = ScoredSignal(total_score=92.0, grade="S", components={})
+
+    decision = strategy.recommend(
+        scored=scored,
+        latest_features=features,
+        can_open_new_position=False,
+        liquidity_pass=True,
+        cross_review_pass=True,
+    )
+
+    assert decision.action == "hold"
+    assert decision.target_position == 0.0
+    assert decision.reason == "risk_gate"

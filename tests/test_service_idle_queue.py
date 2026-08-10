@@ -21,6 +21,7 @@ class _MockProvider:
 def _load_test_config(tmp_path: Path) -> StockAnalyzerConfig:
     root = Path(__file__).resolve().parents[1]
     config = load_config(root / "config" / "default.yaml")
+    config.command_channel.state_persist_path = str(tmp_path / "runtime_state.json")
     config.scheduler.premarket_time = "08:30"
     config.scheduler.auction_report_time = "23:59"
     config.scheduler.close_reconcile_time = "23:59"
@@ -460,6 +461,7 @@ def test_idle_queue_we_learn_01_blocks_stale_market_warehouse_report(
     tmp_path: Path,
 ) -> None:
     config = _load_test_config(tmp_path)
+    config.market_warehouse.enabled = True
     config.auto_promotion.notify_on_training_summary = False
     service = StockAnalyzerService(config=config)
     service._evolution_project_root = tmp_path

@@ -4,7 +4,7 @@
 
 - NAS 项目目录：`/vol1/docker/StockAnalyzer`
 - NAS 架构：`x86_64`
-- 部署方式：`docker compose` + `runtime localvol`
+- 部署方式：`docker compose` + `runtime`（命名卷）
 - API 对外端口：`18001`
 - 前端访问入口：`http://NAS-IP:18001/ui/`
 - 健康检查入口：`http://NAS-IP:18001/health`
@@ -21,7 +21,6 @@
 - `Dockerfile`
 - `docker-compose.yml`
 - `docker-compose.runtime.yml`
-- `docker-compose.runtime.localvol.yml`
 - `.env`
 - 本地构建后上传到 NAS 的镜像包 `*.tar`
 
@@ -164,7 +163,6 @@ cd /vol1/docker/StockAnalyzer
 docker compose \
   -f docker-compose.yml \
   -f docker-compose.runtime.yml \
-  -f docker-compose.runtime.localvol.yml \
   up -d --no-build redis api scheduler
 ```
 
@@ -183,7 +181,6 @@ cd /vol1/docker/StockAnalyzer
 docker compose \
   -f docker-compose.yml \
   -f docker-compose.runtime.yml \
-  -f docker-compose.runtime.localvol.yml \
   ps
 ```
 
@@ -200,13 +197,11 @@ cd /vol1/docker/StockAnalyzer
 docker compose \
   -f docker-compose.yml \
   -f docker-compose.runtime.yml \
-  -f docker-compose.runtime.localvol.yml \
   logs --tail=120 api
 
 docker compose \
   -f docker-compose.yml \
   -f docker-compose.runtime.yml \
-  -f docker-compose.runtime.localvol.yml \
   logs --tail=120 scheduler
 ```
 
@@ -251,7 +246,6 @@ docker rm -f stock-analyzer-api 2>/dev/null || true
 docker compose \
   -f docker-compose.yml \
   -f docker-compose.runtime.yml \
-  -f docker-compose.runtime.localvol.yml \
   up -d --no-build api
 ```
 
@@ -314,7 +308,6 @@ cd /vol1/docker/StockAnalyzer
 docker compose \
   -f docker-compose.yml \
   -f docker-compose.runtime.yml \
-  -f docker-compose.runtime.localvol.yml \
   up -d --no-build api scheduler
 ```
 
@@ -342,7 +335,6 @@ docker load -i redis-7-alpine-amd64.tar
 docker compose \
   -f docker-compose.yml \
   -f docker-compose.runtime.yml \
-  -f docker-compose.runtime.localvol.yml \
   up -d --no-build redis api scheduler
 ```
 
@@ -353,7 +345,6 @@ cd /vol1/docker/StockAnalyzer
 docker compose \
   -f docker-compose.yml \
   -f docker-compose.runtime.yml \
-  -f docker-compose.runtime.localvol.yml \
   ps
 ```
 

@@ -1,9 +1,28 @@
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi.testclient import TestClient
 from pytest import MonkeyPatch
 
 import stock_analyzer.main as main_module
+
+
+def _run_task_and_get_result(
+    client: TestClient,
+    url: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """POST a heavy endpoint (202 + task_id), then fetch the recorded result."""
+    response = client.post(url, json=payload)
+    assert response.status_code == 202, f"{url} -> {response.status_code}: {response.text}"
+    body = response.json()
+    assert body["status"] == "queued", url
+    task_response = client.get(f"/tasks/{body['task_id']}")
+    assert task_response.status_code == 200
+    task_payload = task_response.json()
+    assert task_payload["status"] == "succeeded", f"{url}: {task_payload.get('error')}"
+    return task_payload["result"]
 
 
 class _FakeLearningBackfillService:
@@ -1109,18 +1128,16 @@ def test_train_learning_manifest_endpoint_returns_manifest_training_payload(
     monkeypatch.setattr(main_module, "_service", _FakeLearningBackfillService())
     client = TestClient(main_module.app)
 
-    response = client.post(
+    payload = _run_task_and_get_result(
+        client,
         "/train/learning-manifest",
-        json={
+        {
             "dataset_manifest_id": "dataset_manifest_v1_test",
             "artifact_path": "tmp/manifest_model.json",
             "load_predictor": True,
             "register_model": True,
         },
     )
-
-    assert response.status_code == 200
-    payload = response.json()
     assert payload["ok"] is True
     assert payload["input_mode"] == "dataset_manifest"
     assert payload["dataset_manifest_id"] == "dataset_manifest_v1_test"
@@ -1346,9 +1363,10 @@ def test_train_execution_risk_endpoint_returns_training_payload(
     monkeypatch.setattr(main_module, "_service", _FakeLearningBackfillService())
     client = TestClient(main_module.app)
 
-    response = client.post(
+    payload = _run_task_and_get_result(
+        client,
         "/train/execution-risk",
-        json={
+        {
             "artifact_path": "tmp/execution_risk_artifact.json",
             "maturity_statuses": ["reconciled"],
             "max_rows": 50,
@@ -1357,9 +1375,6 @@ def test_train_execution_risk_endpoint_returns_training_payload(
             "seed": 9,
         },
     )
-
-    assert response.status_code == 200
-    payload = response.json()
     assert payload["mode"] == "execution_risk_training"
     assert payload["status"] == "trained"
     assert payload["dataset_id"] == "execution_risk_dataset_v1_test"
@@ -1401,9 +1416,10 @@ def test_train_learning_manifest_shadow_validate_endpoint_returns_bundle_payload
     monkeypatch.setattr(main_module, "_service", _FakeLearningBackfillService())
     client = TestClient(main_module.app)
 
-    response = client.post(
+    payload = _run_task_and_get_result(
+        client,
         "/train/learning-manifest/shadow-validate",
-        json={
+        {
             "dataset_manifest_id": "dataset_manifest_v1_test",
             "artifact_path": "tmp/manifest_model.json",
             "champion_model_id": "model_champion_test",
@@ -1419,9 +1435,6 @@ def test_train_learning_manifest_shadow_validate_endpoint_returns_bundle_payload
             "mark_shadow_validated": True,
         },
     )
-
-    assert response.status_code == 200
-    payload = response.json()
     assert payload["ok"] is True
     assert payload["mode"] == "learning_manifest_shadow_validation"
     assert payload["shadow_model_id"] == "model_shadow_test"
@@ -1485,9 +1498,10 @@ def test_train_learning_manifest_shadow_promote_endpoint_returns_workflow_payloa
     monkeypatch.setattr(main_module, "_service", _FakeLearningBackfillService())
     client = TestClient(main_module.app)
 
-    response = client.post(
+    payload = _run_task_and_get_result(
+        client,
         "/train/learning-manifest/shadow-promote",
-        json={
+        {
             "dataset_manifest_id": "dataset_manifest_v1_test",
             "artifact_path": "tmp/manifest_model.json",
             "champion_model_id": "model_champion_test",
@@ -1509,9 +1523,6 @@ def test_train_learning_manifest_shadow_promote_endpoint_returns_workflow_payloa
             "block_if_failed": False,
         },
     )
-
-    assert response.status_code == 200
-    payload = response.json()
     assert payload["ok"] is True
     assert payload["mode"] == "learning_manifest_shadow_promotion_gate"
     assert payload["status"] == "pass"
@@ -1569,9 +1580,10 @@ def test_train_learning_manifest_shadow_proposal_endpoint_returns_workflow_paylo
     monkeypatch.setattr(main_module, "_service", _FakeLearningBackfillService())
     client = TestClient(main_module.app)
 
-    response = client.post(
+    payload = _run_task_and_get_result(
+        client,
         "/train/learning-manifest/shadow-proposal",
-        json={
+        {
             "dataset_manifest_id": "dataset_manifest_v1_test",
             "artifact_path": "tmp/manifest_model.json",
             "champion_model_id": "model_champion_test",
@@ -1594,9 +1606,6 @@ def test_train_learning_manifest_shadow_proposal_endpoint_returns_workflow_paylo
             "source_trace_id": "api-shadow-proposal",
         },
     )
-
-    assert response.status_code == 200
-    payload = response.json()
     assert payload["ok"] is True
     assert payload["mode"] == "learning_manifest_shadow_proposal"
     assert payload["status"] == "generated"

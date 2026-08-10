@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from evaluate_fall_then_rise import list_universe, read_day_bars  # noqa: E402
+from stock_analyzer.config import BacktestMatcherConfig  # noqa: E402
 from stock_analyzer.feature.engineer import FeatureEngineer  # noqa: E402
 from stock_analyzer.feature.tdx_indicators import compute_fall_then_rise  # noqa: E402
 from stock_analyzer.labels.soup import build_soup_labels  # noqa: E402
@@ -47,9 +48,10 @@ MIN_TRAIN_ROWS = 5000
 TAKE_PROFIT = 0.08
 STOP_LOSS = 0.05
 MAX_HOLD_DAYS = 10
-SLIPPAGE = 0.0015
-COMMISSION = 0.0003
-STAMP = 0.0005
+_MATCHER_CONFIG = BacktestMatcherConfig()
+SLIPPAGE = float(_MATCHER_CONFIG.slippage_by_strategy.get("trend", 0.0))
+COMMISSION = _MATCHER_CONFIG.commission_rate
+STAMP = _MATCHER_CONFIG.stamp_tax_rate
 BONUS = 4.0
 TOP_K_BUFFER = 5
 

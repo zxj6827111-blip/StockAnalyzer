@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import tempfile
+import time
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
@@ -33,7 +35,11 @@ def _load_test_config(tmp_path: Path) -> StockAnalyzerConfig:
     config.command_channel.state_persist_enabled = True
     config.command_channel.state_persist_path = str(tmp_path / "runtime_state.json")
     config.command_channel.history_archive_enabled = False
-    config.training.artifact_path = str(root / "artifacts" / "nonexistent_test_model.json")
+    config.training.artifact_path = str(
+        Path(tempfile.gettempdir())
+        / f"stock_analyzer_service_runtime_state_persistence_{time.time_ns()}"
+        / "nonexistent_test_model.json"
+    )
     config.training.bootstrap_auto_run_on_first_start = False
     config.training.bootstrap_require_completion_for_runtime = False
     config.training.bootstrap_auto_seed_watchlist = False

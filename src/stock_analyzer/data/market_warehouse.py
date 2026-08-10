@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import math
+import time
+from collections.abc import Callable
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -2254,7 +2256,36 @@ class MarketWarehouse:
         return self._connect()
 
     def _connect_readonly(self) -> _DUCK_CONNECTION:
-        return self._connect()
+        # Read paths must open DuckDB in read_only mode: multiple readers can
+        # share the file concurrently and a reader never blocks (or is blocked
+        # by) the nightly write window. When the database file is absent,
+        # fall back to legacy behaviour (opens/creates an empty DB) so callers
+        # that tolerate an empty warehouse keep working unchanged.
+        import duckdb
+
+        def _open() -> _DUCK_CONNECTION:
+            if self._db_path.exists():
+                try:
+                    return cast(
+                        _DUCK_CONNECTION,
+                        duckdb.connect(database=str(self._db_path), read_only=True),
+                    )
+                except duckdb.ConnectionException as exc:
+                    if "different configuration" in str(exc).lower():
+                        # DuckDB forbids opening a second connection to the
+                        # same file with a different configuration while a
+                        # write connection is already open in this process.
+                        # Fall back to the legacy connection so same-process
+                        # read/write coexistence keeps working; cross-process
+                        # readers still get the read-only fast path.
+                        return cast(
+                            _DUCK_CONNECTION,
+                            duckdb.connect(database=str(self._db_path)),
+                        )
+                    raise
+            return cast(_DUCK_CONNECTION, duckdb.connect(database=str(self._db_path)))
+
+        return _connect_with_lock_retry(_open)
 
     def _connect(self) -> _DUCK_CONNECTION:
         import duckdb
@@ -2267,6 +2298,39 @@ class MarketWarehouse:
                 duckdb.connect(database=str(self._db_path), read_only=True),
             )
         return cast(_DUCK_CONNECTION, duckdb.connect(database=str(self._db_path)))
+
+
+_DUCKDB_LOCK_RETRY_ATTEMPTS = 5
+_DUCKDB_LOCK_RETRY_BASE_DELAY_SEC = 0.25
+_DUCKDB_LOCK_RETRY_MAX_DELAY_SEC = 2.0
+
+
+def _is_retryable_duckdb_lock_error(exc: Exception) -> bool:
+    message = str(exc).strip().lower()
+    return (
+        "could not set lock on file" in message
+        or "conflicting lock is held" in message
+    )
+
+
+def _connect_with_lock_retry(connect_fn: Callable[[], _DUCK_CONNECTION]) -> _DUCK_CONNECTION:
+    """Open a DuckDB connection, retrying transient file-lock conflicts.
+
+    The nightly market-warehouse write window holds the database file lock for
+    a long time; readers that try to open the file during that window can hit
+    ``could not set lock on file`` / ``conflicting lock is held``. Retry with
+    exponential backoff instead of failing the request outright.
+    """
+    delay_sec = _DUCKDB_LOCK_RETRY_BASE_DELAY_SEC
+    for attempt in range(1, _DUCKDB_LOCK_RETRY_ATTEMPTS + 1):
+        try:
+            return connect_fn()
+        except Exception as exc:
+            if not _is_retryable_duckdb_lock_error(exc) or attempt >= _DUCKDB_LOCK_RETRY_ATTEMPTS:
+                raise
+            time.sleep(delay_sec)
+            delay_sec = min(_DUCKDB_LOCK_RETRY_MAX_DELAY_SEC, delay_sec * 2.0)
+    raise RuntimeError("unreachable")
 
 
 def list_package_symbols(source_root: str | Path) -> list[str]:

@@ -7,6 +7,12 @@ security:
   api_auth_enabled: false
   api_token: ""
 
+# Blacklisted symbols produce no trading signals (hold + reason "blacklist").
+# Exact codes ("600000") or prefix wildcards ("688*") are supported.
+blacklist:
+  enabled: false
+  symbols: []
+
 data_source:
   primary: market_warehouse
   local_data_root: "artifacts/warehouse/package"
@@ -440,12 +446,32 @@ factor_lifecycle:
   history_limit: 240
   graveyard_enabled: true
   graveyard_observation_months: 2
+  ic_decay_report: monthly
+  ic_decay_report_time: "21:00"
+  ic_decay_lookback_months: 12
+  ic_decay_min_months: 3
+  ic_decay_healthy_threshold: 0.03
+  ic_decay_slope_threshold: -0.005
 
 sim_broker_weekly:
   enabled: true
+  run_time: "17:00"
   history_limit: 240
   export_enabled: true
   export_dir: "artifacts/week7/sim_broker_weekly"
+  auto_notify: true
+
+monthly_review:
+  enabled: true
+  report_time: "21:30"
+  export_dir: "artifacts/review/monthly"
+  history_limit: 24
+  min_closed_trades: 3
+  over_position_threshold: 0.5
+  stop_loss_threshold: -0.08
+  take_profit_trigger: 0.10
+  discipline_pass_threshold: 85.0
+  position_cut_ratio: 0.10
   auto_notify: true
 
 notifications:
@@ -481,6 +507,14 @@ notifications:
   email_receivers: []
   custom_webhook_url: ""
   custom_webhook_bearer_token: ""
+  dingtalk_webhook: ""
+  dingtalk_secret: ""
+  sms_url: ""
+  sms_app_key: ""
+  sms_app_secret: ""
+  sms_sign_name: ""
+  sms_template_id: ""
+  sms_phone_numbers: []
   timeout_sec: 5
 
 wecom_interaction:
@@ -534,6 +568,9 @@ scheduler:
   close_reconcile_time: "15:10"
   week4_acceptance_time: "20:35"
   week6_daily_time: "15:25"
+  leader_lock_enabled: true
+  leader_lock_stale_after_sec: 300
+  leader_lock_path: "artifacts/runtime/scheduler_leader.lock"
 
 labels:
   primary: "soup_10d_tp8_before_sl5"
@@ -898,6 +935,36 @@ idle_queue:
   universe_cache_path: "artifacts/universe/a_share_symbols.json"
   universe_cache_max_age_hours: 24
   universe_min_symbols: 500
+  # P2-#27 阶段一：universe 构建排除退市股（幸存者偏差）。名单来源：
+  # tushare stock_basic(list_status='D')（token 可用时拉取并落盘），
+  # 否则回退本地 delisted_symbols_path 文件；文件缺失/损坏按空集处理。
+  exclude_delisted: true
+  delisted_symbols_path: "artifacts/universe/delisted.json"
 
 dashboard:
   default_total_asset: 100000.0
+
+# PRD §8.7 参数冻结窗口：交易时段（默认 09:15-15:00）内拒绝变更交易相关参数。
+# frozen_paths: 冻结端点黑名单（变更型 POST，由 ensure_params_not_frozen 依赖统一拦截）。
+# frozen_queries: 交互通道（wecom/feishu）里的改参 query，在指令处理层拦截。
+# 注意：GET 查询/报告生成/调度任务/指令通道(/command/execute)不纳入冻结。
+param_freeze:
+  enabled: true
+  timezone: "Asia/Shanghai"
+  freeze_windows:
+    - {start: "09:15", end: "15:00"}
+  frozen_paths:
+    - "/week7/kill-switch/reset"
+    - "/settings/blacklist/add"
+    - "/settings/blacklist/remove"
+    - "/models/registry/lifecycle"
+    - "/models/registry/role"
+    - "/models/registry/bootstrap-active-champion"
+    - "/learning/models/proposal/approval"
+    - "/learning/models/proposal/revoke"
+    - "/learning/models/release/ticket/execute"
+    - "/learning/models/release/ticket/confirm"
+    - "/learning/models/release/ticket/rollback"
+    - "/learning/models/release/confirmation/watchdog"
+  frozen_queries:
+    - "execution_mode_set"

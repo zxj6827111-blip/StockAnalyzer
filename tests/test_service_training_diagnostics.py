@@ -35,6 +35,7 @@ def _as_int(value: object) -> int:
 def test_service_generates_training_evaluation_report(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[1]
     config = load_config(root / "config" / "default.yaml")
+    config.data_source.primary = "synthetic"
     config.training.min_samples = 40
     config.training.artifact_path = str(tmp_path / "model.json")
 
@@ -60,6 +61,7 @@ def test_service_generates_training_evaluation_report(tmp_path: Path) -> None:
 def test_service_generates_label_conflict_shadow_report(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[1]
     config = load_config(root / "config" / "default.yaml")
+    config.data_source.primary = "synthetic"
     config.training.min_samples = 40
     config.training.artifact_path = str(tmp_path / "model.json")
 
