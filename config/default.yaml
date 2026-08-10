@@ -454,6 +454,19 @@ sim_broker_weekly:
   export_dir: "artifacts/week7/sim_broker_weekly"
   auto_notify: true
 
+monthly_review:
+  enabled: true
+  report_time: "21:30"
+  export_dir: "artifacts/review/monthly"
+  history_limit: 24
+  min_closed_trades: 3
+  over_position_threshold: 0.5
+  stop_loss_threshold: -0.08
+  take_profit_trigger: 0.10
+  discipline_pass_threshold: 85.0
+  position_cut_ratio: 0.10
+  auto_notify: true
+
 notifications:
   enabled: true
   primary: console

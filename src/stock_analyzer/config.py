@@ -77,6 +77,19 @@ def _normalize_ic_decay_report_mode(value: str) -> str:
     raise ValueError(f"unsupported ic_decay_report: {value} (supported: monthly, off)")
 
 
+def _normalize_hhmm(value: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        return ""
+    try:
+        hours, minutes = normalized.split(":", maxsplit=1)
+        if not (0 <= int(hours) <= 23 and 0 <= int(minutes) <= 59):
+            raise ValueError
+    except (ValueError, AttributeError):
+        raise ValueError(f"invalid hhmm time: {value} (expected HH:MM)") from None
+    return f"{int(hours):02d}:{int(minutes):02d}"
+
+
 class AppConfig(_StrictModel):
     timezone: str = "Asia/Shanghai"
     mode: str = "simulation"
@@ -581,6 +594,35 @@ class SimBrokerWeeklyConfig(_StrictModel):
     auto_notify: bool = True
 
 
+class MonthlyReviewConfig(_StrictModel):
+    enabled: bool = True
+    report_time: str = "21:30"
+    export_dir: str = "artifacts/review/monthly"
+    history_limit: int = 24
+    min_closed_trades: int = 3
+    over_position_threshold: float = 0.5
+    stop_loss_threshold: float = -0.08
+    take_profit_trigger: float = 0.10
+    discipline_pass_threshold: float = 85.0
+    position_cut_ratio: float = 0.10
+    auto_notify: bool = True
+
+    @field_validator("report_time")
+    @classmethod
+    def _validate_monthly_review_report_time(cls, value: str) -> str:
+        return _normalize_hhmm(value)
+
+    @field_validator("discipline_pass_threshold", "position_cut_ratio")
+    @classmethod
+    def _validate_monthly_review_ranges(cls, value: float) -> float:
+        return max(0.0, float(value))
+
+    @field_validator("over_position_threshold")
+    @classmethod
+    def _validate_over_position_threshold(cls, value: float) -> float:
+        return max(0.0, min(1.0, float(value)))
+
+
 class FeishuAppTargetConfig(_StrictModel):
     name: str = ""
     app_id: str = ""
@@ -883,6 +925,7 @@ class BacktestMatcherConfig(_StrictModel):
     price_tick_rule: str = "exchange_tick"
     min_notional_per_order: float = 5000.0
     residual_order_policy: str = "day_cancel_then_recalc"
+    apply_dynamic_slippage_live: bool = False
 
 
 class WalkForwardConfig(_StrictModel):
@@ -1275,6 +1318,7 @@ class StockAnalyzerConfig(_StrictModel):
     cloud_backup: CloudBackupConfig = Field(default_factory=CloudBackupConfig)
     factor_lifecycle: FactorLifecycleConfig = Field(default_factory=FactorLifecycleConfig)
     sim_broker_weekly: SimBrokerWeeklyConfig = Field(default_factory=SimBrokerWeeklyConfig)
+    monthly_review: MonthlyReviewConfig = Field(default_factory=MonthlyReviewConfig)
     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
     wecom_interaction: WeComInteractionConfig = Field(default_factory=WeComInteractionConfig)
     feishu_interaction: FeishuInteractionConfig = Field(default_factory=FeishuInteractionConfig)
