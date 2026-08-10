@@ -588,10 +588,16 @@ class FactorLifecycleConfig(_StrictModel):
 
 class SimBrokerWeeklyConfig(_StrictModel):
     enabled: bool = True
+    run_time: str = "17:00"
     history_limit: int = 240
     export_enabled: bool = True
     export_dir: str = "artifacts/week7/sim_broker_weekly"
     auto_notify: bool = True
+
+    @field_validator("run_time")
+    @classmethod
+    def _validate_sim_broker_weekly_run_time(cls, value: str) -> str:
+        return _normalize_hhmm(value)
 
 
 class MonthlyReviewConfig(_StrictModel):
@@ -1281,6 +1287,74 @@ class DashboardConfig(_StrictModel):
     default_total_asset: float = 0.0
 
 
+class ParamFreezeWindowConfig(_StrictModel):
+    start: str = "09:15"
+    end: str = "15:00"
+
+    @field_validator("start", "end")
+    @classmethod
+    def _validate_window_bound(cls, value: str) -> str:
+        return _normalize_hhmm(value)
+
+
+class ParamFreezeConfig(_StrictModel):
+    """PRD §8.7 parameter freeze: trading-parameter mutations are rejected
+    inside the freeze windows (default 09:15-15:00 on A-share trading days).
+
+    ``frozen_paths`` is the endpoint blacklist guarded by the
+    ``ensure_params_not_frozen`` FastAPI dependency; ``frozen_queries`` lists
+    interaction-channel mutation queries (e.g. wecom/feishu
+    ``execution_mode_set``) handled at the command-processing layer.
+    """
+
+    enabled: bool = True
+    timezone: str = "Asia/Shanghai"
+    freeze_windows: list[ParamFreezeWindowConfig] = Field(
+        default_factory=lambda: [ParamFreezeWindowConfig()]
+    )
+    frozen_paths: list[str] = Field(
+        default_factory=lambda: [
+            "/week7/kill-switch/reset",
+            "/settings/blacklist/add",
+            "/settings/blacklist/remove",
+            "/models/registry/lifecycle",
+            "/models/registry/role",
+            "/models/registry/bootstrap-active-champion",
+            "/learning/models/proposal/approval",
+            "/learning/models/proposal/revoke",
+            "/learning/models/release/ticket/execute",
+            "/learning/models/release/ticket/confirm",
+            "/learning/models/release/ticket/rollback",
+            "/learning/models/release/confirmation/watchdog",
+        ]
+    )
+    frozen_queries: list[str] = Field(default_factory=lambda: ["execution_mode_set"])
+
+    @field_validator("freeze_windows")
+    @classmethod
+    def _validate_freeze_windows(
+        cls, value: list[ParamFreezeWindowConfig]
+    ) -> list[ParamFreezeWindowConfig]:
+        for window in value:
+            if window.start >= window.end:
+                raise ValueError(
+                    f"freeze window start must be before end: {window.start}-{window.end}"
+                )
+        return value
+
+    @field_validator("timezone")
+    @classmethod
+    def _validate_timezone(cls, value: str) -> str:
+        normalized = value.strip() or "Asia/Shanghai"
+        try:
+            from zoneinfo import ZoneInfo
+
+            ZoneInfo(normalized)
+        except Exception as exc:
+            raise ValueError(f"invalid param_freeze timezone: {value}") from exc
+        return normalized
+
+
 class SecurityConfig(_StrictModel):
     api_auth_enabled: bool = False
     api_token: str = ""
@@ -1288,10 +1362,43 @@ class SecurityConfig(_StrictModel):
     suppress_plain_test_notifications: bool = True
 
 
+class BlacklistConfig(_StrictModel):
+    """Per-symbol blacklist that suppresses trading signals for listed targets.
+
+    Patterns are exact symbols (``600000``) or prefix wildcards (``688*``);
+    matching is case-sensitive on the stripped symbol string.
+    """
+
+    enabled: bool = False
+    symbols: list[str] = Field(default_factory=list)
+
+    def matches(self, symbol: str) -> str | None:
+        """Return the first pattern matching ``symbol``, or ``None``."""
+        normalized = symbol.strip()
+        if not normalized:
+            return None
+        for pattern in self.symbols:
+            candidate = str(pattern).strip()
+            if not candidate:
+                continue
+            if candidate.endswith("*"):
+                if normalized.startswith(candidate[:-1]):
+                    return candidate
+            elif candidate == normalized:
+                return candidate
+        return None
+
+    def is_blacklisted(self, symbol: str) -> bool:
+        if not self.enabled:
+            return False
+        return self.matches(symbol) is not None
+
+
 class StockAnalyzerConfig(_StrictModel):
     app: AppConfig
     data_source: DataSourceConfig
     security: SecurityConfig = Field(default_factory=SecurityConfig)
+    blacklist: BlacklistConfig = Field(default_factory=BlacklistConfig)
     market_depth: MarketDepthConfig = Field(default_factory=MarketDepthConfig)
     tdx_sync: TdxSyncConfig = Field(default_factory=TdxSyncConfig)
     market_warehouse: MarketWarehouseConfig = Field(default_factory=MarketWarehouseConfig)
@@ -1338,6 +1445,7 @@ class StockAnalyzerConfig(_StrictModel):
     evolution: EvolutionConfig = Field(default_factory=EvolutionConfig)
     idle_queue: IdleQueueConfig = Field(default_factory=IdleQueueConfig)
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
+    param_freeze: ParamFreezeConfig = Field(default_factory=ParamFreezeConfig)
 
 
 def _parse_env_value(raw: str) -> Any:

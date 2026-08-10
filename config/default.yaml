@@ -7,6 +7,12 @@ security:
   api_auth_enabled: false
   api_token: ""
 
+# Blacklisted symbols produce no trading signals (hold + reason "blacklist").
+# Exact codes ("600000") or prefix wildcards ("688*") are supported.
+blacklist:
+  enabled: false
+  symbols: []
+
 data_source:
   primary: market_warehouse
   local_data_root: "artifacts/warehouse/package"
@@ -449,6 +455,7 @@ factor_lifecycle:
 
 sim_broker_weekly:
   enabled: true
+  run_time: "17:00"
   history_limit: 240
   export_enabled: true
   export_dir: "artifacts/week7/sim_broker_weekly"
@@ -928,3 +935,28 @@ idle_queue:
 
 dashboard:
   default_total_asset: 100000.0
+
+# PRD §8.7 参数冻结窗口：交易时段（默认 09:15-15:00）内拒绝变更交易相关参数。
+# frozen_paths: 冻结端点黑名单（变更型 POST，由 ensure_params_not_frozen 依赖统一拦截）。
+# frozen_queries: 交互通道（wecom/feishu）里的改参 query，在指令处理层拦截。
+# 注意：GET 查询/报告生成/调度任务/指令通道(/command/execute)不纳入冻结。
+param_freeze:
+  enabled: true
+  timezone: "Asia/Shanghai"
+  freeze_windows:
+    - {start: "09:15", end: "15:00"}
+  frozen_paths:
+    - "/week7/kill-switch/reset"
+    - "/settings/blacklist/add"
+    - "/settings/blacklist/remove"
+    - "/models/registry/lifecycle"
+    - "/models/registry/role"
+    - "/models/registry/bootstrap-active-champion"
+    - "/learning/models/proposal/approval"
+    - "/learning/models/proposal/revoke"
+    - "/learning/models/release/ticket/execute"
+    - "/learning/models/release/ticket/confirm"
+    - "/learning/models/release/ticket/rollback"
+    - "/learning/models/release/confirmation/watchdog"
+  frozen_queries:
+    - "execution_mode_set"
