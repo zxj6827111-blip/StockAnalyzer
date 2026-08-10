@@ -12,6 +12,11 @@ make test
 uvicorn stock_analyzer.main:app --reload
 ```
 
+完整上手流程（环境准备 / 安装 / .env 配置 / 启动 / 首次扫描与报告 / CLI 常用命令）见
+[docs/quickstart.md](docs/quickstart.md)；常见问题（认证 401/403、参数冻结 423、
+202 任务查询、artifacts 污染、覆盖率门禁、数据源降级等）见
+[docs/troubleshooting.md](docs/troubleshooting.md)。
+
 ## V1.3 Ops Docs
 
 - `docs/v13_deployment_guide.md`
