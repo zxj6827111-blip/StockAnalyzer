@@ -9,9 +9,9 @@
 
 | 状态 | 条数 | 条目 |
 |---|---|---|
-| ✅ 已实现+测试 | 20 | #1 #2 #4 #5 #8 #10 #12 #13 #14 #16 #21 #22 #23 #24 #25 #27 #28 #29 #30 #11 |
-| ⚠️ 部分/待补 | 6 | #3 #15 #18 #26 #31 #32 |
-| ❌ 疑似缺失 | 2 | #9 #19（#20 与 #9 同源，见下） |
+| ✅ 已实现+测试 | 25 | #1 #2 #4 #5 #8 #9 #10 #12 #13 #14 #15 #16 #18 #19 #20 #21 #22 #23 #24 #25 #27 #28 #29 #30 #32 |
+| ⚠️ 部分/待补 | 2 | #26 #31 |
+| ❌ 疑似缺失 | 0 | — |
 | ⏳ 需实跑 | 3 | #6 #7（+ #3/#26/#17 的达标属性） |
 
 ## 明细
@@ -26,18 +26,18 @@
 | 6 | 连续 5 交易日稳定运行 | ⏳ | scripts/run_scheduler_soak.py（可配 days） | 无 pytest 断言 | **NAS 实跑 5 个交易日** |
 | 7 | 压力测试：极端行情回撤<25% | ⏳ | stress/scenarios.py:36-53（max_drawdown_limit_pct=25） | test_stress_scenarios.py:27-40（合成行情 6 场景过） | **真实极端行情压测实跑** |
 | 8 | 资金曲线保护线 95% 有效触发 | ✅ | config.py:325 protect_line=0.95；risk/controls.py:56-57 freeze | test_service_portfolio.py:2229 | 无 |
-| 9 | 喝汤参数不可盘中修改 | ❌ | **未找到**：无 freeze_windows 配置、无冻结机制（计划 §8.7 的 09:15-15:00 冻结+OTP 未落地）；现状"无运行时改参 API"仅为隐式满足 | 无对应测试 | **需决策**：补冻结机制实现，或与 #20 合并降级为"文档化约束" |
+| 9 | 喝汤参数不可盘中修改 | ✅ | 本轮新增 param_freeze.py：09:15-15:00 冻结窗口（交易日判定）、12 个变更端点统一 423 拦截、交互通道 execution_mode_set 冻结 | test_param_freeze.py 21 用例 | 无（OTP 紧急解锁未做，可选） |
 | 10 | 回撤熔断可触发（单日2.5%/单周4%） | ✅ | config.py:332-333；risk/controls.py:86-96 should_pause/should_reduce | test_risk_controls.py:53、test_stress_scenarios.py | 无 |
 | 11 | 执行质量可追踪 | ✅ | sample_store execution outcome（realized_slippage_bp/fill_ratio）、execution_risk_labels、week7 对账 | test_learning_sample_store.py、test_service_week7_sim_broker.py | 无 |
 | 12 | 指令通道正常（签名+幂等） | ✅ | SignedCommandProcessor（HMAC 验签、时间戳窗口、command_id 去重） | test_security.py（security 终审确认） | 无 |
 | 13 | 智能推送过滤生效 | ✅ | notify/filter.py NotificationFilter（安静窗/冷却去重/阈值） | test_notification_filter.py 9 用例 | 无 |
 | 14 | Dashboard 面板正常 | ✅ | api/dashboard.py + 前端页面齐全 | test_main_dashboard.py、test_service_dashboard.py:92 | 无 |
-| 15 | 竞价速报正常输出 | ⚠️ | auction_report 任务 09:26（config.py:822、service.py:15905/16564） | **无直接断言用例**（测试均绕过） | 补 1 个直接用例 + 实跑验证推送 |
+| 15 | 竞价速报正常输出 | ✅ | auction_report 任务 09:26（config.py:822、service.py:15905/16564） | 本轮补 test_service_auction_report.py 7 用例（内容前缀/空处理/推送链路） | 实跑验证真实推送 |
 | 16 | 跨市场因子正常 | ✅ | week6/engines.py:170 GlobalMarketFactorEngine | test_service_week6.py:238、test_main_week6.py:143 | 无 |
 | 17 | 异常告警 30 秒触达 | ⚠️ | 通知链路齐备（飞书/企微/pushplus + 本轮新增钉钉/短信冗余） | 通道级测试全过 | **30s 触达属性需实跑**（依赖网络与配置） |
-| 18 | 模拟盘 vs 实盘周报自动生成 | ⚠️ | week7_sim_broker_service.py 功能完整（评分/导出/通知） | test_service_week7_sim_broker.py 3 用例 | **未注册调度器**（无自动触发）→ 补月末/周度调度注册（小改动） |
-| 19 | 黑名单生效 | ❌ | **全仓库未找到个股黑名单过滤**（仅授权关键词/数据质量停摆日，非黑名单） | 无 | **需决策**：补实现（策略/标的黑名单）或明确由其他机制（妖股隔离/质量闸门）覆盖 |
-| 20 | 参数冻结窗口生效 | ⚠️ | 与 #9 同源：未找到冻结窗口实现 | 无 | 与 #9 合并决策 |
+| 18 | 模拟盘 vs 实盘周报自动生成 | ✅ | week7_sim_broker_service.py 功能完整；本轮注册周度调度（周五 17:00、交易日判定） | test_service_week7_sim_broker.py 3 用例 + 调度 4 用例（注册/触发/去重） | 无 |
+| 19 | 黑名单生效 | ✅ | 本轮新增 BlacklistConfig + pipeline 入口过滤（reason=blacklist/留痕）+ 管理 API（GET/增删） | test_blacklist.py 12 用例（含通配符/幂等/401） | 运行时内存态，重启回落 YAML（可选落盘） |
+| 20 | 参数冻结窗口生效 | ✅ | 与 #9 同实现（param_freeze，默认 09:15-15:00） | test_param_freeze.py（窗口边界/时区/禁用） | 无 |
 | 21 | 全链路审计 trace_id 可回放 | ✅ | service.py:19330 `_record_audit_event`、trace_replay、api/audit.py | test_service_audit.py:80-103 | 无 |
 | 22 | 回测撮合器执行 T+1 和不可成交规则 | ✅ | execution/engine.py can_buy/can_sell（t_plus_1_block、limit_up/down_reject、suspended） | test_backtest_matcher.py 11 用例、test_execution_engine.py | 无 |
 | 23 | 标签与策略一致 | ✅ | labels/soup.py build_soup_labels、label_policy_registry | test_labels.py 6 用例 | 无 |
@@ -48,18 +48,22 @@
 | 28 | 因子 IC 衰减报告月度输出 | ✅ | 本轮新增 research/ic_decay_report.py + 月末调度 + CLI | test_research_ic_decay_report.py 18 用例 | 无 |
 | 29 | 策略自毁开关（连续3月跑输触发） | ✅ | service.py 自毁机制 + week7 kill_switch | test_service_week7_kill_switch.py | 无 |
 | 30 | 云冷备：Mac 失联 15 分钟推送持仓快照 | ✅ | config.py:563-564（ping 10min/alert 15min）；run_cloud_backup_check | test_service_week7_cloud_backup.py 4 用例 | 无 |
-| 31 | 长假前 3 天自动降仓 50% | ⚠️ | week6/engines.py:145 CalendarFactorEngine（pre_holiday_reduce_days=3→0.5） | test_service_week6_execution.py:269（0.5 缩放路径） | 实现为"周五前3交易日"近似，非交易日历；日期触发分支无直接测试（补 1 用例） |
+| 31 | 长假前 3 天自动降仓 50% | ⚠️ | week6/engines.py:145 CalendarFactorEngine（pre_holiday_reduce_days=3→0.5） | 本轮补 test_week6_calendar_factor.py 11 用例（触发/边界/契约） | **实现与 PRD 有语义偏差**：是"距周五≤3天"周内近似（普通周周二~周五也降仓），非长假日历——需产品决策修正或接受 |
 | 32 | 动态滑点公式回测和实时均生效 | ⚠️→✅ | 本轮共享引擎：execution/engine.py，线上滑点已接线（apply_dynamic_slippage_live 开关） | test_backtest_live_consistency.py 双模式断言 | 开关默认关（shadow），**灰度开启后实跑确认** |
 
 ## 剩余动作清单
 
-### A. 代码侧可立即做（约 1-2 人天）
-1. #15 竞价速报：补 1 个直接断言用例（构造速报内容断言输出）
-2. #18 周报：注册周度调度任务（自动生成）
-3. #31 长假降仓：补 pre_holiday 日期触发分支测试
-4. #9/#19/#20 决策：补冻结机制与黑名单实现（各 0.5-1 人天），或明确降级为文档化约束并修改验收口径
+### A. 代码侧（已全部完成，2026-08-10 关闭）
+- ~~#15 竞价速报测试~~ ✅ 已补（7 用例）
+- ~~#18 周报调度~~ ✅ 已注册（周五 17:00）
+- ~~#9/#19/#20 补实现~~ ✅ 参数冻结（12 端点 423 拦截）+ 黑名单（pipeline 过滤+API）
+- ~~#31 降仓触发测试~~ ✅ 已补（11 用例），但发现 PRD 语义偏差（见下）
 
-### B. 需实跑验证（NAS 环境，与代码并行）
+### B. 待决策
+- **#31 长假降仓语义**：实现为"距周五≤3 天"近似（普通周周二~周五降仓 50%），与 PRD"长假前 3 交易日"不符（如 2026 春节前第 4 个交易日 02-10 会被误降仓）。选项：① 改为感知长假日历（春节/国庆，需引入节假日表）；② 接受周内近似并改 PRD 口径。测试已按现状锁定契约。
+- #3 首板 ≤5min 与代码 monster_scan_sla 15min 不一致：澄清 PRD 口径或调配置。
+
+### C. 需实跑验证（NAS 环境，与代码并行）
 - #6 连续 5 交易日稳定运行（soak 脚本在位）
 - #7 极端行情压测回撤 <25%（stress 套件在位）
 - #3 性能预算实际耗时（含首板 5min 口径澄清）
