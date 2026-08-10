@@ -54,6 +54,10 @@ class SchedulerRunRequest(BaseModel):
     jobs: list[str] = Field(default_factory=list)
 
 
+class BlacklistSymbolRequest(BaseModel):
+    symbol: str
+
+
 class TdxSyncRunRequest(BaseModel):
     now: str | None = None
     force: bool = False

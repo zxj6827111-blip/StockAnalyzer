@@ -127,6 +127,7 @@ from stock_analyzer.api.notifications import router as notifications_router
 from stock_analyzer.api.portfolio import router as portfolio_router
 from stock_analyzer.api.research import router as research_router
 from stock_analyzer.api.runtime import router as runtime_router
+from stock_analyzer.api.settings import router as settings_router
 from stock_analyzer.api.training import router as training_router
 from stock_analyzer.api.week5 import router as week5_router
 from stock_analyzer.api.week6 import router as week6_router
@@ -206,6 +207,7 @@ app.include_router(research_router)
 app.include_router(acceptance_router)
 app.include_router(portfolio_router)
 app.include_router(runtime_router)
+app.include_router(settings_router)
 app.include_router(week5_router)
 app.include_router(week6_router)
 app.include_router(week7_router)
