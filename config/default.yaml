@@ -306,6 +306,18 @@ week5:
     risk_penalty: 0.10
   universe_quality_snapshot_path: "artifacts/runtime/universe_quality_snapshot.json"
   universe_quality_snapshot_max_age_days: 7
+  # Incremental feature snapshot layer (Week5 全市场扫描性能改造).
+  feature_snapshot_enabled: true
+  feature_snapshot_root: "artifacts/features_light"
+  feature_snapshot_lookback_days: 250
+  feature_snapshot_max_age_days: 3
+  feature_snapshot_require_current: true
+  feature_snapshot_min_coverage_ratio: 1.0
+  # 并行构建控制：transform 进程池 worker 数、单次任务携带的候选数
+  # （限制 IPC 序列化量）、以及进度文件的原子 JSON 输出路径。
+  feature_snapshot_max_workers: 4
+  feature_snapshot_batch_size: 20
+  feature_snapshot_progress_path: "artifacts/runtime/feature_snapshot_progress.json"
   monster_scan_intraday_max_symbols: 15
   monster_scan_max_symbols: 120
   monster_scan_sla_target_ms: 900000

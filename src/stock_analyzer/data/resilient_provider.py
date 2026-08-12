@@ -103,3 +103,20 @@ class ResilientProvider:
             "degraded_mode": self.degraded_mode,
             "last_error": self.last_error,
         }
+
+    def latest_daily_dates(
+        self,
+        *,
+        symbols: list[str] | None = None,
+    ) -> dict[str, date] | None:
+        """Transparent pass-through to the primary so the incremental snapshot
+        layer can drive date-based dirtiness through the resilient wrapper.
+
+        Returns ``None`` when the primary has NO date interface (see
+        CachedProvider.latest_daily_dates for the None-vs-empty contract).
+        """
+        primary = getattr(self.primary, "latest_daily_dates", None)
+        if not callable(primary):
+            return None
+        result = primary(symbols=symbols)
+        return result if isinstance(result, dict) else None

@@ -94,6 +94,23 @@ def test_load_default_config_values(monkeypatch: MonkeyPatch) -> None:
     assert config.week5.universe_prefilter_shortlist_top_n == 50
     assert config.week5.universe_quality_selector_enabled is True
     assert config.week5.universe_quality_target_size == 100
+    assert config.week5.offhours_weekday_universe_max_symbols == 300
+    # 100/300 覆盖关系：默认 quality target 为 100；offhours 工作日档通过
+    # universe_max_symbols_override=300 覆盖到 300（行为在 week5_service 的
+    # profile 解析中生效，配置层只保证两个默认值不变）。
+    assert config.week5.universe_quality_target_size == 100
+    assert config.week5.offhours_weekday_universe_max_symbols == 300
+    assert config.week5.feature_snapshot_enabled is True
+    assert config.week5.feature_snapshot_root == "artifacts/features_light"
+    assert config.week5.feature_snapshot_lookback_days == 250
+    assert config.week5.feature_snapshot_max_age_days == 3
+    assert config.week5.feature_snapshot_require_current is True
+    assert config.week5.feature_snapshot_max_workers == 4
+    assert config.week5.feature_snapshot_batch_size == 20
+    assert (
+        config.week5.feature_snapshot_progress_path
+        == "artifacts/runtime/feature_snapshot_progress.json"
+    )
     assert config.week5.universe_quality_min_history_days == 60
     assert config.week5.universe_quality_min_avg_turnover_20 == 5_000_000.0
     assert config.week5.universe_quality_min_float_market_cap == 300_000_000.0
