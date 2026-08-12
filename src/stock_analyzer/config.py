@@ -373,6 +373,12 @@ class Week5Config(_StrictModel):
     feature_snapshot_lookback_days: int = 250
     feature_snapshot_max_age_days: int = 3
     feature_snapshot_require_current: bool = True
+    # Parallel build controls: process-pool transform workers, payloads per
+    # pool task (bounds IPC serialization), and an atomic JSON progress file
+    # for external monitoring of long offhours builds.
+    feature_snapshot_max_workers: int = 4
+    feature_snapshot_batch_size: int = 20
+    feature_snapshot_progress_path: str = "artifacts/runtime/feature_snapshot_progress.json"
     # Strict fail-close: any symbol that failed the last snapshot refresh
     # makes the snapshot NOT fully current (no signals rather than wrong
     # signals).

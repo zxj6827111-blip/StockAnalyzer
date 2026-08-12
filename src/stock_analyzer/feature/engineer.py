@@ -379,15 +379,27 @@ class FeatureEngineer:
                 (idx_close > idx_ma20).astype(float) * 2.0 - 1.0
             )
         else:
-            for feat in (
-                "excess_ret_5", "excess_ret_20", "excess_ret_60",
-                "relative_strength_5", "relative_strength_20",
-                "rs_ma5", "rs_ma20", "rolling_beta_60",
-                "excess_vol_20", "excess_vol_60", "market_trend",
-            ):
-                raw[feat] = pd.Series(
-                    np.nan, index=ordered.index, dtype=float
-                )
+            # Batch-construct the missing market-relative columns instead of
+            # assigning them one by one: repeated single-column inserts on the
+            # same frame fragment the DataFrame block manager and emit a
+            # PerformanceWarning per transform call.  The result is identical
+            # (float NaN columns in the same order).
+            raw = pd.concat(
+                [
+                    raw,
+                    pd.DataFrame(
+                        np.nan,
+                        index=ordered.index,
+                        columns=(
+                            "excess_ret_5", "excess_ret_20", "excess_ret_60",
+                            "relative_strength_5", "relative_strength_20",
+                            "rs_ma5", "rs_ma20", "rolling_beta_60",
+                            "excess_vol_20", "excess_vol_60", "market_trend",
+                        ),
+                    ),
+                ],
+                axis=1,
+            )
 
         # Defragment once before the final block to avoid repeated frame reallocation.
         raw = raw.copy()

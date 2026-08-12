@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from stock_analyzer.feature.engineer import FeatureEngineer
 from stock_analyzer.feature.snapshot import (
     build_feature_snapshot,
     load_feature_snapshot,
+    load_snapshot_tails,
     snapshot_is_current,
 )
 from stock_analyzer.runtime.service import StockAnalyzerService
@@ -525,12 +527,20 @@ def test_snapshot_incremental_preserves_clean_tails_and_fingerprints(
 
 
 def test_snapshot_missing_blocks_scheduler_scan(tmp_path: Path) -> None:
+    """Week5 性能改造后，universe 扫描会自动确保快照；只有快照构建失败时
+    scheduler 才 fail-closed（不进入重型 fallback）。"""
     service, root = _make_service(tmp_path)  # require_current=True, no snapshot yet
     assert not (root / "current.json").exists()
     service._config.week5.universe_quality_selector_enabled = False
     service._resolve_symbol_universe = lambda **kw: {  # noqa: SLF001
         "symbols": ["600000", "000001"],
         "source": "test",
+    }
+    # 模拟快照构建失败：scheduler 路径必须 fail-closed。
+    service.ensure_week5_feature_snapshot = lambda **kw: {  # noqa: SLF001
+        "ok": False,
+        "skipped": False,
+        "build": {"ok": False},
     }
     report = service.run_week5_scan(
         symbols=None,
@@ -715,3 +725,631 @@ def test_data_gate_applies_week6_quality_thresholds(tmp_path: Path) -> None:
     # Missing quality report -> no quality judgement (other gates still apply).
     no_report = _gate(None)
     assert no_report["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Week5 性能改造：候选集 scope / 成员维护 / batch 并行 / staging 发布
+# ---------------------------------------------------------------------------
+class _AdvancingProviderNoDates:
+    """SyntheticProvider WITHOUT ``latest_daily_dates`` (mirrors the production
+    CachedProvider/ResilientProvider topology) whose latest bar advances by one
+    trading day when ``advance`` is enabled."""
+
+    def __init__(self, seed_offset: int = 2026, advance: bool = False) -> None:
+        self._inner = SyntheticProvider(seed_offset=seed_offset)
+        self._advance = advance
+        self._cache: dict[str, pd.DataFrame] = {}
+
+    def fetch_daily_bars(self, symbol: str, lookback_days: int = 120, **kwargs):
+        if symbol not in self._cache:
+            self._cache[symbol] = self._inner.fetch_daily_bars(
+                symbol=symbol, lookback_days=250, **kwargs
+            )
+        frame = self._cache[symbol].tail(max(1, int(lookback_days))).copy()
+        if self._advance:
+            # 模拟新交易日：最新 bar 日期 +1 且内容变化（保留 index name）。
+            last = frame.index[-1] + timedelta(days=1)
+            new_row = frame.iloc[[-1]].copy()
+            new_row.index = pd.DatetimeIndex([last], name=frame.index.name)
+            new_row["close"] = new_row["close"] * 1.01
+            frame = pd.concat([frame, new_row])
+        return frame
+
+
+def test_snapshot_refreshes_on_new_trading_day_without_date_interface(
+    tmp_path: Path,
+) -> None:
+    """P0 回归：生产拓扑（CachedProvider/ResilientProvider 包装）不暴露
+    latest_daily_dates 时，快照必须通过指纹探测发现新交易日并刷新，
+    而不是无限复用旧快照。"""
+    service, _root = _make_service(tmp_path)
+    provider = _AdvancingProviderNoDates(advance=False)
+    first = build_feature_snapshot(
+        service._config, provider, symbols=_SYMBOLS, lookback_days=250, force=True
+    )
+    assert first["ok"] is True
+    manifest, _ = load_feature_snapshot(service._config)
+    assert manifest is not None
+    date0 = manifest.per_symbol["600519"]["latest_date"]
+
+    provider._advance = True  # 数据推进一天
+    second = build_feature_snapshot(
+        service._config, provider, symbols=_SYMBOLS, lookback_days=250
+    )
+    assert second["skipped"] is False
+    assert second["incremental"] is True
+    manifest2, frame2 = load_feature_snapshot(service._config)
+    assert manifest2 is not None and frame2 is not None
+    assert manifest2.per_symbol["600519"]["latest_date"] > date0
+    assert str(
+        frame2.loc[frame2["symbol"] == "600519", "trade_date"].iloc[0]
+    ) > date0
+
+
+class _WindowDependentNoDatesProvider:
+    """无 latest_daily_dates、且数据随 lookback 窗口变化的 provider：每次
+    fetch 都按窗口重新生成，最新 bar 的 fingerprint 跨窗口不可比——正好
+    复现 P1 误判所需的"日期相同、短窗口指纹不同"（与 _AdvancingProviderNoDates
+    的缓存式 tail 切片相反）。"""
+
+    def __init__(
+        self,
+        seed_offset: int = 2026,
+        advance_symbols: set[str] | None = None,
+    ) -> None:
+        self._inner = SyntheticProvider(seed_offset=seed_offset)
+        self._advance_symbols = set(advance_symbols or set())
+
+    def fetch_daily_bars(self, symbol: str, lookback_days: int = 120, **kwargs):
+        frame = self._inner.fetch_daily_bars(
+            symbol=symbol, lookback_days=max(1, int(lookback_days)), **kwargs
+        )
+        if symbol in self._advance_symbols:
+            # 只推进指定 symbol：追加一个新交易日（日期+内容都变化）。
+            last = frame.index[-1] + timedelta(days=1)
+            new_row = frame.iloc[[-1]].copy()
+            new_row.index = pd.DatetimeIndex([last], name=frame.index.name)
+            new_row["close"] = new_row["close"] * 1.01
+            frame = pd.concat([frame, new_row])
+        return frame
+
+
+def test_snapshot_partial_advance_without_date_interface_not_all_dirty(
+    tmp_path: Path,
+) -> None:
+    """P1 回归（复核 3）：无日期能力 provider 仅部分 symbol 推进时，其余
+    symbol 的短窗口 fingerprint 差异不得被误判为 dirty——否则增量路径每次
+    都会把全部候选标 dirty，退化成全量刷新。"""
+    service, _root = _make_service(tmp_path)
+    provider = _WindowDependentNoDatesProvider()
+    first = build_feature_snapshot(
+        service._config, provider, symbols=_SYMBOLS, lookback_days=250, force=True
+    )
+    assert first["ok"] is True
+    manifest, _ = load_feature_snapshot(service._config)
+    assert manifest is not None
+    before = {symbol: manifest.per_symbol[symbol]["latest_date"] for symbol in _SYMBOLS}
+
+    provider._advance_symbols = {"600519"}  # 仅一只票推进
+    second = build_feature_snapshot(
+        service._config, provider, symbols=_SYMBOLS, lookback_days=250
+    )
+    assert second["skipped"] is False
+    assert second["incremental"] is True
+    assert second["dirty_symbols"] == 1, second  # 不是全部候选
+    assert second["refreshed_count"] == 1
+    assert second["published_symbol_count"] == len(_SYMBOLS)
+
+    manifest2, frame2 = load_feature_snapshot(service._config)
+    assert manifest2 is not None and frame2 is not None
+    assert manifest2.per_symbol["600519"]["latest_date"] > before["600519"]
+    for symbol in _SYMBOLS:
+        if symbol != "600519":
+            assert manifest2.per_symbol[symbol]["latest_date"] == before[symbol]
+            assert str(frame2.loc[frame2["symbol"] == symbol].iloc[0]["trade_date"]) == (
+                before[symbol]
+            )
+
+    # 推进停止后再次构建 -> 数据未变 -> 正常跳过（无残留误判）。
+    provider._advance_symbols = set()
+    third = build_feature_snapshot(
+        service._config, provider, symbols=_SYMBOLS, lookback_days=250
+    )
+    assert third["skipped"] is True, third
+
+
+def test_snapshot_stale_recovery_and_skip_without_date_interface(
+    tmp_path: Path,
+) -> None:
+    """P0 回归：无 latest_daily_dates 接口时——
+    1) 数据未变 + 快照过期：指纹探测确认无变化后恢复 current（保守探测）；
+    2) 数据未变 + 快照 current：正常跳过。"""
+    service, root = _make_service(tmp_path)
+    provider = _AdvancingProviderNoDates(advance=False)
+    build_feature_snapshot(
+        service._config, provider, symbols=_SYMBOLS, lookback_days=250, force=True
+    )
+    manifest, _ = load_feature_snapshot(service._config)
+    assert manifest is not None
+
+    # 数据未变 + 快照过期 -> 指纹相同 -> 刷新时效戳恢复 current。
+    payload = manifest.to_payload()
+    payload["built_at"] = (datetime.now(UTC) - timedelta(days=40)).isoformat()
+    (root / "current.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
+    manifest_stale, _ = load_feature_snapshot(service._config)
+    assert manifest_stale is not None
+    assert snapshot_is_current(manifest_stale, service._config) is False
+    third = build_feature_snapshot(
+        service._config, provider, symbols=_SYMBOLS, lookback_days=250
+    )
+    assert third["ok"] is True
+    manifest4, _ = load_feature_snapshot(service._config)
+    assert manifest4 is not None
+    assert snapshot_is_current(manifest4, service._config) is True
+
+    # 数据未变 + current -> 跳过。
+    fourth = build_feature_snapshot(
+        service._config, provider, symbols=_SYMBOLS, lookback_days=250
+    )
+    assert fourth["skipped"] is True
+
+
+def test_snapshot_wrapper_chain_without_date_capability_falls_back(
+    tmp_path: Path,
+) -> None:
+    """P0/P1 回归（真实缺陷场景）：CachedProvider(ResilientProvider(无日期接口
+    provider)) 的包装链。包装层不得把"无能力"伪装成空 dict（会把全部候选
+    误判 dirty 导致每次全量刷新）；必须让 snapshot 走 probe 兜底：
+    1) 首次构建；2) 数据不变再次构建 skipped=True；3) 数据推进后 skipped=False
+    且日期推进。"""
+    from stock_analyzer.config import DataSourceConfig
+    from stock_analyzer.data.cached_provider import CachedProvider
+    from stock_analyzer.data.resilient_provider import ResilientProvider
+    from stock_analyzer.infra.cache import InMemoryCache
+
+    service, _root = _make_service(tmp_path)
+    inner = _AdvancingProviderNoDates(advance=False)
+    resilient = ResilientProvider(
+        primary=inner, config=DataSourceConfig(), backup=None
+    )
+    cache = InMemoryCache()
+    provider = CachedProvider(
+        inner=resilient, cache=cache, ttl_sec=60, key_prefix="test"
+    )
+
+    first = build_feature_snapshot(
+        service._config, provider, symbols=_SYMBOLS, lookback_days=250, force=True
+    )
+    assert first["ok"] is True
+    manifest, _ = load_feature_snapshot(service._config)
+    assert manifest is not None
+    date0 = manifest.per_symbol["600519"]["latest_date"]
+
+    # 数据不变再次构建 -> 必须 skipped（包装链无能力时不误判全部 dirty）。
+    second = build_feature_snapshot(
+        service._config, provider, symbols=_SYMBOLS, lookback_days=250
+    )
+    assert second["skipped"] is True, second
+
+    # 数据推进一天（模拟缓存 TTL 过期后的真实读取）-> 探测到新交易日并刷新。
+    cache.delete_prefix("test")
+    inner._advance = True
+    third = build_feature_snapshot(
+        service._config, provider, symbols=_SYMBOLS, lookback_days=250
+    )
+    assert third["skipped"] is False
+    assert third["incremental"] is True
+    manifest3, frame3 = load_feature_snapshot(service._config)
+    assert manifest3 is not None and frame3 is not None
+    assert manifest3.per_symbol["600519"]["latest_date"] > date0
+    assert str(
+        frame3.loc[frame3["symbol"] == "600519", "trade_date"].iloc[0]
+    ) > date0
+
+
+
+
+def test_snapshot_builds_from_legacy_daily_cache_payload(tmp_path: Path) -> None:
+    """Legacy daily cache hits must remain usable by the snapshot builder."""
+    from stock_analyzer.data.cached_provider import CachedProvider
+    from stock_analyzer.infra.cache import InMemoryCache
+
+    service, _root = _make_service(tmp_path)
+    upstream = SyntheticProvider(seed_offset=2026)
+    cache = InMemoryCache()
+    provider = CachedProvider(
+        inner=upstream,
+        cache=cache,
+        ttl_sec=60,
+        key_prefix="legacy_snapshot",
+    )
+    for symbol in _SYMBOLS:
+        bars = upstream.fetch_daily_bars(symbol=symbol, lookback_days=250)
+        cache.set(
+            f"legacy_snapshot:bars:{symbol}:250:latest",
+            bars.to_json(date_format="iso", orient="split"),
+            ttl_sec=60,
+        )
+
+    report = build_feature_snapshot(
+        service._config,
+        provider,
+        symbols=_SYMBOLS,
+        lookback_days=250,
+        force=True,
+        max_workers=1,
+    )
+
+    assert report["ok"] is True, report
+    assert report["failed_symbols"] == 0
+    assert provider.cache_hits == len(_SYMBOLS)
+    manifest, frame = load_feature_snapshot(service._config)
+    assert manifest is not None and frame is not None
+    assert len(frame) == len(_SYMBOLS)
+
+def test_snapshot_transparent_latest_dates_through_wrappers(tmp_path: Path) -> None:
+    """P0 回归：CachedProvider / ResilientProvider 透传 latest_daily_dates，
+    生产拓扑可直接驱动日期增量。"""
+    from datetime import date
+
+    from stock_analyzer.config import DataSourceConfig
+    from stock_analyzer.data.cached_provider import CachedProvider
+    from stock_analyzer.data.resilient_provider import ResilientProvider
+    from stock_analyzer.infra.cache import InMemoryCache
+
+    class _NoDates:
+        def fetch_daily_bars(self, symbol, lookback_days=120, **kwargs):
+            raise AssertionError("not used in this test")
+
+    class _WithDates:
+        def latest_daily_dates(self, *, symbols=None):
+            return {s: date(2026, 8, 12) for s in (symbols or [])}
+
+    inner = _WithDates()
+    cached = CachedProvider(
+        inner=inner, cache=InMemoryCache(), ttl_sec=60, key_prefix="test"
+    )
+    assert callable(getattr(cached, "latest_daily_dates", None))
+    assert cached.latest_daily_dates(symbols=["600519"]) == {
+        "600519": date(2026, 8, 12)
+    }
+    # 内层无日期接口 -> 包装层必须返回 None（不是空 dict），
+    # 否则 snapshot 会把全部候选误判为 dirty。
+    no_dates = CachedProvider(
+        inner=_NoDates(), cache=InMemoryCache(), ttl_sec=60, key_prefix="test"
+    )
+    assert no_dates.latest_daily_dates(symbols=["600519"]) is None
+    no_dates_resilient = ResilientProvider(
+        primary=_NoDates(), config=DataSourceConfig(), backup=None
+    )
+    assert no_dates_resilient.latest_daily_dates(symbols=["600519"]) is None
+
+    resilient = ResilientProvider(
+        primary=_WithDates(),
+        config=DataSourceConfig(),
+        backup=None,
+    )
+    assert callable(getattr(resilient, "latest_daily_dates", None))
+    assert resilient.latest_daily_dates(symbols=["600519"]) == {
+        "600519": date(2026, 8, 12)
+    }
+
+
+def test_snapshot_manifest_records_scope_and_candidate_counts(tmp_path: Path) -> None:
+    service, root = _make_service(tmp_path)
+    provider = SyntheticProvider(seed_offset=2026)
+    report = build_feature_snapshot(
+        service._config,
+        provider,
+        symbols=_SYMBOLS,
+        lookback_days=250,
+        force=True,
+        scope="universe_quality",
+    )
+    assert report["ok"] is True
+    assert report["scope"] == "universe_quality"
+    assert report["requested_symbol_count"] == len(_SYMBOLS)
+    assert report["published_symbol_count"] == len(_SYMBOLS)
+    assert report["universe_hash"] != ""
+    assert "stages" in report
+    assert set(report["stages"]) == {"snapshot_fetch", "snapshot_transform"}
+    assert report["workers"] == 4
+
+    manifest, _ = load_feature_snapshot(service._config)
+    assert manifest is not None
+    assert manifest.scope == "universe_quality"
+    assert manifest.universe_hash == report["universe_hash"]
+    assert manifest.requested_symbol_count == len(_SYMBOLS)
+    assert manifest.published_symbol_count == len(_SYMBOLS)
+    # 相同的候选集再次构建 -> 直接跳过（不重复构建）。
+    again = build_feature_snapshot(
+        service._config,
+        provider,
+        symbols=_SYMBOLS,
+        lookback_days=250,
+        scope="universe_quality",
+    )
+    assert again["skipped"] is True
+
+
+def test_snapshot_scope_change_forces_refresh_not_skip(tmp_path: Path) -> None:
+    """scope 或候选集变化时，即使数据本身 current 也不允许无条件跳过。"""
+    service, _root = _make_service(tmp_path)
+    provider = SyntheticProvider(seed_offset=2026)
+    build_feature_snapshot(
+        service._config,
+        provider,
+        symbols=_SYMBOLS,
+        lookback_days=250,
+        force=True,
+        scope="universe_quality",
+    )
+    # 候选集不变但 scope 不同 -> 不跳过（重新落 scope 标签）。
+    report = build_feature_snapshot(
+        service._config,
+        provider,
+        symbols=_SYMBOLS,
+        lookback_days=250,
+        scope="manual_scope",
+    )
+    assert report["skipped"] is False
+    manifest, _ = load_feature_snapshot(service._config)
+    assert manifest is not None
+    assert manifest.scope == "manual_scope"
+
+
+def test_snapshot_incremental_drops_removed_and_adds_new_symbols(
+    tmp_path: Path,
+) -> None:
+    """候选集变化时：移出股票必须从快照/记账/尾巴中删除，新增股票必须补齐。"""
+    service, root = _make_service(tmp_path)
+    provider = SyntheticProvider(seed_offset=2026)
+    first = build_feature_snapshot(
+        service._config, provider, symbols=_SYMBOLS, lookback_days=250, force=True
+    )
+    assert first["ok"] is True
+    manifest0, frame0 = load_feature_snapshot(service._config)
+    assert manifest0 is not None and frame0 is not None
+    assert set(frame0["symbol"]) == set(_SYMBOLS)
+
+    # 新候选集：移出 2 只（600519、000001），新增 2 只（002415、300999）。
+    new_set = ["601318", "000858", "600000", "300750", "002415", "300999"]
+    second = build_feature_snapshot(
+        service._config, provider, symbols=new_set, lookback_days=250
+    )
+    assert second["ok"] is True
+    assert second["skipped"] is False
+    assert second["incremental"] is True
+    assert set(second["removed_symbols"]) == {"600519", "000001"}
+
+    manifest, frame = load_feature_snapshot(service._config)
+    assert manifest is not None and frame is not None
+    assert set(frame["symbol"]) == set(new_set)
+    assert manifest.symbol_count == len(new_set)
+    assert manifest.requested_symbol_count == len(new_set)
+    assert manifest.published_symbol_count == len(new_set)
+    # 记账中不残留移出符号。
+    assert "600519" not in manifest.per_symbol
+    assert "000001" not in manifest.per_symbol
+    assert "002415" in manifest.per_symbol
+    # 尾巴中不残留移出符号。
+    tails = load_snapshot_tails(root, manifest.data_snapshot_id)
+    assert tails is not None
+    assert {"600519", "000001"}.isdisjoint(set(tails["symbol"]))
+
+
+def test_snapshot_removed_only_refresh_drops_symbols_without_dirty(
+    tmp_path: Path,
+) -> None:
+    """候选集缩小但无日期脏数据：必须发布子集而非原样跳过。"""
+    service, _root = _make_service(tmp_path)
+    provider = SyntheticProvider(seed_offset=2026)
+    build_feature_snapshot(
+        service._config, provider, symbols=_SYMBOLS, lookback_days=250, force=True
+    )
+    subset = _SYMBOLS[:4]
+    report = build_feature_snapshot(
+        service._config, provider, symbols=subset, lookback_days=250
+    )
+    assert report["ok"] is True
+    assert report["incremental"] is True
+    assert report["dirty_symbols"] == 0
+    assert set(report["removed_symbols"]) == set(_SYMBOLS[4:])
+    manifest, frame = load_feature_snapshot(service._config)
+    assert manifest is not None and frame is not None
+    assert set(frame["symbol"]) == set(subset)
+    assert manifest.symbol_count == len(subset)
+
+
+def test_snapshot_removed_failed_symbol_no_longer_blocks_current(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """失败符号移出候选集后，快照必须恢复 current（否则永远不会自愈）。"""
+    import stock_analyzer.feature.snapshot as snapshot_module
+
+    service, _root = _make_service(tmp_path)
+    provider = SyntheticProvider(seed_offset=2026)
+    original_worker = snapshot_module._transform_row_worker
+
+    def _fail_one(payload):
+        if payload[0] == "000001":
+            return payload[0], None
+        return original_worker(payload)
+
+    monkeypatch.setattr(snapshot_module, "_transform_row_worker", _fail_one)
+    first = build_feature_snapshot(
+        service._config,
+        provider,
+        symbols=["600519", "000001", "601318"],
+        lookback_days=250,
+        force=True,
+        max_workers=1,
+    )
+    assert first["ok"] is False
+    manifest, _ = load_feature_snapshot(service._config)
+    assert manifest is not None
+    assert manifest.failed_symbols_list == ["000001"]
+    assert snapshot_is_current(manifest, service._config) is False
+
+    # 失败符号离开候选集 -> 快照（其余符号完整）恢复 current。
+    monkeypatch.setattr(snapshot_module, "_transform_row_worker", original_worker)
+    second = build_feature_snapshot(
+        service._config,
+        provider,
+        symbols=["600519", "601318"],
+        lookback_days=250,
+    )
+    assert second["ok"] is True
+    manifest2, frame2 = load_feature_snapshot(service._config)
+    assert manifest2 is not None and frame2 is not None
+    assert set(frame2["symbol"]) == {"600519", "601318"}
+    assert manifest2.failed_symbols_list == []
+    assert snapshot_is_current(manifest2, service._config) is True
+
+
+def test_snapshot_build_failure_publishes_no_half_product(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """transform 全失败时不得发布半成品：无 staging 残留、current.json 不被替换。"""
+    import stock_analyzer.feature.snapshot as snapshot_module
+
+    service, root = _make_service(tmp_path)
+    provider = SyntheticProvider(seed_offset=2026)
+
+    def _always_fail(payload):
+        return payload[0], None
+
+    monkeypatch.setattr(snapshot_module, "_transform_row_worker", _always_fail)
+    report = build_feature_snapshot(
+        service._config,
+        provider,
+        symbols=_SYMBOLS,
+        lookback_days=250,
+        force=True,
+        max_workers=1,
+    )
+    assert report["ok"] is False
+    assert (root / "current.json").exists() is False
+    # 无半成品目录：不残留 staging，也不存在指向失败产物的 snap_ 目录。
+    if root.exists():
+        leftovers = [
+            item.name
+            for item in root.iterdir()
+            if item.name.startswith("snap_") or item.name.endswith(".staging")
+        ]
+        assert leftovers == []
+
+
+def test_snapshot_transform_uses_process_pool_with_batching(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """max_workers>1 时确实走进程池并行，且按 batch 提交（任务数 = ceil(n/batch)）。"""
+    import stock_analyzer.feature.snapshot as snapshot_module
+
+    service, _root = _make_service(tmp_path)
+    provider = SyntheticProvider(seed_offset=2026)
+    submitted: list[int] = []
+
+    real_pool = snapshot_module.ProcessPoolExecutor
+
+    class _RecordingPool(real_pool):
+        def __init__(self, max_workers: int = 1, **kwargs):
+            submitted.append(max_workers)
+            super().__init__(max_workers=max_workers, **kwargs)
+
+    monkeypatch.setattr(snapshot_module, "ProcessPoolExecutor", _RecordingPool)
+    report = build_feature_snapshot(
+        service._config,
+        provider,
+        symbols=_SYMBOLS,
+        lookback_days=250,
+        force=True,
+        max_workers=2,
+        batch_size=4,
+    )
+    assert report["ok"] is True
+    # 进程池被真实创建（workers>1 分支），且按 batch_size=4 分块提交：
+    # 6 只符号 -> 2 个 batch 任务。
+    assert submitted == [2]
+    assert report["batch_size"] == 4
+    assert report["stages"]["snapshot_transform"]["completed"] == len(_SYMBOLS)
+
+
+def test_snapshot_transform_sliding_window_limits_inflight_batches(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """P2 回归：滑动窗口提交保证任意时刻在途 batch <= workers
+    （IPC 队列不驻留全部候选的 pickle）。"""
+    import stock_analyzer.feature.snapshot as snapshot_module
+
+    service, _root = _make_service(tmp_path)
+    provider = SyntheticProvider(seed_offset=2026)
+    real_pool = snapshot_module.ProcessPoolExecutor
+
+    class _TrackingPool(real_pool):
+        def __init__(self, max_workers: int = 1, **kwargs):
+            self.max_workers_arg = max_workers
+            self.submit_count = 0
+            self._inflight = 0
+            self.peak_inflight = 0
+            super().__init__(max_workers=max_workers, **kwargs)
+
+        def submit(self, fn, *args, **kwargs):
+            self.submit_count += 1
+            self._inflight += 1
+            self.peak_inflight = max(self.peak_inflight, self._inflight)
+            future = super().submit(fn, *args, **kwargs)
+            future.add_done_callback(lambda _f: self._decrement())
+            return future
+
+        def _decrement(self) -> None:
+            self._inflight -= 1
+
+    tracking: list[_TrackingPool] = []
+
+    def _make_tracking_pool(max_workers: int = 1, **kwargs):
+        pool = _TrackingPool(max_workers=max_workers, **kwargs)
+        tracking.append(pool)
+        return pool
+
+    monkeypatch.setattr(snapshot_module, "ProcessPoolExecutor", _make_tracking_pool)
+    report = build_feature_snapshot(
+        service._config,
+        provider,
+        symbols=_SYMBOLS,
+        lookback_days=250,
+        force=True,
+        max_workers=2,
+        batch_size=4,  # 6 只 -> 2 个 batch
+    )
+    assert report["ok"] is True
+    assert len(tracking) == 1
+    pool = tracking[0]
+    assert pool.submit_count == 2  # ceil(6/4)
+    # 任意时刻在途 batch 不超过 workers。
+    assert pool.peak_inflight <= 2
+
+
+def test_snapshot_progress_file_written_atomically(tmp_path: Path) -> None:
+    service, root = _make_service(tmp_path)
+    progress = tmp_path / "progress.json"
+    provider = SyntheticProvider(seed_offset=2026)
+    report = build_feature_snapshot(
+        service._config,
+        provider,
+        symbols=_SYMBOLS,
+        lookback_days=250,
+        force=True,
+        progress_path=str(progress),
+    )
+    assert report["ok"] is True
+    payload = json.loads(progress.read_text(encoding="utf-8"))
+    assert payload["phase"] == "snapshot_transform"
+    assert payload["completed"] == len(_SYMBOLS)
+    assert payload["total"] == len(_SYMBOLS)
+    assert payload["workers"] == 4
+    assert "timestamp" in payload
+    # 原子写入不留 .tmp 残留。
+    assert not list(tmp_path.glob("*.tmp"))

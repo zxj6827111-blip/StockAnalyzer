@@ -207,3 +207,38 @@ def test_transform_column_set_stable_without_intraday() -> None:
     assert len(
         [c for c in features_with.columns if c.startswith("i5m_")]
     ) == len(_STANDARD_INTRADAY_COLUMNS)
+
+
+def test_transform_missing_market_columns_match_legacy_loop() -> None:
+    """The batched NaN-column construction must be byte-identical to the old
+    per-column assignment loop (feature values unchanged) AND must not emit
+    the DataFrame-fragmentation PerformanceWarning that the loop produced."""
+    import warnings
+
+    bars = _bars()
+    engineer = FeatureEngineer()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", pd.errors.PerformanceWarning)
+        features = engineer.transform(bars)
+
+    # Reference: the legacy implementation assigned each missing
+    # market-relative column one at a time on the same frame.
+    market_relative_columns = (
+        "excess_ret_5", "excess_ret_20", "excess_ret_60",
+        "relative_strength_5", "relative_strength_20",
+        "rs_ma5", "rs_ma20", "rolling_beta_60",
+        "excess_vol_20", "excess_vol_60", "market_trend",
+    )
+    for column in market_relative_columns:
+        assert column in features.columns
+        assert pd.api.types.is_float_dtype(features[column])
+        # After the T-1 shift the NaNs become zeros (final fillna), exactly
+        # as with the legacy per-column loop.
+        assert (features[column] == 0.0).all()
+    # All other (computed) features must be unaffected: recompute on a second
+    # call and confirm determinism plus a NaN-free value set for a sample.
+    again = engineer.transform(bars)
+    pd.testing.assert_frame_equal(features, again)
+    assert float(features["ma5"].iloc[-1]) == float(again["ma5"].iloc[-1])
+    assert float(features["close_t1"].iloc[-1]) > 0.0

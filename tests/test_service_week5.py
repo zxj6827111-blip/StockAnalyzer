@@ -165,6 +165,12 @@ def _load_test_config() -> StockAnalyzerConfig:
     config.training.bootstrap_auto_seed_watchlist = False
     temp_root = Path(tempfile.gettempdir()) / "stock_analyzer_tests"
     config.training.bootstrap_state_path = str(temp_root / "test_bootstrap_state_week5.json")
+    # 测试间隔离：快照写入每次唯一的 temp 目录，避免污染仓库
+    # artifacts/features_light，也避免跨用例的残留快照影响
+    # （真实快照集成见 test_week5_snapshot_integration.py）。
+    config.week5.feature_snapshot_root = str(
+        temp_root / f"features_light_week5_{time.time_ns()}"
+    )
     return config
 
 
@@ -1612,6 +1618,16 @@ def test_service_week5_force_universe_scan_preserves_pinned_symbols_after_prefil
                     "preview": [],
                 }
             },
+        },
+    )
+    # 本测试聚焦 prefilter/pinned 语义；快照构建打桩为快速成功避免真实构建。
+    _patch_attr(
+        service,
+        "ensure_week5_feature_snapshot",
+        lambda **kwargs: {
+            "ok": True,
+            "skipped": True,
+            "build": {"ok": True, "skipped": True},
         },
     )
 
@@ -3355,6 +3371,18 @@ def _patch_minimal_prefilter_and_pipeline(service: StockAnalyzerService) -> dict
         }
 
     _patch_attr(service, "_prefilter_week5_universe_symbols", _fake_prefilter)
+    # 这些测试聚焦 quality selector -> prefilter 的传播语义；快照构建的真实
+    # 集成由 test_week5_snapshot_integration.py 覆盖，这里打桩为快速成功，
+    # 避免对数百只候选做真实特征构建。
+    _patch_attr(
+        service,
+        "ensure_week5_feature_snapshot",
+        lambda **kwargs: {
+            "ok": True,
+            "skipped": True,
+            "build": {"ok": True, "skipped": True},
+        },
+    )
     _patch_attr(
         service,
         "run_pipeline",

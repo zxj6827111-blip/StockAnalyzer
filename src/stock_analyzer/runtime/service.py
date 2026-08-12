@@ -58,7 +58,14 @@ from stock_analyzer.evolution.shadow_online_v2_report import ShadowOnlineV2Repor
 from stock_analyzer.execution.engine import ExecutionEngine
 from stock_analyzer.feature.engineer import FeatureEngineer
 from stock_analyzer.feature.market_context import build_market_relative_frame
-from stock_analyzer.feature.snapshot import RAW_SNAPSHOT_COLUMNS as _FEATURE_SNAPSHOT_RAW_COLUMNS
+from stock_analyzer.feature.snapshot import (
+    RAW_SNAPSHOT_COLUMNS as _FEATURE_SNAPSHOT_RAW_COLUMNS,
+)
+from stock_analyzer.feature.snapshot import (
+    build_feature_snapshot,
+    load_feature_snapshot,
+    snapshot_is_current,
+)
 from stock_analyzer.infra.cache import CacheStore, InMemoryCache, RedisCache
 from stock_analyzer.labels.soup import build_soup_labels
 from stock_analyzer.learning.backfill import LearningBackfillEngine
@@ -6277,6 +6284,81 @@ class StockAnalyzerService:
             "rejected_count": len(rejected),
             "final_signals": capped,
             "rejected": rejected,
+        }
+
+    def ensure_week5_feature_snapshot(
+        self,
+        *,
+        symbols: list[str],
+        scope: str = "universe_quality",
+        provider: object | None = None,
+        force: bool = False,
+    ) -> dict[str, object]:
+        """Build or incrementally refresh the feature snapshot for a candidate set.
+
+        Called by the Week5 scan AFTER the universe quality selection, so the
+        snapshot always covers exactly the actual candidate set (symbols that
+        left the set are dropped by the snapshot layer).  Skips when a current
+        snapshot already exists for the same candidate set.
+
+        Fail-closed semantics: ``ok`` is True only when the resulting snapshot
+        passes the full currency check (``snapshot_is_current`` — schema /
+        signature / factor drift, freshness age, and zero failed symbols).
+        A partial refresh never enters the scan: the scheduler path treats a
+        non-current snapshot as a blocked data gate.
+        """
+        config = self._config
+        if not bool(config.week5.feature_snapshot_enabled):
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": "feature_snapshot_disabled",
+                "scope": scope,
+            }
+        normalized = _dedupe_preserve_order(
+            [
+                item
+                for item in (_normalize_a_share_symbol(symbol) for symbol in symbols)
+                if item
+            ]
+        )
+        if not normalized:
+            return {
+                "ok": False,
+                "skipped": False,
+                "errors": ["empty_candidate_set"],
+                "scope": scope,
+            }
+        build_provider = provider if provider is not None else self._provider
+        build_report = build_feature_snapshot(
+            config=config,
+            provider=build_provider,
+            symbols=normalized,
+            max_workers=max(1, int(config.week5.feature_snapshot_max_workers)),
+            batch_size=max(1, int(config.week5.feature_snapshot_batch_size)),
+            progress_path=str(config.week5.feature_snapshot_progress_path).strip() or None,
+            scope=scope,
+            force=force,
+        )
+        manifest, _frame = load_feature_snapshot(config)
+        snapshot_current = (
+            snapshot_is_current(manifest, config) if manifest is not None else False
+        )
+        return {
+            "ok": bool(build_report.get("ok", False)) and snapshot_current,
+            "skipped": bool(build_report.get("skipped", False)),
+            "snapshot_current": snapshot_current,
+            "build": build_report,
+            "data_snapshot_id": str(
+                build_report.get("data_snapshot_id")
+                or (manifest.data_snapshot_id if manifest else "")
+            ),
+            "scope": scope,
+            "requested_symbol_count": len(normalized),
+            "published_symbol_count": _as_int(
+                build_report.get("published_symbol_count"),
+                default=len(normalized),
+            ),
         }
 
     def _build_data_gate(

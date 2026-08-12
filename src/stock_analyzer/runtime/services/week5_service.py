@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from functools import lru_cache
 from importlib import import_module
 from pathlib import Path
+from time import perf_counter
 from typing import TYPE_CHECKING, Any, cast
 
 import pandas as pd
@@ -1103,6 +1104,11 @@ class RuntimeWeek5Service:
             return blocked
 
         now = timestamp or datetime.now()
+        # 阶段耗时计数器必须在任何阶段执行之前初始化，否则会覆盖
+        # quality_selection / light_stage 已记录的耗时。
+        quality_selection_ms = 0
+        light_stage_ms = 0
+        deep_stage_ms = 0
         snapshot_manifest = None
         snapshot_frame = None
         snapshot_current = False
@@ -1259,6 +1265,7 @@ class RuntimeWeek5Service:
                     quality_board_scope = list(
                         service._config.evolution.universe_spec.board_scope
                     )
+                    selection_started = perf_counter()
                     selection = service._select_universe_quality_candidates(
                         symbols=full_universe_symbols,
                         target_size=quality_target,
@@ -1266,6 +1273,11 @@ class RuntimeWeek5Service:
                         reference_date=now.date().isoformat(),
                         ruleset_id=quality_ruleset_id,
                         board_scope=quality_board_scope,
+                    )
+                    # 已执行阶段取整后至少为 1ms：极快阶段向下取整会得到 0，
+                    # 与"未执行=0"的观测口径冲突，也会让测试出现 flaky。
+                    quality_selection_ms = max(
+                        1, int((perf_counter() - selection_started) * 1000)
                     )
                     selection_report = selection.get("report", {})
                     if not isinstance(selection_report, dict):
@@ -1337,8 +1349,62 @@ class RuntimeWeek5Service:
                     prefilter_report["reason"] = "existing_watchlist"
 
         symbol_list = [str(item).strip() for item in raw_symbols if str(item).strip()]
+        # Feature snapshot is ensured AFTER the quality selection resolved the
+        # actual candidate set: the snapshot is built (or incrementally
+        # refreshed) for exactly those candidates, then the snapshot state and
+        # the data gate are re-evaluated so a fresh build is consumed by the
+        # light/deep stages.  On build failure the snapshot state is reset to
+        # missing and the gate keeps the scheduler path fail-closed.
+        feature_snapshot_report: dict[str, object] | None = None
+        snapshot_ensure_ms = 0
+        if (
+            should_scan_universe
+            and symbol_list
+            and bool(service._config.week5.feature_snapshot_enabled)
+        ):
+            snapshot_ensure_started = perf_counter()
+            feature_snapshot_report = service.ensure_week5_feature_snapshot(
+                symbols=symbol_list,
+                scope="universe_quality",
+            )
+            snapshot_ensure_ms = max(
+                1, int((perf_counter() - snapshot_ensure_started) * 1000)
+            )
+            if not bool(feature_snapshot_report.get("ok", False)):
+                snapshot_manifest = None
+                snapshot_frame = None
+                snapshot_current = False
+            else:
+                try:
+                    snapshot_manifest, snapshot_frame = load_feature_snapshot(
+                        service._config
+                    )
+                    snapshot_current = bool(
+                        snapshot_manifest is not None
+                        and snapshot_frame is not None
+                        and snapshot_is_current(snapshot_manifest, service._config, now)
+                    )
+                except Exception:
+                    snapshot_manifest = None
+                    snapshot_frame = None
+                    snapshot_current = False
+            snapshot_mode = bool(
+                snapshot_manifest is not None
+                and snapshot_frame is not None
+                and snapshot_current
+            )
+            data_gate = service._build_data_gate(
+                snapshot_manifest=snapshot_manifest,
+                snapshot_current=snapshot_current,
+                latest_trade_date=str(snapshot_manifest.trade_date)
+                if snapshot_manifest
+                else "",
+                now=now,
+            )
+            gate_status = str(data_gate.get("status", "ok"))
         if should_scan_universe and symbol_list and prefilter_enabled:
             if snapshot_mode:
+                light_started = perf_counter()
                 light_target = max(
                     1, int(service._config.week5.light_candidate_target)
                 )
@@ -1351,6 +1417,9 @@ class RuntimeWeek5Service:
                     frame=snapshot_frame,
                     target=light_target,
                     allowed_exchanges=allowed_exchanges_for_light,
+                )
+                light_stage_ms = max(
+                    1, int((perf_counter() - light_started) * 1000)
                 )
             else:
                 if gate_status == "blocked" and sync_reason.strip().lower().startswith(
@@ -1373,6 +1442,8 @@ class RuntimeWeek5Service:
                         else "",
                         snapshot_current=snapshot_current,
                     )
+                    if feature_snapshot_report is not None:
+                        blocked_payload["feature_snapshot"] = feature_snapshot_report
                     self._state_service.store_week5_scan_report(blocked_payload)
                     service._record_audit_event(
                         event_type="week5_scan_blocked_data_gate",
@@ -1418,10 +1489,14 @@ class RuntimeWeek5Service:
 
         deep_report: dict[str, object] = {}
         if snapshot_mode:
+            deep_started = perf_counter()
             deep_report = service._deep_stage_from_snapshot(
                 frame=snapshot_frame,
                 target=max(1, int(service._config.week5.deep_candidate_target)),
                 light_report=prefilter_report,
+            )
+            deep_stage_ms = max(
+                1, int((perf_counter() - deep_started) * 1000)
             )
             deep_symbols = [
                 str(item.get("symbol", "")).strip()
@@ -1829,6 +1904,61 @@ class RuntimeWeek5Service:
             if snapshot_manifest is not None
             else "",
             "data_gate": dict(data_gate),
+            "feature_snapshot": feature_snapshot_report,
+            "scan_stages": {
+                "quality_selection": {
+                    "duration_ms": quality_selection_ms,
+                    "selected_count": _as_int(
+                        quality_selection_report.get("selected_count", 0),
+                        default=0,
+                    )
+                    if isinstance(quality_selection_report, dict)
+                    else 0,
+                },
+                "snapshot_ensure": {
+                    "duration_ms": snapshot_ensure_ms,
+                    "enabled": bool(service._config.week5.feature_snapshot_enabled),
+                    "requested_count": (
+                        _as_int(
+                            feature_snapshot_report.get("requested_symbol_count", 0),
+                            default=0,
+                        )
+                        if isinstance(feature_snapshot_report, dict)
+                        else 0
+                    ),
+                    "published_count": (
+                        _as_int(
+                            feature_snapshot_report.get("published_symbol_count", 0),
+                            default=0,
+                        )
+                        if isinstance(feature_snapshot_report, dict)
+                        else 0
+                    ),
+                    "ok": bool(feature_snapshot_report.get("ok", False))
+                    if isinstance(feature_snapshot_report, dict)
+                    else False,
+                },
+                "light_stage": {
+                    "duration_ms": light_stage_ms,
+                    "mode": str(prefilter_report.get("mode", "")),
+                    "shortlisted_count": _as_int(
+                        prefilter_report.get("shortlisted_count", 0), default=0
+                    ),
+                },
+                "deep_stage": {
+                    "duration_ms": deep_stage_ms,
+                    "mode": str(deep_report.get("mode", "")),
+                    "selected_count": _as_int(
+                        deep_report.get("selected_count", 0), default=0
+                    ),
+                },
+                "final_pipeline": {
+                    "duration_ms": _as_int(
+                        monster_runtime_payload.get("duration_ms"), default=0
+                    ),
+                    "symbols": len(symbol_list),
+                },
+            },
             "funnel": {
                 "mode": "snapshot" if snapshot_mode else "direct",
                 "light_candidate_target": max(
