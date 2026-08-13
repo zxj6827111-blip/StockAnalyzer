@@ -379,6 +379,13 @@ class Week5Config(_StrictModel):
     feature_snapshot_max_workers: int = 4
     feature_snapshot_batch_size: int = 20
     feature_snapshot_progress_path: str = "artifacts/runtime/feature_snapshot_progress.json"
+    # Week5 扫描进度文件：阶段推进 + final pipeline 单股心跳，原子 JSON 更新。
+    # 与 feature_snapshot_progress_path 独立，供外部监控整条扫描链路。
+    scan_progress_path: str = "artifacts/runtime/week5_scan_progress.json"
+    # Week5 final pipeline 仅并行无副作用的 FeatureEngineer.transform；
+    # provider、模型推理、风控与落库仍在主线程按输入顺序执行。
+    # 部署环境同步限制 BLAS 线程，防止 ProcessPool 内部线程膨胀。
+    final_pipeline_transform_max_workers: int = 4
     # Strict fail-close: any symbol that failed the last snapshot refresh
     # makes the snapshot NOT fully current (no signals rather than wrong
     # signals).

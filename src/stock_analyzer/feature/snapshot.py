@@ -32,7 +32,7 @@ from concurrent.futures import (
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import Any
 
 import numpy as np
@@ -992,7 +992,20 @@ def _publish_snapshot_dir(
         import shutil
 
         shutil.rmtree(final_dir, ignore_errors=True)
-    staging.replace(final_dir)
+    _replace_snapshot_dir_with_retry(staging=staging, final_dir=final_dir)
+
+
+def _replace_snapshot_dir_with_retry(*, staging: Path, final_dir: Path) -> None:
+    """Retry transient Windows directory locks without masking real failures."""
+    attempts = 5
+    for attempt in range(attempts):
+        try:
+            staging.replace(final_dir)
+            return
+        except PermissionError:
+            if attempt >= attempts - 1:
+                raise
+            sleep(0.075 * (attempt + 1))
 
 
 def _write_progress_mark(

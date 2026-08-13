@@ -3,12 +3,15 @@
 import hashlib
 import json
 import math
-from collections.abc import Mapping
+import os
+from collections.abc import Callable, Mapping
+from concurrent.futures import Future, ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from copy import deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
-from time import perf_counter
-from typing import Protocol
+from time import perf_counter, perf_counter_ns
+from typing import Protocol, TypedDict, cast
 from uuid import uuid4
 
 import numpy as np
@@ -45,6 +48,67 @@ from stock_analyzer.strategy.soup import SoupStrategy
 from stock_analyzer.time_semantics import apply_time_invariants_to_frame
 from stock_analyzer.types import PipelineReport, PipelineSignal, ScoredSignal
 from stock_analyzer.week6.engines import MainForceTracker
+
+
+class SymbolStageTiming(TypedDict):
+    """单只股票的 pipeline 耗时（symbol + duration_ms）。"""
+
+    symbol: str
+    duration_ms: int
+
+
+class SymbolTransformInputs(TypedDict):
+    """单只股票进入 transform/finalize 的稳定输入快照。"""
+
+    symbol: str
+    strategy: str
+    current_equity: float
+    decision_time: datetime
+    bars: pd.DataFrame
+    bars_time_gate: dict[str, object]
+    analysis_bars: pd.DataFrame
+    intraday_1m: pd.DataFrame
+    intraday_5m: pd.DataFrame
+    market_index: pd.DataFrame | None
+    feature_prepare_ms: float
+    provider_status: dict[str, object]
+
+
+class SymbolTransformResult(TypedDict):
+    """ProcessPool worker 的可观测结果。"""
+
+    features: pd.DataFrame
+    transform_ms: float
+    worker_pid: int
+    started_ns: int
+    finished_ns: int
+
+
+def _transform_symbol_features_worker(
+    inputs: SymbolTransformInputs,
+) -> SymbolTransformResult:
+    """ProcessPool worker：仅执行无副作用、可序列化的特征 transform。
+
+    每次调用新建 FeatureEngineer（transform 为纯函数式，无跨调用状态）；
+    输入/输出均为 DataFrame（可 pickle 序列化）。异常由调用方按
+    feature_empty fallback 处理。
+    """
+    started_ns = perf_counter_ns()
+    engineer = FeatureEngineer()
+    features = engineer.transform(
+        inputs["analysis_bars"],
+        intraday_1m=inputs["intraday_1m"],
+        intraday_5m=inputs["intraday_5m"],
+        market_index=inputs["market_index"],
+    )
+    finished_ns = perf_counter_ns()
+    return {
+        "features": features,
+        "transform_ms": (finished_ns - started_ns) / 1_000_000.0,
+        "worker_pid": os.getpid(),
+        "started_ns": started_ns,
+        "finished_ns": finished_ns,
+    }
 
 
 class NewsSignalProvider(Protocol):
@@ -123,6 +187,21 @@ class AnalyzerPipeline:
             "feature_engine_ms": 0,
             "inference_ms": 0,
         }
+        # 最近一次 run_once 的逐股耗时（输入顺序），供报告最慢股票列表。
+        self._last_symbol_stage_ms: list[SymbolStageTiming] = []
+        self._last_parallel_transform: dict[str, object] = {
+            "enabled": False,
+            "configured_workers": 1,
+            "submitted_count": 0,
+            "worker_count": 0,
+            "worker_pids": [],
+            "max_concurrency": 0,
+            "wall_ms": 0,
+            "worker_transform_ms": 0,
+            "fallback_count": 0,
+            "pool_fallback": False,
+            "pool_error": "",
+        }
         self._evolution_controls: dict[str, object] = {}
         self._news_preview_cache: dict[tuple[str, str], tuple[float, dict[str, object]]] = {}
         self._news_preview_cache_ttl_sec = 60.0
@@ -157,6 +236,8 @@ class AnalyzerPipeline:
         symbols: list[str],
         strategy: str = "trend",
         current_equity: float = 1.0,
+        on_symbol_progress: Callable[[str, int, int, bool], None] | None = None,
+        transform_max_workers: int = 1,
     ) -> PipelineReport:
         trace_id = uuid4().hex[:16]
         signals: list[PipelineSignal] = []
@@ -165,18 +246,57 @@ class AnalyzerPipeline:
             "feature_engine_ms": 0.0,
             "inference_ms": 0.0,
         }
-
-        for symbol in symbols:
-            signal = self._process_symbol(
-                symbol=symbol, strategy=strategy, current_equity=current_equity
+        symbol_stage_ms: list[SymbolStageTiming] = []
+        total = len(symbols)
+        # Phase 2 受控并行由调用方显式开启。通用 pipeline 默认串行，
+        # Week5 final pipeline 传入配置值，避免 API/验收等其他链路被隐式改变。
+        max_transform_workers = max(1, int(transform_max_workers))
+        self._last_parallel_transform = {
+            "enabled": False,
+            "configured_workers": max_transform_workers,
+            "submitted_count": 0,
+            "worker_count": 0,
+            "worker_pids": [],
+            "max_concurrency": 0,
+            "wall_ms": 0,
+            "worker_transform_ms": 0,
+            "fallback_count": 0,
+            "pool_fallback": False,
+            "pool_error": "",
+        }
+        if max_transform_workers > 1 and total > 1:
+            signals = self._run_once_parallel(
+                symbols=symbols,
+                strategy=strategy,
+                current_equity=current_equity,
+                max_workers=max_transform_workers,
+                on_symbol_progress=on_symbol_progress,
             )
-            signals.append(signal)
+            symbol_stage_ms = self._last_symbol_stage_ms
+        else:
+            for index, symbol in enumerate(symbols):
+                if on_symbol_progress is not None:
+                    on_symbol_progress(symbol, index, total, True)
+                symbol_started = perf_counter()
+                signal = self._process_symbol(
+                    symbol=symbol, strategy=strategy, current_equity=current_equity
+                )
+                symbol_stage_ms.append(
+                    {
+                        "symbol": symbol,
+                        "duration_ms": int((perf_counter() - symbol_started) * 1000),
+                    }
+                )
+                if on_symbol_progress is not None:
+                    on_symbol_progress(symbol, index, total, False)
+                signals.append(signal)
 
         self._last_pipeline_stage_ms = {
             "fetch_bars_ms": int(self._stage_ms_accum["fetch_bars_ms"]),
             "feature_engine_ms": int(self._stage_ms_accum["feature_engine_ms"]),
             "inference_ms": int(self._stage_ms_accum["inference_ms"]),
         }
+        self._last_symbol_stage_ms = symbol_stage_ms
 
         provider_status = self.provider_status()
         self._risk_controller.update_degraded_mode(
@@ -508,10 +628,13 @@ class AnalyzerPipeline:
     def _maybe_build_market_index(self, bars: pd.DataFrame) -> pd.DataFrame | None:
         if not bool(self._config.market_relative_feature.enabled):
             return None
-        return build_market_relative_frame(
-            self._provider,
-            bars=bars,
-            config=self._config.market_relative_feature,
+        return cast(
+            pd.DataFrame,
+            build_market_relative_frame(
+                self._provider,
+                bars=bars,
+                config=self._config.market_relative_feature,
+            ),
         )
 
     def _active_champion_auc(self) -> float | None:
@@ -523,10 +646,7 @@ class AnalyzerPipeline:
         metrics_summary = getattr(champion, "metrics_summary", {})
         if not isinstance(metrics_summary, Mapping):
             return None
-        try:
-            return float(metrics_summary.get("auc"))
-        except (TypeError, ValueError):
-            return None
+        return _optional_float(metrics_summary.get("auc"))
 
     def _safe_fetch_intraday_summary(
         self,
@@ -536,10 +656,13 @@ class AnalyzerPipeline:
         lookback_days: int,
     ) -> pd.DataFrame:
         try:
-            frame = self._provider.fetch_intraday_summary(
-                symbol=symbol,
-                interval=interval,
-                lookback_days=max(1, int(lookback_days)),
+            frame = cast(
+                pd.DataFrame,
+                self._provider.fetch_intraday_summary(
+                    symbol=symbol,
+                    interval=interval,
+                    lookback_days=max(1, int(lookback_days)),
+                ),
             )
         except Exception:
             return pd.DataFrame()
@@ -551,26 +674,248 @@ class AnalyzerPipeline:
         frame = frame[frame.index.notna()]
         return frame.sort_index()
 
+    def _run_once_parallel(
+        self,
+        *,
+        symbols: list[str],
+        strategy: str,
+        current_equity: float,
+        max_workers: int,
+        on_symbol_progress: Callable[[str, int, int, bool], None] | None,
+    ) -> list[PipelineSignal]:
+        """final pipeline 两段式并行（Phase 2，受控配置启用）。
+
+        主线程：provider 读取、health 状态记录、输入准备、模型推理、概率
+        健康、风险控制、学习快照与 DuckDB 写入——single-writer 语义不变；
+        ProcessPool：仅执行无副作用、可序列化的特征 transform。
+        主线程按原始 symbol 顺序消费 worker 结果，信号、分数、决策字段与
+        落库顺序完全确定。单 worker 异常 fallback 为 feature_empty hold
+        信号（复用串行路径中 transform 返回空特征帧的语义），不影响其他
+        股票。完整 _process_symbol 不做并发（共享可变状态）。
+        """
+        total = len(symbols)
+        prepared: list[
+            tuple[str, PipelineSignal | None, SymbolTransformInputs | None, float]
+        ] = []
+        for symbol in symbols:
+            if on_symbol_progress is not None:
+                on_symbol_progress(symbol, len(prepared), total, True)
+            prepare_started = perf_counter()
+            fail_signal, inputs = self._prepare_symbol_inputs(
+                symbol, strategy, current_equity
+            )
+            prepared.append(
+                (
+                    symbol,
+                    fail_signal,
+                    inputs,
+                    (perf_counter() - prepare_started) * 1000.0,
+                )
+            )
+
+        signals: list[PipelineSignal] = []
+        symbol_stage_ms: list[SymbolStageTiming] = []
+        need_transform = [
+            (symbol, inputs)
+            for symbol, fail_signal, inputs, _ in prepared
+            if fail_signal is None and inputs is not None
+        ]
+        self._last_parallel_transform["enabled"] = bool(need_transform)
+
+        features_by_symbol: dict[str, pd.DataFrame] = {}
+        transform_ms_by_symbol: dict[str, float] = {}
+        prepare_feature_ms = sum(
+            float(inputs["feature_prepare_ms"])
+            for _, inputs in need_transform
+        )
+        transform_wall_started = perf_counter()
+        futures: dict[Future[SymbolTransformResult], str] = {}
+        pool: ProcessPoolExecutor | None = None
+        pool_fallback = False
+        pool_error = ""
+
+        if need_transform:
+            try:
+                pool = ProcessPoolExecutor(max_workers=max_workers)
+                for symbol, inputs in need_transform:
+                    future = pool.submit(_transform_symbol_features_worker, inputs)
+                    futures[future] = symbol
+                self._last_parallel_transform["submitted_count"] = len(futures)
+            except Exception as exc:
+                pool_fallback = True
+                pool_error = f"{type(exc).__name__}: {str(exc)[:200]}"
+
+        worker_transform_ms = 0.0
+        worker_pids: set[int] = set()
+        worker_intervals: list[tuple[int, int]] = []
+        if pool is not None and not pool_fallback:
+            try:
+                for future in as_completed(futures):
+                    symbol = futures[future]
+                    try:
+                        result = future.result()
+                    except BrokenProcessPool as exc:
+                        pool_fallback = True
+                        pool_error = f"{type(exc).__name__}: {str(exc)[:200]}"
+                        break
+                    except Exception:
+                        # 单 worker 业务异常：为空特征帧，其他股票继续。
+                        features_by_symbol[symbol] = pd.DataFrame()
+                        transform_ms_by_symbol[symbol] = 0.0
+                        self._last_parallel_transform["fallback_count"] = _as_int(
+                            self._last_parallel_transform["fallback_count"],
+                            default=0,
+                        ) + 1
+                        continue
+                    features_by_symbol[symbol] = result["features"]
+                    transform_ms = float(result["transform_ms"])
+                    transform_ms_by_symbol[symbol] = transform_ms
+                    worker_transform_ms += transform_ms
+                    worker_pids.add(int(result["worker_pid"]))
+                    worker_intervals.append(
+                        (int(result["started_ns"]), int(result["finished_ns"]))
+                    )
+            finally:
+                if pool_fallback:
+                    for future in futures:
+                        future.cancel()
+                pool.shutdown(wait=True, cancel_futures=pool_fallback)
+        elif pool is not None:
+            for future in futures:
+                future.cancel()
+            pool.shutdown(wait=True, cancel_futures=True)
+
+        if pool_fallback:
+            # ProcessPool 创建、提交或运行时整体失效时，主线程逐只重算。
+            # 单只 transform 仍保持异常隔离，退化为 feature_empty。
+            features_by_symbol.clear()
+            transform_ms_by_symbol.clear()
+            worker_transform_ms = 0.0
+            worker_pids.clear()
+            worker_intervals.clear()
+            self._last_parallel_transform["pool_fallback"] = True
+            self._last_parallel_transform["pool_error"] = pool_error
+            self._last_parallel_transform["fallback_count"] = len(need_transform)
+            for symbol, inputs in need_transform:
+                serial_started = perf_counter()
+                try:
+                    features_by_symbol[symbol] = self._feature_engineer.transform(
+                        inputs["analysis_bars"],
+                        intraday_1m=inputs["intraday_1m"],
+                        intraday_5m=inputs["intraday_5m"],
+                        market_index=inputs["market_index"],
+                    )
+                except Exception:
+                    features_by_symbol[symbol] = pd.DataFrame()
+                transform_ms_by_symbol[symbol] = (
+                    perf_counter() - serial_started
+                ) * 1000.0
+
+        transform_wall_ms = (perf_counter() - transform_wall_started) * 1000.0
+        if need_transform:
+            # 并行计时使用准备阶段总耗时 + transform 阶段墙钟耗时，
+            # 不把多个重叠 future 的等待时间重复累加。
+            self._stage_ms_accum["feature_engine_ms"] += (
+                prepare_feature_ms + transform_wall_ms
+            )
+        self._last_parallel_transform["wall_ms"] = int(transform_wall_ms)
+        self._last_parallel_transform["worker_transform_ms"] = int(
+            worker_transform_ms
+        )
+        self._last_parallel_transform["worker_pids"] = sorted(worker_pids)
+        self._last_parallel_transform["worker_count"] = len(worker_pids)
+        overlap_events = [
+            event
+            for started_ns, finished_ns in worker_intervals
+            for event in ((started_ns, 1), (finished_ns, -1))
+        ]
+        active_workers = 0
+        max_concurrency = 0
+        for _, delta in sorted(overlap_events, key=lambda item: (item[0], item[1])):
+            active_workers += delta
+            max_concurrency = max(max_concurrency, active_workers)
+        self._last_parallel_transform["max_concurrency"] = max_concurrency
+
+        for index, (symbol, fail_signal, inputs, prepare_ms) in enumerate(prepared):
+            finalize_started = perf_counter()
+            if fail_signal is not None:
+                signal = fail_signal
+            elif inputs is None:
+                raise RuntimeError(f"pipeline inputs missing for {symbol}")
+            else:
+                signal = self._finalize_symbol_signal(
+                    symbol,
+                    strategy,
+                    current_equity,
+                    inputs,
+                    features_by_symbol.get(symbol, pd.DataFrame()),
+                )
+            finalize_ms = (perf_counter() - finalize_started) * 1000.0
+            symbol_stage_ms.append(
+                {
+                    "symbol": symbol,
+                    "duration_ms": int(
+                        prepare_ms
+                        + transform_ms_by_symbol.get(symbol, 0.0)
+                        + finalize_ms
+                    ),
+                }
+            )
+            signals.append(signal)
+            if on_symbol_progress is not None:
+                on_symbol_progress(symbol, index, total, False)
+        self._last_symbol_stage_ms = symbol_stage_ms
+        return signals
+
     def _process_symbol(self, symbol: str, strategy: str, current_equity: float) -> PipelineSignal:
+        """单只股票完整处理（串行路径）。
+
+        Phase 2 并行路径使用相同的三段拆分（_prepare_symbol_inputs /
+        _transform_symbol_features / _finalize_symbol_signal），本方法即三段
+        顺序调用，保证串行与并行逐字段等价。
+        """
+        fail_signal, inputs = self._prepare_symbol_inputs(symbol, strategy, current_equity)
+        if fail_signal is not None:
+            return fail_signal
+        if inputs is None:
+            raise RuntimeError(f"pipeline inputs missing for {symbol}")
+        features = self._transform_symbol_features(inputs)
+        return self._finalize_symbol_signal(symbol, strategy, current_equity, inputs, features)
+
+    def _prepare_symbol_inputs(
+        self,
+        symbol: str,
+        strategy: str,
+        current_equity: float,
+    ) -> tuple[PipelineSignal | None, SymbolTransformInputs | None]:
+        """final pipeline 主线程段：provider 读取与 transform 输入准备。
+
+        返回 (None, inputs) 表示可继续进入 transform；返回 (fail_signal, None)
+        表示提前失败（blacklist / 数据源错误 / 时间门 / 历史不足），不进入
+        transform。health 状态记录与 fetch 计时归属主线程（single-writer 语义）。
+        """
         blacklist = self._config.blacklist
         matched_blacklist_pattern = blacklist.matches(symbol) if blacklist.enabled else None
         if matched_blacklist_pattern is not None:
-            return PipelineSignal(
-                symbol=symbol,
-                strategy=strategy,
-                score=0.0,
-                grade="C",
-                action="hold",
-                target_position=0.0,
-                probabilities={"lgbm": 0.0, "xgb": 0.0, "meta": 0.0},
-                reasons=["blacklist"],
-                decision_trace={
-                    "blacklist_gate": {
-                        "passed": False,
-                        "enabled": True,
-                        "matched_pattern": matched_blacklist_pattern,
-                    }
-                },
+            return (
+                PipelineSignal(
+                    symbol=symbol,
+                    strategy=strategy,
+                    score=0.0,
+                    grade="C",
+                    action="hold",
+                    target_position=0.0,
+                    probabilities={"lgbm": 0.0, "xgb": 0.0, "meta": 0.0},
+                    reasons=["blacklist"],
+                    decision_trace={
+                        "blacklist_gate": {
+                            "passed": False,
+                            "enabled": True,
+                            "matched_pattern": matched_blacklist_pattern,
+                        }
+                    },
+                ),
+                None,
             )
         decision_time = datetime.now()
         start = perf_counter()
@@ -583,15 +928,18 @@ class AnalyzerPipeline:
         except DataSourceError as exc:
             self._health_monitor.record(success=False, latency_sec=perf_counter() - start)
             self._stage_ms_accum["fetch_bars_ms"] += (perf_counter() - start) * 1000.0
-            return PipelineSignal(
-                symbol=symbol,
-                strategy=strategy,
-                score=0.0,
-                grade="C",
-                action="hold",
-                target_position=0.0,
-                probabilities={"lgbm": 0.0, "xgb": 0.0, "meta": 0.0},
-                reasons=[f"data_source:{exc}"],
+            return (
+                PipelineSignal(
+                    symbol=symbol,
+                    strategy=strategy,
+                    score=0.0,
+                    grade="C",
+                    action="hold",
+                    target_position=0.0,
+                    probabilities={"lgbm": 0.0, "xgb": 0.0, "meta": 0.0},
+                    reasons=[f"data_source:{exc}"],
+                ),
+                None,
             )
         self._stage_ms_accum["fetch_bars_ms"] += (perf_counter() - start) * 1000.0
         bars, bars_time_gate = apply_time_invariants_to_frame(
@@ -603,42 +951,93 @@ class AnalyzerPipeline:
             require_mature_label=False,
         )
         if bars.empty:
-            return PipelineSignal(
-                symbol=symbol,
-                strategy=strategy,
-                score=0.0,
-                grade="C",
-                action="hold",
-                target_position=0.0,
-                probabilities={"lgbm": 0.0, "xgb": 0.0, "meta": 0.0},
-                reasons=["time_invariant_violation"],
+            return (
+                PipelineSignal(
+                    symbol=symbol,
+                    strategy=strategy,
+                    score=0.0,
+                    grade="C",
+                    action="hold",
+                    target_position=0.0,
+                    probabilities={"lgbm": 0.0, "xgb": 0.0, "meta": 0.0},
+                    reasons=["time_invariant_violation"],
+                ),
+                None,
             )
         if len(bars) < self._min_history_days:
-            return PipelineSignal(
-                symbol=symbol,
-                strategy=strategy,
-                score=0.0,
-                grade="C",
-                action="hold",
-                target_position=0.0,
-                probabilities={"lgbm": 0.0, "xgb": 0.0, "meta": 0.0},
-                reasons=self._insufficient_history_reasons(len(bars)),
+            return (
+                PipelineSignal(
+                    symbol=symbol,
+                    strategy=strategy,
+                    score=0.0,
+                    grade="C",
+                    action="hold",
+                    target_position=0.0,
+                    probabilities={"lgbm": 0.0, "xgb": 0.0, "meta": 0.0},
+                    reasons=self._insufficient_history_reasons(len(bars)),
+                ),
+                None,
             )
         analysis_bars = self._clip_signal_analysis_bars(bars)
 
-        transform_started = perf_counter()
+        feature_prepare_started = perf_counter()
         intraday_1m, intraday_5m = self._fetch_intraday_summaries(
             symbol=symbol,
             lookback_days=max(120, len(analysis_bars) + 5),
         )
         market_index = self._maybe_build_market_index(analysis_bars)
-        features = self._feature_engineer.transform(
-            analysis_bars,
-            intraday_1m=intraday_1m,
-            intraday_5m=intraday_5m,
-            market_index=market_index,
+        feature_prepare_ms = (perf_counter() - feature_prepare_started) * 1000.0
+        provider_status = dict(self.provider_status())
+        return (
+            None,
+            {
+                "symbol": symbol,
+                "strategy": strategy,
+                "current_equity": current_equity,
+                "decision_time": decision_time,
+                "bars": bars,
+                "bars_time_gate": bars_time_gate,
+                "analysis_bars": analysis_bars,
+                "intraday_1m": intraday_1m,
+                "intraday_5m": intraday_5m,
+                "market_index": market_index,
+                "feature_prepare_ms": feature_prepare_ms,
+                "provider_status": provider_status,
+            },
         )
-        self._stage_ms_accum["feature_engine_ms"] += (perf_counter() - transform_started) * 1000.0
+
+    def _transform_symbol_features(self, inputs: SymbolTransformInputs) -> pd.DataFrame:
+        """特征 transform 串行路径；计时含准备阶段和 transform。"""
+        started = perf_counter()
+        try:
+            return cast(
+                pd.DataFrame,
+                self._feature_engineer.transform(
+                    inputs["analysis_bars"],
+                    intraday_1m=inputs["intraday_1m"],
+                    intraday_5m=inputs["intraday_5m"],
+                    market_index=inputs["market_index"],
+                ),
+            )
+        finally:
+            self._stage_ms_accum["feature_engine_ms"] += (
+                float(inputs["feature_prepare_ms"])
+                + (perf_counter() - started) * 1000.0
+            )
+    def _finalize_symbol_signal(
+        self,
+        symbol: str,
+        strategy: str,
+        current_equity: float,
+        inputs: SymbolTransformInputs,
+        features: pd.DataFrame,
+    ) -> PipelineSignal:
+        """final pipeline 主线程段：特征后处理、模型推理、概率健康、风险
+        控制、决策构造、学习快照与落库（single-writer 语义不变）。"""
+        decision_time = inputs["decision_time"]
+        bars = inputs["bars"]
+        bars_time_gate = inputs["bars_time_gate"]
+        analysis_bars = inputs["analysis_bars"]
         if features.empty:
             return PipelineSignal(
                 symbol=symbol,
@@ -809,7 +1208,7 @@ class AnalyzerPipeline:
         )
         liquidity_pass = _liquidity_check(bar_t1, liquidity_config)
 
-        provider_status = self.provider_status()
+        provider_status = dict(inputs["provider_status"])
         self._risk_controller.update_degraded_mode(
             hard_degraded_mode=bool(provider_status.get("hard_degraded_mode", False)),
             soft_degraded_mode=bool(provider_status.get("soft_degraded_mode", False)),
@@ -1086,7 +1485,8 @@ class AnalyzerPipeline:
                     predictor_degraded = False
             if predictor_degraded:
                 return _controlled_heuristic_probabilities(feature_row)
-            return self._predictor.predict_row(feature_row)
+            predicted = self._predictor.predict_row(feature_row)
+            return {str(key): float(value) for key, value in predicted.items()}
         return _controlled_heuristic_probabilities(feature_row)
 
     def _score_board_component(self, *, symbol: str, bars: pd.DataFrame) -> float:
@@ -1212,7 +1612,7 @@ class AnalyzerPipeline:
 
 def _liquidity_check(bar_t1: pd.Series, config: LiquidityFilterConfig) -> bool:
     metrics = _liquidity_metrics(bar_t1)
-    return (
+    return bool(
         metrics["turnover"] >= config.min_daily_turnover
         and metrics["float_market_cap"] >= config.min_float_market_cap
         and metrics["turnover_rate"] <= config.max_turnover_rate

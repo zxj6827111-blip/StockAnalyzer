@@ -121,6 +121,7 @@ class RuntimeWeek5Service:
         if friday_full_deep:
             scan_profile = "offhours_friday_full_deep"
             prefilter_enabled = False
+            funnel_policy = "intentional_full_deep"
             universe_max_symbols = max(
                 0,
                 _as_int(service._config.week5.offhours_weekend_universe_max_symbols, default=0),
@@ -129,14 +130,20 @@ class RuntimeWeek5Service:
         elif weekend_full_deep:
             scan_profile = "offhours_weekend_full_deep"
             prefilter_enabled = False
+            funnel_policy = "intentional_full_deep"
             universe_max_symbols = max(
                 0,
                 _as_int(service._config.week5.offhours_weekend_universe_max_symbols, default=0),
             )
             reasons.append("weekend_full_deep_enabled")
         elif forced_full_deep:
+            # forced profile 保留名称与触发原因，但执行 snapshot light/deep
+            # 漏斗（prefilter 打开）：最终 pipeline 输入为 deep 入选项 + pinned
+            # 增量，不再隐式全量重型扫描。周五/周末的 intentional_full_deep
+            # 才保留 raw 候选 -> monster_scan_max_symbols 的全量语义。
             scan_profile = "offhours_forced_full_deep"
-            prefilter_enabled = False
+            prefilter_enabled = True
+            funnel_policy = "snapshot_funnel"
             universe_max_symbols = max(
                 0,
                 _as_int(service._config.week5.offhours_weekday_universe_max_symbols, default=0),
@@ -144,6 +151,7 @@ class RuntimeWeek5Service:
         else:
             scan_profile = "offhours_weekday_light_topk_deep"
             prefilter_enabled = True
+            funnel_policy = "snapshot_funnel"
             universe_max_symbols = max(
                 0,
                 _as_int(service._config.week5.offhours_weekday_universe_max_symbols, default=0),
@@ -153,6 +161,7 @@ class RuntimeWeek5Service:
         return {
             "scan_profile": scan_profile,
             "prefilter_enabled": prefilter_enabled,
+            "funnel_policy": funnel_policy,
             "force_universe_scan": True,
             "universe_max_symbols": universe_max_symbols,
             "prefer_local_universe": prefer_local_universe,
@@ -298,10 +307,15 @@ class RuntimeWeek5Service:
             )
         report["universe_quality_selector_mode"] = selector_mode
         report["symbol_source"] = f"{annotate_source}:full_deep"
+        # Friday/weekend 显式 full-deep：有意绕过漏斗，raw 候选 -> cap。
+        # 与 snapshot_funnel 的 deep 空回退 fail-closed 明确区分。
+        report["funnel_policy"] = "intentional_full_deep"
+        report["selection_source"] = "intentional_full_deep"
         if isinstance(prefilter, dict):
             prefilter["enabled"] = False
             prefilter["applied"] = False
             prefilter["reason"] = "disabled_by_offhours_full_deep_profile"
+            prefilter["funnel_policy"] = "intentional_full_deep"
             prefilter["universe_source"] = annotate_source
             prefilter["universe_quality_selector_mode"] = selector_mode
             prefilter["universe_count"] = annotate_symbol_count
@@ -998,6 +1012,7 @@ class RuntimeWeek5Service:
         reasons: list[str],
         data_snapshot_id: str,
         snapshot_current: bool,
+        scan_profile: str = "",
     ) -> dict[str, object]:
         """Fail-closed week5 scan report when the data gate is blocked."""
         watchlist_size = len(service._state.watchlist)
@@ -1007,7 +1022,7 @@ class RuntimeWeek5Service:
             "status": "blocked_data_gate",
             "watchlist_size": watchlist_size,
             "symbol_source": "blocked",
-            "scan_profile": "default",
+            "scan_profile": scan_profile.strip() or "default",
             "first_board": {"candidate_count": 0, "candidates": [], "leaders": []},
             "signal_pool": {"candidate_count": 0, "candidates": []},
             "anomalies": {"event_count": 0, "events": []},
@@ -1103,6 +1118,60 @@ class RuntimeWeek5Service:
             )
             return blocked
 
+        # 进度文件由外层统一维护终态：正常结束写 completed，异常写 failed
+        # 与受控错误摘要，且不改变异常传播与扫描结果语义。
+        progress = Week5ScanProgress(
+            service=service,
+            scan_profile=scan_profile.strip() or "default",
+        )
+        progress.update(status="running", phase="quality")
+        try:
+            report = self._run_week5_scan_impl(
+                symbols=symbols,
+                timestamp=timestamp,
+                notify_enabled=notify_enabled,
+                sync_watchlist=sync_watchlist,
+                sync_reason=sync_reason,
+                sync_top_k_override=sync_top_k_override,
+                force_universe_scan=force_universe_scan,
+                prefilter_enabled_override=prefilter_enabled_override,
+                prefilter_top_k_override=prefilter_top_k_override,
+                universe_max_symbols_override=universe_max_symbols_override,
+                pinned_symbols=pinned_symbols,
+                scan_profile=scan_profile,
+                recovery_mode=recovery_mode,
+                _progress=progress,
+            )
+        except Exception as exc:
+            progress.fail(error=exc)
+            raise
+        # 终态区分：data gate blocked（fail-closed 设计内结果）记为 blocked，
+        # 避免外部监控把被拦截的扫描误判为成功完成。
+        report_status = str(report.get("status", "")).strip()
+        if report_status == "blocked_data_gate":
+            progress.update(status="blocked")
+        else:
+            progress.update(status="completed")
+        return report
+
+    def _run_week5_scan_impl(
+        self,
+        symbols: list[str] | None = None,
+        timestamp: datetime | None = None,
+        notify_enabled: bool | None = None,
+        sync_watchlist: bool | None = None,
+        sync_reason: str = "",
+        sync_top_k_override: int | None = None,
+        force_universe_scan: bool = False,
+        prefilter_enabled_override: bool | None = None,
+        prefilter_top_k_override: int | None = None,
+        universe_max_symbols_override: int | None = None,
+        pinned_symbols: list[str] | None = None,
+        scan_profile: str = "",
+        recovery_mode: bool = False,
+        _progress: Week5ScanProgress | None = None,
+    ) -> dict[str, object]:
+        service = self._service
         now = timestamp or datetime.now()
         # 阶段耗时计数器必须在任何阶段执行之前初始化，否则会覆盖
         # quality_selection / light_stage 已记录的耗时。
@@ -1357,6 +1426,8 @@ class RuntimeWeek5Service:
         # missing and the gate keeps the scheduler path fail-closed.
         feature_snapshot_report: dict[str, object] | None = None
         snapshot_ensure_ms = 0
+        if _progress is not None:
+            _progress.update(phase="snapshot", total=len(symbol_list))
         if (
             should_scan_universe
             and symbol_list
@@ -1402,6 +1473,25 @@ class RuntimeWeek5Service:
                 now=now,
             )
             gate_status = str(data_gate.get("status", "ok"))
+
+        # 三类选择策略（Week5 扫描漏斗整改）：
+        # - snapshot_funnel：全市场扫描（含 offhours_forced_full_deep），强制
+        #   执行 light/deep，deep 空结果 fail-closed；
+        # - intentional_full_deep：Friday/weekend 显式全量扫描，raw 候选 ->
+        #   monster_scan_max_symbols，有意绕过漏斗；
+        # - direct_non_universe：非全市场或不适用快照的既有直接扫描路径。
+        scan_profile_name = scan_profile.strip() or "default"
+        if scan_profile_name in ("offhours_friday_full_deep", "offhours_weekend_full_deep"):
+            funnel_policy = "intentional_full_deep"
+        elif should_scan_universe:
+            funnel_policy = "snapshot_funnel"
+        else:
+            funnel_policy = "direct_non_universe"
+        if _progress is not None:
+            _progress.update(funnel_policy=funnel_policy)
+        if _progress is not None:
+            _progress.update(phase="light")
+
         if should_scan_universe and symbol_list and prefilter_enabled:
             if snapshot_mode:
                 light_started = perf_counter()
@@ -1422,14 +1512,23 @@ class RuntimeWeek5Service:
                     1, int((perf_counter() - light_started) * 1000)
                 )
             else:
-                if gate_status == "blocked" and sync_reason.strip().lower().startswith(
-                    "scheduler_"
-                ):
-                    # Fail-closed: the nightly scheduled universe scan must NOT
-                    # silently fall back to the heavy direct-scan path
-                    # (top_k=500 full market) when the feature snapshot is
-                    # missing/stale.  Manual recovery runs override this by
-                    # passing an explicit non-scheduler sync reason.
+                # 自动调度触发：scheduler_* 前缀（intraday/nightly）或
+                # offhours_refresh 全市场漏斗（evolution 自动 offhours 链路）。
+                # 手动恢复（CLI/API 自定义 sync_reason）不在此列，保留绕过能力。
+                auto_scheduled_scan = bool(
+                    sync_reason.strip().lower().startswith("scheduler_")
+                    or (
+                        sync_reason.strip().lower() == "offhours_refresh"
+                        and funnel_policy == "snapshot_funnel"
+                    )
+                )
+                if gate_status == "blocked" and auto_scheduled_scan:
+                    # Fail-closed: the scheduled universe scan (including the
+                    # evolution offhours refresh) must NOT silently fall back to
+                    # the heavy direct-scan path (top_k=500 full market) when
+                    # the feature snapshot is missing/stale.  Manual recovery
+                    # runs override this by passing an explicit non-scheduler
+                    # sync reason.
                     gate_reasons = [
                         str(item) for item in (data_gate.get("reasons") or [])
                     ]
@@ -1441,9 +1540,11 @@ class RuntimeWeek5Service:
                         if snapshot_manifest
                         else "",
                         snapshot_current=snapshot_current,
+                        scan_profile=scan_profile_name,
                     )
                     if feature_snapshot_report is not None:
                         blocked_payload["feature_snapshot"] = feature_snapshot_report
+                    blocked_payload["funnel_policy"] = funnel_policy
                     self._state_service.store_week5_scan_report(blocked_payload)
                     service._record_audit_event(
                         event_type="week5_scan_blocked_data_gate",
@@ -1488,7 +1589,15 @@ class RuntimeWeek5Service:
             symbol_source = f"{symbol_source}:prefilter"
 
         deep_report: dict[str, object] = {}
-        if snapshot_mode:
+        deep_stage_ran = False
+        deep_symbols: list[str] = []
+        # 立即固化 deep 入选项数量：symbol_list 后续会追加 pinned / 被 cap
+        # 重建（引用别名），deep_selected_count 必须保持 deep 阶段原始口径。
+        deep_selected_count = 0
+        if _progress is not None:
+            _progress.update(phase="deep")
+        if snapshot_mode and funnel_policy != "intentional_full_deep":
+            deep_stage_ran = True
             deep_started = perf_counter()
             deep_report = service._deep_stage_from_snapshot(
                 frame=snapshot_frame,
@@ -1503,10 +1612,27 @@ class RuntimeWeek5Service:
                 for item in deep_report.get("selected", [])
                 if isinstance(item, dict) and str(item.get("symbol", "")).strip()
             ]
+            deep_selected_count = len(deep_symbols)
             if deep_symbols:
                 symbol_list = deep_symbols
                 symbol_source = f"{symbol_source}:snapshot_deep"
+            elif funnel_policy == "snapshot_funnel":
+                # fail-closed：deep 无入选项时清空 raw 候选，仅允许随后追加
+                # pinned；绝不回退至质量选择原始候选或 cap 后的截断列表。
+                symbol_list = []
+                symbol_source = f"{symbol_source}:snapshot_deep_empty_fail_closed"
             prefilter_report["deep_stage"] = deep_report
+
+        # deep 空结果归因：light 为空 / 快照无匹配行 / deep 筛选为空 三态区分，
+        # 与"deep 未执行"（intentional_full_deep）不可混淆。
+        deep_empty_reason = ""
+        if deep_stage_ran and not deep_symbols:
+            if _as_int(deep_report.get("light_shortlist_count"), default=0) <= 0:
+                deep_empty_reason = "light_shortlist_empty"
+            elif _as_int(deep_report.get("snapshot_match_rows"), default=0) <= 0:
+                deep_empty_reason = "no_snapshot_matching_rows"
+            else:
+                deep_empty_reason = "deep_selected_empty"
 
         quality_selector_mode = (
             str(quality_selection_report.get("selector_mode", "")).strip()
@@ -1616,6 +1742,41 @@ class RuntimeWeek5Service:
             symbol_list = _dedupe_preserve_order([*pinned_first, *non_pinned])[:monster_scan_cap]
             symbol_source = f"{symbol_source}:monster_cap"
             prefilter_report["selected_count"] = len(symbol_list)
+        # funnel 汇总计数：政策、deep 是否执行/空结果归因、deep/pinned/实际
+        # pipeline 输入数。deep_symbols_empty 仅在 deep 真正执行且无入选项时为
+        # True——intentional_full_deep 的"deep 未运行"不会被误判为 fail-closed。
+        funnel_report: dict[str, object] = {
+            "mode": "snapshot" if snapshot_mode else "direct",
+            "policy": funnel_policy,
+            "deep_stage_ran": deep_stage_ran,
+            "deep_symbols_empty": bool(deep_stage_ran and deep_selected_count == 0),
+            "deep_empty_reason": deep_empty_reason,
+            "deep_selected_count": deep_selected_count,
+            "pinned_added_count": len(pinned_added_symbols),
+            "pipeline_input_count": len(symbol_list),
+        }
+        if funnel_policy == "intentional_full_deep":
+            selection_source = "intentional_full_deep"
+        elif deep_stage_ran and deep_selected_count:
+            # deep 有入选项（含既有直接路径在快照可用时的 deep 收窄）。
+            selection_source = "snapshot_deep"
+        elif funnel_policy == "snapshot_funnel" and deep_stage_ran:
+            # deep 执行且无入选项：fail-closed，仅 pinned。
+            selection_source = "deep_empty_pinned_only"
+        else:
+            # deep 未执行（快照不可用等）：既有直接路径来源，不标为 deep 空回退。
+            selection_source = "direct_scan"
+        # snapshot_funnel 的最终 pipeline 输入上限：min(monster 上限, deep+pinned)。
+        # deep 未执行时上限就是 monster_scan_cap（直接路径既有语义）。
+        if funnel_policy == "snapshot_funnel" and deep_stage_ran:
+            deep_plus_pinned = deep_selected_count + len(pinned_added_symbols)
+            effective_input_cap = (
+                min(monster_scan_cap, deep_plus_pinned)
+                if monster_scan_cap > 0
+                else deep_plus_pinned
+            )
+        else:
+            effective_input_cap = monster_scan_cap
         monster_scan_controls: dict[str, object] = {
             "cap": monster_scan_cap,
             "cap_applied": monster_scan_cap_applied,
@@ -1624,23 +1785,38 @@ class RuntimeWeek5Service:
             "selected_count": len(symbol_list),
             "dropped_count": max(0, original_monster_scan_count - len(symbol_list)),
             "ranking_mode": ranking_mode,
+            "selection_source": selection_source,
+            "effective_input_cap": effective_input_cap,
         }
         prefilter_report["monster_scan_controls"] = monster_scan_controls
 
         if not symbol_list:
+            # snapshot_funnel 的 deep 空回退 fail-closed 是有意的修复行为，
+            # 与普通空 watchlist 区分记录，便于现场归因。
+            empty_fail_closed = bool(
+                funnel_policy == "snapshot_funnel"
+                and deep_stage_ran
+                and deep_selected_count == 0
+            )
+            empty_reason = (
+                "snapshot_deep_empty_fail_closed" if empty_fail_closed else "empty_watchlist"
+            )
             empty_report = {
                 "timestamp": now.isoformat(),
                 "trace_id": "",
                 "watchlist_size": 0,
                 "symbol_source": symbol_source,
                 "scan_profile": scan_profile.strip() or "default",
+                "funnel_policy": funnel_policy,
                 "prefilter": prefilter_report,
+                "funnel": dict(funnel_report),
+                "monster_scan_controls": dict(monster_scan_controls),
                 "first_board": {"candidate_count": 0, "candidates": [], "leaders": []},
                 "signal_pool": {"candidate_count": 0, "candidates": []},
                 "anomalies": {"event_count": 0, "events": []},
                 "empty_signal": {
                     "triggered": True,
-                    "reasons": ["empty_watchlist"],
+                    "reasons": [empty_reason],
                     "no_buy_streak": 0,
                     "buy_signals": 0,
                     "drawdown_pct": 0.0,
@@ -1666,9 +1842,28 @@ class RuntimeWeek5Service:
             service._record_audit_event(
                 event_type="week5_scan",
                 level="warn",
-                payload={"watchlist_size": 0, "reason": "empty_watchlist"},
+                payload={"watchlist_size": 0, "reason": empty_reason},
             )
             return empty_report
+
+        if _progress is not None:
+            _progress.update(
+                phase="final_pipeline",
+                total=len(symbol_list),
+                current_symbol="",
+            )
+
+        def _pipeline_heartbeat(symbol: str, index: int, total: int, started: bool) -> None:
+            # final pipeline 单股开始/完成各更新一次（事件驱动，非周期心跳）：
+            # 单只耗时数分钟时通过 current_symbol 指示当前处理股票；若某只
+            # 股票长时间卡住，updated_at 不会继续刷新，这是已知语义边界。
+            if _progress is not None:
+                _progress.update(
+                    phase="final_pipeline",
+                    completed=index if started else index + 1,
+                    total=total,
+                    current_symbol=symbol,
+                )
 
         live_provider = service._select_provider(use_live_runtime=True)
         monster_report = service.run_pipeline(
@@ -1678,8 +1873,15 @@ class RuntimeWeek5Service:
             use_live_runtime=True,
             dry_run_execution=True,
             job_name="week5_scan_monster",
+            on_symbol_progress=_pipeline_heartbeat,
+            transform_max_workers=max(
+                1,
+                int(service._config.week5.final_pipeline_transform_max_workers),
+            ),
         )
         trace_id = str(monster_report.get("trace_id", ""))
+        if _progress is not None:
+            _progress.update(trace_id=trace_id)
         monster_runtime_payload: dict[str, object] = {}
         monster_runtime = monster_report.get("runtime")
         if isinstance(monster_runtime, dict):
@@ -1813,6 +2015,10 @@ class RuntimeWeek5Service:
                     }
                 )
 
+        if _progress is not None:
+            _progress.update(phase="first_board_anomaly")
+
+        first_board_anomaly_started = perf_counter()
         first_board_candidates: list[dict[str, object]] = []
         anomalies: list[dict[str, object]] = []
         for symbol in symbol_list:
@@ -1857,6 +2063,9 @@ class RuntimeWeek5Service:
             )
             if anomaly is not None:
                 anomalies.append(anomaly)
+        first_board_anomaly_ms = max(
+            1, int((perf_counter() - first_board_anomaly_started) * 1000)
+        )
 
         empty_signal = service._evaluate_empty_signal(monster_report=monster_report)
         isolation = service._monster_isolation_gate(
@@ -1957,10 +2166,14 @@ class RuntimeWeek5Service:
                         monster_runtime_payload.get("duration_ms"), default=0
                     ),
                     "symbols": len(symbol_list),
+                    **self._final_pipeline_timing_report(monster_runtime_payload),
+                },
+                "first_board_anomaly": {
+                    "duration_ms": first_board_anomaly_ms,
                 },
             },
             "funnel": {
-                "mode": "snapshot" if snapshot_mode else "direct",
+                **funnel_report,
                 "light_candidate_target": max(
                     1, int(service._config.week5.light_candidate_target)
                 ),
@@ -2151,6 +2364,42 @@ class RuntimeWeek5Service:
             )
 
         return report
+
+    @staticmethod
+    def _final_pipeline_timing_report(
+        runtime_payload: dict[str, object],
+    ) -> dict[str, object]:
+        """final pipeline 聚合子阶段耗时 + 最慢 5 只股票（Phase 1 可观测性）。"""
+        timing: dict[str, object] = {}
+        stage_ms = runtime_payload.get("pipeline_stage_ms")
+        if isinstance(stage_ms, dict):
+            for key in ("fetch_bars_ms", "feature_engine_ms", "inference_ms"):
+                timing[key] = _as_int(stage_ms.get(key), default=0)
+        parallel_transform = runtime_payload.get("pipeline_parallel_transform")
+        if isinstance(parallel_transform, dict):
+            timing["parallel_transform"] = dict(parallel_transform)
+        raw_symbol_ms = runtime_payload.get("pipeline_symbol_ms")
+        symbol_ms: list[dict[str, object]] = []
+        if isinstance(raw_symbol_ms, list):
+            for item in raw_symbol_ms:
+                if not isinstance(item, dict):
+                    continue
+                symbol = str(item.get("symbol", "")).strip()
+                if symbol:
+                    symbol_ms.append(
+                        {
+                            "symbol": symbol,
+                            "duration_ms": _as_int(item.get("duration_ms"), default=0),
+                        }
+                    )
+        symbol_ms.sort(
+            key=lambda item: (
+                -_as_int(item.get("duration_ms"), default=0),
+                str(item.get("symbol", "")),
+            )
+        )
+        timing["slowest_symbols"] = symbol_ms[:5]
+        return timing
 
     def _apply_execution_aware_rerank(
         self,
@@ -3077,6 +3326,97 @@ class RuntimeWeek5Service:
             return False
         windows = list(self._service._config.week5.first_board_windows)
         return _is_within_hhmm_windows(now=now, windows=windows)
+
+
+class Week5ScanProgress:
+    """Week5 扫描进度文件（原子 JSON 更新）。
+
+    字段固定为：trace_id / status / phase / started_at / updated_at /
+    elapsed_ms / completed / total / current_symbol / scan_profile /
+    funnel_policy；failed 终态追加受控 error_summary。
+    更新为事件驱动（阶段推进、单股开始/完成），不是周期心跳——单股长时间
+    卡住时 updated_at 不会刷新，current_symbol 标识当前处理对象。
+    任何写入失败都静默忽略——进度文件只是可观测性，不得影响扫描语义。
+    """
+
+    def __init__(self, *, service: Any, scan_profile: str) -> None:
+        raw_path = str(service._config.week5.scan_progress_path).strip()  # noqa: SLF001
+        self._path = (
+            Path(raw_path)
+            if raw_path
+            else Path("artifacts/runtime/week5_scan_progress.json")
+        )
+        self._scan_profile = scan_profile
+        self._started_at = datetime.now(UTC)
+        self._status = "running"
+        self._phase = "quality"
+        self._completed = 0
+        self._total = 0
+        self._current_symbol = ""
+        self._trace_id = ""
+        self._funnel_policy = ""
+        self._error_summary = ""
+        self._write()
+
+    def update(
+        self,
+        *,
+        phase: str | None = None,
+        status: str | None = None,
+        completed: int | None = None,
+        total: int | None = None,
+        current_symbol: str | None = None,
+        trace_id: str | None = None,
+        funnel_policy: str | None = None,
+    ) -> None:
+        if phase is not None:
+            self._phase = phase
+        if status is not None:
+            self._status = status
+        if completed is not None:
+            self._completed = completed
+        if total is not None:
+            self._total = total
+        if current_symbol is not None:
+            self._current_symbol = current_symbol
+        if trace_id is not None:
+            self._trace_id = trace_id
+        if funnel_policy is not None:
+            self._funnel_policy = funnel_policy
+        self._write()
+
+    def fail(self, *, error: Exception) -> None:
+        self._status = "failed"
+        self._error_summary = f"{type(error).__name__}: {str(error)[:300]}"
+        self._write()
+
+    def _write(self) -> None:
+        try:
+            updated_at = datetime.now(UTC)
+            payload: dict[str, object] = {
+                "trace_id": self._trace_id,
+                "status": self._status,
+                "phase": self._phase,
+                "started_at": self._started_at.isoformat(),
+                "updated_at": updated_at.isoformat(),
+                "elapsed_ms": int((updated_at - self._started_at).total_seconds() * 1000),
+                "completed": self._completed,
+                "total": self._total,
+                "current_symbol": self._current_symbol,
+                "scan_profile": self._scan_profile,
+                "funnel_policy": self._funnel_policy,
+            }
+            if self._status == "failed":
+                payload["error_summary"] = self._error_summary
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self._path.with_name(f"{self._path.name}.tmp")
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temporary.replace(self._path)
+        except Exception:
+            pass
 
 
 @lru_cache(maxsize=1)
