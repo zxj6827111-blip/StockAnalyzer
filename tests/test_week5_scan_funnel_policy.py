@@ -1024,6 +1024,70 @@ def test_week5_scan_light_records_iteration_equivalent(tmp_path: Path) -> None:
     assert _as_mapping(deep_stage)["selected_count"] == 3
 
 
+class _PositionPredictor:
+    """返回与输入行序一一对应的确定性概率，用于锁死 deep 位置映射。"""
+
+    def predict_rows(self, features: pd.DataFrame) -> dict[str, list[float]]:
+        n = len(features)
+        return {
+            "lgbm": [round(0.10 * (i + 1), 4) for i in range(n)],
+            "xgb": [round(0.20 * (i + 1), 4) for i in range(n)],
+            "meta": [round(0.15 * (i + 1), 4) for i in range(n)],
+        }
+
+
+def test_week5_scan_deep_position_map_equivalent(tmp_path: Path) -> None:
+    """7b：deep 用预构建位置映射替换 list(rows.index).index() 后，每只
+    symbol 命中的 lgbm/xgb/meta 必须与其在 rows 中的行序严格对齐（逐字段
+    等价），不受 frame 原始行序与 shortlist 顺序差异影响。"""
+    config = _load_test_config()
+    service = _new_service(config)
+    # 停用 model_registry，隔离 champion_auc 读取，专注位置映射本身。
+    _patch_attr(service, "_model_registry", None)
+    _patch_attr(service._pipeline, "_predictor", _PositionPredictor())
+
+    # frame 行序 = [000001, 000002, 000003]，索引故意非顺序（100/200/300），
+    # 以证明映射依据的是 index 标签而非 iterrows 遍历位置。
+    frame = pd.DataFrame(
+        {
+            "symbol": ["000001", "000002", "000003"],
+            "trade_date": ["2026-03-16"] * 3,
+            "f1": [1.0, 2.0, 3.0],
+            "f2": [4.0, 5.0, 6.0],
+        },
+        index=[100, 200, 300],
+    )
+    # shortlist 顺序与 frame 相反：000003（frame 第 3 行）排前，000001 排后。
+    light_report = {
+        "shortlisted": [
+            {"symbol": "000003", "baseline_score": 80.0},
+            {"symbol": "000001", "baseline_score": 70.0},
+        ]
+    }
+    report = _as_mapping(
+        service._deep_stage_from_snapshot(  # noqa: SLF001
+            frame=frame,
+            target=2,
+            light_report=light_report,
+        )
+    )
+    selected = _as_mapping_list(report["selected"])
+    by_symbol = {str(item["symbol"]): item for item in selected}
+
+    # rows = frame[isin(["000003","000001"])] 按 frame 行序 => [000001(idx100),
+    # 000003(idx300)]，故 position_by_index = {100:0, 300:1}：
+    #   000001 -> 位置 0 -> lgbm 0.10 / xgb 0.20 / meta 0.15
+    #   000003 -> 位置 1 -> lgbm 0.20 / xgb 0.40 / meta 0.30
+    assert by_symbol["000001"]["lgbm"] == 0.10
+    assert by_symbol["000001"]["xgb"] == 0.20
+    assert by_symbol["000001"]["meta"] == 0.15
+    assert by_symbol["000003"]["lgbm"] == 0.20
+    assert by_symbol["000003"]["xgb"] == 0.40
+    assert by_symbol["000003"]["meta"] == 0.30
+    # 排序键不变：funnel_score 更高的 000003 排在 000001 之前。
+    assert [str(item["symbol"]) for item in selected] == ["000003", "000001"]
+
+
 def test_week5_scan_post_scan_enrichment_reuses_bars(tmp_path: Path) -> None:
     """final pipeline 开启 post_scan_enrichment 后，first-board/anomaly 复用
     bars 尾部快照，不再对每只 symbol 二次 fetch_daily_bars。"""

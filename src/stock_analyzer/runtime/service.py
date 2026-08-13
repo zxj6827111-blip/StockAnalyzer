@@ -6190,7 +6190,10 @@ class StockAnalyzerService:
         cross_review_passed = 0
         # 预构建行位置映射：predict_rows 行序与 rows 输入行序严格一致，
         # 用 dict 查找替代循环内 list(rows.index).index 的 O(n²) 扫描。
-        position_by_index = {idx: position for position, idx in enumerate(rows.index)}
+        # setdefault 保证重复索引取首次命中，与旧 list.index() 行为完全一致。
+        position_by_index: dict[object, int] = {}
+        for position, idx in enumerate(rows.index):
+            position_by_index.setdefault(idx, position)
         for index, row in rows.iterrows():
             symbol = str(row.get("symbol", "")).strip()
             light = by_symbol.get(symbol)
