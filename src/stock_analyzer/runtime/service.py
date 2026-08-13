@@ -90,7 +90,7 @@ from stock_analyzer.models.registry import (
 from stock_analyzer.models.trainer import ModelTrainer
 from stock_analyzer.notify.channels import NotificationMessage
 from stock_analyzer.notify.filter import NotificationFilter, is_quiet_time
-from stock_analyzer.pipeline import AnalyzerPipeline
+from stock_analyzer.pipeline import AnalyzerPipeline, SymbolStageTiming
 from stock_analyzer.portfolio.book import PortfolioBook
 from stock_analyzer.research import (
     compute_daily_review_report,
@@ -3706,6 +3706,8 @@ class StockAnalyzerService:
         dry_run_execution: bool = False,
         notify_enabled: bool = True,
         job_name: str = "",
+        on_symbol_progress: Callable[[str, int, int, bool], None] | None = None,
+        transform_max_workers: int = 1,
     ) -> dict[str, object]:
         advisory_only_mode = bool(self._config.app.advisory_only)
         execution_dry_run = bool(dry_run_execution)
@@ -3767,6 +3769,8 @@ class StockAnalyzerService:
 
         pipeline_started = perf_counter()
         pipeline_stage_ms: dict[str, int] | None = None
+        pipeline_symbol_ms: list[SymbolStageTiming] | None = None
+        pipeline_parallel_transform: dict[str, object] | None = None
         if normalized_strategy == "multi":
             multi_payload = self._run_multi_strategy_pipeline(
                 symbols=symbol_list,
@@ -3798,8 +3802,14 @@ class StockAnalyzerService:
                 symbols=symbol_list,
                 strategy=normalized_strategy,
                 current_equity=equity,
+                on_symbol_progress=on_symbol_progress,
+                transform_max_workers=max(1, int(transform_max_workers)),
             )
             pipeline_stage_ms = getattr(pipeline, "_last_pipeline_stage_ms", None)
+            pipeline_symbol_ms = getattr(pipeline, "_last_symbol_stage_ms", None)
+            pipeline_parallel_transform = getattr(
+                pipeline, "_last_parallel_transform", None
+            )
             trace_id = report.trace_id
             timestamp = report.timestamp
             degraded_mode = report.degraded_mode
@@ -4080,6 +4090,12 @@ class StockAnalyzerService:
         }
         if pipeline_stage_ms is not None:
             runtime_payload["pipeline_stage_ms"] = pipeline_stage_ms
+        if pipeline_symbol_ms is not None:
+            runtime_payload["pipeline_symbol_ms"] = pipeline_symbol_ms
+        if pipeline_parallel_transform is not None:
+            runtime_payload["pipeline_parallel_transform"] = dict(
+                pipeline_parallel_transform
+            )
         payload["runtime"] = runtime_payload
         self._record_run_summary(
             report=payload,
@@ -6118,6 +6134,11 @@ class StockAnalyzerService:
                 "selected_count": 0,
                 "selected": [],
                 "cross_review_passed": 0,
+                # 诊断字段：区分"light 为空"与"deep 无入选项"，避免与
+                # "deep 未执行"混为同一种空结果。
+                "light_shortlist_count": 0,
+                "snapshot_match_rows": 0,
+                "model_prediction_degraded": False,
             }
         symbols = [
             str(item.get("symbol", "")).strip() for item in shortlisted if str(item.get("symbol"))
@@ -6217,6 +6238,11 @@ class StockAnalyzerService:
             "cross_review_passed": cross_review_passed,
             "selected_count": len(capped),
             "selected": capped,
+            # 诊断字段：light shortlist 数、快照匹配行数、模型预测是否降级
+            # （predictor 缺失或批量推理失败），用于区分三种"空结果"。
+            "light_shortlist_count": len(shortlisted),
+            "snapshot_match_rows": len(rows),
+            "model_prediction_degraded": probabilities is None,
         }
 
     def _final_signal_selector(

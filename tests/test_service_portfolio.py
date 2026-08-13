@@ -144,7 +144,16 @@ class _StaticPipeline:
         symbols: list[str],
         strategy: str = "trend",
         current_equity: float = 1.0,
+        on_symbol_progress: object | None = None,
+        transform_max_workers: int = 1,
     ) -> PipelineReport:
+        _ = (
+            symbols,
+            strategy,
+            current_equity,
+            on_symbol_progress,
+            transform_max_workers,
+        )
         return self._report
 
 
@@ -183,6 +192,10 @@ def test_service_pipeline_exposes_runtime_stage_metrics() -> None:
     assert isinstance(runtime["runtime_state_persist_reasons"], list)
     assert _as_int(runtime["runtime_state_persist_bytes"]) >= 0
     assert runtime["runtime_state_persist_enabled"] is False
+    parallel_transform = _as_mapping(runtime["pipeline_parallel_transform"])
+    assert parallel_transform["enabled"] is False
+    assert parallel_transform["configured_workers"] == 1
+    assert parallel_transform["submitted_count"] == 0
 
     events = _as_mapping_list(service.audit_events(limit=5)["events"])
     pipeline_events = [

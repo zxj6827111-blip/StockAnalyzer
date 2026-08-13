@@ -41,6 +41,37 @@ def _make_service(tmp_path: Path) -> tuple[StockAnalyzerService, Path]:
     return service, tmp_path / "features_light"
 
 
+def test_snapshot_publish_retries_transient_windows_permission_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """目录发布遇到瞬时 PermissionError 时有界重试，最终仍原子落盘。"""
+    import stock_analyzer.feature.snapshot as snapshot_module
+
+    root = tmp_path / "features_light"
+    original_replace = Path.replace
+    attempts = 0
+
+    def _flaky_replace(self: Path, target: Path) -> Path:
+        nonlocal attempts
+        if self.name.endswith(".staging"):
+            attempts += 1
+            if attempts < 3:
+                raise PermissionError("transient-directory-lock")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", _flaky_replace)
+    monkeypatch.setattr(snapshot_module, "sleep", lambda _seconds: None)
+    snapshot_module._publish_snapshot_dir(
+        root=root,
+        snapshot_id="snap_retry_test",
+        frame=pd.DataFrame([{"symbol": "600519", "score": 1.0}]),
+    )
+
+    assert attempts == 3
+    assert (root / "snap_retry_test" / "market_features.parquet").exists()
+    assert not (root / "snap_retry_test.staging").exists()
+
+
 def test_snapshot_build_skip_and_load(tmp_path: Path) -> None:
     service, root = _make_service(tmp_path)
     provider = SyntheticProvider(seed_offset=2026)

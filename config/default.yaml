@@ -318,6 +318,11 @@ week5:
   feature_snapshot_max_workers: 4
   feature_snapshot_batch_size: 20
   feature_snapshot_progress_path: "artifacts/runtime/feature_snapshot_progress.json"
+  # Week5 扫描进度文件：阶段推进 + final pipeline 单股心跳（原子 JSON 更新）。
+  scan_progress_path: "artifacts/runtime/week5_scan_progress.json"
+  # final pipeline 仅并行 FeatureEngineer.transform；provider、模型推理、
+  # 风控与落库仍按输入顺序留在主线程。容器同时限制 BLAS 内部线程。
+  final_pipeline_transform_max_workers: 4
   monster_scan_intraday_max_symbols: 15
   monster_scan_max_symbols: 120
   monster_scan_sla_target_ms: 900000

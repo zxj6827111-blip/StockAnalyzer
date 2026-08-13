@@ -111,6 +111,11 @@ def test_load_default_config_values(monkeypatch: MonkeyPatch) -> None:
         config.week5.feature_snapshot_progress_path
         == "artifacts/runtime/feature_snapshot_progress.json"
     )
+    assert (
+        config.week5.scan_progress_path
+        == "artifacts/runtime/week5_scan_progress.json"
+    )
+    assert config.week5.final_pipeline_transform_max_workers == 4
     assert config.week5.universe_quality_min_history_days == 60
     assert config.week5.universe_quality_min_avg_turnover_20 == 5_000_000.0
     assert config.week5.universe_quality_min_float_market_cap == 300_000_000.0
