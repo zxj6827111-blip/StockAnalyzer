@@ -510,11 +510,23 @@ def test_pipeline_records_per_stage_wall_clock_breakdown() -> None:
     pipeline = AnalyzerPipeline(config=config, provider=MinimalBarsProvider())
     _ = pipeline.run_once(symbols=["600000", "000001"], strategy="trend", current_equity=1.0)
     stages = pipeline._last_pipeline_stage_ms  # noqa: SLF001
-    assert set(stages.keys()) == {"fetch_bars_ms", "feature_engine_ms", "inference_ms"}
+    # 阶段细分计时（检查项 6）：旧三键仍在，新增 5 子阶段 + completed_count。
+    assert set(stages.keys()) == {
+        "fetch_bars_ms",
+        "feature_engine_ms",
+        "inference_ms",
+        "intraday_ms",
+        "market_context_ms",
+        "cross_review_ms",
+        "score_risk_ms",
+        "learning_persist_ms",
+        "completed_count",
+    }
     for value in stages.values():
         assert value >= 0
     # Two symbols were processed: per-symbol work must be aggregated, not reset.
     assert stages["fetch_bars_ms"] > 0
+    assert stages["completed_count"] == 2
 
 
 def test_pipeline_news_preview_returns_component_payload() -> None:

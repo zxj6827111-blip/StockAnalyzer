@@ -1354,9 +1354,12 @@ def _normalize_tushare_daily(
     )
     frame["background_data_source"] = f"tushare_pro_{mode}"
     frame["background_data_complete"] = False
+    # 与 background_adapter 分级口径一致：核心字段列字段名，可选字段
+    # 加 optional: 前缀；financing_balance 与 margin_financing_balance
+    # 共用同一来源，不重复列账。
     frame["background_missing_fields"] = (
-        "holder_count,block_trade_net,financing_balance,"
-        "margin_financing_balance,northbound_net,dragon_tiger_flag"
+        "block_trade_net,margin_financing_balance,northbound_net,"
+        "dragon_tiger_flag,optional:holder_count"
     )
     frame["background_as_of"] = ""
     frame["price_series_mode"] = mode

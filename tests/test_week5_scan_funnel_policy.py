@@ -17,12 +17,14 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import cast
 
+import pandas as pd
 import pytest
 
+from stock_analyzer.data.provider import SyntheticProvider
 from stock_analyzer.feature.snapshot import build_feature_snapshot
 from stock_analyzer.pipeline import AnalyzerPipeline
 from stock_analyzer.runtime.service import StockAnalyzerService
@@ -945,3 +947,310 @@ def test_week5_scan_blocked_report_carries_real_scan_profile_and_progress(
     )
     assert payload["status"] == "blocked"
     assert payload["scan_profile"] == "offhours_forced_full_deep"
+
+
+def test_week5_scan_final_pipeline_substage_timing_and_completed_count(
+    tmp_path: Path,
+) -> None:
+    """final pipeline 报告：pipeline_stage_ms 新增 5 子阶段 + completed_count
+    （Phase 1 收尾：细分计时下钻）。"""
+    candidates = ["600519", "000001", "601318", "000858", "600000", "300750"]
+    service = _prepare_snapshot_service(tmp_path, candidates=candidates, deep_target=5)
+    symbols_under_test: list[str] = []
+
+    def _fake_pipeline(**kwargs: object) -> dict[str, object]:
+        symbols = _as_text_list(cast(list, kwargs.get("symbols", [])))
+        symbols_under_test.extend(symbols)
+        return {
+            "trace_id": "substage-timing-trace",
+            "signals": [],
+            "risk": {"action": "monitor", "drawdown_pct": 0.0},
+            "runtime": {
+                "duration_ms": 3000,
+                "pipeline_stage_ms": {
+                    "fetch_bars_ms": 120,
+                    "feature_engine_ms": 2500,
+                    "inference_ms": 180,
+                    "intraday_ms": 400,
+                    "market_context_ms": 300,
+                    "cross_review_ms": 50,
+                    "score_risk_ms": 90,
+                    "learning_persist_ms": 60,
+                    "completed_count": len(symbols),
+                },
+                "pipeline_symbol_ms": [],
+                "pipeline_parallel_transform": {
+                    "enabled": False,
+                    "configured_workers": 1,
+                    "submitted_count": 0,
+                    "worker_count": 0,
+                    "worker_pids": [],
+                    "max_concurrency": 0,
+                    "wall_ms": 0,
+                    "worker_transform_ms": 0,
+                    "fallback_count": 0,
+                    "pool_fallback": False,
+                    "pool_error": "",
+                },
+            },
+        }
+
+    _patch_attr(service, "run_pipeline", _fake_pipeline)
+    report = _run_scan(service)
+
+    final_pipeline = _as_mapping(_as_mapping(report["scan_stages"])["final_pipeline"])
+    assert final_pipeline["intraday_ms"] == 400
+    assert final_pipeline["market_context_ms"] == 300
+    assert final_pipeline["cross_review_ms"] == 50
+    assert final_pipeline["score_risk_ms"] == 90
+    assert final_pipeline["learning_persist_ms"] == 60
+    assert final_pipeline["completed_count"] == len(symbols_under_test)
+
+
+def test_week5_scan_light_records_iteration_equivalent(tmp_path: Path) -> None:
+    """light 从 iterrows 改为 records 迭代后：deep 入选项/顺序与既有行为一致
+    （评分公式/排序键不变，逐字段等价）。"""
+    candidates = ["600519", "000001", "601318", "000858", "600000", "300750"]
+    service = _prepare_snapshot_service(tmp_path, candidates=candidates, deep_target=3)
+    report = _run_scan(service)
+
+    funnel = _as_mapping(report["funnel"])
+    assert funnel["policy"] == "snapshot_funnel"
+    assert funnel["deep_stage_ran"] is True
+    deep_stage = _as_mapping(_as_mapping(report["prefilter"])["deep_stage"])
+    # light 迭代方式不影响 deep 入选项数量与快照匹配行数。
+    assert _as_mapping(deep_stage)["light_shortlist_count"] > 0
+    assert _as_mapping(deep_stage)["snapshot_match_rows"] > 0
+    assert _as_mapping(deep_stage)["selected_count"] == 3
+
+
+class _PositionPredictor:
+    """返回与输入行序一一对应的确定性概率，用于锁死 deep 位置映射。"""
+
+    def predict_rows(self, features: pd.DataFrame) -> dict[str, list[float]]:
+        n = len(features)
+        return {
+            "lgbm": [round(0.10 * (i + 1), 4) for i in range(n)],
+            "xgb": [round(0.20 * (i + 1), 4) for i in range(n)],
+            "meta": [round(0.15 * (i + 1), 4) for i in range(n)],
+        }
+
+
+def test_week5_scan_deep_position_map_equivalent(tmp_path: Path) -> None:
+    """7b：deep 用预构建位置映射替换 list(rows.index).index() 后，每只
+    symbol 命中的 lgbm/xgb/meta 必须与其在 rows 中的行序严格对齐（逐字段
+    等价），不受 frame 原始行序与 shortlist 顺序差异影响。"""
+    config = _load_test_config()
+    service = _new_service(config)
+    # 停用 model_registry，隔离 champion_auc 读取，专注位置映射本身。
+    _patch_attr(service, "_model_registry", None)
+    _patch_attr(service._pipeline, "_predictor", _PositionPredictor())
+
+    # frame 行序 = [000001, 000002, 000003]，索引故意非顺序（100/200/300），
+    # 以证明映射依据的是 index 标签而非 iterrows 遍历位置。
+    frame = pd.DataFrame(
+        {
+            "symbol": ["000001", "000002", "000003"],
+            "trade_date": ["2026-03-16"] * 3,
+            "f1": [1.0, 2.0, 3.0],
+            "f2": [4.0, 5.0, 6.0],
+        },
+        index=[100, 200, 300],
+    )
+    # shortlist 顺序与 frame 相反：000003（frame 第 3 行）排前，000001 排后。
+    light_report = {
+        "shortlisted": [
+            {"symbol": "000003", "baseline_score": 80.0},
+            {"symbol": "000001", "baseline_score": 70.0},
+        ]
+    }
+    report = _as_mapping(
+        service._deep_stage_from_snapshot(  # noqa: SLF001
+            frame=frame,
+            target=2,
+            light_report=light_report,
+        )
+    )
+    selected = _as_mapping_list(report["selected"])
+    by_symbol = {str(item["symbol"]): item for item in selected}
+
+    # rows = frame[isin(["000003","000001"])] 按 frame 行序 => [000001(idx100),
+    # 000003(idx300)]，故 position_by_index = {100:0, 300:1}：
+    #   000001 -> 位置 0 -> lgbm 0.10 / xgb 0.20 / meta 0.15
+    #   000003 -> 位置 1 -> lgbm 0.20 / xgb 0.40 / meta 0.30
+    assert by_symbol["000001"]["lgbm"] == 0.10
+    assert by_symbol["000001"]["xgb"] == 0.20
+    assert by_symbol["000001"]["meta"] == 0.15
+    assert by_symbol["000003"]["lgbm"] == 0.20
+    assert by_symbol["000003"]["xgb"] == 0.40
+    assert by_symbol["000003"]["meta"] == 0.30
+    # 排序键不变：funnel_score 更高的 000003 排在 000001 之前。
+    assert [str(item["symbol"]) for item in selected] == ["000003", "000001"]
+
+
+def test_week5_scan_post_scan_enrichment_reuses_bars(tmp_path: Path) -> None:
+    """final pipeline 开启 post_scan_enrichment 后，first-board/anomaly 复用
+    bars 尾部快照，不再对每只 symbol 二次 fetch_daily_bars。"""
+    candidates = ["600519", "000001", "601318"]
+    service = _prepare_snapshot_service(tmp_path, candidates=candidates, deep_target=3)
+    fetched_extra: list[str] = []
+
+    _patch_attr(
+        service,
+        "_select_provider",
+        lambda **_: _FetchStub(service, fetched_extra),
+    )
+    _patch_attr(
+        service,
+        "run_pipeline",
+        _post_scan_pipeline_fake(candidates),
+    )
+
+    report = _run_scan(service)
+    assert str(report.get("status", "")) != "blocked_data_gate"
+    # first-board/anomaly 复用 enrich 数据：无额外 provider 拉取记录。
+    assert fetched_extra == []
+
+
+def test_week5_scan_post_scan_enrichment_fallback_fetches(tmp_path: Path) -> None:
+    """post_scan_enrichment 缺失（字段为空）时，first-board/anomaly 回退
+    live_provider 拉取（向后兼容）。"""
+    candidates = ["600519", "000001", "601318"]
+    service = _prepare_snapshot_service(tmp_path, candidates=candidates, deep_target=3)
+    fetched_extra: list[str] = []
+
+    _patch_attr(
+        service,
+        "_select_provider",
+        lambda **_: _FetchStub(service, fetched_extra),
+    )
+    _patch_attr(
+        service,
+        "run_pipeline",
+        _post_scan_pipeline_fake(candidates, include_enrichment=False),
+    )
+
+    report = _run_scan(service)
+    assert str(report.get("status", "")) != "blocked_data_gate"
+    # enrich 为空 => 回退拉取，每只 pipeline 输入 symbol 都被 fetch。
+    assert set(fetched_extra) == set(candidates)
+
+
+class _FetchStub:
+    def __init__(self, service: StockAnalyzerService, fetched: list[str]) -> None:
+        self._service = service
+        self._fetched = fetched
+
+    def fetch_daily_bars(self, symbol: str, lookback_days: int) -> object:
+        self._fetched.append(symbol)
+        return self._service._provider.fetch_daily_bars(  # noqa: SLF001
+            symbol=symbol,
+            lookback_days=lookback_days,
+        )
+
+
+def _post_scan_pipeline_fake(
+    candidates: list[str],
+    include_enrichment: bool = True,
+):
+    """构造带（或不带）post_scan_enrichment 的 signals，覆盖 first-board 的
+    复用与回退两条消费路径。"""
+    import json as _json
+
+    def _fake(**kwargs: object) -> dict[str, object]:
+        symbols = _as_text_list(cast(list, kwargs.get("symbols", [])))
+        rows = [
+            {
+                "date": f"2026-03-1{day}",
+                "open": 10.0 + day,
+                "high": 11.0 + day,
+                "low": 9.0 + day,
+                "close": 10.5 + day,
+                "turnover": 20_000_000.0 + day,
+            }
+            for day in range(1, 6)
+        ]
+        return {
+            "trace_id": "post-scan-trace",
+            "signals": [
+                {
+                    "symbol": symbol,
+                    "strategy": "monster",
+                    "score": 80.0,
+                    "grade": "A",
+                    "action": "buy",
+                    "target_position": 0.1,
+                    "probabilities": {"lgbm": 0.8, "xgb": 0.7, "meta": 0.75},
+                    "reasons": ["test"],
+                    "decision_trace": {},
+                    "post_scan_enrichment": (
+                        _json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
+                        if include_enrichment
+                        else ""
+                    ),
+                }
+                for symbol in symbols
+                if symbol in candidates
+            ],
+            "risk": {"action": "monitor", "drawdown_pct": 0.0},
+            "runtime": {"duration_ms": 1000},
+        }
+
+    return _fake
+
+
+class _GateDroppingProvider(SyntheticProvider):
+    """包装 SyntheticProvider：最新一根 daily bar 的 available_time 设为未来，
+    使 time-gate 丢弃最新行（模拟 realtime 决策时最新 bar 尚未可用）。
+    记录 gate 前的最新收盘，供 post_scan_enrichment 断言对比。"""
+
+    def __init__(self) -> None:
+        super().__init__(seed_offset=2027)
+        self.original_latest_close: dict[str, float] = {}
+
+    def fetch_daily_bars(
+        self,
+        symbol: str,
+        lookback_days: int = 120,
+        *,
+        end_date: object | None = None,
+    ) -> pd.DataFrame:
+        frame = super().fetch_daily_bars(
+            symbol=symbol,
+            lookback_days=lookback_days,
+            end_date=end_date,  # type: ignore[arg-type]
+        )
+        self.original_latest_close[symbol] = float(frame.iloc[-1]["close"])
+        times = pd.to_datetime(frame.index)
+        future = pd.Timestamp(datetime.now() + timedelta(days=1))
+        available = pd.Series(times, index=frame.index)
+        available.iloc[-1] = future
+        frame = frame.copy()
+        frame["available_time"] = available
+        return frame
+
+
+def test_post_scan_enrichment_uses_gate_pre_raw_bars() -> None:
+    """🟡 回归：time-gate 丢弃最新 bar 时，post_scan_enrichment 仍应反映
+    gate 前的原始最新收盘，而非 gate 后的倒数第二根（first-board/anomaly
+    依赖最新收盘判断涨停/跳空，不能用被丢行的 bars）。"""
+    config = _load_test_config()
+    service = _new_service(config)
+    pipeline = cast(AnalyzerPipeline, service._pipeline)
+    provider = _GateDroppingProvider()
+    pipeline._provider = provider  # noqa: SLF001
+
+    report = pipeline.run_once(
+        symbols=["600000"],
+        strategy="monster",
+        current_equity=1.0,
+        capture_post_scan_enrichment=True,
+    )
+
+    assert len(report.signals) == 1
+    enrich = report.signals[0].post_scan_enrichment
+    assert enrich
+    rows = json.loads(enrich)
+    assert isinstance(rows, list) and rows
+    # 反序列化后的最新收盘 == gate 前原始最新收盘（含被 time-gate 丢弃的行）。
+    assert float(rows[-1]["close"]) == pytest.approx(provider.original_latest_close["600000"])
