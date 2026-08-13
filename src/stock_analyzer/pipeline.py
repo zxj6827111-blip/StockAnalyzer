@@ -67,6 +67,10 @@ class SymbolTransformInputs(TypedDict):
     bars: pd.DataFrame
     bars_time_gate: dict[str, object]
     analysis_bars: pd.DataFrame
+    # time-gate 之前的原始 daily bars 尾部（未裁剪、未丢行）：仅主线程
+    # finalize 的 post_scan_enrichment 使用。first-board/anomaly 依赖最新
+    # 收盘/前收，不能使用被 time-gate 丢过行的 bars。
+    raw_bars: pd.DataFrame
     intraday_1m: pd.DataFrame
     intraday_5m: pd.DataFrame
     market_index: pd.DataFrame | None
@@ -324,6 +328,8 @@ class AnalyzerPipeline:
             "cross_review_ms": int(self._stage_ms_accum["cross_review_ms"]),
             "score_risk_ms": int(self._stage_ms_accum["score_risk_ms"]),
             "learning_persist_ms": int(self._stage_ms_accum["learning_persist_ms"]),
+            # 处理股票数（含 fail_signal，_process_symbol 对每只输入恒产出信号，
+            # 故等于输入 symbol 数，非"成功产出 buy 信号数"）。
             "completed_count": len(signals),
         }
         self._last_symbol_stage_ms = symbol_stage_ms
@@ -972,6 +978,17 @@ class AnalyzerPipeline:
                 None,
             )
         self._stage_ms_accum["fetch_bars_ms"] += (perf_counter() - start) * 1000.0
+        # time-gate 之前保留原始 daily bars 尾部：first-board/anomaly 依赖最新
+        # 收盘/前收，而 time-gate 可能丢弃最新一根（realtime 场景 decision_ts <=
+        # available_time）。尾部长度对齐 first_board_scan_lookback_days + 缓冲，
+        # 以控制 ProcessPool pickle 体积（当前 week5 monster 串行无此开销）。
+        try:
+            first_board_lookback = int(
+                self._config.evolution.universe_spec.first_board_scan_lookback_days
+            )
+        except AttributeError:
+            first_board_lookback = self._min_history_days
+        raw_bars = bars.tail(max(self._min_history_days + 40, first_board_lookback)).copy()
         bars, bars_time_gate = apply_time_invariants_to_frame(
             bars,
             decision_time=decision_time,
@@ -1034,6 +1051,7 @@ class AnalyzerPipeline:
                 "bars": bars,
                 "bars_time_gate": bars_time_gate,
                 "analysis_bars": analysis_bars,
+                "raw_bars": raw_bars,
                 "intraday_1m": intraday_1m,
                 "intraday_5m": intraday_5m,
                 "market_index": market_index,
@@ -1416,7 +1434,7 @@ class AnalyzerPipeline:
             reasons=reasons,
             decision_trace=decision_trace,
             post_scan_enrichment=(
-                self._serialize_post_scan_enrichment(analysis_bars)
+                self._serialize_post_scan_enrichment(inputs["raw_bars"])
                 if self._capture_post_scan_enrichment
                 else ""
             ),

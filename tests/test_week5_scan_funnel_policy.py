@@ -17,12 +17,14 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import cast
 
+import pandas as pd
 import pytest
 
+from stock_analyzer.data.provider import SyntheticProvider
 from stock_analyzer.feature.snapshot import build_feature_snapshot
 from stock_analyzer.pipeline import AnalyzerPipeline
 from stock_analyzer.runtime.service import StockAnalyzerService
@@ -1131,3 +1133,60 @@ def _post_scan_pipeline_fake(
         }
 
     return _fake
+
+
+class _GateDroppingProvider(SyntheticProvider):
+    """包装 SyntheticProvider：最新一根 daily bar 的 available_time 设为未来，
+    使 time-gate 丢弃最新行（模拟 realtime 决策时最新 bar 尚未可用）。
+    记录 gate 前的最新收盘，供 post_scan_enrichment 断言对比。"""
+
+    def __init__(self) -> None:
+        super().__init__(seed_offset=2027)
+        self.original_latest_close: dict[str, float] = {}
+
+    def fetch_daily_bars(
+        self,
+        symbol: str,
+        lookback_days: int = 120,
+        *,
+        end_date: object | None = None,
+    ) -> pd.DataFrame:
+        frame = super().fetch_daily_bars(
+            symbol=symbol,
+            lookback_days=lookback_days,
+            end_date=end_date,  # type: ignore[arg-type]
+        )
+        self.original_latest_close[symbol] = float(frame.iloc[-1]["close"])
+        times = pd.to_datetime(frame.index)
+        future = pd.Timestamp(datetime.now() + timedelta(days=1))
+        available = pd.Series(times, index=frame.index)
+        available.iloc[-1] = future
+        frame = frame.copy()
+        frame["available_time"] = available
+        return frame
+
+
+def test_post_scan_enrichment_uses_gate_pre_raw_bars() -> None:
+    """🟡 回归：time-gate 丢弃最新 bar 时，post_scan_enrichment 仍应反映
+    gate 前的原始最新收盘，而非 gate 后的倒数第二根（first-board/anomaly
+    依赖最新收盘判断涨停/跳空，不能用被丢行的 bars）。"""
+    config = _load_test_config()
+    service = _new_service(config)
+    pipeline = cast(AnalyzerPipeline, service._pipeline)
+    provider = _GateDroppingProvider()
+    pipeline._provider = provider  # noqa: SLF001
+
+    report = pipeline.run_once(
+        symbols=["600000"],
+        strategy="monster",
+        current_equity=1.0,
+        capture_post_scan_enrichment=True,
+    )
+
+    assert len(report.signals) == 1
+    enrich = report.signals[0].post_scan_enrichment
+    assert enrich
+    rows = json.loads(enrich)
+    assert isinstance(rows, list) and rows
+    # 反序列化后的最新收盘 == gate 前原始最新收盘（含被 time-gate 丢弃的行）。
+    assert float(rows[-1]["close"]) == pytest.approx(provider.original_latest_close["600000"])
