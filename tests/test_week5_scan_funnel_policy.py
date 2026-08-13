@@ -945,3 +945,189 @@ def test_week5_scan_blocked_report_carries_real_scan_profile_and_progress(
     )
     assert payload["status"] == "blocked"
     assert payload["scan_profile"] == "offhours_forced_full_deep"
+
+
+def test_week5_scan_final_pipeline_substage_timing_and_completed_count(
+    tmp_path: Path,
+) -> None:
+    """final pipeline 报告：pipeline_stage_ms 新增 5 子阶段 + completed_count
+    （Phase 1 收尾：细分计时下钻）。"""
+    candidates = ["600519", "000001", "601318", "000858", "600000", "300750"]
+    service = _prepare_snapshot_service(tmp_path, candidates=candidates, deep_target=5)
+    symbols_under_test: list[str] = []
+
+    def _fake_pipeline(**kwargs: object) -> dict[str, object]:
+        symbols = _as_text_list(cast(list, kwargs.get("symbols", [])))
+        symbols_under_test.extend(symbols)
+        return {
+            "trace_id": "substage-timing-trace",
+            "signals": [],
+            "risk": {"action": "monitor", "drawdown_pct": 0.0},
+            "runtime": {
+                "duration_ms": 3000,
+                "pipeline_stage_ms": {
+                    "fetch_bars_ms": 120,
+                    "feature_engine_ms": 2500,
+                    "inference_ms": 180,
+                    "intraday_ms": 400,
+                    "market_context_ms": 300,
+                    "cross_review_ms": 50,
+                    "score_risk_ms": 90,
+                    "learning_persist_ms": 60,
+                    "completed_count": len(symbols),
+                },
+                "pipeline_symbol_ms": [],
+                "pipeline_parallel_transform": {
+                    "enabled": False,
+                    "configured_workers": 1,
+                    "submitted_count": 0,
+                    "worker_count": 0,
+                    "worker_pids": [],
+                    "max_concurrency": 0,
+                    "wall_ms": 0,
+                    "worker_transform_ms": 0,
+                    "fallback_count": 0,
+                    "pool_fallback": False,
+                    "pool_error": "",
+                },
+            },
+        }
+
+    _patch_attr(service, "run_pipeline", _fake_pipeline)
+    report = _run_scan(service)
+
+    final_pipeline = _as_mapping(_as_mapping(report["scan_stages"])["final_pipeline"])
+    assert final_pipeline["intraday_ms"] == 400
+    assert final_pipeline["market_context_ms"] == 300
+    assert final_pipeline["cross_review_ms"] == 50
+    assert final_pipeline["score_risk_ms"] == 90
+    assert final_pipeline["learning_persist_ms"] == 60
+    assert final_pipeline["completed_count"] == len(symbols_under_test)
+
+
+def test_week5_scan_light_records_iteration_equivalent(tmp_path: Path) -> None:
+    """light 从 iterrows 改为 records 迭代后：deep 入选项/顺序与既有行为一致
+    （评分公式/排序键不变，逐字段等价）。"""
+    candidates = ["600519", "000001", "601318", "000858", "600000", "300750"]
+    service = _prepare_snapshot_service(tmp_path, candidates=candidates, deep_target=3)
+    report = _run_scan(service)
+
+    funnel = _as_mapping(report["funnel"])
+    assert funnel["policy"] == "snapshot_funnel"
+    assert funnel["deep_stage_ran"] is True
+    deep_stage = _as_mapping(_as_mapping(report["prefilter"])["deep_stage"])
+    # light 迭代方式不影响 deep 入选项数量与快照匹配行数。
+    assert _as_mapping(deep_stage)["light_shortlist_count"] > 0
+    assert _as_mapping(deep_stage)["snapshot_match_rows"] > 0
+    assert _as_mapping(deep_stage)["selected_count"] == 3
+
+
+def test_week5_scan_post_scan_enrichment_reuses_bars(tmp_path: Path) -> None:
+    """final pipeline 开启 post_scan_enrichment 后，first-board/anomaly 复用
+    bars 尾部快照，不再对每只 symbol 二次 fetch_daily_bars。"""
+    candidates = ["600519", "000001", "601318"]
+    service = _prepare_snapshot_service(tmp_path, candidates=candidates, deep_target=3)
+    fetched_extra: list[str] = []
+
+    _patch_attr(
+        service,
+        "_select_provider",
+        lambda **_: _FetchStub(service, fetched_extra),
+    )
+    _patch_attr(
+        service,
+        "run_pipeline",
+        _post_scan_pipeline_fake(candidates),
+    )
+
+    report = _run_scan(service)
+    assert str(report.get("status", "")) != "blocked_data_gate"
+    # first-board/anomaly 复用 enrich 数据：无额外 provider 拉取记录。
+    assert fetched_extra == []
+
+
+def test_week5_scan_post_scan_enrichment_fallback_fetches(tmp_path: Path) -> None:
+    """post_scan_enrichment 缺失（字段为空）时，first-board/anomaly 回退
+    live_provider 拉取（向后兼容）。"""
+    candidates = ["600519", "000001", "601318"]
+    service = _prepare_snapshot_service(tmp_path, candidates=candidates, deep_target=3)
+    fetched_extra: list[str] = []
+
+    _patch_attr(
+        service,
+        "_select_provider",
+        lambda **_: _FetchStub(service, fetched_extra),
+    )
+    _patch_attr(
+        service,
+        "run_pipeline",
+        _post_scan_pipeline_fake(candidates, include_enrichment=False),
+    )
+
+    report = _run_scan(service)
+    assert str(report.get("status", "")) != "blocked_data_gate"
+    # enrich 为空 => 回退拉取，每只 pipeline 输入 symbol 都被 fetch。
+    assert set(fetched_extra) == set(candidates)
+
+
+class _FetchStub:
+    def __init__(self, service: StockAnalyzerService, fetched: list[str]) -> None:
+        self._service = service
+        self._fetched = fetched
+
+    def fetch_daily_bars(self, symbol: str, lookback_days: int) -> object:
+        self._fetched.append(symbol)
+        return self._service._provider.fetch_daily_bars(  # noqa: SLF001
+            symbol=symbol,
+            lookback_days=lookback_days,
+        )
+
+
+def _post_scan_pipeline_fake(
+    candidates: list[str],
+    include_enrichment: bool = True,
+):
+    """构造带（或不带）post_scan_enrichment 的 signals，覆盖 first-board 的
+    复用与回退两条消费路径。"""
+    import json as _json
+
+    def _fake(**kwargs: object) -> dict[str, object]:
+        symbols = _as_text_list(cast(list, kwargs.get("symbols", [])))
+        rows = [
+            {
+                "date": f"2026-03-1{day}",
+                "open": 10.0 + day,
+                "high": 11.0 + day,
+                "low": 9.0 + day,
+                "close": 10.5 + day,
+                "turnover": 20_000_000.0 + day,
+            }
+            for day in range(1, 6)
+        ]
+        return {
+            "trace_id": "post-scan-trace",
+            "signals": [
+                {
+                    "symbol": symbol,
+                    "strategy": "monster",
+                    "score": 80.0,
+                    "grade": "A",
+                    "action": "buy",
+                    "target_position": 0.1,
+                    "probabilities": {"lgbm": 0.8, "xgb": 0.7, "meta": 0.75},
+                    "reasons": ["test"],
+                    "decision_trace": {},
+                    "post_scan_enrichment": (
+                        _json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
+                        if include_enrichment
+                        else ""
+                    ),
+                }
+                for symbol in symbols
+                if symbol in candidates
+            ],
+            "risk": {"action": "monitor", "drawdown_pct": 0.0},
+            "runtime": {"duration_ms": 1000},
+        }
+
+    return _fake

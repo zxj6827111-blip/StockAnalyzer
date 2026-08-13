@@ -82,6 +82,21 @@ class AkshareBackgroundAdapter:
             if token
         ]
         source_text = ",".join(sorted(set(source_tokens)))
+        # 分级完整性：核心字段（大宗/两融/北向/龙虎榜）齐全才置 True；可选
+        # 字段（holder_count）缺失不翻转 complete，仅记入分级 missing 清单。
+        # 核心缺失清单列字段名，可选缺失加 "optional:" 前缀，供审计区分。
+        core_source_map = [
+            ("block_trade_net", block_source),
+            ("margin_financing_balance", financing_source),
+            ("northbound_net", northbound_source),
+            ("dragon_tiger_flag", dragon_source),
+        ]
+        missing_core = [name for name, token in core_source_map if not token]
+        missing_optional = [] if holder_source else ["holder_count"]
+        background_missing_fields = ",".join(
+            [*missing_core, *(f"optional:{name}" for name in missing_optional)]
+        )
+        background_data_complete = not missing_core
         background = pd.DataFrame(
             {
                 "holder_count": holder_series.reindex(index).ffill(),
@@ -91,7 +106,8 @@ class AkshareBackgroundAdapter:
                 "northbound_net": northbound_series.reindex(index).fillna(0.0),
                 "dragon_tiger_flag": dragon_series.reindex(index).fillna(0.0),
                 "background_data_source": source_text,
-                "background_data_complete": bool(source_tokens),
+                "background_data_complete": background_data_complete,
+                "background_missing_fields": background_missing_fields,
             },
             index=index,
         )
@@ -238,6 +254,10 @@ def _empty_background(index: pd.Index) -> pd.DataFrame:
             "dragon_tiger_flag": 0.0,
             "background_data_source": "",
             "background_data_complete": False,
+            "background_missing_fields": (
+                "block_trade_net,margin_financing_balance,"
+                "northbound_net,dragon_tiger_flag,optional:holder_count"
+            ),
         },
         index=index,
     )

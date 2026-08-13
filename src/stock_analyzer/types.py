@@ -56,6 +56,10 @@ class PipelineSignal:
     probabilities: dict[str, float]
     reasons: list[str] = field(default_factory=list)
     decision_trace: dict[str, object] = field(default_factory=dict)
+    # 后处理富集快照：pipeline 开关开启时序列化的 bars 尾部 JSON（紧凑
+    # [{date,open,high,low,close,turnover},...]），供 first-board/anomaly
+    # 复用，避免二次 fetch_daily_bars。默认空串 = 未捕获，消费方回退拉取。
+    post_scan_enrichment: str = ""
 
 
 @dataclass(slots=True)

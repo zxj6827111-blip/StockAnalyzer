@@ -1878,6 +1878,9 @@ class RuntimeWeek5Service:
                 1,
                 int(service._config.week5.final_pipeline_transform_max_workers),
             ),
+            # 捕获每只股票的 bars 尾部快照，first-board/anomaly 直接复用，
+            # 不再对每只 symbol 二次 fetch_daily_bars。
+            capture_post_scan_enrichment=True,
         )
         trace_id = str(monster_report.get("trace_id", ""))
         if _progress is not None:
@@ -2022,20 +2025,30 @@ class RuntimeWeek5Service:
         first_board_candidates: list[dict[str, object]] = []
         anomalies: list[dict[str, object]] = []
         for symbol in symbol_list:
-            try:
-                bars = live_provider.fetch_daily_bars(
-                    symbol=symbol,
-                    lookback_days=first_board_scan_lookback_days,
-                )
-            except Exception as exc:
-                anomalies.append(
-                    {
-                        "symbol": symbol,
-                        "types": ["data_source_error"],
-                        "detail": str(exc),
-                    }
-                )
-                continue
+            signal = signal_map.get(symbol, {})
+            # 优先复用 pipeline 已捕获的 post_scan_enrichment（bars 尾部快照），
+            # 避免对每只 symbol 二次 fetch_daily_bars；字段为空/不可解析时
+            # 回退 live_provider 拉取（向后兼容）。
+            bars = _bars_from_post_scan_enrichment(
+                str(signal.get("post_scan_enrichment", "")).strip()
+                if isinstance(signal, dict)
+                else ""
+            )
+            if bars is None:
+                try:
+                    bars = live_provider.fetch_daily_bars(
+                        symbol=symbol,
+                        lookback_days=first_board_scan_lookback_days,
+                    )
+                except Exception as exc:
+                    anomalies.append(
+                        {
+                            "symbol": symbol,
+                            "types": ["data_source_error"],
+                            "detail": str(exc),
+                        }
+                    )
+                    continue
             if len(bars) < min_history_days:
                 anomalies.append(
                     {
@@ -2048,7 +2061,6 @@ class RuntimeWeek5Service:
                 continue
             if len(bars) < 2:
                 continue
-            signal = signal_map.get(symbol, {})
             candidate = service._build_first_board_candidate(
                 symbol=symbol,
                 bars=bars,
@@ -2373,7 +2385,19 @@ class RuntimeWeek5Service:
         timing: dict[str, object] = {}
         stage_ms = runtime_payload.get("pipeline_stage_ms")
         if isinstance(stage_ms, dict):
-            for key in ("fetch_bars_ms", "feature_engine_ms", "inference_ms"):
+            for key in (
+                "fetch_bars_ms",
+                "feature_engine_ms",
+                "inference_ms",
+                # 子阶段细分：intraday/market-context 已含在 feature_engine_ms
+                # 桶内，此处并列展示供耗时下钻。
+                "intraday_ms",
+                "market_context_ms",
+                "cross_review_ms",
+                "score_risk_ms",
+                "learning_persist_ms",
+                "completed_count",
+            ):
                 timing[key] = _as_int(stage_ms.get(key), default=0)
         parallel_transform = runtime_payload.get("pipeline_parallel_transform")
         if isinstance(parallel_transform, dict):
@@ -3541,6 +3565,32 @@ def _dict_list(value: object) -> list[dict[str, object]]:
     if not isinstance(value, list):
         return []
     return [cast(dict[str, object], item) for item in value if isinstance(item, dict)]
+
+
+def _bars_from_post_scan_enrichment(enrich: str) -> pd.DataFrame | None:
+    """反序列化 post_scan_enrichment JSON 为 bars DataFrame。
+
+    返回的行序与序列化时一致（时间正序，末行为最新）；任一解析失败返回
+    None，由调用方回退 live_provider 拉取，绝不抛错影响扫描语义。
+    """
+    if not enrich:
+        return None
+    try:
+        rows = json.loads(enrich)
+    except Exception:
+        return None
+    if not isinstance(rows, list) or not rows:
+        return None
+    try:
+        frame = pd.DataFrame(rows)
+    except Exception:
+        return None
+    if frame.empty:
+        return None
+    for column in ("open", "high", "low", "close", "turnover"):
+        if column not in frame.columns:
+            return None
+    return frame
 
 
 def _number_list(value: object) -> list[float]:

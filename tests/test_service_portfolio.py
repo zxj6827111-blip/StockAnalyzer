@@ -146,6 +146,7 @@ class _StaticPipeline:
         current_equity: float = 1.0,
         on_symbol_progress: object | None = None,
         transform_max_workers: int = 1,
+        capture_post_scan_enrichment: bool = False,
     ) -> PipelineReport:
         _ = (
             symbols,
@@ -153,6 +154,7 @@ class _StaticPipeline:
             current_equity,
             on_symbol_progress,
             transform_max_workers,
+            capture_post_scan_enrichment,
         )
         return self._report
 

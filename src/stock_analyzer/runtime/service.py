@@ -3708,6 +3708,7 @@ class StockAnalyzerService:
         job_name: str = "",
         on_symbol_progress: Callable[[str, int, int, bool], None] | None = None,
         transform_max_workers: int = 1,
+        capture_post_scan_enrichment: bool = False,
     ) -> dict[str, object]:
         advisory_only_mode = bool(self._config.app.advisory_only)
         execution_dry_run = bool(dry_run_execution)
@@ -3804,6 +3805,7 @@ class StockAnalyzerService:
                 current_equity=equity,
                 on_symbol_progress=on_symbol_progress,
                 transform_max_workers=max(1, int(transform_max_workers)),
+                capture_post_scan_enrichment=capture_post_scan_enrichment,
             )
             pipeline_stage_ms = getattr(pipeline, "_last_pipeline_stage_ms", None)
             pipeline_symbol_ms = getattr(pipeline, "_last_symbol_stage_ms", None)
@@ -5904,7 +5906,9 @@ class StockAnalyzerService:
         identically.
         """
         try:
-            data = pd.Series(row) if not isinstance(row, pd.Series) else row
+            # dict 直达（light 阶段以 records 迭代），非 dict 才包 Series，
+            # 避免每行重建 pd.Series 的开销。
+            data = row if isinstance(row, dict) else pd.Series(row)
         except Exception:
             return None
         symbol = str(data.get("symbol", "")).strip()
@@ -6087,7 +6091,9 @@ class StockAnalyzerService:
         """Funnel light stage: rank the snapshot universe by baseline score."""
         candidates: list[dict[str, object]] = []
         skipped = 0
-        for _, row in frame.iterrows():
+        # records 顺序稳定迭代（DataFrame 行序），dict 直达避免 iterrows 的
+        # 每行 pd.Series 装箱开销；评分公式/舍入/排序键与旧实现完全一致。
+        for row in frame.to_dict("records"):
             candidate = self._prefilter_week5_from_snapshot_row(row)
             if candidate is None:
                 skipped += 1
@@ -6182,6 +6188,9 @@ class StockAnalyzerService:
 
         selected: list[dict[str, object]] = []
         cross_review_passed = 0
+        # 预构建行位置映射：predict_rows 行序与 rows 输入行序严格一致，
+        # 用 dict 查找替代循环内 list(rows.index).index 的 O(n²) 扫描。
+        position_by_index = {idx: position for position, idx in enumerate(rows.index)}
         for index, row in rows.iterrows():
             symbol = str(row.get("symbol", "")).strip()
             light = by_symbol.get(symbol)
@@ -6189,7 +6198,7 @@ class StockAnalyzerService:
                 continue
             lgbm = xgb = meta = 0.5
             if probabilities is not None:
-                position = list(rows.index).index(index)
+                position = position_by_index[index]
                 lgbm = float(probabilities["lgbm"][position])
                 xgb = float(probabilities["xgb"][position])
                 meta = float(probabilities["meta"][position])

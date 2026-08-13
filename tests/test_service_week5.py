@@ -4279,7 +4279,20 @@ def test_service_run_pipeline_reports_pipeline_stage_ms() -> None:
     )
     runtime = _as_mapping(payload["runtime"])
     stages = _as_mapping(runtime["pipeline_stage_ms"])
-    assert set(stages.keys()) == {"fetch_bars_ms", "feature_engine_ms", "inference_ms"}
+    # Phase 1 收尾：细分计时新增 5 子阶段 + completed_count（并列增量，
+    # 旧三键仍在）。
+    assert set(stages.keys()) == {
+        "fetch_bars_ms",
+        "feature_engine_ms",
+        "inference_ms",
+        "intraday_ms",
+        "market_context_ms",
+        "cross_review_ms",
+        "score_risk_ms",
+        "learning_persist_ms",
+        "completed_count",
+    }
     assert _as_int(stages["fetch_bars_ms"]) >= 0
     assert _as_int(stages["feature_engine_ms"]) >= 0
     assert _as_int(stages["inference_ms"]) >= 0
+    assert _as_int(stages["completed_count"]) == 1

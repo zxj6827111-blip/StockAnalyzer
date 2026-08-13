@@ -181,14 +181,29 @@ class AnalyzerPipeline:
             "fetch_bars_ms": 0.0,
             "feature_engine_ms": 0.0,
             "inference_ms": 0.0,
+            # 子阶段细分计时：intraday/market-context 已含在 feature_engine_ms
+            # 桶内（feature_prepare_ms 汇总），此处并列增量供报告下钻。
+            "intraday_ms": 0.0,
+            "market_context_ms": 0.0,
+            "cross_review_ms": 0.0,
+            "score_risk_ms": 0.0,
+            "learning_persist_ms": 0.0,
         }
         self._last_pipeline_stage_ms: dict[str, int] = {
             "fetch_bars_ms": 0,
             "feature_engine_ms": 0,
             "inference_ms": 0,
+            "intraday_ms": 0,
+            "market_context_ms": 0,
+            "cross_review_ms": 0,
+            "score_risk_ms": 0,
+            "learning_persist_ms": 0,
+            "completed_count": 0,
         }
         # 最近一次 run_once 的逐股耗时（输入顺序），供报告最慢股票列表。
         self._last_symbol_stage_ms: list[SymbolStageTiming] = []
+        # post_scan_enrichment 捕获开关（默认关闭，week5 monster 扫描显式开启）。
+        self._capture_post_scan_enrichment = False
         self._last_parallel_transform: dict[str, object] = {
             "enabled": False,
             "configured_workers": 1,
@@ -238,13 +253,22 @@ class AnalyzerPipeline:
         current_equity: float = 1.0,
         on_symbol_progress: Callable[[str, int, int, bool], None] | None = None,
         transform_max_workers: int = 1,
+        capture_post_scan_enrichment: bool = False,
     ) -> PipelineReport:
         trace_id = uuid4().hex[:16]
         signals: list[PipelineSignal] = []
+        # 本次运行是否捕获 post_scan_enrichment（first-board/anomaly 复用 bars，
+        # 避免二次拉取）。通用路径默认关闭，week5 monster 扫描显式开启。
+        self._capture_post_scan_enrichment = bool(capture_post_scan_enrichment)
         self._stage_ms_accum = {
             "fetch_bars_ms": 0.0,
             "feature_engine_ms": 0.0,
             "inference_ms": 0.0,
+            "intraday_ms": 0.0,
+            "market_context_ms": 0.0,
+            "cross_review_ms": 0.0,
+            "score_risk_ms": 0.0,
+            "learning_persist_ms": 0.0,
         }
         symbol_stage_ms: list[SymbolStageTiming] = []
         total = len(symbols)
@@ -295,6 +319,12 @@ class AnalyzerPipeline:
             "fetch_bars_ms": int(self._stage_ms_accum["fetch_bars_ms"]),
             "feature_engine_ms": int(self._stage_ms_accum["feature_engine_ms"]),
             "inference_ms": int(self._stage_ms_accum["inference_ms"]),
+            "intraday_ms": int(self._stage_ms_accum["intraday_ms"]),
+            "market_context_ms": int(self._stage_ms_accum["market_context_ms"]),
+            "cross_review_ms": int(self._stage_ms_accum["cross_review_ms"]),
+            "score_risk_ms": int(self._stage_ms_accum["score_risk_ms"]),
+            "learning_persist_ms": int(self._stage_ms_accum["learning_persist_ms"]),
+            "completed_count": len(signals),
         }
         self._last_symbol_stage_ms = symbol_stage_ms
 
@@ -981,11 +1011,17 @@ class AnalyzerPipeline:
         analysis_bars = self._clip_signal_analysis_bars(bars)
 
         feature_prepare_started = perf_counter()
+        intraday_started = perf_counter()
         intraday_1m, intraday_5m = self._fetch_intraday_summaries(
             symbol=symbol,
             lookback_days=max(120, len(analysis_bars) + 5),
         )
+        self._stage_ms_accum["intraday_ms"] += (perf_counter() - intraday_started) * 1000.0
+        market_context_started = perf_counter()
         market_index = self._maybe_build_market_index(analysis_bars)
+        self._stage_ms_accum["market_context_ms"] += (
+            perf_counter() - market_context_started
+        ) * 1000.0
         feature_prepare_ms = (perf_counter() - feature_prepare_started) * 1000.0
         provider_status = dict(self.provider_status())
         return (
@@ -1133,6 +1169,7 @@ class AnalyzerPipeline:
             except Exception:
                 dynamic_history = None
         champion_auc = self._active_champion_auc()
+        cross_review_started = perf_counter()
         cross_review = evaluate_cross_review(
             lgbm_prob=probabilities["lgbm"],
             xgb_prob=probabilities["xgb"],
@@ -1141,6 +1178,8 @@ class AnalyzerPipeline:
             champion_auc=champion_auc,
             dynamic_history=dynamic_history,
         )
+        self._stage_ms_accum["cross_review_ms"] += (perf_counter() - cross_review_started) * 1000.0
+        score_risk_started = perf_counter()
         news_value, news_available = self._score_news_component(
             symbol=symbol,
             bars=analysis_bars,
@@ -1214,6 +1253,7 @@ class AnalyzerPipeline:
             soft_degraded_mode=bool(provider_status.get("soft_degraded_mode", False)),
         )
         risk_status = self._risk_controller.evaluate(current_equity=current_equity)
+        self._stage_ms_accum["score_risk_ms"] += (perf_counter() - score_risk_started) * 1000.0
 
         decision = self._strategy.recommend(
             scored=scored,
@@ -1348,6 +1388,7 @@ class AnalyzerPipeline:
             },
         }
 
+        learning_persist_started = perf_counter()
         learning_protocol_ref = self._persist_learning_snapshot(
             symbol=symbol,
             strategy=strategy,
@@ -1358,6 +1399,9 @@ class AnalyzerPipeline:
             risk_status=risk_status,
             decision_trace=decision_trace,
         )
+        self._stage_ms_accum["learning_persist_ms"] += (
+            perf_counter() - learning_persist_started
+        ) * 1000.0
         if learning_protocol_ref:
             decision_trace["learning_protocol"] = learning_protocol_ref
 
@@ -1371,7 +1415,50 @@ class AnalyzerPipeline:
             probabilities={key: round(value, 4) for key, value in probabilities.items()},
             reasons=reasons,
             decision_trace=decision_trace,
+            post_scan_enrichment=(
+                self._serialize_post_scan_enrichment(analysis_bars)
+                if self._capture_post_scan_enrichment
+                else ""
+            ),
         )
+
+    def _serialize_post_scan_enrichment(self, bars: pd.DataFrame) -> str:
+        """序列化 analysis_bars 尾部为紧凑 JSON（供 first-board/anomaly 复用）。
+
+        覆盖 first_board_scan_lookback_days（默认 40）+ 缓冲；只保留 K 线/成交
+        所需列；任一列缺失或异常都回退空串，由消费方兜底重新拉取，绝不抛错。
+        """
+        try:
+            if bars is None or len(bars) == 0:
+                return ""
+            ordered = bars if bars.index.is_monotonic_increasing else bars.sort_index()
+            try:
+                first_board_lookback = int(
+                    self._config.evolution.universe_spec.first_board_scan_lookback_days
+                )
+            except AttributeError:
+                first_board_lookback = 40
+            tail = ordered.tail(max(first_board_lookback, 40))
+            rows: list[dict[str, object]] = []
+            for index, row in tail.iterrows():
+                try:
+                    rows.append(
+                        {
+                            "date": str(row.get("date", index)),
+                            "open": _as_float(row.get("open"), default=0.0),
+                            "high": _as_float(row.get("high"), default=0.0),
+                            "low": _as_float(row.get("low"), default=0.0),
+                            "close": _as_float(row.get("close"), default=0.0),
+                            "turnover": _as_float(row.get("turnover"), default=0.0),
+                        }
+                    )
+                except Exception:
+                    continue
+            if not rows:
+                return ""
+            return json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
+        except Exception:
+            return ""
 
     def _persist_learning_snapshot(
         self,
