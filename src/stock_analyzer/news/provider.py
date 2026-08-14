@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from math import isfinite
 from pathlib import Path
@@ -11,6 +12,25 @@ from typing import Any
 import pandas as pd
 
 from stock_analyzer.evolution.modules.m7_news_loader import load_m7_news_records
+
+
+@dataclass(slots=True)
+class NewsRiskDecision:
+    """结构化新闻风险判定（PLAN P2-2）。
+
+    单一 float 新闻分数升级为结构化决策：无个股证据时明确返回
+    ``available_for_symbol=False``（score=None），不再回退全市场均值。
+    ``hard_veto`` 仅在负面且置信度达标时为 True（LLM 不得单独执行硬否决，
+    本字段只作证据输出，决策由 news_risk_mode 门消费）。
+    """
+
+    score: float | None
+    available_for_symbol: bool
+    hard_veto: bool
+    max_negative_confidence: float
+    matched_event_ids: list[str] = field(default_factory=list)
+    freshness: dict[str, object] = field(default_factory=dict)
+    reasons: list[str] = field(default_factory=list)
 
 
 class ArtifactNewsSignalProvider:
@@ -50,7 +70,6 @@ class ArtifactNewsSignalProvider:
         now = _ensure_utc(self._now_func())
         normalized_symbol = _normalize_symbol(symbol)
         symbol_scores: list[tuple[float, float]] = []
-        market_scores: list[tuple[float, float]] = []
         for record in records:
             sentiment = _extract_sentiment(record)
             if sentiment is None:
@@ -72,22 +91,122 @@ class ArtifactNewsSignalProvider:
             weight = confidence * recency_weight
             if weight <= 0:
                 continue
-            market_scores.append((score, weight))
             symbols = _extract_symbols(record)
             if normalized_symbol and normalized_symbol in symbols:
                 symbol_scores.append((score, weight))
 
-        candidates = symbol_scores if symbol_scores else market_scores
-        if not candidates:
+        # PLAN P2-2：无个股证据时不再回退全市场均值——返回中性 fallback，
+        # 结构化决策（news_risk）中明确标记 unavailable_for_symbol。
+        if not symbol_scores:
             return self._fallback_score
-        weighted_score = _weighted_mean(candidates)
+        weighted_score = _weighted_mean(symbol_scores)
         if weighted_score is None:
             return self._fallback_score
         return _clamp_01(weighted_score)
 
+    def news_risk(self, *, symbol: str) -> NewsRiskDecision:
+        """结构化新闻风险判定：个股证据为准，无证据 → unavailable。"""
+        records = self._load_records()
+        now = _ensure_utc(self._now_func())
+        normalized_symbol = _normalize_symbol(symbol)
+        symbol_events: list[dict[str, object]] = []
+        all_events: list[dict[str, object]] = []
+        for record in records:
+            event_time = _extract_event_time(record)
+            if _is_stale(
+                event_time=event_time,
+                now=now,
+                max_age_days=self._max_age_days,
+            ):
+                continue
+            all_events.append(record)
+            symbols = _extract_symbols(record)
+            if normalized_symbol and normalized_symbol in symbols:
+                symbol_events.append(record)
+
+        if not symbol_events:
+            return NewsRiskDecision(
+                score=None,
+                available_for_symbol=False,
+                hard_veto=False,
+                max_negative_confidence=0.0,
+                matched_event_ids=[],
+                freshness=_freshness_fields(
+                    events=all_events,
+                    now=now,
+                    max_age_days=self._max_age_days,
+                ),
+                reasons=["no_symbol_news_evidence"],
+            )
+
+        scores: list[float] = []
+        negative_confidences: list[float] = []
+        event_ids: list[str] = []
+        for record in symbol_events:
+            sentiment = _extract_sentiment(record)
+            if sentiment is None:
+                continue
+            event_id = str(
+                record.get("event_id") or record.get("id") or ""
+            ).strip()
+            if event_id:
+                event_ids.append(event_id)
+            scores.append(_map_sentiment_to_score(sentiment))
+            confidence = max(self._confidence_floor, _extract_confidence(record))
+            if sentiment < 0:
+                negative_confidences.append(confidence)
+        if not scores:
+            return NewsRiskDecision(
+                score=None,
+                available_for_symbol=False,
+                hard_veto=False,
+                max_negative_confidence=0.0,
+                matched_event_ids=[],
+                freshness=_freshness_fields(
+                    events=all_events,
+                    now=now,
+                    max_age_days=self._max_age_days,
+                ),
+                reasons=["symbol_news_without_sentiment"],
+            )
+        weighted_pairs: list[tuple[float, float]] = []
+        for record in symbol_events:
+            sentiment_value = _extract_sentiment(record)
+            if sentiment_value is None:
+                continue
+            weighted_pairs.append(
+                (
+                    _map_sentiment_to_score(sentiment_value),
+                    max(self._confidence_floor, _extract_confidence(record)),
+                )
+            )
+        weighted = _weighted_mean(weighted_pairs)
+        max_negative = max(negative_confidences) if negative_confidences else 0.0
+        hard_veto = bool(negative_confidences) and max_negative >= 0.6
+        reasons: list[str] = []
+        if hard_veto:
+            reasons.append("negative_high_confidence")
+        elif negative_confidences:
+            reasons.append("negative_news")
+        return NewsRiskDecision(
+            score=_clamp_01(weighted) if weighted is not None else None,
+            available_for_symbol=True,
+            hard_veto=hard_veto,
+            max_negative_confidence=round(max_negative, 4),
+            matched_event_ids=event_ids[:20],
+            freshness=_freshness_fields(
+                events=all_events,
+                now=now,
+                max_age_days=self._max_age_days,
+            ),
+            reasons=reasons,
+        )
+
     def available(self, symbol: str = "") -> bool:
         """返回新闻数据是否可用（有非空记录且不是纯 fallback）。"""
-        _ = symbol
+        if symbol:
+            decision = self.news_risk(symbol=symbol)
+            return decision.available_for_symbol
         return bool(self._load_records())
 
     def _load_records(self) -> list[dict[str, object]]:
@@ -114,6 +233,30 @@ def _resolve_news_path(path: str | Path) -> Path:
     if target.is_absolute():
         return target
     return _project_root() / target
+
+
+def _freshness_fields(
+    *,
+    events: list[dict[str, object]],
+    now: datetime,
+    max_age_days: int,
+) -> dict[str, object]:
+    """新闻数据新鲜度：最新事件时间、事件数、数据窗口天数。"""
+    event_times = [
+        parsed
+        for record in events
+        if (parsed := _extract_event_time(record)) is not None
+    ]
+    if not event_times:
+        return {"event_count": len(events), "latest_event_time": "", "window_days": 0}
+    latest = max(event_times)
+    window_days = max(0, (now - min(event_times)).days) if len(event_times) > 1 else 0
+    return {
+        "event_count": len(events),
+        "latest_event_time": latest.isoformat(),
+        "window_days": window_days,
+        "max_age_days": max_age_days,
+    }
 
 
 def _project_root() -> Path:
