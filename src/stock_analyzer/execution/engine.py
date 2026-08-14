@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 
 from stock_analyzer.config import BacktestMatcherConfig, LimitRuleConfig
@@ -22,6 +22,9 @@ from stock_analyzer.data.limit_rule import build_price_limits, resolve_stamp_tax
 class MatchDecision:
     executable: bool
     reason: str
+    # 结构化拒绝明细（价格、涨跌停价、停牌标记等），供执行层审计与诊断；
+    # 对既有契约保持 reason 字符串不变，details 仅追加不破坏。
+    details: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -48,10 +51,22 @@ class ExecutionEngine:
 
     def can_buy(self, bar: Mapping[str, object]) -> MatchDecision:
         if self._is_suspended(bar):
-            return MatchDecision(executable=False, reason="suspended")
-        if self._config.reject_limit_up_buy and self._is_limit_up(bar):
-            return MatchDecision(executable=False, reason="limit_up_reject")
-        return MatchDecision(executable=True, reason="ok")
+            return MatchDecision(False, "suspended", details={"suspended": True})
+        close, up_limit, _ = self._resolve_limit_prices(bar)
+        if close <= 0 or up_limit is None:
+            # 无有效价格/涨跌停数据：fail-closed，不猜测可买（P0 执行安全门）。
+            return MatchDecision(
+                False,
+                "no_valid_price_data",
+                details={"close": close, "up_limit": up_limit},
+            )
+        if self._config.reject_limit_up_buy and close >= up_limit:
+            return MatchDecision(
+                False,
+                "limit_up_reject",
+                details={"close": close, "up_limit": up_limit},
+            )
+        return MatchDecision(True, "ok", details={"close": close, "up_limit": up_limit})
 
     def can_sell(
         self,
@@ -60,16 +75,39 @@ class ExecutionEngine:
         current_date: datetime,
     ) -> MatchDecision:
         if self._is_suspended(bar):
-            return MatchDecision(executable=False, reason="suspended")
+            return MatchDecision(False, "suspended", details={"suspended": True})
+        close, _, down_limit = self._resolve_limit_prices(bar)
+        if close <= 0 or down_limit is None:
+            # 无有效价格/涨跌停数据：fail-closed，不猜测可卖。
+            return MatchDecision(
+                False,
+                "no_valid_price_data",
+                details={"close": close, "down_limit": down_limit},
+            )
         if (
             self._config.enforce_t_plus_1
             and last_buy_date is not None
             and current_date.date() <= last_buy_date.date()
         ):
-            return MatchDecision(executable=False, reason="t_plus_1_block")
-        if self._config.reject_limit_down_sell and self._is_limit_down(bar):
-            return MatchDecision(executable=False, reason="limit_down_reject")
-        return MatchDecision(executable=True, reason="ok")
+            return MatchDecision(
+                False,
+                "t_plus_1_block",
+                details={
+                    "last_buy_date": last_buy_date.isoformat(),
+                    "current_date": current_date.isoformat(),
+                },
+            )
+        if self._config.reject_limit_down_sell and close <= down_limit:
+            return MatchDecision(
+                False,
+                "limit_down_reject",
+                details={"close": close, "down_limit": down_limit},
+            )
+        return MatchDecision(
+            True,
+            "ok",
+            details={"close": close, "down_limit": down_limit},
+        )
 
     def dynamic_slippage_ratio(
         self,
@@ -199,27 +237,25 @@ class ExecutionEngine:
     def _is_suspended(self, bar: Mapping[str, object]) -> bool:
         return bool(bar.get("suspended", False))
 
-    def _is_limit_up(self, bar: Mapping[str, object]) -> bool:
+    def _resolve_limit_prices(
+        self, bar: Mapping[str, object]
+    ) -> tuple[float, float | None, float | None]:
+        """Resolve close plus up/down limit prices for a bar view.
+
+        Uses ``build_price_limits`` (source first, then board/date fallback).
+        When the fallback cannot derive a limit (no pre_close / no pct_change)
+        the limit is ``None`` and the caller must fail closed - never guess
+        tradability from ``close +/- 1`` (previous permissive behavior).
+        """
         close = _optional_numeric(bar.get("close"), default=0.0)
-        limits = build_price_limits(
-            bar=dict(bar),
-            config=self._limit_rule,
-        )
+        limits = build_price_limits(bar=dict(bar), config=self._limit_rule)
         up_limit = limits.up_limit
         if up_limit is None:
-            up_limit = _optional_numeric(bar.get("up_limit"), default=close + 1.0)
-        return bool(close >= up_limit)
-
-    def _is_limit_down(self, bar: Mapping[str, object]) -> bool:
-        close = _optional_numeric(bar.get("close"), default=0.0)
-        limits = build_price_limits(
-            bar=dict(bar),
-            config=self._limit_rule,
-        )
+            up_limit = _optional_numeric(bar.get("up_limit"), default=None)
         down_limit = limits.down_limit
         if down_limit is None:
-            down_limit = _optional_numeric(bar.get("down_limit"), default=close - 1.0)
-        return bool(close <= down_limit)
+            down_limit = _optional_numeric(bar.get("down_limit"), default=None)
+        return close, up_limit, down_limit
 
 
 def _validate_matcher_config(config: BacktestMatcherConfig) -> None:

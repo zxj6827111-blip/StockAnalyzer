@@ -12,9 +12,11 @@
 2. 滑点公式一致性：walk_forward 经 matcher.dynamic_slippage_ratio 的调用链
    （ratio -> should_downgrade -> apply_slippage -> plan_order）与引擎直调输出一致，
    并锁定公式数值（防漂移）。
-3. 差异契约锁定（P2 未统一项，TODO）：线上无 T+1 拦截、无涨跌停拦截、
-   无 min_notional 拒单。断言**现状**（不做拦截），与共享引擎对同一输入返回
-   的拦截决策形成对照，防止未来某端单边修改造成静默漂移。
+3. 统一执行层风险门契约（P0）：线上 sell/buy 委托路径与共享引擎
+   ExecutionEngine.can_buy/can_sell 一致——涨停买入、跌停卖出、同日 T+1
+   卖出均被同一风险门拒绝；回测（ExecutionMatcher）与线上（模拟委托）
+   共用同一套可交易性判断，不再存在"线上放行、回测拦截"的静默漂移。
+   min_notional 差异契约仍在（线上不执行 plan_order 拒单）。
 """
 
 from __future__ import annotations
@@ -30,7 +32,6 @@ from stock_analyzer.execution.bar_adapter import market_payload_to_bar
 from stock_analyzer.execution.engine import ExecutionEngine
 from stock_analyzer.runtime.service import StockAnalyzerService
 from stock_analyzer.types import PipelineSignal
-
 from tests.test_service_portfolio import _load_test_config, _patch_attr
 
 # 线上模拟盘初始资金（_simulation_initial_cash 取 config.dashboard.default_total_asset）
@@ -471,13 +472,11 @@ def test_dynamic_slippage_disabled_degrades_to_static_base_both_sides() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_contract_p2_live_has_no_t_plus_1_block_on_same_day_sell() -> None:
-    """契约锁定（TODO P2）：线上无 T+1 拦截。
+def test_contract_p2_live_blocks_same_day_sell_like_shared_engine() -> None:
+    """契约（P0 统一执行层风险门）：线上与共享引擎一致拦截同日 T+1 卖出。
 
-    现状：线上 sell 信号路径不调用 can_sell，同日买入后当日卖出直接成交；
-    而共享引擎对同一输入（last_buy_date/current_date 同一天）返回
-    t_plus_1_block。本用例锁定这一不对称现状——任何一侧新增/移除拦截
-    都会破坏契约（防止静默漂移）。P2 统一后需同步修改本用例。
+    历史版本锁定过"线上同日卖出不拦截"的现状；P0 统一后线上 sell 路径
+    直接经过 ExecutionEngine.can_sell，与回测共享同一风险门。
     """
     config = _load_test_config()
     service = StockAnalyzerService(config=config)
@@ -504,22 +503,23 @@ def test_contract_p2_live_has_no_t_plus_1_block_on_same_day_sell() -> None:
         use_live_runtime=True,
     )
 
-    # 线上现状：同日卖出不拦截
-    assert update["closed_signals"] == 1
-    assert len(service.portfolio_positions()) == 0
+    # 线上与共享引擎一致：同日卖出被 T+1 拦截，持仓保留
+    assert update["closed_signals"] == 0
+    assert len(service.portfolio_positions()) == 1
+    assert update["execution_attempts"]["engine_risk_gate_blocked"] == 1
 
-    # 对照：共享引擎对同一输入仍拦截 T+1
+    # 对照：共享引擎对同一输入同样拦截 T+1
     bar = market_payload_to_bar(dict(payload), symbol="600000", limit_rule=config.limit_rule)
     decision = engine.can_sell(bar=bar, last_buy_date=opened_at, current_date=close_ts)
     assert decision.executable is False
     assert decision.reason == "t_plus_1_block"
 
 
-def test_contract_p2_live_has_no_limit_up_buy_block() -> None:
-    """契约锁定（TODO P2）：线上无涨停买入拦截。
+def test_contract_p2_live_blocks_limit_up_buy_like_shared_engine() -> None:
+    """契约（P0 统一执行层风险门）：线上统一拒绝涨停买入。
 
-    现状：即使价格位于涨停价（close == up_limit），线上 buy 路径仍直接成交；
-    共享引擎对同一 bar 返回 limit_up_reject。锁定现状防漂移。
+    历史版本锁定过"允许涨停买入"的现状（TODO P2）；本轮按 PLAN 改为
+    正式拒绝契约：price == up_limit 时线上 buy 路径直接拒绝成交。
     """
     config = _load_test_config()
     service = StockAnalyzerService(config=config)
@@ -537,22 +537,30 @@ def test_contract_p2_live_has_no_limit_up_buy_block() -> None:
         use_live_runtime=True,
     )
 
-    # 线上现状：涨停价买入不拦截
-    assert update["opened"] == 1
-    assert _as_int(update["executions"][0]["quantity"]) > 0
+    # 线上现状：涨停价买入被共享引擎风险门拒绝（limit_up_reject）
+    assert update["opened"] == 0
+    assert update["execution_attempts"]["engine_risk_gate_blocked"] == 1
+    blocked = [
+        item
+        for item in _as_mapping_list(update["executions"])
+        if item["side"] == "buy" and item["status"] == "rejected_execution_gate"
+    ]
+    assert len(blocked) == 1
+    assert "limit_up_reject" in str(blocked[0]["reason"])
 
     # 对照：共享引擎对同一输入拒绝买入（limit_up_reject）
     bar = market_payload_to_bar(dict(payload), symbol="600000", limit_rule=config.limit_rule)
     decision = engine.can_buy(bar=bar)
     assert decision.executable is False
     assert decision.reason == "limit_up_reject"
+    assert decision.details.get("up_limit") == pytest.approx(11.0)
 
 
-def test_contract_p2_live_has_no_limit_down_sell_block() -> None:
-    """契约锁定（TODO P2）：线上无跌停卖出拦截。
+def test_contract_p2_live_blocks_limit_down_sell_like_shared_engine() -> None:
+    """契约（P0 统一执行层风险门）：线上统一拒绝跌停卖出。
 
-    现状：即使价格位于跌停价（close == down_limit），线上 sell 信号路径仍
-    直接平仓；共享引擎对同一输入返回 limit_down_reject。锁定现状防漂移。
+    历史版本锁定过"线上跌停卖出不拦截"的现状；P0 统一后线上 sell 路径
+    经过 ExecutionEngine.can_sell，跌停价卖出被拒绝。
     """
     config = _load_test_config()
     service = StockAnalyzerService(config=config)
@@ -580,15 +588,17 @@ def test_contract_p2_live_has_no_limit_down_sell_block() -> None:
         use_live_runtime=True,
     )
 
-    # 线上现状：跌停价卖出不拦截
-    assert update["closed_signals"] == 1
-    assert len(service.portfolio_positions()) == 0
+    # 线上与共享引擎一致：跌停价卖出被拒绝，持仓保留
+    assert update["closed_signals"] == 0
+    assert len(service.portfolio_positions()) == 1
+    assert update["execution_attempts"]["engine_risk_gate_blocked"] == 1
 
     # 对照：共享引擎对同一输入拒绝卖出（limit_down_reject）
     bar = market_payload_to_bar(dict(payload), symbol="600000", limit_rule=config.limit_rule)
     decision = engine.can_sell(bar=bar, last_buy_date=opened_at, current_date=close_ts)
     assert decision.executable is False
     assert decision.reason == "limit_down_reject"
+    assert decision.details.get("down_limit") == pytest.approx(9.0)
 
 
 def test_contract_p2_live_does_not_enforce_min_notional() -> None:

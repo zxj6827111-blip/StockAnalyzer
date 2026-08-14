@@ -3,7 +3,7 @@ from __future__ import annotations
 import tempfile
 import time
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -73,8 +73,9 @@ def _sign(
     command_id: str,
     payload: dict[str, object],
     secret: str,
+    timestamp: int | None = None,
 ) -> CommandEnvelope:
-    ts = int(time.time())
+    ts = int(time.time()) if timestamp is None else timestamp
     signature = SignedCommandProcessor.build_signature(
         secret_key=secret,
         command_id=command_id,
@@ -1195,20 +1196,18 @@ def test_service_simulated_trim_notification_keeps_remaining_position_context() 
 def test_service_live_auto_execution_closes_position_on_sell_signal() -> None:
     config = _load_test_config()
     service = StockAnalyzerService(config=config)
-    _ = service.execute_command(
-        _sign(
-            action="SET_POSITION",
-            command_id="cmd-auto-sell-open",
-            payload={
-                "symbol": "600000",
-                "strategy": "manual",
-                "target_position": 0.1,
-                "entry_price": 10.0,
-                "quantity": 1000,
-            },
-            secret=config.command_channel.secret_key,
-        )
+    # 直接建仓于昨日：命令通道有 300s 时钟容差无法提前建仓，而本用例只
+    # 验证"卖出信号路径成交"，建仓时间需早于 sell 一日以通过 T+1 风险门。
+    service._portfolio.set_manual_position(
+        symbol="600000",
+        strategy="manual",
+        target_position=0.1,
+        timestamp=datetime.now() - timedelta(days=1),
+        trace_id="seed-auto-sell-open",
+        reason="manual_set_position_command",
+        manual_fill={"entry_price": 10.0, "quantity": 1000},
     )
+    assert len(service.portfolio_positions()) == 1
     _patch_attr(service, "_build_week5_symbol_market_payload", lambda **kwargs: {
         "last_price": 9.92,
         "open_price": 10.0,
@@ -1236,7 +1235,7 @@ def test_service_live_auto_execution_closes_position_on_sell_signal() -> None:
     )
     update = service._apply_live_auto_portfolio_signals(
         trace_id="trace-live-sell",
-        timestamp=datetime.fromisoformat("2026-03-11T10:05:00"),
+        timestamp=datetime.now(),
         signals=[signal],
         use_live_runtime=True,
     )

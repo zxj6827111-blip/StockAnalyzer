@@ -55,6 +55,7 @@ from stock_analyzer.evolution.modules.m6_counterparty import evaluate_m6_counter
 from stock_analyzer.evolution.orchestrator import OffhoursEvolutionOrchestrator
 from stock_analyzer.evolution.shadow_dataset_builder import ShadowDatasetBuilder
 from stock_analyzer.evolution.shadow_online_v2_report import ShadowOnlineV2ReportBuilder
+from stock_analyzer.execution.bar_adapter import market_payload_to_bar
 from stock_analyzer.execution.engine import ExecutionEngine
 from stock_analyzer.feature.engineer import FeatureEngineer
 from stock_analyzer.feature.market_context import build_market_relative_frame
@@ -13387,6 +13388,7 @@ class StockAnalyzerService:
             "buy_new_attempted": 0,
             "buy_new_rejected": 0,
             "buy_new_filled": 0,
+            "engine_risk_gate_blocked": 0,
             "non_buy_signals": 0,
         }
 
@@ -13453,6 +13455,12 @@ class StockAnalyzerService:
                     _as_int(execution_attempts.get("risk_gate_blocked"), default=0) + 1
                 )
                 block_category = "risk_gate_blocked"
+            elif reason.startswith("auto_simulated_buy_engine_block:"):
+                # 共享执行引擎风险门（涨停/停牌/无有效价格数据），P0 统一契约。
+                execution_attempts["engine_risk_gate_blocked"] = (
+                    _as_int(execution_attempts.get("engine_risk_gate_blocked"), default=0) + 1
+                )
+                block_category = "engine_risk_gate_blocked"
             executions.append(
                 {
                     "trade_id": f"SKIP-{trace_id[:8]}-{symbol}-{status}",
@@ -13628,6 +13636,44 @@ class StockAnalyzerService:
                     execution_attempts["sell_no_position"] += 1
                     continue
                 market_payload = _market_payload_for(symbol)
+                engine = self._shared_execution_engine()
+                bar = market_payload_to_bar(
+                    dict(market_payload),
+                    symbol=symbol,
+                    limit_rule=self._config.limit_rule,
+                )
+                decision = engine.can_sell(
+                    bar=bar,
+                    last_buy_date=_parse_iso_datetime(existing.get("opened_at")),
+                    current_date=timestamp,
+                )
+                if not decision.executable:
+                    execution_attempts["sell_close_failed"] += 1
+                    execution_attempts["engine_risk_gate_blocked"] = (
+                        _as_int(
+                            execution_attempts.get("engine_risk_gate_blocked"), default=0
+                        )
+                        + 1
+                    )
+                    executions.append(
+                        {
+                            "trade_id": f"SKIP-{trace_id[:8]}-{symbol}-sell",
+                            "symbol": symbol,
+                            "side": "sell",
+                            "status": "rejected_execution_gate",
+                            "block_category": "engine_risk_gate_blocked",
+                            "strategy": str(signal.strategy).strip() or "trend",
+                            "target_position": 0.0,
+                            "price": 0.0,
+                            "quantity": 0,
+                            "amount": 0.0,
+                            "fee": 0.0,
+                            "price_source": "no_fill",
+                            "trade_time": timestamp.isoformat(),
+                            "reason": f"auto_simulated_sell_engine_block:{decision.reason}",
+                        }
+                    )
+                    continue
                 trade_price, price_source = self._select_simulated_trade_price(
                     side="sell",
                     market_payload=market_payload,
@@ -13709,6 +13755,23 @@ class StockAnalyzerService:
             existing = open_positions.get(symbol)
             if isinstance(existing, dict):
                 execution_attempts["buy_existing_position"] += 1
+                market_payload = _market_payload_for(symbol)
+                engine = self._shared_execution_engine()
+                bar = market_payload_to_bar(
+                    dict(market_payload),
+                    symbol=symbol,
+                    limit_rule=self._config.limit_rule,
+                )
+                decision = engine.can_buy(bar=bar)
+                if not decision.executable:
+                    execution_attempts["buy_new_rejected"] += 1
+                    _append_rejected_buy_execution(
+                        signal=signal,
+                        symbol=symbol,
+                        status="rejected_execution_gate",
+                        reason=f"auto_simulated_buy_engine_block:{decision.reason}",
+                    )
+                    continue
                 changed = self._portfolio.update_target_position(
                     symbol=symbol,
                     target_position=max(0.0, float(signal.target_position)),
@@ -13750,6 +13813,22 @@ class StockAnalyzerService:
                 available_cash,
             )
             market_payload = _market_payload_for(symbol)
+            engine = self._shared_execution_engine()
+            bar = market_payload_to_bar(
+                dict(market_payload),
+                symbol=symbol,
+                limit_rule=self._config.limit_rule,
+            )
+            decision = engine.can_buy(bar=bar)
+            if not decision.executable:
+                execution_attempts["buy_new_rejected"] += 1
+                _append_rejected_buy_execution(
+                    signal=signal,
+                    symbol=symbol,
+                    status="rejected_execution_gate",
+                    reason=f"auto_simulated_buy_engine_block:{decision.reason}",
+                )
+                continue
             trade_price, price_source = self._select_simulated_trade_price(
                 side="buy",
                 market_payload=market_payload,
