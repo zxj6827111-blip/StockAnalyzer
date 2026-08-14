@@ -29,6 +29,8 @@ from stock_analyzer.feature.snapshot import (
 )
 from stock_analyzer.learning.execution_risk_labels import build_execution_risk_feature_vector
 from stock_analyzer.models.execution_risk_predictor import ExecutionRiskPredictor
+from stock_analyzer.risk.board_risk import board_decision_to_dict, evaluate_board_risk
+from stock_analyzer.risk.overextension import evaluate_overextension
 from stock_analyzer.runtime.services.week5_notification_service import (
     RuntimeWeek5NotificationService,
 )
@@ -45,6 +47,99 @@ class RuntimeWeek5Service:
         self._service = service
         self._notification_service = RuntimeWeek5NotificationService(service)
         self._state_service = RuntimeWeek5StateService(service)
+
+    def _build_dual_track_output(
+        self,
+        *,
+        final_selector: dict[str, object],
+        signal_map: dict[str, dict[str, object]],
+        trend_signal_map: dict[str, dict[str, object]],
+        dual_track: bool,
+    ) -> dict[str, object]:
+        """P1 双轨输出：trend_candidates（可执行候选）vs monster_watchlist（观察池）。
+
+        - legacy 模式：维持现状输出（final_signals 单轨），dual_track 段仅
+          标注 mode=legacy，供 Shadow 对比期识别；
+        - dual_track 模式：final_signals 只来自 trend 轨（含 overextension/
+          board_risk 门），monster 轨全部归入 monster_watchlist 且固定
+          executable=false。monster_watchlist 保留高动量标的及风险原因。
+        """
+        final_symbols = [
+            str(item.get("symbol", "")).strip()
+            for item in final_selector.get("final_signals", [])
+            if isinstance(item, dict) and str(item.get("symbol", "")).strip()
+        ]
+        final_symbol_set = set(final_symbols)
+
+        # 兼容期：legacy 模式保持现状输出，dual_track 段仅标注模式供
+        # Shadow 对比识别，不生成新的候选/观察池结构。
+        if not dual_track:
+            return {
+                "mode": "legacy",
+                "trend_candidates": [],
+                "monster_watchlist": [],
+                "monster_watchlist_count": 0,
+                "trend_signal_count": 0,
+                "monster_signal_count": len(signal_map),
+                "final_signals_source": "legacy",
+            }
+
+        trend_candidates: list[dict[str, object]] = []
+        for symbol in final_symbols:
+            trend_candidates.append(
+                {
+                    "symbol": symbol,
+                    "score": _as_float(
+                        next(
+                            (
+                                item.get("score")
+                                for item in final_selector.get("final_signals", [])
+                                if isinstance(item, dict)
+                                and str(item.get("symbol", "")).strip() == symbol
+                            ),
+                            0.0,
+                        ),
+                        default=0.0,
+                    ),
+                    "action": "buy",
+                    "executable": True,
+                }
+            )
+
+        monster_watchlist: list[dict[str, object]] = []
+        for symbol, item in signal_map.items():
+            if symbol in final_symbol_set:
+                continue
+            reason_values = _string_list(item.get("reasons", []))
+            risk_reasons = [
+                str(reason) for reason in reason_values if str(reason).strip()
+            ]
+            monster_watchlist.append(
+                {
+                    "symbol": symbol,
+                    "score": _as_float(item.get("score"), default=0.0),
+                    "executable": False,
+                    "risk_reasons": risk_reasons[:8],
+                }
+            )
+        monster_watchlist.sort(
+            key=lambda item: (
+                -_as_float(item.get("score"), default=0.0),
+                str(item.get("symbol", "")),
+            )
+        )
+
+        # dual_track 模式：trend_candidates 为最终可操作信号，monster 轨
+        # 全部进入观察池（executable=false）。
+        return {
+            "mode": "dual_track",
+            "trend_candidates": trend_candidates,
+            "monster_watchlist": monster_watchlist[:200],
+            "monster_watchlist_count": len(monster_watchlist),
+            "trend_signal_count": len(trend_signal_map),
+            "monster_signal_count": len(signal_map),
+            "final_signals_source": "trend",
+        }
 
     def _resolve_week5_offhours_scan_profile(
         self,
@@ -1866,6 +1961,15 @@ class RuntimeWeek5Service:
                 )
 
         live_provider = service._select_provider(use_live_runtime=True)
+        output_mode = str(service._config.week5.week5_output_mode).strip().lower() or "legacy"
+        dual_track = output_mode == "dual_track"
+        transform_workers = max(
+            1,
+            int(service._config.week5.final_pipeline_transform_max_workers),
+        )
+        # P1 双轨：基础扫描仍以 monster 观察池为主（保留现有评分链路），
+        # dual_track 时额外跑一次 trend 轨作为稳健候选。特征计算为渐进式双跑，
+        # 输出契约（trend_candidates/monster_watchlist/executable）先行落地。
         monster_report = service.run_pipeline(
             symbols=symbol_list,
             strategy="monster",
@@ -1874,14 +1978,24 @@ class RuntimeWeek5Service:
             dry_run_execution=True,
             job_name="week5_scan_monster",
             on_symbol_progress=_pipeline_heartbeat,
-            transform_max_workers=max(
-                1,
-                int(service._config.week5.final_pipeline_transform_max_workers),
-            ),
-            # 捕获每只股票的 bars 尾部快照，first-board/anomaly 直接复用，
-            # 不再对每只 symbol 二次 fetch_daily_bars。
+            transform_max_workers=transform_workers,
+            # 捕获每只股票的 bars 尾部快照，first-board/anomaly/overextension
+            # 直接复用，不再对每只 symbol 二次 fetch_daily_bars。
             capture_post_scan_enrichment=True,
         )
+        trend_report: dict[str, object] | None = None
+        if dual_track:
+            trend_report = service.run_pipeline(
+                symbols=symbol_list,
+                strategy="trend",
+                current_equity=service._state.current_equity,
+                use_live_runtime=True,
+                dry_run_execution=True,
+                job_name="week5_scan_trend",
+                on_symbol_progress=_pipeline_heartbeat,
+                transform_max_workers=transform_workers,
+                capture_post_scan_enrichment=True,
+            )
         trace_id = str(monster_report.get("trace_id", ""))
         if _progress is not None:
             _progress.update(trace_id=trace_id)
@@ -1904,9 +2018,22 @@ class RuntimeWeek5Service:
                 symbol = str(item.get("symbol", "")).strip()
                 if symbol:
                     signal_map[symbol] = item
+        # dual_track 时 trend 轨 signals 单独成图：最终信号只从 trend 轨产生。
+        trend_signal_map: dict[str, dict[str, object]] = {}
+        if dual_track and isinstance(trend_report, dict):
+            trend_raw = trend_report.get("signals")
+            if isinstance(trend_raw, list):
+                for item in trend_raw:
+                    if not isinstance(item, dict):
+                        continue
+                    symbol = str(item.get("symbol", "")).strip()
+                    if symbol:
+                        trend_signal_map[symbol] = item
 
         signal_pool_candidates: list[dict[str, object]] = []
-        for symbol, item in signal_map.items():
+        # dual_track 时最终信号只从 trend 轨产生；monster 轨作为观察池。
+        candidate_signal_map = trend_signal_map if dual_track else signal_map
+        for symbol, item in candidate_signal_map.items():
             reason_values = _string_list(item.get("reasons", []))
             if any(
                 str(reason).strip().startswith("insufficient_history_days:")
@@ -1914,12 +2041,49 @@ class RuntimeWeek5Service:
             ):
                 continue
             normalized_symbol = _normalize_a_share_symbol(symbol) or symbol
-            signal_pool_candidates.append(
-                service._score_week5_signal_pool_candidate(
-                    signal=item,
-                    prefilter_detail=prefilter_details_by_symbol.get(normalized_symbol),
-                )
+            candidate = service._score_week5_signal_pool_candidate(
+                signal=item,
+                prefilter_detail=prefilter_details_by_symbol.get(normalized_symbol),
             )
+            # P1 过热风险（overextension）+ 板块连板（board_risk）在 final
+            # selector 之前计算并注入 signal；final selector 依据
+            # reject_new_buy 拒绝 trend 轨新买入（monster 观察池不受影响）。
+            bars = _bars_from_post_scan_enrichment(
+                str(item.get("post_scan_enrichment", "")).strip()
+            )
+            overextension_decision: dict[str, object] = {
+                "level": "none",
+                "penalty": 0.0,
+                "reject_new_buy": False,
+                "reasons": [],
+                "metrics": {},
+            }
+            board_decision: dict[str, object] = {
+                "consecutive_limit_up": 0,
+                "current_limit_state": "none",
+                "board": "",
+                "reject_new_buy": False,
+                "reasons": [],
+            }
+            if bars is not None and not bars.empty:
+                overextension_decision = _overextension_decision_dict(
+                    row=_latest_bar_dict(bars),
+                    config=service._config.overextension,
+                )
+                board_decision = _board_decision_dict(
+                    bars=bars,
+                    symbol=symbol,
+                    config=service._config.board_risk,
+                    limit_rule=service._config.limit_rule,
+                )
+            candidate["overextension"] = overextension_decision
+            candidate["board_risk"] = board_decision
+            # trend 轨执行质量门：overextension reject 或三连板 reject 时拒绝新买入
+            candidate["reject_new_buy"] = bool(
+                overextension_decision.get("reject_new_buy", False)
+                or board_decision.get("reject_new_buy", False)
+            )
+            signal_pool_candidates.append(candidate)
         execution_rerank = self._apply_execution_aware_rerank(
             candidates=signal_pool_candidates,
         )
@@ -2244,6 +2408,12 @@ class RuntimeWeek5Service:
                     "execution_rerank": dict(execution_rerank),
                 },
             },
+            "dual_track": self._build_dual_track_output(
+                final_selector=final_selector,
+                signal_map=signal_map,
+                trend_signal_map=trend_signal_map,
+                dual_track=dual_track,
+            ),
             "anomalies": {
                 "event_count": len(anomalies),
                 "events": anomalies,
@@ -3597,6 +3767,74 @@ def _number_list(value: object) -> list[float]:
     if not isinstance(value, list):
         return []
     return [float(item) for item in value if isinstance(item, (int, float))]
+
+
+def _latest_bar_dict(bars: pd.DataFrame) -> dict[str, object]:
+    """bars 末行 → dict（P1 overextension evaluator 输入，symbol 一并携带）。"""
+    ordered = bars if bars.index.is_monotonic_increasing else bars.sort_index()
+    if ordered.empty:
+        return {}
+    row = ordered.iloc[-1]
+    result: dict[str, object] = {}
+    for column in ordered.columns:
+        value = row.get(column)
+        try:
+            if pd.isna(value):
+                continue
+        except (TypeError, ValueError):
+            pass
+        result[str(column)] = value
+    return result
+
+
+def _overextension_decision_dict(
+    row: dict[str, object],
+    config: object,
+) -> dict[str, object]:
+    """evaluate_overextension → 可序列化 dict（写入扫描审计）。"""
+    try:
+        decision = evaluate_overextension(row=row, config=config)  # type: ignore[arg-type]
+    except Exception:
+        return {
+            "level": "none",
+            "penalty": 0.0,
+            "reject_new_buy": False,
+            "reasons": [],
+            "metrics": {},
+        }
+    return {
+        "level": decision.level,
+        "penalty": decision.penalty,
+        "reject_new_buy": decision.reject_new_buy,
+        "reasons": list(decision.reasons),
+        "metrics": dict(decision.metrics),
+    }
+
+
+def _board_decision_dict(
+    bars: pd.DataFrame,
+    *,
+    symbol: str,
+    config: object,
+    limit_rule: object,
+) -> dict[str, object]:
+    """evaluate_board_risk → 可序列化 dict（写入扫描审计）。"""
+    try:
+        decision = evaluate_board_risk(
+            bars=bars,
+            symbol=symbol,
+            limit_rule=limit_rule,  # type: ignore[arg-type]
+            board_risk_config=config,  # type: ignore[arg-type]
+        )
+    except Exception:
+        return {
+            "consecutive_limit_up": 0,
+            "current_limit_state": "none",
+            "board": "",
+            "reject_new_buy": False,
+            "reasons": [],
+        }
+    return board_decision_to_dict(decision)
 
 
 def _safe_datetime(value: object) -> datetime | None:

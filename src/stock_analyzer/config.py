@@ -375,6 +375,9 @@ class Week5Config(_StrictModel):
     auto_run: bool = True
     auto_notify: bool = True
     history_limit: int = 500
+    # P1 双轨输出：legacy=单轨 monster（现状），dual_track=trend_candidates +
+    # monster_watchlist 分离。NAS 先 Shadow 对比后切换 dual_track。
+    week5_output_mode: str = "legacy"
     market_radar_enabled: bool = True
     market_radar_notify: bool = True
     market_radar_universe_max_symbols: int = 600
