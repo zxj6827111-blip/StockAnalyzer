@@ -6286,6 +6286,11 @@ class StockAnalyzerService:
                 reasons.append("risk_gate_failed")
             if not bool(cross_review_gate.get("passed", False)):
                 reasons.append("cross_review_failed")
+            # P1 板块感知连板风险：signal 携带的 board_risk 判定（由扫描调用方在
+            # final selector 之前计算并填充），连续涨停达阈值时 trend 轨拒绝。
+            board_risk = _coerce_object_mapping(signal.get("board_risk"))
+            if bool(board_risk.get("reject_new_buy", False)):
+                reasons.append("board_risk_reject_new_buy")
             if score < min_threshold:
                 reasons.append("below_min_threshold")
             if any(reason.startswith("predictor_rejected:") for reason in _string_list(signal.get("reasons"))):

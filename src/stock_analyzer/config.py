@@ -358,6 +358,18 @@ class OverextensionConfig(_StrictModel):
     extra_penalty: float = 0.05
 
 
+class BoardRiskConfig(_StrictModel):
+    """板块感知连板风险（复用 build_price_limits，不再用固定 9.5%）。
+
+    收盘价达到涨停价容差范围才计入连板；连续涨停达到
+    ``consecutive_limit_up_reject`` 天时，trend 轨拒绝新买入
+    （monster 观察池仍可保留，但不得进入默认 final signals）。
+    """
+
+    limit_up_tolerance: float = 0.001
+    consecutive_limit_up_reject: int = 3
+
+
 class Week5Config(_StrictModel):
     enabled: bool = True
     auto_run: bool = True
@@ -1462,6 +1474,7 @@ class StockAnalyzerConfig(_StrictModel):
     circuit_breaker: CircuitBreakerConfig
     monster_risk: MonsterRiskConfig = Field(default_factory=MonsterRiskConfig)
     overextension: OverextensionConfig = Field(default_factory=OverextensionConfig)
+    board_risk: BoardRiskConfig = Field(default_factory=BoardRiskConfig)
     week5: Week5Config = Field(default_factory=Week5Config)
     holiday_risk: HolidayRiskConfig = Field(default_factory=HolidayRiskConfig)
     global_market: GlobalMarketConfig = Field(default_factory=GlobalMarketConfig)

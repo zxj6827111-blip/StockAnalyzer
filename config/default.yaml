@@ -279,6 +279,12 @@ overextension:
   volume_divergence_ratio: 2.5
   extra_penalty: 0.05
 
+# 板块感知连板风险（P1 双轨）：复用 build_price_limits 计算涨跌停价，
+# 收盘价达到涨停价容差范围才计入连板；连续 3 天涨停 trend 轨拒绝新买入。
+board_risk:
+  limit_up_tolerance: 0.001
+  consecutive_limit_up_reject: 3
+
 week5:
   enabled: true
   auto_run: true
