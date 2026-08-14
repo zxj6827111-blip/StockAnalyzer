@@ -206,3 +206,20 @@ def test_news_risk_available_returns_false_for_other_symbol(tmp_path: Path) -> N
     provider = ArtifactNewsSignalProvider(path=records_path)
     assert provider.available(symbol="600000") is True
     assert provider.available(symbol="300001") is False
+
+
+def test_news_risk_missing_confidence_does_not_hard_veto(tmp_path: Path) -> None:
+    """缺失 confidence 字段的负面新闻不得被当作满置信触发 hard_veto。"""
+    records_path = tmp_path / "m7_news_latest.jsonl"
+    _write_jsonl(
+        records_path,
+        [
+            '{"symbol":"600000","sentiment":-1.0,"event_id":"evt-nc"}',
+        ],
+    )
+    provider = ArtifactNewsSignalProvider(path=records_path)
+    decision = provider.news_risk(symbol="600000")
+    assert decision.available_for_symbol is True
+    assert decision.hard_veto is False
+    assert decision.max_negative_confidence == pytest.approx(0.5)
+    assert "negative_news" in decision.reasons

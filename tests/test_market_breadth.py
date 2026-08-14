@@ -233,3 +233,34 @@ def test_policy_healthy_breadth_allows() -> None:
     assert policy["block_new_buy"] is False
     assert policy["reason"] == "breadth_ok"
     assert policy["trend_min_threshold_lift"] == 0.0
+
+
+def test_policy_mixed_timezone_does_not_crash() -> None:
+    """aware as_of + naive now（调用方 datetime.now()）不得抛时区 TypeError。"""
+    snapshot = {
+        "score": {"value": 70.0, "available": True},
+        "as_of": "2026-08-14T13:55:00+00:00",
+        "freshness": {"date_max": "2026-08-14T13:55:00"},
+    }
+    policy = breadth_usage_policy(
+        snapshot,
+        now=datetime(2026, 8, 14, 14, 0, 0),  # naive
+        trend_min_threshold=70.0,
+    )
+    assert policy["block_new_buy"] is False
+    assert policy["reason"] == "breadth_ok"
+
+
+def test_policy_naive_as_of_with_aware_now() -> None:
+    """naive as_of + aware now：as_of 按 UTC 解释，心跳仍新鲜。"""
+    snapshot = {
+        "score": {"value": 70.0, "available": True},
+        "as_of": "2026-08-14T13:55:00",  # naive
+        "freshness": {"date_max": "2026-08-14T13:55:00"},
+    }
+    policy = breadth_usage_policy(
+        snapshot,
+        now=datetime(2026, 8, 14, 14, 0, 0, tzinfo=UTC),
+        trend_min_threshold=70.0,
+    )
+    assert policy["block_new_buy"] is False

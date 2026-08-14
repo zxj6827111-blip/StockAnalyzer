@@ -406,7 +406,7 @@ def run_once(
         "ts": now.isoformat(),
         "maintenance": False,
         "action": "noop",
-        "container": container,
+        "container_name": container,
     }
     maintenance = Path(maintenance_flag).exists()
     report["maintenance"] = maintenance
@@ -418,7 +418,7 @@ def run_once(
     heartbeat_age = heartbeat_age_sec(heartbeat, now=now)
     report["heartbeat_age_sec"] = heartbeat_age
     container_status = inspect_container(container, docker_bin=docker_bin)
-    report["container"] = container_status
+    report["container_status"] = container_status
     unhealthy, reason = _service_unhealthy(
         container_status=container_status,
         heartbeat=heartbeat,

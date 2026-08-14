@@ -88,6 +88,17 @@ def test_overextension_extra_risk_items_add_penalty() -> None:
     assert decision.level == "warn"
 
 
+def test_overextension_extra_item_alone_raises_to_warn() -> None:
+    """ret5 单独命中（bias 低）时至少升 warn 档，避免过热信号无罚分。"""
+    decision = evaluate_overextension(
+        _base_row(ret5=0.35, volume_ratio_5d=1.0),
+        _config(),
+    )
+    assert decision.level == "warn"
+    assert "ret5_high" in decision.reasons
+    assert decision.reject_new_buy is False
+
+
 def test_overextension_falls_back_to_bars_style_fields() -> None:
     # bars 路径无 ma5/atr14 时回退 ma5_from_ma20 / atr_20d
     decision = evaluate_overextension(

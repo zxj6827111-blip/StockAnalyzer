@@ -152,7 +152,7 @@ class ArtifactNewsSignalProvider:
             if event_id:
                 event_ids.append(event_id)
             scores.append(_map_sentiment_to_score(sentiment))
-            confidence = max(self._confidence_floor, _extract_confidence(record))
+            confidence = max(self._confidence_floor, _risk_confidence(record))
             if sentiment < 0:
                 negative_confidences.append(confidence)
         if not scores:
@@ -174,10 +174,16 @@ class ArtifactNewsSignalProvider:
             sentiment_value = _extract_sentiment(record)
             if sentiment_value is None:
                 continue
+            event_time = _extract_event_time(record)
+            recency = _recency_weight(
+                event_time=event_time,
+                now=now,
+                half_life_hours=self._half_life_hours,
+            )
             weighted_pairs.append(
                 (
                     _map_sentiment_to_score(sentiment_value),
-                    max(self._confidence_floor, _extract_confidence(record)),
+                    max(self._confidence_floor, _risk_confidence(record)) * recency,
                 )
             )
         weighted = _weighted_mean(weighted_pairs)
@@ -296,6 +302,20 @@ def _extract_confidence(record: Mapping[str, Any]) -> float:
         if value is not None:
             return _clamp_01(value)
     return 1.0
+
+
+def _risk_confidence(record: Mapping[str, Any]) -> float:
+    """结构化风险判定用的置信度：缺失 confidence 字段时取中性 0.5。
+
+    ``_extract_confidence`` 的 1.0 默认是为旧权重路径设计（无标注按满权重
+    参与加权）；但硬否决/强扣分门槛不能把"未标注"当成"满置信"——缺失
+    置信度的负面新闻按 0.5 处理，避免误触发 hard_veto。
+    """
+    for key in ("llm_confidence", "confidence", "probability", "weight"):
+        value = _as_float(record.get(key))
+        if value is not None:
+            return _clamp_01(value)
+    return 0.5
 
 
 def _extract_event_time(record: Mapping[str, Any]) -> datetime | None:

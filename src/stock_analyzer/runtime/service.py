@@ -13653,7 +13653,9 @@ class StockAnalyzerService:
                     current_date=timestamp,
                 )
                 if not decision.executable:
-                    execution_attempts["sell_close_failed"] += 1
+                    # 引擎风险门拒绝（跌停/停牌/无有效价格数据/T+1）：只计入
+                    # engine_risk_gate_blocked，不混入 sell_close_failed（后者
+                    # 语义是"平仓调用失败"）。
                     execution_attempts["engine_risk_gate_blocked"] = (
                         _as_int(
                             execution_attempts.get("engine_risk_gate_blocked"), default=0

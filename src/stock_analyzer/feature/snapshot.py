@@ -39,8 +39,8 @@ import numpy as np
 import pandas as pd
 
 from stock_analyzer.config import LimitRuleConfig, StockAnalyzerConfig
-from stock_analyzer.data.limit_rule import build_price_limits
 from stock_analyzer.feature.engineer import FeatureEngineer
+from stock_analyzer.risk.board_risk import consecutive_limit_up_count
 
 # v2: 新增 P1 过热风险 raw 列（ma5/ma10/atr14/bias_ma5/bias_ma10/ret5/
 # gap_pct/volume_ratio_5d/consecutive_limit_up）。schema hash 基于
@@ -1791,57 +1791,15 @@ def _limit_up_streak(
 ) -> int:
     """Consecutive limit-up days counting back from the latest bar.
 
-    Reuses ``build_price_limits`` (source first, then board/ST/date rules) so
-    the streak matches the execution layer's tradability view instead of a
-    fixed 9.5% threshold. A close reaching the up-limit price within the
-    tolerance counts as a limit-up day (PLAN: 收盘价达到涨停价容差范围才计入).
+    Delegates to the shared board-risk helper so snapshot and scan paths use
+    one implementation (PLAN: 收盘价达到涨停价容差范围才计入连板).
     """
-    ordered = bars if bars.index.is_monotonic_increasing else bars.sort_index()
-    closes = pd.to_numeric(ordered.get("close"), errors="coerce")
-    if closes is None or closes.empty:
-        return 0
-    streak = 0
-    for index in range(len(ordered) - 1, -1, -1):
-        row = ordered.iloc[index]
-        close = pd.to_numeric(row.get("close"), errors="coerce")
-        if pd.isna(close) or float(close) <= 0:
-            break
-        bar = {
-            "close": float(close),
-            "pre_close": _row_pre_close(row, closes, index),
-            "board": str(row.get("board", "") or ""),
-            "is_st": bool(row.get("is_st", False)),
-            "name": str(row.get("name", "") or ""),
-            "trade_date": _index_to_date(ordered, index),
-            "symbol": symbol,
-        }
-        limits = build_price_limits(bar=bar, config=limit_rule)
-        if limits.up_limit is None:
-            break
-        if float(close) >= limits.up_limit * (1.0 - tolerance):
-            streak += 1
-        else:
-            break
-    return streak
-
-
-def _row_pre_close(row: pd.Series, closes: pd.Series, index: int) -> float:
-    raw = pd.to_numeric(row.get("pre_close"), errors="coerce")
-    if pd.notna(raw) and float(raw) > 0:
-        return float(raw)
-    if index > 0:
-        previous = closes.iloc[index - 1]
-        if pd.notna(previous) and float(previous) > 0:
-            return float(previous)
-    return 0.0
-
-
-def _index_to_date(ordered: pd.DataFrame, index: int) -> str:
-    try:
-        value = ordered.index[index]
-        return str(value.date())
-    except (AttributeError, IndexError):
-        return ""
+    return consecutive_limit_up_count(
+        bars=bars,
+        symbol=symbol,
+        limit_rule=limit_rule,
+        tolerance=tolerance,
+    )
 
 
 def _normalize_symbols(symbols: list[str]) -> list[str]:

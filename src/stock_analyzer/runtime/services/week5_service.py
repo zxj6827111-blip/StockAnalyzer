@@ -55,6 +55,7 @@ class RuntimeWeek5Service:
         signal_map: dict[str, dict[str, object]],
         trend_signal_map: dict[str, dict[str, object]],
         dual_track: bool,
+        trend_pipeline_duration_ms: int = 0,
     ) -> dict[str, object]:
         """P1 双轨输出：trend_candidates（可执行候选）vs monster_watchlist（观察池）。
 
@@ -63,6 +64,8 @@ class RuntimeWeek5Service:
         - dual_track 模式：final_signals 只来自 trend 轨（含 overextension/
           board_risk 门），monster 轨全部归入 monster_watchlist 且固定
           executable=false。monster_watchlist 保留高动量标的及风险原因。
+        - ``trend_pipeline_duration_ms`` 记录兼容期双跑开销，供 Shadow 对比期
+          量化成本；实现"基础特征只计算一次"后该字段归零。
         """
         final_symbols = [
             str(item.get("symbol", "")).strip()
@@ -82,6 +85,7 @@ class RuntimeWeek5Service:
                 "trend_signal_count": 0,
                 "monster_signal_count": len(signal_map),
                 "final_signals_source": "legacy",
+                "trend_pipeline_duration_ms": 0,
             }
 
         trend_candidates: list[dict[str, object]] = []
@@ -139,6 +143,7 @@ class RuntimeWeek5Service:
             "trend_signal_count": len(trend_signal_map),
             "monster_signal_count": len(signal_map),
             "final_signals_source": "trend",
+            "trend_pipeline_duration_ms": max(0, int(trend_pipeline_duration_ms)),
         }
 
     def _resolve_week5_offhours_scan_profile(
@@ -1984,7 +1989,11 @@ class RuntimeWeek5Service:
             capture_post_scan_enrichment=True,
         )
         trend_report: dict[str, object] | None = None
+        trend_pipeline_duration_ms = 0
         if dual_track:
+            # 兼容期双跑成本：Shadow 对比期以 trend_pipeline_duration_ms 量化
+            # 双 pipeline 开销；满足"基础特征只计算一次"后此字段归零。
+            trend_started = perf_counter()
             trend_report = service.run_pipeline(
                 symbols=symbol_list,
                 strategy="trend",
@@ -1995,6 +2004,9 @@ class RuntimeWeek5Service:
                 on_symbol_progress=_pipeline_heartbeat,
                 transform_max_workers=transform_workers,
                 capture_post_scan_enrichment=True,
+            )
+            trend_pipeline_duration_ms = max(
+                1, int((perf_counter() - trend_started) * 1000)
             )
         trace_id = str(monster_report.get("trace_id", ""))
         if _progress is not None:
@@ -2413,6 +2425,7 @@ class RuntimeWeek5Service:
                 signal_map=signal_map,
                 trend_signal_map=trend_signal_map,
                 dual_track=dual_track,
+                trend_pipeline_duration_ms=trend_pipeline_duration_ms,
             ),
             "anomalies": {
                 "event_count": len(anomalies),

@@ -91,18 +91,24 @@ def evaluate_overextension(
         level = "reject"
         reasons.append("bias_or_atr_distance_reject")
 
-    # 附加风险项：5 日涨幅 / 跳空 / 量价背离
+    # 附加风险项：5 日涨幅 / 跳空 / 量价背离。单独命中时至少升 warn 档
+    # （避免 5 日大涨等过热信号在 low-bias 情况下完全无罚分）。
     ret5 = _numeric(row.get("ret5"), 0.0)
     gap_pct = _numeric(row.get("gap_pct"), 0.0)
     volume_ratio_5d = _numeric(row.get("volume_ratio_5d"), 1.0)
     if ret5 >= config.ret5_warn_threshold:
-        level = max(level, "warn") if level == "warn" else level
+        if level == "none":
+            level = "warn"
         reasons.append("ret5_high")
         penalty = max(penalty, float(config.extra_penalty))
     if gap_pct >= config.gap_warn_threshold:
+        if level == "none":
+            level = "warn"
         reasons.append("large_gap")
         penalty = max(penalty, float(config.extra_penalty))
     if volume_ratio_5d >= config.volume_divergence_ratio and bias > config.bias_warn_min:
+        if level == "none":
+            level = "warn"
         reasons.append("volume_divergence")
         penalty = max(penalty, float(config.extra_penalty))
     metrics.update(

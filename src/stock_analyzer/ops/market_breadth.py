@@ -235,6 +235,7 @@ def breadth_usage_policy(
       monster 仅观察（不可执行）；
     - 正常：返回可用的趋势增强分。
     """
+    now = _as_aware(now)
     if snapshot is None:
         return {
             "block_new_buy": True,
@@ -300,9 +301,16 @@ def breadth_usage_policy(
     }
 
 
+def _as_aware(value: datetime) -> datetime:
+    """Normalize a possibly-naive datetime to UTC-aware (heartbeat/stale math)."""
+    if value.tzinfo is not None:
+        return value.astimezone(UTC)
+    return value.replace(tzinfo=UTC)
+
+
 def _parse_ts(value: object) -> datetime | None:
     if isinstance(value, datetime):
-        return value
+        return _as_aware(value)
     if isinstance(value, str):
         text = value.strip()
         if not text:
@@ -311,7 +319,5 @@ def _parse_ts(value: object) -> datetime | None:
             parsed = datetime.fromisoformat(text)
         except ValueError:
             return None
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=UTC)
-        return parsed
+        return _as_aware(parsed)
     return None
