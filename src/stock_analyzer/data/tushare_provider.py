@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import random
 import re
 import urllib.error
 import urllib.request
@@ -36,25 +37,34 @@ class _TushareProApi(Protocol):
         self,
         *,
         ts_code: str = "",
+        trade_date: str = "",
         start_date: str = "",
         end_date: str = "",
+        offset: int = 0,
+        limit: int = 0,
     ) -> object: ...
 
     def daily_basic(
         self,
         *,
         ts_code: str = "",
+        trade_date: str = "",
         start_date: str = "",
         end_date: str = "",
         fields: str = "",
+        offset: int = 0,
+        limit: int = 0,
     ) -> object: ...
 
     def adj_factor(
         self,
         *,
         ts_code: str = "",
+        trade_date: str = "",
         start_date: str = "",
         end_date: str = "",
+        offset: int = 0,
+        limit: int = 0,
     ) -> object: ...
 
     def trade_cal(
@@ -160,14 +170,42 @@ class _TushareProApi(Protocol):
     ) -> object: ...
 
 
-class _HttpTushareProApi:
-    """Minimal Tushare Pro HTTP client used when the optional SDK is absent."""
+def _non_empty_params(**values: object) -> dict[str, object]:
+    """Filter falsy values from a tushare params dict.
 
-    _API_URL = "http://api.tushare.pro"
+    Empty strings and zero offsets/limits are dropped so the HTTP fallback
+    never sends redundant parameters (tushare rejects some endpoints on
+    empty values).
+    """
+    return {key: value for key, value in values.items() if value}
+
+
+class _HttpTushareProApi:
+    """Minimal Tushare Pro HTTP client used when the optional SDK is absent.
+
+    Primary/secondary hosts are tried in order, but only for transport
+    failures (``URLError``/timeout/connection errors, HTTP 408/425/429 and
+    5xx): authentication, quota and parameter errors (HTTP 4xx client codes
+    and Tushare business ``code != 0``) are never retried against another
+    host, so a 401/额度/参数错误 surfaces immediately instead of being
+    replayed.
+    """
+
+    _API_URLS = ("https://api.tushare.pro", "http://api.tushare.pro")
 
     def __init__(self, *, token: str, timeout_sec: float) -> None:
         self._token = str(token).strip()
         self._timeout_sec = max(0.1, float(timeout_sec))
+        self._host_index = 0
+        self._host_switches = 0
+
+    @property
+    def host(self) -> str:
+        return self._API_URLS[self._host_index]
+
+    @property
+    def host_switches(self) -> int:
+        return self._host_switches
 
     def _call(self, api_name: str, **kwargs: object) -> pd.DataFrame:
         fields = str(kwargs.pop("fields", "") or "")
@@ -178,16 +216,39 @@ class _HttpTushareProApi:
             "params": params,
             "fields": fields,
         }
-        request = urllib.request.Request(
-            self._API_URL,
-            data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=self._timeout_sec) as response:
-            parsed = json.loads(response.read().decode("utf-8"))
-        if not isinstance(parsed, dict):
-            raise DataSourceError(f"tushare {api_name} returned invalid response")
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        last_exc: Exception | None = None
+        parsed: dict[str, object] | None = None
+        for host_index in range(len(self._API_URLS)):
+            if host_index != self._host_index:
+                self._host_switches += 1
+            self._host_index = host_index
+            request = urllib.request.Request(
+                self._API_URLS[host_index],
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=self._timeout_sec) as response:
+                    raw = json.loads(response.read().decode("utf-8"))
+                parsed = raw if isinstance(raw, dict) else None
+                break
+            except urllib.error.HTTPError as exc:
+                code = int(exc.code)
+                if code in _NON_RETRYABLE_HTTP_CODES or (
+                    400 <= code < 500 and code not in _TRANSIENT_HTTP_CODES
+                ):
+                    raise  # 鉴权/额度/参数/资源错误：不切 host
+                last_exc = exc  # 5xx/429/408/425：传输性故障，尝试下一个 host
+                continue
+            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
+                last_exc = exc  # DNS/连接/超时/TLS：传输性故障
+                continue
+        if parsed is None:
+            if last_exc is not None:
+                raise last_exc
+            raise DataSourceError(f"tushare {api_name} http fallback exhausted all hosts")
         if parsed.get("code") != 0:
             msg = str(parsed.get("msg", "") or "").strip()
             raise DataSourceError(f"tushare {api_name} failed: code={parsed.get('code')} msg={msg}")
@@ -204,39 +265,68 @@ class _HttpTushareProApi:
         self,
         *,
         ts_code: str = "",
+        trade_date: str = "",
         start_date: str = "",
         end_date: str = "",
+        offset: int = 0,
+        limit: int = 0,
     ) -> object:
-        return self._call("daily", ts_code=ts_code, start_date=start_date, end_date=end_date)
+        return self._call(
+            "daily",
+            **_non_empty_params(
+                ts_code=ts_code,
+                trade_date=trade_date,
+                start_date=start_date,
+                end_date=end_date,
+                offset=offset,
+                limit=limit,
+            ),
+        )
 
     def daily_basic(
         self,
         *,
         ts_code: str = "",
+        trade_date: str = "",
         start_date: str = "",
         end_date: str = "",
         fields: str = "",
+        offset: int = 0,
+        limit: int = 0,
     ) -> object:
         return self._call(
             "daily_basic",
-            ts_code=ts_code,
-            start_date=start_date,
-            end_date=end_date,
-            fields=fields,
+            **_non_empty_params(
+                ts_code=ts_code,
+                trade_date=trade_date,
+                start_date=start_date,
+                end_date=end_date,
+                fields=fields,
+                offset=offset,
+                limit=limit,
+            ),
         )
 
     def adj_factor(
         self,
         *,
         ts_code: str = "",
+        trade_date: str = "",
         start_date: str = "",
         end_date: str = "",
+        offset: int = 0,
+        limit: int = 0,
     ) -> object:
         return self._call(
             "adj_factor",
-            ts_code=ts_code,
-            start_date=start_date,
-            end_date=end_date,
+            **_non_empty_params(
+                ts_code=ts_code,
+                trade_date=trade_date,
+                start_date=start_date,
+                end_date=end_date,
+                offset=offset,
+                limit=limit,
+            ),
         )
 
     def trade_cal(
@@ -420,6 +510,58 @@ class _HttpTushareProApi:
         )
 
 
+class _SdkWithHttpFallback:
+    """Composite ``pro`` object: SDK first, direct HTTP fallback on transport errors.
+
+    The tushare SDK raises ``requests.exceptions.*`` for transport problems
+    (DNS/connection/timeout/TLS). When such an error escapes an SDK call, the
+    same interface is replayed through the plain-HTTP client instead of
+    surfacing immediately - this is the "SDK 调用失败后才进入直接 HTTP
+    fallback" leg of the network-resilience contract. Host failover inside
+    the HTTP client only reacts to transport failures; auth/quota/parameter
+    errors never trigger a fallback or a host switch.
+    """
+
+    def __init__(
+        self,
+        *,
+        sdk: object,
+        http: _HttpTushareProApi,
+    ) -> None:
+        self._sdk = sdk
+        self._http = http
+        self._fallback_calls = 0
+
+    @property
+    def http_client(self) -> _HttpTushareProApi:
+        return self._http
+
+    @property
+    def fallback_calls(self) -> int:
+        return self._fallback_calls
+
+    def __getattr__(self, name: str) -> object:
+        if name.startswith("_"):
+            raise AttributeError(name)
+        sdk_attr = getattr(self._sdk, name, None)
+        http_attr = getattr(self._http, name, None)
+        if not callable(sdk_attr) and not callable(http_attr):
+            raise AttributeError(name)
+
+        def _invoke(*args: object, **kwargs: object) -> object:
+            try:
+                if callable(sdk_attr):
+                    return sdk_attr(*args, **kwargs)
+                return http_attr(*args, **kwargs)  # type: ignore[misc]
+            except Exception as exc:
+                if not _is_transport_failure(exc) or not callable(http_attr):
+                    raise
+                self._fallback_calls += 1
+                return http_attr(*args, **kwargs)  # type: ignore[misc]
+
+        return _invoke
+
+
 class TushareProvider:
     """Fetch A-share daily bars from Tushare Pro (`pro.daily` + `adj_factor` → qfq).
 
@@ -442,9 +584,12 @@ class TushareProvider:
     - Tushare business errors (``DataSourceError`` from a JSON body
       ``code != 0``) are non-transient: a bad parameter or permission issue
       must not be replayed by text-matching the message.
-    Backoff is ``retry_delay_sec * attempt`` capped at ``max_backoff_sec``
-    (an absolute upper bound, default 32 s) - never an unbounded
-    "32x base" growth.
+    Backoff is exponential ``retry_delay_sec * 2 ** (attempt - 1)`` with
+    ``jitter_ratio`` randomization (±20% by default), capped at an absolute
+    ``max_backoff_sec`` (default 32 s); a backoff that already hit the cap
+    gets no jitter so the absolute upper bound stays stable. A simple
+    circuit breaker trips after ``circuit_breaker_threshold`` consecutive
+    transport failures and skips requests for ``circuit_breaker_open_sec``.
     """
 
     def __init__(
@@ -458,14 +603,19 @@ class TushareProvider:
         price_series_mode: str = "qfq",
         min_request_interval_sec: float | None = None,
         max_backoff_sec: float = _DEFAULT_MAX_BACKOFF_SEC,
+        jitter_ratio: float = 0.2,
+        circuit_breaker_threshold: int = 10,
+        circuit_breaker_open_sec: float = 30.0,
     ) -> None:
         self._token = str(token or "").strip() or _resolve_tushare_token()
         self._pro_api = pro_api
+        self._http_fallback_api: _HttpTushareProApi | None = None
         self._retry_delay_sec = max(0.0, float(retry_delay_sec))
         self._max_attempts = max(1, int(max_attempts))
         self._socket_timeout_sec = max(0.1, float(socket_timeout_sec))
         self._price_series_mode = str(price_series_mode or "qfq").strip().lower() or "qfq"
         self._max_backoff_sec = max(0.0, float(max_backoff_sec))
+        self._jitter_ratio = max(0.0, min(0.5, float(jitter_ratio)))
         self._min_request_interval_sec = max(
             0.0,
             float(
@@ -478,6 +628,20 @@ class TushareProvider:
         self._trade_cal_cache: dict[str, list[date]] = {}
         self._top_list_by_trade_date_cache: dict[str, pd.DataFrame] = {}
         self._top_inst_by_trade_date_cache: dict[str, pd.DataFrame] = {}
+        # --- 网络韧性状态：指数退避 jitter / 熔断器 / 传输指标 ---
+        self._circuit_breaker_threshold = max(1, int(circuit_breaker_threshold))
+        self._circuit_breaker_open_sec = max(0.0, float(circuit_breaker_open_sec))
+        self._circuit_failures = 0
+        self._circuit_open_until: float | None = None
+        self._circuit_open_count = 0
+        self._metrics: dict[str, object] = {
+            "total_attempts": 0,
+            "total_failures": 0,
+            "retryable_failures": 0,
+            "last_transport_error": "",
+            "last_recovery_ms": 0.0,
+            "circuit_rejected": 0,
+        }
 
     def fetch_daily_bars(
         self,
@@ -1046,13 +1210,15 @@ class TushareProvider:
                 "tushare token missing; set market_warehouse.tushare_token or "
                 "SA__MARKET_WAREHOUSE__TUSHARE_TOKEN / TUSHARE_TOKEN"
             )
+        http_api = _HttpTushareProApi(
+            token=self._token,
+            timeout_sec=self._socket_timeout_sec,
+        )
+        self._http_fallback_api = http_api
         try:
             ts = importlib.import_module("tushare")
         except ImportError:
-            self._pro_api = _HttpTushareProApi(
-                token=self._token,
-                timeout_sec=self._socket_timeout_sec,
-            )
+            self._pro_api = http_api
             return self._pro_api
         set_token = getattr(ts, "set_token", None)
         if callable(set_token):
@@ -1060,12 +1226,23 @@ class TushareProvider:
         pro_api = getattr(ts, "pro_api", None)
         if not callable(pro_api):
             raise DataSourceError("tushare.pro_api unavailable")
-        self._pro_api = pro_api(self._token)
+        sdk_pro = pro_api(self._token)
+        # SDK 优先；传输类故障自动经 HTTP 兜底（见 _SdkWithHttpFallback）。
+        self._pro_api = _SdkWithHttpFallback(sdk=sdk_pro, http=http_api)
         return self._pro_api
 
     def _call_with_retry(self, fn: Any) -> object:
+        if self._circuit_is_open():
+            self._metrics["circuit_rejected"] = (
+                int(self._metrics["circuit_rejected"]) + 1
+            )
+            raise DataSourceError("tushare circuit breaker open; skipping request")
         last_error: Exception | None = None
-        for attempt in range(1, self._max_attempts + 1):
+        started = monotonic()
+        attempt = 0
+        while attempt < self._max_attempts:
+            attempt += 1
+            self._metrics["total_attempts"] = int(self._metrics["total_attempts"]) + 1
             # Apply the same cadence to initial calls and retries. The lock prevents
             # hard-timeout worker threads from issuing a burst through one provider.
             with self._request_lock:
@@ -1074,21 +1251,91 @@ class TushareProvider:
                     sleep(self._min_request_interval_sec - elapsed)
                 self._last_request_time = monotonic()
             try:
-                return fn()
+                result = fn()
             except Exception as exc:  # pragma: no cover
                 last_error = exc
-                if attempt >= self._max_attempts:
-                    break
-                if not self._is_retryable_error(exc):
-                    break
-                if self._retry_delay_sec > 0:
-                    backoff = min(
-                        self._retry_delay_sec * attempt,
-                        self._max_backoff_sec,
+                retryable = self._is_retryable_error(exc)
+                self._metrics["total_failures"] = int(self._metrics["total_failures"]) + 1
+                if retryable:
+                    self._metrics["retryable_failures"] = (
+                        int(self._metrics["retryable_failures"]) + 1
                     )
-                    sleep(backoff)
+                    self._metrics["last_transport_error"] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    self._circuit_failures += 1
+                    if self._circuit_failures >= self._circuit_breaker_threshold:
+                        self._open_circuit()
+                else:
+                    # 业务/参数/鉴权错误不是传输故障，不累计熔断计数。
+                    self._circuit_failures = 0
+                if attempt >= self._max_attempts or not retryable:
+                    break
+                backoff = self._backoff_for(attempt)
+                sleep(backoff)
+            else:
+                self._circuit_failures = 0
+                if int(self._metrics["retryable_failures"]) > 0 or attempt > 1:
+                    self._metrics["last_recovery_ms"] = round(
+                        (monotonic() - started) * 1000.0, 3
+                    )
+                return result
         assert last_error is not None
         raise last_error
+
+    def _backoff_for(self, attempt: int) -> float:
+        """Exponential backoff with jitter, capped at the absolute maximum.
+
+        A backoff that already hits ``max_backoff_sec`` receives no jitter so
+        the documented absolute upper bound stays stable (tests rely on it).
+        """
+        base = self._retry_delay_sec * (2 ** (attempt - 1))
+        capped = min(base, self._max_backoff_sec)
+        if capped >= self._max_backoff_sec or self._jitter_ratio <= 0.0 or capped <= 0.0:
+            return capped
+        return capped * random.uniform(1.0 - self._jitter_ratio, 1.0 + self._jitter_ratio)
+
+    def _circuit_is_open(self) -> bool:
+        if self._circuit_open_until is None:
+            return False
+        if monotonic() >= self._circuit_open_until:
+            # 窗口到期自动闭合（half-open 简化：时间驱动）
+            self._circuit_open_until = None
+            self._circuit_failures = 0
+            return False
+        return True
+
+    def _open_circuit(self) -> None:
+        self._circuit_open_until = monotonic() + self._circuit_breaker_open_sec
+        self._circuit_open_count += 1
+        self._circuit_failures = 0
+
+    def network_metrics(self) -> dict[str, object]:
+        """Observability snapshot: attempts, transport failures, recovery, circuit."""
+        http = self._http_fallback_api
+        composite = self._pro_api
+        fallback_calls = 0
+        if isinstance(composite, _SdkWithHttpFallback):
+            fallback_calls = composite.fallback_calls
+        host = ""
+        host_switches = 0
+        if http is not None:
+            host = http.host
+            host_switches = http.host_switches
+        circuit_state = "closed"
+        if self._circuit_open_until is not None and monotonic() < self._circuit_open_until:
+            circuit_state = "open"
+        return {
+            **dict(self._metrics),
+            "circuit": {
+                "state": circuit_state,
+                "consecutive_failures": self._circuit_failures,
+                "open_count": self._circuit_open_count,
+                "open_until": self._circuit_open_until,
+            },
+            "http": {"host": host, "host_switches": host_switches},
+            "sdk_http_fallback_calls": fallback_calls,
+        }
 
     def _is_retryable_error(self, exc: Exception) -> bool:
         """Classify exceptions for bounded retry.
@@ -1097,8 +1344,8 @@ class TushareProvider:
         first: HTTP 4xx client errors (bad parameters, auth/permission
         problems, missing resources) are non-transient, HTTP 408/425/429 and
         all 5xx are transient, while plain ``URLError`` (DNS, timeout,
-        connection reset/refused) remains transient. Tushare business errors
-        already wrapped in ``DataSourceError`` are never retried. Only
+        connection reset/refused, TLS) remains transient. Tushare business
+        errors already wrapped in ``DataSourceError`` are never retried. Only
         explicit network-layer error types are transient: generic ``OSError``
         (e.g. ``FileNotFoundError``, ``PermissionError``) is not.
 
@@ -1109,43 +1356,7 @@ class TushareProvider:
         subclass, not the builtin ``ConnectionError``, so it must be matched
         explicitly).
         """
-        import socket as _socket
-
-        if isinstance(exc, urllib.error.HTTPError):
-            code = int(exc.code)
-            if code in _TRANSIENT_HTTP_CODES or code >= 500:
-                return True
-            if code in _NON_RETRYABLE_HTTP_CODES or 400 <= code < 500:
-                return False
-            return False
-        if isinstance(exc, DataSourceError):
-            return False
-        if isinstance(exc, urllib.error.URLError):
-            return True
-        if isinstance(exc, TimeoutError):
-            return True
-        if isinstance(exc, ConnectionError):
-            return True
-        if isinstance(exc, (_socket.gaierror, _socket.herror, BrokenPipeError)):
-            return True
-        try:
-            import requests  # type: ignore[import-untyped]
-        except ImportError:
-            return False
-        if isinstance(exc, requests.exceptions.HTTPError):
-            response = getattr(exc, "response", None)
-            status = getattr(response, "status_code", None)
-            if isinstance(status, int):
-                if status in _TRANSIENT_HTTP_CODES or status >= 500:
-                    return True
-                if status in _NON_RETRYABLE_HTTP_CODES or 400 <= status < 500:
-                    return False
-            return False
-        if isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
-            return True
-        if isinstance(exc, requests.exceptions.RequestException):
-            return False
-        return False
+        return _is_transport_failure(exc)
 
     def _lookup_name(self, *, pro: _TushareProApi, ts_code: str, code6: str) -> str:
         cached = self._name_cache.get(code6)
@@ -1197,6 +1408,59 @@ def _coerce_frame(raw: object) -> pd.DataFrame:
     if isinstance(raw, pd.DataFrame):
         return raw.copy()
     return pd.DataFrame()
+
+
+def _is_transport_failure(exc: Exception) -> bool:
+    """Whether an exception is a transient transport-layer failure.
+
+    Shared classification used by the retry loop, the SDK→HTTP fallback
+    composite and the HTTP host failover. DNS/connection/timeout/TLS errors,
+    HTTP 408/425/429 and all 5xx are transport failures; HTTP 4xx client
+    errors, Tushare business errors and generic OSError subtypes are not.
+    """
+    import socket as _socket
+
+    if isinstance(exc, urllib.error.HTTPError):
+        code = int(exc.code)
+        if code in _TRANSIENT_HTTP_CODES or code >= 500:
+            return True
+        if code in _NON_RETRYABLE_HTTP_CODES or 400 <= code < 500:
+            return False
+        return False
+    if isinstance(exc, DataSourceError):
+        return False
+    if isinstance(exc, urllib.error.URLError):
+        return True
+    if isinstance(exc, TimeoutError):
+        return True
+    if isinstance(exc, ConnectionError):
+        return True
+    if isinstance(exc, (_socket.gaierror, _socket.herror, BrokenPipeError)):
+        return True
+    try:
+        import requests  # type: ignore[import-untyped]
+    except ImportError:
+        return False
+    if isinstance(exc, requests.exceptions.HTTPError):
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        if isinstance(status, int):
+            if status in _TRANSIENT_HTTP_CODES or status >= 500:
+                return True
+            if status in _NON_RETRYABLE_HTTP_CODES or 400 <= status < 500:
+                return False
+        return False
+    if isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+        return True
+    if isinstance(exc, requests.exceptions.RequestException):
+        return False
+    # TLS handshake / cert errors (urllib raises urllib.error.URLError, but
+    # requests raises ssl.SSLError which is not a RequestException subclass).
+    import ssl as _ssl
+
+    if isinstance(exc, _ssl.SSLError):
+        return True
+    return False
 
 
 def _apply_price_adjust(
