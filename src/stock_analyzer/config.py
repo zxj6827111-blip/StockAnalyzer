@@ -340,6 +340,24 @@ class MonsterRiskConfig(_StrictModel):
     disable_if_sentiment_below: float = 45.0
 
 
+class OverextensionConfig(_StrictModel):
+    """统一过热风险模型（bars/snapshot 共用同一套阈值）。
+
+    乖离（bias_ma5）与 ATR 距离分层扣罚；达到 reject 档时 trend 轨拒绝新买入
+    （monster 观察池仍可保留）。5 日涨幅/跳空/量价背离作为附加风险项。
+    """
+
+    bias_warn_min: float = 0.10
+    bias_reject_min: float = 0.15
+    atr_distance_warn: float = 2.0
+    atr_distance_reject: float = 3.0
+    bias_penalty: float = 0.3
+    ret5_warn_threshold: float = 0.30
+    gap_warn_threshold: float = 0.07
+    volume_divergence_ratio: float = 2.5
+    extra_penalty: float = 0.05
+
+
 class Week5Config(_StrictModel):
     enabled: bool = True
     auto_run: bool = True
@@ -1443,6 +1461,7 @@ class StockAnalyzerConfig(_StrictModel):
     capital_curve: CapitalCurveConfig
     circuit_breaker: CircuitBreakerConfig
     monster_risk: MonsterRiskConfig = Field(default_factory=MonsterRiskConfig)
+    overextension: OverextensionConfig = Field(default_factory=OverextensionConfig)
     week5: Week5Config = Field(default_factory=Week5Config)
     holiday_risk: HolidayRiskConfig = Field(default_factory=HolidayRiskConfig)
     global_market: GlobalMarketConfig = Field(default_factory=GlobalMarketConfig)

@@ -38,20 +38,35 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from stock_analyzer.config import StockAnalyzerConfig
+from stock_analyzer.config import LimitRuleConfig, StockAnalyzerConfig
+from stock_analyzer.data.limit_rule import build_price_limits
 from stock_analyzer.feature.engineer import FeatureEngineer
 
-FORMAT_VERSION = 1
+# v2: 新增 P1 过热风险 raw 列（ma5/ma10/atr14/bias_ma5/bias_ma10/ret5/
+# gap_pct/volume_ratio_5d/consecutive_limit_up）。schema hash 基于
+# FeatureEngineer 输出列自动派生，但 raw 列集变更不会改变该 hash，故手工
+# bump：部署后强制全量重建一次快照（见 PLAN「修改 raw snapshot schema 时
+# 同步扩展 schema hash 并 bump FORMAT_VERSION」）。
+FORMAT_VERSION = 2
 SNAPSHOT_FILENAME = "market_features.parquet"
 
 # Raw columns stored alongside the engineered features so the light-stage
 # scoring is byte-identical to the direct bars path.
 RAW_SNAPSHOT_COLUMNS = (
     "latest_close",
+    "ma5",
+    "ma10",
     "ma20",
     "ma60",
     "ma120",
     "ma240",
+    "atr14",
+    "bias_ma5",
+    "bias_ma10",
+    "ret5",
+    "gap_pct",
+    "volume_ratio_5d",
+    "consecutive_limit_up",
     "ret20",
     "ret60",
     "ret120",
@@ -1569,7 +1584,7 @@ def _snapshot_row_for_symbol(
     if features is None or features.empty:
         return None
     latest_features = features.iloc[-1]
-    raw = _raw_snapshot_values(bars=bars, features=latest_features)
+    raw = _raw_snapshot_values(bars=bars, features=latest_features, symbol=symbol)
     if raw is None:
         return None
     payload: dict[str, object] = {
@@ -1586,6 +1601,7 @@ def _raw_snapshot_values(
     *,
     bars: pd.DataFrame,
     features: pd.Series,
+    symbol: str,
 ) -> dict[str, object] | None:
     """Latest-window raw metrics equivalent to the direct bars path."""
     ordered = bars if bars.index.is_monotonic_increasing else bars.sort_index()
@@ -1594,10 +1610,13 @@ def _raw_snapshot_values(
         return None
     latest_close = float(close.iloc[-1])
     close_count = len(close)
+    ma5 = float(close.tail(min(5, close_count)).mean())
+    ma10 = float(close.tail(min(10, close_count)).mean())
     ma20 = float(close.tail(min(20, close_count)).mean())
     ma60 = float(close.tail(min(60, close_count)).mean())
     ma120 = float(close.tail(min(120, close_count)).mean())
     ma240 = float(close.tail(min(240, close_count)).mean())
+    ret5 = _ret_at(close, 5)
     ret20 = _ret_at(close, 20)
     ret60 = _ret_at(close, 60)
     ret120 = _ret_at(close, 120)
@@ -1621,6 +1640,11 @@ def _raw_snapshot_values(
         (high - low) / close.replace(0.0, np.nan)
     ).replace([np.inf, -np.inf], np.nan)
     atr_ratio = atr_ratio.fillna(0.0)
+    atr14 = (
+        float(atr_ratio.tail(min(14, len(atr_ratio))).mean())
+        if not atr_ratio.empty
+        else 0.0
+    )
     atr_20d = (
         float(atr_ratio.tail(min(20, len(atr_ratio))).mean())
         if not atr_ratio.empty
@@ -1641,12 +1665,33 @@ def _raw_snapshot_values(
     northbound_20 = float(features.get("northbound_net_20", 0.0))
     dragon_freq = float(features.get("bg_dragon_tiger_freq20", 0.0))
     latest_bar = ordered.iloc[-1] if not ordered.empty else None
+    # --- P1 过热风险 raw 列 ---
+    bias_ma5 = (latest_close / ma5 - 1.0) if ma5 > 0 else 0.0
+    bias_ma10 = (latest_close / ma10 - 1.0) if ma10 > 0 else 0.0
+    latest_open = _latest_open(ordered)
+    latest_pre_close = _latest_pre_close(ordered)
+    gap_pct = (latest_open / latest_pre_close - 1.0) if latest_pre_close > 0 else 0.0
+    volume_ratio_5d = (volume_5d / volume_20d) if volume_20d > 0 else 1.0
+    consecutive_limit_up = _limit_up_streak(
+        bars=ordered,
+        symbol=symbol,
+        limit_rule=LimitRuleConfig(),
+    )
     return {
         "latest_close": latest_close,
+        "ma5": ma5,
+        "ma10": ma10,
         "ma20": ma20,
         "ma60": ma60,
         "ma120": ma120,
         "ma240": ma240,
+        "atr14": atr14,
+        "bias_ma5": bias_ma5,
+        "bias_ma10": bias_ma10,
+        "ret5": ret5,
+        "gap_pct": gap_pct,
+        "volume_ratio_5d": volume_ratio_5d,
+        "consecutive_limit_up": consecutive_limit_up,
         "ret20": ret20,
         "ret60": ret60,
         "ret120": ret120,
@@ -1714,6 +1759,89 @@ def _ret_at(close: pd.Series, window: int) -> float:
     if start <= 0:
         return 0.0
     return float(close.iloc[-1]) / start - 1.0
+
+
+def _latest_open(ordered: pd.DataFrame) -> float:
+    if "open" not in ordered.columns or ordered.empty:
+        return 0.0
+    return float(pd.to_numeric(ordered["open"], errors="coerce").iloc[-1])
+
+
+def _latest_pre_close(ordered: pd.DataFrame) -> float:
+    if ordered.empty:
+        return 0.0
+    if "pre_close" in ordered.columns:
+        value = pd.to_numeric(ordered["pre_close"], errors="coerce").iloc[-1]
+        if pd.notna(value) and float(value) > 0:
+            return float(value)
+    closes = pd.to_numeric(ordered["close"], errors="coerce")
+    if len(closes) >= 2:
+        previous = closes.iloc[-2]
+        if pd.notna(previous) and float(previous) > 0:
+            return float(previous)
+    return 0.0
+
+
+def _limit_up_streak(
+    *,
+    bars: pd.DataFrame,
+    symbol: str,
+    limit_rule: LimitRuleConfig,
+    tolerance: float = 0.001,
+) -> int:
+    """Consecutive limit-up days counting back from the latest bar.
+
+    Reuses ``build_price_limits`` (source first, then board/ST/date rules) so
+    the streak matches the execution layer's tradability view instead of a
+    fixed 9.5% threshold. A close reaching the up-limit price within the
+    tolerance counts as a limit-up day (PLAN: 收盘价达到涨停价容差范围才计入).
+    """
+    ordered = bars if bars.index.is_monotonic_increasing else bars.sort_index()
+    closes = pd.to_numeric(ordered.get("close"), errors="coerce")
+    if closes is None or closes.empty:
+        return 0
+    streak = 0
+    for index in range(len(ordered) - 1, -1, -1):
+        row = ordered.iloc[index]
+        close = pd.to_numeric(row.get("close"), errors="coerce")
+        if pd.isna(close) or float(close) <= 0:
+            break
+        bar = {
+            "close": float(close),
+            "pre_close": _row_pre_close(row, closes, index),
+            "board": str(row.get("board", "") or ""),
+            "is_st": bool(row.get("is_st", False)),
+            "name": str(row.get("name", "") or ""),
+            "trade_date": _index_to_date(ordered, index),
+            "symbol": symbol,
+        }
+        limits = build_price_limits(bar=bar, config=limit_rule)
+        if limits.up_limit is None:
+            break
+        if float(close) >= limits.up_limit * (1.0 - tolerance):
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def _row_pre_close(row: pd.Series, closes: pd.Series, index: int) -> float:
+    raw = pd.to_numeric(row.get("pre_close"), errors="coerce")
+    if pd.notna(raw) and float(raw) > 0:
+        return float(raw)
+    if index > 0:
+        previous = closes.iloc[index - 1]
+        if pd.notna(previous) and float(previous) > 0:
+            return float(previous)
+    return 0.0
+
+
+def _index_to_date(ordered: pd.DataFrame, index: int) -> str:
+    try:
+        value = ordered.index[index]
+        return str(value.date())
+    except (AttributeError, IndexError):
+        return ""
 
 
 def _normalize_symbols(symbols: list[str]) -> list[str]:
