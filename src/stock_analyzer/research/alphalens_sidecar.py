@@ -96,7 +96,12 @@ def run_alphalens_sidecar(
             sample = sample.dropna(subset=[f"_ret_{horizon}"])
             if sample.empty:
                 continue
-            ic = _rank_ic(sample["_factor"], sample[f"_ret_{horizon}"])
+            ic_series = _cross_sectional_rank_ic(
+                factor=sample["_factor"],
+                returns=sample[f"_ret_{horizon}"],
+                dates=sample[date_col],
+            )
+            ic_summary = _ic_summary(ic_series)
             spread = _quantile_spread(
                 sample["_factor"],
                 sample[f"_ret_{horizon}"],
@@ -106,7 +111,10 @@ def run_alphalens_sidecar(
                 {
                     "horizon": horizon,
                     "samples": int(len(sample)),
-                    "rank_ic": round(ic, 6),
+                    "rank_ic": round(ic_summary["mean"], 6),
+                    "rank_ic_std": round(ic_summary["std"], 6),
+                    "icir": round(ic_summary["icir"], 6),
+                    "cross_sectional_days": ic_summary["days"],
                     "quantile_return_spread": round(spread, 6),
                 }
             )
@@ -165,6 +173,41 @@ def _rank_ic(left: pd.Series, right: pd.Series) -> float:
     ranked_right = right.rank(method="average")
     corr = ranked_left.corr(ranked_right)
     return float(corr) if corr == corr else 0.0
+
+
+def _cross_sectional_rank_ic(
+    *,
+    factor: pd.Series,
+    returns: pd.Series,
+    dates: pd.Series,
+) -> pd.Series:
+    """Per-trading-date cross-sectional RankIC series.
+
+    The previous implementation pooled every row into one Spearman across all
+    dates, which is not how factor IC is evaluated.  This computes one RankIC
+    per trading date (factor vs forward return within that date's
+    cross-section) so callers can see the IC time series and its stability.
+    Dates with fewer than two rows are dropped: a single-row cross-section has
+    no rank correlation.
+    """
+    frame = pd.DataFrame({"date": dates, "factor": factor, "ret": returns}).dropna()
+    if frame.empty:
+        return pd.Series(dtype=float)
+    ics: dict[object, float] = {}
+    for trading_date, group in frame.groupby("date"):
+        if len(group) < 2:
+            continue
+        ics[trading_date] = _rank_ic(group["factor"], group["ret"])
+    return pd.Series(ics, dtype=float)
+
+
+def _ic_summary(ic_series: pd.Series) -> dict[str, float]:
+    if ic_series.empty:
+        return {"mean": 0.0, "std": 0.0, "icir": 0.0, "days": 0.0}
+    mean = float(ic_series.mean())
+    std = float(ic_series.std(ddof=1)) if len(ic_series) > 1 else 0.0
+    icir = mean / std if std > 1e-9 else 0.0
+    return {"mean": mean, "std": std, "icir": icir, "days": float(len(ic_series))}
 
 
 def _quantile_spread(factor: pd.Series, returns: pd.Series, quantiles: int) -> float:

@@ -24,7 +24,11 @@ from stock_analyzer.feature.engineer import FeatureEngineer
 from stock_analyzer.feature.market_context import build_market_relative_frame
 from stock_analyzer.labels.soup import build_soup_labels
 from stock_analyzer.models.predictor import SignalPredictor
-from stock_analyzer.models.trainer import ModelTrainer
+from stock_analyzer.models.trainer import (
+    ModelTrainer,
+    _binary_auc,
+    _precision_recall_at_k,
+)
 from stock_analyzer.time_semantics import apply_time_invariants_to_frame
 
 
@@ -173,6 +177,7 @@ class WalkForwardEngine:
 
             predictions: list[int] = []
             actuals: list[int] = []
+            meta_probs: list[float] = []
             trades = 0
             wins = 0
             skipped_slippage = 0
@@ -186,6 +191,7 @@ class WalkForwardEngine:
                 actual = int(label_value >= 0.5)
                 predictions.append(pred)
                 actuals.append(actual)
+                meta_probs.append(float(probs.get("meta", 0.5)))
 
                 if pred != 1:
                     continue
@@ -273,12 +279,29 @@ class WalkForwardEngine:
                 equity *= max(0.01, 1.0 + net_return)
 
             accuracy = float(np.mean(np.asarray(predictions) == np.asarray(actuals)))
+            y_test = np.asarray(actuals, dtype=float)
+            meta_test = np.asarray(meta_probs, dtype=float)
+            y_binary = (y_test >= 0.5).astype(float)
+            test_auc = _binary_auc(y_binary, meta_test)
+            test_brier = float(np.mean((meta_test - y_binary) ** 2))
+            test_precision_at_k, test_recall_at_k = _precision_recall_at_k(
+                y_true=y_binary,
+                probabilities=meta_test,
+                top_ratio=max(0.01, float(self._training.precision_at_k_ratio)),
+            )
+            positive_probs = meta_test[y_binary >= 0.5]
+            negative_probs = meta_test[y_binary < 0.5]
+            test_mean_prob_spread = (
+                float(positive_probs.mean() - negative_probs.mean())
+                if len(positive_probs) and len(negative_probs)
+                else 0.0
+            )
             folds.append(
                 FoldReport(
                     fold_id=fold_id,
                     train_samples=len(train_slice),
                     calibration_samples=result.samples_calibration,
-                    test_samples=result.samples_test,
+                    test_samples=len(test_slice),
                     embargo_days=int(
                         _as_float(
                             result.metrics.get("embargo_days"),
@@ -286,11 +309,11 @@ class WalkForwardEngine:
                         )
                     ),
                     accuracy=round(accuracy, 6),
-                    auc=_as_float(result.metrics.get("auc"), default=0.5),
-                    brier=_as_float(result.metrics.get("brier"), default=0.0),
-                    precision_at_k=_as_float(result.metrics.get("precision_at_k"), default=0.0),
-                    recall_at_k=_as_float(result.metrics.get("recall_at_k"), default=0.0),
-                    mean_prob_spread=_as_float(result.metrics.get("mean_prob_spread"), default=0.0),
+                    auc=round(test_auc, 6),
+                    brier=round(test_brier, 6),
+                    precision_at_k=round(test_precision_at_k, 6),
+                    recall_at_k=round(test_recall_at_k, 6),
+                    mean_prob_spread=round(test_mean_prob_spread, 6),
                     trade_count=trades,
                     win_count=wins,
                     skipped_slippage=skipped_slippage,

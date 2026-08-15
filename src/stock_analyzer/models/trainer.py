@@ -185,6 +185,7 @@ class ModelTrainer:
             fidelity_filter=normalized_fidelity,
             calibration_ratio=max(0.0, float(self._training.calibration_ratio)),
             test_ratio=max(0.0, float(self._training.test_ratio)),
+            embargo_days=max(0, int(self._labels.horizon_days) + self._settlement_lag_days),
         )
         return self.train_on_dataset_manifest(
             store=store,

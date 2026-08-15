@@ -617,6 +617,11 @@ class LearningBackfillEngine:
             maturity_statuses=effective_maturity,
             calibration_ratio=effective_calibration_ratio,
             test_ratio=effective_test_ratio,
+            embargo_days=max(
+                0,
+                int(self._config.labels.horizon_days)
+                + max(0, int(getattr(self._config.evolution.execution_spec, "settlement_lag", 1))),
+            ),
         )
         split_counts = {
             item.split_name: int(item.row_count) for item in manifest.split_plan
