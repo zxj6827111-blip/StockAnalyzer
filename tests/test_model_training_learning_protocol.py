@@ -5,11 +5,11 @@ from pathlib import Path
 
 from stock_analyzer.config import load_config
 from stock_analyzer.learning.dataset_manifest import DatasetManifestBuilder
+from stock_analyzer.learning.feature_schema_registry import FeatureSchemaRegistry
 from stock_analyzer.learning.feedback_features import (
     LEARNING_PROTOCOL_FEEDBACK_FEATURE_COLUMNS,
     merge_feedback_feature_vector,
 )
-from stock_analyzer.learning.feature_schema_registry import FeatureSchemaRegistry
 from stock_analyzer.learning.label_policy_registry import LabelPolicyRegistry
 from stock_analyzer.learning.sample_schema import (
     BackfillFidelityTier,
@@ -171,7 +171,7 @@ def test_model_trainer_uses_projection_compatible_legacy_snapshots_from_sample_s
 
     base_time = datetime(2026, 1, 1, 14, 30, tzinfo=UTC)
     for index in range(16):
-        decision_time = base_time + timedelta(days=index)
+        decision_time = base_time + timedelta(days=index * 20)
         store.write_snapshot(
             SignalSnapshot(
                 snapshot_id=f"legacy-snap-{index:03d}",
@@ -203,7 +203,7 @@ def test_model_trainer_uses_projection_compatible_legacy_snapshots_from_sample_s
             )
         )
     for index in range(8):
-        decision_time = base_time + timedelta(days=30 + index)
+        decision_time = base_time + timedelta(days=(16 + index) * 20)
         store.write_snapshot(
             SignalSnapshot(
                 snapshot_id=f"current-snap-{index:03d}",
@@ -304,7 +304,7 @@ def _build_learning_protocol_fixture(
             code_version="git:test",
             symbol="600000.SH",
             strategy="trend",
-            decision_time=base_time + timedelta(days=index),
+            decision_time=base_time + timedelta(days=index * 20),
             feature_vector=merge_feedback_feature_vector(
                 {
                     "feature_b": float(index % 7),

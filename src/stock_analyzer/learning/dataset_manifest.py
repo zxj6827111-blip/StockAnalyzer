@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 from stock_analyzer.learning.feature_schema_registry import FeatureSchemaRegistry
 from stock_analyzer.learning.sample_schema import (
@@ -55,8 +55,19 @@ class DatasetManifestBuilder:
         maturity_statuses: Sequence[MaturityStatus] | None = None,
         calibration_ratio: float = 0.1,
         test_ratio: float = 0.1,
+        embargo_days: int = 0,
     ) -> DatasetManifest:
-        """Create or reuse one deterministic manifest and persist its membership."""
+        """Create or reuse one deterministic manifest and persist its membership.
+
+        ``embargo_days`` enables trading-date-grouped splits plus a label-window
+        purge: a training/calibration sample whose label matures on or after the
+        next split's start is dropped, so its future price path never leaks into
+        the evaluation window.  The purge prefers the outcome's real
+        ``label_mature_time`` and falls back to ``decision_time + embargo_days``
+        natural days only when that field is missing.  ``embargo_days <= 0``
+        preserves the legacy row-count split for callers that do not pass a
+        horizon.
+        """
 
         normalized_fidelity = _normalize_fidelity_filter(fidelity_filter)
         normalized_maturity = _normalize_maturity_statuses(maturity_statuses)
@@ -95,6 +106,7 @@ class DatasetManifestBuilder:
             included_pairs=included_pairs,
             calibration_ratio=calibration_ratio,
             test_ratio=test_ratio,
+            embargo_days=embargo_days,
         )
         selection_rule = (
             sample_selection_rule.strip()
@@ -227,30 +239,123 @@ def _build_manifest_items_and_split_plan(
     included_pairs: Sequence[tuple[SignalSnapshot, OutcomeRecord]],
     calibration_ratio: float,
     test_ratio: float,
+    embargo_days: int = 0,
 ) -> tuple[list[dict[str, object]], list[DatasetSplitPlanEntry]]:
     ordered_pairs = sorted(
         included_pairs,
         key=lambda pair: (pair[0].decision_time, pair[0].snapshot_id),
     )
-    split_names = _assign_temporal_splits(
-        total_rows=len(ordered_pairs),
+    if embargo_days <= 0:
+        split_names = _assign_temporal_splits(
+            total_rows=len(ordered_pairs),
+            calibration_ratio=calibration_ratio,
+            test_ratio=test_ratio,
+        )
+        items: list[dict[str, object]] = []
+        split_times: dict[str, list[datetime]] = {}
+        for ordinal, ((snapshot, _outcome), split_name) in enumerate(
+            zip(ordered_pairs, split_names, strict=False)
+        ):
+            items.append(_manifest_item(snapshot, split_name, ordinal))
+            split_times.setdefault(split_name, []).append(snapshot.decision_time)
+        return items, _build_split_plan(split_times)
+
+    return _build_grouped_split_and_purge(
+        ordered_pairs=ordered_pairs,
+        calibration_ratio=calibration_ratio,
+        test_ratio=test_ratio,
+        embargo_days=embargo_days,
+    )
+
+
+def _build_grouped_split_and_purge(
+    *,
+    ordered_pairs: list[tuple[SignalSnapshot, OutcomeRecord]],
+    calibration_ratio: float,
+    test_ratio: float,
+    embargo_days: int,
+) -> tuple[list[dict[str, object]], list[DatasetSplitPlanEntry]]:
+    """Trade-date-grouped split with a label-window purge.
+
+    Rows of the same trading date always share one split (no same-date leakage
+    across the train/calibration/test boundary), and any sample whose label
+    window is not fully matured by the next split's start is purged so future
+    price action never contaminates the evaluation set.
+    """
+    date_order: list[date] = []
+    date_rows: dict[date, list[tuple[SignalSnapshot, OutcomeRecord]]] = {}
+    for snapshot, outcome in ordered_pairs:
+        trading_date = snapshot.decision_time.date()
+        if trading_date not in date_rows:
+            date_rows[trading_date] = []
+            date_order.append(trading_date)
+        date_rows[trading_date].append((snapshot, outcome))
+    date_order.sort()
+
+    date_split = _assign_temporal_splits_by_date(
+        dates=date_order,
         calibration_ratio=calibration_ratio,
         test_ratio=test_ratio,
     )
+
+    calibration_start = _min_decision_time(date_rows, date_split, "calibration")
+    test_start = _min_decision_time(date_rows, date_split, "test")
+
     items: list[dict[str, object]] = []
     split_times: dict[str, list[datetime]] = {}
-    for ordinal, ((snapshot, _outcome), split_name) in enumerate(
-        zip(ordered_pairs, split_names, strict=False)
-    ):
-        item = {
-            "snapshot_id": snapshot.snapshot_id,
-            "split_name": split_name,
-            "ordinal": ordinal,
-            "decision_time": snapshot.decision_time,
-        }
-        items.append(item)
-        split_times.setdefault(split_name, []).append(snapshot.decision_time)
+    ordinal = 0
+    for trading_date in date_order:
+        split_name = date_split[trading_date]
+        for snapshot, outcome in date_rows[trading_date]:
+            label_mature = outcome.label_mature_time
+            purge_time = (
+                label_mature
+                if label_mature is not None
+                else snapshot.decision_time + timedelta(days=max(1, embargo_days))
+            )
+            # Purge when the label window reaches into the following split. The
+            # label window is [decision_time, label_mature_time): a label that
+            # matures exactly at the next split's start has not observed any of
+            # that split's bars, so it is safe to keep.
+            if (
+                split_name == "train"
+                and calibration_start is not None
+                and purge_time > calibration_start
+            ):
+                continue
+            if split_name == "calibration" and test_start is not None and purge_time > test_start:
+                continue
+            items.append(_manifest_item(snapshot, split_name, ordinal))
+            ordinal += 1
+            split_times.setdefault(split_name, []).append(snapshot.decision_time)
 
+    return items, _build_split_plan(split_times)
+
+
+def _manifest_item(snapshot: SignalSnapshot, split_name: str, ordinal: int) -> dict[str, object]:
+    return {
+        "snapshot_id": snapshot.snapshot_id,
+        "split_name": split_name,
+        "ordinal": ordinal,
+        "decision_time": snapshot.decision_time,
+    }
+
+
+def _min_decision_time(
+    date_rows: dict[date, list[tuple[SignalSnapshot, OutcomeRecord]]],
+    date_split: dict[date, str],
+    split_name: str,
+) -> datetime | None:
+    times = [
+        snapshot.decision_time
+        for trading_date, split in date_split.items()
+        if split == split_name
+        for snapshot, _outcome in date_rows[trading_date]
+    ]
+    return min(times) if times else None
+
+
+def _build_split_plan(split_times: dict[str, list[datetime]]) -> list[DatasetSplitPlanEntry]:
     split_plan: list[DatasetSplitPlanEntry] = []
     for split_name in ("train", "calibration", "test"):
         times = split_times.get(split_name, [])
@@ -265,7 +370,58 @@ def _build_manifest_items_and_split_plan(
                 end_time=max(times),
             )
         )
-    return items, split_plan
+    return split_plan
+
+
+def _assign_temporal_splits_by_date(
+    *,
+    dates: Sequence[date],
+    calibration_ratio: float,
+    test_ratio: float,
+) -> dict[date, str]:
+    """Assign whole trading-date groups chronologically to train/cal/test.
+
+    Date counts (not row counts) drive the ratios so every row of one trading
+    date lands in the same split.  Small date counts degrade gracefully to keep
+    all three splits non-empty where possible.
+    """
+    ordered = list(dates)
+    total = len(ordered)
+    if total == 0:
+        return {}
+    if total == 1:
+        return {ordered[0]: "train"}
+    if total == 2:
+        return {ordered[0]: "train", ordered[1]: "test"}
+
+    calibration_count = max(1, int(round(total * max(0.0, calibration_ratio))))
+    test_count = max(1, int(round(total * max(0.0, test_ratio))))
+    while calibration_count + test_count >= total:
+        if calibration_count >= test_count and calibration_count > 1:
+            calibration_count -= 1
+            continue
+        if test_count > 1:
+            test_count -= 1
+            continue
+        break
+    train_count = total - calibration_count - test_count
+    if train_count < 1:
+        # Not enough dates for three sets: shrink calibration to keep a train set.
+        train_count = 1
+        calibration_count = max(0, total - train_count - test_count)
+
+    result: dict[date, str] = {}
+    position = 0
+    for _ in range(train_count):
+        result[ordered[position]] = "train"
+        position += 1
+    for _ in range(calibration_count):
+        result[ordered[position]] = "calibration"
+        position += 1
+    for _ in range(test_count):
+        result[ordered[position]] = "test"
+        position += 1
+    return result
 
 
 def _assign_temporal_splits(

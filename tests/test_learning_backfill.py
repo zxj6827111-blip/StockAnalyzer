@@ -160,7 +160,7 @@ def _seed_projection_compatible_trainable_samples(
     base_time = datetime(2026, 1, 1, 15, 0, tzinfo=UTC)
 
     for index in range(legacy_rows):
-        decision_time = base_time + timedelta(days=index)
+        decision_time = base_time + timedelta(days=index * 20)
         snapshot = SignalSnapshot(
             snapshot_id=f"{symbol}-legacy-trainable-{index:03d}",
             code_version="git:test",
@@ -193,7 +193,7 @@ def _seed_projection_compatible_trainable_samples(
         store.upsert_outcome(outcome)
 
     for index in range(current_rows):
-        decision_time = base_time + timedelta(days=legacy_rows + index)
+        decision_time = base_time + timedelta(days=(legacy_rows + index) * 20)
         snapshot = SignalSnapshot(
             snapshot_id=f"{symbol}-current-trainable-{index:03d}",
             code_version="git:test",

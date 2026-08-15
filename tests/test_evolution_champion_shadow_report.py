@@ -151,7 +151,7 @@ def _build_learning_protocol_fixture(
             code_version="git:test",
             symbol="600000.SH" if index % 2 == 0 else "000001.SZ",
             strategy="trend",
-            decision_time=base_time + timedelta(days=index),
+            decision_time=base_time + timedelta(days=index * 20),
             feature_vector={
                 "feature_b": float(index % 7),
                 "feature_a": float((index % 3) / 3.0),

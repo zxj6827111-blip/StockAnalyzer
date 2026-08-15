@@ -48,6 +48,9 @@ def _load_test_config(base_dir: Path | None = None) -> StockAnalyzerConfig:
     config.training.bootstrap_state_path = str(temp_root / "test_bootstrap_state.json")
     config.training.artifact_path = str(temp_root / "protocol_model.json")
     config.training.min_samples = 20
+    # 缩小标签 horizon，使 1 天间隔的合成样本标签窗口不跨切分边界
+    # （embargo purge 生效后需要留出足够的无污染样本）。
+    config.labels.horizon_days = 2
     config.command_channel.state_persist_enabled = False
     config.command_channel.history_archive_enabled = False
     config.evolution.auto_run = False
@@ -85,6 +88,9 @@ def _seed_learning_protocol_samples(
         code_version="git:test",
     )
     label_record = service._label_policy_registry.register_from_config(service._config.labels)
+    # horizon_days 已缩小为 2（见 _load_test_config），标签窗口为 2 天；
+    # 1 天间隔的 60 个样本总跨度 60 天，完全落在 protocol 的 240 天窗口内，
+    # embargo purge 只剔除切分边界附近极少数样本。
     base_time = datetime.now(UTC) - timedelta(days=max(30, rows_per_symbol + 30))
     row_index = 0
     for symbol in symbols:
@@ -117,7 +123,8 @@ def _seed_learning_protocol_samples(
             outcome = OutcomeRecord(
                 snapshot_id=snapshot.snapshot_id,
                 maturity_status=MaturityStatus.RECONCILED,
-                label_mature_time=decision_time + timedelta(days=service._config.labels.horizon_days),
+                label_mature_time=decision_time
+                + timedelta(days=service._config.labels.horizon_days),
                 realized_return=0.08 if row_index % 2 == 0 else -0.05,
                 max_favorable_excursion=0.09 if row_index % 2 == 0 else 0.01,
                 max_adverse_excursion=-0.01 if row_index % 2 == 0 else -0.07,

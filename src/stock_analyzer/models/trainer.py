@@ -185,6 +185,7 @@ class ModelTrainer:
             fidelity_filter=normalized_fidelity,
             calibration_ratio=max(0.0, float(self._training.calibration_ratio)),
             test_ratio=max(0.0, float(self._training.test_ratio)),
+            embargo_days=max(0, int(self._labels.horizon_days) + self._settlement_lag_days),
         )
         return self.train_on_dataset_manifest(
             store=store,
@@ -809,14 +810,35 @@ def _evaluate_metrics(
 
 
 def _binary_auc(y_true: FloatArray, probabilities: FloatArray) -> float:
+    """Rank-based AUC with average ranks for tied probabilities.
+
+    ``np.argsort``-based rank assignment is unstable under ties: equal
+    probabilities (e.g. a constant 0.5) get arbitrary ranks that depend on
+    the label order, so the same probabilities can yield 0.0, 1.0 or anything
+    between.  Average ranks assign tied values the mean of their rank span,
+    matching ``sklearn.metrics.roc_auc_score`` (and
+    ``scipy.stats.rankdata(method="average")``).
+    """
     positives = int(np.sum(y_true >= 0.5))
     negatives = int(np.sum(y_true < 0.5))
     if positives == 0 or negatives == 0:
         return 0.5
-    order = np.argsort(probabilities)
-    ranks = np.empty_like(order, dtype=float)
-    ranks[order] = np.arange(1, len(probabilities) + 1, dtype=float)
-    positive_rank_sum = float(ranks[y_true >= 0.5].sum())
+    order = np.argsort(probabilities, kind="mergesort")
+    # Average ranks: same value -> mean of its rank span.
+    avg_ranks = np.empty_like(order, dtype=float)
+    span_start = 0
+    while span_start < len(order):
+        span_end = span_start
+        while (
+            span_end + 1 < len(order)
+            and probabilities[order[span_end + 1]] == probabilities[order[span_start]]
+        ):
+            span_end += 1
+        average = (span_start + 1 + span_end + 1) / 2.0
+        for pos in range(span_start, span_end + 1):
+            avg_ranks[order[pos]] = average
+        span_start = span_end + 1
+    positive_rank_sum = float(avg_ranks[y_true >= 0.5].sum())
     auc = (positive_rank_sum - positives * (positives + 1) / 2.0) / (positives * negatives)
     return float(max(0.0, min(1.0, auc)))
 

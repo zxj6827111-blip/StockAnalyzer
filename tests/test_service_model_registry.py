@@ -53,6 +53,8 @@ def _load_test_config(base_dir: Path | None = None) -> StockAnalyzerConfig:
     config.training.bootstrap_state_path = str(temp_root / "test_bootstrap_state.json")
     config.training.artifact_path = str(temp_root / "protocol_model.json")
     config.training.min_samples = 20
+    # 缩小标签 horizon，使合成样本的标签窗口不跨切分边界被 purge。
+    config.labels.horizon_days = 2
     config.command_channel.state_persist_enabled = False
     config.command_channel.history_archive_enabled = False
     config.evolution.auto_run = False
@@ -963,6 +965,9 @@ def test_service_evaluate_learning_model_promotion_gate_can_warn_without_transit
     tmp_path: Path,
 ) -> None:
     config = _load_test_config(tmp_path)
+    # 该用例依赖 shadow_v2 与 champion 的 brier/logloss 差异超过 warn 阈值，
+    # horizon=2（全局默认）时差异落在阈值边界导致结果不稳定；用 5 留出余量。
+    config.labels.horizon_days = 5
     service = _new_service(config, provider=FailingBarsProvider())
     _seed_learning_protocol_samples(
         service,

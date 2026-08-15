@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from stock_analyzer.learning.dataset_manifest import DatasetManifestBuilder
@@ -174,6 +174,65 @@ def test_dataset_manifest_builder_includes_projection_compatible_legacy_snapshot
         "snap-legacy",
         "snap-current",
     ]
+
+
+def test_dataset_manifest_builder_purges_label_windows_crossing_split_boundary(
+    tmp_path: Path,
+) -> None:
+    """embargo 分组切分时，标签窗口跨入下一集合的样本被剔除。
+
+    用「交易日」间隔的样本（每天一条），配合 label_mature_time 落在下一
+    集合起始之后的样本，验证它被 purge、而标签早已成熟的样本保留。
+    """
+    store = SampleStore(db_path=tmp_path / "sample_store.duckdb")
+    builder = DatasetManifestBuilder(store=store)
+
+    # 8 个交易日，比例 0.5/0.5 会得到 4 train / 2 calibration / 2 test。
+    for index in range(8):
+        decision_time = datetime(2026, 1, 1, 14, 30, tzinfo=UTC) + timedelta(days=index)
+        store.write_snapshot(
+            _build_snapshot(
+                f"snap-{index:03d}",
+                decision_time.isoformat(),
+            )
+        )
+        # 前 3 天标签成熟得很早（不跨边界）；最后一条 train 的标签窗口
+        # 恰好跨进 calibration 起始日之后。
+        if index <= 2:
+            mature = decision_time + timedelta(days=1)
+        else:
+            mature = decision_time + timedelta(days=10)
+        store.upsert_outcome(
+            OutcomeRecord(
+                snapshot_id=f"snap-{index:03d}",
+                maturity_status=MaturityStatus.RECONCILED,
+                label_mature_time=mature,
+                realized_return=0.05,
+                backfill_fidelity_tier=BackfillFidelityTier.GOLD,
+                backfill_source="runtime_observed",
+            )
+        )
+
+    manifest = builder.create_manifest(
+        feature_schema_id="feature_schema_v1_abc",
+        feature_schema_hash="feature_hash_1",
+        label_policy_id="label_policy_v1_abc",
+        label_policy_hash="label_hash_1",
+        fidelity_filter=[BackfillFidelityTier.GOLD],
+        calibration_ratio=0.25,
+        test_ratio=0.25,
+        embargo_days=7,
+    )
+
+    items = store.list_manifest_items(manifest.dataset_manifest_id)
+    # 所有同一天样本必须落在同一 split（无同日跨集合泄漏）。
+    by_date: dict[str, set[str]] = {}
+    for item in items:
+        by_date.setdefault(str(item.decision_time.date()), set()).add(item.split_name)
+    assert all(len(splits) == 1 for splits in by_date.values())
+
+    # 有 label 窗口跨界的样本被 purge：总包含数应小于 8。
+    assert manifest.included_snapshot_count < 8
 
 
 def _build_snapshot(

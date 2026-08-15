@@ -90,6 +90,50 @@ def test_alphalens_sidecar_reports_factor_health_and_decay() -> None:
     )
 
 
+def test_alphalens_sidecar_computes_daily_cross_sectional_rank_ic() -> None:
+    """每日横截面 RankIC 序列而非全局一次性秩相关。
+
+    构造因子排名与次日收益排名完全一致的数据：每天 RankIC=1.0，因此
+    ``rank_ic``（横截面均值）=1.0、``cross_sectional_days``=有效天数、
+    ``rank_ic_std``=0、``icir``=0（标准差为 0 时 ICIR 定义为 0）。
+    """
+    closes = {
+        "AAA": [10.0, 11.0, 12.0, 13.0],
+        "BBB": [10.0, 10.5, 11.0, 11.5],
+        "CCC": [10.0, 10.2, 10.4, 10.6],
+    }
+    factor_by_symbol = {"AAA": 3.0, "BBB": 2.0, "CCC": 1.0}
+    records = []
+    for offset in range(4):
+        trade_date = f"2026-03-0{offset + 1}"
+        for symbol in ("AAA", "BBB", "CCC"):
+            records.append(
+                {
+                    "symbol": symbol,
+                    "trade_date": trade_date,
+                    "close": closes[symbol][offset],
+                    "quality_factor": factor_by_symbol[symbol],
+                }
+            )
+
+    report = run_alphalens_sidecar(
+        records=records,
+        factor_columns=["quality_factor"],
+        horizons=(1,),
+        quantiles=3,
+    )
+
+    assert report["status"] == "ok"
+    factors = {str(item["factor"]): item for item in _as_mapping_list(report["factors"])}
+    horizons = _as_mapping_list(factors["quality_factor"]["horizons"])
+    assert len(horizons) == 1
+    h1 = horizons[0]
+    assert _as_float(h1["rank_ic"]) == 1.0
+    assert _as_int(h1["cross_sectional_days"]) == 3
+    assert _as_float(h1["rank_ic_std"]) == 0.0
+    assert _as_float(h1["icir"]) == 0.0
+
+
 def test_alphalens_sidecar_persists_report(tmp_path: Path) -> None:
     report = {
         "status": "ok",
