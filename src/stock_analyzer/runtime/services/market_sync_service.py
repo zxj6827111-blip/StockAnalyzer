@@ -925,6 +925,49 @@ class RuntimeMarketSyncService:
             "date_max": date_max.isoformat() if date_max is not None else "",
         }
 
+    def _write_market_breadth(
+        self,
+        *,
+        warehouse: MarketWarehouse,
+        now: datetime,
+    ) -> dict[str, object]:
+        """同步收尾：从全市场日线现算并预写 market_breadth.json。
+
+        盘后扫描直接读该快照（零额外开销）；快照缺失/过期时扫描兜底现算。
+        计算失败不阻断同步（广度门对缺失采用 fail-open）。
+        """
+        service = self._service
+        from stock_analyzer.ops.market_breadth import (
+            BREADTH_FILENAME,
+            compute_market_breadth_from_warehouse,
+            write_breadth_snapshot,
+        )
+
+        snapshot = compute_market_breadth_from_warehouse(
+            warehouse=warehouse,
+            limit_rule=service._config.limit_rule,
+            now=now,
+        )
+        if snapshot is None:
+            return {"written": False, "reason": "breadth_compute_unavailable"}
+        breadth_path = service._resolve_evolution_path(
+            f"artifacts/runtime/{BREADTH_FILENAME}"
+        )
+        try:
+            write_breadth_snapshot(snapshot, breadth_path)
+        except Exception as exc:
+            return {"written": False, "error": f"{type(exc).__name__}: {exc}"}
+        return {
+            "written": True,
+            "path": service._to_evolution_relative(breadth_path),
+            "as_of": str(snapshot.get("as_of", "")),
+            "score": (
+                float(snapshot["score"]["value"])
+                if isinstance(snapshot.get("score"), dict)
+                else None
+            ),
+        }
+
     def _resolve_market_warehouse_auto_refresh(
         self,
         *,
@@ -3421,6 +3464,11 @@ class RuntimeMarketSyncService:
             # 数据新鲜度唯一权威（旧 manifest 日期只作历史证据）。
             report["freshness"] = self._write_warehouse_freshness(
                 report=report,
+                warehouse=warehouse,
+                now=now,
+            )
+            # 市场广度快照预写：盘后扫描零成本读取（缺失时扫描兜底现算）。
+            report["market_breadth"] = self._write_market_breadth(
                 warehouse=warehouse,
                 now=now,
             )

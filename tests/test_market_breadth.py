@@ -11,6 +11,7 @@ from stock_analyzer.ops.market_breadth import (
     breadth_usage_policy,
     build_breadth_snapshot,
     compute_breadth_score,
+    compute_market_breadth_from_warehouse,
     read_breadth_snapshot,
     write_breadth_snapshot,
 )
@@ -264,3 +265,126 @@ def test_policy_naive_as_of_with_aware_now() -> None:
         trend_min_threshold=70.0,
     )
     assert policy["block_new_buy"] is False
+
+
+# ---------------------------------------------------------------------------
+# 广度 producer：从 warehouse 批量帧现算快照（无外部 API）
+# ---------------------------------------------------------------------------
+
+
+def _fake_warehouse(frame):
+    class _FakeWarehouse:
+        def list_symbols(self):
+            return sorted(frame["symbol"].unique())
+
+        def fetch_universe_quality_metrics(self, *, symbols, lookback_days):
+            return frame
+
+    return _FakeWarehouse()
+
+
+def _rising_market_frame() -> object:
+    import pandas as pd
+
+    rows = []
+    for sym, base in [("600000", 10.0), ("000001", 20.0), ("300001", 30.0)]:
+        for i in range(22):
+            date = pd.Timestamp("2026-08-01") + pd.Timedelta(days=i)
+            close = base * (1.0 + i * 0.005)
+            rows.append(
+                {
+                    "symbol": sym,
+                    "date": date,
+                    "close": close,
+                    "turnover": 1000.0 + i * 10.0,
+                    "board": "主板" if sym.startswith(("6", "00")) else "创业板",
+                    "is_st": False,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def test_producer_computes_breadth_from_warehouse_frame() -> None:
+    snapshot = compute_market_breadth_from_warehouse(_fake_warehouse(_rising_market_frame()))
+    assert snapshot is not None
+    assert snapshot["total_symbols"] == 3
+    assert snapshot["coverage_ratio"] == 1.0
+    assert snapshot["advancers"] + snapshot["decliners"] == 3
+    assert snapshot["score"]["available"] is True
+    assert 0.0 <= snapshot["score"]["value"] <= 100.0
+    assert snapshot["source"] == "warehouse_daily"
+    # 21 个交易日窗口：每日都在涨 → 最新日创 20 日新高
+    assert snapshot["new_highs_20d"] == 3
+
+
+def test_producer_returns_none_on_empty_frame() -> None:
+    import pandas as pd
+
+    snapshot = compute_market_breadth_from_warehouse(
+        _fake_warehouse(pd.DataFrame())
+    )
+    assert snapshot is None
+
+
+def test_producer_returns_none_on_bad_warehouse() -> None:
+    class _BrokenWarehouse:
+        def list_symbols(self):
+            raise OSError("db missing")
+
+    assert compute_market_breadth_from_warehouse(_BrokenWarehouse()) is None
+
+
+def test_producer_sets_freshness_and_enables_stale_lift() -> None:
+    """producer 输出 freshness.date_max（最新交易日）+ as_of（当前时刻），
+    使广度门能判定"轻度过期"（trend 最低分 +5）而非仅二值新鲜/阻断。"""
+    frame = _rising_market_frame()
+    snapshot = compute_market_breadth_from_warehouse(
+        _fake_warehouse(frame),
+        now=datetime(2026, 8, 23, 12, 0, 0, tzinfo=UTC),
+    )
+    assert snapshot is not None
+    assert snapshot["freshness"]["date_max"] == "2026-08-22"
+    policy = breadth_usage_policy(
+        snapshot,
+        now=datetime(2026, 8, 23, 14, 0, 0, tzinfo=UTC),
+        trend_min_threshold=70.0,
+        max_intraday_heartbeat_sec=48.0 * 3600.0,
+    )
+    assert policy["reason"] == "breadth_slightly_stale"
+    assert policy["trend_min_threshold_lift"] == 5.0
+
+
+def test_producer_board_mapping_limit_up_count() -> None:
+    """warehouse 的 board 是英文（main/gem/star/bj），必须映射为中文再判涨跌停；
+    否则科创板/创业板被按 10% 而非 20% 判定，涨跌停家数严重高估。"""
+    import pandas as pd
+
+    rows: list[dict[str, object]] = []
+    # main（主板 10%）：最新日 +10.5% → 涨停
+    for i in range(22):
+        rows.append(
+            {
+                "symbol": "600001",
+                "date": pd.Timestamp("2026-08-01") + pd.Timedelta(days=i),
+                "close": 10.0 if i < 21 else 11.05,
+                "turnover": 100.0,
+                "board": "main",
+                "is_st": False,
+            }
+        )
+    # star（科创板 20%）：最新日 +11% → 未到 20%，不涨停
+    for i in range(22):
+        rows.append(
+            {
+                "symbol": "688001",
+                "date": pd.Timestamp("2026-08-01") + pd.Timedelta(days=i),
+                "close": 20.0 if i < 21 else 22.2,
+                "turnover": 100.0,
+                "board": "star",
+                "is_st": False,
+            }
+        )
+    snapshot = compute_market_breadth_from_warehouse(_fake_warehouse(pd.DataFrame(rows)))
+    assert snapshot is not None
+    assert snapshot["limit_up_count"] == 1  # 只有 main 计入涨停
+    assert snapshot["total_symbols"] == 2

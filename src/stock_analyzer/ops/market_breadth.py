@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import pandas as pd
+
 SCORE_VERSION = 1
 DEFAULT_MIN_COVERAGE = 0.95
 DEFAULT_MAX_INTRADAY_HEARTBEAT_SEC = 600  # 10 分钟
@@ -321,3 +323,165 @@ def _parse_ts(value: object) -> datetime | None:
             return None
         return _as_aware(parsed)
     return None
+
+
+def compute_market_breadth_from_warehouse(
+    warehouse: object,
+    *,
+    limit_rule: object | None = None,
+    lookback_days: int = 25,
+    limit_tolerance: float = 0.001,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    """从 market warehouse 全市场日线现算广度快照（无外部 API 调用）。
+
+    一条批量查询（``fetch_universe_quality_metrics``）取全市场最近
+    ``lookback_days`` 个交易日，按最新交易日统计：上涨/下跌家数、中位收益、
+    涨跌停家数（用 ``resolve_limit_pct`` 现算，warehouse 的 up_limit/down_limit
+    列为空）、20 日新高/新低家数、成交额环比、总家数与覆盖率。
+
+    ``freshness.date_max`` 取最新交易日、``as_of`` 取当前时刻：数据落后于
+    今天时广度门可判定"轻度过期"（trend 最低分 +5），而非仅二值新鲜/阻断。
+
+    返回与 ``build_breadth_snapshot`` 输出一致的快照 dict；数据不足或
+    计算异常返回 ``None``，调用方按"广度不可用"处理（不阻断扫描）。
+    """
+    from stock_analyzer.config import LimitRuleConfig
+    from stock_analyzer.data.limit_rule import resolve_limit_pct
+
+    # warehouse 的 board 用英文简写（main/gem/star/bj），limit_rule 需要中文；
+    # 不映射会把科创板/创业板按 10% 而非 20% 判涨停，涨跌停家数严重高估。
+    _BOARD_MAP = {
+        "main": "主板",
+        "gem": "创业板",
+        "star": "科创板",
+        "bj": "北交所",
+        "st": "ST",
+    }
+
+    try:
+        symbols = list(warehouse.list_symbols())
+        if not symbols:
+            return None
+        frame = warehouse.fetch_universe_quality_metrics(
+            symbols=symbols,
+            lookback_days=max(5, int(lookback_days)),
+        )
+        if frame is None or not hasattr(frame, "empty") or frame.empty:
+            return None
+    except Exception:
+        return None
+
+    required = {"symbol", "date", "close"}
+    if not required.issubset(frame.columns):
+        return None
+    frame = frame.sort_values(["symbol", "date"]).reset_index(drop=True)
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
+    if "turnover" in frame.columns:
+        frame["turnover"] = pd.to_numeric(frame["turnover"], errors="coerce").fillna(0.0)
+    else:
+        frame["turnover"] = 0.0
+    frame = frame.dropna(subset=["date", "close"]).sort_values(["symbol", "date"])
+    if frame.empty:
+        return None
+
+    latest_date = frame["date"].max()
+    latest = frame.loc[frame["date"] == latest_date].copy()
+    if latest.empty:
+        return None
+    # prev_close：每 symbol 上一交易日 close（groupby shift 按 symbol/date 对齐，
+    # 停牌后复牌日自然衔接前一收盘价）。
+    frame["prev_close"] = frame.groupby("symbol")["close"].shift(1)
+    latest["prev_close"] = frame.loc[latest.index, "prev_close"]
+
+    valid = latest.dropna(subset=["prev_close"])
+    valid = valid[valid["prev_close"] > 0]
+    if valid.empty:
+        return None
+    pct = valid["close"] / valid["prev_close"] - 1.0
+    advancers = int((pct > 0).sum())
+    decliners = int((pct < 0).sum())
+    median_return = float(pct.median())
+
+    # 涨跌停：按 (board, is_st) 组合求 limit_pct 后向量化比较，避免 5000 行
+    # 逐行 build_price_limits（同时修正 board 英文值→中文映射）。
+    limit_config = limit_rule if limit_rule is not None else LimitRuleConfig()
+    latest_date_d = latest_date.date() if hasattr(latest_date, "date") else latest_date
+    board_col = (
+        latest["board"]
+        if "board" in latest.columns
+        else pd.Series("", index=latest.index)
+    )
+    is_st_col = (
+        latest["is_st"]
+        if "is_st" in latest.columns
+        else pd.Series(False, index=latest.index)
+    )
+    latest = latest.assign(
+        board_cn=board_col.map(_BOARD_MAP).fillna(board_col),
+        is_st_bool=is_st_col.astype(bool),
+    )
+    key_frame = latest[["board_cn", "is_st_bool"]].drop_duplicates()
+    key_frame["limit_pct"] = key_frame.apply(
+        lambda row: resolve_limit_pct(
+            config=limit_config,
+            trade_date=latest_date_d,
+            board=str(row["board_cn"]),
+            is_st=bool(row["is_st_bool"]),
+            listing_days=None,
+        ),
+        axis=1,
+    )
+    latest = latest.merge(key_frame, on=["board_cn", "is_st_bool"], how="left")
+    tol = max(0.0, float(limit_tolerance))
+    limited = latest[latest["limit_pct"].notna()]
+    if limited.empty:
+        up_count = 0
+        down_count = 0
+    else:
+        up_limit = limited["prev_close"] * (1.0 + limited["limit_pct"])
+        down_limit = limited["prev_close"] * (1.0 - limited["limit_pct"])
+        up_count = int((limited["close"] >= up_limit * (1.0 - tol)).sum())
+        down_count = int((limited["close"] <= down_limit * (1.0 + tol)).sum())
+
+    # 20 日新高/新低：当日 close 高于/低于此前 20 个交易日的最高/最低。
+    high20 = 0
+    low20 = 0
+    for _symbol, group in frame.groupby("symbol"):
+        closes = group["close"].dropna().reset_index(drop=True)
+        if len(closes) < 21:
+            continue
+        tail = closes.iloc[-21:-1]
+        current = closes.iloc[-1]
+        if current >= tail.max():
+            high20 += 1
+        if current <= tail.min():
+            low20 += 1
+
+    dates = sorted(frame["date"].unique())
+    turnover_change_pct = 0.0
+    if len(dates) >= 2:
+        cur_turnover = float(latest["turnover"].sum())
+        prev_turnover = float(frame.loc[frame["date"] == dates[-2], "turnover"].sum())
+        if prev_turnover > 0:
+            turnover_change_pct = (cur_turnover - prev_turnover) / prev_turnover
+
+    total_symbols = int(len(latest))
+    coverage_ratio = total_symbols / max(1, len(symbols))
+    as_of_dt = _as_aware(now) if now is not None else datetime.now(UTC)
+    return build_breadth_snapshot(
+        advancers=advancers,
+        decliners=decliners,
+        limit_up_count=up_count,
+        limit_down_count=down_count,
+        median_return=median_return,
+        new_highs_20d=high20,
+        new_lows_20d=low20,
+        turnover_change_pct=turnover_change_pct,
+        total_symbols=total_symbols,
+        coverage_ratio=coverage_ratio,
+        as_of=as_of_dt,
+        source="warehouse_daily",
+        freshness={"date_max": latest_date.strftime("%Y-%m-%d")},
+    )

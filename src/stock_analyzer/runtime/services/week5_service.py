@@ -2137,9 +2137,19 @@ class RuntimeWeek5Service:
         final_selector_gate_status = (
             "ok" if recovery_direct_scan else str(data_gate.get("status", "ok"))
         )
+        # 市场广度门（PLAN P2-1 接线）：读取预写 market_breadth.json（缺失时
+        # 从 provider 现算兜底）。广度 block → 拒绝全部候选；轻度过期 →
+        # trend 最低分 +lift；数据不可用 → fail-open（不锁死扫描）。
+        breadth_meta: dict[str, object] = {"enabled": False}
+        breadth_lift = 0.0
+        if bool(service._config.week5.market_breadth_enabled):
+            breadth_meta, breadth_lift = service._apply_market_breadth_gate(now=now)
+            if bool(breadth_meta.get("block_new_buy", False)):
+                final_selector_gate_status = "market_breadth_blocked"
         final_selector = service._final_signal_selector(
             signals=signal_pool_candidates,
             data_gate_status=final_selector_gate_status,
+            min_threshold_lift=breadth_lift,
         )
         if recovery_direct_scan:
             # Advisory only: the output is inspected, never treated as a
@@ -2301,6 +2311,7 @@ class RuntimeWeek5Service:
             if snapshot_manifest is not None
             else "",
             "data_gate": dict(data_gate),
+            "market_breadth": dict(breadth_meta),
             "feature_snapshot": feature_snapshot_report,
             "scan_stages": {
                 "quality_selection": {
