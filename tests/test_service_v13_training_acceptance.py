@@ -77,6 +77,8 @@ def _load_test_config(base_dir: Path | None = None) -> StockAnalyzerConfig:
     config.training.bootstrap_auto_run_on_first_start = False
     config.training.bootstrap_require_completion_for_runtime = False
     config.training.bootstrap_auto_seed_watchlist = False
+    # 缩小标签 horizon，使合成样本的标签窗口不跨切分边界被 purge。
+    config.labels.horizon_days = 2
     temp_root = base_dir or Path(tempfile.mkdtemp(prefix="stock_analyzer_tests_"))
     config.training.bootstrap_state_path = str(temp_root / "test_bootstrap_state_v13.json")
     return config
@@ -284,7 +286,9 @@ def test_service_full_market_training_prefers_richer_projection_compatible_schem
     assert payload["input_mode"] == "sample_store"
     assert payload["protocol_attempted"] is True
     assert payload["protocol_fallback_reason"] == ""
-    assert payload["dataset_rows"] == 24
+    # embargo purge 生效后，train 末尾与 calibration 末尾各 1 个样本因标签
+    # 窗口跨入下一集合被剔除（24 → 22）。
+    assert payload["dataset_rows"] == 22
     artifact_payload = _as_mapping(_as_mapping(payload["result"])["artifact"])
     assert artifact_payload["feature_schema_id"] == current_record.feature_schema_id
     assert "feature_c" in cast(list[object], artifact_payload["feature_columns"])
