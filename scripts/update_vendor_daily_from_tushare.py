@@ -684,15 +684,24 @@ def _fetch_symbol(
     daily_root: Path,
     factors_root: Path,
     skip_factors: bool,
+    force_factors: bool = False,
     dry_run: bool,
     index: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    """Phase A worker: decide by ZIP contents and fetch only missing data."""
+    """Phase A worker: decide by ZIP contents and fetch only missing data.
+
+    ``force_factors`` refetches and rebuilds adjustment factors even when the
+    factor ZIP already covers ``end_date`` (repair truncated factor history).
+    """
     ts_code = _to_ts_code(symbol)
     daily_last = _symbol_daily_last_date(daily_root, ts_code, index=index)
     factor_last = None if skip_factors else _symbol_factor_last_date(factors_root, ts_code)
     need_daily = daily_last is None or daily_last < end_date
-    need_factors = (not skip_factors) and (factor_last is None or factor_last < end_date)
+    need_factors = (not skip_factors) and (
+        force_factors
+        or factor_last is None
+        or factor_last < end_date
+    )
     if not need_daily and not need_factors:
         return {
             "symbol": symbol,
@@ -1440,6 +1449,12 @@ def _main(argv: list[str] | None = None) -> int:
         help="Do not fetch adj_factor and do not rebuild the factor ZIPs",
     )
     parser.add_argument(
+        "--force-factors",
+        action="store_true",
+        help="Refetch and rebuild adjustment factors even when the factor ZIP "
+        "already covers --end-date (repair truncated factor history)",
+    )
+    parser.add_argument(
         "--batch",
         action="store_true",
         help="Batch mode: one full-market trade_date call instead of per-symbol "
@@ -1579,6 +1594,7 @@ def _main(argv: list[str] | None = None) -> int:
                         daily_root=daily_root,
                         factors_root=factors_root,
                         skip_factors=bool(args.skip_factors),
+                        force_factors=bool(args.force_factors),
                         dry_run=bool(args.dry_run),
                         index=index,
                     )
@@ -1596,6 +1612,7 @@ def _main(argv: list[str] | None = None) -> int:
                     daily_root=daily_root,
                     factors_root=factors_root,
                     skip_factors=bool(args.skip_factors),
+                    force_factors=bool(args.force_factors),
                     dry_run=bool(args.dry_run),
                     index=index,
                 ): symbol

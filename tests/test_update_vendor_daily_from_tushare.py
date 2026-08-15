@@ -423,6 +423,34 @@ def test_fetch_symbol_skips_when_zip_dates_are_current(
     assert calls == []
 
 
+def test_fetch_symbol_force_factors_refetches_current_factors(
+    updater: object, tmp_path: Path
+) -> None:
+    """force_factors 使因子 ZIP 已覆盖 end_date 时仍重拉 adj_factor（修复截断历史）。"""
+    daily_root = _daily_fixture(tmp_path)
+    factors_root = _factor_fixture(tmp_path)
+    calls: list[str] = []
+    api = _fake_api(updater, calls)
+
+    result = updater._fetch_symbol(
+        api=api,
+        symbol="600000",
+        end_date=date(2025, 7, 17),
+        daily_root=daily_root,
+        factors_root=factors_root,
+        skip_factors=False,
+        force_factors=True,
+        dry_run=False,
+    )
+
+    assert result["status"] == "ok"
+    assert result["daily_fetch"] is False
+    assert result["factor_fetch"] is True
+    # adj_factor only (paged); no daily/daily_basic calls.
+    assert len(calls) == 1
+    assert not result.get("adj", pd.DataFrame()).empty
+
+
 def test_fetch_symbol_fetches_only_missing_factors(updater: object, tmp_path: Path) -> None:
     daily_root = _daily_fixture(tmp_path)
     factors_root = tmp_path / "复权因子_missing"
