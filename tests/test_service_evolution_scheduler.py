@@ -209,7 +209,12 @@ def test_evolution_offhours_sends_learning_completion_notification(tmp_path: Pat
     _patch_attr(service, "run_week5_scan", _fake_run_week5_scan)
     _patch_attr(service, "_notify_if_changed", _fake_notify_if_changed)
 
-    payload = _as_mapping(service._job_evolution_offhours())
+    payload = _as_mapping(
+        # 固定工作日 timestamp：_notify_evolution_offhours_completion 在
+        # weekday()>=5（周末）抑制通知，用真实 datetime.now() 会让该断言
+        # 依赖运行日（周末必挂）。2026-08-12 为周三。
+        service._job_evolution_offhours(now=datetime(2026, 8, 12, 20, 40))
+    )
     content = str(captured.get("content", ""))
     title = str(captured.get("title", ""))
     dedup_key = str(captured.get("dedup_key", ""))

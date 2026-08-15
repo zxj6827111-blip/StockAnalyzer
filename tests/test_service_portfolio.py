@@ -3,7 +3,7 @@ from __future__ import annotations
 import tempfile
 import time
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -73,8 +73,9 @@ def _sign(
     command_id: str,
     payload: dict[str, object],
     secret: str,
+    timestamp: int | None = None,
 ) -> CommandEnvelope:
-    ts = int(time.time())
+    ts = int(time.time()) if timestamp is None else timestamp
     signature = SignedCommandProcessor.build_signature(
         secret_key=secret,
         command_id=command_id,
@@ -301,6 +302,108 @@ def test_service_live_auto_execution_opens_simulated_position() -> None:
     assert position["entry_price"] == 10.1
     assert position["quantity"] == 900
     assert service.state.current_equity > 0
+
+
+def test_service_live_auto_execution_blocks_buy_on_stale_data_gate() -> None:
+    config = _load_test_config()
+    service = StockAnalyzerService(config=config)
+
+    _patch_attr(service, "_build_week5_symbol_market_payload", lambda **kwargs: {
+        "last_price": 10.08,
+        "open_price": 10.0,
+        "prev_close": 9.9,
+        "ask_levels": [{"level": 1, "price": 10.1, "volume": 5000}],
+        "bid_levels": [{"level": 1, "price": 10.0, "volume": 4000}],
+    })
+    _patch_attr(service, "_fetch_market_depth_snapshots", lambda **kwargs: {
+        "600000": {
+            "available": True,
+            "ask_levels": [{"level": 1, "price": 10.1, "volume": 5000}],
+            "bid_levels": [{"level": 1, "price": 10.0, "volume": 4000}],
+        }
+    })
+    # 门返回 blocked → 新开仓应被拒绝，只计 stale_data_gate_blocked。
+    _patch_attr(
+        service,
+        "_stale_data_open_gate",
+        lambda **kwargs: {
+            "blocked": True,
+            "source": "delta",
+            "date_max": "2026-08-10",
+            "stale_trade_days": 3,
+            "reason": "data_stale_3_trade_days",
+        },
+    )
+
+    signal = PipelineSignal(
+        symbol="600000",
+        strategy="monster",
+        score=86.0,
+        grade="S",
+        action="buy",
+        target_position=0.10,
+        probabilities={"lgbm": 0.8, "xgb": 0.8, "meta": 0.8},
+        reasons=["soup_entry"],
+    )
+    update = service._apply_live_auto_portfolio_signals(
+        trace_id="trace-live-buy-stale",
+        timestamp=datetime.fromisoformat("2026-03-11T09:35:00"),
+        signals=[signal],
+        use_live_runtime=True,
+    )
+
+    attempts = _as_mapping(update["execution_attempts"])
+    assert _as_int(attempts["stale_data_gate_blocked"]) == 1
+    assert _as_int(attempts["buy_new_filled"]) == 0
+    assert service.portfolio_positions() == []
+    rejections = [
+        item
+        for item in _as_mapping_list(update["executions"])
+        if str(item.get("status", "")) == "rejected_stale_data"
+    ]
+    assert len(rejections) == 1
+
+
+def test_service_live_auto_execution_buys_when_stale_data_gate_off() -> None:
+    config = _load_test_config()
+    service = StockAnalyzerService(config=config)
+
+    _patch_attr(service, "_build_week5_symbol_market_payload", lambda **kwargs: {
+        "last_price": 10.08,
+        "open_price": 10.0,
+        "prev_close": 9.9,
+        "ask_levels": [{"level": 1, "price": 10.1, "volume": 5000}],
+        "bid_levels": [{"level": 1, "price": 10.0, "volume": 4000}],
+    })
+    _patch_attr(service, "_fetch_market_depth_snapshots", lambda **kwargs: {
+        "600000": {
+            "available": True,
+            "ask_levels": [{"level": 1, "price": 10.1, "volume": 5000}],
+            "bid_levels": [{"level": 1, "price": 10.0, "volume": 4000}],
+        }
+    })
+    # 门关闭（返回 None）→ 不拦截，正常开仓。
+    _patch_attr(service, "_stale_data_open_gate", lambda **kwargs: None)
+
+    signal = PipelineSignal(
+        symbol="600000",
+        strategy="monster",
+        score=86.0,
+        grade="S",
+        action="buy",
+        target_position=0.10,
+        probabilities={"lgbm": 0.8, "xgb": 0.8, "meta": 0.8},
+        reasons=["soup_entry"],
+    )
+    update = service._apply_live_auto_portfolio_signals(
+        trace_id="trace-live-buy-gate-off",
+        timestamp=datetime.fromisoformat("2026-03-11T09:35:00"),
+        signals=[signal],
+        use_live_runtime=True,
+    )
+
+    assert _as_int(update["opened"]) == 1
+    assert len(service.portfolio_positions()) == 1
 
 
 def test_service_live_auto_execution_applies_shared_slippage_and_tick_when_enabled() -> None:
@@ -1195,20 +1298,18 @@ def test_service_simulated_trim_notification_keeps_remaining_position_context() 
 def test_service_live_auto_execution_closes_position_on_sell_signal() -> None:
     config = _load_test_config()
     service = StockAnalyzerService(config=config)
-    _ = service.execute_command(
-        _sign(
-            action="SET_POSITION",
-            command_id="cmd-auto-sell-open",
-            payload={
-                "symbol": "600000",
-                "strategy": "manual",
-                "target_position": 0.1,
-                "entry_price": 10.0,
-                "quantity": 1000,
-            },
-            secret=config.command_channel.secret_key,
-        )
+    # 直接建仓于昨日：命令通道有 300s 时钟容差无法提前建仓，而本用例只
+    # 验证"卖出信号路径成交"，建仓时间需早于 sell 一日以通过 T+1 风险门。
+    service._portfolio.set_manual_position(
+        symbol="600000",
+        strategy="manual",
+        target_position=0.1,
+        timestamp=datetime.now() - timedelta(days=1),
+        trace_id="seed-auto-sell-open",
+        reason="manual_set_position_command",
+        manual_fill={"entry_price": 10.0, "quantity": 1000},
     )
+    assert len(service.portfolio_positions()) == 1
     _patch_attr(service, "_build_week5_symbol_market_payload", lambda **kwargs: {
         "last_price": 9.92,
         "open_price": 10.0,
@@ -1236,7 +1337,7 @@ def test_service_live_auto_execution_closes_position_on_sell_signal() -> None:
     )
     update = service._apply_live_auto_portfolio_signals(
         trace_id="trace-live-sell",
-        timestamp=datetime.fromisoformat("2026-03-11T10:05:00"),
+        timestamp=datetime.now(),
         signals=[signal],
         use_live_runtime=True,
     )
@@ -2781,3 +2882,218 @@ def test_service_reconcile_detects_quantity_and_account_mismatch() -> None:
     cause_breakdown = _as_mapping(_as_mapping(weekly["sim_vs_broker"])["cause_breakdown"])
     assert _as_float(cause_breakdown["quantity_diff"]) >= 1
     assert _as_float(cause_breakdown["account_diff"]) >= 1
+
+
+# ---------------------------------------------------------------------------
+# final selector：overextension 断链修复 + 广度门 + 新闻风险门
+# ---------------------------------------------------------------------------
+
+
+def _final_selector_candidate(
+    *,
+    symbol: str = "600000",
+    score: float = 85.0,
+    overextension_reject: bool = False,
+    board_reject: bool = False,
+) -> dict[str, object]:
+    return {
+        "symbol": symbol,
+        "score": score,
+        "action": "buy",
+        "decision_trace": {
+            "risk_gate": {"passed": True},
+            "cross_review_gate": {"passed": True},
+        },
+        "overextension": {"reject_new_buy": overextension_reject},
+        "board_risk": {"reject_new_buy": board_reject},
+        "reasons": [],
+    }
+
+
+def test_final_selector_rejects_overextension_alone() -> None:
+    """断链回归：overextension 单独触发 reject 时 final selector 必须拒绝。"""
+    config = _load_test_config()
+    service = StockAnalyzerService(config=config)
+    _patch_attr(
+        service,
+        "_apply_news_risk_gate",
+        lambda **kwargs: {"action": "skipped", "penalty_amount": 0.0, "degraded": False},
+    )
+    out = service._final_signal_selector(
+        signals=[_final_selector_candidate(overextension_reject=True)],
+        data_gate_status="ok",
+    )
+    assert out["selected_count"] == 0
+    assert any(
+        "overextension_reject_new_buy" in item["reject_reasons"]
+        for item in out["rejected"]
+    )
+
+
+def test_final_selector_rejects_board_risk_still_works() -> None:
+    config = _load_test_config()
+    service = StockAnalyzerService(config=config)
+    _patch_attr(
+        service,
+        "_apply_news_risk_gate",
+        lambda **kwargs: {"action": "skipped", "penalty_amount": 0.0, "degraded": False},
+    )
+    out = service._final_signal_selector(
+        signals=[_final_selector_candidate(board_reject=True)],
+        data_gate_status="ok",
+    )
+    assert out["selected_count"] == 0
+    assert any(
+        "board_risk_reject_new_buy" in item["reject_reasons"]
+        for item in out["rejected"]
+    )
+
+
+def test_final_selector_news_veto_rejects_candidate() -> None:
+    config = _load_test_config()
+    service = StockAnalyzerService(config=config)
+    _patch_attr(
+        service,
+        "_apply_news_risk_gate",
+        lambda **kwargs: {"action": "veto", "penalty_amount": 0.0, "degraded": False},
+    )
+    out = service._final_signal_selector(
+        signals=[_final_selector_candidate()],
+        data_gate_status="ok",
+    )
+    assert out["selected_count"] == 0
+    assert any("news_risk_veto" in item["reject_reasons"] for item in out["rejected"])
+    assert out["news_risk_gate"]["vetoed"] == 1
+
+
+def test_final_selector_news_penalty_reduces_score() -> None:
+    config = _load_test_config()
+    config.week5.final_signal_min_threshold = 80.0
+    service = StockAnalyzerService(config=config)
+    _patch_attr(
+        service,
+        "_apply_news_risk_gate",
+        lambda **kwargs: {"action": "penalty", "penalty_amount": 10.0, "degraded": False},
+    )
+    # 85 - 10 = 75 < 80 → 低于阈值被拒
+    out = service._final_signal_selector(
+        signals=[_final_selector_candidate(score=85.0)],
+        data_gate_status="ok",
+    )
+    assert out["selected_count"] == 0
+    assert any("below_min_threshold" in item["reject_reasons"] for item in out["rejected"])
+    assert out["news_risk_gate"]["penalized"] == 1
+
+
+def test_final_selector_news_shadow_does_not_change_result() -> None:
+    config = _load_test_config()
+    config.week5.final_signal_min_threshold = 70.0
+    service = StockAnalyzerService(config=config)
+    _patch_attr(
+        service,
+        "_apply_news_risk_gate",
+        lambda **kwargs: {"action": "shadow", "penalty_amount": 0.0, "degraded": False},
+    )
+    out = service._final_signal_selector(
+        signals=[_final_selector_candidate(score=85.0)],
+        data_gate_status="ok",
+    )
+    assert out["selected_count"] == 1
+    assert out["news_risk_gate"]["shadow"] == 1
+
+
+def test_final_selector_news_off_mode_counts_skipped_not_checked() -> None:
+    """off 模式：不调用新闻门（无文件读取），checked 不虚增。"""
+    config = _load_test_config()
+    config.evolution.news_risk_mode = "off"
+    service = StockAnalyzerService(config=config)
+    called: list[str] = []
+
+    def _fake_gate(**kwargs: object) -> dict[str, object]:
+        called.append(str(kwargs.get("mode", "")))
+        return {"action": "skipped", "penalty_amount": 0.0, "degraded": False}
+
+    _patch_attr(service, "_apply_news_risk_gate", _fake_gate)
+    out = service._final_signal_selector(
+        signals=[_final_selector_candidate(score=85.0)],
+        data_gate_status="ok",
+    )
+    # 门仍被调用（per-symbol 契约），但模式为 off
+    assert called == ["off"]
+    assert out["news_risk_gate"]["checked"] == 0
+    assert out["news_risk_gate"]["skipped"] == 1
+    assert out["selected_count"] == 1
+
+
+def test_final_selector_min_threshold_lift() -> None:
+    config = _load_test_config()
+    config.week5.final_signal_min_threshold = 80.0
+    service = StockAnalyzerService(config=config)
+    _patch_attr(
+        service,
+        "_apply_news_risk_gate",
+        lambda **kwargs: {"action": "skipped", "penalty_amount": 0.0, "degraded": False},
+    )
+    out = service._final_signal_selector(
+        signals=[_final_selector_candidate(score=82.0)],
+        data_gate_status="ok",
+        min_threshold_lift=5.0,
+    )
+    assert out["min_threshold"] == 85.0
+    assert out["selected_count"] == 0
+    assert any("below_min_threshold" in item["reject_reasons"] for item in out["rejected"])
+
+
+def test_apply_market_breadth_gate_blocks_when_weak_market(tmp_path: Path) -> None:
+    from datetime import UTC
+
+    from stock_analyzer.ops.market_breadth import (
+        BREADTH_FILENAME,
+        build_breadth_snapshot,
+        write_breadth_snapshot,
+    )
+
+    config = _load_test_config()
+    service = StockAnalyzerService(config=config)
+    _patch_attr(
+        service,
+        "_resolve_evolution_path",
+        lambda raw_path: tmp_path / Path(str(raw_path)).name,
+    )
+    weak = build_breadth_snapshot(
+        advancers=600,
+        decliners=4200,
+        limit_up_count=10,
+        limit_down_count=150,
+        median_return=-0.02,
+        new_highs_20d=30,
+        new_lows_20d=800,
+        turnover_change_pct=-0.15,
+        total_symbols=5000,
+        coverage_ratio=0.99,
+        as_of=datetime(2026, 8, 14, 7, 0, 0, tzinfo=UTC),
+        source="test",
+    )
+    write_breadth_snapshot(weak, tmp_path / BREADTH_FILENAME)
+    meta, lift = service._apply_market_breadth_gate(
+        now=datetime(2026, 8, 14, 14, 0, 0, tzinfo=UTC)
+    )
+    assert meta["block_new_buy"] is True
+    assert meta["reason"] == "breadth_below_threshold"
+    assert lift == 0.0
+
+
+def test_apply_market_breadth_gate_fail_open_when_missing(tmp_path: Path) -> None:
+    config = _load_test_config()
+    service = StockAnalyzerService(config=config)
+    _patch_attr(
+        service,
+        "_resolve_evolution_path",
+        lambda raw_path: tmp_path / Path(str(raw_path)).name,
+    )
+    meta, lift = service._apply_market_breadth_gate(
+        now=datetime.fromisoformat("2026-08-14T14:00:00")
+    )
+    assert meta["block_new_buy"] is False
+    assert meta["reason"] == "breadth_unavailable"
+    assert lift == 0.0

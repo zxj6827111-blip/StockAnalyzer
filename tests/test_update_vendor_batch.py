@@ -18,6 +18,7 @@ from scripts.update_vendor_daily_from_tushare import (
     _merge_factor_rows_scaled,
     _read_last_date_fast,
     _rebuild_daily_year_zip,
+    _run_batch,
     _symbol_daily_last_date,
     _update_last_date_index,
 )
@@ -451,3 +452,38 @@ def test_merge_factor_rows_scaled_uses_stored_map(tmp_path: Path) -> None:
     assert with_map is not None
     assert without_map is not None
     pd.testing.assert_frame_equal(with_map, without_map)
+
+
+def test_run_batch_records_date_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """日期级异常必须记入 errors（8-13 现场空 errors 导致 judge 误判的根因）。"""
+    import scripts.update_vendor_daily_from_tushare as updater_mod
+
+    class _Pro:
+        def trade_cal(self, **kwargs: object) -> pd.DataFrame:
+            return pd.DataFrame({"cal_date": ["20260731"]})
+
+    class _Api:
+        def _resolve_pro_api(self) -> _Pro:
+            return _Pro()
+
+        def _call_with_retry(self, fn: object) -> object:
+            return fn() if callable(fn) else fn
+
+    def _boom(api: object, trade_date: str) -> dict[str, pd.DataFrame]:
+        raise RuntimeError("rate-limit 500/min")
+
+    monkeypatch.setattr(updater_mod, "_fetch_market_wide_by_date", _boom)
+    report = _run_batch(
+        api=_Api(),
+        end_date=date(2026, 7, 31),
+        daily_root=tmp_path / "全A日K",
+        factors_root=tmp_path / "复权因子",
+        skip_factors=True,
+        dry_run=False,
+        index_path="",
+    )
+
+    assert report["ok"] is False
+    assert report["dates_failed"] == ["20260731"]
+    assert report["errors"] == ["20260731:RuntimeError:rate-limit 500/min"]
+    assert report["symbols_updated"] == 0

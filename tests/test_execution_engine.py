@@ -227,3 +227,89 @@ def test_bar_adapter_computes_st_5pct_limit_via_name() -> None:
     bar = market_payload_to_bar(payload, symbol="000001")
     assert bar["up_limit"] == pytest.approx(10.5)
     assert bar["down_limit"] == pytest.approx(9.5)
+
+
+# ---------------------------------------------------------------------------
+# P0 统一执行层风险门：结构化拒绝原因 + 无有效价格数据 fail-closed
+# ---------------------------------------------------------------------------
+
+
+def test_engine_can_buy_rejects_suspended_with_structured_details() -> None:
+    engine = _default_engine()
+    bar = {
+        "close": 10.0,
+        "up_limit": 11.0,
+        "down_limit": 9.0,
+        "suspended": True,
+    }
+    decision = engine.can_buy(bar=bar)
+    assert decision.executable is False
+    assert decision.reason == "suspended"
+    assert decision.details.get("suspended") is True
+
+
+def test_engine_can_sell_rejects_suspended_with_structured_details() -> None:
+    engine = _default_engine()
+    bar = {"close": 10.0, "up_limit": 11.0, "down_limit": 9.0, "suspended": True}
+    now = datetime.fromisoformat("2026-03-11T14:50:00")
+    buy = datetime.fromisoformat("2026-03-10T09:35:00")
+    decision = engine.can_sell(bar=bar, last_buy_date=buy, current_date=now)
+    assert decision.executable is False
+    assert decision.reason == "suspended"
+    assert decision.details.get("suspended") is True
+
+
+def test_engine_can_buy_fails_closed_without_valid_price_data() -> None:
+    """无 close / 无涨跌停推导数据时必须 fail-closed，而不是用 close±1 猜测。"""
+    engine = _default_engine()
+    # 无 pre_close、无 pct_change：build_price_limits 无法推导涨跌停
+    decision = engine.can_buy(bar={"close": 10.0})
+    assert decision.executable is False
+    assert decision.reason == "no_valid_price_data"
+    assert decision.details.get("up_limit") is None
+
+    # close 缺失同样拒绝
+    decision2 = engine.can_buy(bar={"up_limit": 11.0, "down_limit": 9.0})
+    assert decision2.executable is False
+    assert decision2.reason == "no_valid_price_data"
+
+
+def test_engine_can_sell_fails_closed_without_valid_price_data() -> None:
+    engine = _default_engine()
+    now = datetime.fromisoformat("2026-03-11T14:50:00")
+    buy = datetime.fromisoformat("2026-03-10T09:35:00")
+    decision = engine.can_sell(bar={"close": 10.0}, last_buy_date=buy, current_date=now)
+    assert decision.executable is False
+    assert decision.reason == "no_valid_price_data"
+    assert decision.details.get("down_limit") is None
+
+
+def test_engine_can_buy_ok_includes_limit_prices_in_details() -> None:
+    engine = _default_engine()
+    bar = {"close": 10.0, "pre_close": 10.0, "up_limit": 11.0, "down_limit": 9.0}
+    decision = engine.can_buy(bar=bar)
+    assert decision.executable is True
+    assert decision.reason == "ok"
+    assert decision.details.get("close") == 10.0
+    assert decision.details.get("up_limit") == 11.0
+
+
+def test_engine_limit_up_reject_carries_close_and_limit() -> None:
+    engine = _default_engine()
+    bar = {"close": 11.0, "pre_close": 10.0, "up_limit": 11.0, "down_limit": 9.0}
+    decision = engine.can_buy(bar=bar)
+    assert decision.executable is False
+    assert decision.reason == "limit_up_reject"
+    assert decision.details.get("up_limit") == 11.0
+    assert decision.details.get("close") == 11.0
+
+
+def test_engine_limit_down_reject_carries_close_and_limit() -> None:
+    engine = _default_engine()
+    now = datetime.fromisoformat("2026-03-11T14:50:00")
+    buy = datetime.fromisoformat("2026-03-10T09:35:00")
+    bar = {"close": 9.0, "pre_close": 10.0, "up_limit": 11.0, "down_limit": 9.0}
+    decision = engine.can_sell(bar=bar, last_buy_date=buy, current_date=now)
+    assert decision.executable is False
+    assert decision.reason == "limit_down_reject"
+    assert decision.details.get("down_limit") == 9.0

@@ -166,6 +166,11 @@ class MarketWarehouseConfig(_StrictModel):
     post_followup_run_phase_d_tabular_deep: bool = True
     db_path: str = "artifacts/warehouse/market.duckdb"
     package_root: str = "artifacts/warehouse/package"
+    # 更新闭环执行门：读取 warehouse_freshness.json，delta/package 数据超过
+    # stale_data_max_trade_days 个交易日（或 freshness 缺失）时禁止新开仓。
+    # 默认关闭以保持既有行为，部署后经 NAS 验证再开启（渐进启用）。
+    block_new_buy_on_stale_data: bool = False
+    stale_data_max_trade_days: int = 2
     bootstrap_source_root: str = "artifacts/imports/tdx_offline_package"
     bootstrap_on_first_sync: bool = True
     offline_bootstrap_enabled: bool = False
@@ -340,11 +345,44 @@ class MonsterRiskConfig(_StrictModel):
     disable_if_sentiment_below: float = 45.0
 
 
+class OverextensionConfig(_StrictModel):
+    """统一过热风险模型（bars/snapshot 共用同一套阈值）。
+
+    乖离（bias_ma5）与 ATR 距离分层扣罚；达到 reject 档时 trend 轨拒绝新买入
+    （monster 观察池仍可保留）。5 日涨幅/跳空/量价背离作为附加风险项。
+    """
+
+    bias_warn_min: float = 0.10
+    bias_reject_min: float = 0.15
+    atr_distance_warn: float = 2.0
+    atr_distance_reject: float = 3.0
+    bias_penalty: float = 0.3
+    ret5_warn_threshold: float = 0.30
+    gap_warn_threshold: float = 0.07
+    volume_divergence_ratio: float = 2.5
+    extra_penalty: float = 0.05
+
+
+class BoardRiskConfig(_StrictModel):
+    """板块感知连板风险（复用 build_price_limits，不再用固定 9.5%）。
+
+    收盘价达到涨停价容差范围才计入连板；连续涨停达到
+    ``consecutive_limit_up_reject`` 天时，trend 轨拒绝新买入
+    （monster 观察池仍可保留，但不得进入默认 final signals）。
+    """
+
+    limit_up_tolerance: float = 0.001
+    consecutive_limit_up_reject: int = 3
+
+
 class Week5Config(_StrictModel):
     enabled: bool = True
     auto_run: bool = True
     auto_notify: bool = True
     history_limit: int = 500
+    # P1 双轨输出：legacy=单轨 monster（现状），dual_track=trend_candidates +
+    # monster_watchlist 分离。NAS 先 Shadow 对比后切换 dual_track。
+    week5_output_mode: str = "legacy"
     market_radar_enabled: bool = True
     market_radar_notify: bool = True
     market_radar_universe_max_symbols: int = 600
@@ -361,6 +399,10 @@ class Week5Config(_StrictModel):
     universe_prefilter_top_k: int = 500
     universe_prefilter_shortlist_top_n: int = 50
     week5_bars_cache_size: int = 600
+    # 市场广度门：扫描级 gate（market_breadth.json 缺失/不可用时跳过，不锁死）。
+    market_breadth_enabled: bool = True
+    market_breadth_disable_if_below: float = 45.0
+    market_breadth_stale_trend_lift: float = 5.0
     # Candidate funnel: full market -> light -> deep -> final (0..cap).
     light_candidate_target: int = 100
     deep_candidate_target: int = 20
@@ -1144,6 +1186,10 @@ class EvolutionConfig(_StrictModel):
     m7_live_news_artifact_max_records: int = 2000
     m7_ai_review_enabled: bool = False
     m7_ai_review_max_items_per_run: int = 12
+    # 政策面新闻风险门渐进启用：off=不启用 | shadow=仅记录（默认） |
+    # penalty=负面高置信度扣分 | conditional_veto=监管白名单硬否决。
+    # 在 week5 final selector 消费；LLM 不可用时降级不阻断。
+    news_risk_mode: str = "shadow"
     m10_conflict_warn: float = 0.25
     m10_calibration_gap_warn: float = 0.15
     m10_return_volatility_warn: float = 0.06
@@ -1443,6 +1489,8 @@ class StockAnalyzerConfig(_StrictModel):
     capital_curve: CapitalCurveConfig
     circuit_breaker: CircuitBreakerConfig
     monster_risk: MonsterRiskConfig = Field(default_factory=MonsterRiskConfig)
+    overextension: OverextensionConfig = Field(default_factory=OverextensionConfig)
+    board_risk: BoardRiskConfig = Field(default_factory=BoardRiskConfig)
     week5: Week5Config = Field(default_factory=Week5Config)
     holiday_risk: HolidayRiskConfig = Field(default_factory=HolidayRiskConfig)
     global_market: GlobalMarketConfig = Field(default_factory=GlobalMarketConfig)

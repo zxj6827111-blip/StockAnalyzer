@@ -266,11 +266,34 @@ monster_risk:
   max_stock_position: 0.08
   disable_if_sentiment_below: 45
 
+# 统一过热风险模型（P1 双轨）：bias_ma5 乖离分层扣罚，ATR 距离超限拒绝
+# trend 轨新买入；5 日涨幅/跳空/量价背离为附加风险项，阈值写入扫描审计。
+overextension:
+  bias_warn_min: 0.10
+  bias_reject_min: 0.15
+  atr_distance_warn: 2.0
+  atr_distance_reject: 3.0
+  bias_penalty: 0.3
+  ret5_warn_threshold: 0.30
+  gap_warn_threshold: 0.07
+  volume_divergence_ratio: 2.5
+  extra_penalty: 0.05
+
+# 板块感知连板风险（P1 双轨）：复用 build_price_limits 计算涨跌停价，
+# 收盘价达到涨停价容差范围才计入连板；连续 3 天涨停 trend 轨拒绝新买入。
+board_risk:
+  limit_up_tolerance: 0.001
+  consecutive_limit_up_reject: 3
+
 week5:
   enabled: true
   auto_run: true
   auto_notify: true
   history_limit: 500
+  # P1 双轨输出：legacy=单轨 monster（现状）；dual_track=trend_candidates
+  # 稳健候选 + monster_watchlist 高波动观察池（executable=false）。
+  # NAS 先 Shadow 对比后切换为 dual_track。
+  week5_output_mode: legacy
   market_radar_enabled: true
   market_radar_notify: true
   market_radar_universe_max_symbols: 600

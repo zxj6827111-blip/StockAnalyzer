@@ -7,7 +7,7 @@ import math
 import os
 import socket
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import date, datetime, timedelta
 from datetime import time as dt_time
 from pathlib import Path
@@ -855,6 +855,118 @@ class RuntimeMarketSyncService:
             package_root=service._resolve_market_warehouse_package_root(),
             package_writes_enabled=package_writes_enabled,
         )
+
+    def _write_warehouse_freshness(
+        self,
+        *,
+        report: Mapping[str, object],
+        warehouse: MarketWarehouse,
+        now: datetime,
+    ) -> dict[str, object]:
+        """同步闭环收尾：写 warehouse_freshness.json（delta 优先）。
+
+        source 取 delta（vendor_zip_readonly_plus_duckdb_delta）或 package
+        （market_warehouse）；date_max 以目标交易日为准，行数取后台质量
+        快照的 symbols_total。
+        """
+        service = self._service
+        from stock_analyzer.ops.warehouse_freshness import (
+            FRESHNESS_FILENAME,
+            write_warehouse_freshness,
+        )
+
+        storage_mode = str(report.get("storage_mode", "")).strip() or "market_warehouse"
+        source = "delta" if "delta" in storage_mode else "package"
+        date_max: date | None = None
+        raw_target = str(report.get("target_trade_date", "")).strip()
+        if raw_target:
+            try:
+                date_max = datetime.fromisoformat(raw_target).date()
+            except ValueError:
+                date_max = None
+        background = report.get("background_data")
+        row_count = None
+        if isinstance(background, dict):
+            row_count = background.get("symbols_total")
+        verification_status = str(report.get("status", "ok")).strip() or "ok"
+        data_source = str(service._config.market_warehouse.online_daily_primary).strip()
+        freshness_path = service._resolve_evolution_path(
+            f"artifacts/runtime/{FRESHNESS_FILENAME}"
+        )
+        try:
+            write_warehouse_freshness(
+                path=freshness_path,
+                source=source,
+                date_max=date_max,
+                updated_at=now,
+                verification_status=verification_status,
+                row_count=int(row_count) if row_count is not None else None,
+                data_source=data_source,
+                extra={
+                    "storage_mode": storage_mode,
+                    "db_path": service._to_evolution_relative(
+                        cast(Path, report.get("db_path", ""))
+                    )
+                    if str(report.get("db_path", "")).strip()
+                    else "",
+                    "package_root": service._to_evolution_relative(
+                        cast(Path, report.get("package_root", ""))
+                    )
+                    if str(report.get("package_root", "")).strip()
+                    else "",
+                },
+            )
+        except Exception as exc:
+            return {"written": False, "error": f"{type(exc).__name__}: {exc}"}
+        return {
+            "written": True,
+            "path": service._to_evolution_relative(freshness_path),
+            "source": source,
+            "date_max": date_max.isoformat() if date_max is not None else "",
+        }
+
+    def _write_market_breadth(
+        self,
+        *,
+        warehouse: MarketWarehouse,
+        now: datetime,
+    ) -> dict[str, object]:
+        """同步收尾：从全市场日线现算并预写 market_breadth.json。
+
+        盘后扫描直接读该快照（零额外开销）；快照缺失/过期时扫描兜底现算。
+        计算失败不阻断同步（广度门对缺失采用 fail-open）。
+        """
+        service = self._service
+        from stock_analyzer.ops.market_breadth import (
+            BREADTH_FILENAME,
+            compute_market_breadth_from_warehouse,
+            write_breadth_snapshot,
+        )
+
+        snapshot = compute_market_breadth_from_warehouse(
+            warehouse=warehouse,
+            limit_rule=service._config.limit_rule,
+            now=now,
+        )
+        if snapshot is None:
+            return {"written": False, "reason": "breadth_compute_unavailable"}
+        breadth_path = service._resolve_evolution_path(
+            f"artifacts/runtime/{BREADTH_FILENAME}"
+        )
+        try:
+            write_breadth_snapshot(snapshot, breadth_path)
+        except Exception as exc:
+            return {"written": False, "error": f"{type(exc).__name__}: {exc}"}
+        return {
+            "written": True,
+            "path": service._to_evolution_relative(breadth_path),
+            "as_of": str(snapshot.get("as_of", "")),
+            "score": (
+                float(snapshot["score"]["value"])
+                if isinstance(snapshot.get("score"), dict)
+                else None
+            ),
+        }
 
     def _resolve_market_warehouse_auto_refresh(
         self,
@@ -3348,6 +3460,18 @@ class RuntimeMarketSyncService:
                 "next_action": "targeted_retry" if final_failed else "none",
                 "failure_samples": failed_samples[:50],
             }
+            # P1 更新闭环：同步结束后写 warehouse_freshness.json，作为
+            # 数据新鲜度唯一权威（旧 manifest 日期只作历史证据）。
+            report["freshness"] = self._write_warehouse_freshness(
+                report=report,
+                warehouse=warehouse,
+                now=now,
+            )
+            # 市场广度快照预写：盘后扫描零成本读取（缺失时扫描兜底现算）。
+            report["market_breadth"] = self._write_market_breadth(
+                warehouse=warehouse,
+                now=now,
+            )
             _publish_progress(
                 status=str(report.get("status", "ok")),
                 phase="completed",

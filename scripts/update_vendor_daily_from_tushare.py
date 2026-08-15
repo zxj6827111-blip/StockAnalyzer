@@ -153,9 +153,10 @@ BASIC_SAME_NAME = [
 
 # Tushare single-call row cap used by the batch paging guard.  When a
 # trade_date-wide call returns exactly this many rows the caller must page
-# with ``offset`` to avoid silent truncation.  (Real cap depends on account
-# tier; 6000 is the documented single-response limit.)
-_TUSHARE_PAGE_LIMIT = 6000
+# with ``offset`` to avoid silent truncation.  The effective cap is ~5000
+# rows per call (measured 2026-08 on adj_factor; the 6000 documented earlier
+# exceeds it and requests are truncated server-side).
+_TUSHARE_PAGE_LIMIT = 5000
 
 DAILY_BASIC_FIELDS = (
     "ts_code,trade_date,turnover_rate,turnover_rate_f,volume_ratio,"
@@ -739,14 +740,22 @@ def _fetch_symbol(
         basic = _as_frame(raw_basic)
     if need_factors:
         adj_start_s = EARLIEST_DATE.strftime("%Y%m%d")
-        raw_adj = api._call_with_retry(
-            lambda: pro.adj_factor(
-                ts_code=ts_code,
-                start_date=adj_start_s,
-                end_date=end_s,
-            )
+        raw_adj = _fetch_adj_factor_paged(
+            api=api,
+            ts_code=ts_code,
+            start_date=adj_start_s,
+            end_date=end_s,
         )
-        result["adj"] = _as_frame(raw_adj)
+        adj = _as_frame(raw_adj)
+        if adj.empty:
+            # 全历史窗口必然有数据：空响应代表接口失败/权限/限频被上层
+            # 吞掉，而不是「合法无数据」。显式抛错避免 0 数据被当成功
+            # 跳过因子重建（8-13 现场 0 成功 0 失败的上游形态）。
+            raise DataSourceError(
+                f"tushare adj_factor empty for {ts_code} "
+                f"({adj_start_s}~{end_s}); treating as failure, not no-data"
+            )
+        result["adj"] = adj
 
     if need_daily:
         result["daily"] = _daily_to_25_columns(ts_code=ts_code, daily=daily, basic=basic)
@@ -757,6 +766,57 @@ def _as_frame(raw: object) -> pd.DataFrame:
     if isinstance(raw, pd.DataFrame):
         return raw.copy()
     return pd.DataFrame()
+
+
+def _fetch_adj_factor_paged(
+    api: TushareProvider,
+    *,
+    ts_code: str = "",
+    trade_date: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    page_size: int = _TUSHARE_PAGE_LIMIT,
+) -> pd.DataFrame:
+    """Fetch ``adj_factor`` with defensive paging when no ``trade_date`` is set.
+
+    A single per-symbol full-history query (1996→today ≈ 7400 rows) exceeds
+    the ~5000-row per-response cap and is silently truncated server-side,
+    which after re-anchoring drops the pre-truncation years from the rebuilt
+    factor files.  Offsetting until a short page is returned reconstructs the
+    full series.
+
+    ``trade_date``-wide calls are intentionally NOT paged here: a full market
+    day fits in one response and the per-day ``adj_factor`` interface does not
+    accept ``offset``.  Only ``trade_date`` is passed (SDK forwards empty
+    strings verbatim and tushare may reject them; ``_fetch_market_wide_by_date``
+    follows the same convention).
+    """
+    if trade_date:
+        raw = api._call_with_retry(
+            lambda: api._resolve_pro_api().adj_factor(trade_date=trade_date)
+        )
+        return _as_frame(raw)
+    parts: list[pd.DataFrame] = []
+    offset = 0
+    while True:
+        part = _as_frame(
+            api._call_with_retry(
+                lambda offset=offset: api._resolve_pro_api().adj_factor(
+                    ts_code=ts_code,
+                    start_date=start_date,
+                    end_date=end_date,
+                    offset=offset,
+                    limit=page_size,
+                )
+            )
+        )
+        if part.empty:
+            break
+        parts.append(part)
+        if len(part) < page_size:
+            break
+        offset += len(part)
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
 
 def _fetch_market_wide_by_date(
@@ -1117,6 +1177,7 @@ def _run_batch(
     updates_by_year: dict[int, dict[str, pd.DataFrame]] = {}
     factor_updates: dict[str, pd.DataFrame] = {}
     dates_failed: list[str] = []
+    date_errors: list[str] = []
     updated_codes: set[str] = set()
     fetched_symbols = 0
 
@@ -1125,11 +1186,16 @@ def _run_batch(
             continue
         try:
             day = _fetch_market_wide_by_date(api=api, trade_date=trade_date)
-        except Exception:  # pragma: no cover - network dependent
+        except Exception as exc:  # pragma: no cover - network dependent
+            # 异常明细必须记录：8-13 现场 0 成功 + 0 失败，正是这里把
+            # 限频/接口失败吞成空 errors，导致 stock_updater.sh 的 judge
+            # 误判「仅预期 empty 失败」而放行（rc=0 无告警）。
             dates_failed.append(trade_date)
+            date_errors.append(f"{trade_date}:{type(exc).__name__}:{exc}")
             continue
         if day["daily"].empty:
             dates_failed.append(trade_date)
+            date_errors.append(f"{trade_date}:empty_market_daily")
             continue
         _distribute_batch_day(
             daily=day["daily"],
@@ -1154,21 +1220,15 @@ def _run_batch(
             adj_old_day: pd.DataFrame = pd.DataFrame()
             adj_new_day: pd.DataFrame = pd.DataFrame()
             try:
-                adj_new_day = _as_frame(
-                    api._call_with_retry(
-                        lambda: pro.adj_factor(trade_date=end_s)
-                    )
-                )
+                adj_new_day = _fetch_adj_factor_paged(api, trade_date=end_s)
                 previous_factor_date = _latest_factor_anchor_date(
                     factors_root=factors_root,
                     trade_dates=trade_dates,
                     api=api,
                 )
                 if previous_factor_date is not None:
-                    adj_old_day = _as_frame(
-                        api._call_with_retry(
-                            lambda: pro.adj_factor(trade_date=previous_factor_date)
-                        )
+                    adj_old_day = _fetch_adj_factor_paged(
+                        api, trade_date=previous_factor_date
                     )
             except Exception as exc:  # pragma: no cover - network dependent
                 rebuild_reports.append(
@@ -1237,6 +1297,9 @@ def _run_batch(
         "trade_dates": trade_dates,
         "dates_processed": len(trade_dates) - len(dates_failed),
         "dates_failed": dates_failed,
+        # 失败原因明细（8-13 现场为空导致 judge 误判的根因），供 shell 层
+        # judge 区分「真失败」与「合法 empty」。
+        "errors": date_errors,
         "symbols_fetched": fetched_symbols,
         "symbols_updated": len(updated_codes),
         "zip_rebuilds": rebuild_reports,
