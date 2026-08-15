@@ -678,3 +678,122 @@ def test_main_sync_vendor_delta_degraded_on_import_failure(
     assert summary["delta_sync"]["updated"] is False
     assert summary["delta_sync"]["exit_code"] != 0
     assert not delta_db.exists()  # 同步未写入任何数据
+
+
+# ---------------------------------------------------------------------------
+# adj_factor 分页：全历史查询（1996→今 ≈7400 行）超过单次上限时不再截断
+# ---------------------------------------------------------------------------
+def test_fetch_adj_factor_paged_concats_pages(updater: object) -> None:
+    calls: list[dict[str, object]] = []
+
+    class _PaginatedPro:
+        def adj_factor(self, **kwargs: object) -> pd.DataFrame:
+            calls.append(dict(kwargs))
+            offset = int(kwargs.get("offset", 0))
+            total = 5
+            if offset >= total:
+                return pd.DataFrame()
+            rows = [
+                {
+                    "ts_code": "600000.SH",
+                    "trade_date": f"{20000101 + i}",
+                    "adj_factor": 1.0 + i * 0.1,
+                }
+                for i in range(offset, min(offset + 2, total))
+            ]
+            return pd.DataFrame(rows)
+
+    class _PaginatedApi:
+        def _resolve_pro_api(self) -> _PaginatedPro:
+            return _PaginatedPro()
+
+        def _call_with_retry(self, fn: object) -> object:
+            return fn() if callable(fn) else fn
+
+    result = updater._fetch_adj_factor_paged(
+        _PaginatedApi(),
+        ts_code="600000.SH",
+        start_date="19900101",
+        end_date="20260813",
+        page_size=2,
+    )
+
+    assert len(result) == 5
+    assert [int(call.get("offset", 0)) for call in calls] == [0, 2, 4]
+    assert all("limit" in call for call in calls)
+
+
+def test_fetch_adj_factor_paged_trade_date_single_call(updater: object) -> None:
+    """trade_date 全市场单日调用不携带 offset/limit（接口不支持分页）。"""
+    class _Pro:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def adj_factor(self, **kwargs: object) -> pd.DataFrame:
+            self.calls.append(dict(kwargs))
+            return pd.DataFrame(
+                {
+                    "ts_code": ["000001.SZ"],
+                    "trade_date": ["20260813"],
+                    "adj_factor": [2.0],
+                }
+            )
+
+    class _Api:
+        def __init__(self) -> None:
+            self.pro = _Pro()
+
+        def _resolve_pro_api(self) -> _Pro:
+            return self.pro
+
+        def _call_with_retry(self, fn: object) -> object:
+            return fn() if callable(fn) else fn
+
+    api = _Api()
+    result = updater._fetch_adj_factor_paged(api, trade_date="20260813")
+
+    assert len(result) == 1
+    assert len(api.pro.calls) == 1
+    assert "offset" not in api.pro.calls[0]
+    assert "limit" not in api.pro.calls[0]
+    assert api.pro.calls[0]["trade_date"] == "20260813"
+
+
+def test_fetch_symbol_adj_factor_empty_raises(
+    updater: object, tmp_path: Path
+) -> None:
+    """adj_factor 空响应视为失败而非无数据（8-13 现场 0 成功 0 失败被当 empty）。"""
+    daily_root = _daily_fixture(tmp_path)
+    factors_root = tmp_path / "复权因子_missing"
+    factors_root.mkdir(parents=True)
+
+    class _EmptyAdjPro:
+        def daily(self, ts_code: str = "", **kwargs: object) -> pd.DataFrame:
+            return _daily_frame()
+
+        def daily_basic(self, ts_code: str = "", **kwargs: object) -> pd.DataFrame:
+            return _basic_frame()
+
+        def adj_factor(self, ts_code: str = "", **kwargs: object) -> pd.DataFrame:
+            return pd.DataFrame()
+
+    class _Api(updater.TushareProvider):
+        def _resolve_pro_api(self) -> _EmptyAdjPro:
+            return _EmptyAdjPro()
+
+        def _call_with_retry(self, fn: object) -> object:
+            return fn() if callable(fn) else fn
+
+    api = _Api(
+        token="x", retry_delay_sec=0.0, min_request_interval_sec=0.0, max_attempts=1
+    )
+    with pytest.raises(updater.DataSourceError, match="adj_factor empty"):
+        updater._fetch_symbol(
+            api=api,
+            symbol="600000",
+            end_date=date(2025, 7, 20),
+            daily_root=daily_root,
+            factors_root=factors_root,
+            skip_factors=False,
+            dry_run=False,
+        )
