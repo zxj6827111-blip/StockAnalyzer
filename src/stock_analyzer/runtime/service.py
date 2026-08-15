@@ -276,6 +276,8 @@ class StockAnalyzerService:
             provider=provider,
             news_provider=news_provider,
         )
+        # final selector 复用同一 news provider（mtime 缓存）做政策面新闻门。
+        self._news_provider = news_provider
         self._realtime_pipeline = (
             AnalyzerPipeline(
                 config=config,
@@ -6263,13 +6265,27 @@ class StockAnalyzerService:
         *,
         signals: list[object],
         data_gate_status: str,
+        min_threshold_lift: float = 0.0,
     ) -> dict[str, object]:
         """Funnel final stage: gates + threshold -> at most ``final_signal_cap``."""
         cap = max(0, int(self._config.week5.final_signal_cap))
         allow_zero = bool(self._config.week5.allow_zero_signal)
         min_threshold = _as_float(self._config.week5.final_signal_min_threshold, default=70.0)
+        min_threshold += max(0.0, float(min_threshold_lift))
+        news_risk_mode = str(
+            getattr(self._config.evolution, "news_risk_mode", "shadow")
+        ).strip().lower()
         selected: list[dict[str, object]] = []
         rejected: list[dict[str, object]] = []
+        news_gate_summary: dict[str, object] = {
+            "mode": news_risk_mode,
+            "checked": 0,
+            "vetoed": 0,
+            "penalized": 0,
+            "shadow": 0,
+            "degraded": 0,
+            "skipped": 0,
+        }
         for signal in signals:
             if not isinstance(signal, dict):
                 continue
@@ -6286,11 +6302,49 @@ class StockAnalyzerService:
                 reasons.append("risk_gate_failed")
             if not bool(cross_review_gate.get("passed", False)):
                 reasons.append("cross_review_failed")
-            # P1 板块感知连板风险：signal 携带的 board_risk 判定（由扫描调用方在
-            # final selector 之前计算并填充），连续涨停达阈值时 trend 轨拒绝。
+            # P1 过热 + 连板风险门：signal 携带的 overextension/board_risk 判定
+            # （由扫描调用方在 final selector 之前计算并填充）。过热单独触发
+            # reject 也必须拒绝（此前只消费 board_risk，overextension 断链）。
+            overextension = _coerce_object_mapping(signal.get("overextension"))
             board_risk = _coerce_object_mapping(signal.get("board_risk"))
             if bool(board_risk.get("reject_new_buy", False)):
                 reasons.append("board_risk_reject_new_buy")
+            elif bool(overextension.get("reject_new_buy", False)):
+                reasons.append("overextension_reject_new_buy")
+            elif bool(signal.get("reject_new_buy", False)):
+                reasons.append("risk_gate_reject_new_buy")
+            # 新闻风险门（政策面风险）：veto 拒绝 / penalty 扣分 / shadow 仅记录。
+            news_outcome = self._apply_news_risk_gate(
+                symbol=symbol,
+                mode=news_risk_mode,
+            )
+            if news_risk_mode != "off":
+                news_gate_summary["checked"] = (
+                    _as_int(news_gate_summary.get("checked"), default=0) + 1
+                )
+            news_action = str(news_outcome.get("action", "none")).strip()
+            if news_action == "veto":
+                news_gate_summary["vetoed"] = (
+                    _as_int(news_gate_summary.get("vetoed"), default=0) + 1
+                )
+                reasons.append("news_risk_veto")
+            elif news_action == "penalty":
+                news_gate_summary["penalized"] = (
+                    _as_int(news_gate_summary.get("penalized"), default=0) + 1
+                )
+                score = max(0.0, score - _as_float(news_outcome.get("penalty_amount"), default=0.0))
+            elif news_action == "shadow":
+                news_gate_summary["shadow"] = (
+                    _as_int(news_gate_summary.get("shadow"), default=0) + 1
+                )
+            elif news_action == "degraded":
+                news_gate_summary["degraded"] = (
+                    _as_int(news_gate_summary.get("degraded"), default=0) + 1
+                )
+            else:
+                news_gate_summary["skipped"] = (
+                    _as_int(news_gate_summary.get("skipped"), default=0) + 1
+                )
             if score < min_threshold:
                 reasons.append("below_min_threshold")
             if any(reason.startswith("predictor_rejected:") for reason in _string_list(signal.get("reasons"))):
@@ -6323,12 +6377,65 @@ class StockAnalyzerService:
             "input_count": len(signals),
             "final_signal_cap": cap,
             "allow_zero_signal": allow_zero,
-            "min_threshold": min_threshold,
+            "min_threshold": round(min_threshold, 4),
             "selected_count": len(capped),
             "rejected_count": len(rejected),
             "final_signals": capped,
             "rejected": rejected,
+            "news_risk_gate": news_gate_summary,
         }
+
+    def _apply_news_risk_gate(
+        self,
+        *,
+        symbol: str,
+        mode: str,
+    ) -> dict[str, object]:
+        """Per-symbol 政策面新闻风险门（PLAN P2-3 接线）。
+
+        - ``off``：不启用，跳过；
+        - ``shadow``：仅记录判定（action=shadow），不改变选股结果；
+        - ``penalty``：负面高置信度时扣分（penalty_amount），影响排序与阈值；
+        - ``conditional_veto``：监管白名单 + 高置信度 + 官方来源 + hard_veto
+          证据时否决（action=veto）；
+        - LLM 不可用或异常：降级（action=degraded），绝不阻断选股。
+        复用共享 news provider 实例（mtime 缓存），候选量级下开销毫秒级。
+        """
+        if mode == "off" or not symbol:
+            return {"action": "skipped", "penalty_amount": 0.0, "degraded": False}
+        provider = getattr(self, "_news_provider", None)
+        if provider is None or not callable(getattr(provider, "news_risk", None)):
+            return {"action": "skipped", "penalty_amount": 0.0, "degraded": False}
+        try:
+            from stock_analyzer.news.risk_mode import evaluate_news_risk_mode
+
+            decision = provider.news_risk(symbol=symbol)
+            llm_available = bool(
+                bool(getattr(self._config.evolution, "llm_semantic_enabled", False))
+                and str(getattr(self._config.evolution, "llm_api_key", "") or "").strip()
+            )
+            outcome = evaluate_news_risk_mode(
+                mode_value=mode,
+                decision=asdict(decision),
+                shadow_stats=None,
+                llm_available=llm_available,
+            )
+        except Exception:
+            # 新闻门异常不阻断选股：渐进启用期间允许降级并保留 trace。
+            return {"action": "degraded", "penalty_amount": 0.0, "degraded": True}
+        if outcome.action == "veto":
+            return {"action": "veto", "penalty_amount": 0.0, "degraded": bool(outcome.degraded)}
+        if outcome.action == "penalty":
+            return {
+                "action": "penalty",
+                "penalty_amount": float(outcome.penalty_amount),
+                "degraded": bool(outcome.degraded),
+            }
+        if outcome.action == "shadow_record":
+            return {"action": "shadow", "penalty_amount": 0.0, "degraded": bool(outcome.degraded)}
+        if bool(outcome.degraded):
+            return {"action": "degraded", "penalty_amount": 0.0, "degraded": True}
+        return {"action": "none", "penalty_amount": 0.0, "degraded": False}
 
     def ensure_week5_feature_snapshot(
         self,
@@ -6503,6 +6610,89 @@ class StockAnalyzerService:
             "source_trust_levels": source_trust_levels,
             "financial_trust_level": financial_trust_level,
         }
+
+    def _stale_data_open_gate(self, *, now: datetime) -> dict[str, object] | None:
+        """更新闭环执行门：陈旧数据禁止新开仓（PLAN P1-4）。
+
+        仅在 ``market_warehouse.block_new_buy_on_stale_data`` 开启时生效；
+        读取 ``warehouse_freshness.json``（delta 优先、package fallback），
+        fallback 超过 ``stale_data_max_trade_days`` 个交易日或 artifact 缺失
+        时返回 ``blocked=True``。门关闭时返回 ``None``，不改变既有行为。
+        """
+        if not bool(self._config.market_warehouse.block_new_buy_on_stale_data):
+            return None
+        from stock_analyzer.ops.warehouse_freshness import (
+            FRESHNESS_FILENAME,
+            open_position_blocked_by_stale_data,
+            read_warehouse_freshness,
+        )
+
+        freshness_path = self._resolve_evolution_path(
+            f"artifacts/runtime/{FRESHNESS_FILENAME}"
+        )
+        freshness = read_warehouse_freshness(freshness_path)
+        return open_position_blocked_by_stale_data(
+            freshness,
+            now=now.date(),
+            max_stale_trade_days=self._config.market_warehouse.stale_data_max_trade_days,
+        )
+
+    def _apply_market_breadth_gate(
+        self,
+        *,
+        now: datetime,
+    ) -> tuple[dict[str, object], float]:
+        """市场广度门（PLAN P2-1 接线）：读预写快照，缺失时 fail-open。
+
+        返回 ``(meta, trend_lift)``：
+        - meta: ``block_new_buy``/``reason``/``score``/``trend_min_threshold_lift``；
+        - trend_lift: 轻度过期时 trend 最低分提升量（final selector 用）。
+
+        只消费同步时预写的 ``market_breadth.json``（缺失/不可用 → 不阻断，
+        避免 warehouse 未同步或预写失败时锁死扫描）。快照为盘后日频
+        （as_of=数据日 15:00），heartbeat 阈值放大到 48h：数据超过约 2 个
+        交易日未更新 → block 新开仓；数据新鲜 → 正常放行。
+        """
+        from stock_analyzer.ops.market_breadth import (
+            BREADTH_FILENAME,
+            breadth_usage_policy,
+            read_breadth_snapshot,
+        )
+
+        breadth_path = self._resolve_evolution_path(f"artifacts/runtime/{BREADTH_FILENAME}")
+        snapshot = read_breadth_snapshot(breadth_path)
+        if snapshot is None:
+            return (
+                {
+                    "enabled": True,
+                    "block_new_buy": False,
+                    "reason": "breadth_unavailable",
+                    "score": None,
+                    "trend_min_threshold_lift": 0.0,
+                },
+                0.0,
+            )
+        policy = breadth_usage_policy(
+            snapshot=snapshot,
+            now=now,
+            trend_min_threshold=float(
+                _as_float(self._config.week5.final_signal_min_threshold, default=70.0)
+            ),
+            disable_if_below=float(self._config.week5.market_breadth_disable_if_below),
+            # 盘后日频快照：heartbeat 检查放大到 48h（约 2 个交易日更新周期）。
+            max_intraday_heartbeat_sec=48.0 * 3600.0,
+        )
+        stale_lift = float(
+            _as_float(policy.get("trend_min_threshold_lift"), default=0.0)
+        )
+        meta: dict[str, object] = {
+            "enabled": True,
+            "block_new_buy": bool(policy.get("block_new_buy", False)),
+            "reason": str(policy.get("reason", "breadth_ok")),
+            "score": policy.get("score"),
+            "trend_min_threshold_lift": round(stale_lift, 4),
+        }
+        return meta, stale_lift
 
     def _fetch_week5_bars_cached(
         self,
@@ -13394,8 +13584,12 @@ class StockAnalyzerService:
             "buy_new_rejected": 0,
             "buy_new_filled": 0,
             "engine_risk_gate_blocked": 0,
+            "stale_data_gate_blocked": 0,
             "non_buy_signals": 0,
         }
+
+        # 更新闭环执行门：陈旧/缺失数据时禁止新开仓（门关闭时返回 None）。
+        stale_data_gate = self._stale_data_open_gate(now=timestamp)
 
         relevant_symbols = _dedupe_preserve_order(
             [
@@ -13815,6 +14009,15 @@ class StockAnalyzerService:
 
             execution_attempts["buy_new_candidates"] += 1
             execution_attempts["buy_new_attempted"] += 1
+            if isinstance(stale_data_gate, dict) and bool(stale_data_gate.get("blocked")):
+                execution_attempts["stale_data_gate_blocked"] += 1
+                _append_rejected_buy_execution(
+                    signal=signal,
+                    symbol=symbol,
+                    status="rejected_stale_data",
+                    reason="auto_simulated_buy_stale_data",
+                )
+                continue
             desired_cash = min(
                 initial_cash * max(0.0, float(signal.target_position)),
                 available_cash,

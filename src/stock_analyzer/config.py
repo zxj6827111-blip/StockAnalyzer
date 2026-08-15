@@ -166,6 +166,11 @@ class MarketWarehouseConfig(_StrictModel):
     post_followup_run_phase_d_tabular_deep: bool = True
     db_path: str = "artifacts/warehouse/market.duckdb"
     package_root: str = "artifacts/warehouse/package"
+    # 更新闭环执行门：读取 warehouse_freshness.json，delta/package 数据超过
+    # stale_data_max_trade_days 个交易日（或 freshness 缺失）时禁止新开仓。
+    # 默认关闭以保持既有行为，部署后经 NAS 验证再开启（渐进启用）。
+    block_new_buy_on_stale_data: bool = False
+    stale_data_max_trade_days: int = 2
     bootstrap_source_root: str = "artifacts/imports/tdx_offline_package"
     bootstrap_on_first_sync: bool = True
     offline_bootstrap_enabled: bool = False
@@ -394,6 +399,10 @@ class Week5Config(_StrictModel):
     universe_prefilter_top_k: int = 500
     universe_prefilter_shortlist_top_n: int = 50
     week5_bars_cache_size: int = 600
+    # 市场广度门：扫描级 gate（market_breadth.json 缺失/不可用时跳过，不锁死）。
+    market_breadth_enabled: bool = True
+    market_breadth_disable_if_below: float = 45.0
+    market_breadth_stale_trend_lift: float = 5.0
     # Candidate funnel: full market -> light -> deep -> final (0..cap).
     light_candidate_target: int = 100
     deep_candidate_target: int = 20
@@ -1177,6 +1186,10 @@ class EvolutionConfig(_StrictModel):
     m7_live_news_artifact_max_records: int = 2000
     m7_ai_review_enabled: bool = False
     m7_ai_review_max_items_per_run: int = 12
+    # 政策面新闻风险门渐进启用：off=不启用 | shadow=仅记录（默认） |
+    # penalty=负面高置信度扣分 | conditional_veto=监管白名单硬否决。
+    # 在 week5 final selector 消费；LLM 不可用时降级不阻断。
+    news_risk_mode: str = "shadow"
     m10_conflict_warn: float = 0.25
     m10_calibration_gap_warn: float = 0.15
     m10_return_volatility_warn: float = 0.06

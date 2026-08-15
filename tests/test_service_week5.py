@@ -152,6 +152,11 @@ def _load_test_config() -> StockAnalyzerConfig:
     # default require_current=True would block every scan for the missing
     # snapshot and starve the funnel tests of signals.
     config.week5.feature_snapshot_require_current = False
+    # 同理：funnel 测试不测市场广度门（单独在 test_market_breadth /
+    # test_service_portfolio 覆盖）。开启时仓库残留的 market_breadth.json
+    # （由同步类测试写入真实 artifacts/runtime）会被误判为过期 block，
+    # 饿死 funnel 测试的信号。
+    config.week5.market_breadth_enabled = False
     # Default to legacy universe path for existing tests; tests that exercise the
     # quality selector enable it explicitly via _enable_universe_quality_selector.
     config.week5.universe_quality_selector_enabled = False
