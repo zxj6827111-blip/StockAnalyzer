@@ -12,6 +12,7 @@ from typing import Any
 import pandas as pd
 
 from stock_analyzer.evolution.modules.m7_news_loader import load_m7_news_records
+from stock_analyzer.news.risk_mode import REGULATORY_WHITELIST_EVENTS
 
 
 @dataclass(slots=True)
@@ -21,7 +22,9 @@ class NewsRiskDecision:
     单一 float 新闻分数升级为结构化决策：无个股证据时明确返回
     ``available_for_symbol=False``（score=None），不再回退全市场均值。
     ``hard_veto`` 仅在负面且置信度达标时为 True（LLM 不得单独执行硬否决，
-    本字段只作证据输出，决策由 news_risk_mode 门消费）。
+    本字段只作证据输出，决策由 news_risk_mode 门消费）。``event_types`` /
+    ``sources`` 供 ``conditional_veto`` 白名单与来源判定使用（缺字段会让
+    veto 永远无法触发，见 PLAN 审查修复）。
     """
 
     score: float | None
@@ -29,6 +32,8 @@ class NewsRiskDecision:
     hard_veto: bool
     max_negative_confidence: float
     matched_event_ids: list[str] = field(default_factory=list)
+    event_types: list[str] = field(default_factory=list)
+    sources: list[str] = field(default_factory=list)
     freshness: dict[str, object] = field(default_factory=dict)
     reasons: list[str] = field(default_factory=list)
 
@@ -194,12 +199,23 @@ class ArtifactNewsSignalProvider:
             reasons.append("negative_high_confidence")
         elif negative_confidences:
             reasons.append("negative_news")
+        event_types: list[str] = []
+        sources: list[str] = []
+        for record in symbol_events:
+            for event_type in _extract_event_types(record):
+                if event_type not in event_types:
+                    event_types.append(event_type)
+            for source in _extract_sources(record):
+                if source not in sources:
+                    sources.append(source)
         return NewsRiskDecision(
             score=_clamp_01(weighted) if weighted is not None else None,
             available_for_symbol=True,
             hard_veto=hard_veto,
             max_negative_confidence=round(max_negative, 4),
             matched_event_ids=event_ids[:20],
+            event_types=event_types,
+            sources=sources,
             freshness=_freshness_fields(
                 events=all_events,
                 now=now,
@@ -294,6 +310,64 @@ def _extract_symbols(record: Mapping[str, Any]) -> set[str]:
                     if normalized:
                         symbols.add(normalized)
     return symbols
+
+
+def _extract_event_types(record: Mapping[str, Any]) -> list[str]:
+    """提取事件类型：显式字段优先，否则从标题/正文匹配监管关键词。
+
+    ``conditional_veto`` 的白名单判定需要事件类型；真实 M7 记录通常没有
+    独立的 event_type 字段，因此回退到 ``headline``/``content`` 文本匹配
+    ``REGULATORY_WHITELIST_EVENTS``（立案/处罚/欺诈/退市等）。关键词按长度
+    降序输出，避免"退市风险"被"退市"截断后遗漏完整语义。
+    """
+    types: list[str] = []
+    for key in ("event_type", "event_types", "news_type", "category", "event_category"):
+        value = record.get(key)
+        if isinstance(value, str) and value.strip():
+            types.append(value.strip())
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and item.strip():
+                    types.append(item.strip())
+    if types:
+        return types
+    text = " ".join(
+        str(record.get(key) or "")
+        for key in ("headline", "title", "content", "summary", "abstract")
+    )
+    if not text.strip():
+        return []
+    matched = sorted(
+        (keyword for keyword in REGULATORY_WHITELIST_EVENTS if keyword in text),
+        key=len,
+        reverse=True,
+    )
+    # 去掉被更长关键词覆盖的子串（如"立案"是"立案调查"的子串），
+    # 使 event_types 语义干净，同时保留多个独立事件类型。
+    deduped: list[str] = []
+    for keyword in matched:
+        if any(keyword in longer for longer in deduped):
+            continue
+        deduped.append(keyword)
+    return deduped
+
+
+def _extract_sources(record: Mapping[str, Any]) -> list[str]:
+    """提取新闻来源（发布方/媒体/数据源），供 conditional_veto 来源判定。"""
+    sources: list[str] = []
+    for key in (
+        "source",
+        "source_name",
+        "publisher",
+        "media",
+        "media_name",
+        "source_file",
+        "provider",
+    ):
+        value = record.get(key)
+        if isinstance(value, str) and value.strip():
+            sources.append(value.strip())
+    return sources
 
 
 def _extract_confidence(record: Mapping[str, Any]) -> float:

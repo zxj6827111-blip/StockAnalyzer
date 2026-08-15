@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
+from pathlib import Path
+
+from stock_analyzer.news.provider import ArtifactNewsSignalProvider
 from stock_analyzer.news.risk_mode import (
     PENALTY_MIN_CONFIDENCE,
     SHADOW_MIN_EVENTS,
@@ -203,3 +207,40 @@ def test_shadow_constants() -> None:
     assert SHADOW_MIN_EVENTS == 200
     assert PENALTY_MIN_CONFIDENCE == 0.6
     assert VETO_MIN_CONFIDENCE == 0.8
+
+
+def test_conditional_veto_integration_uses_real_provider_fields(
+    tmp_path: Path,
+) -> None:
+    """真实 provider 产物直接喂给 news_risk_mode 门，防止"单测构造假数据"盲区。
+
+    回归：provider 曾不输出 event_types/sources，导致 conditional_veto 的
+    白名单与来源判定在真实数据路径上永远无法命中（veto 永不生效）。
+    """
+    records_path = tmp_path / "m7_news_latest.jsonl"
+    records_path.write_text(
+        "\n".join(
+            [
+                '{"symbol":"600000","sentiment":-1.0,"llm_confidence":0.9,'
+                '"event_id":"evt-reg","headline":"证监会立案调查","source":"证监会"}',
+                '{"symbol":"600000","sentiment":-1.0,"llm_confidence":0.5,'
+                '"event_id":"evt-neg","headline":"业绩下滑","source":"自媒体"}',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    provider = ArtifactNewsSignalProvider(path=records_path)
+    decision = provider.news_risk(symbol="600000")
+    assert decision.hard_veto is True
+    assert "立案调查" in decision.event_types
+    assert "证监会" in decision.sources
+
+    outcome = evaluate_news_risk_mode(
+        mode_value="conditional_veto",
+        decision=asdict(decision),
+        shadow_stats=None,
+        llm_available=True,
+    )
+    assert outcome.applied is True
+    assert outcome.action == "veto"
+    assert outcome.hard_veto is True
