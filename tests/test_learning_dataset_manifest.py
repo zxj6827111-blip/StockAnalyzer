@@ -179,15 +179,17 @@ def test_dataset_manifest_builder_includes_projection_compatible_legacy_snapshot
 def test_dataset_manifest_builder_purges_label_windows_crossing_split_boundary(
     tmp_path: Path,
 ) -> None:
-    """embargo 分组切分时，标签窗口跨入下一集合的样本被剔除。
+    """embargo 分组切分按 label 成熟日归集，calibration 集合不会被清空。
 
-    用「交易日」间隔的样本（每天一条），配合 label_mature_time 落在下一
-    集合起始之后的样本，验证它被 purge、而标签早已成熟的样本保留。
+    用「交易日」间隔的样本（每天一条），label_mature_time 各不相同，验证：
+    样本按其 label 成熟日落入对应集合（同日成熟同集合），train/calibration/
+    test 三个集合全部非空——回归旧 purge 逻辑把 calibration 清空导致训练失败
+    的缺陷。
     """
     store = SampleStore(db_path=tmp_path / "sample_store.duckdb")
     builder = DatasetManifestBuilder(store=store)
 
-    # 8 个交易日，比例 0.5/0.5 会得到 4 train / 2 calibration / 2 test。
+    # 8 个交易日，比例 0.25/0.25 会得到 4 train / 2 calibration / 2 test。
     for index in range(8):
         decision_time = datetime(2026, 1, 1, 14, 30, tzinfo=UTC) + timedelta(days=index)
         store.write_snapshot(
@@ -196,8 +198,7 @@ def test_dataset_manifest_builder_purges_label_windows_crossing_split_boundary(
                 decision_time.isoformat(),
             )
         )
-        # 前 3 天标签成熟得很早（不跨边界）；最后一条 train 的标签窗口
-        # 恰好跨进 calibration 起始日之后。
+        # 前 3 天标签成熟得早；其余样本 label 窗口较长，跨越多个集合边界。
         if index <= 2:
             mature = decision_time + timedelta(days=1)
         else:
@@ -225,14 +226,21 @@ def test_dataset_manifest_builder_purges_label_windows_crossing_split_boundary(
     )
 
     items = store.list_manifest_items(manifest.dataset_manifest_id)
-    # 所有同一天样本必须落在同一 split（无同日跨集合泄漏）。
-    by_date: dict[str, set[str]] = {}
+    # 结构性 embargo：同一 label 成熟日的样本必须落在同一 split（无同日
+    # 标签跨集合泄漏），且没有样本被事后 purge 掉。
+    assert manifest.included_snapshot_count == 8
+    outcome_map = {outcome.snapshot_id: outcome for outcome in store.list_outcomes()}
+    by_mature_date: dict[str, set[str]] = {}
     for item in items:
-        by_date.setdefault(str(item.decision_time.date()), set()).add(item.split_name)
-    assert all(len(splits) == 1 for splits in by_date.values())
+        mature = outcome_map[item.snapshot_id].label_mature_time
+        assert mature is not None
+        by_mature_date.setdefault(str(mature.date()), set()).add(item.split_name)
+    assert all(len(splits) == 1 for splits in by_mature_date.values())
 
-    # 有 label 窗口跨界的样本被 purge：总包含数应小于 8。
-    assert manifest.included_snapshot_count < 8
+    # 回归：三集合全部非空——旧逻辑会因标签窗口跨入下一集合而清空
+    # calibration，导致训练端 "empty train/calibration/test set" 失败。
+    split_names = {item.split_name for item in items}
+    assert split_names == {"train", "calibration", "test"}
 
 
 def _build_snapshot(

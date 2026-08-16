@@ -275,56 +275,45 @@ def _build_grouped_split_and_purge(
     test_ratio: float,
     embargo_days: int,
 ) -> tuple[list[dict[str, object]], list[DatasetSplitPlanEntry]]:
-    """Trade-date-grouped split with a label-window purge.
+    """Label-maturity-grouped split with a structural label-window embargo.
 
-    Rows of the same trading date always share one split (no same-date leakage
-    across the train/calibration/test boundary), and any sample whose label
-    window is not fully matured by the next split's start is purged so future
-    price action never contaminates the evaluation set.
+    Samples are grouped by their label maturity date (the outcome's real
+    ``label_mature_time``, falling back to ``decision_time + embargo_days``)
+    and whole maturity dates are assigned chronologically to
+    train/calibration/test.  A sample belongs to the split in which its label
+    matures, so a training/calibration sample's label window can never reach
+    into a later split — the embargo is structural instead of a post-hoc
+    purge, and the calibration set can never be emptied by its own label
+    windows.  All rows sharing one maturity date share one split (no
+    same-date label leakage across the boundary).
     """
-    date_order: list[date] = []
-    date_rows: dict[date, list[tuple[SignalSnapshot, OutcomeRecord]]] = {}
+    maturity_order: list[date] = []
+    maturity_rows: dict[date, list[tuple[SignalSnapshot, OutcomeRecord]]] = {}
     for snapshot, outcome in ordered_pairs:
-        trading_date = snapshot.decision_time.date()
-        if trading_date not in date_rows:
-            date_rows[trading_date] = []
-            date_order.append(trading_date)
-        date_rows[trading_date].append((snapshot, outcome))
-    date_order.sort()
+        label_mature = outcome.label_mature_time
+        maturity_date = (
+            label_mature.date()
+            if label_mature is not None
+            else snapshot.decision_time.date() + timedelta(days=max(1, embargo_days))
+        )
+        if maturity_date not in maturity_rows:
+            maturity_rows[maturity_date] = []
+            maturity_order.append(maturity_date)
+        maturity_rows[maturity_date].append((snapshot, outcome))
+    maturity_order.sort()
 
-    date_split = _assign_temporal_splits_by_date(
-        dates=date_order,
+    maturity_split = _assign_temporal_splits_by_date(
+        dates=maturity_order,
         calibration_ratio=calibration_ratio,
         test_ratio=test_ratio,
     )
 
-    calibration_start = _min_decision_time(date_rows, date_split, "calibration")
-    test_start = _min_decision_time(date_rows, date_split, "test")
-
     items: list[dict[str, object]] = []
     split_times: dict[str, list[datetime]] = {}
     ordinal = 0
-    for trading_date in date_order:
-        split_name = date_split[trading_date]
-        for snapshot, outcome in date_rows[trading_date]:
-            label_mature = outcome.label_mature_time
-            purge_time = (
-                label_mature
-                if label_mature is not None
-                else snapshot.decision_time + timedelta(days=max(1, embargo_days))
-            )
-            # Purge when the label window reaches into the following split. The
-            # label window is [decision_time, label_mature_time): a label that
-            # matures exactly at the next split's start has not observed any of
-            # that split's bars, so it is safe to keep.
-            if (
-                split_name == "train"
-                and calibration_start is not None
-                and purge_time > calibration_start
-            ):
-                continue
-            if split_name == "calibration" and test_start is not None and purge_time > test_start:
-                continue
+    for maturity_date in maturity_order:
+        split_name = maturity_split[maturity_date]
+        for snapshot, _outcome in maturity_rows[maturity_date]:
             items.append(_manifest_item(snapshot, split_name, ordinal))
             ordinal += 1
             split_times.setdefault(split_name, []).append(snapshot.decision_time)
@@ -339,20 +328,6 @@ def _manifest_item(snapshot: SignalSnapshot, split_name: str, ordinal: int) -> d
         "ordinal": ordinal,
         "decision_time": snapshot.decision_time,
     }
-
-
-def _min_decision_time(
-    date_rows: dict[date, list[tuple[SignalSnapshot, OutcomeRecord]]],
-    date_split: dict[date, str],
-    split_name: str,
-) -> datetime | None:
-    times = [
-        snapshot.decision_time
-        for trading_date, split in date_split.items()
-        if split == split_name
-        for snapshot, _outcome in date_rows[trading_date]
-    ]
-    return min(times) if times else None
 
 
 def _build_split_plan(split_times: dict[str, list[datetime]]) -> list[DatasetSplitPlanEntry]:
