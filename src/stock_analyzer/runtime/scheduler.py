@@ -138,6 +138,25 @@ class DailyScheduler:
                 continue
             today = current.date()
             already_ran = self._last_run.get(name) == today
+            next_due_raw = str(self._job_runtime.get(name, {}).get("next_due_at", "")).strip()
+            if next_due_raw:
+                try:
+                    next_due = datetime.fromisoformat(next_due_raw)
+                except ValueError:
+                    next_due = None
+                if next_due is not None and current < next_due:
+                    # 失败退避窗口内不执行（next_due 由 _record_job_result
+                    # 按连续失败次数指数推后），避免失败任务的无限立即重试。
+                    results.append(
+                        ScheduledTaskResult(
+                            job=name,
+                            ran=False,
+                            success=True,
+                            detail="backoff",
+                            payload={},
+                        )
+                    )
+                    continue
             if job.latest_time is not None and current.time() > job.latest_time and not already_ran:
                 self._last_run[name] = today
                 self._record_job_result(
@@ -385,6 +404,16 @@ class DailyScheduler:
             failures = 0
         elif ran or detail == "expired":
             failures += 1
+        if ran and not success:
+            # 失败退避：失败的每日/间隔任务不能立即重试（旧实现把 next_due
+            # 设为当天触发点/当前时刻，触发点已过时下一次 poll 立即再跑，
+            # 单点失败会形成无节制的重试风暴持续烧 CPU）。退避按连续失败
+            # 次数指数递增、封顶 30 分钟；传入了更晚的 next_due（如次日
+            # 触发点）时尊重原计划。
+            backoff_minutes = min(30, 2 ** min(max(failures - 1, 0), 5))
+            backoff_due = attempted_at + timedelta(minutes=backoff_minutes)
+            if backoff_due > next_due_at:
+                next_due_at = backoff_due
         payload = {
             "last_attempt_at": attempted_at.isoformat() if ran else str(
                 previous.get("last_attempt_at", "")

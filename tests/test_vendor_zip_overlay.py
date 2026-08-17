@@ -207,6 +207,66 @@ def test_vendor_overlay_accepts_qfq_mode(tmp_path: Path) -> None:
     assert provider.status()["price_series_mode"] == "qfq"
 
 
+def test_vendor_overlay_qfq_tolerates_history_before_factor_start(tmp_path: Path) -> None:
+    """早于因子表起点的历史段用原始价（因子 1.0）填充而非 fail-closed。
+
+    前复权因子表有历史起点（Tushare 通常从 2001 年起），而老票日 K 可能
+    更早（2000 甚至 1999）——生产里这些早段是独立的年度 zip 条目，整个
+    条目都在因子起点之前，bfill 无因子可借、全部 NaN。回归：旧实现直接抛
+    DataSourceError，导致整只票在 qfq 模式下读不到（曾引发 285 只票回填
+    失败与 offhours 无限重试风暴）。
+    """
+    # 2025 条目：全部日期在因子起点（2026-01-02）之前 → 因子 1.0。
+    old_csv = "\n".join(
+        [
+            "code,datetime,open,high,low,close,pre_close,change,pct_chg,volume,amount",
+            "600000.SH,2025-11-27,10,11,9,10,0,0,0,100,123.4",
+            "600000.SH,2025-11-28,10.5,11.5,10,10.5,10,0,0,120,140.0",
+        ]
+    )
+    _write_zip(tmp_path / "全A日K" / "2025.zip", {"2025/600000.SH.csv": old_csv})
+    # 2026 条目：因子覆盖（0.9 / 1.0）。
+    new_csv = "\n".join(
+        [
+            "code,datetime,open,high,low,close,pre_close,change,pct_chg,volume,amount",
+            "600000.SH,2026-01-02,9,9.5,8.5,9,10,0,0,200,234.5",
+            "600000.SH,2026-01-05,9.2,9.8,9,9.3,9,0,0,150,180.0",
+        ]
+    )
+    _write_zip(tmp_path / "全A日K" / "2026.zip", {"2026/600000.SH.csv": new_csv})
+    _write_factors_zip(
+        tmp_path,
+        {
+            "2026/600000.SH.csv": "\n".join(
+                [
+                    "股票代码,交易日期,复权因子",
+                    "600000.SH,20260102,0.9",
+                    "600000.SH,20260105,1.0",
+                ]
+            )
+        },
+    )
+    index_path = tmp_path / "index" / "daily_index.json"
+    write_vendor_zip_daily_index(root=tmp_path, output_path=index_path)
+    provider = _qfq_provider(tmp_path, index_path)
+
+    bars = provider.fetch_daily_bars("600000", lookback_days=10)
+
+    assert list(bars.index.strftime("%Y-%m-%d")) == [
+        "2025-11-27",
+        "2025-11-28",
+        "2026-01-02",
+        "2026-01-05",
+    ]
+    # 因子起点（2026-01-02）之前的历史段用因子 1.0：保持原始价。
+    assert float(bars.loc["2025-11-27", "close"]) == pytest.approx(10.0)
+    assert float(bars.loc["2025-11-28", "close"]) == pytest.approx(10.5)
+    assert float(bars.loc["2025-11-27", "open"]) == pytest.approx(10.0)
+    # 因子起点后的日期照常乘因子（0.9 / 1.0）。
+    assert float(bars.loc["2026-01-02", "close"]) == pytest.approx(9.0 * 0.9)
+    assert float(bars.loc["2026-01-05", "close"]) == pytest.approx(9.3 * 1.0)
+
+
 def test_vendor_overlay_rejects_unverified_hfq_price_mode(tmp_path: Path) -> None:
     index_path = _build_qfq_daily_fixture(tmp_path)
     with pytest.raises(DataSourceError, match="only raw or qfq"):

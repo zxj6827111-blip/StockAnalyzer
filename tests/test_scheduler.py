@@ -115,6 +115,47 @@ def test_scheduler_persists_attempt_success_and_failure_state() -> None:
     assert state["consecutive_failures"] == 0
 
 
+def test_scheduler_backs_off_failed_daily_job_instead_of_immediate_retry() -> None:
+    """失败的每日任务必须退避重试，不能形成无限重试风暴。
+
+    回归：旧实现失败后把 next_due 设为当天触发点（已过时），下一次 poll
+    立即再跑，单点失败（如 vendor 因子对齐）会持续烧满一个核（NAS 实测
+    15h+）。修复后失败按连续次数指数退避、封顶 30 分钟。
+    """
+    scheduler = DailyScheduler(config=SchedulerConfig(enabled=True))
+    attempts: list[str] = []
+
+    def _callback() -> dict[str, object]:
+        attempts.append("called")
+        raise RuntimeError("boom")
+
+    scheduler.register("daily", "08:30", callback=_callback)
+    first = scheduler.run_due(datetime.fromisoformat("2026-03-02T08:31:00"))
+    state_after_first = scheduler.export_state()["jobs"]["daily"]
+    # 失败后 next_due 必须晚于失败时刻（首次退避 1 分钟）。
+    assert first[0].ran is True
+    assert first[0].success is False
+    assert state_after_first["consecutive_failures"] == 1
+    assert datetime.fromisoformat(state_after_first["next_due_at"]) >= datetime.fromisoformat(
+        "2026-03-02T08:32:00"
+    )
+    # 退避窗口内再次 poll 不应执行（旧实现会立即重试）。
+    attempts_before = len(attempts)
+    within_backoff = scheduler.run_due(datetime.fromisoformat("2026-03-02T08:31:30"))
+    assert within_backoff[0].ran is False
+    assert len(attempts) == attempts_before
+    # 越过退避窗口后重试，连续失败次数递增。
+    retried = scheduler.run_due(datetime.fromisoformat("2026-03-02T08:32:00"))
+    assert retried[0].ran is True
+    assert retried[0].success is False
+    state_after_retry = scheduler.export_state()["jobs"]["daily"]
+    assert state_after_retry["consecutive_failures"] == 2
+    assert datetime.fromisoformat(state_after_retry["next_due_at"]) >= datetime.fromisoformat(
+        "2026-03-02T08:34:00"
+    )
+    assert len(attempts) == attempts_before + 1
+
+
 def test_scheduler_retries_daily_job_when_callback_does_not_claim_execution_rights() -> None:
     config = SchedulerConfig(
         enabled=True,
