@@ -771,9 +771,19 @@ class VendorZipOverlayProvider:
                 factors = self._load_price_factors(symbol)
                 aligned = factors.reindex(frame["date"], method="ffill").bfill()
                 if aligned.isna().any():
-                    raise DataSourceError(
-                        f"vendor qfq factors could not be aligned to daily bars for {symbol}"
-                    )
+                    # 因子表存在历史起点（Tushare 前复权因子通常从 2001 年
+                    # 才开始），早于该起点的日 K 段没有可用因子。历史段是
+                    # 数据源的覆盖边界而非损坏：用原始价（因子 1.0）填充
+                    # 前缀段，近期段必须严格对齐，任何中段/后段 NaN 仍视为
+                    # 因子数据异常并 fail-closed。
+                    na_mask = aligned.isna().to_numpy()
+                    na_dates = frame.loc[na_mask, "date"]
+                    factor_start = factors.index.min()
+                    if na_dates.empty or bool((na_dates >= factor_start).any()):
+                        raise DataSourceError(
+                            f"vendor qfq factors could not be aligned to daily bars for {symbol}"
+                        )
+                    aligned = aligned.fillna(1.0)
                 factor_values = aligned.to_numpy(dtype=float)
                 for column in ("open", "high", "low", "close", "pre_close"):
                     if column in frame.columns:
