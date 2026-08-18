@@ -33,6 +33,8 @@ _TOP_LIST_TABLE = "top_list_events"
 _TOP_INST_TABLE = "top_inst_events"
 _BLOCK_TRADE_TABLE = "block_trade_events"
 _INDEX_DAILY_TABLE = "index_daily"
+_SECURITY_STATUS_TABLE = "security_status"
+_SECURITY_IDENTITY_MAPPING_TABLE = "security_identity_mapping"
 _INTRADAY_TABLES = {
     "1m": "intraday_summary_1m",
     "5m": "intraday_summary_5m",
@@ -444,6 +446,50 @@ class MarketWarehouse:
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_index_daily_key
                 ON index_daily (index_code, trade_date)
+                """
+            )
+            # Point-in-time 证券状态表：记录每个 symbol 在特定时间区间的
+            # ST / 上市 / 退市 / 停牌 / 板块 / IPO 无涨跌幅阶段等状态。
+            # 关键约束：同一 symbol 的 effective 区间不得重叠。
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS security_status (
+                    symbol VARCHAR,
+                    effective_from DATE,
+                    effective_to DATE,
+                    status_type VARCHAR,
+                    status_value VARCHAR,
+                    board VARCHAR,
+                    exchange VARCHAR,
+                    source VARCHAR,
+                    as_of VARCHAR,
+                    coverage_complete BOOLEAN
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_security_status_key
+                ON security_status (symbol, effective_from, status_type)
+                """
+            )
+            # 证券身份映射表：北交所旧代码 43/83/87 到新代码 92 的带日期映射。
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS security_identity_mapping (
+                    historical_symbol VARCHAR,
+                    canonical_symbol VARCHAR,
+                    effective_from DATE,
+                    effective_to DATE,
+                    source VARCHAR,
+                    as_of VARCHAR
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_security_identity_mapping_key
+                ON security_identity_mapping (historical_symbol, effective_from)
                 """
             )
 
@@ -1041,6 +1087,397 @@ class MarketWarehouse:
             frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
         return frame
 
+    def upsert_security_status(self, *, symbol: str, frame: pd.DataFrame) -> int:
+        """Idempotent upsert of point-in-time security status rows.
+
+        Natural key: (symbol, effective_from, status_type). Time intervals
+        for the same symbol and status_type MUST NOT overlap — this method
+        validates the incoming frame before writing and raises
+        ``DataSourceError`` on any overlap, rather than allowing illegal
+        intervals into the database and detecting them post-hoc.
+        """
+        normalized_symbol = _normalize_symbol(symbol)
+        if frame is None or frame.empty:
+            return 0
+        payload = frame.copy()
+        payload["symbol"] = normalized_symbol
+        payload["effective_from"] = pd.to_datetime(
+            payload["effective_from"], errors="coerce"
+        ).dt.date
+        payload = payload.dropna(subset=["effective_from"])
+        if "effective_to" in payload.columns:
+            payload["effective_to"] = pd.to_datetime(
+                payload["effective_to"], errors="coerce"
+            ).dt.date
+        if payload.empty:
+            return 0
+        # 写前校验：同 symbol + status_type 的区间不得重叠
+        self._validate_security_status_no_overlap(payload)
+        self.ensure_schema()
+        with self._connect_write() as connection:
+            for _, row in payload.iterrows():
+                status_type = str(row.get("status_type", ""))
+                connection.execute(
+                    f"DELETE FROM {_SECURITY_STATUS_TABLE} "
+                    f"WHERE symbol = ? AND effective_from = ? AND status_type = ?",
+                    [normalized_symbol, row["effective_from"], status_type],
+                )
+            connection.register("ss_stage", payload)
+            cols = [
+                c
+                for c in payload.columns
+                if c
+                in (
+                    "symbol",
+                    "effective_from",
+                    "effective_to",
+                    "status_type",
+                    "status_value",
+                    "board",
+                    "exchange",
+                    "source",
+                    "as_of",
+                    "coverage_complete",
+                )
+            ]
+            col_str = ", ".join(cols)
+            connection.execute(
+                f"INSERT INTO {_SECURITY_STATUS_TABLE} ({col_str}) "
+                f"SELECT {col_str} FROM ss_stage"
+            )
+            connection.unregister("ss_stage")
+        return int(len(payload))
+
+    def fetch_security_status(
+        self,
+        *,
+        symbol: str,
+        as_of: date | None = None,
+    ) -> pd.DataFrame:
+        """Read point-in-time security status for a symbol.
+
+        When ``as_of`` is provided, returns only rows where
+        ``effective_from <= as_of`` and (``effective_to`` is NULL or
+        ``effective_to >= as_of``), i.e. the active status on that date.
+        """
+        normalized_symbol = _normalize_symbol(symbol)
+        if not self._table_exists(_SECURITY_STATUS_TABLE):
+            return pd.DataFrame()
+        filters = ["symbol = ?"]
+        params: list[object] = [normalized_symbol]
+        if as_of is not None:
+            filters.append("effective_from <= ?")
+            params.append(as_of.isoformat())
+            filters.append(
+                "(effective_to IS NULL OR effective_to >= ?)"
+            )
+            params.append(as_of.isoformat())
+        query = f"""
+            SELECT * FROM {_SECURITY_STATUS_TABLE}
+            WHERE {" AND ".join(filters)}
+            ORDER BY effective_from ASC
+        """
+        with self._connect_readonly() as connection:
+            frame = cast(
+                pd.DataFrame,
+                connection.execute(query, params).fetch_df(),
+            )
+        return frame
+
+    def upsert_security_identity_mapping(self, *, frame: pd.DataFrame) -> int:
+        """Idempotent upsert of security identity mapping rows.
+
+        Natural key: (historical_symbol, effective_from). Used to map
+        legacy Beijing exchange codes (43/83/87 series) to canonical
+        92-series codes with effective-date intervals.
+        """
+        if frame is None or frame.empty:
+            return 0
+        payload = frame.copy()
+        payload["effective_from"] = pd.to_datetime(
+            payload["effective_from"], errors="coerce"
+        ).dt.date
+        payload = payload.dropna(subset=["effective_from"])
+        if "effective_to" in payload.columns:
+            payload["effective_to"] = pd.to_datetime(
+                payload["effective_to"], errors="coerce"
+            ).dt.date
+        if payload.empty:
+            return 0
+        # 写前校验：同一 historical_symbol 的 effective 区间不得重叠
+        self._validate_identity_mapping_no_overlap(payload)
+        self.ensure_schema()
+        with self._connect_write() as connection:
+            for _, row in payload.iterrows():
+                historical = str(row.get("historical_symbol", ""))
+                connection.execute(
+                    f"DELETE FROM {_SECURITY_IDENTITY_MAPPING_TABLE} "
+                    f"WHERE historical_symbol = ? AND effective_from = ?",
+                    [historical, row["effective_from"]],
+                )
+            connection.register("sim_stage", payload)
+            cols = [
+                c
+                for c in payload.columns
+                if c
+                in (
+                    "historical_symbol",
+                    "canonical_symbol",
+                    "effective_from",
+                    "effective_to",
+                    "source",
+                    "as_of",
+                )
+            ]
+            col_str = ", ".join(cols)
+            connection.execute(
+                f"INSERT INTO {_SECURITY_IDENTITY_MAPPING_TABLE} ({col_str}) "
+                f"SELECT {col_str} FROM sim_stage"
+            )
+            connection.unregister("sim_stage")
+        return int(len(payload))
+
+    def fetch_security_identity_mapping(
+        self,
+        *,
+        historical_symbol: str | None = None,
+    ) -> pd.DataFrame:
+        """Read security identity mapping (all rows or filtered by historical_symbol)."""
+        if not self._table_exists(_SECURITY_IDENTITY_MAPPING_TABLE):
+            return pd.DataFrame()
+        if historical_symbol:
+            query = f"""
+                SELECT * FROM {_SECURITY_IDENTITY_MAPPING_TABLE}
+                WHERE historical_symbol = ?
+                ORDER BY effective_from ASC
+            """
+            with self._connect_readonly() as connection:
+                return cast(
+                    pd.DataFrame,
+                    connection.execute(query, [historical_symbol]).fetch_df(),
+                )
+        query = f"""
+            SELECT * FROM {_SECURITY_IDENTITY_MAPPING_TABLE}
+            ORDER BY historical_symbol, effective_from ASC
+        """
+        with self._connect_readonly() as connection:
+            return cast(
+                pd.DataFrame,
+                connection.execute(query).fetch_df(),
+            )
+
+    def _validate_security_status_no_overlap(self, payload: pd.DataFrame) -> None:
+        """写前校验：同一 symbol + status_type 的 effective 区间不得重叠。
+
+        检查 payload 内部的区间重叠 AND payload 与数据库已有记录的区间
+        重叠。发现重叠时 raise DataSourceError 拒绝写入。
+        """
+        if "status_type" not in payload.columns:
+            return
+        from datetime import date as _date
+
+        def _resolve_end(raw_end: object) -> _date:
+            if raw_end is None:
+                return _date.max
+            if isinstance(raw_end, float) and pd.isna(raw_end):
+                return _date.max
+            if isinstance(raw_end, type(pd.NaT)):
+                return _date.max
+            try:
+                if pd.isna(raw_end):
+                    return _date.max
+            except (TypeError, ValueError):
+                pass
+            if isinstance(raw_end, pd.Timestamp):
+                return raw_end.date()
+            if isinstance(raw_end, _date):
+                return raw_end
+            return _date.max
+
+        # 1. payload 内部重叠检查
+        for (symbol, status_type), group in payload.groupby(
+            ["symbol", "status_type"]
+        ):
+            sorted_group = group.sort_values("effective_from")
+            entries = sorted_group.to_dict("records")
+            for i in range(len(entries)):
+                e1 = entries[i]
+                end1 = _resolve_end(e1.get("effective_to"))
+                for j in range(i + 1, len(entries)):
+                    e2 = entries[j]
+                    start2 = e2["effective_from"]
+                    if start2 <= end1:
+                        raise DataSourceError(
+                            f"security_status overlap detected before write: "
+                            f"symbol={symbol}, status_type={status_type}, "
+                            f"interval_a=[{e1['effective_from']}, {e1.get('effective_to')}], "
+                            f"interval_b=[{e2['effective_from']}, {e2.get('effective_to')}]"
+                        )
+
+        # 2. payload 与数据库已有记录的重叠检查
+        #    排除即将被 DELETE 替换的相同自然键，保证 upsert 幂等性
+        if not self._table_exists(_SECURITY_STATUS_TABLE):
+            return
+        for (symbol, status_type), group in payload.groupby(
+            ["symbol", "status_type"]
+        ):
+            sorted_group = group.sort_values("effective_from")
+            entries = sorted_group.to_dict("records")
+            # 收集 payload 内的 effective_from 值（自然键的一部分），
+            # 在 DB 查询中排除这些行——它们将被 DELETE+INSERT 替换
+            payload_froms = [e["effective_from"] for e in entries]
+            exclude_placeholders = ", ".join("?" for _ in payload_froms)
+            for entry in entries:
+                start = entry["effective_from"]
+                end = _resolve_end(entry.get("effective_to"))
+                query = f"""
+                    SELECT effective_from, effective_to
+                    FROM {_SECURITY_STATUS_TABLE}
+                    WHERE symbol = ?
+                      AND status_type = ?
+                      AND effective_from <= ?
+                      AND effective_from NOT IN ({exclude_placeholders})
+                """
+                with self._connect_readonly() as connection:
+                    rows = connection.execute(
+                        query,
+                        [str(symbol), str(status_type), end, *payload_froms],
+                    ).fetchall()
+                for row in rows:
+                    db_start = row[0]
+                    db_end = _resolve_end(row[1])
+                    if db_start <= end and start <= db_end:
+                        raise DataSourceError(
+                            f"security_status overlap with existing DB record: "
+                            f"symbol={symbol}, status_type={status_type}, "
+                            f"new=[{start}, {entry.get('effective_to')}], "
+                            f"existing=[{db_start}, {row[1]}]"
+                        )
+
+    def _validate_identity_mapping_no_overlap(self, payload: pd.DataFrame) -> None:
+        """写前校验：同一 historical_symbol 的 effective 区间不得重叠。
+
+        检查 payload 内部 AND payload 与数据库已有记录的重叠。
+        """
+        from datetime import date as _date
+
+        def _resolve_end(raw_end: object) -> _date:
+            if raw_end is None:
+                return _date.max
+            if isinstance(raw_end, float) and pd.isna(raw_end):
+                return _date.max
+            if isinstance(raw_end, type(pd.NaT)):
+                return _date.max
+            try:
+                if pd.isna(raw_end):
+                    return _date.max
+            except (TypeError, ValueError):
+                pass
+            if isinstance(raw_end, pd.Timestamp):
+                return raw_end.date()
+            if isinstance(raw_end, _date):
+                return raw_end
+            return _date.max
+
+        # 1. payload 内部重叠检查
+        for historical, group in payload.groupby("historical_symbol"):
+            sorted_group = group.sort_values("effective_from")
+            entries = sorted_group.to_dict("records")
+            for i in range(len(entries)):
+                e1 = entries[i]
+                end1 = _resolve_end(e1.get("effective_to"))
+                for j in range(i + 1, len(entries)):
+                    e2 = entries[j]
+                    start2 = e2["effective_from"]
+                    if start2 <= end1:
+                        raise DataSourceError(
+                            f"security_identity_mapping overlap detected before write: "
+                            f"historical_symbol={historical}, "
+                            f"interval_a=[{e1['effective_from']}, {e1.get('effective_to')}], "
+                            f"interval_b=[{e2['effective_from']}, {e2.get('effective_to')}]"
+                        )
+
+        # 2. payload 与数据库已有记录的重叠检查
+        #    排除即将被 DELETE 替换的相同自然键，保证 upsert 幂等性
+        if not self._table_exists(_SECURITY_IDENTITY_MAPPING_TABLE):
+            return
+        for historical, group in payload.groupby("historical_symbol"):
+            sorted_group = group.sort_values("effective_from")
+            entries = sorted_group.to_dict("records")
+            payload_froms = [e["effective_from"] for e in entries]
+            exclude_placeholders = ", ".join("?" for _ in payload_froms)
+            for entry in entries:
+                start = entry["effective_from"]
+                end = _resolve_end(entry.get("effective_to"))
+                query = f"""
+                    SELECT effective_from, effective_to
+                    FROM {_SECURITY_IDENTITY_MAPPING_TABLE}
+                    WHERE historical_symbol = ?
+                      AND effective_from <= ?
+                      AND effective_from NOT IN ({exclude_placeholders})
+                """
+                with self._connect_readonly() as connection:
+                    rows = connection.execute(
+                        query,
+                        [str(historical), end, *payload_froms],
+                    ).fetchall()
+                for row in rows:
+                    db_start = row[0]
+                    db_end = _resolve_end(row[1])
+                    if db_start <= end and start <= db_end:
+                        raise DataSourceError(
+                            f"security_identity_mapping overlap with existing DB record: "
+                            f"historical_symbol={historical}, "
+                            f"new=[{start}, {entry.get('effective_to')}], "
+                            f"existing=[{db_start}, {row[1]}]"
+                        )
+
+    def validate_security_status_intervals(
+        self,
+        *,
+        symbol: str | None = None,
+    ) -> list[dict[str, str]]:
+        """Read-only check: ensure PIT status intervals do not overlap.
+
+        Returns a list of overlap descriptions (empty = all clean). Each
+        entry has ``symbol``, ``status_type``, ``interval_a``,
+        ``interval_b``, describing the two overlapping rows.
+        """
+        if not self._table_exists(_SECURITY_STATUS_TABLE):
+            return []
+        params: list[object] = []
+        symbol_filter = ""
+        if symbol:
+            normalized = _normalize_symbol(symbol)
+            symbol_filter = " AND a.symbol = ?"
+            params.append(normalized)
+        query = f"""
+            SELECT a.symbol, a.status_type,
+                   a.effective_from AS a_from, a.effective_to AS a_to,
+                   b.effective_from AS b_from, b.effective_to AS b_to
+            FROM {_SECURITY_STATUS_TABLE} a
+            JOIN {_SECURITY_STATUS_TABLE} b
+              ON a.symbol = b.symbol
+             AND a.status_type = b.status_type
+             AND a.effective_from < b.effective_from
+            WHERE (a.effective_to IS NULL OR a.effective_to >= b.effective_from)
+              {symbol_filter}
+            ORDER BY a.symbol, a.effective_from
+        """
+        with self._connect_readonly() as connection:
+            rows = connection.execute(query, params).fetchall()
+        overlaps: list[dict[str, str]] = []
+        for row in rows:
+            overlaps.append(
+                {
+                    "symbol": str(row[0]),
+                    "status_type": str(row[1]),
+                    "interval_a": f"{row[2]}~{row[3]}",
+                    "interval_b": f"{row[4]}~{row[5]}",
+                }
+            )
+        return overlaps
+
     def upsert_index_daily(self, *, frame: pd.DataFrame) -> int:
         if frame is None or frame.empty:
             return 0
@@ -1405,6 +1842,200 @@ class MarketWarehouse:
             package_writes_enabled=self.package_writes_enabled,
         )
 
+    def _check_price_series_mode_consistency(self, payload: pd.DataFrame) -> None:
+        """Fail-closed gate: reject writes that mix price_series_mode per symbol.
+
+        For each symbol present in ``payload``, the incoming non-empty
+        ``price_series_mode`` values must all be the same AND must match the
+        mode already stored for that symbol in ``daily_bars``. A violation
+        raises ``DataSourceError`` with the symbol, existing mode and new
+        mode in the message so the caller can trace the contamination source.
+        """
+        mode_col = payload.get("price_series_mode")
+        if mode_col is None:
+            return
+        payload_with_mode = payload.copy()
+        payload_with_mode["price_series_mode"] = payload_with_mode[
+            "price_series_mode"
+        ].astype(str).str.strip().str.lower()
+        payload_with_mode = payload_with_mode[
+            payload_with_mode["price_series_mode"].str.len() > 0
+        ]
+        if payload_with_mode.empty:
+            return
+        # 新行内部不得混合多种 mode（同一 symbol 的多行 mode 必须一致）
+        symbol_modes = (
+            payload_with_mode.groupby("symbol")["price_series_mode"].agg(
+                lambda series: sorted(set(series.dropna()))
+            )
+        )
+        for symbol, modes in symbol_modes.items():
+            if len(modes) > 1:
+                raise DataSourceError(
+                    f"price_series_mode mismatch within incoming frame for "
+                    f"symbol={symbol}: modes={modes}"
+                )
+        # 新行 mode vs 已有行 mode：从 daily_bars 读取每个 symbol 的全部
+        # distinct mode（不只是最新一行）。只要已有行中出现与新行不同的
+        # mode 就视为冲突——这比只比最新行更严格，能捕获历史中的 mixed 行。
+        if not self._table_exists(_DAILY_TABLE):
+            return
+        incoming_symbols = sorted(set(symbol_modes.index))
+        placeholders = ", ".join("?" for _ in incoming_symbols)
+        query = f"""
+            SELECT symbol, price_series_mode
+            FROM (
+                SELECT symbol, TRIM(price_series_mode) AS price_series_mode,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY symbol, TRIM(price_series_mode)
+                           ORDER BY date DESC
+                       ) AS rn
+                FROM {_DAILY_TABLE}
+                WHERE symbol IN ({placeholders})
+                  AND price_series_mode IS NOT NULL
+                  AND TRIM(price_series_mode) != ''
+            )
+            WHERE rn = 1
+        """
+        with self._connect_readonly() as connection:
+            rows = connection.execute(query, incoming_symbols).fetchall()
+        for row in rows:
+            existing_symbol = str(row[0]).strip()
+            existing_mode = str(row[1] or "").strip().lower()
+            if not existing_mode:
+                continue
+            new_modes = symbol_modes.get(existing_symbol)
+            if not new_modes:
+                continue
+            new_mode = new_modes[0]
+            if new_mode != existing_mode:
+                raise DataSourceError(
+                    f"price_series_mode mismatch for symbol={existing_symbol}: "
+                    f"existing_mode={existing_mode}, new_mode={new_mode}"
+                )
+
+    def detect_price_series_mixed(
+        self,
+        *,
+        symbols: list[str] | None = None,
+    ) -> dict[str, object]:
+        """Read-only detection of symbols whose daily_bars mix price_series_mode.
+
+        Returns a dict with:
+        - ``mixed_symbol_count``: number of symbols with >1 distinct non-empty mode.
+        - ``mixed_symbols``: list of ``{symbol, modes, transition_dates}`` entries.
+        - ``mode_distribution``: ``{mode: row_count}`` across the whole table.
+        - ``empty_mode_rows``: rows where price_series_mode is NULL or empty.
+
+        Opens the DuckDB read-only; never creates tables or mutates the file.
+        """
+        if not self._table_exists(_DAILY_TABLE):
+            return {
+                "mixed_symbol_count": 0,
+                "mixed_symbols": [],
+                "mode_distribution": {},
+                "empty_mode_rows": 0,
+            }
+        params: list[object] = []
+        symbol_filter = ""
+        if symbols:
+            normalized = sorted(
+                {_normalize_symbol(symbol) for symbol in symbols if _normalize_symbol(symbol)}
+            )
+            if normalized:
+                placeholders = ", ".join("?" for _ in normalized)
+                symbol_filter = f"WHERE symbol IN ({placeholders})"
+                params.extend(normalized)
+        empty_cond = (
+            "price_series_mode IS NULL OR TRIM(price_series_mode) = ''"
+        )
+        nonempty_cond = (
+            "price_series_mode IS NOT NULL AND TRIM(price_series_mode) != ''"
+        )
+        with self._connect_readonly() as connection:
+            mode_dist_rows = connection.execute(
+                f"""
+                SELECT COALESCE(TRIM(price_series_mode), '') AS mode, COUNT(*) AS cnt
+                FROM {_DAILY_TABLE}
+                {symbol_filter}
+                GROUP BY mode
+                ORDER BY cnt DESC
+                """,
+                params,
+            ).fetchall()
+            mode_distribution = {str(row[0]) or "(empty)": int(row[1]) for row in mode_dist_rows}
+
+            empty_where = (
+                f"{symbol_filter} AND ({empty_cond})"
+                if symbol_filter
+                else f"WHERE {empty_cond}"
+            )
+            empty_count = connection.execute(
+                f"SELECT COUNT(*) FROM {_DAILY_TABLE} {empty_where}",
+                params,
+            ).fetchone()
+            empty_mode_rows = int(empty_count[0]) if empty_count else 0
+
+            mixed_where = (
+                f"{symbol_filter} AND {nonempty_cond}"
+                if symbol_filter
+                else f"WHERE {nonempty_cond}"
+            )
+            mixed_rows = connection.execute(
+                f"""
+                SELECT symbol, COUNT(DISTINCT price_series_mode) AS mode_count
+                FROM {_DAILY_TABLE}
+                {mixed_where}
+                GROUP BY symbol
+                HAVING COUNT(DISTINCT price_series_mode) > 1
+                ORDER BY symbol
+                """,
+                params,
+            ).fetchall()
+
+            mixed_symbols: list[dict[str, object]] = []
+            for mixed_row in mixed_rows:
+                mixed_symbol = str(mixed_row[0])
+                transition_rows = connection.execute(
+                    f"""
+                    SELECT date, price_series_mode
+                    FROM (
+                        SELECT date, price_series_mode,
+                               LAG(price_series_mode) OVER (ORDER BY date) AS prev_mode
+                        FROM {_DAILY_TABLE}
+                        WHERE symbol = ?
+                          AND price_series_mode IS NOT NULL
+                          AND TRIM(price_series_mode) != ''
+                    )
+                    WHERE price_series_mode != prev_mode OR prev_mode IS NULL
+                    ORDER BY date
+                    """,
+                    [mixed_symbol],
+                ).fetchall()
+                transitions: list[dict[str, str]] = []
+                for t_row in transition_rows:
+                    transitions.append(
+                        {
+                            "date": str(t_row[0]),
+                            "mode": str(t_row[1]),
+                        }
+                    )
+                mixed_symbols.append(
+                    {
+                        "symbol": mixed_symbol,
+                        "modes": sorted(
+                            {str(t["mode"]) for t in transitions}
+                        ),
+                        "transition_dates": transitions,
+                    }
+                )
+        return {
+            "mixed_symbol_count": len(mixed_symbols),
+            "mixed_symbols": mixed_symbols,
+            "mode_distribution": mode_distribution,
+            "empty_mode_rows": empty_mode_rows,
+        }
+
     def has_daily_data(self) -> bool:
         if not self._table_exists(_DAILY_TABLE):
             return False
@@ -1735,6 +2366,7 @@ class MarketWarehouse:
         *,
         frame: pd.DataFrame,
         overwrite_existing: bool = False,
+        enforce_price_series_mode: bool = True,
     ) -> int:
         """Idempotent batch upsert of normalized daily bars. Returns rows stored.
 
@@ -1751,6 +2383,16 @@ class MarketWarehouse:
         ``overwrite_existing=True`` to replace existing rows with the incoming
         values (used by the qfq factor-drift refresh path). Read-only
         warehouses refuse with ``DataSourceError``.
+
+        Price-series mode consistency (``enforce_price_series_mode=True``,
+        default): when the incoming frame carries a non-empty
+        ``price_series_mode`` column, each symbol's new mode is compared
+        against the mode already stored for that symbol. A mismatch raises
+        ``DataSourceError`` with the symbol, existing mode and new mode in the
+        message — this is the fail-closed gate that prevents qfq/raw
+        contamination at the write boundary. Callers that deliberately mix
+        modes (e.g. shadow rebuild tools operating on an isolated copy) can
+        pass ``enforce_price_series_mode=False`` to bypass the check.
         """
         if frame is None or frame.empty:
             return 0
@@ -1779,6 +2421,8 @@ class MarketWarehouse:
                     payload[column] = ""
         columns = ["symbol", "date", *_SELECTED_COLUMNS]
         self.ensure_schema()
+        if enforce_price_series_mode and "price_series_mode" in payload.columns:
+            self._check_price_series_mode_consistency(payload)
         with self._connect_write() as connection:
             connection.register("daily_stage_df", payload)
             try:
