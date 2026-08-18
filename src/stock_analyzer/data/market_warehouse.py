@@ -1284,7 +1284,7 @@ class MarketWarehouse:
             if isinstance(raw_end, type(pd.NaT)):
                 return _date.max
             try:
-                if pd.isna(raw_end):
+                if pd.isna(cast(Any, raw_end)):
                     return _date.max
             except (TypeError, ValueError):
                 pass
@@ -1369,7 +1369,7 @@ class MarketWarehouse:
             if isinstance(raw_end, type(pd.NaT)):
                 return _date.max
             try:
-                if pd.isna(raw_end):
+                if pd.isna(cast(Any, raw_end)):
                     return _date.max
             except (TypeError, ValueError):
                 pass
