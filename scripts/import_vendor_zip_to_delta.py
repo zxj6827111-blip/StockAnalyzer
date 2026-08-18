@@ -531,17 +531,27 @@ def _main(argv: list[str] | None = None) -> int:
 
             if not args.dry_run and warehouse is not None and all_frames:
                 warehouse.ensure_schema()
-                combined = pd.concat(all_frames, axis=0, sort=False, ignore_index=True)
-                stored_fresh = warehouse.upsert_daily_bars(frame=combined)
-                report["rows_stored"] = stored_fresh
+                # drift refresh 有意从旧因子重建为 qfq，可能跨越 mode 边界，
+                # 必须先于 fresh 写入并绕过一致性校验；否则 fresh 的默认
+                # 门禁会因 drift symbol 的 mode 与已有行不同而先失败。
                 if drift_frames:
                     drift_combined = pd.concat(
                         drift_frames, axis=0, sort=False, ignore_index=True
                     )
                     stored_drift = warehouse.upsert_daily_bars(
-                        frame=drift_combined, overwrite_existing=True
+                        frame=drift_combined,
+                        overwrite_existing=True,
+                        enforce_price_series_mode=False,
                     )
                     report["drift_rows_replaced"] = stored_drift
+                # fresh + full import 走默认门禁
+                nondrift_frames = fresh_frames + full_frames
+                if nondrift_frames:
+                    combined = pd.concat(
+                        nondrift_frames, axis=0, sort=False, ignore_index=True
+                    )
+                    stored_fresh = warehouse.upsert_daily_bars(frame=combined)
+                    report["rows_stored"] = stored_fresh
             report["ok"] = True
         else:
             frames = provider._load_vendor_daily_batch(symbols=symbols, limit=limit)
