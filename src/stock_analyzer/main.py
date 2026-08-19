@@ -18,14 +18,15 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Header
-from fastapi.responses import FileResponse, Response
+from fastapi import FastAPI, Header, Request
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from stock_analyzer.command.feishu_long_connection import (
     FeishuLongConnectionRunner as FeishuLongConnectionRunner,
 )
 from stock_analyzer.config import get_config
+from stock_analyzer.data.provider import RequiredIntradayDataError
 from stock_analyzer.notify.channels import FeishuAppNotifier as FeishuAppNotifier
 from stock_analyzer.runtime.service import StockAnalyzerService
 
@@ -166,6 +167,22 @@ async def _app_lifespan(_app: FastAPI) -> Any:
 
 
 app = FastAPI(title="StockAnalyzer API", version="0.1.0", lifespan=_app_lifespan)
+
+
+@app.exception_handler(RequiredIntradayDataError)
+async def required_intraday_data_error(
+    _request: Request,
+    exc: RequiredIntradayDataError,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": {
+                "code": "required_intraday_data_unavailable",
+                "message": str(exc),
+            }
+        },
+    )
 
 
 if _frontend_assets_dir is not None and _frontend_assets_dir.exists():

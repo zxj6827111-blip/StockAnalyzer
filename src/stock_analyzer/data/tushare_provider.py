@@ -731,6 +731,21 @@ class TushareProvider:
         _ = symbol, interval, lookback_days
         return pd.DataFrame()
 
+    def fetch_intraday_summaries(
+        self,
+        symbols: list[str],
+        interval: str,
+        lookback_days: int = 120,
+    ) -> dict[str, pd.DataFrame]:
+        return {
+            symbol: self.fetch_intraday_summary(
+                symbol=symbol,
+                interval=interval,
+                lookback_days=lookback_days,
+            )
+            for symbol in symbols
+        }
+
     def list_open_trade_dates(
         self,
         *,
@@ -1233,9 +1248,7 @@ class TushareProvider:
 
     def _call_with_retry(self, fn: Any) -> object:
         if self._circuit_is_open():
-            self._metrics["circuit_rejected"] = (
-                int(self._metrics["circuit_rejected"]) + 1
-            )
+            self._metrics["circuit_rejected"] = int(self._metrics["circuit_rejected"]) + 1
             raise DataSourceError("tushare circuit breaker open; skipping request")
         last_error: Exception | None = None
         started = monotonic()
@@ -1260,9 +1273,7 @@ class TushareProvider:
                     self._metrics["retryable_failures"] = (
                         int(self._metrics["retryable_failures"]) + 1
                     )
-                    self._metrics["last_transport_error"] = (
-                        f"{type(exc).__name__}: {exc}"
-                    )
+                    self._metrics["last_transport_error"] = f"{type(exc).__name__}: {exc}"
                     self._circuit_failures += 1
                     if self._circuit_failures >= self._circuit_breaker_threshold:
                         self._open_circuit()
@@ -1276,9 +1287,10 @@ class TushareProvider:
             else:
                 self._circuit_failures = 0
                 if int(self._metrics["retryable_failures"]) > 0 or attempt > 1:
-                    self._metrics["last_recovery_ms"] = round(
-                        (monotonic() - started) * 1000.0, 3
-                    )
+                    elapsed_ms = round((monotonic() - started) * 1000.0, 3)
+                    # A completed recovery must remain distinguishable from the initial
+                    # zero value even on clocks that quantize sub-millisecond work.
+                    self._metrics["last_recovery_ms"] = max(0.001, elapsed_ms)
                 return result
         assert last_error is not None
         raise last_error

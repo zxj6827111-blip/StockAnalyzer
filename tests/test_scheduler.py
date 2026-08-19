@@ -3,7 +3,8 @@ from __future__ import annotations
 from datetime import datetime
 
 from stock_analyzer.config import SchedulerConfig
-from stock_analyzer.runtime.scheduler import DailyScheduler
+from stock_analyzer.ops.file_lock import DistributedFileLock
+from stock_analyzer.runtime.scheduler import DailyScheduler, scheduler_job_lock_path
 
 
 def _record_run(runs: list[str]) -> dict[str, object]:
@@ -274,3 +275,26 @@ def test_scheduler_respects_date_predicate_for_daily_and_interval_jobs() -> None
     assert trading_interval[1].ran is True
     assert daily_runs == ["ok"]
     assert interval_runs == ["ok"]
+
+
+def test_scheduler_skips_callback_when_same_job_lock_is_held(tmp_path) -> None:
+    config = SchedulerConfig(
+        enabled=True,
+        job_lock_enabled=True,
+        job_lock_dir=str(tmp_path / "job-locks"),
+    )
+    scheduler = DailyScheduler(config=config)
+    runs: list[str] = []
+    scheduler.register("locked_job", "08:30", callback=lambda: _record_run(runs))
+    holder = DistributedFileLock(scheduler_job_lock_path(config, "locked_job"))
+    assert holder.acquire() is True
+    try:
+        result = scheduler.run_due(datetime.fromisoformat("2026-03-02T08:30:00"))
+    finally:
+        holder.release()
+
+    assert runs == []
+    assert result[0].ran is False
+    assert result[0].success is True
+    assert result[0].detail == "already_running"
+    assert result[0].payload["lock_path"].endswith("locked_job.lock")

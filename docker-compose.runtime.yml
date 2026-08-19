@@ -1,6 +1,6 @@
 # Runtime overlay for production/NAS deployments.
 # Combines the runtime environment defaults with the named-volume runtime layout
-# (previously docker-compose.runtime.localvol.yml): api/scheduler read and write
+# (previously docker-compose.runtime.localvol.yml): api/schedulers read and write
 # artifacts/ + suggestions/ through the external named volumes
 # stock_analyzer_runtime_artifacts / stock_analyzer_runtime_suggestions so that
 # code updates do not depend on project-directory bind mounts.
@@ -26,7 +26,7 @@ services:
       - runtime_artifacts:/app/artifacts
       - runtime_suggestions:/app/suggestions
 
-  scheduler:
+  scheduler-critical:
     environment:
       SA__NOTIFICATIONS__PRIMARY: ${SA__NOTIFICATIONS__PRIMARY:-wecom}
       SA__NOTIFICATIONS__BACKUP: ${SA__NOTIFICATIONS__BACKUP:-console}
@@ -43,7 +43,27 @@ services:
       SA__ACCEPTANCE__AUTO_NOTIFY: "true"
       SA__NOTIFICATION_FILTER__QUIET_WINDOWS: '["23:00-08:30"]'
       SA__TDX_SYNC__AUTO_RUN: "false"
-      SCHEDULER_POLL_SEC: "30"
+    volumes:
+      - runtime_artifacts:/app/artifacts
+      - runtime_suggestions:/app/suggestions
+
+  scheduler-heavy:
+    environment:
+      SA__NOTIFICATIONS__PRIMARY: ${SA__NOTIFICATIONS__PRIMARY:-wecom}
+      SA__NOTIFICATIONS__BACKUP: ${SA__NOTIFICATIONS__BACKUP:-console}
+      SA__WECOM_INTERACTION__ENABLED: ${SA__WECOM_INTERACTION__ENABLED:-false}
+      SA__FEISHU_INTERACTION__ENABLED: ${SA__FEISHU_INTERACTION__ENABLED:-true}
+      SA__SECURITY__API_AUTH_ENABLED: ${SA__SECURITY__API_AUTH_ENABLED:-true}
+      SA__SECURITY__API_TOKEN: ${SA__SECURITY__API_TOKEN:-}
+      SA__AUTO_PROMOTION__ENABLED: ${SA__AUTO_PROMOTION__ENABLED:-false}
+      SA__AUTO_PROMOTION__AUTO_LOAD_PREDICTOR: ${SA__AUTO_PROMOTION__AUTO_LOAD_PREDICTOR:-true}
+      SA__AUTO_PROMOTION__NOTIFY_ON_REJECTION: ${SA__AUTO_PROMOTION__NOTIFY_ON_REJECTION:-true}
+      SA__AUTO_PROMOTION__NOTIFY_ON_TRAINING_SUMMARY: ${SA__AUTO_PROMOTION__NOTIFY_ON_TRAINING_SUMMARY:-true}
+      SA__AUTO_PROMOTION__NOTIFY_ON_MANUAL_RELEASE_PENDING: ${SA__AUTO_PROMOTION__NOTIFY_ON_MANUAL_RELEASE_PENDING:-true}
+      SA__ACCEPTANCE__AUTO_RUN: "true"
+      SA__ACCEPTANCE__AUTO_NOTIFY: "true"
+      SA__NOTIFICATION_FILTER__QUIET_WINDOWS: '["23:00-08:30"]'
+      SA__TDX_SYNC__AUTO_RUN: "false"
     volumes:
       - runtime_artifacts:/app/artifacts
       - runtime_suggestions:/app/suggestions

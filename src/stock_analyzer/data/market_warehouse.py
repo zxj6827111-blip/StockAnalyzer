@@ -634,9 +634,10 @@ class MarketWarehouse:
         snaps = self.fetch_financial_snapshots(symbol=symbol)
         if snaps.empty:
             return daily
-        enriched = cast(
-            pd.DataFrame,
-            apply_financial_snapshots_asof(daily, snaps, only_fill_pending=False),
+        enriched: pd.DataFrame = apply_financial_snapshots_asof(
+            daily,
+            snaps,
+            only_fill_pending=False,
         )
         self.replace_daily_bars(symbol=symbol, frame=enriched)
         if self.package_writes_enabled:
@@ -1142,8 +1143,7 @@ class MarketWarehouse:
             ]
             col_str = ", ".join(cols)
             connection.execute(
-                f"INSERT INTO {_SECURITY_STATUS_TABLE} ({col_str}) "
-                f"SELECT {col_str} FROM ss_stage"
+                f"INSERT INTO {_SECURITY_STATUS_TABLE} ({col_str}) SELECT {col_str} FROM ss_stage"
             )
             connection.unregister("ss_stage")
         return int(len(payload))
@@ -1168,9 +1168,7 @@ class MarketWarehouse:
         if as_of is not None:
             filters.append("effective_from <= ?")
             params.append(as_of.isoformat())
-            filters.append(
-                "(effective_to IS NULL OR effective_to >= ?)"
-            )
+            filters.append("(effective_to IS NULL OR effective_to >= ?)")
             params.append(as_of.isoformat())
         query = f"""
             SELECT * FROM {_SECURITY_STATUS_TABLE}
@@ -1295,9 +1293,7 @@ class MarketWarehouse:
             return _date.max
 
         # 1. payload 内部重叠检查
-        for (symbol, status_type), group in payload.groupby(
-            ["symbol", "status_type"]
-        ):
+        for (symbol, status_type), group in payload.groupby(["symbol", "status_type"]):
             sorted_group = group.sort_values("effective_from")
             entries = sorted_group.to_dict("records")
             for i in range(len(entries)):
@@ -1318,9 +1314,7 @@ class MarketWarehouse:
         #    排除即将被 DELETE 替换的相同自然键，保证 upsert 幂等性
         if not self._table_exists(_SECURITY_STATUS_TABLE):
             return
-        for (symbol, status_type), group in payload.groupby(
-            ["symbol", "status_type"]
-        ):
+        for (symbol, status_type), group in payload.groupby(["symbol", "status_type"]):
             sorted_group = group.sort_values("effective_from")
             entries = sorted_group.to_dict("records")
             # 收集 payload 内的 effective_from 值（自然键的一部分），
@@ -1855,19 +1849,15 @@ class MarketWarehouse:
         if mode_col is None:
             return
         payload_with_mode = payload.copy()
-        payload_with_mode["price_series_mode"] = payload_with_mode[
-            "price_series_mode"
-        ].astype(str).str.strip().str.lower()
-        payload_with_mode = payload_with_mode[
-            payload_with_mode["price_series_mode"].str.len() > 0
-        ]
+        payload_with_mode["price_series_mode"] = (
+            payload_with_mode["price_series_mode"].astype(str).str.strip().str.lower()
+        )
+        payload_with_mode = payload_with_mode[payload_with_mode["price_series_mode"].str.len() > 0]
         if payload_with_mode.empty:
             return
         # 新行内部不得混合多种 mode（同一 symbol 的多行 mode 必须一致）
-        symbol_modes = (
-            payload_with_mode.groupby("symbol")["price_series_mode"].agg(
-                lambda series: sorted(set(series.dropna()))
-            )
+        symbol_modes = payload_with_mode.groupby("symbol")["price_series_mode"].agg(
+            lambda series: sorted(set(series.dropna()))
         )
         for symbol, modes in symbol_modes.items():
             if len(modes) > 1:
@@ -1946,12 +1936,8 @@ class MarketWarehouse:
                 placeholders = ", ".join("?" for _ in normalized)
                 symbol_filter = f"WHERE symbol IN ({placeholders})"
                 params.extend(normalized)
-        empty_cond = (
-            "price_series_mode IS NULL OR TRIM(price_series_mode) = ''"
-        )
-        nonempty_cond = (
-            "price_series_mode IS NOT NULL AND TRIM(price_series_mode) != ''"
-        )
+        empty_cond = "price_series_mode IS NULL OR TRIM(price_series_mode) = ''"
+        nonempty_cond = "price_series_mode IS NOT NULL AND TRIM(price_series_mode) != ''"
         with self._connect_readonly() as connection:
             mode_dist_rows = connection.execute(
                 f"""
@@ -1966,9 +1952,7 @@ class MarketWarehouse:
             mode_distribution = {str(row[0]) or "(empty)": int(row[1]) for row in mode_dist_rows}
 
             empty_where = (
-                f"{symbol_filter} AND ({empty_cond})"
-                if symbol_filter
-                else f"WHERE {empty_cond}"
+                f"{symbol_filter} AND ({empty_cond})" if symbol_filter else f"WHERE {empty_cond}"
             )
             empty_count = connection.execute(
                 f"SELECT COUNT(*) FROM {_DAILY_TABLE} {empty_where}",
@@ -2023,9 +2007,7 @@ class MarketWarehouse:
                 mixed_symbols.append(
                     {
                         "symbol": mixed_symbol,
-                        "modes": sorted(
-                            {str(t["mode"]) for t in transitions}
-                        ),
+                        "modes": sorted({str(t["mode"]) for t in transitions}),
                         "transition_dates": transitions,
                     }
                 )
@@ -2516,6 +2498,104 @@ class MarketWarehouse:
             )
             connection.unregister("intraday_stage_df")
 
+    def upsert_intraday_summaries(
+        self,
+        *,
+        interval: str,
+        frame: pd.DataFrame,
+    ) -> dict[str, int]:
+        """Upsert a multi-symbol summary batch in one DuckDB transaction."""
+        table_name = _INTRADAY_TABLES.get(interval)
+        if table_name is None:
+            raise DataSourceError(f"unsupported intraday interval: {interval}")
+        if frame is None or frame.empty:
+            return {"rows": 0, "conflicts": 0}
+        if "symbol" not in frame.columns or "date" not in frame.columns:
+            raise DataSourceError("intraday summary batch requires symbol and date columns")
+        pieces: list[pd.DataFrame] = []
+        for raw_symbol, group in frame.groupby("symbol", sort=False):
+            symbol = _normalize_symbol(str(raw_symbol))
+            if not symbol:
+                continue
+            normalized = _normalize_intraday_frame(
+                frame=group.drop(columns=["symbol"]).set_index("date"),
+                symbol=symbol,
+            )
+            if normalized.empty:
+                continue
+            payload = normalized.reset_index().rename(columns={"index": "date"})
+            payload.insert(0, "symbol", symbol)
+            pieces.append(payload)
+        if not pieces:
+            return {"rows": 0, "conflicts": 0}
+        payload = pd.concat(pieces, axis=0, sort=False, ignore_index=True)
+        payload["date"] = pd.to_datetime(payload["date"], errors="coerce").dt.date
+        payload = payload.dropna(subset=["symbol", "date"])
+        payload = payload.drop_duplicates(subset=["symbol", "date"], keep="last")
+        self.ensure_schema()
+        with self._connect_write() as connection:
+            connection.register("intraday_stage_df", payload)
+            try:
+                conflicts = int(
+                    connection.execute(
+                        f"""
+                        SELECT COUNT(*)
+                        FROM intraday_stage_df AS stage
+                        INNER JOIN {table_name} AS existing
+                          ON existing.symbol = stage.symbol
+                         AND existing.date = stage.date
+                        """
+                    ).fetchone()[0]
+                )
+                connection.execute("BEGIN TRANSACTION")
+                try:
+                    connection.execute(
+                        f"""
+                        DELETE FROM {table_name}
+                        USING intraday_stage_df AS stage
+                        WHERE {table_name}.symbol = stage.symbol
+                          AND {table_name}.date = stage.date
+                        """
+                    )
+                    connection.execute(
+                        f"""
+                        INSERT INTO {table_name} (
+                            symbol, date, {", ".join(_INTRADAY_COLUMNS)}
+                        )
+                        SELECT symbol, date, {", ".join(_INTRADAY_COLUMNS)}
+                        FROM intraday_stage_df
+                        ORDER BY symbol, date
+                        """
+                    )
+                except Exception:
+                    connection.execute("ROLLBACK")
+                    raise
+                connection.execute("COMMIT")
+            finally:
+                connection.unregister("intraday_stage_df")
+        return {"rows": len(payload), "conflicts": conflicts}
+
+    def delete_intraday_range(
+        self,
+        *,
+        interval: str,
+        start_date: date,
+        end_date: date,
+    ) -> int:
+        table_name = _INTRADAY_TABLES.get(interval)
+        if table_name is None or not self._table_exists(table_name):
+            return 0
+        with self._connect_write() as connection:
+            row = connection.execute(
+                f"SELECT COUNT(*) FROM {table_name} WHERE date BETWEEN ? AND ?",
+                [start_date.isoformat(), end_date.isoformat()],
+            ).fetchone()
+            connection.execute(
+                f"DELETE FROM {table_name} WHERE date BETWEEN ? AND ?",
+                [start_date.isoformat(), end_date.isoformat()],
+            )
+        return int(row[0]) if row else 0
+
     def fetch_daily_bars(
         self,
         symbol: str,
@@ -2575,6 +2655,51 @@ class MarketWarehouse:
         frame = frame.dropna(subset=["date"]).set_index("date").sort_index()
         return _normalize_daily_frame(frame=frame, symbol=normalized_symbol)
 
+    def fetch_intraday_summaries(
+        self,
+        symbols: list[str],
+        interval: str,
+        lookback_days: int = 120,
+    ) -> dict[str, pd.DataFrame]:
+        table_name = _INTRADAY_TABLES.get(interval)
+        normalized_symbols = sorted(
+            {
+                normalized
+                for normalized in (_normalize_symbol(symbol) for symbol in symbols)
+                if normalized
+            }
+        )
+        if table_name is None or not normalized_symbols or not self._table_exists(table_name):
+            return {}
+        placeholders = ", ".join("?" for _ in normalized_symbols)
+        query = f"""
+            SELECT symbol, date, {", ".join(_INTRADAY_COLUMNS)}
+            FROM (
+                SELECT
+                    symbol,
+                    date,
+                    {", ".join(_INTRADAY_COLUMNS)},
+                    ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY date DESC) AS row_num
+                FROM {table_name}
+                WHERE symbol IN ({placeholders})
+            ) AS recent
+            WHERE row_num <= ?
+            ORDER BY symbol, date
+        """
+        params: list[object] = [*normalized_symbols, max(1, int(lookback_days))]
+        with self._connect_readonly() as connection:
+            frame = cast(pd.DataFrame, connection.execute(query, params).fetch_df())
+        if frame.empty:
+            return {}
+        result: dict[str, pd.DataFrame] = {}
+        for raw_symbol, group in frame.groupby("symbol", sort=False):
+            symbol = _normalize_symbol(str(raw_symbol))
+            normalized = group.drop(columns=["symbol"]).copy()
+            normalized["date"] = pd.to_datetime(normalized["date"], errors="coerce")
+            normalized = normalized.dropna(subset=["date"]).set_index("date").sort_index()
+            result[symbol] = _normalize_intraday_frame(frame=normalized, symbol=symbol)
+        return result
+
     def fetch_intraday_summary(
         self,
         symbol: str,
@@ -2611,6 +2736,22 @@ class MarketWarehouse:
         frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
         frame = frame.dropna(subset=["date"]).set_index("date").sort_index()
         return _normalize_intraday_frame(frame=frame, symbol=normalized_symbol)
+
+    def intraday_coverage(self, *, interval: str) -> dict[str, object]:
+        table_name = _INTRADAY_TABLES.get(interval)
+        if table_name is None or not self._table_exists(table_name):
+            return {"interval": interval, "rows": 0, "symbols": 0, "min_date": "", "max_date": ""}
+        with self._connect_readonly() as connection:
+            row = connection.execute(
+                f"SELECT COUNT(*), COUNT(DISTINCT symbol), MIN(date), MAX(date) FROM {table_name}"
+            ).fetchone()
+        return {
+            "interval": interval,
+            "rows": int(row[0]) if row else 0,
+            "symbols": int(row[1]) if row else 0,
+            "min_date": str(row[2]) if row and row[2] is not None else "",
+            "max_date": str(row[3]) if row and row[3] is not None else "",
+        }
 
     def fetch_all_intraday_summary(self, *, symbol: str, interval: str) -> pd.DataFrame:
         table_name = _INTRADAY_TABLES.get(interval)
@@ -3056,10 +3197,7 @@ _DUCKDB_LOCK_RETRY_MAX_DELAY_SEC = 2.0
 
 def _is_retryable_duckdb_lock_error(exc: Exception) -> bool:
     message = str(exc).strip().lower()
-    return (
-        "could not set lock on file" in message
-        or "conflicting lock is held" in message
-    )
+    return "could not set lock on file" in message or "conflicting lock is held" in message
 
 
 def _connect_with_lock_retry(connect_fn: Callable[[], _DUCK_CONNECTION]) -> _DUCK_CONNECTION:

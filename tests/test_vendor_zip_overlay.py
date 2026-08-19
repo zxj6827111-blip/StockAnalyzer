@@ -422,6 +422,35 @@ def test_vendor_overlay_qfq_batch_quality_metrics_multiplies_prices(
     assert volumes == pytest.approx([10_000.0, 20_000.0])
 
 
+def test_qfq_factor_batch_opens_archive_once_and_populates_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    index_path = _build_multi_year_daily_fixture(tmp_path)
+    _write_factors_zip(
+        tmp_path,
+        {
+            "2025/600000.SH.csv": "code,trade_date,factor\n600000.SH,20251231,1.0\n",
+            "2025/000001.SZ.csv": "code,trade_date,factor\n000001.SZ,20251231,1.0\n",
+        },
+    )
+    provider = _qfq_provider(tmp_path, index_path)
+    opened: list[str] = []
+    real_zipfile = zipfile.ZipFile
+
+    class CountingZipFile(real_zipfile):  # type: ignore[misc, valid-type]
+        def __init__(self, file: object, *args: object, **kwargs: object) -> None:
+            opened.append(str(file))
+            super().__init__(file, *args, **kwargs)
+
+    monkeypatch.setattr(zipfile, "ZipFile", CountingZipFile)
+    provider._load_price_factors_batch(["600000", "000001"])  # noqa: SLF001
+
+    assert sorted(provider._factor_cache) == ["000001", "600000"]  # noqa: SLF001
+    provider._load_price_factors("600000")  # noqa: SLF001
+    assert len(opened) == 1
+
+
 def test_runtime_universe_comes_from_provider_index(tmp_path: Path) -> None:
     index_path = _build_daily_fixture(tmp_path)
     service = object.__new__(StockAnalyzerService)

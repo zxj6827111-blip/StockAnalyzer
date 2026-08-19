@@ -9,8 +9,8 @@ EQUITY="${1:-1.0}"
 
 cd "${ROOT}"
 
-echo "[1/5] stop api + scheduler"
-docker stop stock-analyzer-api stock-analyzer-scheduler >/dev/null || true
+echo "[1/5] stop api + schedulers"
+docker stop stock-analyzer-api stock-analyzer-scheduler stock-analyzer-scheduler-critical stock-analyzer-scheduler-heavy >/dev/null || true
 
 echo "[2/5] patch runtime_state.json equity=${EQUITY}, clear portfolio"
 if command -v python3 >/dev/null 2>&1; then
@@ -56,5 +56,5 @@ print(\"summary\", d.get(\"summary\"))
 "
 '
 
-echo "Done. If risk_action is not freeze, optionally: docker start stock-analyzer-scheduler"
+echo "Done. If risk_action is not freeze, optionally: docker start stock-analyzer-scheduler-critical stock-analyzer-scheduler-heavy"
 echo "After image rebuild you can also use: docker exec stock-analyzer-api stock-analyzer reset-sim-account"

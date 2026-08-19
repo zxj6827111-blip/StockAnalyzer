@@ -13,7 +13,21 @@ services:
       SA__WECOM_INTERACTION__ENABLED: "false"
       SA__FEISHU_INTERACTION__ENABLED: "false"
 
-  scheduler:
+  scheduler-critical:
+    environment:
+      SA__NOTIFICATIONS__PRIMARY: console
+      SA__NOTIFICATIONS__BACKUP: console
+      SA__NOTIFICATIONS__PUSHPLUS_TOKEN: ""
+      SA__NOTIFICATIONS__WECOM_WEBHOOK: ""
+      SA__NOTIFICATIONS__FEISHU_WEBHOOK: ""
+      SA__NOTIFICATIONS__FEISHU_APP_ID: ""
+      SA__NOTIFICATIONS__FEISHU_APP_SECRET: ""
+      SA__NOTIFICATIONS__FEISHU_APP_RECEIVE_ID: ""
+      SA__NOTIFICATIONS__FEISHU_APP_RECEIVE_ID_TYPE: open_id
+      SA__WECOM_INTERACTION__ENABLED: "false"
+      SA__FEISHU_INTERACTION__ENABLED: "false"
+
+  scheduler-heavy:
     environment:
       SA__NOTIFICATIONS__PRIMARY: console
       SA__NOTIFICATIONS__BACKUP: console

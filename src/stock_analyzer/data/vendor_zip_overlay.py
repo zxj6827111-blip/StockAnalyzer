@@ -6,12 +6,14 @@ import csv
 import json
 import logging
 import re
+import threading
 import zipfile
 from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from time import monotonic
 from typing import cast
 
 import numpy as np
@@ -19,7 +21,7 @@ import pandas as pd
 
 from stock_analyzer.data.intraday_summary import summarize_minute_bars
 from stock_analyzer.data.market_warehouse import MarketWarehouse
-from stock_analyzer.data.provider import DataSourceError
+from stock_analyzer.data.provider import DataSourceError, RequiredIntradayDataError
 from stock_analyzer.data.tdx_offline_provider import (
     _normalize_frame,
     _normalize_symbol,
@@ -178,17 +180,33 @@ class VendorZipOverlayProvider:
     minute_volume_multiplier: float = 100.0
     minute_amount_multiplier: float = 1.0
     intraday_enabled: bool = True
+    intraday_runtime_mode: str = "zip_legacy"
+    intraday_summary_path: str = ""
+    intraday_zip_fallback_enabled: bool = True
+    intraday_max_staleness_trading_days: int = 0
+    intraday_query_timeout_sec: int = 5
+    intraday_max_concurrency: int = 2
+    intraday_cache_ttl_sec: int = 30
     memory_cache_symbols: int = 32
     delta_access_mode: str = "read_write"
     delta_max_staleness_days: int = 3
     _root: Path = field(init=False)
     _index: dict[str, object] = field(init=False)
     _warehouse: MarketWarehouse | None = field(init=False)
+    _intraday_warehouse: MarketWarehouse | None = field(init=False)
+    _intraday_manifest: dict[str, object] = field(default_factory=dict, init=False)
     _daily_cache: OrderedDict[str, pd.DataFrame] = field(default_factory=OrderedDict, init=False)
     _intraday_cache: OrderedDict[str, pd.DataFrame] = field(default_factory=OrderedDict, init=False)
     _minute_archives: dict[str, list[Path]] = field(default_factory=dict, init=False)
     _minute_entry_index: dict[Path, dict[str, list[str]]] = field(default_factory=dict, init=False)
     _factor_cache: dict[str, pd.Series] = field(default_factory=dict, init=False)
+    _factor_missing_symbols: set[str] = field(default_factory=set, init=False)
+    _intraday_batch_cache: OrderedDict[str, tuple[float, dict[str, pd.DataFrame]]] = field(
+        default_factory=OrderedDict, init=False
+    )
+    _intraday_inflight: dict[str, threading.Event] = field(default_factory=dict, init=False)
+    _intraday_lock: threading.Lock = field(default_factory=threading.Lock, init=False)
+    _intraday_query_gate: threading.BoundedSemaphore = field(init=False)
 
     def __post_init__(self) -> None:
         self._root = Path(self.data_root).expanduser()
@@ -198,8 +216,7 @@ class VendorZipOverlayProvider:
         normalized_mode = str(self.price_series_mode or "raw").strip().lower()
         if normalized_mode not in {"raw", "qfq"}:
             raise DataSourceError(
-                "vendor ZIP overlay supports only raw or qfq prices; "
-                f"got: {self.price_series_mode}"
+                f"vendor ZIP overlay supports only raw or qfq prices; got: {self.price_series_mode}"
             )
         self.price_series_mode = normalized_mode
         access_mode = str(self.delta_access_mode or "read_write").strip().lower()
@@ -225,6 +242,33 @@ class VendorZipOverlayProvider:
             )
         self.memory_cache_symbols = max(1, int(self.memory_cache_symbols))
         self.delta_max_staleness_days = max(1, int(self.delta_max_staleness_days))
+        self.intraday_query_timeout_sec = max(1, int(self.intraday_query_timeout_sec))
+        self.intraday_max_concurrency = max(1, int(self.intraday_max_concurrency))
+        self.intraday_cache_ttl_sec = max(0, int(self.intraday_cache_ttl_sec))
+        self.intraday_max_staleness_trading_days = max(
+            0, int(self.intraday_max_staleness_trading_days)
+        )
+        self._intraday_query_gate = threading.BoundedSemaphore(self.intraday_max_concurrency)
+        runtime_mode = str(self.intraday_runtime_mode or "zip_legacy").strip().lower()
+        if runtime_mode not in {"duckdb_required", "duckdb_optional", "zip_legacy"}:
+            raise DataSourceError(f"unsupported intraday_runtime_mode: {runtime_mode}")
+        self.intraday_runtime_mode = runtime_mode
+        self._intraday_warehouse = None
+        if self.intraday_enabled and runtime_mode != "zip_legacy":
+            summary_path = Path(self.intraday_summary_path).expanduser()
+            manifest_path = _intraday_manifest_path(summary_path)
+            if summary_path.exists() and manifest_path.exists():
+                self._intraday_warehouse = MarketWarehouse(
+                    db_path=summary_path,
+                    package_root=summary_path.parent / "package",
+                    package_writes_enabled=False,
+                    read_only=True,
+                )
+                self._intraday_manifest = _load_intraday_manifest(manifest_path)
+            elif runtime_mode == "duckdb_required":
+                raise RequiredIntradayDataError(
+                    f"required intraday summary database or manifest is missing: {summary_path}"
+                )
 
     def list_symbols(self) -> list[str]:
         symbols = self._symbols_mapping()
@@ -440,14 +484,12 @@ class VendorZipOverlayProvider:
             return frame
         from stock_analyzer.data.financial_pit import apply_financial_snapshots_asof_batch
 
-        return cast(
-            pd.DataFrame,
-            apply_financial_snapshots_asof_batch(
-                frame,
-                snapshots,
-                only_fill_pending=True,
-            ),
+        enriched: pd.DataFrame = apply_financial_snapshots_asof_batch(
+            frame,
+            snapshots,
+            only_fill_pending=True,
         )
+        return enriched
 
     def fetch_intraday_summary(
         self,
@@ -456,32 +498,182 @@ class VendorZipOverlayProvider:
         lookback_days: int = 120,
     ) -> pd.DataFrame:
         normalized = _normalize_symbol(symbol)
-        interval_key = str(interval).strip().lower()
-        if not normalized or interval_key not in {"1m", "5m"}:
+        if not normalized:
             return pd.DataFrame()
-        baseline = (
-            self._load_vendor_intraday_summary(
-                symbol=normalized,
-                interval=interval_key,
-                lookback_days=max(1, int(lookback_days)),
-            )
-            if self.intraday_enabled
-            else pd.DataFrame()
+        return self.fetch_intraday_summaries(
+            [normalized],
+            interval,
+            lookback_days=lookback_days,
+        ).get(normalized, pd.DataFrame())
+
+    def fetch_intraday_summaries(
+        self,
+        symbols: list[str],
+        interval: str,
+        lookback_days: int = 120,
+    ) -> dict[str, pd.DataFrame]:
+        normalized_symbols = sorted(
+            {
+                normalized
+                for normalized in (_normalize_symbol(symbol) for symbol in symbols)
+                if normalized
+            }
         )
-        delta = pd.DataFrame()
+        interval_key = str(interval).strip().lower()
+        limit = max(1, int(lookback_days))
+        if not normalized_symbols or interval_key not in {"1m", "5m"}:
+            return {}
+        if not self.intraday_enabled:
+            return {symbol: pd.DataFrame() for symbol in normalized_symbols}
+        generation = str(self._intraday_manifest.get("generation", "legacy"))
+        cache_key = f"{generation}:{interval_key}:{limit}:{','.join(normalized_symbols)}"
+        while True:
+            with self._intraday_lock:
+                cached = self._intraday_batch_cache.get(cache_key)
+                if cached is not None:
+                    cached_at, cached_frames = cached
+                    if monotonic() - cached_at <= self.intraday_cache_ttl_sec:
+                        self._intraday_batch_cache.move_to_end(cache_key)
+                        return {symbol: frame.copy() for symbol, frame in cached_frames.items()}
+                    self._intraday_batch_cache.pop(cache_key, None)
+                inflight = self._intraday_inflight.get(cache_key)
+                if inflight is None:
+                    inflight = threading.Event()
+                    self._intraday_inflight[cache_key] = inflight
+                    owner = True
+                else:
+                    owner = False
+            if owner:
+                break
+            if not inflight.wait(timeout=self.intraday_query_timeout_sec):
+                raise RequiredIntradayDataError(
+                    f"intraday query single-flight timeout: {interval_key}"
+                )
+
+        acquired = self._intraday_query_gate.acquire(timeout=self.intraday_query_timeout_sec)
+        try:
+            if not acquired:
+                raise RequiredIntradayDataError(
+                    f"intraday query concurrency timeout: {interval_key}"
+                )
+            frames = self._query_intraday_summaries(
+                symbols=normalized_symbols,
+                interval=interval_key,
+                lookback_days=limit,
+            )
+            if self.intraday_runtime_mode == "duckdb_required":
+                missing = [
+                    symbol
+                    for symbol in normalized_symbols
+                    if frames.get(symbol, pd.DataFrame()).empty
+                ]
+                if missing:
+                    raise RequiredIntradayDataError(
+                        "required intraday summaries missing for symbols: "
+                        + ",".join(missing[:20]),
+                        missing_symbols=missing,
+                        partial_frames=frames,
+                    )
+            with self._intraday_lock:
+                self._intraday_batch_cache[cache_key] = (
+                    monotonic(),
+                    {symbol: frame.copy() for symbol, frame in frames.items()},
+                )
+                self._intraday_batch_cache.move_to_end(cache_key)
+                while len(self._intraday_batch_cache) > self.memory_cache_symbols:
+                    self._intraday_batch_cache.popitem(last=False)
+            return {symbol: frame.copy() for symbol, frame in frames.items()}
+        finally:
+            if acquired:
+                self._intraday_query_gate.release()
+            with self._intraday_lock:
+                event = self._intraday_inflight.pop(cache_key, None)
+                if event is not None:
+                    event.set()
+
+    def _query_intraday_summaries(
+        self,
+        *,
+        symbols: list[str],
+        interval: str,
+        lookback_days: int,
+    ) -> dict[str, pd.DataFrame]:
+        baseline: dict[str, pd.DataFrame] = {}
+        if self._intraday_warehouse is not None:
+            self._ensure_intraday_summary_ready(interval)
+            baseline = self._intraday_warehouse.fetch_intraday_summaries(
+                symbols,
+                interval,
+                lookback_days=lookback_days,
+            )
+        elif self.intraday_runtime_mode == "zip_legacy" or self.intraday_zip_fallback_enabled:
+            baseline = {
+                symbol: self._load_vendor_intraday_summary(
+                    symbol=symbol,
+                    interval=interval,
+                    lookback_days=lookback_days,
+                )
+                for symbol in symbols
+            }
+        elif self.intraday_runtime_mode == "duckdb_required":
+            raise RequiredIntradayDataError("required intraday summary database is unavailable")
+
+        delta: dict[str, pd.DataFrame] = {}
         delta_warehouse = self._delta_warehouse()
         if delta_warehouse is not None:
-            delta = delta_warehouse.fetch_intraday_summary(
-                normalized,
-                interval_key,
-                lookback_days=max(1, int(lookback_days)),
+            delta = delta_warehouse.fetch_intraday_summaries(
+                symbols,
+                interval,
+                lookback_days=lookback_days,
             )
-        return _merge_overlay_frames(baseline, delta).tail(max(1, int(lookback_days)))
+        return {
+            symbol: _merge_overlay_frames(
+                baseline.get(symbol, pd.DataFrame()),
+                delta.get(symbol, pd.DataFrame()),
+            ).tail(lookback_days)
+            for symbol in symbols
+        }
+
+    def _ensure_intraday_summary_ready(self, interval: str) -> None:
+        coverage_root = self._intraday_manifest.get("coverage")
+        coverage = coverage_root.get(interval) if isinstance(coverage_root, dict) else None
+        if not isinstance(coverage, dict):
+            raise RequiredIntradayDataError(f"intraday manifest has no {interval} coverage")
+        summary_latest = _coerce_date(coverage.get("max_date"))
+        expected_latest = max(
+            (
+                parsed
+                for raw in self._symbols_mapping().values()
+                if isinstance(raw, dict)
+                for parsed in [_coerce_date(raw.get("latest_date"))]
+                if parsed is not None
+            ),
+            default=None,
+        )
+        if summary_latest is None:
+            raise RequiredIntradayDataError(f"intraday manifest has empty {interval} max_date")
+        if expected_latest is None or summary_latest >= expected_latest:
+            return
+        lag = int(
+            np.busday_count(
+                summary_latest.isoformat(),
+                expected_latest.isoformat(),
+            )
+        )
+        if lag > self.intraday_max_staleness_trading_days:
+            raise RequiredIntradayDataError(
+                f"intraday summary stale for {interval}: "
+                f"summary={summary_latest.isoformat()} "
+                f"expected={expected_latest.isoformat()} lag={lag}"
+            )
 
     def clear_cache(self) -> None:
         self._daily_cache.clear()
         self._intraday_cache.clear()
         self._factor_cache.clear()
+        self._factor_missing_symbols.clear()
+        with self._intraday_lock:
+            self._intraday_batch_cache.clear()
 
     def status(self) -> dict[str, object]:
         delta_warehouse = self._delta_warehouse()
@@ -506,6 +698,10 @@ class VendorZipOverlayProvider:
             ),
             "price_series_mode": self.price_series_mode,
             "intraday_enabled": bool(self.intraday_enabled),
+            "intraday_runtime_mode": self.intraday_runtime_mode,
+            "intraday_summary_path": self.intraday_summary_path,
+            "intraday_generation": str(self._intraday_manifest.get("generation", "")),
+            "intraday_zip_fallback_enabled": bool(self.intraday_zip_fallback_enabled),
         }
 
     def _delta_warehouse(self) -> MarketWarehouse | None:
@@ -587,13 +783,12 @@ class VendorZipOverlayProvider:
         is unaffected, still failing closed on missing factors.
         """
         if self.price_series_mode == "qfq":
-            factor_archive = (
-                self._root / _QFQ_FACTORS_DIR_NAME / _QFQ_FACTORS_ARCHIVE_NAME
-            )
+            factor_archive = self._root / _QFQ_FACTORS_DIR_NAME / _QFQ_FACTORS_ARCHIVE_NAME
             if not factor_archive.exists():
                 raise DataSourceError(
                     f"vendor qfq factor archive missing for batch: {factor_archive}"
                 )
+            self._load_price_factors_batch(symbols)
         entries_by_symbol: dict[str, list[dict[str, object]]] = {}
         for symbol in symbols:
             raw_symbol = self._symbols_mapping().get(symbol)
@@ -688,6 +883,58 @@ class VendorZipOverlayProvider:
             long_frames.append(frame)
         return long_frames
 
+    def _load_price_factors_batch(self, symbols: list[str]) -> None:
+        """Populate factor cache for many symbols with one ZIP directory scan."""
+        requested = sorted(
+            {
+                normalized
+                for normalized in (_normalize_symbol(symbol) for symbol in symbols)
+                if normalized
+                and normalized not in self._factor_cache
+                and normalized not in self._factor_missing_symbols
+            }
+        )
+        if not requested:
+            return
+        archive_path = self._root / _QFQ_FACTORS_DIR_NAME / _QFQ_FACTORS_ARCHIVE_NAME
+        if not archive_path.exists():
+            raise DataSourceError(f"vendor qfq factor archive missing for batch: {archive_path}")
+        requested_set = set(requested)
+        entries_by_symbol: dict[str, list[str]] = {}
+        with zipfile.ZipFile(archive_path) as archive:
+            for name in archive.namelist():
+                if _is_zip_noise(name):
+                    continue
+                file_name = Path(name.replace("\\", "/")).name
+                match = _DAILY_ENTRY_RE.fullmatch(file_name)
+                if match is None:
+                    continue
+                symbol = _normalize_symbol(match.group("code"))
+                if symbol in requested_set:
+                    entries_by_symbol.setdefault(symbol, []).append(name)
+            for symbol in requested:
+                parsed_frames: list[pd.Series] = []
+                for entry_name in entries_by_symbol.get(symbol, []):
+                    try:
+                        with archive.open(entry_name) as stream:
+                            raw = pd.read_csv(stream)
+                        parsed = _parse_vendor_factor_frame(raw, symbol=symbol)
+                    except (KeyError, DataSourceError):
+                        parsed_frames = []
+                        break
+                    if not parsed.empty:
+                        parsed_frames.append(parsed)
+                if not parsed_frames:
+                    self._factor_missing_symbols.add(symbol)
+                    continue
+                merged = cast(pd.Series, pd.concat(parsed_frames, axis=0))
+                merged = merged[merged.index.notna()]
+                merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+                if merged.empty:
+                    self._factor_missing_symbols.add(symbol)
+                    continue
+                self._factor_cache[symbol] = merged
+
     def _load_price_factors(self, symbol: str) -> pd.Series:
         """Load the qfq factor series for ``symbol`` from the vendor archive.
 
@@ -700,16 +947,14 @@ class VendorZipOverlayProvider:
         cached = self._factor_cache.get(symbol)
         if cached is not None:
             return cached
+        if symbol in self._factor_missing_symbols:
+            raise DataSourceError(f"vendor qfq factors missing for {symbol}")
         factors_dir = self._root / _QFQ_FACTORS_DIR_NAME
         if not factors_dir.is_dir():
-            raise DataSourceError(
-                f"vendor factors directory missing for {symbol}: {factors_dir}"
-            )
+            raise DataSourceError(f"vendor factors directory missing for {symbol}: {factors_dir}")
         archive_path = factors_dir / _QFQ_FACTORS_ARCHIVE_NAME
         if not archive_path.exists():
-            raise DataSourceError(
-                f"vendor qfq factor archive missing for {symbol}: {archive_path}"
-            )
+            raise DataSourceError(f"vendor qfq factor archive missing for {symbol}: {archive_path}")
         ts_code = _to_ts_code(symbol)
         expected_name = f"{ts_code}.csv"
         entries: list[str] = []
@@ -721,8 +966,7 @@ class VendorZipOverlayProvider:
                     entries.append(name)
             if not entries:
                 raise DataSourceError(
-                    f"vendor qfq factors missing for {symbol} ({ts_code}) in "
-                    f"{archive_path}"
+                    f"vendor qfq factors missing for {symbol} ({ts_code}) in {archive_path}"
                 )
             frames: list[pd.Series] = []
             for entry_name in entries:
@@ -787,9 +1031,9 @@ class VendorZipOverlayProvider:
                 factor_values = aligned.to_numpy(dtype=float)
                 for column in ("open", "high", "low", "close", "pre_close"):
                     if column in frame.columns:
-                        frame[column] = pd.to_numeric(
-                            frame[column], errors="coerce"
-                        ) * factor_values
+                        frame[column] = (
+                            pd.to_numeric(frame[column], errors="coerce") * factor_values
+                        )
             except DataSourceError:
                 if not strict_factors:
                     return pd.DataFrame()
@@ -838,7 +1082,8 @@ class VendorZipOverlayProvider:
             frame["adjustment_source"] = "local_vendor_raw"
             frame["adjustment_anchor_date"] = ""
             frame["adjustment_anchor_factor"] = np.nan
-        return cast(pd.DataFrame, _normalize_frame(frame=frame, symbol=symbol))
+        normalized_frame: pd.DataFrame = _normalize_frame(frame=frame, symbol=symbol)
+        return normalized_frame
 
     def _load_vendor_intraday_summary(
         self,
@@ -876,36 +1121,11 @@ class VendorZipOverlayProvider:
         return summary.copy()
 
     def _normalize_vendor_minute(self, raw: pd.DataFrame) -> pd.DataFrame:
-        if raw.empty or "datetime" not in raw.columns:
-            return pd.DataFrame()
-        frame = raw.copy()
-        frame["datetime"] = pd.to_datetime(frame["datetime"], errors="coerce")
-        for column in ("open", "high", "low", "close"):
-            if column not in frame.columns:
-                return pd.DataFrame()
-            frame[column] = pd.to_numeric(frame[column], errors="coerce")
-        volume_source = (
-            frame["volume"]
-            if "volume" in frame.columns
-            else pd.Series(0.0, index=frame.index, dtype=float)
+        return normalize_vendor_minute_frame(
+            raw,
+            volume_multiplier=self.minute_volume_multiplier,
+            amount_multiplier=self.minute_amount_multiplier,
         )
-        amount_source = (
-            frame["amount"]
-            if "amount" in frame.columns
-            else pd.Series(0.0, index=frame.index, dtype=float)
-        )
-        frame["volume"] = pd.to_numeric(volume_source, errors="coerce").fillna(0.0) * max(
-            0.0,
-            float(self.minute_volume_multiplier),
-        )
-        frame["amount"] = pd.to_numeric(amount_source, errors="coerce").fillna(0.0) * max(
-            0.0,
-            float(self.minute_amount_multiplier),
-        )
-        frame = frame.dropna(subset=["datetime", "open", "high", "low", "close"])
-        frame = frame.set_index("datetime").sort_index()
-        frame.index.name = "datetime"
-        return frame[["open", "high", "low", "close", "volume", "amount"]]
 
     def _minute_archive_paths(self, *, interval: str, cutoff: date) -> list[Path]:
         cached = self._minute_archives.get(interval)
@@ -937,7 +1157,11 @@ class VendorZipOverlayProvider:
                 if entry.is_dir() or _is_zip_noise(entry.filename):
                     continue
                 name = Path(entry.filename).name
-                match = re.fullmatch(r"(?:sh|sz|bj)?(?P<code>\d{6})\.csv", name, re.I)
+                match = re.fullmatch(
+                    r"(?:sh|sz|bj)?(?P<code>\d{6})(?:_\d{4})?\.csv",
+                    name,
+                    re.I,
+                )
                 if match is None:
                     continue
                 symbol = _normalize_symbol(match.group("code"))
@@ -956,6 +1180,57 @@ class VendorZipOverlayProvider:
         cache.move_to_end(key)
         while len(cache) > self.memory_cache_symbols:
             cache.popitem(last=False)
+
+
+def normalize_vendor_minute_frame(
+    raw: pd.DataFrame,
+    *,
+    volume_multiplier: float = 100.0,
+    amount_multiplier: float = 1.0,
+) -> pd.DataFrame:
+    """Normalize one vendor minute CSV using the runtime unit contract."""
+    if raw.empty or "datetime" not in raw.columns:
+        return pd.DataFrame()
+    frame = raw.copy()
+    frame["datetime"] = pd.to_datetime(frame["datetime"], errors="coerce")
+    for column in ("open", "high", "low", "close"):
+        if column not in frame.columns:
+            return pd.DataFrame()
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    volume_source = (
+        frame["volume"]
+        if "volume" in frame.columns
+        else pd.Series(0.0, index=frame.index, dtype=float)
+    )
+    amount_source = (
+        frame["amount"]
+        if "amount" in frame.columns
+        else pd.Series(0.0, index=frame.index, dtype=float)
+    )
+    frame["volume"] = pd.to_numeric(volume_source, errors="coerce").fillna(0.0) * max(
+        0.0, float(volume_multiplier)
+    )
+    frame["amount"] = pd.to_numeric(amount_source, errors="coerce").fillna(0.0) * max(
+        0.0, float(amount_multiplier)
+    )
+    frame = frame.dropna(subset=["datetime", "open", "high", "low", "close"])
+    frame = frame.set_index("datetime").sort_index()
+    frame.index.name = "datetime"
+    return frame[["open", "high", "low", "close", "volume", "amount"]]
+
+
+def _intraday_manifest_path(db_path: Path) -> Path:
+    return db_path.with_suffix(f"{db_path.suffix}.manifest.json")
+
+
+def _load_intraday_manifest(path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RequiredIntradayDataError(f"intraday manifest is unreadable: {path}: {exc}") from exc
+    if not isinstance(payload, dict) or not str(payload.get("generation", "")).strip():
+        raise RequiredIntradayDataError(f"intraday manifest is invalid: {path}")
+    return cast(dict[str, object], payload)
 
 
 def _select_canonical_daily_archives(
@@ -999,20 +1274,14 @@ def _parse_vendor_factor_frame(raw: pd.DataFrame, *, symbol: str) -> pd.Series:
         "",
     )
     if not date_column or not factor_column:
-        raise DataSourceError(
-            f"vendor factor file missing date or factor column for {symbol}"
-        )
-    parsed = pd.to_datetime(
-        frame[date_column].astype(str), format="%Y%m%d", errors="coerce"
-    )
+        raise DataSourceError(f"vendor factor file missing date or factor column for {symbol}")
+    parsed = pd.to_datetime(frame[date_column].astype(str), format="%Y%m%d", errors="coerce")
     if parsed.isna().any():
         inferred = pd.to_datetime(frame[date_column].astype(str), errors="coerce")
         parsed = parsed.combine_first(inferred)
     factor = pd.to_numeric(frame[factor_column], errors="coerce")
     if bool((factor <= 0).any()):
-        raise DataSourceError(
-            f"vendor factor file contains non-positive factors for {symbol}"
-        )
+        raise DataSourceError(f"vendor factor file contains non-positive factors for {symbol}")
     series = pd.Series(factor.to_numpy(), index=pd.DatetimeIndex(parsed))
     series = series.loc[pd.notna(series.index)]
     series = series[series.notna()]

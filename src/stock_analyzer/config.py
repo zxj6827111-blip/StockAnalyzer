@@ -108,6 +108,13 @@ class DataSourceConfig(_StrictModel):
     vendor_zip_minute_volume_multiplier: float = 100.0
     vendor_zip_minute_amount_multiplier: float = 1.0
     vendor_zip_intraday_enabled: bool = True
+    intraday_runtime_mode: str = "zip_legacy"
+    intraday_summary_path: str = ""
+    intraday_zip_fallback_enabled: bool = True
+    intraday_max_staleness_trading_days: int = 0
+    intraday_query_timeout_sec: int = 5
+    intraday_max_concurrency: int = 2
+    intraday_cache_ttl_sec: int = 30
     vendor_zip_memory_cache_symbols: int = 32
     vendor_zip_delta_max_staleness_days: int = 3
     enable_cache_fallback: bool = True
@@ -892,6 +899,25 @@ class SchedulerConfig(_StrictModel):
     leader_lock_enabled: bool = True
     leader_lock_stale_after_sec: int = 300
     leader_lock_path: str = "artifacts/runtime/scheduler_leader.lock"
+    job_lock_enabled: bool = True
+    job_lock_stale_after_sec: int = 300
+    job_lock_dir: str = "artifacts/runtime/scheduler_job_locks"
+    process_terminate_grace_sec: int = 10
+    critical_max_concurrency: int = 2
+    heavy_max_concurrency: int = 1
+    default_critical_timeout_sec: int = 900
+    default_heavy_timeout_sec: int = 10800
+    job_timeout_sec: dict[str, int] = Field(
+        default_factory=lambda: {
+            "premarket_scan": 900,
+            "auction_report": 300,
+            "midday_news_brief": 600,
+            "close_reconcile": 900,
+            "week5": 1800,
+            "week4_acceptance": 1800,
+            "evolution": 10800,
+        }
+    )
 
 
 class LabelsConfig(_StrictModel):

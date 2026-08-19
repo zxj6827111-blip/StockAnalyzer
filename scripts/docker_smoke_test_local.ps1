@@ -49,7 +49,7 @@ function Start-ComposeStack {
     }
     $upArgs += @("api", "redis")
     if ($IncludeScheduler) {
-        $upArgs += "scheduler"
+        $upArgs += @("scheduler-critical", "scheduler-heavy")
     }
 
     Write-Host "Starting Docker services..."
@@ -190,6 +190,14 @@ function Show-Diagnostics {
     Write-Host ""
     Write-Host "Recent API logs:"
     & docker logs stock-analyzer-api --tail 200
+
+    Write-Host ""
+    Write-Host "Recent scheduler-critical logs:"
+    & docker logs stock-analyzer-scheduler-critical --tail 100
+
+    Write-Host ""
+    Write-Host "Recent scheduler-heavy logs:"
+    & docker logs stock-analyzer-scheduler-heavy --tail 100
 
     Write-Host ""
     Write-Host "Recent Redis logs:"

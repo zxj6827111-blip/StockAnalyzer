@@ -6,7 +6,8 @@ Use this on NAS host when live SET_EQUITY cannot stick because:
 2) historical sim trades recompute equity back below protect_line
 
 Recommended flow (containers stopped):
-  docker stop stock-analyzer-api stock-analyzer-scheduler
+  docker stop stock-analyzer-api stock-analyzer-scheduler \
+    stock-analyzer-scheduler-critical stock-analyzer-scheduler-heavy
   python3 scripts/reset_sim_account_runtime_state.py --state artifacts/runtime/runtime_state.json
   # or with docker python image if host has no python:
   # docker run --rm -v "$PWD/artifacts:/app/artifacts" -v "$PWD/scripts:/scripts:ro" \\

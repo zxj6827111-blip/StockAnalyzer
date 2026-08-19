@@ -51,6 +51,7 @@ import zipfile
 from contextlib import nullcontext
 from datetime import date
 from pathlib import Path
+from typing import cast
 
 import pandas as pd
 
@@ -210,60 +211,61 @@ def _entry_year(name: str) -> int:
         return 0
 
 
-def _factor_entry_index(archive: zipfile.ZipFile) -> dict[str, str]:
-    """Map ``<ts_code>.csv`` -> entry name (one namelist pass, then direct lookups).
-
-    The factor ZIP keeps one entry per year (``<year>/<ts_code>.csv``); the
-    mapping keeps the newest year only, because the drift check needs the
-    factor value on the delta anchor date, and namelist order across years is
-    not guaranteed after an archive rebuild. ``archive`` must be the already
-    open factor ZIP (the caller opens it once for the whole scan).
-    """
-    mapping: dict[str, str] = {}
+def _factor_entry_index(archive: zipfile.ZipFile) -> dict[str, list[str]]:
+    """Map ``<ts_code>.csv`` to all yearly entries in chronological order."""
+    mapping: dict[str, list[str]] = {}
     for name in archive.namelist():
         if _is_zip_noise(name):
             continue
         file_name = Path(name.replace("\\", "/")).name
-        if file_name.lower().endswith(".csv"):
-            ts_code = file_name[:-4].upper()
-            previous = mapping.get(ts_code)
-            if previous is None or _entry_year(name) > _entry_year(previous):
-                mapping[ts_code] = name
+        if not file_name.lower().endswith(".csv"):
+            continue
+        ts_code = file_name[:-4].upper()
+        mapping.setdefault(ts_code, []).append(name)
+    for entries in mapping.values():
+        entries.sort(key=lambda name: (_entry_year(name), name))
     return mapping
 
 
 def _factor_value_on_anchor(
     archive: zipfile.ZipFile,
-    entry_index: dict[str, str],
+    entry_index: dict[str, list[str]],
     symbol: str,
     anchor_date: date,
+    *,
+    factor_cache: dict[str, pd.Series] | None = None,
 ) -> float | None:
-    """Factor value on the delta anchor date, or None when undecidable.
-
-    ``archive`` must be the already-open qfq factor ZIP (the caller opens it
-    once for the whole drift scan — re-opening it per symbol would re-parse
-    the ~80k-entry central directory for every one of thousands of symbols).
-    None means "no drift signal": the symbol has no factor entry at all or
-    the anchor date is not a factor trading day. A value != 1.0 (beyond
-    tolerance) means the qfq series was re-anchored since the baseline.
-    """
+    """Factor value on the delta anchor date, caching the full symbol series."""
     ts_code = _to_ts_code(symbol)
-    entry_name = entry_index.get(ts_code.upper())
-    if entry_name is None:
+    entry_names = entry_index.get(ts_code.upper(), [])
+    if not entry_names:
         return None
-    try:
-        with archive.open(entry_name) as stream:
-            raw = pd.read_csv(stream)
-    except KeyError:
+    frames: list[pd.Series] = []
+    for entry_name in entry_names:
+        try:
+            with archive.open(entry_name) as stream:
+                raw = pd.read_csv(stream)
+        except KeyError:
+            return None
+        try:
+            series = _parse_vendor_factor_frame(raw, symbol=symbol)
+        except DataSourceError:
+            return None
+        if not series.empty:
+            frames.append(series)
+    if not frames:
         return None
-    try:
-        series = _parse_vendor_factor_frame(raw, symbol=symbol)
-    except DataSourceError:
+    merged = cast(pd.Series, pd.concat(frames, axis=0))
+    merged = merged[merged.index.notna()]
+    merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+    if merged.empty:
         return None
+    if factor_cache is not None:
+        factor_cache[symbol] = merged
     anchor_ts = pd.Timestamp(anchor_date)
-    if anchor_ts not in series.index:
+    if anchor_ts not in merged.index:
         return None
-    return float(series.loc[anchor_ts])
+    return float(merged.loc[anchor_ts])
 
 
 def _delta_anchor_dates(
@@ -476,6 +478,7 @@ def _main(argv: list[str] | None = None) -> int:
                             entry_index,
                             symbol,
                             anchor_date,
+                            factor_cache=provider._factor_cache,  # noqa: SLF001
                         )
                         if (
                             factor_value is not None

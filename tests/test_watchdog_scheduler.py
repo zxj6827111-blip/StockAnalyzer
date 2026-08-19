@@ -11,8 +11,10 @@ import pytest
 from scripts.watchdog_scheduler import (
     SimpleFileLock,
     WatchdogState,
+    build_watch_targets,
     heartbeat_age_sec,
     job_last_success_age_sec,
+    recreate_service,
     run_once,
 )
 
@@ -86,6 +88,85 @@ def test_job_last_success_age_sec_reads_heartbeat_jobs(tmp_path: Path) -> None:
     assert job_last_success_age_sec(hb, "premarket_scan", now=now) == pytest.approx(5400.0)
     assert job_last_success_age_sec(hb, "missing_job", now=now) is None
     assert job_last_success_age_sec(None, "premarket_scan", now=now) is None
+
+
+def test_build_watch_targets_defaults_to_critical_and_heavy() -> None:
+    targets = build_watch_targets(group="all")
+
+    assert targets == [
+        {
+            "group": "critical",
+            "service": "scheduler-critical",
+            "container": "stock-analyzer-scheduler-critical",
+            "heartbeat_path": "artifacts/runtime/scheduler_critical_heartbeat.json",
+            "log_path": str(Path("logs") / "scheduler_watchdog_critical.jsonl"),
+            "state_path": str(Path("logs") / "scheduler_watchdog_state_critical.json"),
+            "lock_path": str(Path("logs") / "scheduler_watchdog_critical.lock"),
+            "key_job": "premarket_scan",
+        },
+        {
+            "group": "heavy",
+            "service": "scheduler-heavy",
+            "container": "stock-analyzer-scheduler-heavy",
+            "heartbeat_path": "artifacts/runtime/scheduler_heavy_heartbeat.json",
+            "log_path": str(Path("logs") / "scheduler_watchdog_heavy.jsonl"),
+            "state_path": str(Path("logs") / "scheduler_watchdog_state_heavy.json"),
+            "lock_path": str(Path("logs") / "scheduler_watchdog_heavy.lock"),
+            "key_job": "",
+        },
+    ]
+
+
+def test_build_watch_targets_explicit_service_uses_legacy_target() -> None:
+    targets = build_watch_targets(
+        group="all",
+        service="scheduler-custom",
+        container="custom-container",
+        heartbeat_path="artifacts/runtime/custom-heartbeat.json",
+    )
+
+    assert targets == [
+        {
+            "group": "legacy",
+            "service": "scheduler-custom",
+            "container": "custom-container",
+            "heartbeat_path": "artifacts/runtime/custom-heartbeat.json",
+            "log_path": "logs/scheduler_watchdog.jsonl",
+            "state_path": "logs/scheduler_watchdog_state.json",
+            "lock_path": "logs/scheduler_watchdog.lock",
+            "key_job": "",
+        }
+    ]
+
+
+def test_recreate_service_uses_docker_compose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+
+    def _fake_run_cmd(
+        command: list[str],
+        *,
+        cwd: str | Path | None = None,
+        timeout: float = 30.0,
+    ) -> tuple[int, str, str]:
+        del cwd, timeout
+        calls.append(command)
+        return 0, "started", ""
+
+    monkeypatch.setattr("scripts.watchdog_scheduler._run_cmd", _fake_run_cmd)
+
+    recovered, detail = recreate_service(
+        compose_dir=str(tmp_path),
+        service="scheduler-critical",
+        container="stock-analyzer-scheduler-critical",
+        compose_bin="docker",
+        docker_bin="docker",
+    )
+
+    assert recovered is True
+    assert detail == "compose up ok: started"
+    assert calls == [["docker", "compose", "up", "-d", "--no-deps", "scheduler-critical"]]
 
 
 def test_healthy_cycle_is_noop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -177,9 +258,7 @@ def test_container_not_running_triggers_restart(
     assert report["action"] == "restart_ok"
 
 
-def test_cool_down_skips_repeat_restart(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_cool_down_skips_repeat_restart(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     now = datetime(2026, 8, 14, 10, 0, 0)
     state = WatchdogState(str(tmp_path / "state.json"))
     state.save({"last_attempt_at": (now - timedelta(seconds=120)).isoformat()})

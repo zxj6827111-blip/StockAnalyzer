@@ -1,4 +1,4 @@
-﻿"""EFinance market data provider implementation."""
+"""EFinance market data provider implementation."""
 
 from __future__ import annotations
 
@@ -149,6 +149,21 @@ class EfinanceProvider:
     ) -> pd.DataFrame:
         _ = symbol, interval, lookback_days
         return pd.DataFrame()
+
+    def fetch_intraday_summaries(
+        self,
+        symbols: list[str],
+        interval: str,
+        lookback_days: int = 120,
+    ) -> dict[str, pd.DataFrame]:
+        return {
+            symbol: self.fetch_intraday_summary(
+                symbol=symbol,
+                interval=interval,
+                lookback_days=lookback_days,
+            )
+            for symbol in symbols
+        }
 
     def _resolve_ef_module(self) -> _EfinanceModule:
         if self._ef_module is not None:
@@ -385,4 +400,3 @@ def _is_numeric_text(text: str) -> bool:
     except ValueError:
         return False
     return True
-

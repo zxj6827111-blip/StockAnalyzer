@@ -80,15 +80,13 @@ def test_collect_support_bundle_uses_host_runtime_state_and_redacts_env(tmp_path
             }
         if command[:4] == ["docker", "logs", "--tail", "50"]:
             return {"returncode": 0, "stdout": "line-1\nline-2\n", "stderr": ""}
-        if (
-            command[:4] == ["docker", "exec", "stock-analyzer-redis", "redis-cli"]
-            and command[4:6] == ["INFO", "keyspace"]
-        ):
+        if command[:4] == ["docker", "exec", "stock-analyzer-redis", "redis-cli"] and command[
+            4:6
+        ] == ["INFO", "keyspace"]:
             return {"returncode": 0, "stdout": "db0:keys=3,expires=3\n", "stderr": ""}
-        if (
-            command[:4] == ["docker", "exec", "stock-analyzer-redis", "redis-cli"]
-            and command[4:6] == ["--scan", "--pattern"]
-        ):
+        if command[:4] == ["docker", "exec", "stock-analyzer-redis", "redis-cli"] and command[
+            4:6
+        ] == ["--scan", "--pattern"]:
             return {
                 "returncode": 0,
                 "stdout": "runtime_realtime:600001.SH\nruntime_realtime:600519.SH\n",
@@ -121,6 +119,72 @@ def test_collect_support_bundle_uses_host_runtime_state_and_redacts_env(tmp_path
     tracked_env = bundle["docker"]["containers"]["api"]["tracked_env"]
     assert tracked_env["SA__CACHE__BACKEND"] == "redis"
     assert tracked_env["SA__NOTIFICATIONS__WECOM_WEBHOOK"] == "<redacted:22>"
+
+
+def test_collect_support_bundle_defaults_to_split_schedulers(tmp_path: Path) -> None:
+    project_root = tmp_path / "project"
+    runtime_dir = project_root / "artifacts" / "runtime"
+    runtime_dir.mkdir(parents=True)
+    (runtime_dir / "runtime_state.json").write_text("{}", encoding="utf-8")
+    (runtime_dir / "scheduler_critical_heartbeat.json").write_text(
+        '{"group":"critical","status":"ok"}',
+        encoding="utf-8",
+    )
+    (runtime_dir / "scheduler_heavy_heartbeat.json").write_text(
+        '{"group":"heavy","status":"ok"}',
+        encoding="utf-8",
+    )
+    inspected: list[str] = []
+
+    def fake_http(url: str, timeout_sec: float) -> dict[str, object]:
+        _ = url, timeout_sec
+        return {"status": "ok"}
+
+    def fake_command(command: list[str]) -> dict[str, object]:
+        if command[:4] == ["docker", "version", "--format", "{{.Server.Version}}"]:
+            return {"returncode": 0, "stdout": "27.0.1\n", "stderr": ""}
+        if command[:2] == ["docker", "inspect"]:
+            inspected.append(command[-1])
+            return {
+                "returncode": 0,
+                "stdout": json.dumps(
+                    [
+                        {
+                            "Config": {"Image": "stock-analyzer:latest", "Env": []},
+                            "State": {
+                                "Running": True,
+                                "Status": "running",
+                                "StartedAt": "2026-08-19T00:00:00Z",
+                                "FinishedAt": "0001-01-01T00:00:00Z",
+                            },
+                            "RestartCount": 0,
+                            "Image": "sha256:test",
+                            "Mounts": [],
+                        }
+                    ]
+                ),
+                "stderr": "",
+            }
+        if command[:2] == ["docker", "logs"]:
+            return {"returncode": 0, "stdout": "ok\n", "stderr": ""}
+        if command[:3] == ["docker", "exec", "stock-analyzer-redis"]:
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+        raise AssertionError(command)
+
+    bundle = collect_support_bundle(
+        project_root=project_root,
+        command_runner=fake_command,
+        http_getter=fake_http,
+    )
+
+    containers = bundle["docker"]["containers"]
+    assert containers["scheduler-critical"]["running"] is True
+    assert containers["scheduler-heavy"]["running"] is True
+    assert "stock-analyzer-scheduler-critical" in inspected
+    assert "stock-analyzer-scheduler-heavy" in inspected
+    heartbeats = bundle["runtime_artifacts"]["scheduler_heartbeats"]
+    assert heartbeats["critical"]["group"] == "critical"
+    assert heartbeats["heavy"]["group"] == "heavy"
 
 
 def test_collect_support_bundle_marks_unavailable_runtime_endpoint_as_error(tmp_path: Path) -> None:

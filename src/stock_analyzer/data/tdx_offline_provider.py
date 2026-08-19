@@ -214,6 +214,21 @@ class TdxOfflineProvider:
         self._intraday_cache[cache_key] = (mtime_ns, frame)
         return frame.copy()
 
+    def fetch_intraday_summaries(
+        self,
+        symbols: list[str],
+        interval: str,
+        lookback_days: int = 120,
+    ) -> dict[str, pd.DataFrame]:
+        return {
+            symbol: self.fetch_intraday_summary(
+                symbol=symbol,
+                interval=interval,
+                lookback_days=lookback_days,
+            )
+            for symbol in symbols
+        }
+
     def _load_symbol_frame(self, symbol: str) -> pd.DataFrame:
         symbol_path = _resolve_symbol_path(self._root, symbol)
         if symbol_path is None:
@@ -383,11 +398,7 @@ def _clean_text_value(value: object) -> str:
     text = str(value).strip()
     if not text:
         return ""
-    return (
-        ""
-        if text.lower() in {"nan", "nat", "<na>", "null", "none", "undefined"}
-        else text
-    )
+    return "" if text.lower() in {"nan", "nat", "<na>", "null", "none", "undefined"} else text
 
 
 def _normalize_symbol(symbol: str) -> str:

@@ -12,6 +12,7 @@ from stock_analyzer.config import load_config
 from stock_analyzer.data.provider import SyntheticProvider
 from stock_analyzer.feature.engineer import FeatureEngineer
 from stock_analyzer.feature.snapshot import (
+    _prune_old_snapshots,
     build_feature_snapshot,
     load_feature_snapshot,
     load_snapshot_tails,
@@ -39,6 +40,42 @@ def _make_service(tmp_path: Path) -> tuple[StockAnalyzerService, Path]:
     service = StockAnalyzerService(config=config)
     service._provider = SyntheticProvider(seed_offset=2026)  # noqa: SLF001
     return service, tmp_path / "features_light"
+
+
+def test_prune_old_snapshots_never_deletes_current(tmp_path: Path) -> None:
+    root = tmp_path / "features_light"
+    root.mkdir()
+    current_id = "snap_2026-01-01_older"
+    for snapshot_id in (
+        current_id,
+        "snap_2026-08-17_newest",
+        "snap_2026-08-16_middle",
+    ):
+        (root / snapshot_id).mkdir()
+    (root / "current.json").write_text(
+        json.dumps({"data_snapshot_id": current_id}),
+        encoding="utf-8",
+    )
+
+    _prune_old_snapshots(root, keep=1)
+
+    assert (root / current_id).exists()
+    assert (root / "snap_2026-08-17_newest").exists()
+    assert not (root / "snap_2026-08-16_middle").exists()
+
+
+def test_prune_old_snapshots_corrupt_current_uses_name_order(tmp_path: Path) -> None:
+    root = tmp_path / "features_light"
+    root.mkdir()
+    for snapshot_id in ("snap_1", "snap_2", "snap_3"):
+        (root / snapshot_id).mkdir()
+    (root / "current.json").write_text("{broken", encoding="utf-8")
+
+    _prune_old_snapshots(root, keep=1)
+
+    assert (root / "snap_3").exists()
+    assert not (root / "snap_2").exists()
+    assert not (root / "snap_1").exists()
 
 
 def test_snapshot_publish_retries_transient_windows_permission_error(

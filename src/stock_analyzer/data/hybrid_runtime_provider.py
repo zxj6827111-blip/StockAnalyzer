@@ -15,7 +15,11 @@ from stock_analyzer.data.intraday_summary import (
     fetch_sina_minute_bars,
     summarize_minute_bars,
 )
-from stock_analyzer.data.provider import MarketDataProvider
+from stock_analyzer.data.provider import (
+    MarketDataProvider,
+    RequiredIntradayDataError,
+    fetch_intraday_summaries_compat,
+)
 
 _LIVE_SUPPORTED_INTERVALS = {"1m", "5m"}
 _LIVE_SESSION_START = dt_time(hour=9, minute=15)
@@ -80,8 +84,47 @@ class HybridRuntimeProvider:
                 interval=interval,
                 lookback_days=max(1, int(lookback_days)),
             )
+        except RequiredIntradayDataError:
+            raise
         except Exception:
             base_frame = pd.DataFrame()
+        return self._overlay_intraday_summary(
+            symbol=symbol,
+            interval=interval,
+            lookback_days=lookback_days,
+            base_frame=base_frame,
+        )
+
+    def fetch_intraday_summaries(
+        self,
+        symbols: list[str],
+        interval: str,
+        lookback_days: int = 120,
+    ) -> dict[str, pd.DataFrame]:
+        base_frames = fetch_intraday_summaries_compat(
+            self.base_provider,
+            symbols=symbols,
+            interval=interval,
+            lookback_days=max(1, int(lookback_days)),
+        )
+        return {
+            symbol: self._overlay_intraday_summary(
+                symbol=symbol,
+                interval=interval,
+                lookback_days=lookback_days,
+                base_frame=base_frames.get(symbol, pd.DataFrame()),
+            )
+            for symbol in symbols
+        }
+
+    def _overlay_intraday_summary(
+        self,
+        *,
+        symbol: str,
+        interval: str,
+        lookback_days: int,
+        base_frame: pd.DataFrame,
+    ) -> pd.DataFrame:
         if not self._should_use_live_overlay():
             return base_frame.tail(max(1, int(lookback_days))).copy()
 

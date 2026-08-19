@@ -691,22 +691,31 @@ def test_upsert_overwrite_rolls_back_on_insert_failure(
     assert float(frame["close"].iloc[-1]) == 10.5
 
 
-def test_entry_index_keeps_newest_year_entry(tmp_path: Path) -> None:
-    """多年度同名因子条目：映射保留最新年度，不依赖 namelist 顺序。"""
+def test_factor_entry_index_keeps_all_years_for_anchor_lookup(tmp_path: Path) -> None:
     archive = tmp_path / "factors.zip"
     _write_zip(
         archive,
         {
-            # 乱序写入：2025 在前、2024 在后（归档重建后 namelist 顺序不定）。
-            "2025/600000.SH.csv": "股票代码,交易日期,复权因子\n600000.SH,20251231,1.0\n",
-            "2024/600000.SH.csv": "股票代码,交易日期,复权因子\n600000.SH,20241231,1.0\n",
-            "2025/000001.SZ.csv": "股票代码,交易日期,复权因子\n000001.SZ,20251231,1.0\n",
+            "2025/600000.SH.csv": "code,trade_date,factor\n600000.SH,20251231,1.0\n",
+            "2024/600000.SH.csv": "code,trade_date,factor\n600000.SH,20241231,0.8\n",
+            "2025/000001.SZ.csv": "code,trade_date,factor\n000001.SZ,20251231,1.0\n",
         },
     )
     with zipfile.ZipFile(archive) as opened:
         mapping = delta_import._factor_entry_index(opened)
-    assert mapping["600000.SH"] == "2025/600000.SH.csv"
-    assert mapping["000001.SZ"] == "2025/000001.SZ.csv"
+        value = delta_import._factor_value_on_anchor(
+            opened,
+            mapping,
+            "600000",
+            date(2024, 12, 31),
+        )
+
+    assert mapping["600000.SH"] == [
+        "2024/600000.SH.csv",
+        "2025/600000.SH.csv",
+    ]
+    assert mapping["000001.SZ"] == ["2025/000001.SZ.csv"]
+    assert value == pytest.approx(0.8)
 
 
 def _deep_daily_csv(*, symbol: str, days: int = 70, base_close: float = 11.0) -> str:
