@@ -1905,12 +1905,23 @@ def _new_snapshot_id(trade_date: str) -> str:
 
 
 def _prune_old_snapshots(root: Path, keep: int = 2) -> None:
+    """Keep current plus the newest ``keep`` non-current snapshots."""
+    current_id = ""
+    current_path = root / "current.json"
+    if current_path.exists():
+        try:
+            payload = json.loads(current_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                current_id = str(payload.get("data_snapshot_id", "")).strip()
+        except (OSError, json.JSONDecodeError):
+            current_id = ""
     candidates = [
         item
         for item in root.iterdir()
         if item.is_dir()
         and item.name.startswith("snap_")
         and not item.name.endswith(".staging")
+        and item.name != current_id
     ]
     candidates.sort(key=lambda item: item.name, reverse=True)
     for old in candidates[keep:]:

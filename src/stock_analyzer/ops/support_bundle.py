@@ -23,6 +23,10 @@ HttpGetter = Callable[[str, float], dict[str, Any]]
 DEFAULT_API_BASE_URL = "http://127.0.0.1:8001"
 DEFAULT_API_CONTAINER = "stock-analyzer-api"
 DEFAULT_SCHEDULER_CONTAINER = "stock-analyzer-scheduler"
+DEFAULT_SCHEDULER_CONTAINERS = (
+    "stock-analyzer-scheduler-critical",
+    "stock-analyzer-scheduler-heavy",
+)
 DEFAULT_REDIS_CONTAINER = "stock-analyzer-redis"
 DEFAULT_LOG_TAIL = 120
 DEFAULT_TIMEOUT_SEC = 5.0
@@ -57,6 +61,7 @@ TRACKED_ENV_PREFIXES = (
 
 TRACKED_ENV_NAMES = {
     "TZ",
+    "SCHEDULER_GROUP",
     "SCHEDULER_POLL_SEC",
 }
 
@@ -67,7 +72,8 @@ def export_support_bundle(
     output_path: str | Path | None = None,
     base_url: str = DEFAULT_API_BASE_URL,
     api_container: str = DEFAULT_API_CONTAINER,
-    scheduler_container: str = DEFAULT_SCHEDULER_CONTAINER,
+    scheduler_container: str | None = None,
+    scheduler_containers: Sequence[str] | None = None,
     redis_container: str = DEFAULT_REDIS_CONTAINER,
     log_tail: int = DEFAULT_LOG_TAIL,
     timeout_sec: float = DEFAULT_TIMEOUT_SEC,
@@ -85,6 +91,7 @@ def export_support_bundle(
         base_url=base_url,
         api_container=api_container,
         scheduler_container=scheduler_container,
+        scheduler_containers=scheduler_containers,
         redis_container=redis_container,
         log_tail=log_tail,
         timeout_sec=timeout_sec,
@@ -100,7 +107,8 @@ def collect_support_bundle(
     project_root: str | Path | None = None,
     base_url: str = DEFAULT_API_BASE_URL,
     api_container: str = DEFAULT_API_CONTAINER,
-    scheduler_container: str = DEFAULT_SCHEDULER_CONTAINER,
+    scheduler_container: str | None = None,
+    scheduler_containers: Sequence[str] | None = None,
     redis_container: str = DEFAULT_REDIS_CONTAINER,
     log_tail: int = DEFAULT_LOG_TAIL,
     timeout_sec: float = DEFAULT_TIMEOUT_SEC,
@@ -118,6 +126,10 @@ def collect_support_bundle(
     normalized_mode = mode.strip().lower()
     if normalized_mode not in {"host", "container"}:
         raise ValueError("mode must be host or container")
+    scheduler_targets = _normalize_scheduler_containers(
+        scheduler_container=scheduler_container,
+        scheduler_containers=scheduler_containers,
+    )
 
     bundle: dict[str, Any] = {
         "schema_version": "nas-support-bundle.v2",
@@ -129,9 +141,7 @@ def collect_support_bundle(
         "config_summary": _collect_safe_config_summary(root),
         "build_manifest": _read_json_file(root / "build_manifest.json"),
         "omissions": _mode_omissions(normalized_mode),
-        "tracked_files": [
-            _describe_file(root / relative_path) for relative_path in TRACKED_FILES
-        ],
+        "tracked_files": [_describe_file(root / relative_path) for relative_path in TRACKED_FILES],
         "http": _collect_http_snapshots(
             base_url=base_url,
             timeout_sec=timeout_sec,
@@ -158,35 +168,73 @@ def collect_support_bundle(
     }
 
     if docker_available:
-        containers = {
-            "api": api_container,
-            "scheduler": scheduler_container,
-            "redis": redis_container,
-        }
+        containers = {"api": api_container, "redis": redis_container}
+        scheduler_roles = _scheduler_container_roles(scheduler_targets)
+        containers.update(scheduler_roles)
         for role, container_name in containers.items():
             bundle["docker"]["containers"][role] = _inspect_container(
                 container_name=container_name,
                 run_command=run_command,
             )
-        bundle["docker"]["recent_logs"] = {
+        recent_logs = {
             "api": _tail_container_logs(
                 api_container,
                 log_tail=log_tail,
                 run_command=run_command,
-            ),
-            "scheduler": _tail_container_logs(
-                scheduler_container,
-                log_tail=log_tail,
-                run_command=run_command,
-            ),
+            )
         }
+        recent_logs.update(
+            {
+                role: _tail_container_logs(
+                    container_name,
+                    log_tail=log_tail,
+                    run_command=run_command,
+                )
+                for role, container_name in scheduler_roles.items()
+            }
+        )
+        bundle["docker"]["recent_logs"] = recent_logs
         bundle["docker"]["redis"] = _collect_redis_details(
             redis_container=redis_container,
             run_command=run_command,
         )
-
     bundle["summary"] = _build_summary(bundle)
     return bundle
+
+
+def _normalize_scheduler_containers(
+    *,
+    scheduler_container: str | None,
+    scheduler_containers: Sequence[str] | None,
+) -> tuple[str, ...]:
+    if scheduler_containers is not None:
+        normalized = tuple(
+            dict.fromkeys(str(item).strip() for item in scheduler_containers if str(item).strip())
+        )
+        if normalized:
+            return normalized
+    legacy = str(scheduler_container or "").strip()
+    if legacy:
+        return (legacy,)
+    return DEFAULT_SCHEDULER_CONTAINERS
+
+
+def _scheduler_container_roles(containers: Sequence[str]) -> dict[str, str]:
+    roles: dict[str, str] = {}
+    for index, container in enumerate(containers):
+        normalized = str(container).strip()
+        if not normalized:
+            continue
+        if "critical" in normalized:
+            role = "scheduler-critical"
+        elif "heavy" in normalized:
+            role = "scheduler-heavy"
+        elif len(containers) == 1:
+            role = "scheduler"
+        else:
+            role = f"scheduler-{index + 1}"
+        roles[role] = normalized
+    return roles
 
 
 def _resolve_project_root(project_root: str | Path | None) -> Path:
@@ -288,6 +336,12 @@ def _collect_runtime_artifacts(
         "scheduler_heartbeat": _read_json_file(
             root / "artifacts" / "runtime" / "scheduler_heartbeat.json"
         ),
+        "scheduler_heartbeats": {
+            group: _read_json_file(
+                root / "artifacts" / "runtime" / f"scheduler_{group}_heartbeat.json"
+            )
+            for group in ("critical", "heavy")
+        },
         "runtime_files": _describe_runtime_files(root / "artifacts" / "runtime"),
     }
 
@@ -542,18 +596,14 @@ def _build_summary(bundle: dict[str, Any]) -> dict[str, Any]:
         overall = str(payload.get("overall", "")).lower()
         if overall and overall not in {"pass", "passed"}:
             issues.append(f"week4 acceptance overall={payload.get('overall')}")
-            next_actions.append(
-                "结合 slow-report 与 runtime SLA 定位瓶颈，再决定是否需要发版。"
-            )
+            next_actions.append("结合 slow-report 与 runtime SLA 定位瓶颈，再决定是否需要发版。")
 
     docker_snapshot = bundle.get("docker") or {}
     if docker_snapshot.get("available"):
         for role, container in (docker_snapshot.get("containers") or {}).items():
             if not container.get("ok"):
                 issues.append(f"{role} container inspect failed")
-                next_actions.append(
-                    f"补查容器 `{container.get('name', role)}` 是否已创建。"
-                )
+                next_actions.append(f"补查容器 `{container.get('name', role)}` 是否已创建。")
                 continue
             if not container.get("running"):
                 issues.append(f"{role} container not running")
@@ -563,16 +613,13 @@ def _build_summary(bundle: dict[str, Any]) -> dict[str, Any]:
         redis_info = docker_snapshot.get("redis") or {}
         if redis_info.get("ok") and int(redis_info.get("runtime_realtime_key_count", 0)) == 0:
             next_actions.append(
-                "若盘中实时链路需要诊断，开盘后再观察 "
-                "runtime_realtime Redis key 是否开始滚动。"
+                "若盘中实时链路需要诊断，开盘后再观察 runtime_realtime Redis key 是否开始滚动。"
             )
 
     runtime_artifacts = bundle.get("runtime_artifacts") or {}
     if runtime_artifacts.get("runtime_state") is None:
         issues.append("runtime_state.json missing")
-        next_actions.append(
-            "确认 `/app/artifacts/runtime/runtime_state.json` 是否落在持久卷。"
-        )
+        next_actions.append("确认 `/app/artifacts/runtime/runtime_state.json` 是否落在持久卷。")
 
     status = "ok"
     if issues:
@@ -581,9 +628,7 @@ def _build_summary(bundle: dict[str, Any]) -> dict[str, Any]:
         status = "error"
 
     if not next_actions:
-        next_actions.append(
-            "支持包完整，可直接据此判断是代码问题、配置问题还是运行环境问题。"
-        )
+        next_actions.append("支持包完整，可直接据此判断是代码问题、配置问题还是运行环境问题。")
 
     return {
         "status": status,

@@ -62,7 +62,7 @@ if (-not $SkipBuild) {
 }
 $args += "api"
 if (-not $SkipScheduler) {
-    $args += "scheduler"
+    $args += @("scheduler-critical", "scheduler-heavy")
 }
 
 & docker compose @fileArgs @args

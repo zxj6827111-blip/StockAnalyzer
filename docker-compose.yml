@@ -37,6 +37,7 @@ services:
       SA__DATA_SOURCE__PRIMARY: market_warehouse
       SA__DATA_SOURCE__LOCAL_DATA_ROOT: /app/artifacts/warehouse/package
       SA__DATA_SOURCE__WAREHOUSE_DB_PATH: /app/artifacts/warehouse/market.duckdb
+      SA__DATA_SOURCE__INTRADAY_SUMMARY_PATH: /data/intraday_summary/vendor_intraday_summary.duckdb
       SA__MARKET_WAREHOUSE__DB_PATH: /app/artifacts/warehouse/market.duckdb
       SA__MARKET_WAREHOUSE__PACKAGE_ROOT: /app/artifacts/warehouse/package
       SA__MARKET_WAREHOUSE__BOOTSTRAP_SOURCE_ROOT: /app/artifacts/imports/tdx_offline_package
@@ -47,13 +48,14 @@ services:
     volumes:
       - ./artifacts:/app/artifacts
       - ./suggestions:/app/suggestions
+      - ${SA_INTRADAY_SUMMARY_HOST_ROOT:-./artifacts/intraday_summary}:/data/intraday_summary:ro
     ports:
       - "${SA_API_HOST_PORT:-8001}:8000"
     depends_on:
       - redis
     restart: unless-stopped
 
-  scheduler:
+  scheduler-critical:
     build:
       context: .
       args:
@@ -62,7 +64,7 @@ services:
         STOCK_ANALYZER_BUILD_DIRTY: ${STOCK_ANALYZER_BUILD_DIRTY:-unknown}
         STOCK_ANALYZER_BUILD_TIME_UTC: ${STOCK_ANALYZER_BUILD_TIME_UTC:-unknown}
     image: stock-analyzer:latest
-    container_name: stock-analyzer-scheduler
+    container_name: stock-analyzer-scheduler-critical
     command:
       - /app/scripts/docker-entrypoint.sh
       - python
@@ -87,6 +89,7 @@ services:
       SA__DATA_SOURCE__PRIMARY: market_warehouse
       SA__DATA_SOURCE__LOCAL_DATA_ROOT: /app/artifacts/warehouse/package
       SA__DATA_SOURCE__WAREHOUSE_DB_PATH: /app/artifacts/warehouse/market.duckdb
+      SA__DATA_SOURCE__INTRADAY_SUMMARY_PATH: /data/intraday_summary/vendor_intraday_summary.duckdb
       SA__MARKET_WAREHOUSE__DB_PATH: /app/artifacts/warehouse/market.duckdb
       SA__MARKET_WAREHOUSE__PACKAGE_ROOT: /app/artifacts/warehouse/package
       SA__MARKET_WAREHOUSE__BOOTSTRAP_SOURCE_ROOT: /app/artifacts/imports/tdx_offline_package
@@ -94,10 +97,70 @@ services:
       SA__EVOLUTION__STRICT_DEPENDENCY_CHECK: ${SA__EVOLUTION__STRICT_DEPENDENCY_CHECK:-true}
       SA__EVOLUTION__ACTIVE_CHAMPION_ID: ${SA__EVOLUTION__ACTIVE_CHAMPION_ID:-champion_v7_202603}
       SA__EVOLUTION__CODE_COMMIT_ID: ${SA__EVOLUTION__CODE_COMMIT_ID:-git:release-20260301-local}
+      SA__SCHEDULER__LEADER_LOCK_PATH: /app/artifacts/runtime/scheduler_critical_leader.lock
+      SCHEDULER_GROUP: critical
+      SCHEDULER_STATE_PATH: /app/artifacts/runtime/scheduler_critical_state.json
+      SCHEDULER_HEARTBEAT_PATH: /app/artifacts/runtime/scheduler_critical_heartbeat.json
       SCHEDULER_POLL_SEC: "30"
     volumes:
       - ./artifacts:/app/artifacts
       - ./suggestions:/app/suggestions
+      - ${SA_INTRADAY_SUMMARY_HOST_ROOT:-./artifacts/intraday_summary}:/data/intraday_summary:ro
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  scheduler-heavy:
+    build:
+      context: .
+      args:
+        STOCK_ANALYZER_BUILD_COMMIT: ${STOCK_ANALYZER_BUILD_COMMIT:-unknown}
+        STOCK_ANALYZER_BUILD_SHORT_COMMIT: ${STOCK_ANALYZER_BUILD_SHORT_COMMIT:-unknown}
+        STOCK_ANALYZER_BUILD_DIRTY: ${STOCK_ANALYZER_BUILD_DIRTY:-unknown}
+        STOCK_ANALYZER_BUILD_TIME_UTC: ${STOCK_ANALYZER_BUILD_TIME_UTC:-unknown}
+    image: stock-analyzer:latest
+    container_name: stock-analyzer-scheduler-heavy
+    command:
+      - /app/scripts/docker-entrypoint.sh
+      - python
+      - -m
+      - stock_analyzer.runtime.scheduler_worker
+    env_file:
+      - .env
+    environment:
+      STOCK_ANALYZER_CONTAINERIZED: "1"
+      STOCK_ANALYZER_CONFIG: /app/config/default.yaml
+      TZ: Asia/Shanghai
+      SA__APP__MODE: simulation
+      SA__APP__ADVISORY_ONLY: "true"
+      SA__WEEK5__FINAL_PIPELINE_TRANSFORM_MAX_WORKERS: ${SA__WEEK5__FINAL_PIPELINE_TRANSFORM_MAX_WORKERS:-1}
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-1}
+      OPENBLAS_NUM_THREADS: ${OPENBLAS_NUM_THREADS:-1}
+      MKL_NUM_THREADS: ${MKL_NUM_THREADS:-1}
+      SA__TRAINING__ENABLED: ${SA__TRAINING__ENABLED:-false}
+      SA__AUTO_PROMOTION__ENABLED: ${SA__AUTO_PROMOTION__ENABLED:-false}
+      SA__CACHE__BACKEND: redis
+      SA__CACHE__REDIS_URL: redis://redis:6379/0
+      SA__DATA_SOURCE__PRIMARY: market_warehouse
+      SA__DATA_SOURCE__LOCAL_DATA_ROOT: /app/artifacts/warehouse/package
+      SA__DATA_SOURCE__WAREHOUSE_DB_PATH: /app/artifacts/warehouse/market.duckdb
+      SA__DATA_SOURCE__INTRADAY_SUMMARY_PATH: /data/intraday_summary/vendor_intraday_summary.duckdb
+      SA__MARKET_WAREHOUSE__DB_PATH: /app/artifacts/warehouse/market.duckdb
+      SA__MARKET_WAREHOUSE__PACKAGE_ROOT: /app/artifacts/warehouse/package
+      SA__MARKET_WAREHOUSE__BOOTSTRAP_SOURCE_ROOT: /app/artifacts/imports/tdx_offline_package
+      SA__TDX_SYNC__OUTPUT_ROOT: /app/artifacts/imports/tdx_offline_package
+      SA__EVOLUTION__STRICT_DEPENDENCY_CHECK: ${SA__EVOLUTION__STRICT_DEPENDENCY_CHECK:-true}
+      SA__EVOLUTION__ACTIVE_CHAMPION_ID: ${SA__EVOLUTION__ACTIVE_CHAMPION_ID:-champion_v7_202603}
+      SA__EVOLUTION__CODE_COMMIT_ID: ${SA__EVOLUTION__CODE_COMMIT_ID:-git:release-20260301-local}
+      SA__SCHEDULER__LEADER_LOCK_PATH: /app/artifacts/runtime/scheduler_heavy_leader.lock
+      SCHEDULER_GROUP: heavy
+      SCHEDULER_STATE_PATH: /app/artifacts/runtime/scheduler_heavy_state.json
+      SCHEDULER_HEARTBEAT_PATH: /app/artifacts/runtime/scheduler_heavy_heartbeat.json
+      SCHEDULER_POLL_SEC: "30"
+    volumes:
+      - ./artifacts:/app/artifacts
+      - ./suggestions:/app/suggestions
+      - ${SA_INTRADAY_SUMMARY_HOST_ROOT:-./artifacts/intraday_summary}:/data/intraday_summary:ro
     depends_on:
       - redis
     restart: unless-stopped

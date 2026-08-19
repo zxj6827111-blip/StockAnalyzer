@@ -102,6 +102,15 @@ def build_primary_provider(config: DataSourceConfig) -> MarketDataProvider:
             minute_volume_multiplier=config.vendor_zip_minute_volume_multiplier,
             minute_amount_multiplier=config.vendor_zip_minute_amount_multiplier,
             intraday_enabled=config.vendor_zip_intraday_enabled,
+            intraday_runtime_mode=config.intraday_runtime_mode,
+            intraday_summary_path=config.intraday_summary_path,
+            intraday_zip_fallback_enabled=config.intraday_zip_fallback_enabled,
+            intraday_max_staleness_trading_days=(
+                config.intraday_max_staleness_trading_days
+            ),
+            intraday_query_timeout_sec=config.intraday_query_timeout_sec,
+            intraday_max_concurrency=config.intraday_max_concurrency,
+            intraday_cache_ttl_sec=config.intraday_cache_ttl_sec,
             memory_cache_symbols=config.vendor_zip_memory_cache_symbols,
             delta_max_staleness_days=config.vendor_zip_delta_max_staleness_days,
         )

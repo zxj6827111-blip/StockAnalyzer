@@ -9,7 +9,12 @@ from io import StringIO
 
 import pandas as pd
 
-from stock_analyzer.data.provider import DataSourceError, MarketDataProvider
+from stock_analyzer.data.provider import (
+    DataSourceError,
+    MarketDataProvider,
+    RequiredIntradayDataError,
+    fetch_intraday_summaries_compat,
+)
 from stock_analyzer.infra.cache import CacheStore
 
 
@@ -81,6 +86,8 @@ class CachedProvider:
                 interval=interval_key,
                 lookback_days=lookback_days,
             )
+        except RequiredIntradayDataError:
+            raise
         except Exception as exc:
             self.last_error = str(exc)
             fallback_raw = self.cache.get(cache_key)
@@ -92,6 +99,50 @@ class CachedProvider:
         self.cache.set(cache_key, _serialize_frame(frame), ttl_sec=self.ttl_sec)
         self.last_error = ""
         return frame
+
+    def fetch_intraday_summaries(
+        self,
+        symbols: list[str],
+        interval: str,
+        lookback_days: int = 120,
+    ) -> dict[str, pd.DataFrame]:
+        interval_key = interval.strip().lower()
+        result: dict[str, pd.DataFrame] = {}
+        missing: list[str] = []
+        for symbol in symbols:
+            cache_key = (
+                f"{self.key_prefix}:intraday:{interval_key}:{symbol}:{lookback_days}"
+            )
+            cached_raw = self.cache.get(cache_key)
+            if cached_raw is None:
+                missing.append(symbol)
+                self.cache_misses += 1
+                continue
+            self.cache_hits += 1
+            result[symbol] = _deserialize_frame(cached_raw)
+        if not missing:
+            return result
+        try:
+            loaded = fetch_intraday_summaries_compat(
+                self.inner,
+                symbols=missing,
+                interval=interval_key,
+                lookback_days=lookback_days,
+            )
+        except RequiredIntradayDataError:
+            raise
+        except Exception as exc:
+            self.last_error = str(exc)
+            raise DataSourceError(f"cached provider inner batch failed: {exc}") from exc
+        for symbol in missing:
+            frame = loaded.get(symbol, pd.DataFrame())
+            cache_key = (
+                f"{self.key_prefix}:intraday:{interval_key}:{symbol}:{lookback_days}"
+            )
+            self.cache.set(cache_key, _serialize_frame(frame), ttl_sec=self.ttl_sec)
+            result[symbol] = frame
+        self.last_error = ""
+        return result
 
     def status(self) -> dict[str, object]:
         inner_status: dict[str, object] = {}

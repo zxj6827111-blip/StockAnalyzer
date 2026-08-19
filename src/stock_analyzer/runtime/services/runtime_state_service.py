@@ -9,14 +9,19 @@ from collections.abc import Mapping
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
+from time import monotonic, sleep
 from typing import Any, cast
 from uuid import uuid4
 
+from stock_analyzer.ops.file_lock import DistributedFileLock
 from stock_analyzer.runtime.state_v9 import (
     RUNTIME_STATE_HISTORY_FIELDS,
     RUNTIME_STATE_VERSION,
     migrate_runtime_state_v9,
 )
+
+_RUNTIME_STATE_LOCK_STALE_SEC = 60
+_RUNTIME_STATE_LOCK_WAIT_SEC = 65.0
 
 
 class RuntimeStateService:
@@ -452,32 +457,63 @@ class RuntimeStateService:
         if not bool(service._config.command_channel.state_persist_enabled):
             return
         path = service._runtime_state_path
-        payload = service._default_runtime_state_payload()
-        existing_raw: object = {}
-        if path.exists():
-            try:
-                existing_raw = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                existing_raw = {}
-        payload = service._merge_runtime_state_payload(existing_raw, payload)
-        if isinstance(existing_raw, dict) and isinstance(existing_raw.get("state_migration"), dict):
-            payload["state_migration"] = deepcopy(existing_raw["state_migration"])
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if include_history_sidecars:
-            self._persist_runtime_state_history_sidecars(existing_raw)
-        for history_name in RUNTIME_STATE_HISTORY_FIELDS:
-            payload.pop(history_name, None)
-        payload["runtime_history_sidecars"] = self._runtime_state_history_sidecar_metadata()
-        temp_path = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
-        with temp_path.open("w", encoding="utf-8") as fp:
-            json.dump(payload, fp, ensure_ascii=False, separators=(",", ":"), default=str)
-            fp.flush()
-            os.fsync(fp.fileno())
-        os.replace(temp_path, path)
+        lock = DistributedFileLock(
+            Path(f"{path}.lock"),
+            stale_after_sec=_RUNTIME_STATE_LOCK_STALE_SEC,
+            heartbeat_interval_sec=5.0,
+        )
+        deadline = monotonic() + _RUNTIME_STATE_LOCK_WAIT_SEC
+        while not lock.acquire():
+            if monotonic() >= deadline:
+                raise TimeoutError(f"runtime state write lock timeout: {lock.path}")
+            sleep(0.05)
         try:
-            service._runtime_state_loaded_mtime_ns = path.stat().st_mtime_ns
-        except OSError:
-            service._runtime_state_loaded_mtime_ns = 0
+            payload = service._default_runtime_state_payload()
+            existing_raw: object = {}
+            if path.exists():
+                try:
+                    existing_raw = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    existing_raw = {}
+            base_revision = max(
+                0,
+                _as_int(getattr(service, "_runtime_state_base_revision", 0), default=0),
+            )
+            existing_revision = (
+                max(0, _as_int(existing_raw.get("state_revision"), default=0))
+                if isinstance(existing_raw, dict)
+                else 0
+            )
+            payload = service._merge_runtime_state_payload(
+                existing_raw,
+                payload,
+                base_revision=base_revision,
+            )
+            next_revision = max(existing_revision, base_revision) + 1
+            payload["state_revision"] = next_revision
+            if isinstance(existing_raw, dict) and isinstance(
+                existing_raw.get("state_migration"), dict
+            ):
+                payload["state_migration"] = deepcopy(existing_raw["state_migration"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if include_history_sidecars:
+                self._persist_runtime_state_history_sidecars(existing_raw)
+            for history_name in RUNTIME_STATE_HISTORY_FIELDS:
+                payload.pop(history_name, None)
+            payload["runtime_history_sidecars"] = self._runtime_state_history_sidecar_metadata()
+            temp_path = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
+            with temp_path.open("w", encoding="utf-8") as fp:
+                json.dump(payload, fp, ensure_ascii=False, separators=(",", ":"), default=str)
+                fp.flush()
+                os.fsync(fp.fileno())
+            os.replace(temp_path, path)
+            service._runtime_state_base_revision = next_revision
+            try:
+                service._runtime_state_loaded_mtime_ns = path.stat().st_mtime_ns
+            except OSError:
+                service._runtime_state_loaded_mtime_ns = 0
+        finally:
+            lock.release()
 
     def _load_runtime_state_from_disk(self) -> None:
         service = self._service
@@ -497,6 +533,10 @@ class RuntimeStateService:
             service._persist_runtime_state_to_disk()
             return
 
+        service._runtime_state_base_revision = max(
+            0,
+            _as_int(raw.get("state_revision"), default=0),
+        )
         service._scheduler.import_state(raw.get("scheduler_state"))
         service._portfolio.restore_state(
             raw.get("portfolio") if isinstance(raw.get("portfolio"), Mapping) else None
@@ -837,17 +877,43 @@ class RuntimeStateService:
         self,
         existing_raw: object,
         current_raw: dict[str, object],
+        *,
+        base_revision: int | None = None,
     ) -> dict[str, object]:
         service = self._service
         existing = existing_raw if isinstance(existing_raw, dict) else {}
+        existing_revision = max(
+            0,
+            _as_int(existing.get("state_revision"), default=0),
+        )
+        resolved_base_revision = (
+            existing_revision
+            if base_revision is None
+            else max(0, int(base_revision))
+        )
+        stale_snapshot = existing_revision > resolved_base_revision
         merged = dict(current_raw)
+        if stale_snapshot:
+            # A long-running scheduler child must not write its startup snapshot
+            # over business state already committed by a newer process.
+            for field in (
+                "current_equity",
+                "pause_new_buy",
+                "reconcile_required",
+            ):
+                if field in existing:
+                    merged[field] = deepcopy(existing[field])
         merged["scheduler_state"] = service._merge_runtime_state_scheduler(
             existing.get("scheduler_state"),
             current_raw.get("scheduler_state"),
         )
         merged["watchlist"] = service._merge_runtime_state_watchlist(
             existing.get("watchlist"),
-            current_raw.get("watchlist"),
+            (
+                []
+                if stale_snapshot and isinstance(existing.get("watchlist"), list)
+                else current_raw.get("watchlist")
+            ),
         )
         merged["portfolio"] = service._merge_runtime_state_portfolio(
             existing.get("portfolio"),
@@ -1225,9 +1291,44 @@ class RuntimeStateService:
                 ):
                     merged_interval[normalized_name] = {"date": slot_date, "slot": slot_value}
 
+        merged_jobs: dict[str, dict[str, object]] = {}
+        merged_job_recency: dict[str, str] = {}
+        for raw in (existing_raw, current_raw):
+            if not isinstance(raw, dict):
+                continue
+            jobs = raw.get("jobs")
+            if not isinstance(jobs, dict):
+                continue
+            for name, value in jobs.items():
+                if not isinstance(value, dict):
+                    continue
+                normalized_name = str(name).strip()
+                if not normalized_name:
+                    continue
+                payload = deepcopy(value)
+                recency = max(
+                    (
+                        str(payload.get(field, "")).strip()
+                        for field in (
+                            "heartbeat_at",
+                            "last_attempt",
+                            "last_attempt_at",
+                            "last_success",
+                            "last_success_at",
+                            "last_expired",
+                        )
+                    ),
+                    default="",
+                )
+                previous_recency = merged_job_recency.get(normalized_name, "")
+                if normalized_name not in merged_jobs or recency >= previous_recency:
+                    merged_jobs[normalized_name] = payload
+                    merged_job_recency[normalized_name] = recency
+
         return {
             "last_run": merged_last_run,
             "last_interval_slot": merged_interval,
+            "jobs": merged_jobs,
         }
 
     def _merge_runtime_state_portfolio(
@@ -1237,14 +1338,13 @@ class RuntimeStateService:
     ) -> dict[str, object]:
         existing = deepcopy(existing_raw) if isinstance(existing_raw, dict) else {}
         current = deepcopy(current_raw) if isinstance(current_raw, dict) else {}
-        current_positions = current.get("positions")
-        current_trades = current.get("trades")
-        current_has_state = (
-            (isinstance(current_positions, list) and len(current_positions) > 0)
-            or (isinstance(current_trades, list) and len(current_trades) > 0)
-            or _as_int(current.get("trade_seq"), default=0) > 0
-        )
-        if current_has_state:
+        if not existing:
+            return current
+        if not current:
+            return existing
+        existing_recency = _runtime_state_portfolio_recency(existing)
+        current_recency = _runtime_state_portfolio_recency(current)
+        if current_recency > existing_recency:
             return current
         return existing
 
@@ -1405,6 +1505,31 @@ def _as_int(value: object, default: int) -> int:
         except ValueError:
             return default
     return default
+
+
+def _runtime_state_portfolio_recency(payload: Mapping[str, object]) -> tuple[str, int, int]:
+    latest_timestamp = ""
+    item_count = 0
+    for field, timestamp_fields in (
+        ("positions", ("updated_at", "opened_at")),
+        ("trades", ("timestamp",)),
+    ):
+        rows = payload.get(field)
+        if not isinstance(rows, list):
+            continue
+        item_count += len(rows)
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            for timestamp_field in timestamp_fields:
+                timestamp = str(row.get(timestamp_field, "")).strip()
+                if timestamp > latest_timestamp:
+                    latest_timestamp = timestamp
+    return (
+        latest_timestamp,
+        max(0, _as_int(payload.get("trade_seq"), default=0)),
+        item_count,
+    )
 
 
 def _as_bool(value: object, default: bool) -> bool:

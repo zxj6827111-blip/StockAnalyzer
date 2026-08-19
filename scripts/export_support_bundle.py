@@ -39,8 +39,18 @@ def main() -> int:
     )
     parser.add_argument(
         "--scheduler-container",
-        default="stock-analyzer-scheduler",
-        help="Scheduler container name.",
+        default="",
+        help="Legacy single scheduler container name; overrides split scheduler defaults.",
+    )
+    parser.add_argument(
+        "--scheduler-critical-container",
+        default="stock-analyzer-scheduler-critical",
+        help="Critical scheduler container name.",
+    )
+    parser.add_argument(
+        "--scheduler-heavy-container",
+        default="stock-analyzer-scheduler-heavy",
+        help="Heavy scheduler container name.",
     )
     parser.add_argument(
         "--redis-container",
@@ -61,12 +71,21 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    legacy_scheduler = args.scheduler_container.strip() or None
+    scheduler_containers = None
+    if legacy_scheduler is None:
+        scheduler_containers = (
+            args.scheduler_critical_container,
+            args.scheduler_heavy_container,
+        )
+
     output_path = export_support_bundle(
         project_root=ROOT,
         output_path=ROOT / args.output,
         base_url=args.base_url,
         api_container=args.api_container,
-        scheduler_container=args.scheduler_container,
+        scheduler_container=legacy_scheduler,
+        scheduler_containers=scheduler_containers,
         redis_container=args.redis_container,
         log_tail=args.log_tail,
         timeout_sec=args.timeout_sec,

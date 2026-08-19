@@ -5,8 +5,11 @@ from __future__ import annotations
 from collections.abc import Callable, Collection
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timedelta
+from pathlib import Path
+from uuid import uuid4
 
 from stock_analyzer.config import SchedulerConfig
+from stock_analyzer.ops.file_lock import DistributedFileLock
 
 JobCallback = Callable[[], dict[str, object]]
 DatePredicate = Callable[[date], bool]
@@ -103,6 +106,65 @@ class DailyScheduler:
             date_predicate=date_predicate,
         )
 
+    def registered_job_names(self) -> list[str]:
+        return sorted([*self._jobs.keys(), *self._interval_jobs.keys()])
+
+    def due_job_names(
+        self,
+        now: datetime | None = None,
+        only_jobs: Collection[str] | None = None,
+    ) -> list[str]:
+        """Inspect due jobs without invoking callbacks or mutating scheduler state."""
+        if not self._config.enabled:
+            return []
+        current = now or datetime.now()
+        selectors = _normalize_job_selectors(only_jobs)
+        matched_selectors: set[str] = set()
+        due: list[str] = []
+        for name, job in sorted(self._jobs.items(), key=lambda item: item[1].trigger_time):
+            if selectors and not _job_matches_selectors(name, selectors, matched_selectors):
+                continue
+            if not _date_matches(
+                current.date(),
+                current_weekday=current.weekday(),
+                weekdays=job.weekdays,
+                date_predicate=job.date_predicate,
+            ):
+                continue
+            if self._last_run.get(name) == current.date():
+                continue
+            next_due_raw = str(self._job_runtime.get(name, {}).get("next_due_at", "")).strip()
+            if next_due_raw:
+                try:
+                    if current < datetime.fromisoformat(next_due_raw):
+                        continue
+                except ValueError:
+                    pass
+            if current.time() >= job.trigger_time:
+                due.append(name)
+        for name, interval_job in self._interval_jobs.items():
+            if selectors and not _job_matches_selectors(name, selectors, matched_selectors):
+                continue
+            if not _date_matches(
+                current.date(),
+                current_weekday=current.weekday(),
+                weekdays=interval_job.weekdays,
+                date_predicate=interval_job.date_predicate,
+            ):
+                continue
+            slot = _due_interval_slot(job=interval_job, current=current.time())
+            if slot is None or self._last_interval_slot.get(name) == (current.date(), slot):
+                continue
+            next_due_raw = str(self._job_runtime.get(name, {}).get("next_due_at", "")).strip()
+            if next_due_raw:
+                try:
+                    if current < datetime.fromisoformat(next_due_raw):
+                        continue
+                except ValueError:
+                    pass
+            due.append(name)
+        return due
+
     def run_due(
         self,
         now: datetime | None = None,
@@ -191,7 +253,11 @@ class DailyScheduler:
                 continue
 
             try:
-                ran, success, detail, payload = _normalize_callback_result(job.callback())
+                ran, success, detail, payload = _execute_job_callback(
+                    config=self._config,
+                    name=name,
+                    callback=job.callback,
+                )
                 if ran and success:
                     self._last_run[name] = today
                 self._record_job_result(
@@ -279,8 +345,10 @@ class DailyScheduler:
                 continue
 
             try:
-                ran, success, detail, payload = _normalize_callback_result(
-                    interval_job.callback()
+                ran, success, detail, payload = _execute_job_callback(
+                    config=self._config,
+                    name=name,
+                    callback=interval_job.callback,
                 )
                 if ran and success:
                     self._last_interval_slot[name] = slot_marker
@@ -399,7 +467,11 @@ class DailyScheduler:
         next_due_at: datetime,
     ) -> None:
         previous = self._job_runtime.get(name, {})
-        failures = int(previous.get("consecutive_failures", 0) or 0)
+        raw_failures = previous.get("consecutive_failures", 0)
+        try:
+            failures = int(raw_failures) if isinstance(raw_failures, (int, float, str)) else 0
+        except ValueError:
+            failures = 0
         if ran and success:
             failures = 0
         elif ran or detail == "expired":
@@ -414,20 +486,50 @@ class DailyScheduler:
             backoff_due = attempted_at + timedelta(minutes=backoff_minutes)
             if backoff_due > next_due_at:
                 next_due_at = backoff_due
+        attempt_iso = (
+            attempted_at.isoformat()
+            if ran or detail == "expired"
+            else str(previous.get("last_attempt_at", ""))
+        )
+        success_iso = (
+            attempted_at.isoformat()
+            if ran and success
+            else str(previous.get("last_success_at", ""))
+        )
+        failure_detail = (
+            ""
+            if ran and success
+            else detail
+            if ran or detail == "expired"
+            else str(previous.get("last_failure", ""))
+        )
+        expired_iso = (
+            attempted_at.isoformat()
+            if detail == "expired"
+            else str(previous.get("last_expired", ""))
+        )
+        status = (
+            "success"
+            if ran and success
+            else "expired"
+            if detail == "expired"
+            else "failed"
+            if ran
+            else str(previous.get("status", "idle"))
+        )
         payload = {
-            "last_attempt_at": attempted_at.isoformat() if ran else str(
-                previous.get("last_attempt_at", "")
+            "last_attempt_at": attempt_iso,
+            "last_success_at": success_iso,
+            "last_attempt": attempt_iso,
+            "last_success": success_iso,
+            "last_failure": failure_detail,
+            "last_expired": expired_iso,
+            "running_since": "",
+            "heartbeat_at": attempted_at.isoformat(),
+            "run_id": uuid4().hex if ran or detail == "expired" else str(
+                previous.get("run_id", "")
             ),
-            "last_success_at": (
-                attempted_at.isoformat()
-                if ran and success
-                else str(previous.get("last_success_at", ""))
-            ),
-            "last_failure": (
-                "" if ran and success else detail if ran or detail == "expired" else str(
-                    previous.get("last_failure", "")
-                )
-            ),
+            "status": status,
             "consecutive_failures": failures,
             "next_due_at": next_due_at.isoformat(),
         }
@@ -509,6 +611,36 @@ def _date_matches(
     if not _weekday_matches(current_weekday, weekdays):
         return False
     return date_predicate is None or bool(date_predicate(current_date))
+
+
+def scheduler_job_lock_path(config: SchedulerConfig, name: str) -> Path:
+    safe_name = "".join(
+        character if character.isalnum() or character in {"-", "_", "."} else "_"
+        for character in str(name).strip()
+    )
+    return Path(config.job_lock_dir) / f"{safe_name or 'unnamed'}.lock"
+
+
+def _execute_job_callback(
+    *,
+    config: SchedulerConfig,
+    name: str,
+    callback: JobCallback,
+) -> tuple[bool, bool, str, dict[str, object]]:
+    lock: DistributedFileLock | None = None
+    if config.job_lock_enabled:
+        lock_path = scheduler_job_lock_path(config, name)
+        lock = DistributedFileLock(
+            lock_path,
+            stale_after_sec=max(1, int(config.job_lock_stale_after_sec)),
+        )
+        if not lock.acquire():
+            return False, True, "already_running", {"lock_path": str(lock_path)}
+    try:
+        return _normalize_callback_result(callback())
+    finally:
+        if lock is not None:
+            lock.release()
 
 
 def _normalize_callback_result(

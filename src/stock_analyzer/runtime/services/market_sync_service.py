@@ -31,7 +31,11 @@ from stock_analyzer.data.market_warehouse import (
     write_package_daily_bars,
     write_package_intraday_summary,
 )
-from stock_analyzer.data.provider import DataSourceError, MarketDataProvider
+from stock_analyzer.data.provider import (
+    DataSourceError,
+    MarketDataProvider,
+    RequiredIntradayDataError,
+)
 from stock_analyzer.data.provider_factory import build_primary_provider
 from stock_analyzer.data.resilient_provider import ResilientProvider
 from stock_analyzer.data.tdx_sync import (
@@ -588,6 +592,8 @@ class RuntimeMarketSyncService:
                     lookback_days=max(1, int(lookback_days)),
                 ),
             )
+        except RequiredIntradayDataError:
+            raise
         except Exception:
             return pd.DataFrame()
         if frame.empty:

@@ -455,6 +455,7 @@ class StockAnalyzerService:
             self._config.command_channel.state_persist_path
         )
         self._runtime_state_loaded_mtime_ns = 0
+        self._runtime_state_base_revision = 0
         self._runtime_history_archive_dir = self._resolve_evolution_path(
             self._config.command_channel.history_archive_dir
         )
@@ -4217,6 +4218,18 @@ class StockAnalyzerService:
             return [retry_result, *results]
         return results
 
+    def registered_scheduler_jobs(self) -> list[str]:
+        return self._scheduler.registered_job_names()
+
+    def due_scheduler_jobs(
+        self,
+        *,
+        now: datetime | None = None,
+        only_jobs: list[str] | None = None,
+    ) -> list[str]:
+        self._refresh_runtime_state_from_disk_if_changed()
+        return self._scheduler.due_job_names(now=now, only_jobs=only_jobs)
+
     def _job_now(self) -> datetime:
         return self._scheduler_now_context or datetime.now()
 
@@ -4780,10 +4793,13 @@ class StockAnalyzerService:
         self,
         existing_raw: object,
         current_raw: dict[str, object],
+        *,
+        base_revision: int | None = None,
     ) -> dict[str, object]:
         return self._runtime_state_service._merge_runtime_state_payload(
             existing_raw,
             current_raw,
+            base_revision=base_revision,
         )
 
     def _merge_runtime_state_scheduler(

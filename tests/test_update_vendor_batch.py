@@ -186,6 +186,10 @@ def test_rebuild_daily_year_zip_roundtrip(tmp_path: Path) -> None:
     )
     report = _rebuild_daily_year_zip(daily_root, 2026, updates_by_year[2026])
     assert report["entries_total"] == 2
+    assert report["latest_dates"] == {
+        "000001": "2026-07-31",
+        "600519": "2026-07-31",
+    }
     archive_path = daily_root / "2026.zip"
     with zipfile.ZipFile(archive_path) as archive:
         names = set(archive.namelist())
@@ -242,6 +246,74 @@ def test_update_last_date_index_incremental(tmp_path: Path) -> None:
     assert report["updated"] is True
     payload = json.loads(index_path.read_text(encoding="utf-8"))
     assert payload["symbols"]["000001.SZ"]["latest_date"] == "2026-07-31"
+
+
+def test_update_last_date_index_uses_rebuild_dates_without_zip_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    daily_root = tmp_path / "daily"
+    daily_root.mkdir()
+    index_path = tmp_path / "vendor_daily_index.json"
+    index_path.write_text(
+        json.dumps(
+            {"version": 1, "symbols": {"000001": {"latest_date": "2026-07-01", "entries": []}}}
+        ),
+        encoding="utf-8",
+    )
+
+    def forbidden_zip_open(*args: object, **kwargs: object) -> object:
+        raise AssertionError("rebuild dates must avoid ZIP reads")
+
+    monkeypatch.setattr(zipfile, "ZipFile", forbidden_zip_open)
+    report = _update_last_date_index(
+        index_path=index_path,
+        daily_root=daily_root,
+        updated_symbols={"000001.SZ"},
+        rebuild_latest_dates={"000001.SZ": date(2026, 7, 31)},
+    )
+
+    assert report["dates_from_rebuild"] == 1
+    assert report["dates_from_fallback"] == 0
+    payload = json.loads(index_path.read_text(encoding="utf-8"))
+    assert payload["symbols"]["000001"]["latest_date"] == "2026-07-31"
+
+
+def test_update_last_date_index_fallback_opens_archive_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    daily_root = _build_zip_fixture(tmp_path)
+    index_path = tmp_path / "vendor_daily_index.json"
+    index_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "symbols": {
+                    "000001": {"latest_date": "2026-07-01", "entries": []},
+                    "600519": {"latest_date": "2026-07-01", "entries": []},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    opened: list[str] = []
+    real_zipfile = zipfile.ZipFile
+
+    class CountingZipFile(real_zipfile):  # type: ignore[misc, valid-type]
+        def __init__(self, file: object, *args: object, **kwargs: object) -> None:
+            opened.append(str(file))
+            super().__init__(file, *args, **kwargs)
+
+    monkeypatch.setattr(zipfile, "ZipFile", CountingZipFile)
+    report = _update_last_date_index(
+        index_path=index_path,
+        daily_root=daily_root,
+        updated_symbols={"000001.SZ", "600519.SH"},
+    )
+
+    assert report["dates_from_fallback"] == 2
+    assert opened == [str(daily_root / "2026.zip")]
 
 
 def _build_factor_fixture(tmp_path: Path, values: dict[str, float]) -> Path:

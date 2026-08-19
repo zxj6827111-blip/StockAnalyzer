@@ -7,18 +7,24 @@ import os
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
+from contextvars import ContextVar
 from copy import deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
 from time import perf_counter, perf_counter_ns
-from typing import Protocol, TypedDict, cast
+from typing import Protocol, TypedDict
 from uuid import uuid4
 
 import numpy as np
 import pandas as pd
 
 from stock_analyzer.config import LiquidityFilterConfig, StockAnalyzerConfig
-from stock_analyzer.data.provider import DataSourceError, MarketDataProvider
+from stock_analyzer.data.provider import (
+    DataSourceError,
+    MarketDataProvider,
+    RequiredIntradayDataError,
+    fetch_intraday_summaries_compat,
+)
 from stock_analyzer.data.provider_factory import build_runtime_provider
 from stock_analyzer.feature.engineer import FeatureEngineer
 from stock_analyzer.feature.market_context import build_market_relative_frame
@@ -48,6 +54,10 @@ from stock_analyzer.strategy.soup import SoupStrategy
 from stock_analyzer.time_semantics import apply_time_invariants_to_frame
 from stock_analyzer.types import PipelineReport, PipelineSignal, ScoredSignal
 from stock_analyzer.week6.engines import MainForceTracker
+
+_PIPELINE_INTRADAY_PREFETCH: ContextVar[
+    dict[tuple[str, str], tuple[int, pd.DataFrame, str]] | None
+] = ContextVar("pipeline_intraday_prefetch", default=None)
 
 
 class SymbolStageTiming(TypedDict):
@@ -251,6 +261,33 @@ class AnalyzerPipeline:
         )
 
     def run_once(
+        self,
+        symbols: list[str],
+        strategy: str = "trend",
+        current_equity: float = 1.0,
+        on_symbol_progress: Callable[[str, int, int, bool], None] | None = None,
+        transform_max_workers: int = 1,
+        capture_post_scan_enrichment: bool = False,
+    ) -> PipelineReport:
+        token = _PIPELINE_INTRADAY_PREFETCH.set(
+            self._prefetch_intraday_summaries(
+                symbols=symbols,
+                lookback_days=self._signal_analysis_lookback_days + 5,
+            )
+        )
+        try:
+            return self._run_once_prefetched(
+                symbols=symbols,
+                strategy=strategy,
+                current_equity=current_equity,
+                on_symbol_progress=on_symbol_progress,
+                transform_max_workers=transform_max_workers,
+                capture_post_scan_enrichment=capture_post_scan_enrichment,
+            )
+        finally:
+            _PIPELINE_INTRADAY_PREFETCH.reset(token)
+
+    def _run_once_prefetched(
         self,
         symbols: list[str],
         strategy: str = "trend",
@@ -495,10 +532,20 @@ class AnalyzerPipeline:
             self._news_preview_cache[cache_key] = (now_perf, deepcopy(payload))
             return payload
         analysis_bars = self._clip_signal_analysis_bars(bars)
-        intraday_1m, intraday_5m = self._fetch_intraday_summaries(
-            symbol=normalized_symbol,
-            lookback_days=max(120, len(analysis_bars) + 5),
-        )
+        try:
+            intraday_1m, intraday_5m = self._fetch_intraday_summaries(
+                symbol=normalized_symbol,
+                lookback_days=max(120, len(analysis_bars) + 5),
+            )
+        except RequiredIntradayDataError as exc:
+            return {
+                **fallback_payload,
+                "status": "required_intraday_data_unavailable",
+                "reasons": [
+                    "required_intraday_data_unavailable",
+                    f"required_intraday_data:{exc}",
+                ],
+            }
         market_index = self._maybe_build_market_index(analysis_bars)
         features = self._feature_engineer.transform(
             analysis_bars,
@@ -561,6 +608,31 @@ class AnalyzerPipeline:
         symbols: list[str],
         strategy: str = "trend",
     ) -> dict[str, object]:
+        if not symbols:
+            return self._preview_news_components_prefetched(
+                symbols=symbols,
+                strategy=strategy,
+            )
+        token = _PIPELINE_INTRADAY_PREFETCH.set(
+            self._prefetch_intraday_summaries(
+                symbols=symbols,
+                lookback_days=self._signal_analysis_lookback_days + 5,
+            )
+        )
+        try:
+            return self._preview_news_components_prefetched(
+                symbols=symbols,
+                strategy=strategy,
+            )
+        finally:
+            _PIPELINE_INTRADAY_PREFETCH.reset(token)
+
+    def _preview_news_components_prefetched(
+        self,
+        symbols: list[str],
+        strategy: str = "trend",
+    ) -> dict[str, object]:
+
         normalized_strategy = strategy.strip().lower() or "trend"
         if not symbols:
             return {
@@ -642,6 +714,54 @@ class AnalyzerPipeline:
         self._predictor, self._predictor_status = _load_predictor(path)
         return self._predictor is not None
 
+    def _prefetch_intraday_summaries(
+        self,
+        *,
+        symbols: list[str],
+        lookback_days: int,
+    ) -> dict[tuple[str, str], tuple[int, pd.DataFrame, str]]:
+        normalized_symbols = list(
+            dict.fromkeys(str(symbol).strip() for symbol in symbols if str(symbol).strip())
+        )
+        limit = max(1, int(lookback_days))
+        prefetched: dict[tuple[str, str], tuple[int, pd.DataFrame, str]] = {}
+        for interval in ("1m", "5m"):
+            missing_symbols: set[str] = set()
+            missing_reason = ""
+            try:
+                frames = fetch_intraday_summaries_compat(
+                    self._provider,
+                    symbols=normalized_symbols,
+                    interval=interval,
+                    lookback_days=limit,
+                )
+            except RequiredIntradayDataError as exc:
+                if not exc.missing_symbols or not exc.partial_frames:
+                    raise
+                frames = exc.partial_frames
+                missing_symbols = set(exc.missing_symbols)
+                missing_reason = str(exc)
+            except Exception:
+                continue
+            for symbol in normalized_symbols:
+                frame = frames.get(symbol, pd.DataFrame())
+                if symbol in missing_symbols:
+                    prefetched[(symbol, interval)] = (
+                        limit,
+                        pd.DataFrame(),
+                        missing_reason,
+                    )
+                    continue
+                if not isinstance(frame, pd.DataFrame) or frame.empty:
+                    prefetched[(symbol, interval)] = (limit, pd.DataFrame(), "")
+                    continue
+                normalized = frame.copy()
+                if not isinstance(normalized.index, pd.DatetimeIndex):
+                    normalized.index = pd.to_datetime(normalized.index, errors="coerce")
+                normalized = normalized[normalized.index.notna()].sort_index()
+                prefetched[(symbol, interval)] = (limit, normalized.tail(limit), "")
+        return prefetched
+
     def _fetch_intraday_summaries(
         self,
         *,
@@ -664,14 +784,12 @@ class AnalyzerPipeline:
     def _maybe_build_market_index(self, bars: pd.DataFrame) -> pd.DataFrame | None:
         if not bool(self._config.market_relative_feature.enabled):
             return None
-        return cast(
-            pd.DataFrame,
-            build_market_relative_frame(
-                self._provider,
-                bars=bars,
-                config=self._config.market_relative_feature,
-            ),
+        market_index: pd.DataFrame | None = build_market_relative_frame(
+            self._provider,
+            bars=bars,
+            config=self._config.market_relative_feature,
         )
+        return market_index
 
     def _active_champion_auc(self) -> float | None:
         if self._model_registry is None:
@@ -691,15 +809,26 @@ class AnalyzerPipeline:
         interval: str,
         lookback_days: int,
     ) -> pd.DataFrame:
+        limit = max(1, int(lookback_days))
+        interval_key = interval.strip().lower()
+        normalized_symbol = symbol.strip()
+        prefetched = _PIPELINE_INTRADAY_PREFETCH.get() or {}
+        cached = prefetched.get((normalized_symbol, interval_key))
+        if cached is not None and cached[0] >= limit:
+            if cached[2]:
+                raise RequiredIntradayDataError(
+                    cached[2],
+                    missing_symbols=[normalized_symbol],
+                )
+            return cached[1].tail(limit).copy()
         try:
-            frame = cast(
-                pd.DataFrame,
-                self._provider.fetch_intraday_summary(
-                    symbol=symbol,
-                    interval=interval,
-                    lookback_days=max(1, int(lookback_days)),
-                ),
+            frame: pd.DataFrame = self._provider.fetch_intraday_summary(
+                symbol=symbol,
+                interval=interval_key,
+                lookback_days=limit,
             )
+        except RequiredIntradayDataError:
+            raise
         except Exception:
             return pd.DataFrame()
         if frame.empty:
@@ -730,16 +859,12 @@ class AnalyzerPipeline:
         股票。完整 _process_symbol 不做并发（共享可变状态）。
         """
         total = len(symbols)
-        prepared: list[
-            tuple[str, PipelineSignal | None, SymbolTransformInputs | None, float]
-        ] = []
+        prepared: list[tuple[str, PipelineSignal | None, SymbolTransformInputs | None, float]] = []
         for symbol in symbols:
             if on_symbol_progress is not None:
                 on_symbol_progress(symbol, len(prepared), total, True)
             prepare_started = perf_counter()
-            fail_signal, inputs = self._prepare_symbol_inputs(
-                symbol, strategy, current_equity
-            )
+            fail_signal, inputs = self._prepare_symbol_inputs(symbol, strategy, current_equity)
             prepared.append(
                 (
                     symbol,
@@ -761,8 +886,7 @@ class AnalyzerPipeline:
         features_by_symbol: dict[str, pd.DataFrame] = {}
         transform_ms_by_symbol: dict[str, float] = {}
         prepare_feature_ms = sum(
-            float(inputs["feature_prepare_ms"])
-            for _, inputs in need_transform
+            float(inputs["feature_prepare_ms"]) for _, inputs in need_transform
         )
         transform_wall_started = perf_counter()
         futures: dict[Future[SymbolTransformResult], str] = {}
@@ -798,19 +922,20 @@ class AnalyzerPipeline:
                         # 单 worker 业务异常：为空特征帧，其他股票继续。
                         features_by_symbol[symbol] = pd.DataFrame()
                         transform_ms_by_symbol[symbol] = 0.0
-                        self._last_parallel_transform["fallback_count"] = _as_int(
-                            self._last_parallel_transform["fallback_count"],
-                            default=0,
-                        ) + 1
+                        self._last_parallel_transform["fallback_count"] = (
+                            _as_int(
+                                self._last_parallel_transform["fallback_count"],
+                                default=0,
+                            )
+                            + 1
+                        )
                         continue
                     features_by_symbol[symbol] = result["features"]
                     transform_ms = float(result["transform_ms"])
                     transform_ms_by_symbol[symbol] = transform_ms
                     worker_transform_ms += transform_ms
                     worker_pids.add(int(result["worker_pid"]))
-                    worker_intervals.append(
-                        (int(result["started_ns"]), int(result["finished_ns"]))
-                    )
+                    worker_intervals.append((int(result["started_ns"]), int(result["finished_ns"])))
             finally:
                 if pool_fallback:
                     for future in futures:
@@ -843,21 +968,15 @@ class AnalyzerPipeline:
                     )
                 except Exception:
                     features_by_symbol[symbol] = pd.DataFrame()
-                transform_ms_by_symbol[symbol] = (
-                    perf_counter() - serial_started
-                ) * 1000.0
+                transform_ms_by_symbol[symbol] = (perf_counter() - serial_started) * 1000.0
 
         transform_wall_ms = (perf_counter() - transform_wall_started) * 1000.0
         if need_transform:
             # 并行计时使用准备阶段总耗时 + transform 阶段墙钟耗时，
             # 不把多个重叠 future 的等待时间重复累加。
-            self._stage_ms_accum["feature_engine_ms"] += (
-                prepare_feature_ms + transform_wall_ms
-            )
+            self._stage_ms_accum["feature_engine_ms"] += prepare_feature_ms + transform_wall_ms
         self._last_parallel_transform["wall_ms"] = int(transform_wall_ms)
-        self._last_parallel_transform["worker_transform_ms"] = int(
-            worker_transform_ms
-        )
+        self._last_parallel_transform["worker_transform_ms"] = int(worker_transform_ms)
         self._last_parallel_transform["worker_pids"] = sorted(worker_pids)
         self._last_parallel_transform["worker_count"] = len(worker_pids)
         overlap_events = [
@@ -891,9 +1010,7 @@ class AnalyzerPipeline:
                 {
                     "symbol": symbol,
                     "duration_ms": int(
-                        prepare_ms
-                        + transform_ms_by_symbol.get(symbol, 0.0)
-                        + finalize_ms
+                        prepare_ms + transform_ms_by_symbol.get(symbol, 0.0) + finalize_ms
                     ),
                 }
             )
@@ -1029,10 +1146,36 @@ class AnalyzerPipeline:
 
         feature_prepare_started = perf_counter()
         intraday_started = perf_counter()
-        intraday_1m, intraday_5m = self._fetch_intraday_summaries(
-            symbol=symbol,
-            lookback_days=max(120, len(analysis_bars) + 5),
-        )
+        try:
+            intraday_1m, intraday_5m = self._fetch_intraday_summaries(
+                symbol=symbol,
+                lookback_days=max(120, len(analysis_bars) + 5),
+            )
+        except RequiredIntradayDataError as exc:
+            self._stage_ms_accum["intraday_ms"] += (perf_counter() - intraday_started) * 1000.0
+            return (
+                PipelineSignal(
+                    symbol=symbol,
+                    strategy=strategy,
+                    score=0.0,
+                    grade="C",
+                    action="hold",
+                    target_position=0.0,
+                    probabilities={"lgbm": 0.0, "xgb": 0.0, "meta": 0.0},
+                    reasons=[
+                        "required_intraday_data_unavailable",
+                        f"required_intraday_data:{exc}",
+                    ],
+                    decision_trace={
+                        "intraday_gate": {
+                            "passed": False,
+                            "code": "required_intraday_data_unavailable",
+                            "detail": str(exc),
+                        }
+                    },
+                ),
+                None,
+            )
         self._stage_ms_accum["intraday_ms"] += (perf_counter() - intraday_started) * 1000.0
         market_context_started = perf_counter()
         market_index = self._maybe_build_market_index(analysis_bars)
@@ -1064,20 +1207,18 @@ class AnalyzerPipeline:
         """特征 transform 串行路径；计时含准备阶段和 transform。"""
         started = perf_counter()
         try:
-            return cast(
-                pd.DataFrame,
-                self._feature_engineer.transform(
-                    inputs["analysis_bars"],
-                    intraday_1m=inputs["intraday_1m"],
-                    intraday_5m=inputs["intraday_5m"],
-                    market_index=inputs["market_index"],
-                ),
+            features: pd.DataFrame = self._feature_engineer.transform(
+                inputs["analysis_bars"],
+                intraday_1m=inputs["intraday_1m"],
+                intraday_5m=inputs["intraday_5m"],
+                market_index=inputs["market_index"],
             )
+            return features
         finally:
             self._stage_ms_accum["feature_engine_ms"] += (
-                float(inputs["feature_prepare_ms"])
-                + (perf_counter() - started) * 1000.0
+                float(inputs["feature_prepare_ms"]) + (perf_counter() - started) * 1000.0
             )
+
     def _finalize_symbol_signal(
         self,
         symbol: str,

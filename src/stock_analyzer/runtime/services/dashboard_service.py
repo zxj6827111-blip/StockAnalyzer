@@ -9,6 +9,8 @@ from pathlib import Path
 from time import monotonic
 from typing import Any, cast
 
+from stock_analyzer.data.provider import RequiredIntradayDataError
+
 _TRAINING_OVERVIEW_CACHE_TTL_SEC = 15.0
 
 
@@ -69,15 +71,32 @@ class RuntimeDashboardService:
         evolution_m8_latest = service._build_dashboard_evolution_m8_latest()
         evolution_m10_latest = service._build_dashboard_evolution_m10_latest()
         evolution_m11_latest = service._build_dashboard_evolution_m11_latest()
-        news_watchlist_preview = service.preview_news_watchlist(
-            strategy="trend",
-            limit=10,
-            record_audit=False,
-        )
+        partial_errors: list[dict[str, object]] = []
+        try:
+            news_watchlist_preview = service.preview_news_watchlist(
+                strategy="trend",
+                limit=10,
+                record_audit=False,
+            )
+        except RequiredIntradayDataError as exc:
+            news_watchlist_preview = {
+                "status": "unavailable",
+                "reason": "required_intraday_data_unavailable",
+                "items": [],
+            }
+            partial_errors.append(
+                {
+                    "component": "news_watchlist_preview",
+                    "code": "required_intraday_data_unavailable",
+                    "detail": str(exc),
+                }
+            )
         recommendation_panel = service.recommendation_lifecycle(limit=300)
         holding_alerts = service.holding_alerts(now=now)
         execution_bias = service.execution_bias_report(days=min(30, capped_days * 3), limit=60)
         return {
+            "partial": bool(partial_errors),
+            "errors": partial_errors,
             "summary": {
                 "days": capped_days,
                 "open_positions": len(positions),

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import zlib
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Protocol
+from typing import Protocol, cast
 
 import numpy as np
 import pandas as pd
@@ -13,6 +14,29 @@ import pandas as pd
 
 class DataSourceError(RuntimeError):
     """Raised when market data cannot be fetched."""
+
+
+class RequiredIntradayDataError(DataSourceError):
+    """Raised when required pre-aggregated intraday data is unavailable."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        missing_symbols: Collection[str] | None = None,
+        partial_frames: dict[str, pd.DataFrame] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.missing_symbols = tuple(
+            sorted(
+                {str(symbol).strip() for symbol in (missing_symbols or ()) if str(symbol).strip()}
+            )
+        )
+        self.partial_frames = {
+            str(symbol).strip(): frame.copy()
+            for symbol, frame in (partial_frames or {}).items()
+            if str(symbol).strip() and isinstance(frame, pd.DataFrame)
+        }
 
 
 class MarketDataProvider(Protocol):
@@ -34,6 +58,41 @@ class MarketDataProvider(Protocol):
         lookback_days: int = 120,
     ) -> pd.DataFrame:
         """Return daily intraday summary factors indexed by trading date."""
+
+    def fetch_intraday_summaries(
+        self,
+        symbols: list[str],
+        interval: str,
+        lookback_days: int = 120,
+    ) -> dict[str, pd.DataFrame]:
+        """Return summaries for a symbol batch using one backend query."""
+
+
+def fetch_intraday_summaries_compat(
+    provider: MarketDataProvider,
+    *,
+    symbols: list[str],
+    interval: str,
+    lookback_days: int = 120,
+) -> dict[str, pd.DataFrame]:
+    """Use the provider batch API when available, otherwise preserve legacy behavior."""
+    batch_method = getattr(provider, "fetch_intraday_summaries", None)
+    if callable(batch_method):
+        payload = batch_method(
+            symbols=symbols,
+            interval=interval,
+            lookback_days=lookback_days,
+        )
+        if isinstance(payload, dict):
+            return cast(dict[str, pd.DataFrame], payload)
+    return {
+        symbol: provider.fetch_intraday_summary(
+            symbol=symbol,
+            interval=interval,
+            lookback_days=lookback_days,
+        )
+        for symbol in symbols
+    }
 
 
 @dataclass(slots=True)
@@ -106,6 +165,15 @@ class SyntheticProvider:
     ) -> pd.DataFrame:
         _ = symbol, interval, lookback_days
         return pd.DataFrame()
+
+    def fetch_intraday_summaries(
+        self,
+        symbols: list[str],
+        interval: str,
+        lookback_days: int = 120,
+    ) -> dict[str, pd.DataFrame]:
+        _ = interval, lookback_days
+        return {str(symbol): pd.DataFrame() for symbol in symbols}
 
 
 def _stable_synthetic_seed(*, symbol: str, seed_offset: int) -> int:

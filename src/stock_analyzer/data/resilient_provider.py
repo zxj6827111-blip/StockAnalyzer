@@ -8,7 +8,12 @@ from datetime import date
 import pandas as pd
 
 from stock_analyzer.config import DataSourceConfig
-from stock_analyzer.data.provider import DataSourceError, MarketDataProvider
+from stock_analyzer.data.provider import (
+    DataSourceError,
+    MarketDataProvider,
+    RequiredIntradayDataError,
+    fetch_intraday_summaries_compat,
+)
 
 
 @dataclass(slots=True)
@@ -30,7 +35,8 @@ class ResilientProvider:
         end_date: date | None = None,
     ) -> pd.DataFrame:
         try:
-            frame = self.primary.fetch_daily_bars(
+            frame = _fetch_daily_bars_compat(
+                provider=self.primary,
                 symbol=symbol,
                 lookback_days=lookback_days,
                 end_date=end_date,
@@ -43,7 +49,8 @@ class ResilientProvider:
 
             if self.config.enable_cache_fallback and self.backup is not None:
                 try:
-                    return self.backup.fetch_daily_bars(
+                    return _fetch_daily_bars_compat(
+                        provider=self.backup,
                         symbol=symbol,
                         lookback_days=lookback_days,
                         end_date=end_date,
@@ -72,6 +79,8 @@ class ResilientProvider:
                 interval=interval,
                 lookback_days=lookback_days,
             )
+        except RequiredIntradayDataError:
+            raise
         except Exception as exc:
             self.consecutive_failures += 1
             self.last_error = str(exc)
@@ -85,6 +94,8 @@ class ResilientProvider:
                         interval=interval,
                         lookback_days=lookback_days,
                     )
+                except RequiredIntradayDataError:
+                    raise
                 except Exception as backup_exc:
                     raise DataSourceError(
                         f"primary failed ({exc}) and backup failed ({backup_exc})"
@@ -96,6 +107,46 @@ class ResilientProvider:
         self.degraded_mode = False
         self.last_error = ""
         return frame
+
+    def fetch_intraday_summaries(
+        self,
+        symbols: list[str],
+        interval: str,
+        lookback_days: int = 120,
+    ) -> dict[str, pd.DataFrame]:
+        try:
+            frames = fetch_intraday_summaries_compat(
+                self.primary,
+                symbols=symbols,
+                interval=interval,
+                lookback_days=lookback_days,
+            )
+        except RequiredIntradayDataError:
+            raise
+        except Exception as exc:
+            self.consecutive_failures += 1
+            self.last_error = str(exc)
+            if self.consecutive_failures >= self.config.switch_after_failures:
+                self.degraded_mode = True
+            if self.config.enable_cache_fallback and self.backup is not None:
+                try:
+                    return fetch_intraday_summaries_compat(
+                        self.backup,
+                        symbols=symbols,
+                        interval=interval,
+                        lookback_days=lookback_days,
+                    )
+                except RequiredIntradayDataError:
+                    raise
+                except Exception as backup_exc:
+                    raise DataSourceError(
+                        f"primary batch failed ({exc}) and backup failed ({backup_exc})"
+                    ) from backup_exc
+            raise DataSourceError(f"primary batch failed: {exc}") from exc
+        self.consecutive_failures = 0
+        self.degraded_mode = False
+        self.last_error = ""
+        return frames
 
     def status(self) -> dict[str, object]:
         return {
@@ -120,3 +171,24 @@ class ResilientProvider:
             return None
         result = primary(symbols=symbols)
         return result if isinstance(result, dict) else None
+
+
+def _fetch_daily_bars_compat(
+    *,
+    provider: MarketDataProvider,
+    symbol: str,
+    lookback_days: int,
+    end_date: date | None,
+) -> pd.DataFrame:
+    if end_date is None:
+        return provider.fetch_daily_bars(symbol=symbol, lookback_days=lookback_days)
+    try:
+        return provider.fetch_daily_bars(
+            symbol=symbol,
+            lookback_days=lookback_days,
+            end_date=end_date,
+        )
+    except TypeError as exc:
+        if "end_date" not in str(exc):
+            raise
+        return provider.fetch_daily_bars(symbol=symbol, lookback_days=lookback_days)

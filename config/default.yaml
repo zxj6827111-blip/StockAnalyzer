@@ -26,6 +26,13 @@ data_source:
   vendor_zip_minute_volume_multiplier: 100.0
   vendor_zip_minute_amount_multiplier: 1.0
   vendor_zip_intraday_enabled: true
+  intraday_runtime_mode: "zip_legacy"
+  intraday_summary_path: ""
+  intraday_zip_fallback_enabled: true
+  intraday_max_staleness_trading_days: 0
+  intraday_query_timeout_sec: 5
+  intraday_max_concurrency: 2
+  intraday_cache_ttl_sec: 30
   vendor_zip_memory_cache_symbols: 32
   # 批量读取时 delta 相对 ZIP 索引整体滞后的最大天数；超过则整批回退 ZIP 全量。
   vendor_zip_delta_max_staleness_days: 3
@@ -613,6 +620,22 @@ scheduler:
   leader_lock_enabled: true
   leader_lock_stale_after_sec: 300
   leader_lock_path: "artifacts/runtime/scheduler_leader.lock"
+  job_lock_enabled: true
+  job_lock_stale_after_sec: 300
+  job_lock_dir: "artifacts/runtime/scheduler_job_locks"
+  process_terminate_grace_sec: 10
+  critical_max_concurrency: 2
+  heavy_max_concurrency: 1
+  default_critical_timeout_sec: 900
+  default_heavy_timeout_sec: 10800
+  job_timeout_sec:
+    premarket_scan: 900
+    auction_report: 300
+    midday_news_brief: 600
+    close_reconcile: 900
+    week5: 1800
+    week4_acceptance: 1800
+    evolution: 10800
 
 labels:
   primary: "soup_10d_tp8_before_sl5"

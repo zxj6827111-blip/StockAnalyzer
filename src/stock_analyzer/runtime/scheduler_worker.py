@@ -21,6 +21,12 @@ from stock_analyzer.runtime.service import StockAnalyzerService
 
 
 def main() -> None:
+    group = os.getenv("SCHEDULER_GROUP", "").strip().lower()
+    if group in {"critical", "heavy"}:
+        from stock_analyzer.runtime.scheduler_supervisor import run_supervisor
+
+        run_supervisor(group)
+        return
     interval_sec = _poll_interval()
     service: StockAnalyzerService | None = None
     consecutive_failures = 0

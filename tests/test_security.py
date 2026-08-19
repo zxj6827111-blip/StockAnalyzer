@@ -506,9 +506,9 @@ def test_docker_compose_advisory_override_enforces_research_safety() -> None:
     """Advisory override should keep rebuilt NAS containers in research-only mode."""
     compose_path = Path(__file__).resolve().parents[1] / "docker-compose.advisory.yml"
     content = compose_path.read_text(encoding="utf-8")
-    assert content.count('SA__APP__ADVISORY_ONLY: "true"') == 2
-    assert content.count('SA__TRAINING__ENABLED: "false"') == 2
-    assert content.count('SA__AUTO_PROMOTION__ENABLED: "false"') == 2
+    assert content.count('SA__APP__ADVISORY_ONLY: "true"') == 3
+    assert content.count('SA__TRAINING__ENABLED: "false"') == 3
+    assert content.count('SA__AUTO_PROMOTION__ENABLED: "false"') == 3
 
 
 def test_docker_build_commit_identity_is_build_time_and_exposed_to_health() -> None:
@@ -520,10 +520,10 @@ def test_docker_build_commit_identity_is_build_time_and_exposed_to_health() -> N
     assert "LABEL org.opencontainers.image.revision=${STOCK_ANALYZER_BUILD_COMMIT}" in dockerfile
     assert "ENV STOCK_ANALYZER_BUILD_COMMIT=${STOCK_ANALYZER_BUILD_COMMIT}" in dockerfile
     assert "STOCK_ANALYZER_BUILD_COMMIT: ${STOCK_ANALYZER_BUILD_COMMIT:-unknown}" in compose
-    assert compose.count("SA__APP__MODE: simulation") == 2
-    assert compose.count('SA__APP__ADVISORY_ONLY: "true"') == 2
-    assert compose.count("SA__TRAINING__ENABLED: ${SA__TRAINING__ENABLED:-false}") == 2
-    assert compose.count("SA__AUTO_PROMOTION__ENABLED: ${SA__AUTO_PROMOTION__ENABLED:-false}") == 2
+    assert compose.count("SA__APP__MODE: simulation") == 3
+    assert compose.count('SA__APP__ADVISORY_ONLY: "true"') == 3
+    assert compose.count("SA__TRAINING__ENABLED: ${SA__TRAINING__ENABLED:-false}") == 3
+    assert compose.count("SA__AUTO_PROMOTION__ENABLED: ${SA__AUTO_PROMOTION__ENABLED:-false}") == 3
 
 
 # ---------------------------------------------------------------------------

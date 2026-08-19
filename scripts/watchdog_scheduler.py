@@ -41,6 +41,8 @@ DEFAULT_MAX_HEARTBEAT_AGE_SEC = 900  # 15 minutes
 DEFAULT_COOL_DOWN_SEC = 600  # 10 minutes
 DEFAULT_POLL_SEC = 300  # 5 minutes between daemon cycles
 DEFAULT_CONTAINER_SERVICE = "scheduler"
+DEFAULT_SCHEDULER_GROUP = "all"
+SCHEDULER_GROUPS = ("critical", "heavy")
 DEFAULT_MAINTENANCE_FLAG = "artifacts/runtime/SCHEDULER_MAINTENANCE"
 DEFAULT_LOG_PATH = "logs/scheduler_watchdog.jsonl"
 DEFAULT_STATE_PATH = "logs/scheduler_watchdog_state.json"
@@ -329,8 +331,12 @@ def recreate_service(
     Falls back to ``docker start`` when compose itself is unavailable but the
     container exists. Returns (recovered, detail).
     """
+    compose_command = [compose_bin]
+    if Path(compose_bin).name.lower() in {"docker", "docker.exe"}:
+        compose_command.append("compose")
+    compose_command.extend(["up", "-d", "--no-deps", service])
     code, out, err = _run_cmd(
-        [compose_bin, "up", "-d", "--no-deps", service],
+        compose_command,
         cwd=compose_dir,
         timeout=120.0,
     )
@@ -524,6 +530,61 @@ def diagnose(
     return out
 
 
+def _path_with_group(path: str, group: str) -> str:
+    target = Path(path)
+    suffix = "".join(target.suffixes)
+    stem = target.name[: -len(suffix)] if suffix else target.name
+    return str(target.with_name(f"{stem}_{group}{suffix}"))
+
+
+def build_watch_targets(
+    *,
+    group: str,
+    service: str = "",
+    container: str = "",
+    heartbeat_path: str = "",
+    log_path: str = DEFAULT_LOG_PATH,
+    state_path: str = DEFAULT_STATE_PATH,
+    lock_path: str = DEFAULT_LOCK_PATH,
+    key_job: str = "",
+) -> list[dict[str, str]]:
+    normalized_group = group.strip().lower() or DEFAULT_SCHEDULER_GROUP
+    if normalized_group not in {"all", "legacy", *SCHEDULER_GROUPS}:
+        raise ValueError("scheduler group must be all, legacy, critical, or heavy")
+    legacy_override = any(item.strip() for item in (service, container, heartbeat_path))
+    if normalized_group == "legacy" or legacy_override:
+        return [
+            {
+                "group": "legacy",
+                "service": service.strip() or DEFAULT_CONTAINER_SERVICE,
+                "container": container.strip() or DEFAULT_CONTAINER_SERVICE,
+                "heartbeat_path": heartbeat_path.strip()
+                or "artifacts/runtime/scheduler_heartbeat.json",
+                "log_path": log_path,
+                "state_path": state_path,
+                "lock_path": lock_path,
+                "key_job": key_job,
+            }
+        ]
+
+    groups = SCHEDULER_GROUPS if normalized_group == "all" else (normalized_group,)
+    targets: list[dict[str, str]] = []
+    for item in groups:
+        targets.append(
+            {
+                "group": item,
+                "service": f"scheduler-{item}",
+                "container": f"stock-analyzer-scheduler-{item}",
+                "heartbeat_path": f"artifacts/runtime/scheduler_{item}_heartbeat.json",
+                "log_path": _path_with_group(log_path, item),
+                "state_path": _path_with_group(state_path, item),
+                "lock_path": _path_with_group(lock_path, item),
+                "key_job": key_job or ("premarket_scan" if item == "critical" else ""),
+            }
+        )
+    return targets
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="watchdog_scheduler",
@@ -556,18 +617,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory holding docker-compose.yml.",
     )
     parser.add_argument(
+        "--group",
+        choices=("all", "legacy", "critical", "heavy"),
+        default=_env_str("WATCHDOG_SCHEDULER_GROUP", DEFAULT_SCHEDULER_GROUP),
+        help="Scheduler group to watch; all checks critical and heavy independently.",
+    )
+    parser.add_argument(
         "--service",
-        default=_env_str("WATCHDOG_SERVICE", DEFAULT_CONTAINER_SERVICE),
+        default=_env_str("WATCHDOG_SERVICE", ""),
         help="Compose service name to recreate.",
     )
     parser.add_argument(
         "--container",
-        default=_env_str("WATCHDOG_CONTAINER", DEFAULT_CONTAINER_SERVICE),
+        default=_env_str("WATCHDOG_CONTAINER", ""),
         help="Docker container name (compose project prefixes usually apply).",
     )
     parser.add_argument(
         "--heartbeat-path",
-        default=_env_str("WATCHDOG_HEARTBEAT_PATH", "artifacts/runtime/scheduler_heartbeat.json"),
+        default=_env_str("WATCHDOG_HEARTBEAT_PATH", ""),
         help="Path to scheduler_heartbeat.json.",
     )
     parser.add_argument(
@@ -628,46 +695,66 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    lock = SimpleFileLock(args.lock_path, stale_after_sec=_LOCK_STALE_AFTER_SEC)
+    targets = build_watch_targets(
+        group=args.group,
+        service=args.service,
+        container=args.container,
+        heartbeat_path=args.heartbeat_path,
+        log_path=args.log_path,
+        state_path=args.state_path,
+        lock_path=args.lock_path,
+        key_job=args.key_job,
+    )
 
     if args.diagnose:
-        out = diagnose(
-            compose_dir=args.compose_dir,
-            service=args.service,
-            container=args.container,
-            heartbeat_path=args.heartbeat_path,
-            state_path=args.state_path,
-            docker_bin=args.docker_bin,
-            key_job=args.key_job,
-        )
-        print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
+        diagnostics = {
+            target["group"]: diagnose(
+                compose_dir=args.compose_dir,
+                service=target["service"],
+                container=target["container"],
+                heartbeat_path=target["heartbeat_path"],
+                state_path=target["state_path"],
+                docker_bin=args.docker_bin,
+                key_job=target["key_job"],
+            )
+            for target in targets
+        }
+        payload: object = diagnostics
+        if len(targets) == 1:
+            payload = diagnostics[targets[0]["group"]]
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
         return 0
 
     if not args.check and not args.daemon:
         args.check = True  # default to a single cycle
 
     def _cycle() -> None:
-        if not lock.acquire():
-            return
-        try:
-            run_once(
-                now=datetime.now(),
-                compose_dir=args.compose_dir,
-                service=args.service,
-                container=args.container,
-                heartbeat_path=args.heartbeat_path,
-                max_age_sec=args.max_heartbeat_age_sec,
-                cool_down_sec=args.cool_down_sec,
-                maintenance_flag=args.maintenance_flag,
-                log_path=args.log_path,
-                state=WatchdogState(args.state_path),
-                docker_bin=args.docker_bin,
-                compose_bin=args.compose_bin,
-                key_job=args.key_job,
-                key_job_max_age_sec=args.key_job_max_age_sec,
+        for target in targets:
+            lock = SimpleFileLock(
+                target["lock_path"],
+                stale_after_sec=_LOCK_STALE_AFTER_SEC,
             )
-        finally:
-            lock.release()
+            if not lock.acquire():
+                continue
+            try:
+                run_once(
+                    now=datetime.now(),
+                    compose_dir=args.compose_dir,
+                    service=target["service"],
+                    container=target["container"],
+                    heartbeat_path=target["heartbeat_path"],
+                    max_age_sec=args.max_heartbeat_age_sec,
+                    cool_down_sec=args.cool_down_sec,
+                    maintenance_flag=args.maintenance_flag,
+                    log_path=target["log_path"],
+                    state=WatchdogState(target["state_path"]),
+                    docker_bin=args.docker_bin,
+                    compose_bin=args.compose_bin,
+                    key_job=target["key_job"],
+                    key_job_max_age_sec=args.key_job_max_age_sec,
+                )
+            finally:
+                lock.release()
 
     if args.check:
         _cycle()

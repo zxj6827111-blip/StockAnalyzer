@@ -6,11 +6,20 @@ from pathlib import Path
 from typing import cast
 
 import pandas as pd
+import pytest
 
 from stock_analyzer.config import LiquidityFilterConfig, StockAnalyzerConfig, load_config
-from stock_analyzer.data.provider import DataSourceError, SyntheticProvider
+from stock_analyzer.data.provider import (
+    DataSourceError,
+    RequiredIntradayDataError,
+    SyntheticProvider,
+)
 from stock_analyzer.data.resilient_provider import ResilientProvider
-from stock_analyzer.pipeline import AnalyzerPipeline, _liquidity_check
+from stock_analyzer.pipeline import (
+    _PIPELINE_INTRADAY_PREFETCH,
+    AnalyzerPipeline,
+    _liquidity_check,
+)
 
 
 class AlwaysFailProvider:
@@ -143,6 +152,37 @@ class ToggleFailBarsProvider(MinimalBarsProvider):
         if self.fail:
             raise DataSourceError("forced intraday failure")
         return pd.DataFrame()
+
+
+class PartialRequiredIntradayProvider(MinimalBarsProvider):
+    def __init__(self, missing_symbol: str = "000001") -> None:
+        self.missing_symbol = missing_symbol
+
+    def fetch_intraday_summaries(
+        self,
+        symbols: list[str],
+        interval: str,
+        lookback_days: int = 120,
+    ) -> dict[str, pd.DataFrame]:
+        dates = pd.bdate_range(end=datetime.now().date(), periods=min(lookback_days, 5))
+        frames = {
+            symbol: pd.DataFrame(
+                {
+                    f"{interval}_open_ret": 0.01,
+                    f"{interval}_close_ret": 0.02,
+                },
+                index=dates,
+            )
+            for symbol in symbols
+            if symbol != self.missing_symbol
+        }
+        if self.missing_symbol in symbols:
+            raise RequiredIntradayDataError(
+                f"required summary missing: {self.missing_symbol}:{interval}",
+                missing_symbols=[self.missing_symbol],
+                partial_frames=frames,
+            )
+        return frames
 
 
 class ConstantNewsProvider:
@@ -355,14 +395,22 @@ def test_pipeline_penalizes_trend_instead_of_blocking_under_score_penalty_mode()
     penalized_config.financial_filter.trend_mode = "score_penalty"
     penalized_config.financial_filter.trend_penalty = 6.0
 
-    baseline_signal = AnalyzerPipeline(
-        config=base_config,
-        provider=WeakFundamentalsBarsProvider(),
-    ).run_once(symbols=["600000"], strategy="trend", current_equity=1.0).signals[0]
-    penalized_signal = AnalyzerPipeline(
-        config=penalized_config,
-        provider=WeakFundamentalsBarsProvider(),
-    ).run_once(symbols=["600000"], strategy="trend", current_equity=1.0).signals[0]
+    baseline_signal = (
+        AnalyzerPipeline(
+            config=base_config,
+            provider=WeakFundamentalsBarsProvider(),
+        )
+        .run_once(symbols=["600000"], strategy="trend", current_equity=1.0)
+        .signals[0]
+    )
+    penalized_signal = (
+        AnalyzerPipeline(
+            config=penalized_config,
+            provider=WeakFundamentalsBarsProvider(),
+        )
+        .run_once(symbols=["600000"], strategy="trend", current_equity=1.0)
+        .signals[0]
+    )
 
     assert penalized_signal.action == "buy"
     assert penalized_signal.score < baseline_signal.score
@@ -450,9 +498,7 @@ def test_pipeline_news_component_is_injected_into_score() -> None:
     high_score = high_report.signals[0].score
     low_score = low_report.signals[0].score
     assert high_score > low_score
-    assert any(
-        reason.startswith("news_component:") for reason in high_report.signals[0].reasons
-    )
+    assert any(reason.startswith("news_component:") for reason in high_report.signals[0].reasons)
 
 
 def test_pipeline_news_provider_failure_excludes_news_component() -> None:
@@ -578,6 +624,108 @@ def test_pipeline_news_preview_batch_returns_sorted_items() -> None:
     items = _as_mapping_list(payload_view["items"])
     assert items[0]["symbol"] == "600000"
     assert items[1]["symbol"] == "000001"
+
+
+def test_pipeline_required_intraday_partial_failure_only_holds_missing_symbol() -> None:
+    config = _load_default_config()
+    pipeline = AnalyzerPipeline(
+        config=config,
+        provider=PartialRequiredIntradayProvider(),
+    )
+
+    report = pipeline.run_once(
+        symbols=["600000", "000001"],
+        strategy="trend",
+        current_equity=1.0,
+    )
+
+    signals = {signal.symbol: signal for signal in report.signals}
+    assert "required_intraday_data_unavailable" in signals["000001"].reasons
+    assert "required_intraday_data_unavailable" not in signals["600000"].reasons
+
+
+def test_pipeline_news_preview_partial_failure_keeps_other_symbol_available() -> None:
+    config = _load_default_config()
+    pipeline = AnalyzerPipeline(
+        config=config,
+        provider=PartialRequiredIntradayProvider(),
+        news_provider=SymbolMappedNewsProvider({"600000": 0.8, "000001": 0.2}),
+    )
+
+    payload = _as_mapping(
+        pipeline.preview_news_components(
+            symbols=["600000", "000001"],
+            strategy="trend",
+        )
+    )
+
+    items = {str(item["symbol"]): item for item in _as_mapping_list(payload["items"])}
+    assert items["600000"]["status"] == "ok"
+    assert items["000001"]["status"] == "required_intraday_data_unavailable"
+    assert payload["ok_records"] == 1
+
+
+def test_pipeline_intraday_prefetch_context_resets_after_success() -> None:
+    pipeline = AnalyzerPipeline(
+        config=_load_default_config(),
+        provider=PartialRequiredIntradayProvider(missing_symbol=""),
+    )
+
+    _ = pipeline.run_once(symbols=["600000"], strategy="trend", current_equity=1.0)
+
+    assert _PIPELINE_INTRADAY_PREFETCH.get() is None
+
+
+def test_pipeline_intraday_prefetch_context_resets_after_run_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline = AnalyzerPipeline(
+        config=_load_default_config(),
+        provider=PartialRequiredIntradayProvider(missing_symbol=""),
+    )
+
+    def _raise_after_prefetch(**_: object) -> None:
+        raise RuntimeError("run failed after prefetch")
+
+    monkeypatch.setattr(pipeline, "_run_once_prefetched", _raise_after_prefetch)
+    with pytest.raises(RuntimeError, match="run failed after prefetch"):
+        pipeline.run_once(symbols=["600000"], strategy="trend", current_equity=1.0)
+
+    assert _PIPELINE_INTRADAY_PREFETCH.get() is None
+
+
+def test_pipeline_intraday_prefetch_context_resets_after_preview_success() -> None:
+    pipeline = AnalyzerPipeline(
+        config=_load_default_config(),
+        provider=PartialRequiredIntradayProvider(missing_symbol=""),
+        news_provider=ConstantNewsProvider(0.5),
+    )
+
+    _ = pipeline.preview_news_components(symbols=["600000"], strategy="trend")
+
+    assert _PIPELINE_INTRADAY_PREFETCH.get() is None
+
+
+def test_pipeline_intraday_prefetch_context_resets_after_preview_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline = AnalyzerPipeline(
+        config=_load_default_config(),
+        provider=PartialRequiredIntradayProvider(missing_symbol=""),
+    )
+
+    def _raise_after_prefetch(**_: object) -> None:
+        raise RuntimeError("preview failed after prefetch")
+
+    monkeypatch.setattr(
+        pipeline,
+        "_preview_news_components_prefetched",
+        _raise_after_prefetch,
+    )
+    with pytest.raises(RuntimeError, match="preview failed after prefetch"):
+        pipeline.preview_news_components(symbols=["600000"], strategy="trend")
+
+    assert _PIPELINE_INTRADAY_PREFETCH.get() is None
 
 
 def test_pipeline_news_preview_batch_returns_empty_payload() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import zipfile
 from datetime import date
 from pathlib import Path
@@ -11,7 +12,7 @@ import pytest
 
 from stock_analyzer.config import DataSourceConfig
 from stock_analyzer.data.market_warehouse import MarketWarehouse
-from stock_analyzer.data.provider import DataSourceError
+from stock_analyzer.data.provider import DataSourceError, RequiredIntradayDataError
 from stock_analyzer.data.provider_factory import build_primary_provider
 from stock_analyzer.data.vendor_zip_overlay import (
     VendorZipOverlayProvider,
@@ -420,6 +421,35 @@ def test_vendor_overlay_qfq_batch_quality_metrics_multiplies_prices(
     assert closes == pytest.approx([9.0, 9.0])
     volumes = [float(value) for value in rows["volume"]]
     assert volumes == pytest.approx([10_000.0, 20_000.0])
+
+
+def test_qfq_factor_batch_opens_archive_once_and_populates_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    index_path = _build_multi_year_daily_fixture(tmp_path)
+    _write_factors_zip(
+        tmp_path,
+        {
+            "2025/600000.SH.csv": "code,trade_date,factor\n600000.SH,20251231,1.0\n",
+            "2025/000001.SZ.csv": "code,trade_date,factor\n000001.SZ,20251231,1.0\n",
+        },
+    )
+    provider = _qfq_provider(tmp_path, index_path)
+    opened: list[str] = []
+    real_zipfile = zipfile.ZipFile
+
+    class CountingZipFile(real_zipfile):  # type: ignore[misc, valid-type]
+        def __init__(self, file: object, *args: object, **kwargs: object) -> None:
+            opened.append(str(file))
+            super().__init__(file, *args, **kwargs)
+
+    monkeypatch.setattr(zipfile, "ZipFile", CountingZipFile)
+    provider._load_price_factors_batch(["600000", "000001"])  # noqa: SLF001
+
+    assert sorted(provider._factor_cache) == ["000001", "600000"]  # noqa: SLF001
+    provider._load_price_factors("600000")  # noqa: SLF001
+    assert len(opened) == 1
 
 
 def test_runtime_universe_comes_from_provider_index(tmp_path: Path) -> None:
@@ -1383,3 +1413,56 @@ def test_probe_enforce_read_only_flips_overlay_delta_access(
     assert provider.delta_access_mode == "read_only"
     assert provider._warehouse is not None
     assert provider._warehouse.read_only is True
+
+
+def test_required_intraday_backend_errors_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    index_path = _build_daily_fixture(tmp_path)
+    summary_path = tmp_path / "intraday" / "summary.duckdb"
+    summary_warehouse = MarketWarehouse(
+        db_path=summary_path,
+        package_root=summary_path.parent / "package",
+        package_writes_enabled=False,
+    )
+    summary_warehouse.ensure_schema()
+    Path(str(summary_path) + ".manifest.json").write_text(
+        json.dumps(
+            {
+                "generation": "2026-08-19T00:00:00+00:00",
+                "coverage": {"1m": {"max_date": "2025-12-31"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    provider = VendorZipOverlayProvider(
+        data_root=str(tmp_path),
+        index_path=str(index_path),
+        delta_db_path=str(tmp_path / "delta" / "market_delta.duckdb"),
+        delta_package_root=str(tmp_path / "delta" / "package"),
+        delta_access_mode="disabled",
+        intraday_runtime_mode="duckdb_required",
+        intraday_summary_path=str(summary_path),
+        intraday_zip_fallback_enabled=True,
+    )
+    provider._intraday_manifest = {
+        "coverage": {"1m": {"max_date": "2025-12-31"}}
+    }
+
+    class _BrokenWarehouse:
+        def fetch_intraday_summaries(
+            self,
+            *args: object,
+            **kwargs: object,
+        ) -> dict[str, pd.DataFrame]:
+            _ = args, kwargs
+            raise OSError("corrupt duckdb")
+
+    provider._intraday_warehouse = cast(Any, _BrokenWarehouse())
+    with pytest.raises(RequiredIntradayDataError, match="required intraday summary query failed"):
+        provider.fetch_intraday_summary("600000", "1m", lookback_days=5)
+
+    provider._intraday_warehouse = None
+    with pytest.raises(RequiredIntradayDataError, match="database is unavailable"):
+        provider.fetch_intraday_summary("600000", "1m", lookback_days=5)

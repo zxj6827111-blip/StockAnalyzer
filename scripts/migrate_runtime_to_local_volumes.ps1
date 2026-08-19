@@ -77,7 +77,7 @@ function Copy-DirectoryToVolume {
 }
 
 Write-Host "Stopping api/scheduler containers before migration..."
-Invoke-Compose stop api scheduler
+Invoke-Compose stop api scheduler-critical scheduler-heavy
 
 Write-Host "Preparing runtime volumes..."
 Reset-Volume -VolumeName $runtimeArtifactsVolume
@@ -94,7 +94,7 @@ $upArgs = @("up", "-d")
 if (-not $SkipBuild) {
     $upArgs += "--build"
 }
-$upArgs += @("api", "scheduler")
+$upArgs += @("api", "scheduler-critical", "scheduler-heavy")
 Invoke-Compose @upArgs
 
 Write-Host ""
