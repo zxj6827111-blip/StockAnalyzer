@@ -480,9 +480,20 @@ mapfile -t SUMMARY_MOUNTS < <("${HOST_PYTHON}" - "${RENDERED}" <<'PY'
 import json, sys
 from pathlib import Path
 payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+volume_definitions = payload.get("volumes") or {}
 volumes = (payload.get("services", {}).get("api", {}).get("volumes") or [])
+
+def resolve_mount_source(item: dict[str, object]) -> str:
+    source = str(item.get("source") or "")
+    if item.get("type") != "volume":
+        return source
+    definition = volume_definitions.get(source)
+    if not isinstance(definition, dict):
+        return source
+    return str(definition.get("name") or source)
+
 by_target = {
-    item.get("target"): item.get("source")
+    str(item.get("target")): resolve_mount_source(item)
     for item in volumes
     if isinstance(item, dict) and item.get("target") and item.get("source")
 }
