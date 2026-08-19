@@ -69,6 +69,9 @@ def test_nas_deploy_update_builds_candidate_summary_before_runtime_recreate() ->
     script = _script()
 
     assert "build_vendor_intraday_summary.py" in script
+    assert 'volume_definitions = payload.get("volumes") or {}' in script
+    assert "def resolve_mount_source(item: dict[str, object]) -> str:" in script
+    assert 'return str(definition.get("name") or source)' in script
     assert 'SUMMARY_CANDIDATE="${SUMMARY_CURRENT}.candidate-${DEPLOY_ID}"' in script
     assert 'SUMMARY_CANDIDATE_MANIFEST="${SUMMARY_CANDIDATE}.manifest.json"' in script
     assert "promote_candidate_summary()" in script
