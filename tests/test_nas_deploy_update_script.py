@@ -53,13 +53,16 @@ def test_nas_deploy_update_health_gate_remains_fail_closed() -> None:
     assert "identity or safety validation failed" in script
 
 
-def test_nas_deploy_update_keeps_split_scheduler_start_opt_in() -> None:
+def test_nas_deploy_update_starts_split_schedulers_by_default() -> None:
     script = _script()
 
-    assert "START_SCHEDULERS=0" in script
+    assert "START_SCHEDULERS=1" in script
+    assert "--no-start-scheduler|--no-start-schedulers" in script
     assert "--start-scheduler|--start-schedulers" in script
     assert "scheduler-critical scheduler-heavy" in script
-    assert "schedulers: not started" in script
+    assert "schedulers: explicitly disabled by --no-start-schedulers" in script
+    assert "validate_scheduler_heartbeat" in script
+    assert "HEALTH_GATE_STARTED_EPOCH" in script
 
 
 def test_nas_deploy_update_builds_candidate_summary_before_runtime_recreate() -> None:

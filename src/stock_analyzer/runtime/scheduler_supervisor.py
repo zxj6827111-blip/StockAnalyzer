@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -29,6 +30,18 @@ CRITICAL_JOBS = frozenset(
     }
 )
 _VALID_GROUPS = frozenset({"critical", "heavy"})
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def _signal_process_group(pid: int, sig: int) -> None:
+    getpgid = getattr(os, "getpgid", None)
+    killpg = getattr(os, "killpg", None)
+    if not callable(getpgid) or not callable(killpg):
+        raise OSError("POSIX process-group signaling is unavailable")
+    killpg(getpgid(pid), sig)
 
 
 def scheduler_group_for_job(job: str) -> str:
@@ -205,12 +218,20 @@ class SchedulerSupervisor:
             str(result_path),
         ]
         try:
-            process = self.process_factory(
-                command,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                env=os.environ.copy(),
-            )
+            process_kwargs: dict[str, object] = {
+                "stdout": log_handle,
+                "stderr": subprocess.STDOUT,
+                "env": os.environ.copy(),
+            }
+            if _is_windows():
+                process_kwargs["creationflags"] = getattr(
+                    subprocess,
+                    "CREATE_NEW_PROCESS_GROUP",
+                    0,
+                )
+            else:
+                process_kwargs["start_new_session"] = True
+            process = self.process_factory(command, **process_kwargs)
         except Exception as exc:
             log_handle.close()
             self._record_launch_failure(job=job, run_id=run_id, now=now, detail=str(exc))
@@ -288,12 +309,37 @@ class SchedulerSupervisor:
     def _terminate_process(self, item: _RunningJob) -> None:
         if item.process.poll() is not None:
             return
-        item.process.terminate()
         grace = max(1, int(self.config.scheduler.process_terminate_grace_sec))
+        if _is_windows():
+            try:
+                item.process.send_signal(signal.CTRL_BREAK_EVENT)
+            except (AttributeError, OSError, ProcessLookupError, ValueError):
+                item.process.terminate()
+        else:
+            try:
+                _signal_process_group(item.process.pid, int(signal.SIGTERM))
+            except (OSError, ProcessLookupError):
+                item.process.terminate()
         try:
             item.process.wait(timeout=grace)
         except subprocess.TimeoutExpired:
-            item.process.kill()
+            if _is_windows():
+                subprocess.run(
+                    ["taskkill", "/PID", str(item.process.pid), "/T", "/F"],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                if item.process.poll() is None:
+                    item.process.kill()
+            else:
+                try:
+                    _signal_process_group(
+                        item.process.pid,
+                        int(getattr(signal, "SIGKILL", signal.SIGTERM)),
+                    )
+                except (OSError, ProcessLookupError):
+                    item.process.kill()
             item.process.wait(timeout=grace)
 
     def _complete_job(

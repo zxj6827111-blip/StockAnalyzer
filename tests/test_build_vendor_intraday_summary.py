@@ -133,3 +133,35 @@ def test_promote_restores_old_pair_when_manifest_replace_fails(
     assert json.loads(final_manifest.read_text(encoding="utf-8")) == {"generation": "old"}
     assert not Path(str(output) + ".previous").exists()
     assert not builder.manifest_path(Path(str(output) + ".previous")).exists()
+
+
+def test_build_summary_keeps_previous_output_when_freshness_gate_fails(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "vendor"
+    archive_path = source_root / "StockA_1min_vendor-now" / "2026-08.zip"
+    _write_minute_zip(archive_path, entry_name="monthly/600000_202608.csv")
+    output = tmp_path / "vendor_intraday_summary.duckdb"
+    builder.build_summary(
+        root=source_root,
+        output=output,
+        keep_days=480,
+        intervals=("1m",),
+        volume_multiplier=1.0,
+        required_latest_date="2026-08-18",
+    )
+    before_db = output.read_bytes()
+    before_manifest = builder.manifest_path(output).read_bytes()
+
+    with pytest.raises(RuntimeError, match="does not cover required latest date"):
+        builder.build_summary(
+            root=source_root,
+            output=output,
+            keep_days=480,
+            intervals=("1m",),
+            volume_multiplier=1.0,
+            required_latest_date="2026-08-19",
+        )
+
+    assert output.read_bytes() == before_db
+    assert builder.manifest_path(output).read_bytes() == before_manifest

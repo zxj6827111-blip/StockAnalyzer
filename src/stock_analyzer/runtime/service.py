@@ -455,6 +455,7 @@ class StockAnalyzerService:
             self._config.command_channel.state_persist_path
         )
         self._runtime_state_loaded_mtime_ns = 0
+        self._runtime_state_base_revision = 0
         self._runtime_history_archive_dir = self._resolve_evolution_path(
             self._config.command_channel.history_archive_dir
         )
@@ -4792,10 +4793,13 @@ class StockAnalyzerService:
         self,
         existing_raw: object,
         current_raw: dict[str, object],
+        *,
+        base_revision: int | None = None,
     ) -> dict[str, object]:
         return self._runtime_state_service._merge_runtime_state_payload(
             existing_raw,
             current_raw,
+            base_revision=base_revision,
         )
 
     def _merge_runtime_state_scheduler(

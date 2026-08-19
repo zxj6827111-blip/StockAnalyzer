@@ -1116,36 +1116,40 @@ class MarketWarehouse:
         self._validate_security_status_no_overlap(payload)
         self.ensure_schema()
         with self._connect_write() as connection:
-            for _, row in payload.iterrows():
-                status_type = str(row.get("status_type", ""))
+            registered = False
+            connection.execute("BEGIN TRANSACTION")
+            try:
+                connection.register("ss_stage", payload)
+                registered = True
+                cols = [
+                    c
+                    for c in payload.columns
+                    if c
+                    in (
+                        "symbol",
+                        "effective_from",
+                        "effective_to",
+                        "status_type",
+                        "status_value",
+                        "board",
+                        "exchange",
+                        "source",
+                        "as_of",
+                        "coverage_complete",
+                    )
+                ]
+                col_str = ", ".join(cols)
                 connection.execute(
-                    f"DELETE FROM {_SECURITY_STATUS_TABLE} "
-                    f"WHERE symbol = ? AND effective_from = ? AND status_type = ?",
-                    [normalized_symbol, row["effective_from"], status_type],
+                    f"INSERT OR REPLACE INTO {_SECURITY_STATUS_TABLE} ({col_str}) "
+                    f"SELECT {col_str} FROM ss_stage"
                 )
-            connection.register("ss_stage", payload)
-            cols = [
-                c
-                for c in payload.columns
-                if c
-                in (
-                    "symbol",
-                    "effective_from",
-                    "effective_to",
-                    "status_type",
-                    "status_value",
-                    "board",
-                    "exchange",
-                    "source",
-                    "as_of",
-                    "coverage_complete",
-                )
-            ]
-            col_str = ", ".join(cols)
-            connection.execute(
-                f"INSERT INTO {_SECURITY_STATUS_TABLE} ({col_str}) SELECT {col_str} FROM ss_stage"
-            )
-            connection.unregister("ss_stage")
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+            finally:
+                if registered:
+                    connection.unregister("ss_stage")
         return int(len(payload))
 
     def fetch_security_status(
@@ -1206,33 +1210,36 @@ class MarketWarehouse:
         self._validate_identity_mapping_no_overlap(payload)
         self.ensure_schema()
         with self._connect_write() as connection:
-            for _, row in payload.iterrows():
-                historical = str(row.get("historical_symbol", ""))
+            registered = False
+            connection.execute("BEGIN TRANSACTION")
+            try:
+                connection.register("sim_stage", payload)
+                registered = True
+                cols = [
+                    c
+                    for c in payload.columns
+                    if c
+                    in (
+                        "historical_symbol",
+                        "canonical_symbol",
+                        "effective_from",
+                        "effective_to",
+                        "source",
+                        "as_of",
+                    )
+                ]
+                col_str = ", ".join(cols)
                 connection.execute(
-                    f"DELETE FROM {_SECURITY_IDENTITY_MAPPING_TABLE} "
-                    f"WHERE historical_symbol = ? AND effective_from = ?",
-                    [historical, row["effective_from"]],
+                    f"INSERT OR REPLACE INTO {_SECURITY_IDENTITY_MAPPING_TABLE} ({col_str}) "
+                    f"SELECT {col_str} FROM sim_stage"
                 )
-            connection.register("sim_stage", payload)
-            cols = [
-                c
-                for c in payload.columns
-                if c
-                in (
-                    "historical_symbol",
-                    "canonical_symbol",
-                    "effective_from",
-                    "effective_to",
-                    "source",
-                    "as_of",
-                )
-            ]
-            col_str = ", ".join(cols)
-            connection.execute(
-                f"INSERT INTO {_SECURITY_IDENTITY_MAPPING_TABLE} ({col_str}) "
-                f"SELECT {col_str} FROM sim_stage"
-            )
-            connection.unregister("sim_stage")
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+            finally:
+                if registered:
+                    connection.unregister("sim_stage")
         return int(len(payload))
 
     def fetch_security_identity_mapping(
@@ -2481,22 +2488,32 @@ class MarketWarehouse:
         payload = payload.dropna(subset=["date"])
         self.ensure_schema()
         with self._connect_write() as connection:
-            connection.register("intraday_stage_df", payload)
-            connection.execute(
-                f"DELETE FROM {table_name} WHERE symbol = ?",
-                [normalized_symbol],
-            )
-            connection.execute(
-                f"""
-                INSERT INTO {table_name} (
-                    symbol, date, {", ".join(_INTRADAY_COLUMNS)}
+            registered = False
+            connection.execute("BEGIN TRANSACTION")
+            try:
+                connection.register("intraday_stage_df", payload)
+                registered = True
+                connection.execute(
+                    f"DELETE FROM {table_name} WHERE symbol = ?",
+                    [normalized_symbol],
                 )
-                SELECT symbol, date, {", ".join(_INTRADAY_COLUMNS)}
-                FROM intraday_stage_df
-                ORDER BY date
-                """
-            )
-            connection.unregister("intraday_stage_df")
+                connection.execute(
+                    f"""
+                    INSERT INTO {table_name} (
+                        symbol, date, {", ".join(_INTRADAY_COLUMNS)}
+                    )
+                    SELECT symbol, date, {", ".join(_INTRADAY_COLUMNS)}
+                    FROM intraday_stage_df
+                    ORDER BY date
+                    """
+                )
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+            finally:
+                if registered:
+                    connection.unregister("intraday_stage_df")
 
     def upsert_intraday_summaries(
         self,

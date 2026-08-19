@@ -600,12 +600,23 @@ class VendorZipOverlayProvider:
     ) -> dict[str, pd.DataFrame]:
         baseline: dict[str, pd.DataFrame] = {}
         if self._intraday_warehouse is not None:
-            self._ensure_intraday_summary_ready(interval)
-            baseline = self._intraday_warehouse.fetch_intraday_summaries(
-                symbols,
-                interval,
-                lookback_days=lookback_days,
-            )
+            try:
+                self._ensure_intraday_summary_ready(interval)
+                baseline = self._intraday_warehouse.fetch_intraday_summaries(
+                    symbols,
+                    interval,
+                    lookback_days=lookback_days,
+                )
+            except RequiredIntradayDataError:
+                raise
+            except Exception as exc:
+                if self.intraday_runtime_mode == "duckdb_required":
+                    raise RequiredIntradayDataError(
+                        f"required intraday summary query failed: {exc}"
+                    ) from exc
+                raise
+        elif self.intraday_runtime_mode == "duckdb_required":
+            raise RequiredIntradayDataError("required intraday summary database is unavailable")
         elif self.intraday_runtime_mode == "zip_legacy" or self.intraday_zip_fallback_enabled:
             baseline = {
                 symbol: self._load_vendor_intraday_summary(
@@ -615,24 +626,31 @@ class VendorZipOverlayProvider:
                 )
                 for symbol in symbols
             }
-        elif self.intraday_runtime_mode == "duckdb_required":
-            raise RequiredIntradayDataError("required intraday summary database is unavailable")
 
         delta: dict[str, pd.DataFrame] = {}
-        delta_warehouse = self._delta_warehouse()
-        if delta_warehouse is not None:
-            delta = delta_warehouse.fetch_intraday_summaries(
-                symbols,
-                interval,
-                lookback_days=lookback_days,
-            )
-        return {
-            symbol: _merge_overlay_frames(
-                baseline.get(symbol, pd.DataFrame()),
-                delta.get(symbol, pd.DataFrame()),
-            ).tail(lookback_days)
-            for symbol in symbols
-        }
+        try:
+            delta_warehouse = self._delta_warehouse()
+            if delta_warehouse is not None:
+                delta = delta_warehouse.fetch_intraday_summaries(
+                    symbols,
+                    interval,
+                    lookback_days=lookback_days,
+                )
+            return {
+                symbol: _merge_overlay_frames(
+                    baseline.get(symbol, pd.DataFrame()),
+                    delta.get(symbol, pd.DataFrame()),
+                ).tail(lookback_days)
+                for symbol in symbols
+            }
+        except RequiredIntradayDataError:
+            raise
+        except Exception as exc:
+            if self.intraday_runtime_mode == "duckdb_required":
+                raise RequiredIntradayDataError(
+                    f"required intraday delta or merge query failed: {exc}"
+                ) from exc
+            raise
 
     def _ensure_intraday_summary_ready(self, interval: str) -> None:
         coverage_root = self._intraday_manifest.get("coverage")

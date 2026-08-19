@@ -14,13 +14,14 @@
 #   bash scripts/nas_deploy_update.sh
 #   bash scripts/nas_deploy_update.sh --branch main
 #   bash scripts/nas_deploy_update.sh --no-recreate   # image build only
+#   bash scripts/nas_deploy_update.sh --no-start-schedulers  # emergency API-only cutover
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BRANCH="main"
 DO_RECREATE=1
 DO_PULL=1
-START_SCHEDULERS=0
+START_SCHEDULERS=1
 HEALTH_ATTEMPTS="${HEALTH_ATTEMPTS:-30}"
 HEALTH_SLEEP_SEC="${HEALTH_SLEEP_SEC:-2}"
 HOST_PYTHON="${HOST_PYTHON:-}"
@@ -42,6 +43,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --start-scheduler|--start-schedulers)
       START_SCHEDULERS=1
+      shift
+      ;;
+    --no-start-scheduler|--no-start-schedulers)
+      START_SCHEDULERS=0
       shift
       ;;
     -h|--help)
@@ -481,15 +486,15 @@ by_target = {
     for item in volumes
     if isinstance(item, dict) and item.get("target") and item.get("source")
 }
-for target in ("/data/vendor_history", "/data/intraday_summary"):
+for target in ("/data/vendor_history", "/data/intraday_summary", "/app/artifacts"):
     source = by_target.get(target)
     if not source:
         raise SystemExit(f"missing rendered mount source for {target}")
     print(source)
 PY
 )
-if [[ "${#SUMMARY_MOUNTS[@]}" -ne 2 ]]; then
-  echo "ERROR: failed to resolve vendor and intraday summary host mounts." >&2
+if [[ "${#SUMMARY_MOUNTS[@]}" -ne 3 ]]; then
+  echo "ERROR: failed to resolve vendor, intraday summary, and artifacts mounts." >&2
   if [[ -n "${PREVIOUS_IMAGE_ID}" ]]; then
     docker tag "${PREVIOUS_IMAGE_ID}" stock-analyzer:latest
   fi
@@ -497,6 +502,7 @@ if [[ "${#SUMMARY_MOUNTS[@]}" -ne 2 ]]; then
 fi
 VENDOR_HOST_ROOT="${SUMMARY_MOUNTS[0]}"
 SUMMARY_HOST_ROOT="${SUMMARY_MOUNTS[1]}"
+ARTIFACTS_MOUNT_SOURCE="${SUMMARY_MOUNTS[2]}"
 mkdir -p "${SUMMARY_HOST_ROOT}"
 SUMMARY_CURRENT="${SUMMARY_HOST_ROOT}/vendor_intraday_summary.duckdb"
 SUMMARY_CURRENT_MANIFEST="${SUMMARY_CURRENT}.manifest.json"
@@ -505,6 +511,18 @@ SUMMARY_CANDIDATE_MANIFEST="${SUMMARY_CANDIDATE}.manifest.json"
 SUMMARY_ROLLBACK="${SUMMARY_CURRENT}.rollback-${DEPLOY_ID}"
 SUMMARY_ROLLBACK_MANIFEST="${SUMMARY_ROLLBACK}.manifest.json"
 cleanup_summary_candidates
+INTRADAY_REQUIRED_LATEST_DATE="${INTRADAY_SUMMARY_REQUIRED_LATEST_DATE:-}"
+if [[ -z "${INTRADAY_REQUIRED_LATEST_DATE}" ]]; then
+  INTRADAY_REQUIRED_LATEST_DATE="$(docker run --rm \
+    -v "${ARTIFACTS_MOUNT_SOURCE}:/app/artifacts:ro" \
+    stock-analyzer:latest \
+    python -c 'import json; from pathlib import Path; p=Path("/app/artifacts/vendor_overlay/daily_index.json"); d=json.loads(p.read_text(encoding="utf-8")); dates=[str(v.get("latest_date", "")) for v in (d.get("symbols") or {}).values() if isinstance(v, dict) and str(v.get("latest_date", ""))]; print(max(dates, default=""))')"
+fi
+if [[ -z "${INTRADAY_REQUIRED_LATEST_DATE}" ]]; then
+  echo "ERROR: cannot resolve intraday summary freshness floor from daily_index.json." >&2
+  exit 1
+fi
+echo "intraday summary required latest date: ${INTRADAY_REQUIRED_LATEST_DATE}"
 if ! docker run --rm \
   -v "${VENDOR_HOST_ROOT}:/data/vendor_history:ro" \
   -v "${SUMMARY_HOST_ROOT}:/data/intraday_summary" \
@@ -512,7 +530,8 @@ if ! docker run --rm \
   python /app/scripts/build_vendor_intraday_summary.py \
     --root /data/vendor_history \
     --output "/data/intraday_summary/$(basename "${SUMMARY_CANDIDATE}")" \
-    --keep-days "${INTRADAY_SUMMARY_KEEP_DAYS:-480}"; then
+    --keep-days "${INTRADAY_SUMMARY_KEEP_DAYS:-480}" \
+    --require-latest-date "${INTRADAY_REQUIRED_LATEST_DATE}"; then
   cleanup_summary_candidates
   if [[ -n "${PREVIOUS_IMAGE_ID}" ]]; then
     docker tag "${PREVIOUS_IMAGE_ID}" stock-analyzer:latest
@@ -538,7 +557,8 @@ if ! promote_candidate_summary; then
   exit 1
 fi
 
-echo "[6/6] recreate api; split schedulers require explicit --start-schedulers"
+echo "[6/6] recreate api and split schedulers"
+HEALTH_GATE_STARTED_EPOCH="$(date +%s)"
 if ! "${COMPOSE[@]}" up -d --no-build --force-recreate api; then
   rollback_runtime
   exit 1
@@ -549,7 +569,7 @@ if [[ "${START_SCHEDULERS}" -eq 1 ]]; then
     exit 1
   fi
 else
-  echo "schedulers: not started (pass --start-schedulers after the compatibility gate)"
+  echo "schedulers: explicitly disabled by --no-start-schedulers"
 fi
 
 echo "[6/6] health and image identity"
@@ -557,12 +577,51 @@ echo "[6/6] health and image identity"
 PORT="$(grep -E '^SA_API_HOST_PORT=' .env 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
 PORT="${PORT:-18001}"
 HEALTH_URL="http://127.0.0.1:${PORT}/health"
+
+validate_scheduler_heartbeat() {
+  local group="$1"
+  local container="stock-analyzer-scheduler-${group}"
+  local path="/app/artifacts/runtime/scheduler_${group}_heartbeat.json"
+  local running
+  local heartbeat_mtime
+  local heartbeat
+  running="$(docker inspect --format '{{.State.Running}}' "${container}" 2>/dev/null || true)"
+  if [[ "${running}" != "true" ]]; then
+    return 1
+  fi
+  heartbeat_mtime="$(docker exec "${container}" stat -c %Y "${path}" 2>/dev/null || true)"
+  if ! [[ "${heartbeat_mtime}" =~ ^[0-9]+$ ]] || [[ "${heartbeat_mtime}" -lt "${HEALTH_GATE_STARTED_EPOCH}" ]]; then
+    return 1
+  fi
+  heartbeat="$(docker exec "${container}" cat "${path}" 2>/dev/null || true)"
+  if [[ -z "${heartbeat}" ]]; then
+    return 1
+  fi
+  "${HOST_PYTHON}" - "${heartbeat}" "${COMMIT}" "${group}" <<'PY'
+import json, sys
+payload = json.loads(sys.argv[1])
+expected_commit = sys.argv[2]
+expected_group = sys.argv[3]
+if payload.get("status") != "ok" or payload.get("group") != expected_group:
+    raise SystemExit(f"scheduler heartbeat mismatch: {payload}")
+build = payload.get("build") or {}
+if (
+    build.get("commit") != expected_commit
+    or build.get("short_commit") != expected_commit[:7]
+    or build.get("trusted") is not True
+):
+    raise SystemExit(f"scheduler build mismatch: {build}")
+if not str(payload.get("timestamp", "")).strip():
+    raise SystemExit("scheduler heartbeat timestamp missing")
+PY
+}
+
 attempt=1
 while [[ "${attempt}" -le "${HEALTH_ATTEMPTS}" ]]; do
   HEALTH_ERROR="$(mktemp)"
   if HEALTH="$(curl -fsS --connect-timeout 3 --max-time 10 "${HEALTH_URL}" 2>"${HEALTH_ERROR}")"; then
     rm -f "${HEALTH_ERROR}"
-    if "${HOST_PYTHON}" - "${HEALTH}" "${COMMIT}" <<'PY'
+    if ! "${HOST_PYTHON}" - "${HEALTH}" "${COMMIT}" <<'PY'
 import json, sys
 h = json.loads(sys.argv[1])
 expected = sys.argv[2]
@@ -581,6 +640,17 @@ if runtime.get("advisory_only") is not True or runtime.get("training_enabled") i
 print(json.dumps({"build_commit": build.get("commit"), "advisory_only": runtime.get("advisory_only"), "training_enabled": runtime.get("training_enabled")}, separators=(",", ":")))
 PY
     then
+      echo "ERROR: health endpoint responded but identity or safety validation failed." >&2
+      rollback_runtime
+      exit 1
+    fi
+    SCHEDULERS_READY=1
+    if [[ "${START_SCHEDULERS}" -eq 1 ]]; then
+      if ! validate_scheduler_heartbeat critical || ! validate_scheduler_heartbeat heavy; then
+        SCHEDULERS_READY=0
+      fi
+    fi
+    if [[ "${SCHEDULERS_READY}" -eq 1 ]]; then
       echo
       echo "OK. commit=${SHORT}"
       echo "If capital_curve:freeze still active, run: bash scripts/nas_reset_sim_account.sh"
@@ -589,16 +659,14 @@ PY
       cleanup_summary_rollback || echo "WARNING: stale summary rollback files require manual cleanup" >&2
       exit 0
     fi
-    echo "ERROR: health endpoint responded but identity or safety validation failed." >&2
-    rollback_runtime
-    exit 1
+    echo "health not ready (${attempt}/${HEALTH_ATTEMPTS}): waiting for fresh critical/heavy scheduler heartbeats" >&2
   else
     CURL_CODE=$?
+    HEALTH_MESSAGE="$(tr '\n' ' ' < "${HEALTH_ERROR}")"
+    rm -f "${HEALTH_ERROR}"
+    echo "health not ready (${attempt}/${HEALTH_ATTEMPTS}, curl=${CURL_CODE}): ${HEALTH_MESSAGE}" >&2
   fi
 
-  HEALTH_MESSAGE="$(tr '\n' ' ' < "${HEALTH_ERROR}")"
-  rm -f "${HEALTH_ERROR}"
-  echo "health not ready (${attempt}/${HEALTH_ATTEMPTS}, curl=${CURL_CODE}): ${HEALTH_MESSAGE}" >&2
   if [[ "${attempt}" -lt "${HEALTH_ATTEMPTS}" ]]; then
     sleep "${HEALTH_SLEEP_SEC}"
   fi
@@ -607,5 +675,9 @@ done
 
 echo "ERROR: health did not become ready after ${HEALTH_ATTEMPTS} attempts: ${HEALTH_URL}" >&2
 docker logs stock-analyzer-api --tail 100 >&2 || true
+if [[ "${START_SCHEDULERS}" -eq 1 ]]; then
+  docker logs stock-analyzer-scheduler-critical --tail 100 >&2 || true
+  docker logs stock-analyzer-scheduler-heavy --tail 100 >&2 || true
+fi
 rollback_runtime
 exit 1

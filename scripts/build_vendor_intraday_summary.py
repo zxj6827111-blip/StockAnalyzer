@@ -291,6 +291,7 @@ def build_summary(
     intervals: tuple[str, ...] = ("1m", "5m"),
     volume_multiplier: float = 100.0,
     amount_multiplier: float = 1.0,
+    required_latest_date: str | date | None = None,
 ) -> dict[str, Any]:
     source_root = Path(root).expanduser().resolve()
     output_path = Path(output).expanduser().resolve()
@@ -326,6 +327,19 @@ def build_summary(
                 amount_multiplier=amount_multiplier,
             )
         coverage = _validate(built, normalized_intervals)
+        required_latest = _coerce_required_latest_date(required_latest_date)
+        if required_latest is not None:
+            stale = {
+                interval: str(payload.get("max_date", "")).strip()
+                for interval, payload in coverage.items()
+                if _coerce_required_latest_date(payload.get("max_date")) is None
+                or _coerce_required_latest_date(payload.get("max_date")) < required_latest
+            }
+            if stale:
+                raise RuntimeError(
+                    "intraday summary does not cover required latest date "
+                    f"{required_latest.isoformat()}: {stale}"
+                )
         generation = datetime.now(UTC).isoformat()
         manifest = {
             "schema_version": 1,
@@ -333,6 +347,9 @@ def build_summary(
             "source_root": str(source_root),
             "cutoff_date": cutoff.isoformat(),
             "keep_natural_days": max(1, int(keep_days)),
+            "required_latest_date": (
+                required_latest.isoformat() if required_latest is not None else ""
+            ),
             "intervals": list(normalized_intervals),
             "coverage": coverage,
             "interval_reports": interval_reports,
@@ -357,6 +374,18 @@ def build_summary(
         raise
 
 
+def _coerce_required_latest_date(value: object) -> date | None:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        parsed = pd.Timestamp(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid required latest date: {value!r}") from None
+    if pd.isna(parsed):
+        raise ValueError(f"invalid required latest date: {value!r}")
+    return parsed.date()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", required=True, help="vendor history root")
@@ -365,6 +394,11 @@ def main() -> None:
     parser.add_argument("--interval", action="append", dest="intervals")
     parser.add_argument("--volume-multiplier", type=float, default=100.0)
     parser.add_argument("--amount-multiplier", type=float, default=1.0)
+    parser.add_argument(
+        "--require-latest-date",
+        default="",
+        help="fail without promoting when any interval max_date is older than YYYY-MM-DD",
+    )
     args = parser.parse_args()
     intervals = tuple(args.intervals or ("1m", "5m"))
     report = build_summary(
@@ -374,6 +408,7 @@ def main() -> None:
         intervals=intervals,
         volume_multiplier=args.volume_multiplier,
         amount_multiplier=args.amount_multiplier,
+        required_latest_date=args.require_latest_date,
     )
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
 
