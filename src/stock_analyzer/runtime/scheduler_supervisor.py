@@ -312,7 +312,10 @@ class SchedulerSupervisor:
         grace = max(1, int(self.config.scheduler.process_terminate_grace_sec))
         if _is_windows():
             try:
-                item.process.send_signal(signal.CTRL_BREAK_EVENT)
+                ctrl_break_event = getattr(signal, "CTRL_BREAK_EVENT", None)
+                if ctrl_break_event is None:
+                    raise AttributeError("CTRL_BREAK_EVENT is unavailable")
+                item.process.send_signal(ctrl_break_event)
             except (AttributeError, OSError, ProcessLookupError, ValueError):
                 item.process.terminate()
         else:
