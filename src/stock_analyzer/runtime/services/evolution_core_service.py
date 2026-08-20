@@ -482,7 +482,7 @@ class RuntimeEvolutionCoreService:
         try:
             from stock_analyzer.ops.nightly_readiness import check_nightly_readiness  # noqa: WPS433
 
-            expected_date = service._resolve_nightly_expected_trade_date()  # type: ignore[attr-defined]
+            expected_date = service._resolve_nightly_expected_trade_date()
             # Only gate when the readiness artifact is actually deployed (NAS prod):
             # tests and local dev have no warehouse expected date or no artifact.
             # Missing date means "readiness not yet deployed" — do not block.
