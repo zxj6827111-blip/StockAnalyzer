@@ -359,7 +359,6 @@ def build_intraday_freshness_report(
     report.session_incomplete = sorted(session_incomplete)
     report.fresh_symbols = sorted(fresh)
     report.fresh_count = len(fresh)
-    eligible_denominator = max(1, len([s for s in normalized if s not in unsupported])) if normalized else 1
     # Fresh ratio is fresh / eligible (BJ excluded)
     eligible_for_ratio = [s for s in normalized if s not in unsupported]
     if eligible_for_ratio:

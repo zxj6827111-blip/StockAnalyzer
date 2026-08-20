@@ -1605,7 +1605,40 @@ def _main(argv: list[str] | None = None) -> int:
         "(import_vendor_zip_to_delta.py --incremental); requires --index-path. "
         "Example: /app/artifacts/vendor_delta/market_delta.duckdb",
     )
+    # Legacy intraday summary args: kept for backwards-compat with old
+    # stock_updater.sh / crontab invocations that still pass them.  They
+    # are now no-ops (the nightly readiness gate replaces the intraday
+    # summary build) but must not hard-fail.
+    parser.add_argument(
+        "--intraday-summary-output",
+        default=os.environ.get("SA_INTRADAY_SUMMARY_OUTPUT", ""),
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--intraday-summary-keep-days",
+        type=int,
+        default=int(os.environ.get("SA_INTRADAY_SUMMARY_KEEP_DAYS", "480")),
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--intraday-summary-required-latest-date",
+        default=os.environ.get("SA_INTRADAY_SUMMARY_REQUIRED_LATEST_DATE", ""),
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args(argv)
+    # Surface deprecation warning when legacy args are actually used.
+    try:
+        import warnings as _warnings
+
+        if str(getattr(args, "intraday_summary_output", "")).strip():
+            _warnings.warn(
+                "--intraday-summary-output is deprecated and ignored; "
+                "the nightly readiness gate replaces the intraday summary build",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+    except Exception:
+        pass
 
     vendor_root = Path(args.vendor_root).expanduser()
     daily_root = vendor_root / args.daily_dir
@@ -1901,9 +1934,13 @@ def _main(argv: list[str] | None = None) -> int:
     # Write nightly readiness after successful full run.
     if not args.dry_run and not failures:
         _readiness_ok = True
-        if isinstance(index_report, dict) and str(index_report.get("reason", "")).strip() not in ("", "not_enabled"):
+        if isinstance(index_report, dict) and str(
+            index_report.get("reason", "")
+        ).strip() not in ("", "not_enabled"):
             _readiness_ok = bool(index_report.get("updated", False))
-        if isinstance(delta_sync_report, dict) and str(delta_sync_report.get("reason", "")).strip() not in ("", "not_enabled"):
+        if isinstance(delta_sync_report, dict) and str(
+            delta_sync_report.get("reason", "")
+        ).strip() not in ("", "not_enabled"):
             _readiness_ok = bool(delta_sync_report.get("updated", False))
         if _readiness_ok:
             try:

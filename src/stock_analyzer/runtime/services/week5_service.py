@@ -1946,6 +1946,8 @@ class RuntimeWeek5Service:
                             | set(getattr(freshness_obj, "effective_stale", []))
                             | set(getattr(freshness_obj, "session_incomplete", []))
                             | set(getattr(freshness_obj, "unsupported_market", []))
+                            | set(getattr(freshness_obj, "summary_missing", []))
+                            | set(getattr(freshness_obj, "delta_missing", []))
                         )
                         if ps in evaled:
                             # Evaluated: only include if fresh
@@ -2010,7 +2012,7 @@ class RuntimeWeek5Service:
                 deep_report = service._deep_stage_from_snapshot(
                     frame=fresh_deep_frame,  # type: ignore[arg-type]
                     target=deep_candidate_target,
-                    light_report=prefilter_report,
+                    light_report=fresh_light_report,
                 )
                 # Tag that deep used fresh frame
                 deep_report["fresh_frame_used"] = True

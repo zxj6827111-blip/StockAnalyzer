@@ -2218,14 +2218,14 @@ def _format_minute_datetime(value: object, *, is_start: bool = True) -> str:
         except Exception:
             pass
         return text
-# Date-only string
-        anchor = "09:30:00" if is_start else "15:00:00"
-        for fmt in ("%Y-%m-%d", "%Y%m%d"):
-            try:
-                parsed = datetime.strptime(text, fmt)
-                return parsed.strftime(f"%Y-%m-%d {anchor}")
-            except ValueError:
-                continue
+    # Date-only string — plain YYYY-MM-DD / YYYYMMDD
+    anchor = "09:30:00" if is_start else "15:00:00"
+    for fmt in ("%Y-%m-%d", "%Y%m%d"):
+        try:
+            parsed = datetime.strptime(text, fmt)
+            return parsed.strftime(f"%Y-%m-%d {anchor}")
+        except ValueError:
+            continue
     try:
         parsed = pd.to_datetime(text, errors="coerce")  # type: ignore[arg-type]
         if not pd.isna(parsed):

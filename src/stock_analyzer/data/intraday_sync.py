@@ -27,12 +27,11 @@ with the guarantees required by the PLAN:
 
 from __future__ import annotations
 
-import json
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time
 from pathlib import Path
 from time import monotonic
 from typing import Any
@@ -357,13 +356,15 @@ def sync_intraday_symbols(
 
         tushare = tushare_provider or _resolve_tushare_provider(warehouse)
         # Probe capability with up to 2 symbols that actually need fetching.
+        # Never probe up_to_date symbols — they may not need fetching at all.
         probe_symbols: list[str] = fetch_needed[:_PROBE_COUNT]
         if len(probe_symbols) < _PROBE_COUNT:
-            for sym in eligible:
+            for sym in fetch_needed:
                 if sym not in probe_symbols:
                     probe_symbols.append(sym)
                     if len(probe_symbols) >= _PROBE_COUNT:
                         break
+        # If still short (e.g. fetch_needed empty), do not probe.
 
         tushare_ok = True
         probe_error = ""
