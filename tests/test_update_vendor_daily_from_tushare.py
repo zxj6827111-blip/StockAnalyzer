@@ -641,6 +641,8 @@ def test_main_sync_vendor_delta_runs_incremental_import(
     _factor_fixture(tmp_path)
     index_path = _full_daily_index(tmp_path)
     delta_db = tmp_path / "delta" / "market_delta.duckdb"
+    readiness_path = tmp_path / "runtime" / "nightly_data_ready.json"
+    monkeypatch.setenv("SA__NIGHTLY_READINESS_PATH", str(readiness_path))
 
     exit_code, summary = _main_with_fake_api(
         updater,
@@ -662,6 +664,8 @@ def test_main_sync_vendor_delta_runs_incremental_import(
     assert exit_code == 0
     assert summary["delta_sync"]["updated"] is True
     assert summary["delta_sync"]["exit_code"] == 0
+    assert summary["readiness"]["written"] is True
+    assert readiness_path.exists()
     # delta 库已含 600000 的两行（07-17 旧行 + 07-20 新行）。
     from stock_analyzer.data.market_warehouse import MarketWarehouse
 
@@ -674,16 +678,18 @@ def test_main_sync_vendor_delta_runs_incremental_import(
     assert float(frame["close"].iloc[-1]) == pytest.approx(9.5)
 
 
-def test_main_sync_vendor_delta_degraded_on_import_failure(
+def test_main_sync_vendor_delta_failure_blocks_readiness(
     updater: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """钩子失败降级：updated=False + exit_code，updater 主流程不受影响。"""
+    """Delta 导入失败必须返回非零且不得发布 readiness。"""
     _daily_fixture(tmp_path)
     _factor_fixture(tmp_path)
-    # index 文件缺失：updater 主流程回退全扫描不失败，但 import 脚本
-    # 构造 provider 时需要加载 index → 钩子降级（exit_code != 0）。
-    missing_index = tmp_path / "index" / "daily_index.json"
-    delta_db = tmp_path / "delta" / "market_delta.duckdb"
+    # Index 成功后，把 delta DB 路径预先建成目录，强制 importer 非零退出。
+    index_path = _full_daily_index(tmp_path)
+    delta_db = tmp_path / "delta-target-is-directory"
+    delta_db.mkdir()
+    readiness_path = tmp_path / "runtime" / "nightly_data_ready.json"
+    monkeypatch.setenv("SA__NIGHTLY_READINESS_PATH", str(readiness_path))
 
     exit_code, summary = _main_with_fake_api(
         updater,
@@ -696,16 +702,157 @@ def test_main_sync_vendor_delta_degraded_on_import_failure(
             "--interval-sec",
             "0",
             "--index-path",
-            str(missing_index),
+            str(index_path),
+            "--sync-vendor-delta",
+            str(delta_db),
+        ],
+    )
+
+    assert exit_code == 1
+    assert summary["delta_sync"]["updated"] is False
+    assert summary["delta_sync"]["exit_code"] != 0
+    assert summary["readiness"]["written"] is False
+    assert not readiness_path.exists()
+    assert delta_db.is_dir()  # 非法目标未被替换成 DuckDB 文件
+
+
+def test_main_batch_skips_per_symbol_and_writes_readiness_after_delta(
+    updater: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _daily_fixture(tmp_path)
+    _factor_fixture(tmp_path)
+    index_path = _full_daily_index(tmp_path)
+    delta_db = tmp_path / "delta" / "market_delta.duckdb"
+    readiness_path = tmp_path / "runtime" / "nightly_data_ready.json"
+    monkeypatch.setenv("SA__NIGHTLY_READINESS_PATH", str(readiness_path))
+    per_symbol_calls: list[str] = []
+
+    def _fake_batch(**kwargs: object) -> dict[str, object]:
+        _ = kwargs
+        return {
+            "attempted": True,
+            "ok": True,
+            "latest_daily_date": "2025-07-20",
+            "symbols_updated": 1,
+            "zip_rebuilds": [],
+            "index": {"updated": True},
+        }
+
+    def _unexpected_fetch(**kwargs: object) -> dict[str, object]:
+        per_symbol_calls.append(str(kwargs.get("symbol", "")))
+        raise AssertionError("batch mode must not dispatch per-symbol fetches")
+
+    monkeypatch.setattr(updater, "_run_batch", _fake_batch)
+    monkeypatch.setattr(updater, "_fetch_symbol", _unexpected_fetch)
+
+    exit_code, summary = _main_with_fake_api(
+        updater,
+        monkeypatch,
+        [
+            "--batch",
+            "--vendor-root",
+            str(tmp_path),
+            "--end-date",
+            "2025-07-20",
+            "--interval-sec",
+            "0",
+            "--index-path",
+            str(index_path),
             "--sync-vendor-delta",
             str(delta_db),
         ],
     )
 
     assert exit_code == 0
-    assert summary["delta_sync"]["updated"] is False
-    assert summary["delta_sync"]["exit_code"] != 0
-    assert not delta_db.exists()  # 同步未写入任何数据
+    assert per_symbol_calls == []
+    assert summary["mode"] == "batch"
+    assert summary["delta_sync"]["updated"] is True
+    assert summary["readiness"]["written"] is True
+    assert readiness_path.exists()
+
+
+def test_main_batch_index_failure_blocks_delta_and_readiness(
+    updater: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _daily_fixture(tmp_path)
+    index_path = _full_daily_index(tmp_path)
+    delta_db = tmp_path / "delta" / "market_delta.duckdb"
+    readiness_path = tmp_path / "runtime" / "nightly_data_ready.json"
+    monkeypatch.setenv("SA__NIGHTLY_READINESS_PATH", str(readiness_path))
+
+    def _fake_batch(**kwargs: object) -> dict[str, object]:
+        _ = kwargs
+        return {
+            "attempted": True,
+            "ok": True,
+            "latest_daily_date": "2025-07-20",
+            "symbols_updated": 1,
+            "zip_rebuilds": [],
+            "index": {"updated": False, "reason": "write_failed"},
+        }
+
+    monkeypatch.setattr(updater, "_run_batch", _fake_batch)
+    exit_code, summary = _main_with_fake_api(
+        updater,
+        monkeypatch,
+        [
+            "--batch",
+            "--vendor-root",
+            str(tmp_path),
+            "--end-date",
+            "2025-07-20",
+            "--interval-sec",
+            "0",
+            "--index-path",
+            str(index_path),
+            "--sync-vendor-delta",
+            str(delta_db),
+        ],
+    )
+
+    assert exit_code == 1
+    assert summary["delta_sync"] == {
+        "updated": False,
+        "reason": "index_update_failed",
+    }
+    assert summary["readiness"]["written"] is False
+    assert not readiness_path.exists()
+    assert not delta_db.exists()
+
+
+def test_main_readiness_write_failure_is_fatal(
+    updater: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _daily_fixture(tmp_path)
+    _factor_fixture(tmp_path)
+
+    def _fail_readiness(**kwargs: object) -> None:
+        _ = kwargs
+        raise OSError("readiness volume is read-only")
+
+    monkeypatch.setattr(updater, "write_nightly_readiness", _fail_readiness)
+    exit_code, summary = _main_with_fake_api(
+        updater,
+        monkeypatch,
+        [
+            "--vendor-root",
+            str(tmp_path),
+            "--end-date",
+            "2025-07-20",
+            "--interval-sec",
+            "0",
+        ],
+    )
+
+    assert exit_code == 1
+    assert summary["readiness"]["written"] is False
+    assert "readiness volume is read-only" in summary["readiness"]["error"]
 
 
 # ---------------------------------------------------------------------------

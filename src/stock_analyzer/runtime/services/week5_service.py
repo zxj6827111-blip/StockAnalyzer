@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
@@ -11,8 +13,6 @@ from importlib import import_module
 from pathlib import Path
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, cast
-
-import logging
 
 import pandas as pd
 
@@ -1558,6 +1558,7 @@ class RuntimeWeek5Service:
         # Daily snapshot is daily-only; intraday minute date = previous open
         # trading date before snapshot latest day (T-1 contract, via calendar).
         required_intraday_date: object | None = None
+        cal_source: object | None = None
         if snapshot_manifest is not None and str(snapshot_manifest.trade_date).strip():
             cal_source = _resolve_calendar_provider(service)
             required_intraday_date = _resolve_required_intraday_date(
@@ -1680,8 +1681,15 @@ class RuntimeWeek5Service:
             if not light_symbols:
                 light_symbols = list(prefilter_report.get("symbols", []) or [])
                 light_symbols = [str(s).strip() for s in light_symbols if str(s).strip()]
-            eligible = [s for s in light_symbols if not _is_bj_symbol(s)]
-            unsupported_market = [s for s in light_symbols if _is_bj_symbol(s)]
+            (
+                eligible,
+                pinned_candidates,
+                unsupported_market,
+                sync_targets,
+            ) = _prepare_intraday_sync_symbols(
+                light_symbols=light_symbols,
+                pinned_symbols=pinned_symbols or [],
+            )
 
             # Resolve warehouses for freshness + sync
             _delta_warehouse: object | None = None
@@ -1709,10 +1717,10 @@ class RuntimeWeek5Service:
                             break
             except Exception:
                 pass
-            # Minute sync for eligible (tushare primary, sina fallback, shared lock)
+            # Minute sync covers light candidates and off-light pinned symbols.
             sync_report: dict[str, object] = {}
             if (
-                eligible
+                sync_targets
                 and required_intraday_date is not None
                 and bool(getattr(service._config.week5, "intraday_sync_enabled", True))
             ):
@@ -1720,7 +1728,7 @@ class RuntimeWeek5Service:
                     sync_report = _sync_intraday_symbols(
                         warehouse=_delta_warehouse,
                         vendor_overlay=_vendor_overlay,
-                        symbols=eligible,
+                        symbols=sync_targets,
                         required_trade_date=required_intraday_date,
                         primary=str(
                             getattr(service._config.week5, "intraday_sync_primary", "tushare")
@@ -1738,11 +1746,16 @@ class RuntimeWeek5Service:
                             30,
                             int(getattr(service._config.week5, "intraday_sync_deadline_sec", 180)),
                         ),
+                        tushare_provider=(
+                            cal_source
+                            if callable(getattr(cal_source, "fetch_minute_bars", None))
+                            else None
+                        ),
                     )
                 except Exception as exc:
                     sync_report = {
                         "error": f"{type(exc).__name__}:{exc}",
-                        "symbols_total": len(eligible),
+                        "symbols_total": len(sync_targets),
                     }
                 # Clear VendorZipOverlayProvider intraday cache after sync
                 for src in (_vendor_overlay, _delta_warehouse):
@@ -1752,7 +1765,7 @@ class RuntimeWeek5Service:
                             fn()
                     except Exception:
                         pass
-            elif eligible and required_intraday_date is None:
+            elif sync_targets and required_intraday_date is None:
                 sync_report = {"skipped": True, "reason": "no_required_intraday_date"}
 
             # Per-symbol freshness report (allowed_lag=0, session threshold 230)
@@ -1855,7 +1868,7 @@ class RuntimeWeek5Service:
             try:
                 _prov = getattr(service, "_provider", None)
                 _key = ""
-                if hasattr(_prov, "status") and callable(getattr(_prov, "status")):
+                if hasattr(_prov, "status") and callable(_prov.status):
                     _key = str(
                         _prov.status().get("provider_key", _prov.status().get("provider_mode", ""))
                     ).lower()  # type: ignore[union-attr]
@@ -1912,11 +1925,8 @@ class RuntimeWeek5Service:
             # Build fresh deep frame for eligible fresh symbols (daily+intraday)
             # Filter pinned through same freshness gate
             pinned_fresh: list[str] = []
-            if pinned_symbols:
-                pinned_normalized = [str(s).strip() for s in pinned_symbols if str(s).strip()]
-                for ps in pinned_normalized:
-                    if _is_bj_symbol(ps):
-                        continue
+            if pinned_candidates:
+                for ps in pinned_candidates:
                     # pinned must pass the same freshness gate as eligible:
                     # stale pinned is dropped.  For symbols not in the eligible
                     # list, run an on-demand freshness check instead of blindly
@@ -1964,13 +1974,16 @@ class RuntimeWeek5Service:
                                         interval="5m",
                                         deep_candidate_target=1,
                                     )
-                                    if ps in pinned_report.fresh_symbols and ps in pinned_report_5m.fresh_symbols:
+                                    if (
+                                        ps in pinned_report.fresh_symbols
+                                        and ps in pinned_report_5m.fresh_symbols
+                                    ):
                                         pinned_fresh.append(ps)
                                 except Exception:
                                     # On check failure, do not include — fail-closed
                                     pass
-                    else:
-                        # No freshness data (synthetic/test path), include all non-BJ pinned
+                    elif _is_synthetic:
+                        # Synthetic tests have no real intraday warehouse.
                         pinned_fresh.append(ps)
             # Determine deep input symbols: only fresh eligible (not stale/BJ)
             fresh_symbols = (
@@ -2121,27 +2134,12 @@ class RuntimeWeek5Service:
             prefilter_report["degraded_fail_closed"] = True
             prefilter_report["degraded_fail_closed_reason"] = "quality_unavailable_without_snapshot"
 
-        # Pinned must pass same freshness gate: only fresh pinned are added
-        _fresh_pinned = prefilter_report.get("_fresh_pinned_symbols")
-        if isinstance(_fresh_pinned, list) and _fresh_pinned:
-            normalized_pinned_symbols = _dedupe_preserve_order(
-                [str(s).strip() for s in _fresh_pinned if str(s).strip()]
-            )
-        else:
-            normalized_pinned_symbols = _dedupe_preserve_order(
-                [
-                    symbol
-                    for symbol in (_normalize_a_share_symbol(item) for item in pinned_symbols or [])
-                    if symbol and not _is_bj_symbol(symbol)
-                ]
-            )
-            # If freshness was computed, only keep pinned that are fresh
-            if isinstance(prefilter_report.get("intraday_freshness"), dict):
-                fresh_set = set(prefilter_report["intraday_freshness"].get("fresh_symbols", []))  # type: ignore[union-attr]
-                if fresh_set:
-                    normalized_pinned_symbols = [
-                        s for s in normalized_pinned_symbols if s in fresh_set
-                    ]
+        # Pinned must pass the same freshness gate; an explicit empty
+        # _fresh_pinned_symbols list is authoritative and must not fall back.
+        normalized_pinned_symbols = _resolve_pinned_symbols_after_freshness(
+            prefilter_report=prefilter_report,
+            pinned_symbols=pinned_symbols or [],
+        )
         pinned_added_symbols: list[str] = []
         if normalized_pinned_symbols:
             existing_symbols = {
@@ -3444,11 +3442,15 @@ class RuntimeWeek5Service:
             )
             required_date = None
             try:
-                from stock_analyzer.data.trading_calendar import resolve_required_intraday_date  # noqa: WPS433
+                from stock_analyzer.data.trading_calendar import (
+                    resolve_required_intraday_date,  # noqa: WPS433
+                )
 
                 manifest_date = ""
                 try:
-                    from stock_analyzer.feature.snapshot import load_feature_snapshot  # noqa: WPS433
+                    from stock_analyzer.feature.snapshot import (
+                        load_feature_snapshot,  # noqa: WPS433
+                    )
 
                     manifest, _ = load_feature_snapshot(service._config)
                     if manifest is not None:
@@ -3462,7 +3464,9 @@ class RuntimeWeek5Service:
                 pass
             if required_date is not None:
                 try:
-                    from stock_analyzer.data.intraday_sync import sync_intraday_symbols  # noqa: WPS433
+                    from stock_analyzer.data.intraday_sync import (
+                        sync_intraday_symbols,  # noqa: WPS433
+                    )
 
                     warehouse = None
                     vendor_overlay = None
@@ -3486,6 +3490,11 @@ class RuntimeWeek5Service:
                         ),
                         deadline_sec=budget_sec,
                         vendor_overlay=vendor_overlay,
+                        tushare_provider=(
+                            cal_source
+                            if callable(getattr(cal_source, "fetch_minute_bars", None))
+                            else None
+                        ),
                     )
                     # After sync: clear cache and re-check completeness
                     for src in (vendor_overlay, warehouse):
@@ -4435,22 +4444,151 @@ def _is_bj_symbol(symbol: str) -> bool:
         return False
 
 
-def _resolve_calendar_provider(service: object) -> object | None:
-    """Find the inner provider exposing list_open_trade_dates via BFS.
-
-    Walks CachedProvider.inner / ResilientProvider.primary etc. so a
-    wrapped TushareProvider is still discoverable.  Returns None when
-    no provider in the graph has the calendar capability.
-    """
+def _resolve_service_tushare_provider(
+    service: object,
+    *,
+    timeout_sec: float,
+) -> object | None:
+    """Build one bounded Tushare provider shared by calendar and minute sync."""
+    cached = getattr(service, "_week5_tushare_provider", None)
+    if cached is not None:
+        return cached
+    config = getattr(service, "_config", None)
+    market_config = getattr(config, "market_warehouse", None)
+    token = str(getattr(market_config, "tushare_token", "") or "").strip()
+    if not token:
+        for key in ("SA__MARKET_WAREHOUSE__TUSHARE_TOKEN", "TUSHARE_TOKEN", "TS_TOKEN"):
+            token = str(os.environ.get(key, "") or "").strip()
+            if token:
+                break
+    if not token:
+        return None
+    configured_timeout = float(getattr(market_config, "online_socket_timeout_sec", timeout_sec))
+    request_interval = float(getattr(market_config, "request_interval_sec", 0.35))
     try:
-        graph_fn = getattr(service, "_iter_market_data_provider_graph", None)  # type: ignore[union-attr]
+        from stock_analyzer.data.tushare_provider import TushareProvider  # noqa: WPS433
+
+        provider = TushareProvider(
+            token=token,
+            max_attempts=1,
+            socket_timeout_sec=max(0.1, min(float(timeout_sec), configured_timeout)),
+            retry_delay_sec=max(0.0, request_interval),
+            min_request_interval_sec=max(0.0, request_interval),
+        )
+        try:
+            service._week5_tushare_provider = provider
+        except Exception:
+            pass
+        return provider
+    except Exception:
+        return None
+
+
+def _resolve_calendar_provider(service: object) -> object | None:
+    """Resolve a real exchange calendar from the graph or configured Tushare."""
+    try:
+        graph_fn = getattr(service, "_iter_market_data_provider_graph", None)
         if callable(graph_fn):
-            for provider in graph_fn():  # type: ignore[operator]
+            for provider in graph_fn():
                 if callable(getattr(provider, "list_open_trade_dates", None)):
                     return provider
     except Exception:
         pass
-    return None
+    config = getattr(service, "_config", None)
+    week5_config = getattr(config, "week5", None)
+    timeout_sec = float(getattr(week5_config, "intraday_sync_timeout_sec", 5))
+    return _resolve_service_tushare_provider(service, timeout_sec=timeout_sec)
+
+
+def _normalize_intraday_symbol(value: object) -> str:
+    """Normalize SH/SZ/BJ symbols without dropping the 920 BJ prefix."""
+    normalized = _normalize_a_share_symbol(value)
+    if normalized:
+        return normalized
+    text = str(value or "").strip().upper()
+    primary = text.split(".", maxsplit=1)[0]
+    digits = "".join(ch for ch in primary if ch.isdigit())
+    if len(digits) == 6 and _is_bj_symbol(text):
+        return digits
+    return ""
+
+
+def _prepare_intraday_sync_symbols(
+    *,
+    light_symbols: list[str],
+    pinned_symbols: list[str],
+) -> tuple[list[str], list[str], list[str], list[str]]:
+    """Normalize light/pinned symbols and build the bounded sync target union."""
+    normalized_light = _dedupe_preserve_order(
+        [
+            symbol
+            for symbol in (_normalize_intraday_symbol(item) for item in light_symbols)
+            if symbol
+        ]
+    )
+    normalized_pinned = _dedupe_preserve_order(
+        [
+            symbol
+            for symbol in (_normalize_intraday_symbol(item) for item in pinned_symbols)
+            if symbol
+        ]
+    )
+    eligible = [symbol for symbol in normalized_light if not _is_bj_symbol(symbol)]
+    pinned_candidates = [
+        symbol for symbol in normalized_pinned if not _is_bj_symbol(symbol)
+    ]
+    unsupported_market = _dedupe_preserve_order(
+        [
+            symbol
+            for symbol in [*normalized_light, *normalized_pinned]
+            if _is_bj_symbol(symbol)
+        ]
+    )
+    sync_targets = _dedupe_preserve_order([*eligible, *pinned_candidates])
+    return eligible, pinned_candidates, unsupported_market, sync_targets
+
+
+def _resolve_pinned_symbols_after_freshness(
+    *,
+    prefilter_report: dict[str, object],
+    pinned_symbols: list[str],
+) -> list[str]:
+    """Return only pinned symbols authorized by the available freshness result."""
+    if "_fresh_pinned_symbols" in prefilter_report:
+        authoritative = prefilter_report.get("_fresh_pinned_symbols")
+        if not isinstance(authoritative, list):
+            return []
+        return _dedupe_preserve_order(
+            [
+                symbol
+                for symbol in (
+                    _normalize_intraday_symbol(item) for item in authoritative
+                )
+                if symbol and not _is_bj_symbol(symbol)
+            ]
+        )
+
+    candidates = _dedupe_preserve_order(
+        [
+            symbol
+            for symbol in (_normalize_intraday_symbol(item) for item in pinned_symbols)
+            if symbol and not _is_bj_symbol(symbol)
+        ]
+    )
+    freshness = prefilter_report.get("intraday_freshness")
+    if isinstance(freshness, dict):
+        raw_fresh = freshness.get("fresh_symbols", [])
+        fresh_set = {
+            normalized
+            for normalized in (
+                _normalize_intraday_symbol(item)
+                for item in raw_fresh
+                if str(item).strip()
+            )
+            if normalized
+        }
+        return [symbol for symbol in candidates if symbol in fresh_set]
+    return candidates
 
 
 def _resolve_required_intraday_date(
@@ -4513,7 +4651,7 @@ def _build_fresh_deep_frame(
         # Fetch intraday summaries for the required date (tolerate missing)
         intraday_1m: pd.DataFrame | None = None
         intraday_5m: pd.DataFrame | None = None
-        for interval, target in (("1m", "intraday_1m"), ("5m", "intraday_5m")):
+        for interval, _target in (("1m", "intraday_1m"), ("5m", "intraday_5m")):
             frame: pd.DataFrame | None = None
             for src in (vendor_overlay, warehouse):
                 if src is None:
@@ -4563,6 +4701,7 @@ def _sync_intraday_symbols(
     concurrency: int = 4,
     timeout_sec: int = 5,
     deadline_sec: int = 180,
+    tushare_provider: object | None = None,
 ) -> dict[str, object]:
     """Unified minute sync (PLAN §2) with Sina fallback and shared lock.
 
@@ -4583,6 +4722,7 @@ def _sync_intraday_symbols(
             concurrency=concurrency,
             timeout_sec=timeout_sec,
             vendor_overlay=vendor_overlay,
+            tushare_provider=tushare_provider,
         )
         return report.to_dict()
     except Exception as exc:  # pragma: no cover - defensive surface

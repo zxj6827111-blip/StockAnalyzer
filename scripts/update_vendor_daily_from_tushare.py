@@ -1573,6 +1573,9 @@ def _main(argv: list[str] | None = None) -> int:
         help=argparse.SUPPRESS,
     )
     args = parser.parse_args(argv)
+    if args.sync_vendor_delta.strip() and not args.index_path.strip():
+        print("--sync-vendor-delta requires --index-path", file=sys.stderr)
+        return 2
     # Surface deprecation warning when legacy args are actually used.
     try:
         import warnings as _warnings
@@ -1680,13 +1683,32 @@ def _main(argv: list[str] | None = None) -> int:
         batch_ok = bool(batch_payload.get("ok", False))
         batch_latest_daily = _coerce_date(batch_payload.get("latest_daily_date", ""))
 
-    max_workers = max(1, int(args.max_workers))
-    if len(symbols) == 1 or max_workers == 1 or api is None:
-        for symbol in symbols:
-            try:
-                results.append(
-                    _fetch_symbol(
-                        api=api,  # type: ignore[arg-type]
+    if batch_payload is None:
+        max_workers = max(1, int(args.max_workers))
+        if len(symbols) == 1 or max_workers == 1 or api is None:
+            for symbol in symbols:
+                try:
+                    results.append(
+                        _fetch_symbol(
+                            api=api,  # type: ignore[arg-type]
+                            symbol=symbol,
+                            end_date=end_date,
+                            daily_root=daily_root,
+                            factors_root=factors_root,
+                            skip_factors=bool(args.skip_factors),
+                            force_factors=bool(args.force_factors),
+                            dry_run=bool(args.dry_run),
+                            index=index,
+                        )
+                    )
+                except Exception as exc:
+                    failures.append(f"{symbol}:{type(exc).__name__}:{exc}")
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {
+                    pool.submit(
+                        _fetch_symbol,
+                        api=api,
                         symbol=symbol,
                         end_date=end_date,
                         daily_root=daily_root,
@@ -1695,33 +1717,15 @@ def _main(argv: list[str] | None = None) -> int:
                         force_factors=bool(args.force_factors),
                         dry_run=bool(args.dry_run),
                         index=index,
-                    )
-                )
-            except Exception as exc:
-                failures.append(f"{symbol}:{type(exc).__name__}:{exc}")
-    else:
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {
-                pool.submit(
-                    _fetch_symbol,
-                    api=api,
-                    symbol=symbol,
-                    end_date=end_date,
-                    daily_root=daily_root,
-                    factors_root=factors_root,
-                    skip_factors=bool(args.skip_factors),
-                    force_factors=bool(args.force_factors),
-                    dry_run=bool(args.dry_run),
-                    index=index,
-                ): symbol
-                for symbol in symbols
-            }
-            for future in as_completed(futures):
-                symbol = futures[future]
-                try:
-                    results.append(future.result())
-                except Exception as exc:
-                    failures.append(f"{symbol}:{type(exc).__name__}:{exc}")
+                    ): symbol
+                    for symbol in symbols
+                }
+                for future in as_completed(futures):
+                    symbol = futures[future]
+                    try:
+                        results.append(future.result())
+                    except Exception as exc:
+                        failures.append(f"{symbol}:{type(exc).__name__}:{exc}")
 
     # In batch mode per-symbol results are empty — derives success from batch_payload.
     if batch_payload is not None:
@@ -1828,13 +1832,28 @@ def _main(argv: list[str] | None = None) -> int:
     delta_should_sync = bool(batch_payload is not None and batch_ok and not failures)
     if not delta_should_sync:
         delta_should_sync = bool(ok_results)
+    delta_requested = bool(
+        not args.dry_run and args.sync_vendor_delta.strip() and args.index_path.strip()
+    )
+    # Resolve index success before delta import.  Importing with a stale or
+    # failed index would silently copy the wrong incremental window.
+    _batch_index_report: dict[str, object] | None = None
+    if batch_payload is not None and isinstance(batch_payload.get("index"), dict):
+        _batch_index_report = batch_payload["index"]  # type: ignore[assignment]
+    _effective_index_report = (
+        _batch_index_report if _batch_index_report is not None else index_report
+    )
+    index_should_update = bool(
+        not args.dry_run and args.index_path.strip() and delta_should_sync
+    )
+    index_ok = not index_should_update or bool(
+        _effective_index_report.get("updated", False)
+    )
+
     delta_sync_report: dict[str, object] = {"updated": False, "reason": "not_enabled"}
-    if (
-        not args.dry_run
-        and args.sync_vendor_delta.strip()
-        and args.index_path.strip()
-        and delta_should_sync
-    ):
+    if delta_requested and delta_should_sync and not index_ok:
+        delta_sync_report = {"updated": False, "reason": "index_update_failed"}
+    elif delta_requested and delta_should_sync:
         try:
             # 显式按路径加载同目录脚本，不依赖 sys.path 恰好包含 scripts/：
             # ``python -m`` 方式运行本脚本时 sys.path[0] 是 CWD，裸 import
@@ -1867,6 +1886,8 @@ def _main(argv: list[str] | None = None) -> int:
                     ]
                 )
             delta_sync_report = {"updated": sync_rc == 0, "exit_code": sync_rc}
+            if sync_rc != 0:
+                delta_sync_report["reason"] = "nonzero_exit"
             _delta_output = _captured.getvalue().strip()
             if _delta_output:
                 try:
@@ -1879,48 +1900,38 @@ def _main(argv: list[str] | None = None) -> int:
                 "reason": f"{type(exc).__name__}:{exc}",
             }
 
-    # Write nightly readiness after successful full run (batch + per-symbol share tail).
-    if not args.dry_run and not failures:
-        _readiness_ok = True
-        # Batch carries its own index report inside batch_payload; surface it when present.
-        _batch_index_report: dict[str, object] | None = None
-        if batch_payload is not None and isinstance(batch_payload.get("index"), dict):
-            _batch_index_report = batch_payload["index"]  # type: ignore[assignment]
-        _effective_index_report = (
-            _batch_index_report if _batch_index_report is not None else index_report
-        )
-        if isinstance(_effective_index_report, dict) and str(
-            _effective_index_report.get("reason", "")
-        ).strip() not in ("", "not_enabled"):
-            _readiness_ok = bool(_effective_index_report.get("updated", False))
-        if isinstance(delta_sync_report, dict) and str(
-            delta_sync_report.get("reason", "")
-        ).strip() not in ("", "not_enabled"):
-            _readiness_ok = bool(delta_sync_report.get("updated", False))
-        # Batch skips delta when neither flag is set — that is expected, not a failure.
-        if batch_payload is not None and not args.sync_vendor_delta.strip():
-            # No delta requested: delta_sync stays not_enabled, treat as ok.
-            _readiness_ok = _readiness_ok and True
-        if _readiness_ok:
-            try:
-                # Batch's latest_daily_date already reflects ZIP rebuild date.
-                _readiness_date = (
-                    batch_latest_daily
-                    if batch_payload is not None and batch_latest_daily is not None
-                    else end_date
-                )
-                write_nightly_readiness(
-                    target_trade_date=_readiness_date,
-                    db_path=args.sync_vendor_delta,
-                    index_path=args.index_path,
-                    extra={
-                        "source": "batch_update"
-                        if batch_payload is not None
-                        else "per_symbol_update"
-                    },
-                )
-            except Exception:
-                pass  # Non-fatal: readiness is a signal, not a gate.
+    delta_exit_code = int(delta_sync_report.get("exit_code", 1))
+    delta_ok = not (delta_requested and delta_should_sync) or bool(
+        delta_sync_report.get("updated", False) and delta_exit_code == 0
+    )
+    batch_execution_ok = batch_payload is None or batch_ok
+    full_run_ok = bool(not failures and batch_execution_ok and index_ok and delta_ok)
+    readiness_written = False
+    readiness_error = ""
+
+    # Write readiness only after every requested data stage succeeds.
+    if not args.dry_run and full_run_ok:
+        try:
+            # Batch's latest_daily_date already reflects ZIP rebuild date.
+            _readiness_date = (
+                batch_latest_daily
+                if batch_payload is not None and batch_latest_daily is not None
+                else end_date
+            )
+            write_nightly_readiness(
+                target_trade_date=_readiness_date,
+                db_path=args.sync_vendor_delta,
+                index_path=args.index_path,
+                extra={
+                    "source": "batch_update"
+                    if batch_payload is not None
+                    else "per_symbol_update"
+                },
+            )
+            readiness_written = True
+        except Exception as exc:
+            readiness_error = f"{type(exc).__name__}:{exc}"
+            full_run_ok = False
 
     # Merge batch index into index_report for observability when in batch mode.
     if batch_payload is not None and isinstance(batch_payload.get("index"), dict):
@@ -1948,6 +1959,10 @@ def _main(argv: list[str] | None = None) -> int:
         else list(batch_payload.get("zip_rebuilds", []) or []),  # type: ignore[arg-type]
         "index": index_report,
         "delta_sync": delta_sync_report,
+        "readiness": {
+            "written": readiness_written,
+            "error": readiness_error,
+        },
         "mode": "batch" if batch_payload is not None else "per_symbol",
     }
     # Back-compat: also spread batch_payload keys for callers parsing symbols_fetched etc.
@@ -1962,10 +1977,7 @@ def _main(argv: list[str] | None = None) -> int:
             if _k not in summary and _k in batch_payload:
                 summary[_k] = batch_payload[_k]
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    if failures:
-        return 1
-    # Batch ok=False with no explicit failures still means blocked readiness; return 1.
-    if batch_payload is not None and not batch_ok and not args.dry_run:
+    if not full_run_ok and not args.dry_run:
         return 1
     return 0
 

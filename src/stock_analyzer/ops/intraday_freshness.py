@@ -35,7 +35,6 @@ from typing import Any
 
 import pandas as pd
 
-
 SESSION_COMPLETE_MINUTE_THRESHOLD = 230
 SESSION_COMPLETE_MINUTE_THRESHOLD_5M = 46
 
@@ -208,7 +207,9 @@ class IntradayFreshnessReport:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "required_trade_date": self.required_trade_date.isoformat() if self.required_trade_date else "",
+            "required_trade_date": (
+                self.required_trade_date.isoformat() if self.required_trade_date else ""
+            ),
             "summary_missing": list(self.summary_missing),
             "delta_missing": list(self.delta_missing),
             "effective_stale": list(self.effective_stale),
@@ -345,7 +346,11 @@ def build_intraday_freshness_report(
         if minute_count is None:
             session_incomplete.append(symbol)
             continue
-        threshold = SESSION_COMPLETE_MINUTE_THRESHOLD_5M if interval == "5m" else SESSION_COMPLETE_MINUTE_THRESHOLD
+        threshold = (
+            SESSION_COMPLETE_MINUTE_THRESHOLD_5M
+            if interval == "5m"
+            else SESSION_COMPLETE_MINUTE_THRESHOLD
+        )
         if minute_count < threshold:
             session_incomplete.append(symbol)
             continue

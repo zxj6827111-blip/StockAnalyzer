@@ -486,7 +486,11 @@ class RuntimeEvolutionCoreService:
             # Only gate when the readiness artifact is actually deployed (NAS prod):
             # tests and local dev have no warehouse expected date or no artifact.
             # Missing date means "readiness not yet deployed" — do not block.
-            if expected_date is not None and str(expected_date).strip() and str(expected_date).strip() != "unresolved":
+            if (
+                expected_date is not None
+                and str(expected_date).strip()
+                and str(expected_date).strip() != "unresolved"
+            ):
                 try:
                     readiness_gate = check_nightly_readiness(expected_trade_date=expected_date)
                 except Exception as exc:
@@ -613,7 +617,9 @@ class RuntimeEvolutionCoreService:
             watchlist_sync_ok = False
         if _consume_success and watchlist_sync_ok:
             try:
-                from stock_analyzer.ops.nightly_readiness import consume_nightly_readiness  # noqa: WPS433
+                from stock_analyzer.ops.nightly_readiness import (
+                    consume_nightly_readiness,  # noqa: WPS433
+                )
 
                 consumed = consume_nightly_readiness()
                 if consumed is not None:

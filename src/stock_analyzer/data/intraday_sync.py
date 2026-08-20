@@ -160,8 +160,12 @@ class IntradaySyncReport:
         }
 
 
-def _resolve_tushare_provider(warehouse: Any | None) -> Any | None:
-    """Best-effort: instantiate a TushareProvider when token is available."""
+def _resolve_tushare_provider(
+    warehouse: Any | None,
+    *,
+    timeout_sec: float,
+) -> Any | None:
+    """Instantiate a bounded Tushare provider only when a token is available."""
     try:
         from stock_analyzer.data.tushare_provider import TushareProvider  # noqa: WPS433
 
@@ -172,7 +176,6 @@ def _resolve_tushare_provider(warehouse: Any | None) -> Any | None:
                 token = value
                 break
         if not token and warehouse is not None:
-            # Some warehouse wrappers carry config.token
             for attr in ("tushare_token", "_token", "token"):
                 try:
                     candidate = str(getattr(warehouse, attr, "") or "").strip()
@@ -181,15 +184,22 @@ def _resolve_tushare_provider(warehouse: Any | None) -> Any | None:
                         break
                 except Exception:
                     continue
-        provider = TushareProvider(token=token) if token else TushareProvider()
-        return provider
+        if not token:
+            return None
+        return TushareProvider(
+            token=token,
+            max_attempts=1,
+            socket_timeout_sec=max(0.1, float(timeout_sec)),
+        )
     except Exception:
         return None
 
 
 def _is_transport_failure(exc: Exception) -> bool:
     try:
-        from stock_analyzer.data.tushare_provider import _is_transport_failure as _impl  # noqa: WPS433
+        from stock_analyzer.data.tushare_provider import (
+            _is_transport_failure as _impl,  # noqa: WPS433
+        )
 
         return bool(_impl(exc))
     except Exception:
@@ -202,7 +212,7 @@ def _fetch_with_sina(symbol: str, timeout_sec: int = 5) -> pd.DataFrame:
         from stock_analyzer.data.intraday_summary import fetch_sina_minute_bars  # noqa: WPS433
 
         return fetch_sina_minute_bars(
-            symbol=symbol, interval="1m", timeout_sec=max(5, int(timeout_sec))
+            symbol=symbol, interval="1m", timeout_sec=max(1, int(timeout_sec))
         )
     except Exception:
         return pd.DataFrame()
@@ -356,7 +366,10 @@ def sync_intraday_symbols(
         primary_norm = str(primary or "tushare").strip().lower() or "tushare"
         fallback_norm = str(fallback or "sina").strip().lower() or "sina"
 
-        tushare = tushare_provider or _resolve_tushare_provider(warehouse)
+        provider_timeout = min(max(0.1, float(timeout_sec)), max(0.1, float(deadline_sec)))
+        tushare = tushare_provider or _resolve_tushare_provider(
+            warehouse, timeout_sec=provider_timeout
+        )
         # Probe capability with up to 2 symbols that actually need fetching.
         # Never probe up_to_date symbols — they may not need fetching at all.
         probe_symbols: list[str] = fetch_needed[:_PROBE_COUNT]
@@ -372,48 +385,85 @@ def sync_intraday_symbols(
         probe_error = ""
         probed = 0
         circuit_open = False
+
+        def _probe_one(symbol: str) -> tuple[bool, bool, str]:
+            """Return (provider_usable, business_failure, error)."""
+            first_error = ""
+            try:
+                tushare.fetch_minute_bars(  # type: ignore[union-attr]
+                    symbol=symbol,
+                    start_date=required_date,
+                    end_date=required_date,
+                    freq="1min",
+                )
+                return True, False, ""
+            except Exception as exc:
+                first_error = f"{type(exc).__name__}:{exc}"
+                if not _is_transport_failure(exc):
+                    return False, True, first_error
+            if monotonic() - started >= float(deadline_sec):
+                return False, False, f"{first_error} | retry:deadline_exceeded"
+            try:
+                tushare.fetch_minute_bars(  # type: ignore[union-attr]
+                    symbol=symbol,
+                    start_date=required_date,
+                    end_date=required_date,
+                    freq="1min",
+                )
+                return True, False, first_error
+            except Exception as exc:
+                retry_error = f"{type(exc).__name__}:{exc}"
+                if not _is_transport_failure(exc):
+                    return False, True, f"{first_error} | retry:{retry_error}"
+                # A repeated transport failure is handled per symbol via fallback;
+                # it does not prove that the Tushare capability is unavailable.
+                return True, False, f"{first_error} | retry:{retry_error}"
+
         if primary_norm == "tushare" and tushare is not None and probe_symbols:
-            for sym in probe_symbols[:_PROBE_COUNT]:
-                probed += 1
-                try:
-                    frame = tushare.fetch_minute_bars(  # type: ignore[union-attr]
-                        symbol=sym,
-                        start_date=required_date,
-                        end_date=required_date,
-                        freq="1min",
-                    )
-                    # Empty frame is not a capability failure — the stock may be
-                    # suspended on that day.  Only an exception counts.
-                    _ = frame
-                except Exception as exc:
-                    msg = f"{type(exc).__name__}:{exc}"
-                    probe_error = msg
-                    if _is_transport_failure(exc):
-                        # Transient: retry once per PLAN
-                        try:
-                            frame = tushare.fetch_minute_bars(  # type: ignore[union-attr]
-                                symbol=sym,
-                                start_date=required_date,
-                                end_date=required_date,
-                                freq="1min",
-                            )
-                            _ = frame
-                            continue
-                        except Exception as exc2:
-                            probe_error = f"{type(exc2).__name__}:{exc2}"
-                            if not _is_transport_failure(exc2):
-                                circuit_open = True
-                                tushare_ok = False
-                                probe_error = msg + f" | retry:{probe_error}"
-                                break
-                            # Transient even after retry: treat as probe OK but
-                            # let per-symbol logic fall back individually.
-                            continue
-                    else:
-                        # Business / permission / quota error -> circuit open
+            probe_targets = probe_symbols[:_PROBE_COUNT]
+            probed = len(probe_targets)
+            executor = ThreadPoolExecutor(max_workers=min(len(probe_targets), max(1, concurrency)))
+            try:
+                futures = {executor.submit(_probe_one, sym): sym for sym in probe_targets}
+                pending = set(futures)
+                while pending and not circuit_open:
+                    remaining = max(0.0, float(deadline_sec) - (monotonic() - started))
+                    if remaining <= 0:
                         circuit_open = True
                         tushare_ok = False
+                        probe_error = "deadline_exceeded"
+                        for future in pending:
+                            future.cancel()
                         break
+                    done, pending = wait(
+                        pending,
+                        timeout=remaining,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    if not done:
+                        circuit_open = True
+                        tushare_ok = False
+                        probe_error = "deadline_exceeded"
+                        for future in pending:
+                            future.cancel()
+                        break
+                    for future in done:
+                        try:
+                            provider_usable, business_failure, error = future.result(timeout=0)
+                        except Exception as exc:
+                            provider_usable = True
+                            business_failure = False
+                            error = f"{type(exc).__name__}:{exc}"
+                        if error:
+                            probe_error = error
+                        if business_failure or not provider_usable:
+                            circuit_open = True
+                            tushare_ok = False
+                            for pending_future in pending:
+                                pending_future.cancel()
+                            break
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
             report.capability_probe = {
                 "probed": probed,
                 "tushare_ok": tushare_ok,
@@ -430,8 +480,10 @@ def sync_intraday_symbols(
 
         # If circuit is open for tushare, remaining HS stocks uniformly use fallback.
         # The per-symbol fetcher will honour that.
-        from stock_analyzer.data.tushare_provider import resample_1m_to_5m_session_aware  # noqa: WPS433
         from stock_analyzer.data.intraday_summary import summarize_minute_bars  # noqa: WPS433
+        from stock_analyzer.data.tushare_provider import (
+            resample_1m_to_5m_session_aware,  # noqa: WPS433
+        )
 
         ok_symbols: list[str] = []
         failed_symbols: list[str] = []
@@ -445,7 +497,7 @@ def sync_intraday_symbols(
         def _fetch_one(symbol: str) -> tuple[str, str, pd.DataFrame, str]:
             """Return (symbol, source_used, frame_1m, error_reason)."""
             # Budget check — float comparison, no int truncation.
-            if monotonic() - started > max(5.0, float(deadline_sec)):
+            if monotonic() - started >= float(deadline_sec):
                 return symbol, "deadline", pd.DataFrame(), "deadline_exceeded"
             prefer_tushare = use_tushare_for_symbol(symbol)
             # Try primary first
@@ -496,43 +548,43 @@ def sync_intraday_symbols(
         # timeout enforcement.  The executor is shut down without waiting so
         # running HTTP calls do not block beyond the deadline (P1-3 fix).
         results: dict[str, tuple[str, pd.DataFrame, str]] = {}
-        executor = ThreadPoolExecutor(max_workers=max(1, int(concurrency)))
-        try:
-            futures_to_symbol: dict[Any, str] = {}
-            for sym in fetch_needed:
-                fut = executor.submit(_fetch_one, sym)
-                futures_to_symbol[fut] = sym
-            pending = set(futures_to_symbol.keys())
-            while pending:
-                remaining = max(0.0, float(deadline_sec) - (monotonic() - started))
-                if remaining <= 0:
-                    for fut in pending:
-                        fut.cancel()
-                    break
-                iter_timeout = min(remaining, max(1.0, float(timeout_sec)) + 1.0)
-                done, pending = wait(pending, timeout=iter_timeout, return_when=FIRST_COMPLETED)
-                for fut in done:
-                    sym = futures_to_symbol[fut]
-                    try:
-                        symbol, source, frame, err = fut.result(timeout=0)
-                    except Exception as exc:
-                        symbol, source, frame, err = (
-                            sym,
-                            "",
-                            pd.DataFrame(),
-                            f"{type(exc).__name__}:{exc}",
-                        )
-                    results[symbol] = (source, frame, err)
-        finally:
-            # Do not block on running HTTP calls beyond the deadline.
+        remaining_before_fetch = max(0.0, float(deadline_sec) - (monotonic() - started))
+        if fetch_needed and remaining_before_fetch > 0:
+            executor = ThreadPoolExecutor(max_workers=max(1, int(concurrency)))
             try:
+                futures_to_symbol: dict[Any, str] = {}
+                for sym in fetch_needed:
+                    if monotonic() - started >= float(deadline_sec):
+                        break
+                    fut = executor.submit(_fetch_one, sym)
+                    futures_to_symbol[fut] = sym
+                pending = set(futures_to_symbol.keys())
+                while pending:
+                    remaining = max(0.0, float(deadline_sec) - (monotonic() - started))
+                    if remaining <= 0:
+                        for fut in pending:
+                            fut.cancel()
+                        break
+                    iter_timeout = min(remaining, max(1.0, float(timeout_sec)) + 1.0)
+                    done, pending = wait(
+                        pending,
+                        timeout=iter_timeout,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    for fut in done:
+                        sym = futures_to_symbol[fut]
+                        try:
+                            symbol, source, frame, err = fut.result(timeout=0)
+                        except Exception as exc:
+                            symbol, source, frame, err = (
+                                sym,
+                                "",
+                                pd.DataFrame(),
+                                f"{type(exc).__name__}:{exc}",
+                            )
+                        results[symbol] = (source, frame, err)
+            finally:
                 executor.shutdown(wait=False, cancel_futures=True)
-            except TypeError:
-                # Python <3.9: cancel_futures not supported.
-                try:
-                    executor.shutdown(wait=False)
-                except Exception:
-                    pass
         # Seed results for the up-to-date stocks so the loop below can skip them.
         for sym in skipped_up_to_date:
             if sym not in results:

@@ -16,7 +16,9 @@ from stock_analyzer.ops.nightly_readiness import (
 )
 
 
-def test_write_to_authoritative_and_read_back(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_write_to_authoritative_and_read_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     auth = tmp_path / "artifacts" / "runtime" / "nightly_data_ready.json"
     monkeypatch.setenv("SA__NIGHTLY_READINESS_PATH", str(auth))
     assert authoritative_readiness_path() == auth
@@ -61,7 +63,9 @@ def test_consume_drains_all_mirrors(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(mod, "_candidate_readiness_paths", orig_candidates)
 
 
-def test_batch_readiness_file_contains_expected_keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_batch_readiness_file_contains_expected_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     auth = tmp_path / "artifacts" / "runtime" / "nightly_data_ready.json"
     monkeypatch.setenv("SA__NIGHTLY_READINESS_PATH", str(auth))
     write_nightly_readiness(

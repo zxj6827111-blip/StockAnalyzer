@@ -797,7 +797,9 @@ class TushareProvider:
                 )
             )
         except Exception as exc:
-            raise DataSourceError(f"tushare stk_mins failed for {ts_code} {freq_norm}: {exc}") from exc
+            raise DataSourceError(
+                f"tushare stk_mins failed for {ts_code} {freq_norm}: {exc}"
+            ) from exc
         frame = _coerce_frame(raw)
         if frame.empty:
             return pd.DataFrame()
@@ -2205,7 +2207,11 @@ def _format_minute_datetime(value: object, *, is_start: bool = True) -> str:
         return value.strftime("%Y-%m-%d %H:%M:%S")
     if isinstance(value, date):
         anchor = "09:30:00" if is_start else "15:00:00"
-        return datetime.combine(value, datetime.min.time()).strftime("%Y-%m-%d %H:%M:%S").replace("00:00:00", anchor)
+        return (
+            datetime.combine(value, datetime.min.time())
+            .strftime("%Y-%m-%d %H:%M:%S")
+            .replace("00:00:00", anchor)
+        )
     text = str(value or "").strip()
     if not text:
         return ""
@@ -2255,7 +2261,11 @@ def _normalize_tushare_minute_frame(frame: pd.DataFrame, *, freq: str) -> pd.Dat
         datetime_col = "datetime"
     else:
         datetime_col = next(
-            (name for name in ("trade_time", "datetime", "date", "trade_date") if name in raw.columns),
+            (
+                name
+                for name in ("trade_time", "datetime", "date", "trade_date")
+                if name in raw.columns
+            ),
             "",
         )
         if not datetime_col:
@@ -2289,7 +2299,11 @@ def _normalize_tushare_minute_frame(frame: pd.DataFrame, *, freq: str) -> pd.Dat
     raw = raw.set_index("datetime").sort_index()
     raw = raw[~raw.index.duplicated(keep="last")]
     raw.index.name = "datetime"
-    keep_cols = [c for c in ("open", "high", "low", "close", "volume", "amount") if c in raw.columns]
+    keep_cols = [
+        column
+        for column in ("open", "high", "low", "close", "volume", "amount")
+        if column in raw.columns
+    ]
     return raw[keep_cols].copy()
 
 
@@ -2314,11 +2328,15 @@ def resample_1m_to_5m_session_aware(frame: pd.DataFrame) -> pd.DataFrame:
             e_hour, e_min = map(int, session_end_str.split(":"))
             session_start = pd.Timestamp(trade_date) + pd.Timedelta(hours=s_hour, minutes=s_min)
             session_end = pd.Timestamp(trade_date) + pd.Timedelta(hours=e_hour, minutes=e_min)
-            session = day_group.loc[(day_group.index >= session_start) & (day_group.index <= session_end)]
+            session = day_group.loc[
+                (day_group.index >= session_start) & (day_group.index <= session_end)
+            ]
             if session.empty:
                 continue
             # Bucket index within session (integer minutes, no hidden float).
-            minutes_since_start = ((session.index - session_start) // pd.Timedelta("1min")).astype(int)
+            minutes_since_start = (
+                (session.index - session_start) // pd.Timedelta("1min")
+            ).astype(int)
             bin_idx = minutes_since_start // 5
             for _, bucket in session.groupby(bin_idx, sort=True):
                 bucket = bucket.sort_index()
@@ -2331,7 +2349,11 @@ def resample_1m_to_5m_session_aware(frame: pd.DataFrame) -> pd.DataFrame:
                             "low": [float(bucket["low"].min())],
                             "close": [float(bucket["close"].iloc[-1])],
                             "volume": [float(bucket["volume"].sum())],
-                            "amount": [float(bucket["amount"].sum()) if "amount" in bucket.columns else 0.0],
+                            "amount": [
+                                float(bucket["amount"].sum())
+                                if "amount" in bucket.columns
+                                else 0.0
+                            ],
                         }
                     ).set_index("datetime")
                 )
