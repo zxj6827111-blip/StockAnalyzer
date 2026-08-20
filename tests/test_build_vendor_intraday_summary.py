@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 
 from scripts import build_vendor_intraday_summary as builder
+from stock_analyzer.data.intraday_summary_builder import entry_symbol
 from stock_analyzer.data.market_warehouse import MarketWarehouse
 
 
@@ -46,7 +47,7 @@ def test_entry_symbol_accepts_annual_and_monthly_names(
     entry_name: str,
     expected: str,
 ) -> None:
-    assert builder._entry_symbol(entry_name) == expected
+    assert entry_symbol(entry_name) == expected
 
 
 def test_build_summary_opens_each_source_zip_once(

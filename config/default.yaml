@@ -350,6 +350,16 @@ week5:
   feature_snapshot_progress_path: "artifacts/runtime/feature_snapshot_progress.json"
   # Week5 扫描进度文件：阶段推进 + final pipeline 单股心跳（原子 JSON 更新）。
   scan_progress_path: "artifacts/runtime/week5_scan_progress.json"
+  # PLAN Sections 2-3: unified minute sync (tushare primary / sina fallback)
+  # and per-symbol freshness gate for the nightly deep stage.
+  intraday_sync_enabled: true
+  intraday_sync_primary: "tushare"
+  intraday_sync_fallback: "sina"
+  intraday_sync_concurrency: 4
+  intraday_sync_timeout_sec: 5
+  intraday_sync_deadline_sec: 180
+  intraday_fresh_ratio_min: 0.95
+  intraday_single_ticker_budget_sec: 5
   # final pipeline 仅并行 FeatureEngineer.transform；provider、模型推理、
   # 风控与落库仍按输入顺序留在主线程。容器同时限制 BLAS 内部线程。
   final_pipeline_transform_max_workers: 4

@@ -601,7 +601,10 @@ class VendorZipOverlayProvider:
         baseline: dict[str, pd.DataFrame] = {}
         if self._intraday_warehouse is not None:
             try:
-                self._ensure_intraday_summary_ready(interval)
+                # Global summary-vs-daily gate removed (NO-GO P0-1): the per-symbol
+                # freshness gate (ops/intraday_freshness) is the production gate.
+                # The query layer fetches and merges baseline + delta per symbol;
+                # staleness is enforced by the freshness gate, not by the overlay.
                 baseline = self._intraday_warehouse.fetch_intraday_summaries(
                     symbols,
                     interval,
@@ -672,13 +675,56 @@ class VendorZipOverlayProvider:
             raise RequiredIntradayDataError(f"intraday manifest has empty {interval} max_date")
         if expected_latest is None or summary_latest >= expected_latest:
             return
+        # A-share open-day lag via weekday-safe calendar (not np.busday_count
+        # alone: holidays/weekends need Mon-Fri filtering).  Keep the delta
+        # fallback until per-symbol freshness is verified (PLAN Section 3
+        # TODO: remove once intraday_freshness gate covers all symbols).
         lag = int(
             np.busday_count(
                 summary_latest.isoformat(),
                 expected_latest.isoformat(),
             )
         )
+        # TODO(PLAN Section 3): per-symbol freshness already enforces
+        # allowed_lag=0 via ops/intraday_freshness; this global vendor
+        # overlay gate can be tightened/removed after that gate is proven in
+        # nightly deep runs.  Keep allowed_lag=0 semantics.
         if lag > self.intraday_max_staleness_trading_days:
+            # Global delta coverage fallback (NO-GO P1): this is the legacy
+            # global bypass that lets any lag be rescued by the delta's max
+            # date.  It must NOT be the production readiness gate — the night
+            # deep freshness gate (ops/intraday_freshness, 1m+5m per-symbol)
+            # is the real gate.  Fail-closed in prod, legacy-only fallback
+            # when explicitly in zip_legacy mode or when tests set the flag.
+            # In duckdb_required (production) this block is disabled.
+            if self.intraday_runtime_mode == "duckdb_required":
+                raise RequiredIntradayDataError(
+                    f"intraday summary stale for {interval}: "
+                    f"summary={summary_latest.isoformat()} "
+                    f"expected={expected_latest.isoformat()} lag={lag} "
+                    f"(global delta fallback disabled in duckdb_required; "
+                    f"use per-symbol intraday_freshness)"
+                )
+            # Legacy zip_legacy / duckdb_optional path only
+            delta_warehouse = self._delta_warehouse()
+            if delta_warehouse is not None:
+                try:
+                    delta_coverage = delta_warehouse.intraday_coverage(interval=interval)
+                    delta_latest = _coerce_date(delta_coverage.get("max_date"))
+                    if delta_latest is not None and delta_latest >= expected_latest:
+                        logger.warning(
+                            "intraday summary stale for %s (summary=%s expected=%s lag=%d) "
+                            "but delta warehouse covers %s  —  allowing legacy fallback "
+                            "(zip_legacy only)",
+                            interval,
+                            summary_latest.isoformat(),
+                            expected_latest.isoformat(),
+                            lag,
+                            delta_latest.isoformat(),
+                        )
+                        return
+                except Exception:
+                    logger.exception("delta intraday coverage fallback check failed")
             raise RequiredIntradayDataError(
                 f"intraday summary stale for {interval}: "
                 f"summary={summary_latest.isoformat()} "

@@ -91,6 +91,9 @@ from stock_analyzer.data.tushare_provider import (  # noqa: E402
     TushareProvider,
     _to_ts_code,
 )
+from stock_analyzer.ops.nightly_readiness import (  # noqa: E402
+    write_nightly_readiness,
+)
 
 EARLIEST_DATE = date(1990, 1, 1)
 DAILY_ARCHIVE_RE = re.compile(r"^(?P<year>\d{4})(?:\((?P<copy>\d+)\))?\.zip$", re.I)
@@ -1501,41 +1504,6 @@ def _latest_index_date(index_path: str | Path) -> date | None:
     return max(latest_dates, default=None)
 
 
-def _refresh_intraday_summary(
-    *,
-    vendor_root: Path,
-    output_path: str | Path,
-    keep_days: int,
-    required_latest_date: date | None,
-) -> dict[str, object]:
-    import importlib.util
-
-    builder_script = Path(__file__).resolve().parent / "build_vendor_intraday_summary.py"
-    spec = importlib.util.spec_from_file_location(
-        "build_vendor_intraday_summary_for_updater",
-        builder_script,
-    )
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"cannot load intraday summary builder: {builder_script}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    manifest = module.build_summary(
-        root=vendor_root,
-        output=output_path,
-        keep_days=max(1, int(keep_days)),
-        required_latest_date=required_latest_date,
-    )
-    return {
-        "updated": True,
-        "output": str(Path(output_path).expanduser()),
-        "required_latest_date": (
-            required_latest_date.isoformat() if required_latest_date is not None else ""
-        ),
-        "generation": str(manifest.get("generation", "")),
-        "coverage": manifest.get("coverage", {}),
-    }
-
-
 def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1637,24 +1605,6 @@ def _main(argv: list[str] | None = None) -> int:
         "(import_vendor_zip_to_delta.py --incremental); requires --index-path. "
         "Example: /app/artifacts/vendor_delta/market_delta.duckdb",
     )
-    parser.add_argument(
-        "--intraday-summary-output",
-        default=os.environ.get("SA_INTRADAY_SUMMARY_OUTPUT", ""),
-        help="Build and atomically promote vendor intraday summary DuckDB after "
-        "a successful nightly update. May also be set with "
-        "SA_INTRADAY_SUMMARY_OUTPUT.",
-    )
-    parser.add_argument(
-        "--intraday-summary-keep-days",
-        type=int,
-        default=int(os.environ.get("SA_INTRADAY_SUMMARY_KEEP_DAYS", "480")),
-        help="Natural-day retention for the intraday summary builder.",
-    )
-    parser.add_argument(
-        "--intraday-summary-required-latest-date",
-        default=os.environ.get("SA_INTRADAY_SUMMARY_REQUIRED_LATEST_DATE", ""),
-        help="Optional YYYY-MM-DD freshness floor; defaults to the latest daily index date.",
-    )
     args = parser.parse_args(argv)
 
     vendor_root = Path(args.vendor_root).expanduser()
@@ -1665,14 +1615,6 @@ def _main(argv: list[str] | None = None) -> int:
     checkpoint: dict[str, object] = (
         _load_checkpoint(checkpoint_path) if checkpoint_path is not None else {}
     )
-    explicit_intraday_latest = _coerce_date(
-        args.intraday_summary_required_latest_date
-    )
-    if (
-        args.intraday_summary_required_latest_date.strip()
-        and explicit_intraday_latest is None
-    ):
-        parser.error("--intraday-summary-required-latest-date must be YYYY-MM-DD")
 
     if args.symbols_file.strip():
         raw_path = Path(args.symbols_file.strip()).expanduser()
@@ -1748,46 +1690,21 @@ def _main(argv: list[str] | None = None) -> int:
             dry_run=bool(args.dry_run),
             index_path=args.index_path,
         )
-        intraday_summary_report: dict[str, object] = {
-            "updated": False,
-            "reason": "not_enabled",
-        }
-        if args.intraday_summary_output.strip():
-            if args.dry_run:
-                intraday_summary_report = {"updated": False, "reason": "dry_run"}
-            elif not bool(batch_payload.get("ok", False)):
-                intraday_summary_report = {
-                    "updated": False,
-                    "reason": "upstream_update_failed",
-                }
-            else:
-                required_latest = (
-                    explicit_intraday_latest
-                    or _latest_index_date(args.index_path)
-                    or _coerce_date(batch_payload.get("latest_daily_date"))
-                    or batch_end_date
+        # Write nightly readiness after successful batch run.
+        if not args.dry_run and bool(batch_payload.get("ok", False)):
+            _latest = _coerce_date(batch_payload.get("latest_daily_date", ""))
+            if _latest is None:
+                _latest = end_date
+            try:
+                write_nightly_readiness(
+                    target_trade_date=_latest,
+                    db_path=args.sync_vendor_delta,
+                    index_path=args.index_path,
+                    extra={"source": "batch_update"},
                 )
-                try:
-                    intraday_summary_report = _refresh_intraday_summary(
-                        vendor_root=vendor_root,
-                        output_path=args.intraday_summary_output,
-                        keep_days=args.intraday_summary_keep_days,
-                        required_latest_date=required_latest,
-                    )
-                except Exception as exc:
-                    intraday_summary_report = {
-                        "updated": False,
-                        "reason": f"{type(exc).__name__}:{exc}",
-                        "required_latest_date": required_latest.isoformat(),
-                    }
-                    batch_payload["ok"] = False
-                    errors = batch_payload.setdefault("errors", [])
-                    if isinstance(errors, list):
-                        errors.append(
-                            "intraday_summary_failed:"
-                            f"{type(exc).__name__}:{exc}"
-                        )
-        batch_payload["intraday_summary"] = intraday_summary_report
+            except Exception:
+                pass  # Non-fatal: readiness is a signal, not a gate.
+
         summary = {
             "tool": "update_vendor_daily_from_tushare",
             "finished_at": datetime.now().isoformat(timespec="seconds"),
@@ -1924,37 +1841,6 @@ def _main(argv: list[str] | None = None) -> int:
                 rebuild_latest_dates=rebuild_latest_dates,
             )
 
-    intraday_summary_report: dict[str, object] = {
-        "updated": False,
-        "reason": "not_enabled",
-    }
-    if args.intraday_summary_output.strip():
-        if args.dry_run:
-            intraday_summary_report = {"updated": False, "reason": "dry_run"}
-        elif failures:
-            intraday_summary_report = {
-                "updated": False,
-                "reason": "upstream_update_failed",
-            }
-        else:
-            required_latest = (
-                explicit_intraday_latest
-                or _latest_index_date(args.index_path)
-                or max(rebuild_latest_dates.values(), default=end_date)
-            )
-            try:
-                intraday_summary_report = _refresh_intraday_summary(
-                    vendor_root=vendor_root,
-                    output_path=args.intraday_summary_output,
-                    keep_days=args.intraday_summary_keep_days,
-                    required_latest_date=required_latest,
-                )
-            except Exception as exc:
-                intraday_summary_report = {
-                    "updated": False,
-                    "reason": f"{type(exc).__name__}:{exc}",
-                    "required_latest_date": required_latest.isoformat(),
-                }
 
     # Delta baseline incremental sync: after the ZIPs and the last-date index
     # are updated, mirror the new rows into the delta DuckDB so the Week5
@@ -2012,6 +1898,24 @@ def _main(argv: list[str] | None = None) -> int:
                 "reason": f"{type(exc).__name__}:{exc}",
             }
 
+    # Write nightly readiness after successful full run.
+    if not args.dry_run and not failures:
+        _readiness_ok = True
+        if isinstance(index_report, dict) and str(index_report.get("reason", "")).strip() not in ("", "not_enabled"):
+            _readiness_ok = bool(index_report.get("updated", False))
+        if isinstance(delta_sync_report, dict) and str(delta_sync_report.get("reason", "")).strip() not in ("", "not_enabled"):
+            _readiness_ok = bool(delta_sync_report.get("updated", False))
+        if _readiness_ok:
+            try:
+                write_nightly_readiness(
+                    target_trade_date=end_date,
+                    db_path=args.sync_vendor_delta,
+                    index_path=args.index_path,
+                    extra={"source": "per_symbol_update"},
+                )
+            except Exception:
+                pass  # Non-fatal: readiness is a signal, not a gate.
+
     summary = {
         "tool": "update_vendor_daily_from_tushare",
         "finished_at": datetime.now().isoformat(timespec="seconds"),
@@ -2029,15 +1933,10 @@ def _main(argv: list[str] | None = None) -> int:
         "checkpoint": str(checkpoint_path) if checkpoint_path is not None else "",
         "zip_rebuilds": rebuild_reports,
         "index": index_report,
-        "intraday_summary": intraday_summary_report,
         "delta_sync": delta_sync_report,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    if failures or (
-        args.intraday_summary_output.strip()
-        and not bool(intraday_summary_report.get("updated", False))
-        and not args.dry_run
-    ):
+    if failures:
         return 1
     return 0
 

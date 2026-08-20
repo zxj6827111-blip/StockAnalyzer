@@ -7208,6 +7208,52 @@ class StockAnalyzerService:
         # 第 3 级：稳定 sentinel，不使用 wall-clock 日期
         return "unresolved"
 
+    def _resolve_nightly_expected_trade_date(self) -> str | date | None:
+        """Latest daily index date (authoritative expected date for readiness).
+
+        Uses the same cascade as ``_resolve_universe_seed_trade_date`` but
+        returns raw date/ISO string so callers can feed ``check`` directly.
+        Returns ``None`` when no index / warehouse date is available.
+        """
+        try:
+            snapshot = self._market_warehouse().background_data_quality_snapshot()
+            if isinstance(snapshot, dict):
+                latest = str(snapshot.get("latest_trade_date", "")).strip()
+                if latest:
+                    return latest
+        except Exception:
+            pass
+        try:
+            max_date: date | None = None
+            for provider in self._iter_market_data_provider_graph():
+                fetcher = getattr(provider, "latest_daily_dates", None)
+                if not callable(fetcher):
+                    continue
+                try:
+                    dates_map = fetcher()
+                except Exception:
+                    continue
+                if not isinstance(dates_map, dict):
+                    continue
+                for value in dates_map.values():
+                    candidate: date | None = None
+                    if isinstance(value, date) and not isinstance(value, datetime):
+                        candidate = value
+                    elif isinstance(value, datetime):
+                        candidate = value.date()
+                    elif isinstance(value, str) and value.strip():
+                        try:
+                            candidate = datetime.fromisoformat(value.strip()).date()
+                        except ValueError:
+                            continue
+                    if candidate is not None and (max_date is None or candidate > max_date):
+                        max_date = candidate
+            if max_date is not None:
+                return max_date
+        except Exception:
+            pass
+        return None
+
     def _resolve_market_warehouse_auto_refresh(
         self,
         *,
