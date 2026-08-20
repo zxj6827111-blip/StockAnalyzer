@@ -541,7 +541,7 @@ def sync_intraday_symbols(
                 results[sym] = ("skipped", pd.DataFrame(), f"up_to_date:1m={d1},5m={d5}")
 
         # Classify up-to-date symbols as skipped upfront (no fetch, no stale).
-        for sym in skipped_up_to_date:
+        for _sym in skipped_up_to_date:
             source_counts["skipped"] = int(source_counts.get("skipped", 0)) + 1
 
         for symbol in eligible:

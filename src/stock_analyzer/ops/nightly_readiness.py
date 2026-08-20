@@ -154,15 +154,13 @@ def _candidate_readiness_paths() -> list[Path]:
     cwd_candidate = Path.cwd() / "artifacts" / "runtime" / READINESS_FILENAME
     if cwd_candidate not in candidates:
         candidates.append(cwd_candidate)
-    # De-duplicate while preserving order.
+    # De-duplicate while preserving order (resolved path when file exists).
     seen: set[str] = set()
     unique: list[Path] = []
     for item in candidates:
         key = str(item.resolve()) if item.exists() else str(item)
-        # Use string form for de-duplication even when file absent.
-        str_key = str(item)
-        if str_key not in seen:
-            seen.add(str_key)
+        if key not in seen:
+            seen.add(key)
             unique.append(item)
     return unique
 
