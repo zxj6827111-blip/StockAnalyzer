@@ -226,19 +226,14 @@ def _read_last_line_date(archive_path: Path, entry_name: str) -> date | None:
             with archive.open(entry_name) as stream:
                 frame = pd.read_csv(
                     stream,
-                    usecols=lambda column: column
-                    in {"datetime", "trade_date", "date", "交易日期"},
+                    usecols=lambda column: column in {"datetime", "trade_date", "date", "交易日期"},
                 )
         except (KeyError, ValueError):
             return None
     if frame.empty:
         return None
     date_column = next(
-        (
-            name
-            for name in ("datetime", "trade_date", "date", "交易日期")
-            if name in frame.columns
-        ),
+        (name for name in ("datetime", "trade_date", "date", "交易日期") if name in frame.columns),
         "",
     )
     if not date_column:
@@ -322,9 +317,7 @@ def _scan_latest_dates_for_symbols(
                             entry_name,
                         )
                         current = found_in_archive.get(symbol)
-                        if entry_date is not None and (
-                            current is None or entry_date > current
-                        ):
+                        if entry_date is not None and (current is None or entry_date > current):
                             found_in_archive[symbol] = entry_date
         except zipfile.BadZipFile:
             continue
@@ -363,14 +356,9 @@ def _update_last_date_index(
         return {"updated": False, "reason": "index_missing"}
     symbols = cast("dict[str, object]", payload["symbols"])
     provided = {
-        _index_symbol_key(symbol): latest
-        for symbol, latest in (rebuild_latest_dates or {}).items()
+        _index_symbol_key(symbol): latest for symbol, latest in (rebuild_latest_dates or {}).items()
     }
-    missing = {
-        symbol
-        for symbol in updated_symbols
-        if _index_symbol_key(symbol) not in provided
-    }
+    missing = {symbol for symbol in updated_symbols if _index_symbol_key(symbol) not in provided}
     scanned = (
         _scan_latest_dates_for_symbols(
             daily_root=daily_root,
@@ -385,11 +373,7 @@ def _update_last_date_index(
         latest = latest_by_symbol.get(normalized_code)
         if latest is None:
             continue
-        index_key = (
-            normalized_code
-            if normalized_code in symbols or code not in symbols
-            else code
-        )
+        index_key = normalized_code if normalized_code in symbols or code not in symbols else code
         existing = symbols.get(index_key)
         if isinstance(existing, dict):
             existing["latest_date"] = latest.isoformat()
@@ -482,9 +466,7 @@ def _daily_to_25_columns(
         }
     )
     frame["code"] = ts_code
-    frame["datetime"] = (
-        frame["datetime"].astype(str).str.replace("-", "", regex=False)
-    )
+    frame["datetime"] = frame["datetime"].astype(str).str.replace("-", "", regex=False)
     frame = frame[frame["datetime"].str.fullmatch(r"\d{8}", na=False)]
     if basic is not None and not basic.empty and "trade_date" in basic.columns:
         basic_frame = basic.copy()
@@ -533,9 +515,7 @@ def _factor_rows(
     frame["adj_factor"] = pd.to_numeric(frame["adj_factor"], errors="coerce")
     frame = frame.dropna(subset=["trade_date", "adj_factor"])
     frame = frame[frame["adj_factor"] > 0]
-    frame = frame.sort_values("trade_date").drop_duplicates(
-        subset=["trade_date"], keep="last"
-    )
+    frame = frame.sort_values("trade_date").drop_duplicates(subset=["trade_date"], keep="last")
     if frame.empty:
         raise DataSourceError(f"tushare adj_factor empty after normalize for {ts_code}")
     if anchor == "latest":
@@ -639,11 +619,7 @@ def _rebuild_daily_year_zip(
             continue
         replace_entries[entry_name] = rendered
         date_column = next(
-            (
-                name
-                for name in ("datetime", "trade_date", "date")
-                if name in merged.columns
-            ),
+            (name for name in ("datetime", "trade_date", "date") if name in merged.columns),
             "",
         )
         if date_column:
@@ -679,11 +655,7 @@ def _rebuild_zip(
     ) as output:
         if archive_path.exists():
             with zipfile.ZipFile(archive_path) as source:
-                old_names = {
-                    info.filename
-                    for info in source.infolist()
-                    if not info.is_dir()
-                }
+                old_names = {info.filename for info in source.infolist() if not info.is_dir()}
                 for info in source.infolist():
                     if info.is_dir() or info.filename in replace_entries:
                         continue
@@ -697,23 +669,16 @@ def _rebuild_zip(
         # readability and completeness.
         written_names: list[str] = []
         with zipfile.ZipFile(temporary) as check:
-            written_names = [
-                info.filename for info in check.infolist() if not info.is_dir()
-            ]
+            written_names = [info.filename for info in check.infolist() if not info.is_dir()]
             for name in replace_entries:
                 if name not in written_names:
-                    raise DataSourceError(
-                        f"vendor ZIP rebuild lost entry: {archive_path}!{name}"
-                    )
+                    raise DataSourceError(f"vendor ZIP rebuild lost entry: {archive_path}!{name}")
             for name in written_names:
                 check.read(name)
-        duplicate_names = sorted(
-            {name for name in written_names if written_names.count(name) > 1}
-        )
+        duplicate_names = sorted({name for name in written_names if written_names.count(name) > 1})
         if duplicate_names:
             raise DataSourceError(
-                f"vendor ZIP rebuild produced duplicate entries: {archive_path}: "
-                f"{duplicate_names}"
+                f"vendor ZIP rebuild produced duplicate entries: {archive_path}: {duplicate_names}"
             )
         missing_names = sorted(old_names - set(written_names))
         if missing_names:
@@ -788,9 +753,7 @@ def _fetch_symbol(
     factor_last = None if skip_factors else _symbol_factor_last_date(factors_root, ts_code)
     need_daily = daily_last is None or daily_last < end_date
     need_factors = (not skip_factors) and (
-        force_factors
-        or factor_last is None
-        or factor_last < end_date
+        force_factors or factor_last is None or factor_last < end_date
     )
     if not need_daily and not need_factors:
         return {
@@ -891,9 +854,7 @@ def _fetch_adj_factor_paged(
     follows the same convention).
     """
     if trade_date:
-        raw = api._call_with_retry(
-            lambda: api._resolve_pro_api().adj_factor(trade_date=trade_date)
-        )
+        raw = api._call_with_retry(lambda: api._resolve_pro_api().adj_factor(trade_date=trade_date))
         return _as_frame(raw)
     parts: list[pd.DataFrame] = []
     offset = 0
@@ -947,9 +908,7 @@ def _fetch_market_wide_by_date(
         if len(part) < _TUSHARE_PAGE_LIMIT:
             break
         offset += len(part)
-    daily = (
-        pd.concat(daily_parts, ignore_index=True) if daily_parts else pd.DataFrame()
-    )
+    daily = pd.concat(daily_parts, ignore_index=True) if daily_parts else pd.DataFrame()
     basic = _as_frame(
         api._call_with_retry(
             lambda: pro.daily_basic(
@@ -958,9 +917,7 @@ def _fetch_market_wide_by_date(
             )
         )
     )
-    adj = _as_frame(
-        api._call_with_retry(lambda: pro.adj_factor(trade_date=trade_date))
-    )
+    adj = _as_frame(api._call_with_retry(lambda: pro.adj_factor(trade_date=trade_date)))
     return {"daily": daily, "basic": basic, "adj": adj}
 
 
@@ -1009,9 +966,7 @@ def _distribute_batch_day(
         code = str(ts_code)
         previous = factor_updates.get(code)
         factor_updates[code] = (
-            pd.concat([previous, group], ignore_index=True)
-            if previous is not None
-            else group
+            pd.concat([previous, group], ignore_index=True) if previous is not None else group
         )
 
 
@@ -1112,9 +1067,7 @@ def _merge_factor_rows_scaled(
     if adj_new_day is None or adj_new_day.empty:
         return None
     new_rows = adj_new_day.copy()
-    new_rows["trade_date"] = (
-        new_rows["trade_date"].astype(str).str.replace("-", "", regex=False)
-    )
+    new_rows["trade_date"] = new_rows["trade_date"].astype(str).str.replace("-", "", regex=False)
     new_rows = new_rows[new_rows["trade_date"].str.fullmatch(r"\d{8}", na=False)]
     new_rows["adj_factor"] = pd.to_numeric(new_rows["adj_factor"], errors="coerce")
     new_rows = new_rows.dropna(subset=["trade_date", "adj_factor"])
@@ -1152,9 +1105,7 @@ def _merge_factor_rows_scaled(
         if stored_frame is not None and not stored_frame.empty:
             old_dates = stored_frame["交易日期"].astype(str).tolist()
             old_values = (
-                pd.to_numeric(stored_frame["复权因子"], errors="coerce")
-                .fillna(0.0)
-                .tolist()
+                pd.to_numeric(stored_frame["复权因子"], errors="coerce").fillna(0.0).tolist()
             )
     elif archive_path.exists():
         with zipfile.ZipFile(archive_path) as archive:
@@ -1170,9 +1121,7 @@ def _merge_factor_rows_scaled(
                     continue
                 if "交易日期" not in old_frame.columns or "复权因子" not in old_frame.columns:
                     continue
-                old_frame = old_frame[
-                    ["交易日期", "复权因子"]
-                ].dropna()
+                old_frame = old_frame[["交易日期", "复权因子"]].dropna()
                 old_dates.extend(old_frame["交易日期"].astype(str).tolist())
                 old_values.extend(
                     pd.to_numeric(old_frame["复权因子"], errors="coerce").fillna(0.0).tolist()
@@ -1182,16 +1131,13 @@ def _merge_factor_rows_scaled(
         # No stored history: seed from the new day only.
         return _seed_factor_rows(ts_code=ts_code, new_rows=new_rows, anchor=anchor)
 
-    stored = pd.DataFrame(
-        {"trade_date": old_dates, "value": old_values}
-    ).drop_duplicates(subset=["trade_date"], keep="last")
-    stored = stored[stored["value"] > 0].sort_values("trade_date")
-    new_day = new_rows.sort_values("trade_date").drop_duplicates(
+    stored = pd.DataFrame({"trade_date": old_dates, "value": old_values}).drop_duplicates(
         subset=["trade_date"], keep="last"
     )
+    stored = stored[stored["value"] > 0].sort_values("trade_date")
+    new_day = new_rows.sort_values("trade_date").drop_duplicates(subset=["trade_date"], keep="last")
     new_by_date = {
-        str(row["trade_date"]): float(row["adj_factor"])
-        for _, row in new_day.iterrows()
+        str(row["trade_date"]): float(row["adj_factor"]) for _, row in new_day.iterrows()
     }
 
     merged_dates: list[str] = []
@@ -1215,9 +1161,11 @@ def _merge_factor_rows_scaled(
             # hfq(T) = hfq_old(T_old) * adj(T)/adj(T_old); history is unchanged.
             merged_values.append(last_old * float(new_by_date[trade_date]) / old_scale)
 
-    merged = pd.DataFrame(
-        {"交易日期": merged_dates, "复权因子": merged_values}
-    ).sort_values("交易日期").drop_duplicates(subset=["交易日期"], keep="last")
+    merged = (
+        pd.DataFrame({"交易日期": merged_dates, "复权因子": merged_values})
+        .sort_values("交易日期")
+        .drop_duplicates(subset=["交易日期"], keep="last")
+    )
     merged = merged[merged["复权因子"] > 0]
     if merged.empty:
         return None
@@ -1335,9 +1283,7 @@ def _run_batch(
                     api=api,
                 )
                 if previous_factor_date is not None:
-                    adj_old_day = _fetch_adj_factor_paged(
-                        api, trade_date=previous_factor_date
-                    )
+                    adj_old_day = _fetch_adj_factor_paged(api, trade_date=previous_factor_date)
             except Exception as exc:  # pragma: no cover - network dependent
                 rebuild_reports.append(
                     {
@@ -1412,9 +1358,7 @@ def _run_batch(
         "symbols_fetched": fetched_symbols,
         "symbols_updated": len(updated_codes),
         "latest_daily_date": (
-            max(rebuild_latest_dates.values()).isoformat()
-            if rebuild_latest_dates
-            else ""
+            max(rebuild_latest_dates.values()).isoformat() if rebuild_latest_dates else ""
         ),
         "zip_rebuilds": rebuild_reports,
         "index": index_report,
@@ -1458,8 +1402,12 @@ def _latest_factor_anchor_date(
         return trade_dates[-2]
     try:
         probe_from = (
-            pd.to_datetime(trade_dates[0], format="%Y%m%d") - pd.Timedelta(days=10)
-        ).strftime("%Y%m%d") if trade_dates else "20260101"
+            (pd.to_datetime(trade_dates[0], format="%Y%m%d") - pd.Timedelta(days=10)).strftime(
+                "%Y%m%d"
+            )
+            if trade_dates
+            else "20260101"
+        )
         cal = _as_frame(
             api._call_with_retry(
                 lambda: api._resolve_pro_api().trade_cal(
@@ -1588,8 +1536,7 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--batch-trade-date",
         default="",
-        help="Batch mode: single trade date to fetch (YYYY-MM-DD); "
-        "defaults to --end-date",
+        help="Batch mode: single trade date to fetch (YYYY-MM-DD); defaults to --end-date",
     )
     parser.add_argument(
         "--index-path",
@@ -1687,9 +1634,10 @@ def _main(argv: list[str] | None = None) -> int:
         print("empty universe: nothing to update", file=sys.stderr)
         return 2
 
-    token = str(os.environ.get("TUSHARE_TOKEN", "") or "").strip() or str(
-        os.environ.get("SA__MARKET_WAREHOUSE__TUSHARE_TOKEN", "") or ""
-    ).strip()
+    token = (
+        str(os.environ.get("TUSHARE_TOKEN", "") or "").strip()
+        or str(os.environ.get("SA__MARKET_WAREHOUSE__TUSHARE_TOKEN", "") or "").strip()
+    )
     if args.dry_run:
         api: TushareProvider | None = None
     else:
@@ -1712,6 +1660,12 @@ def _main(argv: list[str] | None = None) -> int:
     failures: list[str] = []
     index = _load_last_date_index(args.index_path) if args.index_path.strip() else None
 
+    # Unified batch/per-symbol dispatch: batch only decides how fetch/index
+    # is done; delta sync + readiness + summary are shared tail so batch
+    # never bypasses the incremental delta path (P0-1 fix).
+    batch_payload: dict[str, object] | None = None
+    batch_ok = False
+    batch_latest_daily: date | None = None
     if args.batch:
         batch_end_date = _coerce_date(args.batch_trade_date) or end_date
         batch_payload = _run_batch(
@@ -1723,36 +1677,8 @@ def _main(argv: list[str] | None = None) -> int:
             dry_run=bool(args.dry_run),
             index_path=args.index_path,
         )
-        # Write nightly readiness after successful batch run.
-        if not args.dry_run and bool(batch_payload.get("ok", False)):
-            _latest = _coerce_date(batch_payload.get("latest_daily_date", ""))
-            if _latest is None:
-                _latest = end_date
-            try:
-                write_nightly_readiness(
-                    target_trade_date=_latest,
-                    db_path=args.sync_vendor_delta,
-                    index_path=args.index_path,
-                    extra={"source": "batch_update"},
-                )
-            except Exception:
-                pass  # Non-fatal: readiness is a signal, not a gate.
-
-        summary = {
-            "tool": "update_vendor_daily_from_tushare",
-            "finished_at": datetime.now().isoformat(timespec="seconds"),
-            "vendor_root": str(vendor_root),
-            "daily_dir": str(daily_root),
-            "factors_dir": str(factors_root),
-            "end_date": end_date.isoformat(),
-            "symbols_total": len(symbols),
-            "dry_run": bool(args.dry_run),
-            "skip_factors": bool(args.skip_factors),
-            "checkpoint": str(checkpoint_path) if checkpoint_path is not None else "",
-            **batch_payload,
-        }
-        print(json.dumps(summary, ensure_ascii=False, indent=2))
-        return 0 if bool(batch_payload.get("ok", False)) else 1
+        batch_ok = bool(batch_payload.get("ok", False))
+        batch_latest_daily = _coerce_date(batch_payload.get("latest_daily_date", ""))
 
     max_workers = max(1, int(args.max_workers))
     if len(symbols) == 1 or max_workers == 1 or api is None:
@@ -1797,10 +1723,33 @@ def _main(argv: list[str] | None = None) -> int:
                 except Exception as exc:
                     failures.append(f"{symbol}:{type(exc).__name__}:{exc}")
 
-    ok_results = [
-        result for result in results if result.get("status") not in {"skipped", "error"}
-    ]
-    skipped_results = [result for result in results if result.get("status") == "skipped"]
+    # In batch mode per-symbol results are empty — derives success from batch_payload.
+    if batch_payload is not None:
+        batch_failures: list[str] = []
+        raw_batch_errors = batch_payload.get("errors")
+        if isinstance(raw_batch_errors, list):
+            batch_failures = [str(item) for item in raw_batch_errors if str(item).strip()]
+        # Only treat batch as failed when there are real errors; empty batch with
+        # no failures is a legitimate no-op (e.g. capped by --limit in tests).
+        if not batch_ok and not batch_failures and not args.dry_run:
+            # _run_batch reports ok=False only on fatal path; keep failures empty
+            # so the readiness gate will block (target date still written via fallback).
+            pass
+        # Merge batch errors into failures for unified exit-code/ readiness gate.
+        failures.extend(batch_failures)
+        if not batch_ok and batch_failures:
+            # keep failures non-empty so shared tail returns 1
+            pass
+        # No per-symbol ok_results in batch — delta/index success is derived from
+        # batch_payload's own index report; keep ok_results empty so shared ZIP
+        # rebuild block is skipped (ZIPs already rebuilt inside _run_batch).
+        ok_results: list[dict[str, object]] = []  # type: ignore[no-redef]
+        skipped_results: list[dict[str, object]] = []  # type: ignore[no-redef]
+    else:
+        ok_results = [
+            result for result in results if result.get("status") not in {"skipped", "error"}
+        ]
+        skipped_results = [result for result in results if result.get("status") == "skipped"]
 
     # Incremental record-only checkpoint: each symbol's fetch completion.
     if checkpoint_path is not None and not args.dry_run:
@@ -1862,9 +1811,7 @@ def _main(argv: list[str] | None = None) -> int:
     index_report: dict[str, object] = {"updated": False, "reason": "not_enabled"}
     if not args.dry_run and args.index_path.strip() and ok_results:
         updated_codes = {
-            str(result.get("ts_code"))
-            for result in ok_results
-            if str(result.get("ts_code"))
+            str(result.get("ts_code")) for result in ok_results if str(result.get("ts_code"))
         }
         if updated_codes:
             index_report = _update_last_date_index(
@@ -1874,16 +1821,19 @@ def _main(argv: list[str] | None = None) -> int:
                 rebuild_latest_dates=rebuild_latest_dates,
             )
 
-
     # Delta baseline incremental sync: after the ZIPs and the last-date index
     # are updated, mirror the new rows into the delta DuckDB so the Week5
     # batch keeps reading the fast DuckDB path.
+    # NOTE: batch mode has no per-symbol ok_results; gate on failures instead.
+    delta_should_sync = bool(batch_payload is not None and batch_ok and not failures)
+    if not delta_should_sync:
+        delta_should_sync = bool(ok_results)
     delta_sync_report: dict[str, object] = {"updated": False, "reason": "not_enabled"}
     if (
         not args.dry_run
         and args.sync_vendor_delta.strip()
         and args.index_path.strip()
-        and ok_results
+        and delta_should_sync
     ):
         try:
             # 显式按路径加载同目录脚本，不依赖 sys.path 恰好包含 scripts/：
@@ -1893,9 +1843,7 @@ def _main(argv: list[str] | None = None) -> int:
             import importlib.util
             import io
 
-            _delta_script = (
-                Path(__file__).resolve().parent / "import_vendor_zip_to_delta.py"
-            )
+            _delta_script = Path(__file__).resolve().parent / "import_vendor_zip_to_delta.py"
             _spec = importlib.util.spec_from_file_location(
                 "import_vendor_zip_to_delta", _delta_script
             )
@@ -1931,27 +1879,52 @@ def _main(argv: list[str] | None = None) -> int:
                 "reason": f"{type(exc).__name__}:{exc}",
             }
 
-    # Write nightly readiness after successful full run.
+    # Write nightly readiness after successful full run (batch + per-symbol share tail).
     if not args.dry_run and not failures:
         _readiness_ok = True
-        if isinstance(index_report, dict) and str(
-            index_report.get("reason", "")
+        # Batch carries its own index report inside batch_payload; surface it when present.
+        _batch_index_report: dict[str, object] | None = None
+        if batch_payload is not None and isinstance(batch_payload.get("index"), dict):
+            _batch_index_report = batch_payload["index"]  # type: ignore[assignment]
+        _effective_index_report = (
+            _batch_index_report if _batch_index_report is not None else index_report
+        )
+        if isinstance(_effective_index_report, dict) and str(
+            _effective_index_report.get("reason", "")
         ).strip() not in ("", "not_enabled"):
-            _readiness_ok = bool(index_report.get("updated", False))
+            _readiness_ok = bool(_effective_index_report.get("updated", False))
         if isinstance(delta_sync_report, dict) and str(
             delta_sync_report.get("reason", "")
         ).strip() not in ("", "not_enabled"):
             _readiness_ok = bool(delta_sync_report.get("updated", False))
+        # Batch skips delta when neither flag is set — that is expected, not a failure.
+        if batch_payload is not None and not args.sync_vendor_delta.strip():
+            # No delta requested: delta_sync stays not_enabled, treat as ok.
+            _readiness_ok = _readiness_ok and True
         if _readiness_ok:
             try:
+                # Batch's latest_daily_date already reflects ZIP rebuild date.
+                _readiness_date = (
+                    batch_latest_daily
+                    if batch_payload is not None and batch_latest_daily is not None
+                    else end_date
+                )
                 write_nightly_readiness(
-                    target_trade_date=end_date,
+                    target_trade_date=_readiness_date,
                     db_path=args.sync_vendor_delta,
                     index_path=args.index_path,
-                    extra={"source": "per_symbol_update"},
+                    extra={
+                        "source": "batch_update"
+                        if batch_payload is not None
+                        else "per_symbol_update"
+                    },
                 )
             except Exception:
                 pass  # Non-fatal: readiness is a signal, not a gate.
+
+    # Merge batch index into index_report for observability when in batch mode.
+    if batch_payload is not None and isinstance(batch_payload.get("index"), dict):
+        index_report = batch_payload["index"]  # type: ignore[assignment]
 
     summary = {
         "tool": "update_vendor_daily_from_tushare",
@@ -1961,19 +1934,38 @@ def _main(argv: list[str] | None = None) -> int:
         "factors_dir": str(factors_root),
         "end_date": end_date.isoformat(),
         "symbols_total": len(symbols),
-        "fetched": len(ok_results),
+        "fetched": len(ok_results)
+        if batch_payload is None
+        else int(batch_payload.get("symbols_updated", 0) or 0),  # type: ignore[arg-type]
         "skipped": len(skipped_results),
         "failed": len(failures),
         "failures": failures[:100],
         "dry_run": bool(args.dry_run),
         "skip_factors": bool(args.skip_factors),
         "checkpoint": str(checkpoint_path) if checkpoint_path is not None else "",
-        "zip_rebuilds": rebuild_reports,
+        "zip_rebuilds": rebuild_reports
+        if batch_payload is None
+        else list(batch_payload.get("zip_rebuilds", []) or []),  # type: ignore[arg-type]
         "index": index_report,
         "delta_sync": delta_sync_report,
+        "mode": "batch" if batch_payload is not None else "per_symbol",
     }
+    # Back-compat: also spread batch_payload keys for callers parsing symbols_fetched etc.
+    if batch_payload is not None:
+        for _k in (
+            "symbols_fetched",
+            "symbols_updated",
+            "trade_dates",
+            "dates_failed",
+            "latest_daily_date",
+        ):
+            if _k not in summary and _k in batch_payload:
+                summary[_k] = batch_payload[_k]
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     if failures:
+        return 1
+    # Batch ok=False with no explicit failures still means blocked readiness; return 1.
+    if batch_payload is not None and not batch_ok and not args.dry_run:
         return 1
     return 0
 

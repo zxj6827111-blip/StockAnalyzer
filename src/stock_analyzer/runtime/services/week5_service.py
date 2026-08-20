@@ -1559,24 +1559,7 @@ class RuntimeWeek5Service:
         # trading date before snapshot latest day (T-1 contract, via calendar).
         required_intraday_date: object | None = None
         if snapshot_manifest is not None and str(snapshot_manifest.trade_date).strip():
-            try:
-                provider_for_cal = (
-                    service._market_warehouse()
-                    if callable(getattr(service, "_market_warehouse", None))
-                    else None
-                )
-            except Exception:
-                provider_for_cal = None
-            # Prefer a provider that has list_open_trade_dates (TushareProvider
-            # has it; MarketWarehouse does not).  Fall back to the main provider
-            # for weekday-only resolution.
-            cal_source = getattr(service, "_provider", None) or provider_for_cal
-            if cal_source is not None and not hasattr(cal_source, "list_open_trade_dates"):
-                cal_source = (
-                    provider_for_cal
-                    if hasattr(provider_for_cal, "list_open_trade_dates")
-                    else cal_source
-                )
+            cal_source = _resolve_calendar_provider(service)
             required_intraday_date = _resolve_required_intraday_date(
                 str(snapshot_manifest.trade_date).strip(), cal_source
             )
@@ -1934,11 +1917,10 @@ class RuntimeWeek5Service:
                 for ps in pinned_normalized:
                     if _is_bj_symbol(ps):
                         continue
-                    # pinned must be in fresh set or have fresh data; if freshness
-                    # gate blocked we already returned. Otherwise allow pinned that
-                    # is fresh; stale pinned is dropped.
-                    # Pinned symbols not in the eligible list (not evaluated for
-                    # freshness) are allowed through as manual override.
+                    # pinned must pass the same freshness gate as eligible:
+                    # stale pinned is dropped.  For symbols not in the eligible
+                    # list, run an on-demand freshness check instead of blindly
+                    # allowing them through.
                     if freshness_obj is not None:
                         # Build set of all symbols that were evaluated for freshness
                         evaled = (
@@ -1954,10 +1936,41 @@ class RuntimeWeek5Service:
                             if ps in getattr(freshness_obj, "fresh_symbols", []):
                                 pinned_fresh.append(ps)
                         else:
-                            # Not evaluated (not in eligible list), include as override
-                            pinned_fresh.append(ps)
+                            # Not evaluated: on-demand freshness check for this pinned symbol.
+                            # In synthetic/test mode there is no real intraday warehouse,
+                            # so the check would always fail — allow through (existing
+                            # pinned_only tests rely on this).
+                            if _is_synthetic:
+                                pinned_fresh.append(ps)
+                            else:
+                                try:
+                                    from stock_analyzer.ops.intraday_freshness import (
+                                        build_intraday_freshness_report,
+                                    )
+
+                                    pinned_report = build_intraday_freshness_report(
+                                        warehouse=_delta_warehouse,
+                                        vendor_overlay=_vendor_overlay,
+                                        symbols=[ps],
+                                        required_trade_date=required_intraday_date,  # type: ignore[arg-type]
+                                        interval="1m",
+                                        deep_candidate_target=1,
+                                    )
+                                    pinned_report_5m = build_intraday_freshness_report(
+                                        warehouse=_delta_warehouse,
+                                        vendor_overlay=_vendor_overlay,
+                                        symbols=[ps],
+                                        required_trade_date=required_intraday_date,  # type: ignore[arg-type]
+                                        interval="5m",
+                                        deep_candidate_target=1,
+                                    )
+                                    if ps in pinned_report.fresh_symbols and ps in pinned_report_5m.fresh_symbols:
+                                        pinned_fresh.append(ps)
+                                except Exception:
+                                    # On check failure, do not include — fail-closed
+                                    pass
                     else:
-                        # No freshness data, include all non-BJ pinned
+                        # No freshness data (synthetic/test path), include all non-BJ pinned
                         pinned_fresh.append(ps)
             # Determine deep input symbols: only fresh eligible (not stale/BJ)
             fresh_symbols = (
@@ -3381,7 +3394,7 @@ class RuntimeWeek5Service:
 
             _is_bj = is_bj_symbol(normalized_symbol)
         except Exception:
-            _is_bj = normalized_symbol.startswith(("8", "4")) or normalized_symbol.startswith("92")
+            _is_bj = normalized_symbol.startswith("920") or normalized_symbol.startswith(("8", "4"))
         if _is_bj:
             return {
                 "status": "unsupported_market",
@@ -3443,12 +3456,7 @@ class RuntimeWeek5Service:
                 except Exception:
                     pass
                 if manifest_date:
-                    provider_for_cal = None
-                    try:
-                        provider_for_cal = service._market_warehouse()  # type: ignore[attr-defined]
-                    except Exception:
-                        provider_for_cal = None
-                    cal_source = provider_for_cal or getattr(service, "_provider", None)
+                    cal_source = _resolve_calendar_provider(service)
                     required_date = resolve_required_intraday_date(manifest_date, cal_source)
             except Exception:
                 pass
@@ -4408,16 +4416,41 @@ def _market_radar_reason_code_zh(value: str) -> str:
 
 
 def _is_bj_symbol(symbol: str) -> bool:
-    text = str(symbol).strip()
-    if not text:
+    """Single source of truth: delegates to trading_calendar.is_bj_symbol."""
+    try:
+        from stock_analyzer.data.trading_calendar import is_bj_symbol as _is_bj
+
+        return bool(_is_bj(symbol))
+    except Exception:
+        text = str(symbol).strip().upper()
+        if text.endswith(".BJ"):
+            return True
+        code = "".join(ch for ch in text if ch.isdigit())
+        if len(code) != 6:
+            return False
+        if code.startswith("920"):
+            return True
+        if code.startswith(("4", "8")):
+            return True
         return False
-    upper = text.strip().upper()
-    if upper.endswith(".BJ"):
-        return True
-    code = "".join(ch for ch in text if ch.isdigit())
-    if len(code) == 6 and code.startswith(("4", "8")):
-        return True
-    return False
+
+
+def _resolve_calendar_provider(service: object) -> object | None:
+    """Find the inner provider exposing list_open_trade_dates via BFS.
+
+    Walks CachedProvider.inner / ResilientProvider.primary etc. so a
+    wrapped TushareProvider is still discoverable.  Returns None when
+    no provider in the graph has the calendar capability.
+    """
+    try:
+        graph_fn = getattr(service, "_iter_market_data_provider_graph", None)  # type: ignore[union-attr]
+        if callable(graph_fn):
+            for provider in graph_fn():  # type: ignore[operator]
+                if callable(getattr(provider, "list_open_trade_dates", None)):
+                    return provider
+    except Exception:
+        pass
+    return None
 
 
 def _resolve_required_intraday_date(

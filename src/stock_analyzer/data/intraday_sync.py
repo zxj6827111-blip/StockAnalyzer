@@ -201,7 +201,9 @@ def _fetch_with_sina(symbol: str, timeout_sec: int = 5) -> pd.DataFrame:
     try:
         from stock_analyzer.data.intraday_summary import fetch_sina_minute_bars  # noqa: WPS433
 
-        return fetch_sina_minute_bars(symbol=symbol, interval="1m", timeout_sec=max(5, int(timeout_sec)))
+        return fetch_sina_minute_bars(
+            symbol=symbol, interval="1m", timeout_sec=max(5, int(timeout_sec))
+        )
     except Exception:
         return pd.DataFrame()
 
@@ -412,7 +414,11 @@ def sync_intraday_symbols(
                         circuit_open = True
                         tushare_ok = False
                         break
-            report.capability_probe = {"probed": probed, "tushare_ok": tushare_ok, "error": probe_error}
+            report.capability_probe = {
+                "probed": probed,
+                "tushare_ok": tushare_ok,
+                "error": probe_error,
+            }
 
         # Per-symbol fetch + completeness + summarise.
         # We collect 1m and 5m payloads and upsert them in bulk.
@@ -438,8 +444,8 @@ def sync_intraday_symbols(
 
         def _fetch_one(symbol: str) -> tuple[str, str, pd.DataFrame, str]:
             """Return (symbol, source_used, frame_1m, error_reason)."""
-            # Budget check
-            if monotonic() - started > max(5, int(deadline_sec)):
+            # Budget check — float comparison, no int truncation.
+            if monotonic() - started > max(5.0, float(deadline_sec)):
                 return symbol, "deadline", pd.DataFrame(), "deadline_exceeded"
             prefer_tushare = use_tushare_for_symbol(symbol)
             # Try primary first
@@ -487,30 +493,46 @@ def sync_intraday_symbols(
 
         # Submit only the missing window with bounded concurrency and hard deadline.
         # Uses wait(FIRST_COMPLETED, timeout=remaining) for real per-iteration
-        # timeout enforcement (P1-5 fix: as_completed + result(timeout=...) is
-        # not a real timeout when the future is already done).
+        # timeout enforcement.  The executor is shut down without waiting so
+        # running HTTP calls do not block beyond the deadline (P1-3 fix).
         results: dict[str, tuple[str, pd.DataFrame, str]] = {}
-        with ThreadPoolExecutor(max_workers=max(1, int(concurrency))) as pool:
+        executor = ThreadPoolExecutor(max_workers=max(1, int(concurrency)))
+        try:
             futures_to_symbol: dict[Any, str] = {}
             for sym in fetch_needed:
-                fut = pool.submit(_fetch_one, sym)
+                fut = executor.submit(_fetch_one, sym)
                 futures_to_symbol[fut] = sym
             pending = set(futures_to_symbol.keys())
             while pending:
-                remaining = max(0, int(deadline_sec) - (monotonic() - started))
+                remaining = max(0.0, float(deadline_sec) - (monotonic() - started))
                 if remaining <= 0:
                     for fut in pending:
                         fut.cancel()
                     break
-                iter_timeout = min(remaining, max(1, int(timeout_sec)) + 1)
+                iter_timeout = min(remaining, max(1.0, float(timeout_sec)) + 1.0)
                 done, pending = wait(pending, timeout=iter_timeout, return_when=FIRST_COMPLETED)
                 for fut in done:
                     sym = futures_to_symbol[fut]
                     try:
                         symbol, source, frame, err = fut.result(timeout=0)
                     except Exception as exc:
-                        symbol, source, frame, err = sym, "", pd.DataFrame(), f"{type(exc).__name__}:{exc}"
+                        symbol, source, frame, err = (
+                            sym,
+                            "",
+                            pd.DataFrame(),
+                            f"{type(exc).__name__}:{exc}",
+                        )
                     results[symbol] = (source, frame, err)
+        finally:
+            # Do not block on running HTTP calls beyond the deadline.
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                # Python <3.9: cancel_futures not supported.
+                try:
+                    executor.shutdown(wait=False)
+                except Exception:
+                    pass
         # Seed results for the up-to-date stocks so the loop below can skip them.
         for sym in skipped_up_to_date:
             if sym not in results:
@@ -555,9 +577,14 @@ def sync_intraday_symbols(
             except Exception:
                 summary_1m = pd.DataFrame()
             try:
-                summary_5m = summarize_minute_bars(frame_5m, interval="5m") if not frame_5m.empty else pd.DataFrame()
+                summary_5m = (
+                    summarize_minute_bars(frame_5m, interval="5m")
+                    if not frame_5m.empty
+                    else pd.DataFrame()
+                )
             except Exception:
                 summary_5m = pd.DataFrame()
+
             # Filter summaries to the required date only (keep history untouched).
             # The warehouse upsert will merge per-date rows; we only pass that date.
             def _filter_to_date(summary: pd.DataFrame) -> pd.DataFrame:
@@ -660,7 +687,11 @@ def sync_intraday_symbols(
         report.stale_symbols = sorted(set(stale_symbols))
         report.source_breakdown = dict(source_counts)
         if not report.capability_probe:
-            report.capability_probe = {"probed": probed, "tushare_ok": tushare_ok, "error": probe_error}
+            report.capability_probe = {
+                "probed": probed,
+                "tushare_ok": tushare_ok,
+                "error": probe_error,
+            }
         report.detail = {
             "upsert_errors": upsert_errors,
             "deadline_sec": int(deadline_sec),

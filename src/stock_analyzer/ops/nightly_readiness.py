@@ -50,11 +50,19 @@ The host actual location is the named volume source of
 container sees it as ``/app/artifacts/runtime/nightly_data_ready.json``.
 The helper ``nightly_readiness_paths`` resolves the candidate locations
 so local tests using ``artifacts/runtime`` keep working.
+
+Single authoritative path
+-------------------------
+``authoritative_readiness_path()`` is the single write target.  Legacy
+mirrors under ``src/artifacts/runtime`` are never written; they are only
+read as fallback for backwards-compat when the authoritative file is
+absent, and ``consume`` drains all mirrors.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -65,6 +73,8 @@ from uuid import uuid4
 READINESS_FILENAME = "nightly_data_ready.json"
 CONSUMED_FILENAME = "nightly_data_ready.consumed.json"
 READINESS_SCHEMA_VERSION = 1
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -103,22 +113,58 @@ def _coerce_date(value: object) -> date | None:
     return None
 
 
+def authoritative_readiness_path() -> Path:
+    """Return the single authoritative path for the readiness file.
+
+    Priority:
+    1. ``SA__NIGHTLY_READINESS_PATH`` env var (explicit override, e.g. tests).
+    2. ``/app/artifacts/runtime/nightly_data_ready.json`` when ``/app/artifacts``
+       exists (container with named volume).
+    3. ``<cwd>/artifacts/runtime/nightly_data_ready.json`` otherwise.
+    """
+    env_path = str(os.environ.get("SA__NIGHTLY_READINESS_PATH", "") or "").strip()
+    if env_path:
+        return Path(env_path)
+    if Path("/app/artifacts").exists():
+        return Path("/app/artifacts/runtime") / READINESS_FILENAME
+    return Path.cwd() / "artifacts" / "runtime" / READINESS_FILENAME
+
+
 def _candidate_readiness_paths() -> list[Path]:
-    """All locations that may hold the readiness file, newest first."""
+    """All locations that may hold the readiness file, newest first.
+
+    Includes legacy ``src/artifacts/runtime`` mirror for backwards-compat
+    reads only — writes never target it.
+    """
     candidates: list[Path] = []
-    # Container path (authoritative at runtime).
-    candidates.append(Path("/app/artifacts/runtime") / READINESS_FILENAME)
-    # Repo-root relative (tests / local dev).
+    # Authoritative first.
+    auth = authoritative_readiness_path()
+    candidates.append(auth)
+    # Legacy: repo-root relative and src/artifacts (read fallback only).
     here = Path(__file__).resolve()
     for parent in here.parents:
         candidate = parent / "artifacts" / "runtime" / READINESS_FILENAME
         if candidate not in candidates:
             candidates.append(candidate)
+        # Explicit src/artifacts mirror (baked image artifact).
+        src_candidate = parent / "src" / "artifacts" / "runtime" / READINESS_FILENAME
+        if src_candidate not in candidates:
+            candidates.append(src_candidate)
     # CWD relative fallback.
     cwd_candidate = Path.cwd() / "artifacts" / "runtime" / READINESS_FILENAME
     if cwd_candidate not in candidates:
         candidates.append(cwd_candidate)
-    return candidates
+    # De-duplicate while preserving order.
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for item in candidates:
+        key = str(item.resolve()) if item.exists() else str(item)
+        # Use string form for de-duplication even when file absent.
+        str_key = str(item)
+        if str_key not in seen:
+            seen.add(str_key)
+            unique.append(item)
+    return unique
 
 
 def nightly_readiness_paths() -> list[Path]:
@@ -154,10 +200,22 @@ def read_nightly_readiness(path: str | Path | None = None) -> dict[str, Any] | N
     """Return the readiness JSON payload, or ``None`` when absent / unreadable."""
     if path is not None:
         return _read_json(Path(path))
+    auth = authoritative_readiness_path()
+    payload = _read_json(auth)
+    if payload is not None:
+        return payload
+    # Fallback: legacy mirrors (warn so they get cleaned up).
     for candidate in _candidate_readiness_paths():
-        payload = _read_json(candidate)
-        if payload is not None:
-            return payload
+        if candidate == auth:
+            continue
+        candidate_payload = _read_json(candidate)
+        if candidate_payload is not None:
+            logger.warning(
+                "readiness read from legacy mirror %s (authoritative %s missing)",
+                candidate,
+                auth,
+            )
+            return candidate_payload
     return None
 
 
@@ -170,14 +228,14 @@ def write_nightly_readiness(
     extra: dict[str, Any] | None = None,
     path: str | Path | None = None,
 ) -> Path:
-    """Atomically write ``nightly_data_ready.json``.
+    """Atomically write ``nightly_data_ready.json`` to the authoritative path.
 
     Args:
         target_trade_date: latest daily index date (not shell calendar date).
         db_path / index_path: informational only, recorded in payload.
         updater_commit: the updater git commit (from ``.build_commit``).
         extra: additional keys merged into the payload.
-        path: override output path; when omitted the primary candidate is used.
+        path: override output path; when omitted the authoritative path is used.
 
     Returns:
         The path that was written.
@@ -185,25 +243,7 @@ def write_nightly_readiness(
     coerced = _coerce_date(target_trade_date)
     if coerced is None:
         raise ValueError(f"invalid target_trade_date: {target_trade_date!r}")
-    # Default write target must be the shared artifacts mount, not the repo's
-    # src/stock_analyzer/ops/artifacts/... (old bug: _candidate_readiness_paths()[1]
-    # resolved to src/stock_analyzer/ops/artifacts/... when here=.../ops).
-    if path is not None:
-        target = Path(path)
-    else:
-        # Prefer the CWD-anchored repo artifacts (e.g. /app/artifacts/runtime or
-        # /repo/artifacts/runtime), falling back to /app/... when CWD is not
-        # the repo root.
-        repo_artifacts = (Path.cwd() / "artifacts" / "runtime" / READINESS_FILENAME).resolve()
-        if repo_artifacts.parent.exists() or Path("/app/artifacts").exists():
-            candidates = _candidate_readiness_paths()
-            # Choose the first candidate whose parent exists or is /app/...
-            target = next(
-                (c for c in candidates if c.parent.exists() or str(c).startswith("/app/")),
-                candidates[1] if len(candidates) > 1 else candidates[0],
-            )
-        else:
-            target = _candidate_readiness_paths()[0]
+    target = Path(path) if path is not None else authoritative_readiness_path()
     target.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {
         "schema_version": READINESS_SCHEMA_VERSION,
@@ -228,23 +268,6 @@ def write_nightly_readiness(
         fp.flush()
         os.fsync(fp.fileno())
     os.replace(tmp, target)
-    # Mirror into sibling candidates only when they are discoverable/exist.
-    # The /app/artifacts path is authoritive only inside the container; on
-    # local dev or CI it may be absent or read-only — avoid spurious mkdir
-    # there (old code unconditionally created parent dirs).
-    for mirror in _candidate_readiness_paths():
-        if mirror == target or mirror.exists():
-            continue
-        # Only mirror when the candidate's ancestor exists (i.e. the
-        # artifacts mount/volume is actually present).  This avoids
-        # mkdir(/app) on systems where that path is not expected.
-        if not mirror.parent.parent.exists():
-            continue
-        try:
-            mirror.parent.mkdir(parents=True, exist_ok=True)
-            mirror.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        except OSError:
-            pass
     return target
 
 
@@ -293,7 +316,9 @@ def check_nightly_readiness(
                 ready=False,
                 reason="nightly_data_not_ready",
                 payload=payload,
-                expected_trade_date=str(expected_trade_date or payload.get("target_trade_date", "")),
+                expected_trade_date=str(
+                    expected_trade_date or payload.get("target_trade_date", "")
+                ),
             )
     readiness_date = _coerce_date(payload.get("target_trade_date"))
     if readiness_date is None:
@@ -303,7 +328,11 @@ def check_nightly_readiness(
             payload=payload,
             expected_trade_date=str(expected_trade_date or ""),
         )
-    expected_date = _coerce_date(expected_trade_date) if expected_trade_date not in (None, "") else readiness_date
+    expected_date = (
+        _coerce_date(expected_trade_date)
+        if expected_trade_date not in (None, "")
+        else readiness_date
+    )
     if expected_date is None:
         expected_date = readiness_date
     if readiness_date != expected_date:
@@ -325,9 +354,11 @@ def consume_nightly_readiness(
     *,
     path: str | Path | None = None,
 ) -> dict[str, Any] | None:
-    """Atomically rename the readiness file to the consumed name.
+    """Atomically rename the readiness file(s) to the consumed name.
 
-    Returns the consumed payload, or ``None`` when no readiness file exists.
+    When ``path`` is given, only that file is consumed.  Otherwise all
+    candidate locations are drained so a stale mirror cannot be re-read
+    after the authoritative file is consumed.
     """
     if path is not None:
         source = Path(path)
@@ -340,15 +371,25 @@ def consume_nightly_readiness(
         except OSError:
             return None
         return payload
-    # Walk candidates, consuming the first that exists.
+    # Drain all candidates; return the first payload found.
+    first_payload: dict[str, Any] | None = None
     for candidate in _candidate_readiness_paths():
         payload = _read_json(candidate)
         if payload is None:
             continue
+        if first_payload is None:
+            first_payload = payload
         target = candidate.with_name(CONSUMED_FILENAME)
+        # Avoid overwriting an existing consumed file from another candidate
+        # with different content — keep the first consumed payload's file.
+        if target.exists():
+            try:
+                candidate.unlink()
+            except OSError:
+                pass
+            continue
         try:
             os.replace(candidate, target)
         except OSError:
             continue
-        return payload
-    return None
+    return first_payload

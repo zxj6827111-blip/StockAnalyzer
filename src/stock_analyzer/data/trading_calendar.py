@@ -161,7 +161,9 @@ def resolve_required_intraday_date(
     # 1) Provider-backed calendar with 20-day window
     if provider_or_trade_cal is not None:
         # provider may be a callable returning dates directly
-        if callable(provider_or_trade_cal) and not hasattr(provider_or_trade_cal, "list_open_trade_dates"):
+        if callable(provider_or_trade_cal) and not hasattr(
+            provider_or_trade_cal, "list_open_trade_dates"
+        ):
             try:
                 result = provider_or_trade_cal(parsed)
                 coerced = _coerce_date(result)
