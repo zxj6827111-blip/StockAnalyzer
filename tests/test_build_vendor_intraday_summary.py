@@ -105,6 +105,66 @@ def test_build_summary_opens_each_source_zip_once(
     assert list(summary.index.strftime("%Y-%m-%d")) == ["2026-08-17", "2026-08-18"]
 
 
+def test_validate_reusable_summary_accepts_unchanged_source_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "vendor"
+    archive_path = source_root / "StockA_1min_vendor-now" / "2026-08.zip"
+    _write_minute_zip(archive_path, entry_name="monthly/600000_202608.csv")
+    output = tmp_path / "vendor_intraday_summary.duckdb"
+    builder.build_summary(
+        root=source_root,
+        output=output,
+        keep_days=480,
+        intervals=("1m",),
+        volume_multiplier=1.0,
+        required_latest_date="2026-08-18",
+    )
+
+    def _unexpected_zip_open(*args: object, **kwargs: object) -> None:
+        raise AssertionError("reuse validation must not open minute ZIP contents")
+
+    monkeypatch.setattr(builder.zipfile, "ZipFile", _unexpected_zip_open)
+    report = builder.validate_reusable_summary(
+        root=source_root,
+        output=output,
+        intervals=("1m",),
+        volume_multiplier=1.0,
+        required_latest_date="2026-08-18",
+    )
+
+    assert report["reusable"] is True
+    assert report["coverage"]["1m"]["max_date"] == "2026-08-18"
+    assert report["archive_counts"] == {"1m": 1}
+
+
+def test_validate_reusable_summary_rejects_changed_source_snapshot(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "vendor"
+    archive_path = source_root / "StockA_1min_vendor-now" / "2026-08.zip"
+    _write_minute_zip(archive_path, entry_name="monthly/600000_202608.csv")
+    output = tmp_path / "vendor_intraday_summary.duckdb"
+    builder.build_summary(
+        root=source_root,
+        output=output,
+        keep_days=480,
+        intervals=("1m",),
+        volume_multiplier=1.0,
+    )
+    with zipfile.ZipFile(archive_path, "a") as archive:
+        archive.writestr("source-changed.txt", "changed")
+
+    with pytest.raises(RuntimeError, match="source ZIP snapshot changed"):
+        builder.validate_reusable_summary(
+            root=source_root,
+            output=output,
+            intervals=("1m",),
+            volume_multiplier=1.0,
+        )
+
+
 def test_promote_restores_old_pair_when_manifest_replace_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

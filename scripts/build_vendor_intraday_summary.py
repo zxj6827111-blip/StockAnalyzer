@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import json
 import os
+import sys
 import zipfile
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -155,6 +156,141 @@ def _validate(db_path: Path, intervals: tuple[str, ...]) -> dict[str, dict[str, 
         if not str(payload.get("max_date", "")).strip():
             raise RuntimeError(f"invalid {interval} summary max_date: {payload}")
     return coverage
+
+
+def _archive_stat_snapshot(
+    *,
+    root: Path,
+    interval: str,
+    cutoff: date,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "path": path.relative_to(root).as_posix(),
+            "size": int(path.stat().st_size),
+            "mtime_ns": int(path.stat().st_mtime_ns),
+        }
+        for path in archive_paths(root, interval, cutoff)
+    ]
+
+
+def validate_reusable_summary(
+    *,
+    root: str | Path,
+    output: str | Path,
+    intervals: tuple[str, ...] = ("1m", "5m"),
+    volume_multiplier: float = 100.0,
+    amount_multiplier: float = 1.0,
+    required_latest_date: str | date | None = None,
+) -> dict[str, Any]:
+    """Validate that an existing summary still matches its source ZIP snapshot."""
+    source_root = Path(root).expanduser().resolve()
+    output_path = Path(output).expanduser().resolve()
+    output_manifest = manifest_path(output_path)
+    normalized_intervals = tuple(dict.fromkeys(intervals))
+    if not source_root.is_dir():
+        raise RuntimeError(f"vendor root does not exist: {source_root}")
+    if not output_path.is_file() or output_path.stat().st_size <= 0:
+        raise RuntimeError(f"intraday summary does not exist: {output_path}")
+    if not output_manifest.is_file() or output_manifest.stat().st_size <= 0:
+        raise RuntimeError(f"intraday summary manifest does not exist: {output_manifest}")
+    if not normalized_intervals or any(
+        item not in _SUPPORTED_INTERVALS for item in normalized_intervals
+    ):
+        raise ValueError(f"unsupported intervals: {normalized_intervals}")
+
+    try:
+        manifest = json.loads(output_manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"invalid intraday summary manifest: {exc}") from exc
+    if not isinstance(manifest, dict):
+        raise RuntimeError("intraday summary manifest root must be an object")
+    if int(manifest.get("schema_version", 0)) != 1:
+        raise RuntimeError(
+            f"unsupported intraday summary manifest schema: {manifest.get('schema_version')!r}"
+        )
+    manifest_intervals = tuple(str(item) for item in manifest.get("intervals", []))
+    if any(interval not in manifest_intervals for interval in normalized_intervals):
+        raise RuntimeError(
+            f"intraday summary manifest is missing required intervals: {normalized_intervals}"
+        )
+    unit_contract = manifest.get("unit_contract")
+    try:
+        units_match = isinstance(unit_contract, dict) and (
+            float(unit_contract.get("volume_multiplier")) == float(volume_multiplier)
+            and float(unit_contract.get("amount_multiplier")) == float(amount_multiplier)
+        )
+    except (TypeError, ValueError):
+        units_match = False
+    if not units_match:
+        raise RuntimeError("intraday summary unit contract does not match deployment settings")
+    cutoff = _coerce_required_latest_date(manifest.get("cutoff_date"))
+    if cutoff is None:
+        raise RuntimeError("intraday summary manifest has no valid cutoff_date")
+
+    coverage = _validate(output_path, normalized_intervals)
+    manifest_coverage = manifest.get("coverage")
+    if not isinstance(manifest_coverage, dict):
+        raise RuntimeError("intraday summary manifest has no coverage section")
+    for interval, actual in coverage.items():
+        expected = manifest_coverage.get(interval)
+        if not isinstance(expected, dict):
+            raise RuntimeError(f"intraday summary manifest has no {interval} coverage")
+        for key in ("rows", "symbols", "min_date", "max_date"):
+            if str(actual.get(key, "")) != str(expected.get(key, "")):
+                raise RuntimeError(
+                    f"intraday summary {interval} coverage changed for {key}: "
+                    f"{actual.get(key)!r} != {expected.get(key)!r}"
+                )
+
+    required_latest = _coerce_required_latest_date(required_latest_date)
+    if required_latest is not None:
+        stale = {
+            interval: str(payload.get("max_date", "")).strip()
+            for interval, payload in coverage.items()
+            if _coerce_required_latest_date(payload.get("max_date")) is None
+            or _coerce_required_latest_date(payload.get("max_date")) < required_latest
+        }
+        if stale:
+            raise RuntimeError(
+                "intraday summary does not cover required latest date "
+                f"{required_latest.isoformat()}: {stale}"
+            )
+
+    fingerprints = manifest.get("zip_fingerprint")
+    if not isinstance(fingerprints, dict):
+        raise RuntimeError("intraday summary manifest has no ZIP fingerprint")
+    archive_counts: dict[str, int] = {}
+    for interval in normalized_intervals:
+        fingerprint = fingerprints.get(interval)
+        records = fingerprint.get("archives") if isinstance(fingerprint, dict) else None
+        if not isinstance(records, list) or not records:
+            raise RuntimeError(f"intraday summary manifest has no {interval} archive snapshot")
+        expected_snapshot = [
+            {
+                "path": str(record.get("path", "")),
+                "size": int(record.get("size", -1)),
+                "mtime_ns": int(record.get("mtime_ns", -1)),
+            }
+            for record in records
+            if isinstance(record, dict)
+        ]
+        current_snapshot = _archive_stat_snapshot(
+            root=source_root,
+            interval=interval,
+            cutoff=cutoff,
+        )
+        if current_snapshot != expected_snapshot:
+            raise RuntimeError(f"{interval} source ZIP snapshot changed")
+        archive_counts[interval] = len(current_snapshot)
+
+    return {
+        "reusable": True,
+        "generation": str(manifest.get("generation", "")),
+        "cutoff_date": cutoff.isoformat(),
+        "coverage": coverage,
+        "archive_counts": archive_counts,
+    }
 
 
 def _promote(output: Path, built: Path, built_manifest: Path) -> None:
@@ -309,17 +445,36 @@ def main() -> None:
         default="",
         help="fail without promoting when any interval max_date is older than YYYY-MM-DD",
     )
+    parser.add_argument(
+        "--check-reusable",
+        action="store_true",
+        help="validate an existing output and source ZIP snapshot without rebuilding",
+    )
     args = parser.parse_args()
     intervals = tuple(args.intervals or ("1m", "5m"))
-    report = build_summary(
-        root=args.root,
-        output=args.output,
-        keep_days=args.keep_days,
-        intervals=intervals,
-        volume_multiplier=args.volume_multiplier,
-        amount_multiplier=args.amount_multiplier,
-        required_latest_date=args.require_latest_date,
-    )
+    if args.check_reusable:
+        try:
+            report = validate_reusable_summary(
+                root=args.root,
+                output=args.output,
+                intervals=intervals,
+                volume_multiplier=args.volume_multiplier,
+                amount_multiplier=args.amount_multiplier,
+                required_latest_date=args.require_latest_date,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"intraday summary is not reusable: {exc}", file=sys.stderr)
+            raise SystemExit(1) from None
+    else:
+        report = build_summary(
+            root=args.root,
+            output=args.output,
+            keep_days=args.keep_days,
+            intervals=intervals,
+            volume_multiplier=args.volume_multiplier,
+            amount_multiplier=args.amount_multiplier,
+            required_latest_date=args.require_latest_date,
+        )
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
 
 

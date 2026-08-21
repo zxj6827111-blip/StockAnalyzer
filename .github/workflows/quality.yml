@@ -53,6 +53,16 @@ jobs:
           path: artifacts/coverage/coverage.xml
           if-no-files-found: error
 
+      # 失败时上传 quality gate 的 pytest 完整日志，便于定位只在 CI
+      # 环境出现的测试失败（本地 Windows 复现不了的 flaky）。
+      - name: Upload Quality Gate Logs on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-gate-logs
+          path: artifacts/quality/
+          if-no-files-found: ignore
+
       - name: Slow Test Report
         run: python scripts/run_quality_gate.py --stage slow-report
         continue-on-error: true
