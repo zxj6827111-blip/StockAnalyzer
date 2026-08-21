@@ -9,7 +9,7 @@ import random
 import re
 import urllib.error
 import urllib.request
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from threading import Lock
 from time import monotonic, sleep
 from typing import Any, Protocol
@@ -167,6 +167,17 @@ class _TushareProApi(Protocol):
         ts_code: str = "",
         start_date: str = "",
         end_date: str = "",
+    ) -> object: ...
+
+    def stk_mins(
+        self,
+        *,
+        ts_code: str = "",
+        freq: str = "",
+        start_date: str = "",
+        end_date: str = "",
+        offset: int = 0,
+        limit: int = 0,
     ) -> object: ...
 
 
@@ -509,6 +520,28 @@ class _HttpTushareProApi:
             end_date=end_date,
         )
 
+    def stk_mins(
+        self,
+        *,
+        ts_code: str = "",
+        freq: str = "",
+        start_date: str = "",
+        end_date: str = "",
+        offset: int = 0,
+        limit: int = 0,
+    ) -> object:
+        return self._call(
+            "stk_mins",
+            **_non_empty_params(
+                ts_code=ts_code,
+                freq=freq,
+                start_date=start_date,
+                end_date=end_date,
+                offset=offset,
+                limit=limit,
+            ),
+        )
+
 
 class _SdkWithHttpFallback:
     """Composite ``pro`` object: SDK first, direct HTTP fallback on transport errors.
@@ -721,6 +754,56 @@ class TushareProvider:
         if frame.empty:
             raise DataSourceError(f"tushare normalized empty for {ts_code}")
         return frame
+
+    def fetch_minute_bars(
+        self,
+        symbol: str,
+        start_date: date | str,
+        end_date: date | str,
+        freq: str = "1min",
+    ) -> pd.DataFrame:
+        """Fetch minute bars via Tushare ``stk_mins``.
+
+        ``freq`` accepts ``1min``/``5min`` and the aliases ``1m``/``5m``.
+        Dates may be ``YYYYMMDD`` string or ``date``; Tushare expects
+        ``YYYY-MM-DD HH:MM:SS``.  Returns a DataFrame indexed by ``datetime``
+        with columns ``open,high,low,close,volume,amount`` (volume already in
+        shares, not lots — ``stk_mins`` vol is shares and is not rescaled).
+        Empty DataFrame on no data.
+        """
+        code6 = _normalize_symbol(symbol)
+        if not code6:
+            raise DataSourceError(f"invalid symbol for stk_mins: {symbol}")
+        ts_code = _to_ts_code(code6)
+        freq_norm = str(freq or "1min").strip().lower()
+        if freq_norm in {"1m", "1min"}:
+            freq_norm = "1min"
+        elif freq_norm in {"5m", "5min"}:
+            freq_norm = "5min"
+        else:
+            raise DataSourceError(f"unsupported stk_mins freq: {freq!r}")
+        start_s = _format_minute_datetime(start_date, is_start=True)
+        end_s = _format_minute_datetime(end_date, is_start=False)
+        if not start_s or not end_s:
+            raise DataSourceError(f"invalid stk_mins date range: {start_date!r}~{end_date!r}")
+        pro = self._resolve_pro_api()
+        try:
+            raw = self._call_with_retry(
+                lambda: pro.stk_mins(  # type: ignore[attr-defined]
+                    ts_code=ts_code,
+                    freq=freq_norm,
+                    start_date=start_s,
+                    end_date=end_s,
+                )
+            )
+        except Exception as exc:
+            raise DataSourceError(
+                f"tushare stk_mins failed for {ts_code} {freq_norm}: {exc}"
+            ) from exc
+        frame = _coerce_frame(raw)
+        if frame.empty:
+            return pd.DataFrame()
+        return _normalize_tushare_minute_frame(frame, freq=freq_norm)
 
     def fetch_intraday_summary(
         self,
@@ -2094,6 +2177,192 @@ def _normalize_block_trade(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
     out["as_of"] = out["trade_date"].dt.strftime("%Y-%m-%d")
     out["coverage_complete"] = True
     return out
+
+
+def _format_yyyymmdd(value: object) -> str:
+    if isinstance(value, str) and value.strip():
+        text = value.strip().replace("-", "")
+        if len(text) == 8 and text.isdigit():
+            return text
+    if isinstance(value, date):
+        return value.strftime("%Y%m%d")
+    try:
+        parsed = pd.to_datetime(value, errors="coerce")  # type: ignore[arg-type]
+        if not pd.isna(parsed):
+            return pd.Timestamp(parsed).strftime("%Y%m%d")
+    except Exception:
+        pass
+    return ""
+
+
+def _format_minute_datetime(value: object, *, is_start: bool = True) -> str:
+    """Format stk_mins start_date/end_date as YYYY-MM-DD HH:MM:SS.
+
+    Tushare stk_mins expects datetime strings (inclusive window).  A plain
+    date is expanded to the session window (09:30:00 for start, 15:00:00
+    for end) when the caller passes a date object / YYYY-MM-DD without a
+    time component; otherwise the value is normalised to datetime.
+    """
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(value, date):
+        anchor = "09:30:00" if is_start else "15:00:00"
+        return (
+            datetime.combine(value, datetime.min.time())
+            .strftime("%Y-%m-%d %H:%M:%S")
+            .replace("00:00:00", anchor)
+        )
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    # Already datetime-like
+    if " " in text or "T" in text:
+        try:
+            parsed = pd.to_datetime(text, errors="coerce")  # type: ignore[arg-type]
+            if not pd.isna(parsed):
+                return pd.Timestamp(parsed).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+        return text
+    # Date-only string — plain YYYY-MM-DD / YYYYMMDD
+    anchor = "09:30:00" if is_start else "15:00:00"
+    for fmt in ("%Y-%m-%d", "%Y%m%d"):
+        try:
+            parsed = datetime.strptime(text, fmt)
+            return parsed.strftime(f"%Y-%m-%d {anchor}")
+        except ValueError:
+            continue
+    try:
+        parsed = pd.to_datetime(text, errors="coerce")  # type: ignore[arg-type]
+        if not pd.isna(parsed):
+            return pd.Timestamp(parsed).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+    return ""
+
+
+def _normalize_tushare_minute_frame(frame: pd.DataFrame, *, freq: str) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    raw = frame.copy()
+    # Tushare stk_mins may return trade_date + trade_time as separate columns;
+    # that split must be handled before single-column detection, otherwise the
+    # trade_time-only branch would shadow it and a date-only string would be
+    # mis-parsed as a timestamp.
+    if (
+        "trade_date" in raw.columns
+        and "trade_time" in raw.columns
+        and "datetime" not in raw.columns
+    ):
+        raw["datetime"] = pd.to_datetime(
+            raw["trade_date"].astype(str) + " " + raw["trade_time"].astype(str),
+            errors="coerce",
+        )
+        datetime_col = "datetime"
+    else:
+        datetime_col = next(
+            (
+                name
+                for name in ("trade_time", "datetime", "date", "trade_date")
+                if name in raw.columns
+            ),
+            "",
+        )
+        if not datetime_col:
+            return pd.DataFrame()
+        # Tushare trade_time is "YYYY-MM-DD HH:MM:SS"
+        raw["datetime"] = pd.to_datetime(raw[datetime_col], errors="coerce")
+    raw = raw.dropna(subset=["datetime"])
+    if raw.empty:
+        return pd.DataFrame()
+    rename_map: dict[str, str] = {}
+    if "vol" in raw.columns:
+        rename_map["vol"] = "volume"
+    if "amount" in raw.columns:
+        rename_map["amount"] = "amount"
+    raw = raw.rename(columns=rename_map)
+    for col in ("open", "high", "low", "close"):
+        if col not in raw.columns:
+            return pd.DataFrame()
+        raw[col] = pd.to_numeric(raw[col], errors="coerce")
+    if "volume" not in raw.columns:
+        raw["volume"] = 0.0
+    if "amount" not in raw.columns:
+        raw["amount"] = 0.0
+    # stk_mins returns volume in shares (not lots); do NOT multiply by 100
+    # (daily's *100 was for lot-to-share; minute docs already use shares).
+    raw["volume"] = pd.to_numeric(raw["volume"], errors="coerce").fillna(0.0)
+    raw["amount"] = pd.to_numeric(raw["amount"], errors="coerce").fillna(0.0)
+    raw = raw.dropna(subset=["open", "high", "low", "close"])
+    if raw.empty:
+        return pd.DataFrame()
+    raw = raw.set_index("datetime").sort_index()
+    raw = raw[~raw.index.duplicated(keep="last")]
+    raw.index.name = "datetime"
+    keep_cols = [
+        column
+        for column in ("open", "high", "low", "close", "volume", "amount")
+        if column in raw.columns
+    ]
+    return raw[keep_cols].copy()
+
+
+def resample_1m_to_5m_session_aware(frame: pd.DataFrame) -> pd.DataFrame:
+    """Resample 1-minute bars to 5-minute bars respecting A-share sessions.
+
+    Splits each trading day into AM (09:30-11:30) and PM (13:00-15:00)
+    and bins 1m bars into 5m buckets within each session.  Aggregation:
+    open=first, high=max, low=min, close=last, volume/amount=sum.
+    The bar timestamp is the last timestamp falling in the bucket.
+    """
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    ordered = frame.sort_index().copy()
+    if not isinstance(ordered.index, pd.DatetimeIndex):
+        return pd.DataFrame()
+    pieces: list[pd.DataFrame] = []
+    for trade_date, day_group in ordered.groupby(ordered.index.normalize()):
+        day_group = day_group.sort_index()
+        for session_start_str, session_end_str in (("09:30", "11:30"), ("13:00", "15:00")):
+            s_hour, s_min = map(int, session_start_str.split(":"))
+            e_hour, e_min = map(int, session_end_str.split(":"))
+            session_start = pd.Timestamp(trade_date) + pd.Timedelta(hours=s_hour, minutes=s_min)
+            session_end = pd.Timestamp(trade_date) + pd.Timedelta(hours=e_hour, minutes=e_min)
+            session = day_group.loc[
+                (day_group.index >= session_start) & (day_group.index <= session_end)
+            ]
+            if session.empty:
+                continue
+            # Bucket index within session (integer minutes, no hidden float).
+            minutes_since_start = (
+                (session.index - session_start) // pd.Timedelta("1min")
+            ).astype(int)
+            bin_idx = minutes_since_start // 5
+            for _, bucket in session.groupby(bin_idx, sort=True):
+                bucket = bucket.sort_index()
+                pieces.append(
+                    pd.DataFrame(
+                        {
+                            "datetime": [bucket.index[-1]],
+                            "open": [float(bucket["open"].iloc[0])],
+                            "high": [float(bucket["high"].max())],
+                            "low": [float(bucket["low"].min())],
+                            "close": [float(bucket["close"].iloc[-1])],
+                            "volume": [float(bucket["volume"].sum())],
+                            "amount": [
+                                float(bucket["amount"].sum())
+                                if "amount" in bucket.columns
+                                else 0.0
+                            ],
+                        }
+                    ).set_index("datetime")
+                )
+    if not pieces:
+        return pd.DataFrame()
+    result = pd.concat(pieces, axis=0, sort=False).sort_index()
+    result = result[~result.index.duplicated(keep="last")]
+    result.index.name = "datetime"
+    return result
 
 
 def _normalize_index_daily(frame: pd.DataFrame, *, index_code: str) -> pd.DataFrame:

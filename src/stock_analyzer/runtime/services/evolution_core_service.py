@@ -476,6 +476,72 @@ class RuntimeEvolutionCoreService:
     def _job_evolution_offhours(self, now: datetime | None = None) -> dict[str, object]:
         service = self._service
         job_now = now or datetime.now()
+        # PLAN Section 4: readiness gate — missing/mismatched nightly_data_ready.json
+        # is a hard scheduler failure (ran=true, success=false).
+        readiness_gate = None
+        try:
+            from stock_analyzer.ops.nightly_readiness import check_nightly_readiness  # noqa: WPS433
+
+            expected_date = service._resolve_nightly_expected_trade_date()
+            # Only gate when the readiness artifact is actually deployed (NAS prod):
+            # tests and local dev have no warehouse expected date or no artifact.
+            # Missing date means "readiness not yet deployed" — do not block.
+            if (
+                expected_date is not None
+                and str(expected_date).strip()
+                and str(expected_date).strip() != "unresolved"
+            ):
+                try:
+                    readiness_gate = check_nightly_readiness(expected_trade_date=expected_date)
+                except Exception as exc:
+                    # Fail-closed on readiness read failure: surface explicit block
+                    # rather than silently bypassing the gate (old fail-open bug).
+                    service._record_audit_event(
+                        event_type="evolution_offhours_blocked_readiness_error",
+                        trace_id="scheduler-evolution",
+                        level="warn",
+                        payload={"error": f"{type(exc).__name__}:{exc}"},
+                    )
+                    return {
+                        "status": "blocked_nightly_data_not_ready",
+                        "readiness": {},
+                        "expected_trade_date": str(expected_date),
+                        "_scheduler_ran": True,
+                        "_scheduler_success": False,
+                        "_scheduler_detail": "nightly_data_not_ready",
+                    }
+                if not readiness_gate.ready:
+                    ran, success, detail = readiness_gate.scheduler_triple()
+                    payload: dict[str, object] = {
+                        "status": "blocked_nightly_data_not_ready",
+                        "readiness": readiness_gate.payload,
+                        "expected_trade_date": readiness_gate.expected_trade_date,
+                        "_scheduler_ran": ran,
+                        "_scheduler_success": success,
+                        "_scheduler_detail": detail,
+                    }
+                    service._record_audit_event(
+                        event_type="evolution_offhours_blocked_readiness",
+                        trace_id="scheduler-evolution",
+                        level="warn",
+                        payload={"expected_trade_date": readiness_gate.expected_trade_date},
+                    )
+                    return payload
+        except Exception as exc:
+            service._record_audit_event(
+                event_type="evolution_offhours_readiness_unexpected_error",
+                trace_id="scheduler-evolution",
+                level="warn",
+                payload={"error": f"{type(exc).__name__}:{exc}"},
+            )
+            return {
+                "status": "blocked_nightly_data_not_ready",
+                "readiness": {},
+                "expected_trade_date": str(expected_date) if "expected_date" in locals() else "",
+                "_scheduler_ran": True,
+                "_scheduler_success": False,
+                "_scheduler_detail": "nightly_data_not_ready",
+            }
         watchlist_before = _normalized_symbol_list(service._state.watchlist)
         symbols = [str(item).strip() for item in service._state.watchlist if str(item).strip()]
         symbol_source = "watchlist"
@@ -523,6 +589,45 @@ class RuntimeEvolutionCoreService:
             source_trace_id="scheduler-evolution",
             timestamp=job_now,
         )
+        # PLAN Section 4: consume readiness atomically on full success only.
+        _consume_success = (
+            not str(report.get("status", "")).strip().lower().startswith("blocked")
+            and str(report.get("status", "")).strip().lower() != "failed"
+            and str(week5_refresh.get("status", "")).strip().lower() not in {"failed", "blocked"}
+        )
+        # Watchlist sync / final selector must have succeeded to consume.
+        # Default False: success strings are ONLY the explicit positives.
+        # Blocked/skipped/error must NOT be consumed so the scheduler can
+        # retry via backoff.
+        try:
+            watchlist_sync_ok = False
+            if isinstance(week5_refresh, dict):
+                status = str(week5_refresh.get("status", "")).strip().lower()
+                # Freshness/evolution blocked statuses must never be consumed.
+                blocked_markers = ("blocked", "failed", "error", "skipped")
+                if any(status.startswith(marker) for marker in blocked_markers):
+                    watchlist_sync_ok = False
+                elif bool(week5_refresh.get("watchlist_synced", False)):
+                    watchlist_sync_ok = True
+                elif bool(week5_refresh.get("final_signals")):
+                    watchlist_sync_ok = True
+                elif status in {"ok", "completed", "success"}:
+                    watchlist_sync_ok = True
+        except Exception:
+            watchlist_sync_ok = False
+        if _consume_success and watchlist_sync_ok:
+            try:
+                from stock_analyzer.ops.nightly_readiness import (
+                    consume_nightly_readiness,  # noqa: WPS433
+                )
+
+                consumed = consume_nightly_readiness()
+                if consumed is not None:
+                    report["readiness_consumed"] = True
+                    week5_refresh = dict(week5_refresh)
+                    week5_refresh["readiness_consumed"] = True
+            except Exception:
+                pass
         return {
             "report": report,
             "tdx_sync": report.get("tdx_sync", {}),

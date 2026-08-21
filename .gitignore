@@ -47,6 +47,7 @@ manual_test_tmp/
 suggestions/
 artifacts/*
 !artifacts/model_v1.json
+src/artifacts/
 codex_pytest_*/
 output/
 staging/tdx_probe/

@@ -10,7 +10,6 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import zipfile
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -18,58 +17,16 @@ from typing import Any
 
 import pandas as pd
 
-from stock_analyzer.data.intraday_summary import summarize_minute_bars
+from stock_analyzer.data.intraday_summary_builder import (
+    _BATCH_SYMBOLS,
+    _SUPPORTED_INTERVALS,
+    archive_paths,
+    entry_symbol,
+    flush_summaries,
+    manifest_path,
+    read_entry_summary,
+)
 from stock_analyzer.data.market_warehouse import MarketWarehouse
-from stock_analyzer.data.tdx_offline_provider import _normalize_symbol
-from stock_analyzer.data.vendor_zip_overlay import (
-    _minute_archive_coverage,
-    normalize_vendor_minute_frame,
-)
-
-_ENTRY_RE = re.compile(
-    r"^(?:sh|sz|bj)?(?P<code>\d{6})(?:\.(?:SH|SZ|BJ))?"
-    r"(?:_(?:\d{4}|\d{6}|\d{8}))?\.csv$",
-    re.IGNORECASE,
-)
-_SUPPORTED_INTERVALS = {"1m": "1min", "5m": "5min"}
-_BATCH_SYMBOLS = 128
-
-
-def manifest_path(db_path: Path) -> Path:
-    return Path(str(db_path) + ".manifest.json")
-
-
-def _entry_symbol(entry_name: str) -> str:
-    basename = entry_name.replace("\\", "/").rsplit("/", 1)[-1]
-    match = _ENTRY_RE.fullmatch(basename)
-    if match is None:
-        return ""
-    return _normalize_symbol(match.group("code"))
-
-
-def _archive_paths(root: Path, interval: str, cutoff: date) -> list[Path]:
-    token = _SUPPORTED_INTERVALS[interval]
-    candidates: list[Path] = []
-    for directory in root.rglob(f"Stock*_{token}_*-now"):
-        if not directory.is_dir():
-            continue
-        candidates.extend(directory.glob("*.zip"))
-    selected: list[Path] = []
-    for path in sorted(set(candidates)):
-        coverage = _minute_archive_coverage(path)
-        if coverage is None or coverage[1] < cutoff:
-            continue
-        selected.append(path)
-    # Annual archives are processed first and same-period monthly archives last,
-    # so a vendor monthly refresh wins on duplicate symbol/date rows.
-    selected.sort(
-        key=lambda item: (
-            _minute_archive_coverage(item)[0] if _minute_archive_coverage(item) else date.min,
-            0 if "-" not in item.stem else 1,
-            item.as_posix(),
-        )
-    )
-    return selected
 
 
 def _update_archive_fingerprint(
@@ -103,53 +60,6 @@ def _update_archive_fingerprint(
     )
 
 
-def _read_entry_summary(
-    archive: zipfile.ZipFile,
-    entry_names: list[str],
-    *,
-    interval: str,
-    cutoff: date,
-    volume_multiplier: float,
-    amount_multiplier: float,
-) -> pd.DataFrame:
-    pieces: list[pd.DataFrame] = []
-    cutoff_ts = pd.Timestamp(cutoff)
-    for entry_name in entry_names:
-        try:
-            with archive.open(entry_name) as stream:
-                raw = pd.read_csv(stream)
-        except (KeyError, OSError, ValueError, pd.errors.ParserError):
-            continue
-        normalized = normalize_vendor_minute_frame(
-            raw,
-            volume_multiplier=volume_multiplier,
-            amount_multiplier=amount_multiplier,
-        )
-        if normalized.empty:
-            continue
-        normalized = normalized.loc[normalized.index >= cutoff_ts]
-        if not normalized.empty:
-            pieces.append(normalized)
-    if not pieces:
-        return pd.DataFrame()
-    minute_bars = pd.concat(pieces, axis=0, sort=False)
-    minute_bars = minute_bars[~minute_bars.index.duplicated(keep="last")].sort_index()
-    return summarize_minute_bars(minute_bars, interval=interval)
-
-
-def _flush(
-    warehouse: MarketWarehouse,
-    *,
-    interval: str,
-    rows: list[pd.DataFrame],
-) -> dict[str, int]:
-    if not rows:
-        return {"rows": 0, "conflicts": 0}
-    frame = pd.concat(rows, axis=0, ignore_index=True)
-    rows.clear()
-    return warehouse.upsert_intraday_summaries(interval=interval, frame=frame)
-
-
 def _build_interval(
     *,
     root: Path,
@@ -159,7 +69,7 @@ def _build_interval(
     volume_multiplier: float,
     amount_multiplier: float,
 ) -> dict[str, Any]:
-    archives = _archive_paths(root, interval, cutoff)
+    archives = archive_paths(root, interval, cutoff)
     if not archives:
         raise RuntimeError(f"no {interval} minute ZIP archives cover {cutoff.isoformat()}")
     symbols_seen: set[str] = set()
@@ -184,7 +94,7 @@ def _build_interval(
             for info in infos:
                 if info.is_dir() or info.filename.startswith("__MACOSX/"):
                     continue
-                symbol = _entry_symbol(info.filename)
+                symbol = entry_symbol(info.filename)
                 if not symbol:
                     continue
                 grouped.setdefault(symbol, []).append(info.filename)
@@ -193,7 +103,7 @@ def _build_interval(
             archive_count += 1
             entry_count += sum(len(items) for items in grouped.values())
             for symbol, entry_names in sorted(grouped.items()):
-                summary = _read_entry_summary(
+                summary = read_entry_summary(
                     archive,
                     entry_names,
                     interval=interval,
@@ -208,10 +118,10 @@ def _build_interval(
                 rows.append(summary)
                 symbols_seen.add(symbol)
                 if len(rows) >= _BATCH_SYMBOLS:
-                    result = _flush(warehouse, interval=interval, rows=rows)
+                    result = flush_summaries(warehouse, interval=interval, rows=rows)
                     rows_written += int(result["rows"])
                     conflicts += int(result["conflicts"])
-            result = _flush(warehouse, interval=interval, rows=rows)
+            result = flush_summaries(warehouse, interval=interval, rows=rows)
             rows_written += int(result["rows"])
             conflicts += int(result["conflicts"])
     coverage = warehouse.intraday_coverage(interval=interval)

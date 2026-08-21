@@ -515,6 +515,15 @@ class Week5Config(_StrictModel):
     anomaly_shadow_pct: float = 0.06
     empty_signal_drawdown_pct: float = 10.0
     empty_signal_no_buy_runs: int = 5
+    # PLAN Section 3: intraday sync + freshness gate for the nightly deep stage.
+    intraday_sync_enabled: bool = True
+    intraday_sync_primary: str = "tushare"
+    intraday_sync_fallback: str = "sina"
+    intraday_sync_concurrency: int = 4
+    intraday_sync_timeout_sec: int = 5
+    intraday_sync_deadline_sec: int = 180
+    intraday_fresh_ratio_min: float = 0.95
+    intraday_single_ticker_budget_sec: int = 5
 
 
 class HolidayRiskConfig(_StrictModel):

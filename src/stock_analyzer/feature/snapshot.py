@@ -1575,10 +1575,19 @@ def _snapshot_row_for_symbol(
     bars: pd.DataFrame,
     symbol: str,
     engineer: FeatureEngineer,
+    intraday_1m: pd.DataFrame | None = None,
+    intraday_5m: pd.DataFrame | None = None,
 ) -> pd.DataFrame | None:
-    """One row: symbol + trade_date + engineered features + raw columns."""
+    """One row: symbol + trade_date + engineered features + raw columns.
+
+    Snapshot building is **daily-only** (no intraday): callers must pass
+    ``intraday_1m``/``intraday_5m`` as ``None`` for the light funnel.  The
+    deep stage builds fresh frames via ``engineer.transform(bars,
+    intraday_1m=..., intraday_5m=...)`` so daily snapshot rows never carry
+    stale intraday factors.
+    """
     try:
-        features = engineer.transform(bars)
+        features = engineer.transform(bars, intraday_1m=intraday_1m, intraday_5m=intraday_5m)
     except Exception:
         return None
     if features is None or features.empty:
