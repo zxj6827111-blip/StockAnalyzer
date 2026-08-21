@@ -93,6 +93,25 @@ def test_nas_deploy_update_builds_candidate_summary_before_runtime_recreate() ->
     assert cutover_index < script.index("--force-recreate api", cutover_index)
 
 
+def test_nas_deploy_update_reuses_valid_intraday_summary_by_default() -> None:
+    script = _script()
+
+    assert "FORCE_REBUILD_INTRADAY_SUMMARY=0" in script
+    assert "--rebuild-intraday-summary" in script
+    assert "--check-reusable" in script
+    assert "${SUMMARY_HOST_ROOT}:/data/intraday_summary:ro" in script
+    assert "existing intraday summary is valid and will be reused" in script
+    assert 'if [[ "${SUMMARY_REUSED}" -eq 0 ]]; then' in script
+    assert "existing intraday summary remains in place" in script
+    reusable_check = script.index("--check-reusable")
+    candidate_build = script.index(
+        '--output "/data/intraday_summary/$(basename "${SUMMARY_CANDIDATE}")"',
+        reusable_check,
+    )
+    assert reusable_check < candidate_build
+    assert candidate_build < script.index("if ! snapshot_runtime_containers")
+
+
 def test_nas_deploy_update_has_automatic_runtime_rollback() -> None:
     script = _script()
 

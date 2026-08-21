@@ -261,7 +261,31 @@ E:\AStockData\raw\local_vendor\original_files\incoming\股票历史数据
 
 这些是本机代码和真实数据格式证据，不等于 NAS 已经部署完成。NAS 上仍需按本指南验证实际挂载、Tushare Token、首次增量和运行日志。
 
-## 10. 回滚
+## 10. NAS 代码部署与分钟摘要复用
+
+正常更新代码并切换容器：
+
+```bash
+bash scripts/nas_deploy_update.sh --branch main
+```
+
+部署脚本会先校验现有 `vendor_intraday_summary.duckdb` 和 manifest，包括
+`1m`/`5m` 覆盖、单位契约、可选的最新日期门禁，以及源分钟 ZIP 的路径、
+大小和修改时间快照。全部一致时直接复用正式摘要，不读取或解压分钟 ZIP 内容。
+
+以下情况才执行 480 个自然日的全量重建：
+
+- 正式摘要或 manifest 缺失、损坏或格式不兼容；
+- 源分钟 ZIP 新增、删除或发生变化；
+- 显式要求强制重建：
+
+```bash
+bash scripts/nas_deploy_update.sh --branch main --rebuild-intraday-summary
+```
+
+每日 Tushare 日线更新、ZIP 索引、Delta 同步和 readiness 发布不触发该分钟摘要重建。
+
+## 11. 回滚
 
 外挂模式出现问题时，不要删除原始 ZIP 或 runtime artifacts 卷。先停止当前组合：
 

@@ -15,6 +15,7 @@
 #   bash scripts/nas_deploy_update.sh --branch main
 #   bash scripts/nas_deploy_update.sh --no-recreate   # image build only
 #   bash scripts/nas_deploy_update.sh --no-start-schedulers  # emergency API-only cutover
+#   bash scripts/nas_deploy_update.sh --rebuild-intraday-summary  # force full rebuild
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -22,6 +23,7 @@ BRANCH="main"
 DO_RECREATE=1
 DO_PULL=1
 START_SCHEDULERS=1
+FORCE_REBUILD_INTRADAY_SUMMARY=0
 HEALTH_ATTEMPTS="${HEALTH_ATTEMPTS:-30}"
 HEALTH_SLEEP_SEC="${HEALTH_SLEEP_SEC:-2}"
 HOST_PYTHON="${HOST_PYTHON:-}"
@@ -47,6 +49,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-start-scheduler|--no-start-schedulers)
       START_SCHEDULERS=0
+      shift
+      ;;
+    --rebuild-intraday-summary)
+      FORCE_REBUILD_INTRADAY_SUMMARY=1
       shift
       ;;
     -h|--help)
@@ -197,6 +203,7 @@ SUMMARY_OLD_DB_BACKED_UP=0
 SUMMARY_OLD_MANIFEST_BACKED_UP=0
 SUMMARY_NEW_DB_PROMOTED=0
 SUMMARY_NEW_MANIFEST_PROMOTED=0
+SUMMARY_REUSED=0
 
 snapshot_runtime_containers() {
   local name
@@ -372,6 +379,11 @@ restore_previous_summary() {
   if [[ -z "${SUMMARY_CURRENT}" ]]; then
     return 0
   fi
+  if [[ "${SUMMARY_REUSED}" -eq 1 ]]; then
+    cleanup_summary_candidates
+    echo "rollback: reused intraday summary remained unchanged" >&2
+    return 0
+  fi
   if [[ "${SUMMARY_NEW_DB_PROMOTED}" -eq 1 \
     || ( "${SUMMARY_OLD_DB_BACKED_UP}" -eq 1 && -e "${SUMMARY_CURRENT}" ) ]]; then
     if ! rm -f "${SUMMARY_CURRENT}"; then
@@ -475,7 +487,7 @@ if [[ "${DO_RECREATE}" -eq 0 ]]; then
   exit 0
 fi
 
-echo "[4/6] build candidate intraday summary DuckDB while the current runtime remains available"
+echo "[4/6] validate existing intraday summary or build a replacement candidate"
 mapfile -t SUMMARY_MOUNTS < <("${HOST_PYTHON}" - "${RENDERED}" <<'PY'
 import json, sys
 from pathlib import Path
@@ -533,38 +545,66 @@ if [[ -n "${INTRADAY_REQUIRED_LATEST_DATE}" ]]; then
 else
   echo "intraday summary static freshness floor disabled; runtime candidate sync is authoritative"
 fi
-if ! docker run --rm \
-  -v "${VENDOR_HOST_ROOT}:/data/vendor_history:ro" \
-  -v "${SUMMARY_HOST_ROOT}:/data/intraday_summary" \
-  stock-analyzer:latest \
-  python /app/scripts/build_vendor_intraday_summary.py \
-    --root /data/vendor_history \
-    --output "/data/intraday_summary/$(basename "${SUMMARY_CANDIDATE}")" \
-    --keep-days "${INTRADAY_SUMMARY_KEEP_DAYS:-480}" \
-    "${INTRADAY_FRESHNESS_ARGS[@]}"; then
-  cleanup_summary_candidates
-  if [[ -n "${PREVIOUS_IMAGE_ID}" ]]; then
-    docker tag "${PREVIOUS_IMAGE_ID}" stock-analyzer:latest
+if [[ "${FORCE_REBUILD_INTRADAY_SUMMARY}" -eq 1 ]]; then
+  echo "intraday summary rebuild explicitly requested"
+elif [[ -s "${SUMMARY_CURRENT}" && -s "${SUMMARY_CURRENT_MANIFEST}" ]]; then
+  echo "checking whether the existing intraday summary can be reused"
+  if docker run --rm \
+    -v "${VENDOR_HOST_ROOT}:/data/vendor_history:ro" \
+    -v "${SUMMARY_HOST_ROOT}:/data/intraday_summary:ro" \
+    stock-analyzer:latest \
+    python /app/scripts/build_vendor_intraday_summary.py \
+      --root /data/vendor_history \
+      --output /data/intraday_summary/vendor_intraday_summary.duckdb \
+      --check-reusable \
+      "${INTRADAY_FRESHNESS_ARGS[@]}"; then
+    SUMMARY_REUSED=1
+    echo "existing intraday summary is valid and will be reused"
+  else
+    echo "existing intraday summary is not reusable; building a replacement"
   fi
-  exit 1
-fi
-if [[ ! -s "${SUMMARY_CANDIDATE}" || ! -s "${SUMMARY_CANDIDATE_MANIFEST}" ]]; then
-  echo "ERROR: candidate intraday summary or manifest is missing." >&2
-  cleanup_summary_candidates
-  if [[ -n "${PREVIOUS_IMAGE_ID}" ]]; then
-    docker tag "${PREVIOUS_IMAGE_ID}" stock-analyzer:latest
-  fi
-  exit 1
+else
+  echo "existing intraday summary is missing; building the initial database"
 fi
 
-echo "[5/6] preserve old containers and atomically promote the candidate summary"
+if [[ "${SUMMARY_REUSED}" -eq 0 ]]; then
+  if ! docker run --rm \
+    -v "${VENDOR_HOST_ROOT}:/data/vendor_history:ro" \
+    -v "${SUMMARY_HOST_ROOT}:/data/intraday_summary" \
+    stock-analyzer:latest \
+    python /app/scripts/build_vendor_intraday_summary.py \
+      --root /data/vendor_history \
+      --output "/data/intraday_summary/$(basename "${SUMMARY_CANDIDATE}")" \
+      --keep-days "${INTRADAY_SUMMARY_KEEP_DAYS:-480}" \
+      "${INTRADAY_FRESHNESS_ARGS[@]}"; then
+    cleanup_summary_candidates
+    if [[ -n "${PREVIOUS_IMAGE_ID}" ]]; then
+      docker tag "${PREVIOUS_IMAGE_ID}" stock-analyzer:latest
+    fi
+    exit 1
+  fi
+  if [[ ! -s "${SUMMARY_CANDIDATE}" || ! -s "${SUMMARY_CANDIDATE_MANIFEST}" ]]; then
+    echo "ERROR: candidate intraday summary or manifest is missing." >&2
+    cleanup_summary_candidates
+    if [[ -n "${PREVIOUS_IMAGE_ID}" ]]; then
+      docker tag "${PREVIOUS_IMAGE_ID}" stock-analyzer:latest
+    fi
+    exit 1
+  fi
+fi
+
+echo "[5/6] preserve old containers and prepare the validated intraday summary"
 if ! snapshot_runtime_containers || ! backup_runtime_containers; then
   rollback_runtime
   exit 1
 fi
-if ! promote_candidate_summary; then
-  rollback_runtime
-  exit 1
+if [[ "${SUMMARY_REUSED}" -eq 0 ]]; then
+  if ! promote_candidate_summary; then
+    rollback_runtime
+    exit 1
+  fi
+else
+  echo "existing intraday summary remains in place"
 fi
 
 echo "[6/6] recreate api and split schedulers"
