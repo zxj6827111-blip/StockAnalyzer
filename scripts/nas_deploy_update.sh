@@ -523,17 +523,16 @@ SUMMARY_ROLLBACK="${SUMMARY_CURRENT}.rollback-${DEPLOY_ID}"
 SUMMARY_ROLLBACK_MANIFEST="${SUMMARY_ROLLBACK}.manifest.json"
 cleanup_summary_candidates
 INTRADAY_REQUIRED_LATEST_DATE="${INTRADAY_SUMMARY_REQUIRED_LATEST_DATE:-}"
-if [[ -z "${INTRADAY_REQUIRED_LATEST_DATE}" ]]; then
-  INTRADAY_REQUIRED_LATEST_DATE="$(docker run --rm \
-    -v "${ARTIFACTS_MOUNT_SOURCE}:/app/artifacts:ro" \
-    stock-analyzer:latest \
-    python -c 'import json; from pathlib import Path; p=Path("/app/artifacts/vendor_overlay/daily_index.json"); d=json.loads(p.read_text(encoding="utf-8")); dates=[str(v.get("latest_date", "")) for v in (d.get("symbols") or {}).values() if isinstance(v, dict) and str(v.get("latest_date", ""))]; print(max(dates, default=""))')"
+INTRADAY_FRESHNESS_ARGS=()
+if [[ -n "${INTRADAY_REQUIRED_LATEST_DATE}" ]]; then
+  echo "intraday summary explicit freshness floor: ${INTRADAY_REQUIRED_LATEST_DATE}"
+  INTRADAY_FRESHNESS_ARGS=(
+    --require-latest-date
+    "${INTRADAY_REQUIRED_LATEST_DATE}"
+  )
+else
+  echo "intraday summary static freshness floor disabled; runtime candidate sync is authoritative"
 fi
-if [[ -z "${INTRADAY_REQUIRED_LATEST_DATE}" ]]; then
-  echo "ERROR: cannot resolve intraday summary freshness floor from daily_index.json." >&2
-  exit 1
-fi
-echo "intraday summary required latest date: ${INTRADAY_REQUIRED_LATEST_DATE}"
 if ! docker run --rm \
   -v "${VENDOR_HOST_ROOT}:/data/vendor_history:ro" \
   -v "${SUMMARY_HOST_ROOT}:/data/intraday_summary" \
@@ -542,7 +541,7 @@ if ! docker run --rm \
     --root /data/vendor_history \
     --output "/data/intraday_summary/$(basename "${SUMMARY_CANDIDATE}")" \
     --keep-days "${INTRADAY_SUMMARY_KEEP_DAYS:-480}" \
-    --require-latest-date "${INTRADAY_REQUIRED_LATEST_DATE}"; then
+    "${INTRADAY_FRESHNESS_ARGS[@]}"; then
   cleanup_summary_candidates
   if [[ -n "${PREVIOUS_IMAGE_ID}" ]]; then
     docker tag "${PREVIOUS_IMAGE_ID}" stock-analyzer:latest

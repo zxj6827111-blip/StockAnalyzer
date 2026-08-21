@@ -20,11 +20,11 @@ Schema
 ``nightly_data_ready.json`` example ::
 
     {
-        "schema_version": 1,
+        "schema_version": 2,
         "target_trade_date": "2026-08-19",
-        "daily":   {"ok": true},
-        "index":   {"ok": true},
-        "delta":   {"ok": true},
+        "daily":   {"ok": true, "latest_trade_date": "2026-08-19"},
+        "index":   {"ok": true, "symbols_on_target_date": 5541},
+        "delta":   {"ok": true, "symbols_on_target_date": 5541},
         "created_at": "2026-08-19T19:48:12+08:00",
         "updater_commit": "abc1234",
         "source": "stock_updater.sh"
@@ -72,7 +72,7 @@ from uuid import uuid4
 
 READINESS_FILENAME = "nightly_data_ready.json"
 CONSUMED_FILENAME = "nightly_data_ready.consumed.json"
-READINESS_SCHEMA_VERSION = 1
+READINESS_SCHEMA_VERSION = 2
 
 logger = logging.getLogger(__name__)
 
@@ -194,6 +194,125 @@ def _expected_trade_date_from_payload(
     return _coerce_date(fallback)
 
 
+def _required_artifact_path(value: str | Path | None, *, label: str) -> Path:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{label} is required for nightly readiness")
+    path = Path(text).expanduser()
+    if not path.is_file():
+        raise ValueError(f"{label} does not exist: {path}")
+    return path
+
+
+def _validate_daily_index(
+    *,
+    index_path: str | Path | None,
+    target_trade_date: date,
+) -> dict[str, Any]:
+    path = _required_artifact_path(index_path, label="index_path")
+    payload = _read_json(path)
+    if payload is None:
+        raise ValueError(f"index_path is not valid JSON: {path}")
+    symbols = payload.get("symbols")
+    if not isinstance(symbols, dict) or not symbols:
+        raise ValueError(f"index_path has no symbols: {path}")
+
+    latest_dates: list[date] = []
+    for item in symbols.values():
+        if not isinstance(item, dict):
+            continue
+        parsed = _coerce_date(item.get("latest_date"))
+        if parsed is not None:
+            latest_dates.append(parsed)
+    if not latest_dates:
+        raise ValueError(f"index_path has no latest_date values: {path}")
+
+    index_latest = max(latest_dates)
+    symbols_on_target = sum(1 for item in latest_dates if item == target_trade_date)
+    if index_latest != target_trade_date:
+        raise ValueError(
+            "daily index latest date mismatch: "
+            f"expected {target_trade_date.isoformat()}, got {index_latest.isoformat()}"
+        )
+    if symbols_on_target <= 0:
+        raise ValueError(f"daily index has no symbols on {target_trade_date.isoformat()}")
+    return {
+        "ok": True,
+        "path": str(path),
+        "latest_trade_date": index_latest.isoformat(),
+        "symbols_total": len(symbols),
+        "symbols_on_target_date": symbols_on_target,
+    }
+
+
+def _validate_delta_db(
+    *,
+    db_path: str | Path | None,
+    target_trade_date: date,
+    expected_symbols_on_target: int,
+) -> dict[str, Any]:
+    path = _required_artifact_path(db_path, label="delta_db_path")
+    try:
+        import duckdb
+    except ImportError as exc:  # pragma: no cover - production dependency
+        raise RuntimeError("duckdb is required to validate nightly readiness") from exc
+
+    try:
+        with duckdb.connect(str(path), read_only=True) as connection:
+            table_exists = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM information_schema.tables
+                WHERE table_name = 'daily_bars'
+                """
+            ).fetchone()
+            if not table_exists or int(table_exists[0] or 0) <= 0:
+                raise ValueError(f"delta DB has no daily_bars table: {path}")
+            row = connection.execute(
+                """
+                SELECT
+                    MAX(date),
+                    COUNT(DISTINCT symbol),
+                    COUNT(DISTINCT CASE WHEN date = ? THEN symbol END)
+                FROM daily_bars
+                """,
+                [target_trade_date.isoformat()],
+            ).fetchone()
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"cannot validate delta DB {path}: {type(exc).__name__}:{exc}") from exc
+
+    delta_latest = _coerce_date(row[0] if row else None)
+    symbols_total = int(row[1] or 0) if row else 0
+    symbols_on_target = int(row[2] or 0) if row else 0
+    if delta_latest != target_trade_date:
+        actual = delta_latest.isoformat() if delta_latest is not None else ""
+        raise ValueError(
+            "delta DB latest date mismatch: "
+            f"expected {target_trade_date.isoformat()}, got {actual or 'missing'}"
+        )
+    if symbols_on_target < expected_symbols_on_target:
+        raise ValueError(
+            "delta DB target-date coverage is incomplete: "
+            f"{symbols_on_target}<{expected_symbols_on_target}"
+        )
+    coverage_ratio = (
+        round(symbols_on_target / expected_symbols_on_target, 6)
+        if expected_symbols_on_target > 0
+        else 0.0
+    )
+    return {
+        "ok": True,
+        "path": str(path),
+        "latest_trade_date": delta_latest.isoformat(),
+        "symbols_total": symbols_total,
+        "symbols_on_target_date": symbols_on_target,
+        "expected_symbols_on_target_date": expected_symbols_on_target,
+        "coverage_ratio": coverage_ratio,
+    }
+
+
 def read_nightly_readiness(path: str | Path | None = None) -> dict[str, Any] | None:
     """Return the readiness JSON payload, or ``None`` when absent / unreadable."""
     if path is not None:
@@ -230,7 +349,8 @@ def write_nightly_readiness(
 
     Args:
         target_trade_date: latest daily index date (not shell calendar date).
-        db_path / index_path: informational only, recorded in payload.
+        db_path / index_path: required artifacts. Both are opened and checked
+            against `target_trade_date` before readiness is published.
         updater_commit: the updater git commit (from ``.build_commit``).
         extra: additional keys merged into the payload.
         path: override output path; when omitted the authoritative path is used.
@@ -241,24 +361,45 @@ def write_nightly_readiness(
     coerced = _coerce_date(target_trade_date)
     if coerced is None:
         raise ValueError(f"invalid target_trade_date: {target_trade_date!r}")
+    index_validation = _validate_daily_index(
+        index_path=index_path,
+        target_trade_date=coerced,
+    )
+    delta_validation = _validate_delta_db(
+        db_path=db_path,
+        target_trade_date=coerced,
+        expected_symbols_on_target=int(index_validation["symbols_on_target_date"]),
+    )
     target = Path(path) if path is not None else authoritative_readiness_path()
     target.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {
         "schema_version": READINESS_SCHEMA_VERSION,
         "target_trade_date": coerced.isoformat(),
-        "daily": {"ok": True},
-        "index": {"ok": True},
-        "delta": {"ok": True},
+        "daily": {
+            "ok": True,
+            "latest_trade_date": coerced.isoformat(),
+            "symbols_on_target_date": index_validation["symbols_on_target_date"],
+        },
+        "index": index_validation,
+        "delta": delta_validation,
         "created_at": datetime.now(UTC).isoformat(),
         "updater_commit": str(updater_commit or "").strip(),
         "source": "stock_updater.sh",
+        "delta_db_path": str(db_path),
+        "index_path": str(index_path),
     }
-    if db_path is not None:
-        payload["delta_db_path"] = str(db_path)
-    if index_path is not None:
-        payload["index_path"] = str(index_path)
     if extra:
-        payload.update(extra)
+        reserved = {
+            "schema_version",
+            "target_trade_date",
+            "daily",
+            "index",
+            "delta",
+            "created_at",
+            "delta_db_path",
+            "index_path",
+        }
+        payload.update({key: value for key, value in extra.items() if key not in reserved})
     tmp = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
     with tmp.open("w", encoding="utf-8") as fp:
         json.dump(payload, fp, ensure_ascii=False, indent=2, sort_keys=True)

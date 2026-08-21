@@ -243,9 +243,7 @@ def test_zip_rebuild_validation_failure_preserves_old_archive(
 
     monkeypatch.setattr(updater.zipfile, "ZipFile", _FlakyZipFile)
     with pytest.raises(updater.zipfile.BadZipFile):
-        updater._rebuild_zip(
-            target, {"2025/600000.SH.csv": "new content\n"}
-        )
+        updater._rebuild_zip(target, {"2025/600000.SH.csv": "new content\n"})
     # The official archive is byte-identical: validation failed before replace.
     assert target.read_bytes() == original_bytes
     assert not list(tmp_path.glob("*.tmp"))  # temp cleaned up on failure
@@ -266,7 +264,11 @@ def test_rebuild_daily_year_zip_merges_old_and_new_rows(updater: object, tmp_pat
         daily=_daily_frame(),
         basic=_basic_frame(),
     )
-    updater._rebuild_daily_year_zip(tmp_path / "全A日K", 2025, {"600000.SH": fresh})
+    report = updater._rebuild_daily_year_zip(
+        tmp_path / "全A日K",
+        2025,
+        {"600000.SH": fresh},
+    )
 
     with zipfile.ZipFile(tmp_path / "全A日K" / "2025.zip") as archive:
         content = archive.read("2025/600000.SH.csv").decode("utf-8")
@@ -275,6 +277,7 @@ def test_rebuild_daily_year_zip_merges_old_and_new_rows(updater: object, tmp_pat
     assert [row.split(",")[1] for row in rows] == ["2025-07-17", "2025-07-20"]
     assert rows[0].split(",")[5] == "10.5"
     assert rows[1].split(",")[9] == "300"
+    assert report["latest_dates"]["600000"] == "2025-07-20"
 
 
 def test_rebuild_daily_year_zip_deduplicates_by_date(updater: object, tmp_path: Path) -> None:
@@ -302,9 +305,7 @@ def test_rebuild_daily_year_zip_deduplicates_by_date(updater: object, tmp_path: 
     assert rows[1].split(",")[9] == "300"
 
 
-def test_rebuild_factor_zip_replaces_all_years_of_symbol(
-    updater: object, tmp_path: Path
-) -> None:
+def test_rebuild_factor_zip_replaces_all_years_of_symbol(updater: object, tmp_path: Path) -> None:
     _write_zip(
         tmp_path / "复权因子" / "复权因子_前复权.zip",
         {
@@ -336,6 +337,9 @@ def test_rebuild_factor_zip_replaces_all_years_of_symbol(
 # ---------------------------------------------------------------------------
 def _fake_pro() -> object:
     class _FakePro:
+        def trade_cal(self, **kwargs: object) -> pd.DataFrame:
+            return pd.DataFrame({"cal_date": ["20250720"]})
+
         def daily(self, ts_code: str = "", **kwargs: object) -> pd.DataFrame:
             return _daily_frame()
 
@@ -382,9 +386,7 @@ def _factor_fixture(tmp_path: Path) -> Path:
         tmp_path / "复权因子" / "复权因子_前复权.zip",
         {
             "2025/600000.SH.csv": (
-                "股票代码,交易日期,复权因子\n"
-                "600000.SH,20250701,0.9\n"
-                "600000.SH,20250717,1.0\n"
+                "股票代码,交易日期,复权因子\n600000.SH,20250701,0.9\n600000.SH,20250717,1.0\n"
             )
         },
     )
@@ -401,9 +403,7 @@ def _factor_fixture(tmp_path: Path) -> Path:
     return tmp_path / "复权因子"
 
 
-def test_fetch_symbol_skips_when_zip_dates_are_current(
-    updater: object, tmp_path: Path
-) -> None:
+def test_fetch_symbol_skips_when_zip_dates_are_current(updater: object, tmp_path: Path) -> None:
     daily_root = _daily_fixture(tmp_path)
     factors_root = _factor_fixture(tmp_path)
     calls: list[str] = []
@@ -475,9 +475,7 @@ def test_fetch_symbol_fetches_only_missing_factors(updater: object, tmp_path: Pa
     assert len(calls) == 1
 
 
-def test_fetch_symbol_fetches_missing_daily_and_factors(
-    updater: object, tmp_path: Path
-) -> None:
+def test_fetch_symbol_fetches_missing_daily_and_factors(updater: object, tmp_path: Path) -> None:
     daily_root = _daily_fixture(tmp_path)
     factors_root = _factor_fixture(tmp_path)
     calls: list[str] = []
@@ -596,6 +594,7 @@ def _main_with_fake_api(
     argv: list[str],
 ) -> tuple[int, dict[str, object]]:
     """跑 updater._main，tushare API 用 fake（无网络），捕获 stdout JSON。"""
+
     class _FakeTushareProvider:
         def __init__(self, **kwargs: object) -> None:
             pass
@@ -669,9 +668,7 @@ def test_main_sync_vendor_delta_runs_incremental_import(
     # delta 库已含 600000 的两行（07-17 旧行 + 07-20 新行）。
     from stock_analyzer.data.market_warehouse import MarketWarehouse
 
-    warehouse = MarketWarehouse(
-        db_path=delta_db, package_root=tmp_path / "delta" / "package"
-    )
+    warehouse = MarketWarehouse(db_path=delta_db, package_root=tmp_path / "delta" / "package")
     frame = warehouse.fetch_all_daily_bars(symbol="600000")
     assert len(frame) == 2
     # qfq 最新因子锚定 07-20（=1.0）：新行 close 保持 raw 值 9.5。
@@ -729,22 +726,10 @@ def test_main_batch_skips_per_symbol_and_writes_readiness_after_delta(
     monkeypatch.setenv("SA__NIGHTLY_READINESS_PATH", str(readiness_path))
     per_symbol_calls: list[str] = []
 
-    def _fake_batch(**kwargs: object) -> dict[str, object]:
-        _ = kwargs
-        return {
-            "attempted": True,
-            "ok": True,
-            "latest_daily_date": "2025-07-20",
-            "symbols_updated": 1,
-            "zip_rebuilds": [],
-            "index": {"updated": True},
-        }
-
     def _unexpected_fetch(**kwargs: object) -> dict[str, object]:
         per_symbol_calls.append(str(kwargs.get("symbol", "")))
         raise AssertionError("batch mode must not dispatch per-symbol fetches")
 
-    monkeypatch.setattr(updater, "_run_batch", _fake_batch)
     monkeypatch.setattr(updater, "_fetch_symbol", _unexpected_fetch)
 
     exit_code, summary = _main_with_fake_api(
@@ -831,6 +816,8 @@ def test_main_readiness_write_failure_is_fatal(
 ) -> None:
     _daily_fixture(tmp_path)
     _factor_fixture(tmp_path)
+    index_path = _full_daily_index(tmp_path)
+    delta_db = tmp_path / "delta" / "market_delta.duckdb"
 
     def _fail_readiness(**kwargs: object) -> None:
         _ = kwargs
@@ -847,12 +834,49 @@ def test_main_readiness_write_failure_is_fatal(
             "2025-07-20",
             "--interval-sec",
             "0",
+            "--index-path",
+            str(index_path),
+            "--sync-vendor-delta",
+            str(delta_db),
         ],
     )
 
     assert exit_code == 1
+    assert summary["readiness"]["requested"] is True
     assert summary["readiness"]["written"] is False
     assert "readiness volume is read-only" in summary["readiness"]["error"]
+
+
+def test_main_without_delta_does_not_publish_readiness(
+    updater: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _daily_fixture(tmp_path)
+    _factor_fixture(tmp_path)
+    readiness_path = tmp_path / "runtime" / "nightly_data_ready.json"
+    monkeypatch.setenv("SA__NIGHTLY_READINESS_PATH", str(readiness_path))
+
+    exit_code, summary = _main_with_fake_api(
+        updater,
+        monkeypatch,
+        [
+            "--vendor-root",
+            str(tmp_path),
+            "--end-date",
+            "2025-07-20",
+            "--interval-sec",
+            "0",
+        ],
+    )
+
+    assert exit_code == 0
+    assert summary["readiness"] == {
+        "requested": False,
+        "written": False,
+        "error": "not_published:index_and_delta_required",
+    }
+    assert not readiness_path.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -900,6 +924,7 @@ def test_fetch_adj_factor_paged_concats_pages(updater: object) -> None:
 
 def test_fetch_adj_factor_paged_trade_date_single_call(updater: object) -> None:
     """trade_date 全市场单日调用不携带 offset/limit（接口不支持分页）。"""
+
     class _Pro:
         def __init__(self) -> None:
             self.calls: list[dict[str, object]] = []
@@ -934,9 +959,7 @@ def test_fetch_adj_factor_paged_trade_date_single_call(updater: object) -> None:
     assert api.pro.calls[0]["trade_date"] == "20260813"
 
 
-def test_fetch_symbol_adj_factor_empty_raises(
-    updater: object, tmp_path: Path
-) -> None:
+def test_fetch_symbol_adj_factor_empty_raises(updater: object, tmp_path: Path) -> None:
     """adj_factor 空响应视为失败而非无数据（8-13 现场 0 成功 0 失败被当 empty）。"""
     daily_root = _daily_fixture(tmp_path)
     factors_root = tmp_path / "复权因子_missing"
@@ -959,9 +982,7 @@ def test_fetch_symbol_adj_factor_empty_raises(
         def _call_with_retry(self, fn: object) -> object:
             return fn() if callable(fn) else fn
 
-    api = _Api(
-        token="x", retry_delay_sec=0.0, min_request_interval_sec=0.0, max_attempts=1
-    )
+    api = _Api(token="x", retry_delay_sec=0.0, min_request_interval_sec=0.0, max_attempts=1)
     with pytest.raises(updater.DataSourceError, match="adj_factor empty"):
         updater._fetch_symbol(
             api=api,

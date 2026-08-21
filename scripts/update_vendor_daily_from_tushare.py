@@ -623,12 +623,13 @@ def _rebuild_daily_year_zip(
             "",
         )
         if date_column:
-            parsed = pd.to_datetime(
-                merged[date_column].astype(str),
-                errors="coerce",
-            ).dropna()
-            if not parsed.empty:
-                latest_dates[_index_symbol_key(ts_code)] = parsed.max().date().isoformat()
+            parsed_dates = [
+                parsed
+                for value in merged[date_column].tolist()
+                if (parsed := _coerce_date(value)) is not None
+            ]
+            if parsed_dates:
+                latest_dates[_index_symbol_key(ts_code)] = max(parsed_dates).isoformat()
     report = _rebuild_zip(archive_path, replace_entries)
     report["latest_dates"] = latest_dates
     return report
@@ -1843,12 +1844,8 @@ def _main(argv: list[str] | None = None) -> int:
     _effective_index_report = (
         _batch_index_report if _batch_index_report is not None else index_report
     )
-    index_should_update = bool(
-        not args.dry_run and args.index_path.strip() and delta_should_sync
-    )
-    index_ok = not index_should_update or bool(
-        _effective_index_report.get("updated", False)
-    )
+    index_should_update = bool(not args.dry_run and args.index_path.strip() and delta_should_sync)
+    index_ok = not index_should_update or bool(_effective_index_report.get("updated", False))
 
     delta_sync_report: dict[str, object] = {"updated": False, "reason": "not_enabled"}
     if delta_requested and delta_should_sync and not index_ok:
@@ -1908,9 +1905,13 @@ def _main(argv: list[str] | None = None) -> int:
     full_run_ok = bool(not failures and batch_execution_ok and index_ok and delta_ok)
     readiness_written = False
     readiness_error = ""
+    readiness_requested = bool(args.index_path.strip() and args.sync_vendor_delta.strip())
 
-    # Write readiness only after every requested data stage succeeds.
-    if not args.dry_run and full_run_ok:
+    # Readiness is a production contract, not a generic updater success marker.
+    # Publish it only when index + delta were part of this same transaction;
+    # ad-hoc ZIP-only updates may still succeed but must not release the
+    # off-hours selector.
+    if not args.dry_run and full_run_ok and readiness_requested:
         try:
             # Batch's latest_daily_date already reflects ZIP rebuild date.
             _readiness_date = (
@@ -1923,15 +1924,15 @@ def _main(argv: list[str] | None = None) -> int:
                 db_path=args.sync_vendor_delta,
                 index_path=args.index_path,
                 extra={
-                    "source": "batch_update"
-                    if batch_payload is not None
-                    else "per_symbol_update"
+                    "source": "batch_update" if batch_payload is not None else "per_symbol_update"
                 },
             )
             readiness_written = True
         except Exception as exc:
             readiness_error = f"{type(exc).__name__}:{exc}"
             full_run_ok = False
+    elif not args.dry_run and full_run_ok:
+        readiness_error = "not_published:index_and_delta_required"
 
     # Merge batch index into index_report for observability when in batch mode.
     if batch_payload is not None and isinstance(batch_payload.get("index"), dict):
@@ -1960,6 +1961,7 @@ def _main(argv: list[str] | None = None) -> int:
         "index": index_report,
         "delta_sync": delta_sync_report,
         "readiness": {
+            "requested": readiness_requested,
             "written": readiness_written,
             "error": readiness_error,
         },

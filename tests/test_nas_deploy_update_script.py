@@ -76,6 +76,11 @@ def test_nas_deploy_update_builds_candidate_summary_before_runtime_recreate() ->
     assert 'SUMMARY_CANDIDATE_MANIFEST="${SUMMARY_CANDIDATE}.manifest.json"' in script
     assert "promote_candidate_summary()" in script
     assert "INTRADAY_SUMMARY_KEEP_DAYS:-480" in script
+    assert "INTRADAY_FRESHNESS_ARGS=()" in script
+    assert "INTRADAY_SUMMARY_REQUIRED_LATEST_DATE:-" in script
+    assert '"${INTRADAY_FRESHNESS_ARGS[@]}"' in script
+    assert "runtime candidate sync is authoritative" in script
+    assert "cannot resolve intraday summary freshness floor" not in script
     assert "/data/vendor_history:ro" in script
     assert "/data/intraday_summary" in script
     assert script.index("build api image with commit metadata") < script.index(
@@ -107,10 +112,7 @@ def test_nas_deploy_update_has_automatic_runtime_rollback() -> None:
     assert '"${RUNTIME_CONTAINER_BACKED_UP[index]:-0}" == "1"' in script
     assert "rollback: failed to quiesce unrenamed container" in script
     assert "rollback: original container disappeared before backup" in script
-    assert (
-        "FATAL: automatic rollback was incomplete; manual recovery is required."
-        in script
-    )
+    assert "FATAL: automatic rollback was incomplete; manual recovery is required." in script
     rollback_body = script[
         script.index("rollback_runtime()") : script.index(
             'echo "[3/6] build api image with commit metadata'
