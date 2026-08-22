@@ -7,8 +7,10 @@ delta 停在 8/19 而 ZIP 已到 8/20。该脚本迁入仓库后由部署脚本�
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -117,3 +119,51 @@ def test_managed_updater_verify_failure_explains_empty_only_block() -> None:
 
     assert "readiness verification FAILED" in script
     assert "errors are empty-only or the date had no market data" in script
+
+
+def test_managed_updater_empty_classifier_preserves_real_retries(
+    tmp_path: Path,
+) -> None:
+    """无 per-symbol failures 的 index/delta/readiness 故障不能冒充 empty-only。"""
+    script = _script()
+    marker = '  python3 - "$1" <<\'PY\'\n'
+    marker_at = script.find(marker)
+    assert marker_at >= 0
+    start = marker_at + len(marker)
+    end = script.index("\nPY\n", start)
+    assert end > start
+    classifier = script[start:end]
+
+    def _classify(payload: dict[str, object]) -> int:
+        path = tmp_path / "summary.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        completed = subprocess.run(
+            [sys.executable, "-c", classifier, str(path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return completed.returncode
+
+    assert _classify({"ok": False, "failures": []}) == 1
+    assert (
+        _classify(
+            {
+                "ok": False,
+                "mode": "batch",
+                "failures": ["20260821:empty_market_daily"],
+            }
+        )
+        == 1
+    )
+    assert (
+        _classify(
+            {
+                "ok": False,
+                "mode": "per_symbol",
+                "failures": ["legacy symbol daily empty"],
+            }
+        )
+        == 0
+    )
+    assert _classify({"ok": False, "failures": ["Tushare timeout"]}) == 1

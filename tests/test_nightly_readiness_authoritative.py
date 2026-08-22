@@ -239,3 +239,28 @@ def test_invalidate_without_any_readiness_is_noop(tmp_path: Path) -> None:
         assert invalidate_nightly_readiness() == []
     finally:
         monkey.undo()
+
+
+def test_invalidate_reports_replace_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """生产强制模式必须能感知失效失败，不能留下可消费的旧文件。"""
+    import stock_analyzer.ops.nightly_readiness as mod
+
+    path = tmp_path / "runtime" / "nightly_data_ready.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({"schema_version": 2, "target_trade_date": "2026-08-20"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(mod, "_candidate_readiness_paths", lambda: [path])
+
+    def _deny_replace(source: Path, target: Path) -> None:
+        _ = source, target
+        raise PermissionError("read-only readiness directory")
+
+    monkeypatch.setattr(mod.os, "replace", _deny_replace)
+
+    with pytest.raises(OSError, match="failed to invalidate"):
+        mod.invalidate_nightly_readiness(stamp="20260822T000000Z")
+    assert path.exists()

@@ -1149,3 +1149,61 @@ def test_require_readiness_invalidates_legacy_mirror_too(
     assert json.loads(auth.read_text(encoding="utf-8"))["target_trade_date"] == (
         "2025-07-20"
     )
+
+
+def test_require_readiness_invalidates_before_token_preflight(
+    updater: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """即使 token 缺失导致 updater 无法启动，也不能保留上一夜 readiness。"""
+    _daily_fixture(tmp_path)
+    readiness_path = tmp_path / "runtime" / "nightly_data_ready.json"
+    readiness_path.parent.mkdir(parents=True)
+    readiness_path.write_text(
+        json.dumps({"schema_version": 2, "target_trade_date": "2025-07-19"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SA__NIGHTLY_READINESS_PATH", str(readiness_path))
+    monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
+    monkeypatch.delenv("SA__MARKET_WAREHOUSE__TUSHARE_TOKEN", raising=False)
+
+    exit_code = updater._main(
+        [
+            "--vendor-root",
+            str(tmp_path),
+            "--index-path",
+            str(tmp_path / "daily_index.json"),
+            "--sync-vendor-delta",
+            str(tmp_path / "market_delta.duckdb"),
+            "--require-readiness",
+        ]
+    )
+
+    assert exit_code == 2
+    assert not readiness_path.exists()
+    assert len(list(readiness_path.parent.glob("nightly_data_ready.stale-*.json"))) == 1
+
+
+def test_require_readiness_invalidation_failure_is_fatal(
+    updater: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """旧 readiness 无法失效时，生产模式必须在任何数据访问前退出。"""
+    _daily_fixture(tmp_path)
+
+    def _fail_invalidation() -> list[Path]:
+        raise PermissionError("readiness volume is read-only")
+
+    monkeypatch.setattr(updater, "invalidate_nightly_readiness", _fail_invalidation)
+
+    exit_code = updater._main(
+        [
+            "--vendor-root",
+            str(tmp_path),
+            "--index-path",
+            str(tmp_path / "daily_index.json"),
+            "--sync-vendor-delta",
+            str(tmp_path / "market_delta.duckdb"),
+            "--require-readiness",
+        ]
+    )
+
+    assert exit_code == 1

@@ -144,14 +144,13 @@ def test_nas_deploy_update_has_automatic_runtime_rollback() -> None:
     assert script.count("rollback_runtime") >= 4
 
 
-def test_nas_deploy_update_no_recreate_is_image_build_only() -> None:
+def test_nas_deploy_update_no_recreate_leaves_runtime_unchanged() -> None:
     script = _script()
 
     marker = 'if [[ "${DO_RECREATE}" -eq 0 ]]; then'
     assert marker in script
-    assert "image build complete; runtime was not recreated" in script
+    assert "image/updater pair ready; runtime was not recreated" in script
     assert script.index(marker) < script.index('PORT="$(grep -E')
-
 
 def test_nas_deploy_update_requires_duckdb_runtime_without_zip_fallback() -> None:
     script = _script()
@@ -238,20 +237,22 @@ def test_nas_deploy_update_rollback_restores_previous_updater() -> None:
         in script
     )
     assert 'cp -p "${UPDATER_BACKUP}" "${PROD_UPDATER}"' in script
+    assert "UPDATER_INSTALLED=1" in script
+    assert "UPDATER_EXISTED=1" in script
+    assert 'rm -f "${PROD_UPDATER}"' in script
 
 
-def test_nas_deploy_update_skips_updater_install_on_no_recreate() -> None:
-    """--no-recreate 保持仅构建镜像语义：安装段整体位于 DO_RECREATE=1 守卫内。"""
+def test_nas_deploy_update_pairs_updater_before_no_recreate_exit() -> None:
+    """--no-recreate 仍会换装配套 updater，避免 latest 镜像与 cron 脚本错位。"""
     script = _script()
 
     installer_at = script.find('if [[ ! -f "${MANAGED_UPDATER_SRC}" ]]; then')
     assert installer_at != -1
-    guard = 'if [[ "${DO_RECREATE}" -eq 1 ]]; then'
-    guard_before_installer = script.rfind(guard, 0, installer_at)
-    assert guard_before_installer != -1, (
-        "managed updater install must be guarded by DO_RECREATE=1"
+    installed_at = script.find("UPDATER_INSTALLED=1", installer_at)
+    no_recreate_exit_at = script.find(
+        'if [[ "${DO_RECREATE}" -eq 0 ]]; then',
+        installer_at,
     )
-    # 守卫与其闭合 fi 之间不得出现提前退出的 no-recreate 分支。
-    closing_fi = script.find("\nfi\n", guard_before_installer)
-    assert closing_fi != -1
-    assert "runtime was not recreated" not in script[guard_before_installer:closing_fi]
+    assert installed_at != -1
+    assert no_recreate_exit_at != -1
+    assert installer_at < installed_at < no_recreate_exit_at

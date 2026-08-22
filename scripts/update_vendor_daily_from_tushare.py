@@ -1607,6 +1607,31 @@ def _main(argv: list[str] | None = None) -> int:
     except Exception:
         pass
 
+    # Fail-closed before any filesystem/provider preflight that could abort
+    # the new nightly cycle. If this run cannot even start, yesterday's
+    # readiness must still not remain consumable by the off-hours selector.
+    invalidated_readiness_paths: list[str] = []
+    readiness_invalidation_error = ""
+    if not args.dry_run:
+        try:
+            invalidated_readiness_paths = [
+                str(path) for path in invalidate_nightly_readiness()
+            ]
+        except Exception as exc:
+            readiness_invalidation_error = f"{type(exc).__name__}:{exc}"
+            if args.require_readiness:
+                print(
+                    "readiness invalidation failed in --require-readiness "
+                    f"mode: {readiness_invalidation_error}",
+                    file=sys.stderr,
+                )
+                return 1
+            print(
+                f"WARNING: readiness invalidation failed: "
+                f"{readiness_invalidation_error}",
+                file=sys.stderr,
+            )
+
     vendor_root = Path(args.vendor_root).expanduser()
     daily_root = vendor_root / args.daily_dir
     factors_root = vendor_root / args.factors_dir
@@ -1675,32 +1700,6 @@ def _main(argv: list[str] | None = None) -> int:
             max_attempts=max(1, int(args.max_retries)),
             price_series_mode="raw",
         )
-
-    # Fail-closed: a fresh update run retires the previous night's readiness
-    # BEFORE touching any data.  If this run then fails, yesterday's
-    # readiness must not remain consumable by the off-hours selector, and a
-    # failed invalidation must never be silently ignored in production mode.
-    invalidated_readiness_paths: list[str] = []
-    readiness_invalidation_error = ""
-    if not args.dry_run:
-        try:
-            invalidated_readiness_paths = [
-                str(path) for path in invalidate_nightly_readiness()
-            ]
-        except Exception as exc:
-            readiness_invalidation_error = f"{type(exc).__name__}:{exc}"
-            if args.require_readiness:
-                print(
-                    "readiness invalidation failed in --require-readiness "
-                    f"mode: {readiness_invalidation_error}",
-                    file=sys.stderr,
-                )
-                return 1
-            print(
-                f"WARNING: readiness invalidation failed: "
-                f"{readiness_invalidation_error}",
-                file=sys.stderr,
-            )
 
     results: list[dict[str, object]] = []
     failures: list[str] = []

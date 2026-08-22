@@ -508,6 +508,7 @@ def invalidate_nightly_readiness(
     """
     marker = stamp or datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     invalidated: list[Path] = []
+    failures: list[str] = []
     for candidate in _candidate_readiness_paths():
         if _read_json(candidate) is None:
             continue
@@ -524,9 +525,17 @@ def invalidate_nightly_readiness(
             suffix += 1
         try:
             os.replace(candidate, target)
-        except OSError:
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            failures.append(f"{candidate}:{type(exc).__name__}:{exc}")
             continue
         invalidated.append(candidate)
+    if failures:
+        raise OSError(
+            "failed to invalidate one or more nightly readiness files: "
+            + " | ".join(failures)
+        )
     return invalidated
 
 

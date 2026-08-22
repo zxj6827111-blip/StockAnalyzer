@@ -10,7 +10,8 @@
 # run never does (fail-closed via --require-readiness).
 #
 # Failure policy:
-#   - "empty" failures (delisted / legacy BSE old codes) are EXPECTED and OK;
+#   - "empty" failures (delisted / legacy BSE old codes) are expected, so a
+#     second API attempt is skipped, but readiness remains blocked;
 #   - any other failure -> retry once after 30 minutes;
 #   - readiness not published at the end -> non-zero exit (no selector run).
 #
@@ -37,7 +38,7 @@ flock -n 9 || { echo "[$(date '+%F %T')] updater already running, skip" >> "$LOG
 stamp() { date '+%F %T'; }
 
 judge() {
-  # $1 = JSON summary file; exits 0 if no failures or all are "empty"-type.
+  # $1 = JSON summary file; exits 0 only for expected per-symbol "empty" failures.
   python3 - "$1" <<'PY'
 import json, sys
 try:
@@ -45,6 +46,15 @@ try:
 except Exception:
     sys.exit(2)
 fails = d.get("failures") or []
+if not fails:
+    # Index / delta / readiness failures commonly have no per-symbol entries.
+    # They are real failures and must receive the normal delayed retry.
+    sys.exit(1)
+if d.get("mode") == "batch":
+    # In batch mode every requested date comes from trade_cal. An empty
+    # full-market response is therefore an API/data-source failure, not a
+    # delisted-symbol no-op, and must be retried.
+    sys.exit(1)
 bad = [f for f in fails if "empty" not in f]
 print(f"  failures={len(fails)} real={len(bad)}")
 sys.exit(0 if not bad else 1)
@@ -78,7 +88,7 @@ if [ $RC -ne 0 ]; then
   judge "$TMP" 2>/dev/null
   JRC=$?
   if [ $JRC -eq 0 ]; then
-    echo "[$(stamp)] attempt1: only expected empty failures, OK" >> "$LOG"
+    echo "[$(stamp)] attempt1: only expected empty failures; skip retry, keep readiness blocked" >> "$LOG"
     RC=0
   else
     echo "[$(stamp)] attempt1 rc=$RC -> retry in 30min" >> "$LOG"
