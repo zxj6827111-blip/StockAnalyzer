@@ -92,6 +92,7 @@ from stock_analyzer.data.tushare_provider import (  # noqa: E402
     _to_ts_code,
 )
 from stock_analyzer.ops.nightly_readiness import (  # noqa: E402
+    invalidate_nightly_readiness,
     write_nightly_readiness,
 )
 
@@ -1553,6 +1554,13 @@ def _main(argv: list[str] | None = None) -> int:
         "(import_vendor_zip_to_delta.py --incremental); requires --index-path. "
         "Example: /app/artifacts/vendor_delta/market_delta.duckdb",
     )
+    parser.add_argument(
+        "--require-readiness",
+        action="store_true",
+        help="Production mode: the run may only exit 0 when nightly "
+        "readiness is actually published. Requires --index-path and "
+        "--sync-vendor-delta; missing either exits 2.",
+    )
     # Legacy intraday summary args: kept for backwards-compat with old
     # stock_updater.sh / crontab invocations that still pass them.  They
     # are now no-ops (the nightly readiness gate replaces the intraday
@@ -1577,6 +1585,14 @@ def _main(argv: list[str] | None = None) -> int:
     if args.sync_vendor_delta.strip() and not args.index_path.strip():
         print("--sync-vendor-delta requires --index-path", file=sys.stderr)
         return 2
+    if args.require_readiness and (
+        not args.index_path.strip() or not args.sync_vendor_delta.strip()
+    ):
+        print(
+            "--require-readiness requires both --index-path and --sync-vendor-delta",
+            file=sys.stderr,
+        )
+        return 2
     # Surface deprecation warning when legacy args are actually used.
     try:
         import warnings as _warnings
@@ -1590,6 +1606,31 @@ def _main(argv: list[str] | None = None) -> int:
             )
     except Exception:
         pass
+
+    # Fail-closed before any filesystem/provider preflight that could abort
+    # the new nightly cycle. If this run cannot even start, yesterday's
+    # readiness must still not remain consumable by the off-hours selector.
+    invalidated_readiness_paths: list[str] = []
+    readiness_invalidation_error = ""
+    if not args.dry_run:
+        try:
+            invalidated_readiness_paths = [
+                str(path) for path in invalidate_nightly_readiness()
+            ]
+        except Exception as exc:
+            readiness_invalidation_error = f"{type(exc).__name__}:{exc}"
+            if args.require_readiness:
+                print(
+                    "readiness invalidation failed in --require-readiness "
+                    f"mode: {readiness_invalidation_error}",
+                    file=sys.stderr,
+                )
+                return 1
+            print(
+                f"WARNING: readiness invalidation failed: "
+                f"{readiness_invalidation_error}",
+                file=sys.stderr,
+            )
 
     vendor_root = Path(args.vendor_root).expanduser()
     daily_root = vendor_root / args.daily_dir
@@ -1906,6 +1947,8 @@ def _main(argv: list[str] | None = None) -> int:
     readiness_written = False
     readiness_error = ""
     readiness_requested = bool(args.index_path.strip() and args.sync_vendor_delta.strip())
+    require_readiness = bool(args.require_readiness)
+    readiness_target_date: date | None = None
 
     # Readiness is a production contract, not a generic updater success marker.
     # Publish it only when index + delta were part of this same transaction;
@@ -1914,13 +1957,13 @@ def _main(argv: list[str] | None = None) -> int:
     if not args.dry_run and full_run_ok and readiness_requested:
         try:
             # Batch's latest_daily_date already reflects ZIP rebuild date.
-            _readiness_date = (
+            readiness_target_date = (
                 batch_latest_daily
                 if batch_payload is not None and batch_latest_daily is not None
                 else end_date
             )
             write_nightly_readiness(
-                target_trade_date=_readiness_date,
+                target_trade_date=readiness_target_date,
                 db_path=args.sync_vendor_delta,
                 index_path=args.index_path,
                 extra={
@@ -1938,8 +1981,17 @@ def _main(argv: list[str] | None = None) -> int:
     if batch_payload is not None and isinstance(batch_payload.get("index"), dict):
         index_report = batch_payload["index"]  # type: ignore[assignment]
 
+    require_readiness_unmet = bool(
+        require_readiness and not args.dry_run and not readiness_written
+    )
     summary = {
         "tool": "update_vendor_daily_from_tushare",
+        # ok = run success AND, in --require-readiness mode, readiness actually
+        # published — the single field production callers should check first.
+        "ok": bool(full_run_ok) and not require_readiness_unmet,
+        "target_trade_date": (
+            readiness_target_date.isoformat() if readiness_target_date else ""
+        ),
         "finished_at": datetime.now().isoformat(timespec="seconds"),
         "vendor_root": str(vendor_root),
         "daily_dir": str(daily_root),
@@ -1961,8 +2013,11 @@ def _main(argv: list[str] | None = None) -> int:
         "index": index_report,
         "delta_sync": delta_sync_report,
         "readiness": {
+            "required": require_readiness,
             "requested": readiness_requested,
             "written": readiness_written,
+            "invalidated_paths": invalidated_readiness_paths,
+            "invalidation_error": readiness_invalidation_error,
             "error": readiness_error,
         },
         "mode": "batch" if batch_payload is not None else "per_symbol",
@@ -1980,6 +2035,10 @@ def _main(argv: list[str] | None = None) -> int:
                 summary[_k] = batch_payload[_k]
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     if not full_run_ok and not args.dry_run:
+        return 1
+    if require_readiness_unmet:
+        # Production contract: --require-readiness only exits 0 when the
+        # readiness file was actually published in this run.
         return 1
     return 0
 

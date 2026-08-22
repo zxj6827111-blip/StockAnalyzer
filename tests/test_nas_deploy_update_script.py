@@ -144,14 +144,13 @@ def test_nas_deploy_update_has_automatic_runtime_rollback() -> None:
     assert script.count("rollback_runtime") >= 4
 
 
-def test_nas_deploy_update_no_recreate_is_image_build_only() -> None:
+def test_nas_deploy_update_no_recreate_leaves_runtime_unchanged() -> None:
     script = _script()
 
     marker = 'if [[ "${DO_RECREATE}" -eq 0 ]]; then'
     assert marker in script
-    assert "image build complete; runtime was not recreated" in script
+    assert "image/updater pair ready; runtime was not recreated" in script
     assert script.index(marker) < script.index('PORT="$(grep -E')
-
 
 def test_nas_deploy_update_requires_duckdb_runtime_without_zip_fallback() -> None:
     script = _script()
@@ -199,3 +198,61 @@ def test_nas_deploy_update_checks_run_in_quality_gate() -> None:
 
     assert "tests/test_nas_deploy_update_script.py" in clean_scope.command
     assert "tests/test_nas_deploy_update_script.py" in smoke.command
+
+
+# ---------------------------------------------------------------------------
+# 受管 stock_updater 安装（2026-08-20 版本错位事故的回归防线）
+# ---------------------------------------------------------------------------
+def test_nas_deploy_update_installs_managed_updater_with_flag_gate() -> None:
+    script = _script()
+
+    # 只在新镜像真正支持新参数后才安装，杜绝脚本/镜像再次错位。
+    assert "scripts/nas_stock_updater.sh" in script
+    assert 'grep -q -- "--require-readiness"' in script
+    assert (
+        "image does not support --require-readiness; refusing to install "
+        "the managed updater" in script
+    )
+    # 安装前校验受管脚本语法与关键运维能力。
+    assert "bash -n" in script
+    for capability in ("flock", "update_checkpoint.json", "sleep 1800", "--sync-vendor-delta"):
+        assert f'"{capability}"' in script
+    # 生产路径可覆盖，默认指向 NAS 现网位置；替换前先备份、原子落位。
+    assert (
+        'PROD_UPDATER="${STOCK_ANALYZER_PROD_UPDATER:-'
+        '/vol1/docker/tools/stock_updater.sh}"' in script
+    )
+    assert "UPDATER_BACKUP=" in script
+    assert ".stock_updater.staged-" in script
+    # cron 指向校验为警告而非阻塞（cron 归 NAS 管理员所有）。
+    assert "WARNING: crontab does not reference" in script
+
+
+def test_nas_deploy_update_rollback_restores_previous_updater() -> None:
+    """镜像回滚必须同步恢复旧 updater：回滚后的镜像可能不认新参数。"""
+    script = _script()
+
+    assert (
+        "# The rolled-back image may lack the new updater flags, so the previous"
+        in script
+    )
+    assert 'cp -p "${UPDATER_BACKUP}" "${PROD_UPDATER}"' in script
+    assert "UPDATER_INSTALLED=1" in script
+    assert "UPDATER_EXISTED=1" in script
+    assert 'rm -f "${PROD_UPDATER}"' in script
+
+
+def test_nas_deploy_update_pairs_updater_before_no_recreate_exit() -> None:
+    """--no-recreate 仍会换装配套 updater，避免 latest 镜像与 cron 脚本错位。"""
+    script = _script()
+
+    installer_at = script.find('if [[ ! -f "${MANAGED_UPDATER_SRC}" ]]; then')
+    assert installer_at != -1
+    installed_at = script.find("UPDATER_INSTALLED=1", installer_at)
+    no_recreate_exit_at = script.find(
+        'if [[ "${DO_RECREATE}" -eq 0 ]]; then',
+        installer_at,
+    )
+    assert installed_at != -1
+    assert no_recreate_exit_at != -1
+    assert installer_at < installed_at < no_recreate_exit_at

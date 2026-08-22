@@ -489,6 +489,56 @@ def check_nightly_readiness(
     )
 
 
+def invalidate_nightly_readiness(
+    *,
+    stamp: str | None = None,
+) -> list[Path]:
+    """Atomically retire every readable readiness file as ``*.stale-*``.
+
+    A vendor update run must invalidate the previous night's readiness
+    BEFORE touching any data: if the update then fails, no stale readiness
+    may survive for the off-hours selector to consume (fail-closed).
+    ``read_nightly_readiness`` falls back to legacy mirrors, so ALL
+    candidate locations are drained here, not just the authoritative one.
+
+    Consumed files are not touched; stale files keep their payload and
+    mtime for post-mortem auditing and are never restored automatically.
+
+    Returns the source paths that were invalidated (they no longer exist).
+    """
+    marker = stamp or datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    invalidated: list[Path] = []
+    failures: list[str] = []
+    for candidate in _candidate_readiness_paths():
+        if _read_json(candidate) is None:
+            continue
+        # 中缀命名与 consumed 文件（nightly_data_ready.consumed.json）一致：
+        # 前缀固定，按文件名排序即按失效时间排序。
+        target = candidate.with_name(
+            f"nightly_data_ready.stale-{marker}.json"
+        )
+        suffix = 1
+        while target.exists():
+            target = candidate.with_name(
+                f"nightly_data_ready.stale-{marker}.{suffix}.json"
+            )
+            suffix += 1
+        try:
+            os.replace(candidate, target)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            failures.append(f"{candidate}:{type(exc).__name__}:{exc}")
+            continue
+        invalidated.append(candidate)
+    if failures:
+        raise OSError(
+            "failed to invalidate one or more nightly readiness files: "
+            + " | ".join(failures)
+        )
+    return invalidated
+
+
 def consume_nightly_readiness(
     *,
     path: str | Path | None = None,

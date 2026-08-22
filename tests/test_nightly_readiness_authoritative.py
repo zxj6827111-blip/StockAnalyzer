@@ -174,3 +174,93 @@ def test_schema_v1_readiness_is_rejected(tmp_path: Path) -> None:
     )
     assert gate.ready is False
     assert gate.reason == "nightly_data_not_ready"
+
+
+def test_invalidate_retires_all_mirrors_and_keeps_consumed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """invalidate 必须原子失效 authoritative 与全部 legacy mirror。
+
+    read_nightly_readiness 在 authoritative 缺失时会回退读 legacy mirror，
+    因此更新开始前的失效不能只处理一个文件；consumed 文件不属于 candidate
+    列表，必须原样保留供审计。
+    """
+    import stock_analyzer.ops.nightly_readiness as mod
+    from stock_analyzer.ops.nightly_readiness import invalidate_nightly_readiness
+
+    auth = tmp_path / "auth" / "artifacts" / "runtime" / "nightly_data_ready.json"
+    legacy = tmp_path / "legacy" / "artifacts" / "runtime" / "nightly_data_ready.json"
+    consumed = tmp_path / "auth" / "artifacts" / "runtime" / (
+        "nightly_data_ready.consumed.json"
+    )
+    auth.parent.mkdir(parents=True, exist_ok=True)
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({"schema_version": 2, "target_trade_date": "2026-08-20"})
+    auth.write_text(payload, encoding="utf-8")
+    legacy.write_text(payload, encoding="utf-8")
+    consumed.write_text(payload, encoding="utf-8")
+
+    def _patched_candidates() -> list[Path]:
+        return [auth, legacy]
+
+    monkeypatch.setattr(mod, "_candidate_readiness_paths", _patched_candidates)
+    invalidated = invalidate_nightly_readiness(stamp="20260821T120000Z")
+
+    assert sorted(Path(item).name for item in invalidated) == [
+        "nightly_data_ready.json",
+        "nightly_data_ready.json",
+    ]
+    assert not auth.exists()
+    assert not legacy.exists()
+    stale_files = sorted(auth.parent.glob("nightly_data_ready.stale-*"))
+    assert len(stale_files) == 1
+    # stale 文件保留原始 payload，供故障审计；文件名带失效时间戳。
+    assert json.loads(stale_files[0].read_text(encoding="utf-8"))["target_trade_date"] == (
+        "2026-08-20"
+    )
+    assert "20260821T120000Z" in stale_files[0].name
+    # consumed 文件不受影响。
+    assert consumed.exists()
+
+
+def test_invalidate_without_any_readiness_is_noop(tmp_path: Path) -> None:
+    from stock_analyzer.ops.nightly_readiness import invalidate_nightly_readiness
+
+    missing = tmp_path / "does-not-exist" / "nightly_data_ready.json"
+
+    def _patched_candidates() -> list[Path]:
+        return [missing]
+
+    import stock_analyzer.ops.nightly_readiness as mod
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(mod, "_candidate_readiness_paths", _patched_candidates)
+        assert invalidate_nightly_readiness() == []
+    finally:
+        monkey.undo()
+
+
+def test_invalidate_reports_replace_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """生产强制模式必须能感知失效失败，不能留下可消费的旧文件。"""
+    import stock_analyzer.ops.nightly_readiness as mod
+
+    path = tmp_path / "runtime" / "nightly_data_ready.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({"schema_version": 2, "target_trade_date": "2026-08-20"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(mod, "_candidate_readiness_paths", lambda: [path])
+
+    def _deny_replace(source: Path, target: Path) -> None:
+        _ = source, target
+        raise PermissionError("read-only readiness directory")
+
+    monkeypatch.setattr(mod.os, "replace", _deny_replace)
+
+    with pytest.raises(OSError, match="failed to invalidate"):
+        mod.invalidate_nightly_readiness(stamp="20260822T000000Z")
+    assert path.exists()

@@ -872,8 +872,11 @@ def test_main_without_delta_does_not_publish_readiness(
 
     assert exit_code == 0
     assert summary["readiness"] == {
+        "required": False,
         "requested": False,
         "written": False,
+        "invalidated_paths": [],
+        "invalidation_error": "",
         "error": "not_published:index_and_delta_required",
     }
     assert not readiness_path.exists()
@@ -993,3 +996,214 @@ def test_fetch_symbol_adj_factor_empty_raises(updater: object, tmp_path: Path) -
             skip_factors=False,
             dry_run=False,
         )
+
+
+# ---------------------------------------------------------------------------
+# --require-readiness：生产强制模式（NAS 受管 updater 使用）
+# ---------------------------------------------------------------------------
+def test_require_readiness_without_index_path_exits_2(updater: object) -> None:
+    """强制模式缺 --index-path：参数校验直接退出 2，不做任何数据操作。"""
+    exit_code = updater._main(
+        ["--vendor-root", "whatever", "--require-readiness",
+         "--sync-vendor-delta", "delta.duckdb"],
+    )
+    assert exit_code == 2
+
+
+def test_require_readiness_without_delta_path_exits_2(updater: object) -> None:
+    """强制模式缺 --sync-vendor-delta：同样退出 2。"""
+    exit_code = updater._main(
+        ["--vendor-root", "whatever", "--require-readiness",
+         "--index-path", "index.json"],
+    )
+    assert exit_code == 2
+
+
+def test_require_readiness_success_publishes_and_reports_ok(
+    updater: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """强制模式全链路成功：发布 readiness、ok=true、记录被失效的旧文件。"""
+    _daily_fixture(tmp_path)
+    _factor_fixture(tmp_path)
+    index_path = _full_daily_index(tmp_path)
+    delta_db = tmp_path / "delta" / "market_delta.duckdb"
+    readiness_path = tmp_path / "runtime" / "nightly_data_ready.json"
+    readiness_path.parent.mkdir(parents=True, exist_ok=True)
+    # 预置上一轮的旧 readiness：本轮更新开始时必须先被失效。
+    readiness_path.write_text(
+        json.dumps({"schema_version": 2, "target_trade_date": "2025-07-17"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SA__NIGHTLY_READINESS_PATH", str(readiness_path))
+
+    exit_code, summary = _main_with_fake_api(
+        updater,
+        monkeypatch,
+        [
+            "--vendor-root", str(tmp_path),
+            "--end-date", "2025-07-20",
+            "--interval-sec", "0",
+            "--index-path", str(index_path),
+            "--sync-vendor-delta", str(delta_db),
+            "--require-readiness",
+        ],
+    )
+
+    assert exit_code == 0
+    assert summary["ok"] is True
+    assert summary["target_trade_date"] != ""
+    assert summary["readiness"]["required"] is True
+    assert summary["readiness"]["written"] is True
+    # 更新开始前旧 readiness 被原子失效：stale 文件保留审计，内容是旧目标日。
+    assert str(readiness_path) in summary["readiness"]["invalidated_paths"]
+    stale_files = list(readiness_path.parent.glob("nightly_data_ready.stale-*.json"))
+    assert len(stale_files) == 1
+    assert json.loads(stale_files[0].read_text(encoding="utf-8"))["target_trade_date"] == (
+        "2025-07-17"
+    )
+    # 本轮成功后在同一路径发布了新 readiness（target 已推进到 end-date）。
+    assert readiness_path.exists()
+    new_payload = json.loads(readiness_path.read_text(encoding="utf-8"))
+    assert new_payload["target_trade_date"] == "2025-07-20"
+
+
+def test_require_readiness_failure_blocks_release_with_nonzero_exit(
+    updater: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """强制模式下 readiness 未发布（delta 失败）：退出码必须非零且 ok=false。"""
+    _daily_fixture(tmp_path)
+    _factor_fixture(tmp_path)
+    index_path = _full_daily_index(tmp_path)
+    delta_db = tmp_path / "delta-target-is-directory"
+    delta_db.mkdir()
+    readiness_path = tmp_path / "runtime" / "nightly_data_ready.json"
+    monkeypatch.setenv("SA__NIGHTLY_READINESS_PATH", str(readiness_path))
+
+    exit_code, summary = _main_with_fake_api(
+        updater,
+        monkeypatch,
+        [
+            "--vendor-root", str(tmp_path),
+            "--end-date", "2025-07-20",
+            "--interval-sec", "0",
+            "--index-path", str(index_path),
+            "--sync-vendor-delta", str(delta_db),
+            "--require-readiness",
+        ],
+    )
+
+    assert exit_code == 1
+    assert summary["ok"] is False
+    assert summary["readiness"]["required"] is True
+    assert summary["readiness"]["written"] is False
+
+
+def test_require_readiness_invalidates_legacy_mirror_too(
+    updater: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """read 会回退读 legacy mirror，因此更新前必须把 mirror 一并失效。"""
+    import stock_analyzer.ops.nightly_readiness as readiness_mod
+
+    _daily_fixture(tmp_path)
+    _factor_fixture(tmp_path)
+    index_path = _full_daily_index(tmp_path)
+    delta_db = tmp_path / "delta" / "market_delta.duckdb"
+    auth = tmp_path / "runtime" / "nightly_data_ready.json"
+    legacy = tmp_path / "legacy" / "runtime" / "nightly_data_ready.json"
+    auth.parent.mkdir(parents=True, exist_ok=True)
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    old_payload = json.dumps(
+        {"schema_version": 2, "target_trade_date": "2025-07-17"}
+    )
+    auth.write_text(old_payload, encoding="utf-8")
+    legacy.write_text(old_payload, encoding="utf-8")
+    monkeypatch.setenv("SA__NIGHTLY_READINESS_PATH", str(auth))
+    monkeypatch.setattr(
+        readiness_mod,
+        "_candidate_readiness_paths",
+        lambda: [auth, legacy],
+    )
+
+    exit_code, summary = _main_with_fake_api(
+        updater,
+        monkeypatch,
+        [
+            "--vendor-root", str(tmp_path),
+            "--end-date", "2025-07-20",
+            "--interval-sec", "0",
+            "--index-path", str(index_path),
+            "--sync-vendor-delta", str(delta_db),
+            "--require-readiness",
+        ],
+    )
+
+    assert exit_code == 0
+    invalidated = summary["readiness"]["invalidated_paths"]
+    assert str(auth) in invalidated
+    assert str(legacy) in invalidated
+    # legacy 只被失效不重发：原路径消失、stale 留存审计。
+    assert not legacy.exists()
+    assert len(list(legacy.parent.glob("nightly_data_ready.stale-*.json"))) == 1
+    assert len(list(auth.parent.glob("nightly_data_ready.stale-*.json"))) == 1
+    # 新 readiness 发布在 authoritative 路径（target 推进到 end-date）。
+    assert json.loads(auth.read_text(encoding="utf-8"))["target_trade_date"] == (
+        "2025-07-20"
+    )
+
+
+def test_require_readiness_invalidates_before_token_preflight(
+    updater: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """即使 token 缺失导致 updater 无法启动，也不能保留上一夜 readiness。"""
+    _daily_fixture(tmp_path)
+    readiness_path = tmp_path / "runtime" / "nightly_data_ready.json"
+    readiness_path.parent.mkdir(parents=True)
+    readiness_path.write_text(
+        json.dumps({"schema_version": 2, "target_trade_date": "2025-07-19"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SA__NIGHTLY_READINESS_PATH", str(readiness_path))
+    monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
+    monkeypatch.delenv("SA__MARKET_WAREHOUSE__TUSHARE_TOKEN", raising=False)
+
+    exit_code = updater._main(
+        [
+            "--vendor-root",
+            str(tmp_path),
+            "--index-path",
+            str(tmp_path / "daily_index.json"),
+            "--sync-vendor-delta",
+            str(tmp_path / "market_delta.duckdb"),
+            "--require-readiness",
+        ]
+    )
+
+    assert exit_code == 2
+    assert not readiness_path.exists()
+    assert len(list(readiness_path.parent.glob("nightly_data_ready.stale-*.json"))) == 1
+
+
+def test_require_readiness_invalidation_failure_is_fatal(
+    updater: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """旧 readiness 无法失效时，生产模式必须在任何数据访问前退出。"""
+    _daily_fixture(tmp_path)
+
+    def _fail_invalidation() -> list[Path]:
+        raise PermissionError("readiness volume is read-only")
+
+    monkeypatch.setattr(updater, "invalidate_nightly_readiness", _fail_invalidation)
+
+    exit_code = updater._main(
+        [
+            "--vendor-root",
+            str(tmp_path),
+            "--index-path",
+            str(tmp_path / "daily_index.json"),
+            "--sync-vendor-delta",
+            str(tmp_path / "market_delta.duckdb"),
+            "--require-readiness",
+        ]
+    )
+
+    assert exit_code == 1
