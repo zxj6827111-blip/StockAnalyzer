@@ -449,6 +449,14 @@ rollback_runtime() {
     echo "rollback: failed to restore stock-analyzer:latest image tag" >&2
     failed=1
   fi
+  # The rolled-back image may lack the new updater flags, so the previous
+  # cron script must come back together with the image (version pairing).
+  if [[ -n "${UPDATER_BACKUP:-}" && -f "${UPDATER_BACKUP}" ]]; then
+    if ! cp -p "${UPDATER_BACKUP}" "${PROD_UPDATER}"; then
+      echo "rollback: failed to restore previous stock_updater.sh" >&2
+      failed=1
+    fi
+  fi
   RUNTIME_BACKUP_STARTED=0
   ROLLBACK_COMPLETED=1
   set -e
@@ -479,6 +487,74 @@ LABEL_COMMIT="$(docker image inspect stock-analyzer:latest --format '{{index .Co
 if [[ "${LABEL_COMMIT}" != "${COMMIT}" ]]; then
   echo "ERROR: image label commit ${LABEL_COMMIT} != source ${COMMIT}" >&2
   exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Managed stock_updater: install the version-controlled NAS updater only when
+# the freshly built image actually supports its new flags, so the cron script
+# and the image can never drift apart again (2026-08-20 incident: the old
+# script passed removed flags -> nightly cron rc=2, index/delta silently
+# stale while ZIP moved on).
+# ---------------------------------------------------------------------------
+MANAGED_UPDATER_SRC="${ROOT}/scripts/nas_stock_updater.sh"
+PROD_UPDATER="${STOCK_ANALYZER_PROD_UPDATER:-/vol1/docker/tools/stock_updater.sh}"
+UPDATER_BACKUP=""
+if [[ "${DO_RECREATE}" -eq 1 ]]; then
+  if [[ ! -f "${MANAGED_UPDATER_SRC}" ]]; then
+    echo "ERROR: managed updater missing: ${MANAGED_UPDATER_SRC}" >&2
+    exit 1
+  fi
+  if ! docker run --rm stock-analyzer:latest \
+      python3 /app/scripts/update_vendor_daily_from_tushare.py --help \
+      | grep -q -- "--require-readiness"; then
+    echo "ERROR: image does not support --require-readiness; refusing to install the managed updater." >&2
+    exit 1
+  fi
+
+  if ! bash -n "${MANAGED_UPDATER_SRC}"; then
+    echo "ERROR: managed updater failed bash -n" >&2
+    exit 1
+  fi
+  for pattern in "flock" "update_checkpoint.json" "sleep 1800" "updater_last.json" "--require-readiness" "--sync-vendor-delta"; do
+    if ! grep -q -- "${pattern}" "${MANAGED_UPDATER_SRC}"; then
+      echo "ERROR: managed updater lost required capability: ${pattern}" >&2
+      exit 1
+    fi
+  done
+  if grep -q -- "--intraday-summary-output" "${MANAGED_UPDATER_SRC}"; then
+    echo "ERROR: managed updater still passes deprecated --intraday-summary-output" >&2
+    exit 1
+  fi
+
+  mkdir -p "$(dirname "${PROD_UPDATER}")"
+  if [[ -f "${PROD_UPDATER}" ]]; then
+    UPDATER_BACKUP="${PROD_UPDATER}.bak-${DEPLOY_ID}"
+    cp -p "${PROD_UPDATER}" "${UPDATER_BACKUP}"
+  fi
+  UPDATER_STAGE="$(dirname "${PROD_UPDATER}")/.stock_updater.staged-${DEPLOY_ID}"
+  if ! cat "${MANAGED_UPDATER_SRC}" > "${UPDATER_STAGE}"; then
+    rm -f "${UPDATER_STAGE}"
+    echo "ERROR: cannot stage managed updater next to ${PROD_UPDATER}" >&2
+    exit 1
+  fi
+  if [[ -n "${UPDATER_BACKUP}" ]]; then
+    chmod --reference="${PROD_UPDATER}" "${UPDATER_STAGE}" 2>/dev/null || chmod 755 "${UPDATER_STAGE}"
+  else
+    chmod 755 "${UPDATER_STAGE}"
+  fi
+  if ! mv -f "${UPDATER_STAGE}" "${PROD_UPDATER}"; then
+    rm -f "${UPDATER_STAGE}"
+    echo "ERROR: atomic replace of ${PROD_UPDATER} failed" >&2
+    exit 1
+  fi
+  echo "[install] managed stock_updater installed (backup: ${UPDATER_BACKUP:-none})"
+
+  # Warn-only: cron ownership belongs to the NAS admin, not this deploy.
+  if command -v crontab >/dev/null 2>&1; then
+    if ! crontab -l 2>/dev/null | grep -q "${PROD_UPDATER}"; then
+      echo "WARNING: crontab does not reference ${PROD_UPDATER}; verify the nightly schedule manually." >&2
+    fi
+  fi
 fi
 if [[ "${DO_RECREATE}" -eq 0 ]]; then
   echo "[4/6] skip intraday summary replacement"
