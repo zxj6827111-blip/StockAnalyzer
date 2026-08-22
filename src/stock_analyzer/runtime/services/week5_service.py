@@ -1724,18 +1724,20 @@ class RuntimeWeek5Service:
                 and required_intraday_date is not None
                 and bool(getattr(service._config.week5, "intraday_sync_enabled", True))
             ):
+                _sync_primary = str(
+                    getattr(service._config.week5, "intraday_sync_primary", "sina")
+                )
+                _sync_fallback = str(
+                    getattr(service._config.week5, "intraday_sync_fallback", "sina")
+                )
                 try:
                     sync_report = _sync_intraday_symbols(
                         warehouse=_delta_warehouse,
                         vendor_overlay=_vendor_overlay,
                         symbols=sync_targets,
                         required_trade_date=required_intraday_date,
-                        primary=str(
-                            getattr(service._config.week5, "intraday_sync_primary", "tushare")
-                        ),
-                        fallback=str(
-                            getattr(service._config.week5, "intraday_sync_fallback", "sina")
-                        ),
+                        primary=_sync_primary,
+                        fallback=_sync_fallback,
                         concurrency=max(
                             1, int(getattr(service._config.week5, "intraday_sync_concurrency", 4))
                         ),
@@ -1753,10 +1755,22 @@ class RuntimeWeek5Service:
                         ),
                     )
                 except Exception as exc:
+                    # 二道兜底：wrapper 内部已兜一层，此处仍需携带主备源与
+                    # ok/failed 计数，保证 all_failed 审计可判定。
                     sync_report = {
                         "error": f"{type(exc).__name__}:{exc}",
                         "symbols_total": len(sync_targets),
+                        "ok": 0,
+                        "failed": len(sync_targets),
+                        "detail": {
+                            "primary": _sync_primary,
+                            "fallback": _sync_fallback,
+                        },
                     }
+                # 分钟源健康度审计：capability_probe 目前无任何外部消费者，
+                # 主源降级/全军覆没必须在此显性留痕，否则只能等到 fresh_ratio
+                # 门禁拦截整轮 deep 才暴露（2026-08-22 复核结论）。
+                _record_intraday_sync_health_audits(service=service, sync_report=sync_report)
                 # Clear VendorZipOverlayProvider intraday cache after sync
                 for src in (_vendor_overlay, _delta_warehouse):
                     try:
@@ -3052,6 +3066,44 @@ class RuntimeWeek5Service:
                 "reason": reason,
             }
 
+        # 预探测：legacy 无 scaler 等 artifact 缺陷会让逐票推理全批失败
+        # （2026-08-22 NAS 实测 20/20 prediction_failed:ValueError）。先用零向量
+        # 试推一次，失败则整批短路，给出精确原因并留审计痕迹（fail-fast）。
+        try:
+            predictor.predict_features({name: 0.0 for name in predictor.feature_names})
+        except Exception as exc:
+            blocked_detail = _artifact_inference_blocked_detail(predictor=predictor, exc=exc)
+            blocked_reason = f"artifact_inference_blocked:{blocked_detail}"
+            for candidate in candidates:
+                candidate["execution_rerank_reason"] = blocked_reason
+            service._record_audit_event(
+                event_type="execution_risk_artifact_unusable",
+                level="warn",
+                payload={
+                    "artifact_path": str(artifact_path),
+                    "qualification_status": predictor.qualification_status,
+                    "skipped_prediction_failed": candidate_count,
+                    "candidate_count": candidate_count,
+                    "phase": "probe",
+                    "detail": blocked_detail,
+                },
+            )
+            return {
+                "applied": False,
+                "score_key": "shortlist_score",
+                "candidate_count": candidate_count,
+                "applied_count": 0,
+                "coverage_ratio": 0.0,
+                "artifact_path": str(artifact_path),
+                "reason": blocked_reason,
+                "qualification_status": predictor.qualification_status,
+                "shadow_predictions": 0,
+                "skipped_missing_snapshot": 0,
+                "skipped_snapshot_not_found": 0,
+                "skipped_snapshot_read_failed": 0,
+                "skipped_prediction_failed": candidate_count,
+            }
+
         shadow_only = not predictor.can_rerank
 
         applied_count = 0
@@ -3146,6 +3198,30 @@ class RuntimeWeek5Service:
                 candidate["execution_rerank_applied"] = True
                 candidate["execution_rerank_reason"] = "applied"
             applied_count += 1
+
+        # 残余逐票型推理失败（预探测已通过但个别候选仍失败）也要留痕，
+        # 避免静默退化只体现在计数器上。
+        if skipped_prediction_failed > 0:
+            residual_reason_counts: dict[str, int] = {}
+            for candidate in candidates:
+                residual_reason = str(candidate.get("execution_rerank_reason", "")).strip()
+                if not residual_reason:
+                    continue
+                residual_reason_counts[residual_reason] = (
+                    residual_reason_counts.get(residual_reason, 0) + 1
+                )
+            service._record_audit_event(
+                event_type="execution_risk_artifact_unusable",
+                level="warn",
+                payload={
+                    "artifact_path": str(artifact_path),
+                    "qualification_status": predictor.qualification_status,
+                    "skipped_prediction_failed": skipped_prediction_failed,
+                    "candidate_count": candidate_count,
+                    "phase": "residual",
+                    "reason_counts": residual_reason_counts,
+                },
+            )
 
         applied = applied_count > 0 and not shadow_only
         return {
@@ -3483,7 +3559,7 @@ class RuntimeWeek5Service:
                         symbols=[normalized_symbol],
                         required_trade_date=required_date,
                         primary=str(
-                            getattr(service._config.week5, "intraday_sync_primary", "tushare")
+                            getattr(service._config.week5, "intraday_sync_primary", "sina")
                         ),
                         fallback=str(
                             getattr(service._config.week5, "intraday_sync_fallback", "sina")
@@ -4690,6 +4766,83 @@ def _build_fresh_deep_frame(
     return {"frame": frame, "failed": failed}
 
 
+def _artifact_inference_blocked_detail(
+    *,
+    predictor: ExecutionRiskPredictor,
+    exc: Exception,
+) -> str:
+    """提取推理被阻断的精确原因（如 legacy_no_scaler），供审计与 reason 使用。
+
+    LogisticProbModel 反序列化时会把缺失 scaler 等 legacy 缺陷记入
+    ``inference_blocked_reason``；优先读该字段，取不到再退回异常类名，
+    避免只报 ``ValueError`` 无法区分缺陷类型。
+    """
+    for model in predictor.models.values():
+        blocked_reason = str(getattr(model, "inference_blocked_reason", "") or "").strip()
+        if blocked_reason:
+            return blocked_reason
+    return exc.__class__.__name__
+
+
+def _record_intraday_sync_health_audits(
+    *,
+    service: Any,
+    sync_report: Mapping[str, object],
+) -> None:
+    """按同步报告记录分钟源健康度审计事件。
+
+    注意 ``source_breakdown`` 在会话完整性过滤之前计数，因此
+    sina=100 / ok=96 / failed=4 属正常形态；降级判定必须用
+    ``ok>0 且 tushare==0 且 sina>=ok``，不能用 ``sina==ok``。
+    """
+    detail = sync_report.get("detail")
+    if not isinstance(detail, Mapping):
+        # detail 缺失（异常兜底 dict）时无从判断主源，直接跳过避免误报。
+        return
+    # 单点归一化：三个来源（数据层/wrapper 兜底/调用层兜底）的大小写
+    # 处理不一致，统一在消费端 lower，避免非小写配置漏匹配降级审计。
+    primary = str(detail.get("primary", "")).strip().lower()
+    if not primary:
+        return
+    sources_raw = sync_report.get("source_breakdown")
+    sources = sources_raw if isinstance(sources_raw, Mapping) else {}
+    payload = {
+        "primary": primary,
+        "fallback": str(detail.get("fallback", "")).strip().lower(),
+        "ok": _as_int(sync_report.get("ok"), default=0),
+        "failed": _as_int(sync_report.get("failed"), default=0),
+        "source_breakdown": {
+            "tushare": _as_int(sources.get("tushare"), default=0),
+            "sina": _as_int(sources.get("sina"), default=0),
+            "skipped": _as_int(sources.get("skipped"), default=0),
+        },
+        "capability_probe": sync_report.get("capability_probe")
+        if isinstance(sync_report.get("capability_probe"), dict)
+        else {},
+    }
+    ok_count = _as_int(sync_report.get("ok"), default=0)
+    failed_count = _as_int(sync_report.get("failed"), default=0)
+    tushare_count = _as_int(sources.get("tushare"), default=0)
+    sina_count = _as_int(sources.get("sina"), default=0)
+    if (
+        primary == "tushare"
+        and ok_count > 0
+        and tushare_count == 0
+        and sina_count >= ok_count
+    ):
+        service._record_audit_event(
+            event_type="intraday_primary_degraded_to_fallback",
+            level="warn",
+            payload=payload,
+        )
+    elif ok_count == 0 and failed_count > 0:
+        service._record_audit_event(
+            event_type="intraday_sync_all_failed",
+            level="warn",
+            payload=payload,
+        )
+
+
 def _sync_intraday_symbols(
     *,
     warehouse: object | None,
@@ -4733,6 +4886,11 @@ def _sync_intraday_symbols(
             "skipped": 0,
             "failed_symbols": [str(s).strip() for s in symbols if str(s).strip()][:20],
             "error": f"{type(exc).__name__}:{exc}",
+            # 异常兜底也保留主备源，让健康度审计可判定 all_failed。
+            "detail": {
+                "primary": str(primary or "").strip().lower(),
+                "fallback": str(fallback or "").strip().lower(),
+            },
         }
 
 

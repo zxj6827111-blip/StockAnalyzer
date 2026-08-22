@@ -516,8 +516,10 @@ class Week5Config(_StrictModel):
     empty_signal_drawdown_pct: float = 10.0
     empty_signal_no_buy_runs: int = 5
     # PLAN Section 3: intraday sync + freshness gate for the nightly deep stage.
+    # 主源 2026-08-22 起定为 sina：Tushare stk_mins 因套餐限频（1 次/分钟）
+    # 结构性不可用；主源为 sina 后不再执行 Tushare probe（复核记录见部署手册）。
     intraday_sync_enabled: bool = True
-    intraday_sync_primary: str = "tushare"
+    intraday_sync_primary: str = "sina"
     intraday_sync_fallback: str = "sina"
     intraday_sync_concurrency: int = 4
     intraday_sync_timeout_sec: int = 5

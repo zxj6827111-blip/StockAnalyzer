@@ -589,33 +589,46 @@ class RuntimeEvolutionCoreService:
             source_trace_id="scheduler-evolution",
             timestamp=job_now,
         )
-        # PLAN Section 4: consume readiness atomically on full success only.
-        _consume_success = (
-            not str(report.get("status", "")).strip().lower().startswith("blocked")
-            and str(report.get("status", "")).strip().lower() != "failed"
-            and str(week5_refresh.get("status", "")).strip().lower() not in {"failed", "blocked"}
+        # PLAN Section 4: consume readiness atomically on explicit success only.
+        # 双层状态否决 + 显式成功证据（fail-closed，2026-08-22 复核修正）：
+        # 1) evolution 报告状态非负值且带 run_id；
+        # 2) Week5 状态非负值——即使携带成功字段，blocked*/error/skipped 也否决；
+        # 3) Week5 携带真实嵌套成功证据之一：summary.watchlist_synced /
+        #    watchlist_sync.updated / funnel.final_selection.final_signals 非空。
+        # 模糊成功字符串（ok/completed/success）不再作为消费依据。注意正常
+        # 成功的扫描报告没有顶层 status 键，负值判定必须容忍缺失状态。
+        def _is_negative_status(value: object) -> bool:
+            status_text = str(value or "").strip().lower()
+            return any(
+                status_text.startswith(marker)
+                for marker in ("blocked", "failed", "error", "skipped")
+            )
+
+        evolution_ok = not _is_negative_status(report.get("status")) and bool(
+            report.get("run_id")
         )
-        # Watchlist sync / final selector must have succeeded to consume.
-        # Default False: success strings are ONLY the explicit positives.
-        # Blocked/skipped/error must NOT be consumed so the scheduler can
-        # retry via backoff.
-        try:
-            watchlist_sync_ok = False
-            if isinstance(week5_refresh, dict):
-                status = str(week5_refresh.get("status", "")).strip().lower()
-                # Freshness/evolution blocked statuses must never be consumed.
-                blocked_markers = ("blocked", "failed", "error", "skipped")
-                if any(status.startswith(marker) for marker in blocked_markers):
-                    watchlist_sync_ok = False
-                elif bool(week5_refresh.get("watchlist_synced", False)):
-                    watchlist_sync_ok = True
-                elif bool(week5_refresh.get("final_signals")):
-                    watchlist_sync_ok = True
-                elif status in {"ok", "completed", "success"}:
-                    watchlist_sync_ok = True
-        except Exception:
-            watchlist_sync_ok = False
-        if _consume_success and watchlist_sync_ok:
+
+        week5_status_ok = False
+        week5_explicit_success = False
+        if isinstance(week5_refresh, dict):
+            week5_status_ok = not _is_negative_status(week5_refresh.get("status"))
+            summary = week5_refresh.get("summary")
+            watchlist_sync = week5_refresh.get("watchlist_sync")
+            funnel = week5_refresh.get("funnel")
+            final_selection = (
+                funnel.get("final_selection") if isinstance(funnel, dict) else None
+            )
+            week5_explicit_success = any(
+                (
+                    isinstance(summary, dict)
+                    and summary.get("watchlist_synced") is True,
+                    isinstance(watchlist_sync, dict)
+                    and watchlist_sync.get("updated") is True,
+                    isinstance(final_selection, dict)
+                    and bool(final_selection.get("final_signals")),
+                )
+            )
+        if evolution_ok and week5_status_ok and week5_explicit_success:
             try:
                 from stock_analyzer.ops.nightly_readiness import (
                     consume_nightly_readiness,  # noqa: WPS433
