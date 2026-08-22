@@ -101,3 +101,19 @@ def test_managed_updater_has_valid_bash_syntax() -> None:
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_managed_updater_documents_adhoc_invalidation_risk() -> None:
+    """头部注释必须警示：白天手动 ad-hoc 更新会废掉当晚 readiness。"""
+    script = _script()
+
+    assert "any non-dry-run updater invocation invalidates the current" in script
+    assert "nightly_data_not_ready" in script
+
+
+def test_managed_updater_verify_failure_explains_empty_only_block() -> None:
+    """verify 失败日志必须提示 empty-only 失败也会按设计阻断 readiness。"""
+    script = _script()
+
+    assert "readiness verification FAILED" in script
+    assert "errors are empty-only or the date had no market data" in script

@@ -1096,3 +1096,56 @@ def test_require_readiness_failure_blocks_release_with_nonzero_exit(
     assert summary["ok"] is False
     assert summary["readiness"]["required"] is True
     assert summary["readiness"]["written"] is False
+
+
+def test_require_readiness_invalidates_legacy_mirror_too(
+    updater: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """read 会回退读 legacy mirror，因此更新前必须把 mirror 一并失效。"""
+    import stock_analyzer.ops.nightly_readiness as readiness_mod
+
+    _daily_fixture(tmp_path)
+    _factor_fixture(tmp_path)
+    index_path = _full_daily_index(tmp_path)
+    delta_db = tmp_path / "delta" / "market_delta.duckdb"
+    auth = tmp_path / "runtime" / "nightly_data_ready.json"
+    legacy = tmp_path / "legacy" / "runtime" / "nightly_data_ready.json"
+    auth.parent.mkdir(parents=True, exist_ok=True)
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    old_payload = json.dumps(
+        {"schema_version": 2, "target_trade_date": "2025-07-17"}
+    )
+    auth.write_text(old_payload, encoding="utf-8")
+    legacy.write_text(old_payload, encoding="utf-8")
+    monkeypatch.setenv("SA__NIGHTLY_READINESS_PATH", str(auth))
+    monkeypatch.setattr(
+        readiness_mod,
+        "_candidate_readiness_paths",
+        lambda: [auth, legacy],
+    )
+
+    exit_code, summary = _main_with_fake_api(
+        updater,
+        monkeypatch,
+        [
+            "--vendor-root", str(tmp_path),
+            "--end-date", "2025-07-20",
+            "--interval-sec", "0",
+            "--index-path", str(index_path),
+            "--sync-vendor-delta", str(delta_db),
+            "--require-readiness",
+        ],
+    )
+
+    assert exit_code == 0
+    invalidated = summary["readiness"]["invalidated_paths"]
+    assert str(auth) in invalidated
+    assert str(legacy) in invalidated
+    # legacy 只被失效不重发：原路径消失、stale 留存审计。
+    assert not legacy.exists()
+    assert len(list(legacy.parent.glob("nightly_data_ready.stale-*.json"))) == 1
+    assert len(list(auth.parent.glob("nightly_data_ready.stale-*.json"))) == 1
+    # 新 readiness 发布在 authoritative 路径（target 推进到 end-date）。
+    assert json.loads(auth.read_text(encoding="utf-8"))["target_trade_date"] == (
+        "2025-07-20"
+    )

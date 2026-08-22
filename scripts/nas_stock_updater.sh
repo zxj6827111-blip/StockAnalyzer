@@ -15,6 +15,11 @@
 #   - readiness not published at the end -> non-zero exit (no selector run).
 #
 # Date override for one-off backfills: UPDATER_END_DATE=YYYY-MM-DD bash ...
+#
+# WARNING: any non-dry-run updater invocation invalidates the current
+# nightly_data_ready.json first (fail-closed). Do NOT run ad-hoc manual
+# updates on production between the 19:45 cron and the 21:45 selector,
+# or tonight's run will be blocked with nightly_data_not_ready.
 # Log: /vol1/docker/tools/logs/updater.log
 set -u
 
@@ -105,6 +110,11 @@ PY
     :
   else
     echo "[$(stamp)] readiness verification FAILED rc=1 (summary in $TMP)" >> "$LOG"
+    # empty-only trade-date failures (e.g. holiday backfill via
+    # UPDATER_END_DATE) also block readiness by design: no complete data,
+    # no release. Check updater_last.json errors before assuming a bug.
+    echo "[$(stamp)] hint: nightly_data_not_ready tonight is expected if" \
+      "errors are empty-only or the date had no market data" >> "$LOG"
     echo "[$(stamp)] ==== updater end rc=1 ====" >> "$LOG"
     exit 1
   fi
