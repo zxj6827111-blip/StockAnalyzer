@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import time
 import zipfile
@@ -27,6 +28,9 @@ from stock_analyzer.models.execution_risk_artifact import ExecutionRiskArtifact
 from stock_analyzer.models.fallback import LogisticProbModel
 from stock_analyzer.runtime import service as runtime_service_module
 from stock_analyzer.runtime.service import StockAnalyzerService
+from stock_analyzer.runtime.services.week5_service import (
+    _record_intraday_sync_health_audits,
+)
 
 
 def _as_mapping(value: object) -> Mapping[str, object]:
@@ -4301,3 +4305,243 @@ def test_service_run_pipeline_reports_pipeline_stage_ms() -> None:
     assert _as_int(stages["feature_engine_ms"]) >= 0
     assert _as_int(stages["inference_ms"]) >= 0
     assert _as_int(stages["completed_count"]) == 1
+
+
+def _build_legacy_execution_risk_artifact(path: Path) -> Path:
+    """构造无 scaler 的 legacy artifact（模拟 2026-07-31 前训练的旧文件）。
+
+    现行 LogisticProbModel 推理对缺 scaler 的权重直接抛 ValueError
+    （legacy_no_scaler 安全门），Week5 重排必须整批短路而不是逐票报错。
+    """
+    _build_test_execution_risk_artifact(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    for target_payload in payload["target_models"].values():
+        target_payload["model"].pop("scaler", None)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def test_service_week5_scan_rerank_short_circuits_on_legacy_artifact_without_scaler(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config()
+    config.training.bootstrap_state_path = str(tmp_path / "bootstrap_state.json")
+    service = _new_service(config)
+
+    artifact_path = _build_legacy_execution_risk_artifact(
+        tmp_path / "execution_risk_artifact_legacy.json"
+    )
+    service._last_execution_risk_training = {  # noqa: SLF001
+        "artifact_path": str(artifact_path),
+        "dataset_id": "execution_risk_dataset_week5_test",
+    }
+    _write_week5_execution_snapshot(
+        service,
+        snapshot_id="snap-legacy-a",
+        symbol="600000",
+        decision_time=datetime(2026, 3, 20, 14, 30, tzinfo=UTC),
+        liquidity_score=0.12,
+        volatility_score=0.91,
+        meta_probability=0.46,
+        degraded_mode=True,
+        data_quality_score=0.84,
+    )
+    _write_week5_execution_snapshot(
+        service,
+        snapshot_id="snap-legacy-b",
+        symbol="000001",
+        decision_time=datetime(2026, 3, 20, 14, 31, tzinfo=UTC),
+        liquidity_score=0.94,
+        volatility_score=0.12,
+        meta_probability=0.73,
+        degraded_mode=False,
+        data_quality_score=0.98,
+    )
+
+    audit_events: list[dict[str, object]] = []
+
+    def _capture_audit(**kwargs: object) -> None:
+        audit_events.append(dict(kwargs))
+
+    # _new_service 内部把 _record_audit_event 打成 no-op，这里重新接管以捕获。
+    _patch_attr(service, "_record_audit_event", _capture_audit)
+    _patch_attr(service, "run_pipeline", _build_week5_execution_rerank_pipeline())
+    _patch_attr(service, "_build_first_board_candidate", lambda **_: None)
+    _patch_attr(service, "_detect_symbol_anomaly", lambda **_: None)
+    _patch_attr(
+        service,
+        "_monster_isolation_gate",
+        lambda **_: {
+            "can_open_new_position": True,
+            "reasons": [],
+            "total_monster_position": 0.0,
+            "max_monster_position": 0.0,
+            "sentiment_score": 0.0,
+        },
+    )
+
+    report = _as_mapping(
+        service.run_week5_scan(
+            symbols=["600000", "000001"],
+            notify_enabled=False,
+            sync_watchlist=False,
+        )
+    )
+
+    signal_pool = _as_mapping(report["signal_pool"])
+    ranking = _as_mapping(signal_pool["ranking"])
+    execution_rerank = _as_mapping(ranking["execution_rerank"])
+    candidates = _as_mapping_list(signal_pool["candidates"])
+
+    # 整批短路：不再出现逐票 prediction_failed:ValueError，reason 精确到缺陷类型。
+    assert ranking["score_key"] == "shortlist_score"
+    assert execution_rerank["applied"] is False
+    assert execution_rerank["reason"] == "artifact_inference_blocked:legacy_no_scaler"
+    assert execution_rerank["skipped_prediction_failed"] == len(candidates)
+    assert execution_rerank["candidate_count"] == len(candidates)
+    for candidate in candidates:
+        assert (
+            str(candidate["execution_rerank_reason"])
+            == "artifact_inference_blocked:legacy_no_scaler"
+        )
+        assert candidate["execution_rerank_applied"] is False
+        assert float(candidate["execution_reranked_score"]) == float(
+            candidate["shortlist_score"]
+        )
+
+    unusable_events = [
+        event
+        for event in audit_events
+        if event.get("event_type") == "execution_risk_artifact_unusable"
+    ]
+    assert len(unusable_events) == 1
+    payload = _as_mapping(unusable_events[0]["payload"])
+    assert payload["phase"] == "probe"
+    assert payload["detail"] == "legacy_no_scaler"
+    assert int(payload["skipped_prediction_failed"]) == len(candidates)  # type: ignore[arg-type]
+
+
+class _AuditRecorder:
+    def __init__(self) -> None:
+        self.events: list[dict[str, object]] = []
+
+    def _record_audit_event(self, **kwargs: object) -> None:
+        self.events.append(dict(kwargs))
+
+
+def test_intraday_sync_health_audit_flags_degraded_fallback_on_partial_success() -> None:
+    recorder = _AuditRecorder()
+    # 真实形态：source_breakdown 在会话完整性过滤前计数（sina=100/ok=96/failed=4）。
+    _record_intraday_sync_health_audits(
+        service=recorder,
+        sync_report={
+            "ok": 96,
+            "failed": 4,
+            "skipped": 0,
+            "source_breakdown": {"tushare": 0, "sina": 100, "skipped": 0},
+            "detail": {"primary": "tushare", "fallback": "sina"},
+            "capability_probe": {
+                "probed": 2,
+                "tushare_ok": False,
+                "error": "DataSourceError:每分钟限频",
+            },
+        },
+    )
+
+    assert len(recorder.events) == 1
+    assert recorder.events[0]["event_type"] == "intraday_primary_degraded_to_fallback"
+    assert recorder.events[0]["level"] == "warn"
+
+
+def test_intraday_sync_health_audit_flags_all_failed() -> None:
+    recorder = _AuditRecorder()
+    _record_intraday_sync_health_audits(
+        service=recorder,
+        sync_report={
+            "ok": 0,
+            "failed": 100,
+            "skipped": 0,
+            "source_breakdown": {"tushare": 0, "sina": 0, "skipped": 100},
+            "detail": {"primary": "tushare", "fallback": "sina"},
+            "capability_probe": {"probed": 2, "tushare_ok": False, "error": "quota"},
+        },
+    )
+
+    assert len(recorder.events) == 1
+    assert recorder.events[0]["event_type"] == "intraday_sync_all_failed"
+    assert recorder.events[0]["level"] == "warn"
+
+
+def test_intraday_sync_health_audit_silent_when_tushare_serves() -> None:
+    recorder = _AuditRecorder()
+    _record_intraday_sync_health_audits(
+        service=recorder,
+        sync_report={
+            "ok": 90,
+            "failed": 10,
+            "skipped": 0,
+            "source_breakdown": {"tushare": 85, "sina": 15, "skipped": 0},
+            "detail": {"primary": "tushare", "fallback": "sina"},
+            "capability_probe": {"probed": 2, "tushare_ok": True, "error": ""},
+        },
+    )
+
+    assert recorder.events == []
+
+
+def test_intraday_sync_health_audit_silent_when_sina_is_primary() -> None:
+    recorder = _AuditRecorder()
+    # Sina 已是主源：全部由 Sina 供数不构成"降级"。
+    _record_intraday_sync_health_audits(
+        service=recorder,
+        sync_report={
+            "ok": 96,
+            "failed": 4,
+            "skipped": 0,
+            "source_breakdown": {"tushare": 0, "sina": 100, "skipped": 0},
+            "detail": {"primary": "sina", "fallback": "sina"},
+            "capability_probe": {
+                "probed": 0,
+                "tushare_ok": None,
+                "error": "",
+                "note": "primary_not_tushare",
+            },
+        },
+    )
+
+    assert recorder.events == []
+
+
+def test_sync_intraday_symbols_wrapper_error_dict_feeds_all_failed_audit() -> None:
+    """wrapper 异常兜底必须携带 detail.primary + ok/failed 计数，让审计可判定。
+
+    用非法 required_trade_date 触发内层 ValueError，验证兜底 dict 字段完整
+    且能触发 intraday_sync_all_failed（NO-GO 复核修复验证）。
+    """
+    from stock_analyzer.runtime.services.week5_service import (
+        _sync_intraday_symbols as _sync_intraday_symbols_wrapper,
+    )
+
+    error_dict = _sync_intraday_symbols_wrapper(
+        warehouse=None,
+        vendor_overlay=None,
+        symbols=["600000", "000001"],
+        required_trade_date="not-a-date",
+        primary="tushare",
+        fallback="sina",
+    )
+
+    assert error_dict["ok"] == 0
+    assert error_dict["failed"] == 2
+    detail = error_dict["detail"]
+    assert isinstance(detail, dict)
+    assert detail["primary"] == "tushare"
+    assert detail["fallback"] == "sina"
+    assert "error" in error_dict
+
+    recorder = _AuditRecorder()
+    _record_intraday_sync_health_audits(service=recorder, sync_report=error_dict)
+
+    assert len(recorder.events) == 1
+    assert recorder.events[0]["event_type"] == "intraday_sync_all_failed"
+    assert recorder.events[0]["level"] == "warn"

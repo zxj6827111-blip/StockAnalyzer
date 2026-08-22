@@ -6,6 +6,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 
+import pytest
+
 from stock_analyzer.config import StockAnalyzerConfig, load_config
 from stock_analyzer.data.provider import SyntheticProvider
 from stock_analyzer.runtime.service import StockAnalyzerService
@@ -500,3 +502,192 @@ def test_evolution_offhours_refreshes_market_warehouse_before_run_when_enabled(
     assert len(calls) == 1
     assert calls[0]["source_trace_id"] == "warehouse-pre-sync"
     assert market_warehouse_sync["status"] == "ok"
+
+
+def _patch_readiness_consume(
+    monkeypatch: pytest.MonkeyPatch,
+    calls: list[dict[str, object]],
+) -> None:
+    """消费代码在函数体内 import，patch 模块属性即可拦截。"""
+    import stock_analyzer.ops.nightly_readiness as readiness_module
+
+    def _fake_consume() -> dict[str, object]:
+        calls.append({"consumed": True})
+        return {"target_trade_date": "2026-08-21"}
+
+    monkeypatch.setattr(readiness_module, "consume_nightly_readiness", _fake_consume)
+
+
+def _evolution_report(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "status": "ok",
+        "run_id": "run-test-1",
+        "proposal": {"authorization_level": "C"},
+        "tdx_sync": {},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _week5_refresh(**overrides: object) -> dict[str, object]:
+    """按真实扫描报告嵌套结构构造（零信号默认形态）。"""
+    payload: dict[str, object] = {
+        "summary": {"watchlist_synced": False},
+        "watchlist_sync": {"updated": False},
+        "funnel": {"final_selection": {"final_signals": []}},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _success_week5_refresh() -> dict[str, object]:
+    return _week5_refresh(
+        summary={"watchlist_synced": True},
+        watchlist_sync={"updated": True},
+        funnel={"final_selection": {"final_signals": [{"symbol": "600000"}]}},
+    )
+
+
+def test_offhours_consumes_readiness_on_watchlist_sync_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _load_test_config(tmp_path)
+    service = _new_service(config=config, tmp_path=tmp_path)
+    service.state.watchlist = ["600000.SH"]
+    _patch_attr(service, "run_evolution_offhours", lambda **_: _evolution_report())
+    _patch_attr(
+        service,
+        "run_week5_scan",
+        lambda **_: _week5_refresh(
+            summary={"watchlist_synced": True},
+            watchlist_sync={"updated": True},
+        ),
+    )
+    calls: list[dict[str, object]] = []
+    _patch_readiness_consume(monkeypatch, calls)
+
+    service._job_evolution_offhours()
+
+    assert len(calls) == 1
+
+
+def test_offhours_consumes_readiness_on_final_signals_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _load_test_config(tmp_path)
+    service = _new_service(config=config, tmp_path=tmp_path)
+    service.state.watchlist = ["600000.SH"]
+    _patch_attr(service, "run_evolution_offhours", lambda **_: _evolution_report())
+    _patch_attr(
+        service,
+        "run_week5_scan",
+        lambda **_: _week5_refresh(
+            funnel={"final_selection": {"final_signals": [{"symbol": "600000"}]}},
+        ),
+    )
+    calls: list[dict[str, object]] = []
+    _patch_readiness_consume(monkeypatch, calls)
+
+    service._job_evolution_offhours()
+
+    assert len(calls) == 1
+
+
+def test_offhours_skips_readiness_on_zero_signal_real_structure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _load_test_config(tmp_path)
+    service = _new_service(config=config, tmp_path=tmp_path)
+    service.state.watchlist = ["600000.SH"]
+    _patch_attr(service, "run_evolution_offhours", lambda **_: _evolution_report())
+    # 真实零信号形态：final_signals=[]、未同步、summary 未标记。
+    _patch_attr(service, "run_week5_scan", lambda **_: _week5_refresh())
+    calls: list[dict[str, object]] = []
+    _patch_readiness_consume(monkeypatch, calls)
+
+    service._job_evolution_offhours()
+
+    assert calls == []
+
+
+def test_offhours_status_only_success_string_does_not_consume_readiness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _load_test_config(tmp_path)
+    service = _new_service(config=config, tmp_path=tmp_path)
+    service.state.watchlist = ["600000.SH"]
+    _patch_attr(service, "run_evolution_offhours", lambda **_: _evolution_report())
+    # 旧逻辑的漏洞形态：仅靠 status=ok/completed 兜底即消费；新逻辑必须拒绝。
+    _patch_attr(service, "run_week5_scan", lambda **_: {"status": "completed"})
+    calls: list[dict[str, object]] = []
+    _patch_readiness_consume(monkeypatch, calls)
+
+    service._job_evolution_offhours()
+
+    assert calls == []
+
+
+@pytest.mark.parametrize("negative_status", ["error", "skipped", "blocked_data_gate"])
+def test_offhours_week5_negative_status_vetoes_readiness_consumption(
+    negative_status: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _load_test_config(tmp_path)
+    service = _new_service(config=config, tmp_path=tmp_path)
+    service.state.watchlist = ["600000.SH"]
+    _patch_attr(service, "run_evolution_offhours", lambda **_: _evolution_report())
+    # Week5 状态为负值时，即使构造出全部成功字段也必须否决（fail-closed）。
+    _patch_attr(service, "run_week5_scan", lambda **_: _week5_refresh(status=negative_status))
+    calls: list[dict[str, object]] = []
+    _patch_readiness_consume(monkeypatch, calls)
+
+    service._job_evolution_offhours()
+
+    assert calls == []
+
+
+@pytest.mark.parametrize("negative_status", ["error", "skipped", "failed"])
+def test_offhours_evolution_negative_status_vetoes_readiness_consumption(
+    negative_status: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _load_test_config(tmp_path)
+    service = _new_service(config=config, tmp_path=tmp_path)
+    service.state.watchlist = ["600000.SH"]
+    _patch_attr(
+        service,
+        "run_evolution_offhours",
+        lambda **_: _evolution_report(status=negative_status),
+    )
+    _patch_attr(service, "run_week5_scan", lambda **_: _success_week5_refresh())
+    calls: list[dict[str, object]] = []
+    _patch_readiness_consume(monkeypatch, calls)
+
+    service._job_evolution_offhours()
+
+    assert calls == []
+
+
+def test_offhours_missing_run_id_blocks_readiness_consumption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _load_test_config(tmp_path)
+    service = _new_service(config=config, tmp_path=tmp_path)
+    service.state.watchlist = ["600000.SH"]
+    report = _evolution_report()
+    report.pop("run_id")
+    _patch_attr(service, "run_evolution_offhours", lambda **_: report)
+    _patch_attr(service, "run_week5_scan", lambda **_: _success_week5_refresh())
+    calls: list[dict[str, object]] = []
+    _patch_readiness_consume(monkeypatch, calls)
+
+    service._job_evolution_offhours()
+
+    assert calls == []

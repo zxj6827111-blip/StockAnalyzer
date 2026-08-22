@@ -283,12 +283,26 @@ def sync_intraday_symbols(
     unsupported_market: list[str] = [s for s in normalized if _is_bj_symbol(s)]
     eligible: list[str] = [s for s in normalized if s not in set(unsupported_market)]
 
+    # 主备源归一化必须先于 report 构造：无 eligible / lock busy 等早退路径
+    # 也要携带正确形态的 capability_probe（Sina 主源下不应出现误导性的
+    # tushare_ok=False，见 2026-08-22 复核）。
+    primary_norm = str(primary or "tushare").strip().lower() or "tushare"
+    fallback_norm = str(fallback or "sina").strip().lower() or "sina"
+
+    def _initial_capability_probe() -> dict[str, object]:
+        if primary_norm == "tushare":
+            return {"probed": 0, "tushare_ok": False, "error": ""}
+        return {"probed": 0, "tushare_ok": None, "error": "", "note": "primary_not_tushare"}
+
     report = IntradaySyncReport(
         target_trade_date=required_date.isoformat(),
         symbols_total=len(normalized),
         unsupported_market=sorted(unsupported_market),
         source_breakdown={"tushare": 0, "sina": 0, "skipped": 0},
-        capability_probe={"probed": 0, "tushare_ok": False, "error": ""},
+        capability_probe=_initial_capability_probe(),
+        # detail 从构造起就携带主备源：lock_error 等异常早退路径也必须
+        # 让下游健康度审计能读到 primary（2026-08-22 NO-GO 复核修复）。
+        detail={"primary": primary_norm, "fallback": fallback_norm},
     )
 
     if not eligible:
@@ -327,7 +341,8 @@ def sync_intraday_symbols(
         # Lock construction failure: fail-closed, do not proceed without lock.
         report.skipped = 0
         report.failed = len(eligible)
-        report.detail = {"lock_error": f"{type(exc).__name__}:{exc}"}
+        # update 而非整体替换：保留构造时写入的 primary/fallback，供下游审计。
+        report.detail["lock_error"] = f"{type(exc).__name__}:{exc}"
         report.elapsed_ms = max(1, int((monotonic() - started) * 1000))
         return report
 
@@ -362,10 +377,8 @@ def sync_intraday_symbols(
         skipped_up_to_date = sorted(up_to_date)
         fetch_needed = [s for s in eligible if s not in up_to_date]
 
-        # Primary provider resolution (tushare vs sina).
-        primary_norm = str(primary or "tushare").strip().lower() or "tushare"
-        fallback_norm = str(fallback or "sina").strip().lower() or "sina"
-
+        # Primary provider resolution (tushare vs sina) 已上移至 report 构造前，
+        # 保证所有早退路径的 capability_probe 形态一致。
         provider_timeout = min(max(0.1, float(timeout_sec)), max(0.1, float(deadline_sec)))
         tushare = tushare_provider or _resolve_tushare_provider(
             warehouse, timeout_sec=provider_timeout
