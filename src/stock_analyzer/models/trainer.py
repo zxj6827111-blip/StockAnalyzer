@@ -39,6 +39,7 @@ from stock_analyzer.learning.sample_schema import (
     OutcomeRecord,
 )
 from stock_analyzer.learning.sample_store import SampleStore
+from stock_analyzer.learning.slot_occupied_nav import simulate_slot_occupied_realized_nav
 from stock_analyzer.models.adapters import (
     LightGBMAdapter,
     XGBoostAdapter,
@@ -249,6 +250,7 @@ class ModelTrainer:
         row_payloads: list[dict[str, float]] = []
         split_labels: list[str] = []
         sample_weights: list[float] = []
+        realized_returns: list[float] = []
         feedback_rows = []
         for item in manifest_items:
             snapshot = snapshots.get(item.snapshot_id)
@@ -280,6 +282,10 @@ class ModelTrainer:
             )
             feedback_rows.append(feedback_weight)
             sample_weights.append(float(feedback_weight.final_weight))
+            outcome_return = outcome.realized_return
+            realized_returns.append(
+                float(outcome_return) if outcome_return is not None else 0.0
+            )
 
         if not row_payloads:
             raise ValueError(
@@ -334,6 +340,22 @@ class ModelTrainer:
             str(dedup_metadata["rows_dropped_by_dedup"])
         )
         result.artifact.metadata["dataset_dedup_quality"] = dedup_metadata
+        # 数据集级 NAV 口径（P1-b）：slot 占用固定基数模拟 + 旧复利参照，
+        # 用于晋级有效性门识别“逐笔全仓复利×重复快照”式口径爆炸。
+        nav_report = simulate_slot_occupied_realized_nav(realized_returns=realized_returns)
+        nav_cap = 1.0e18
+        naive_value = (
+            float(nav_report.naive_compounded_nav)
+            if nav_report.naive_compounded_nav <= nav_cap
+            else nav_cap
+        )
+        result.metrics["dataset_slot_occupied_realized_nav"] = round(
+            nav_report.slot_occupied_realized_nav, 6
+        )
+        result.metrics["dataset_naive_compounded_nav"] = round(naive_value, 6)
+        result.metrics["dataset_nav_compounding_explosion"] = (
+            1.0 if nav_report.compounding_explosion else 0.0
+        )
         return result
 
     def train_on_feature_label(self, features: pd.DataFrame, labels: pd.Series) -> TrainResult:

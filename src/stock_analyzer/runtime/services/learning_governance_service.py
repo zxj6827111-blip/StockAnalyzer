@@ -18,6 +18,11 @@ from stock_analyzer.evolution.governance.compliance import (
     ComplianceLogger,
     ComplianceState,
 )
+from stock_analyzer.learning.slot_occupied_nav import (
+    PromotionValidityReport,
+    evaluate_promotion_validity,
+)
+from stock_analyzer.models.artifact import ModelArtifact
 from stock_analyzer.models.bundle import (
     ARTIFACT_FILENAME,
     BundleIntegrityError,
@@ -2265,6 +2270,22 @@ class _TwoPhaseReleaseExecutor:
         except BundleIntegrityError as exc:
             raise _ReleaseFlowError("target_bundle_integrity_failed", str(exc)) from exc
 
+        # 晋级有效性门（P1-b）：对候选评估产物做口径与有限性检查，
+        # blocking 命中一律拒绝发布（fail-closed）。
+        candidate_artifact = ModelArtifact.load(artifact_path)
+        raw_dedup_quality = candidate_artifact.metadata.get("dataset_dedup_quality")
+        dedup_quality = raw_dedup_quality if isinstance(raw_dedup_quality, Mapping) else None
+        validity_report = self._evaluate_candidate_validity(
+            metrics_summary=candidate_artifact.training_metrics,
+            dedup_quality=dedup_quality,
+        )
+        if not validity_report.valid:
+            raise _ReleaseFlowError(
+                "promotion_validity_failed",
+                "candidate evaluation failed promotion validity gate: "
+                + ", ".join(validity_report.blocking_reasons),
+            )
+
         alias_payload = build_release_alias_payload(
             bundle_root=self.bundle_root,
             registry_model_id=self._target.model_id,
@@ -2285,6 +2306,7 @@ class _TwoPhaseReleaseExecutor:
             "bundle_content_hash": content_hash,
             "expected_previous_champion_model_id": self.expected_previous_champion_id(),
             "alias_path": str(self._alias_path),
+            "promotion_validity": validity_report.to_dict(),
         }
         self._service._record_audit_event(
             event_type="learning_release_intent",
@@ -2352,6 +2374,19 @@ class _TwoPhaseReleaseExecutor:
             "promoted": promoted.model_dump(mode="json"),
             "demoted": [record.model_dump(mode="json") for record in demoted],
         }
+
+    def _evaluate_candidate_validity(
+        self,
+        *,
+        metrics_summary: Mapping[str, float],
+        dedup_quality: Mapping[str, object] | None,
+    ) -> PromotionValidityReport:
+        """有效性门入口（独立方法便于故障注入测试）。"""
+
+        return evaluate_promotion_validity(
+            metrics_summary=metrics_summary,
+            dedup_quality=dedup_quality,
+        )
 
     def rollback(self, *, alias_switched: bool) -> dict[str, object]:
         """步骤⑥失败恢复：逆序还原 predictor、别名与 registry 状态。"""
