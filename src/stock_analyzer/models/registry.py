@@ -185,6 +185,10 @@ class ModelRegistry:
 
         if self._schema_ready:
             return
+        if not self._db_path.exists():
+            # 库文件尚不存在时不做迁移——避免服务启动把 DuckDB 文件提前物化
+            # （既有行为是首次写入才建库）；首个写路径的 _ensure_table 会补齐。
+            return
         conn = self._connection_factory(str(self._db_path))
         try:
             self._ensure_table(conn=conn)

@@ -286,6 +286,25 @@ def build_release_alias_payload(
     return payload
 
 
+def latest_bundle_artifact_path(archive_root: str | Path) -> Path | None:
+    """返回归档中最新的 bundle 工件路径（按修改时间）；无 bundle 时 None。
+
+    供“别名尚未由发布流程写入”的场景（如训练后立即生成验收报告）回退使用。
+    """
+
+    root = Path(archive_root)
+    if not root.is_dir():
+        return None
+    candidates = [
+        item
+        for item in root.glob(f"model_v2_*/{ARTIFACT_FILENAME}")
+        if item.is_file()
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item.stat().st_mtime)
+
+
 def _verify_declared_sidecars(
     *,
     artifact_payload_path: Path,

@@ -31,12 +31,25 @@ from stock_analyzer.training_diagnostics import (
     build_label_conflict_shadow_report,
     persist_diagnostic_report,
 )
+from stock_analyzer.models.bundle import latest_bundle_artifact_path
 from stock_analyzer.types import PipelineSignal
 from stock_analyzer.v13_acceptance import (
     build_v13_acceptance_report,
     persist_v13_acceptance_report,
     summarize_model_artifact,
 )
+def _effective_artifact_summary_path(service: object) -> Path:
+    """验收报告的工件来源：优先运行时别名，缺失时回退最新 bundle。"""
+
+    from stock_analyzer.config import StockAnalyzerConfig
+
+    config = cast(StockAnalyzerConfig, getattr(service, "_config"))
+    configured = Path(str(config.training.artifact_path)).expanduser()
+    if configured.exists():
+        return configured
+    archive_root = Path(str(config.training.model_archive_dir)).expanduser()
+    latest_bundle = latest_bundle_artifact_path(archive_root)
+    return latest_bundle if latest_bundle is not None else configured
 
 
 def _resolve_acceptance_safe_timestamp(now: datetime | None = None) -> datetime:
@@ -1218,7 +1231,7 @@ class RuntimeAcceptanceService:
             baseline_report=baseline_payload,
             provider_status=service.provider_status(),
             artifact_summary=summarize_model_artifact(
-                artifact_path=service._config.training.artifact_path
+                artifact_path=str(_effective_artifact_summary_path(service))
             ),
             week5_report=active_week5,
             positions=service.portfolio_positions(),
