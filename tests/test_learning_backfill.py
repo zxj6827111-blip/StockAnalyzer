@@ -415,7 +415,7 @@ def test_build_trainable_manifest_auto_selects_projection_compatible_current_sch
     assert payload["included_snapshot_count"] == 24
     assert sum(int(value) for value in _as_mapping(payload["split_counts"]).values()) == 24
     assert payload["fidelity_breakdown"] == {"gold": 24}
-    assert str(payload["dataset_manifest_id"]).startswith("dataset_manifest_v1_")
+    assert str(payload["dataset_manifest_id"]).startswith("dataset_manifest_v2_")
     assert manifest is not None
     assert manifest.feature_schema_id == current_record.feature_schema_id
     assert "600000.SH-legacy-trainable-000" in manifest_snapshot_ids

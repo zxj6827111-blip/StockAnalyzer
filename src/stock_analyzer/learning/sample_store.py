@@ -5,7 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 from collections.abc import Callable, Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -267,8 +267,11 @@ class SampleStore:
                     "label_policy_hash, sample_selection_rule, time_window_start, "
                     "time_window_end, fidelity_filter_json, included_snapshot_count, "
                     "included_outcome_count, fidelity_breakdown_json, "
-                    "dropped_reason_breakdown_json, split_plan_json, generated_at"
-                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    "dropped_reason_breakdown_json, split_plan_json, generated_at, "
+                    "dedup_key, dedup_rule, rows_before_dedup, rows_dropped_by_dedup, "
+                    "blocking_quality_flags_json, warning_quality_flags_json"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                    "?, ?, ?, ?, ?, ?)"
                 ),
                 _manifest_parameters(manifest),
             )
@@ -282,12 +285,12 @@ class SampleStore:
         conn = self._connect()
         try:
             self._ensure_schema(conn)
-            row = conn.execute(
-                f"SELECT {', '.join(_MANIFEST_COLUMNS)} "
-                "FROM dataset_manifests WHERE dataset_manifest_id = ? LIMIT 1",
-                [dataset_manifest_id],
-            ).fetchone()
-            return None if row is None else _row_to_manifest(row)
+            rows = self._fetch_manifest_rows(
+                conn,
+                where_clause=" WHERE dataset_manifest_id = ? LIMIT 1",
+                parameters=[dataset_manifest_id],
+            )
+            return rows[0] if rows else None
         finally:
             conn.close()
 
@@ -298,16 +301,35 @@ class SampleStore:
         try:
             self._ensure_schema(conn)
             capped_limit = max(1, int(limit))
-            rows = conn.execute(
-                f"SELECT {', '.join(_MANIFEST_COLUMNS)} "
-                "FROM dataset_manifests "
-                "ORDER BY generated_at DESC, dataset_manifest_id DESC "
-                "LIMIT ?",
-                [capped_limit],
-            ).fetchall()
-            return [_row_to_manifest(row) for row in rows]
+            return self._fetch_manifest_rows(
+                conn,
+                where_clause=(
+                    " ORDER BY generated_at DESC, dataset_manifest_id DESC "
+                    "LIMIT ?"
+                ),
+                parameters=[capped_limit],
+            )
         finally:
             conn.close()
+
+    def _fetch_manifest_rows(
+        self,
+        conn: _DuckConnection,
+        *,
+        where_clause: str,
+        parameters: list[object],
+    ) -> list[DatasetManifest]:
+        # 先按新 schema 查询；未迁移旧库缺列时降级旧列集（默认空值），不触发写。
+        for columns in (_MANIFEST_COLUMNS, _MANIFEST_LEGACY_COLUMNS):
+            query = f"SELECT {', '.join(columns)} FROM dataset_manifests{where_clause}"
+            try:
+                rows = conn.execute(query, parameters).fetchall()
+            except Exception as exc:
+                if columns is _MANIFEST_COLUMNS and _is_missing_dedup_column_error(exc):
+                    continue
+                raise
+            return [_row_to_manifest(row) for row in rows]
+        return []
 
     def replace_manifest_items(
         self,
@@ -367,6 +389,34 @@ class SampleStore:
             item.snapshot_id
             for item in self.list_manifest_items(dataset_manifest_id=dataset_manifest_id)
         ]
+
+    def has_snapshot_for_decision_date(
+        self,
+        *,
+        symbol: str,
+        strategy: str,
+        decision_time: datetime,
+    ) -> bool:
+        """上游幂等检查：同一 (symbol, strategy, Asia/Shanghai 决策日) 是否已有快照。
+
+        NAS 实测重复根因：同日反复 pipeline_run_once 对同一 symbol/strategy
+        重复写入（outcome 完全相同）。写入前按日查重可从源头阻断。
+        """
+
+        decision_date_sh = (decision_time + timedelta(hours=8)).date()
+        conn = self._connect()
+        try:
+            self._ensure_schema(conn)
+            row = conn.execute(
+                "SELECT COUNT(*) FROM signal_snapshots "
+                "WHERE symbol = ? AND strategy = ? "
+                "AND CAST(CAST(substr(decision_time, 1, 19) AS TIMESTAMP) "
+                "+ INTERVAL 8 HOUR AS DATE) = ?",
+                [symbol, strategy, decision_date_sh.isoformat()],
+            ).fetchone()
+            return row is not None and int(str(row[0])) > 0
+        finally:
+            conn.close()
 
     def list_snapshots(
         self,
@@ -545,9 +595,16 @@ class SampleStore:
             "fidelity_breakdown_json VARCHAR NOT NULL, "
             "dropped_reason_breakdown_json VARCHAR NOT NULL, "
             "split_plan_json VARCHAR NOT NULL, "
+            "dedup_key VARCHAR NOT NULL DEFAULT '', "
+            "dedup_rule VARCHAR NOT NULL DEFAULT '', "
+            "rows_before_dedup INTEGER NOT NULL DEFAULT 0, "
+            "rows_dropped_by_dedup INTEGER NOT NULL DEFAULT 0, "
+            "blocking_quality_flags_json VARCHAR NOT NULL DEFAULT '[]', "
+            "warning_quality_flags_json VARCHAR NOT NULL DEFAULT '[]', "
             "generated_at VARCHAR NOT NULL"
             ")"
         )
+        self._migrate_dataset_manifests_columns(conn)
         conn.execute(
             "CREATE TABLE IF NOT EXISTS dataset_manifest_items ("
             "dataset_manifest_id VARCHAR NOT NULL, "
@@ -557,6 +614,52 @@ class SampleStore:
             "decision_time VARCHAR NOT NULL, "
             "PRIMARY KEY(dataset_manifest_id, snapshot_id)"
             ")"
+        )
+
+    def _migrate_dataset_manifests_columns(self, conn: _DuckConnection) -> None:
+        """旧库逐列补 v2 去重字段（幂等；DuckDB 不支持带约束 ADD COLUMN）。"""
+
+        rows = conn.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
+            ["dataset_manifests"],
+        ).fetchall()
+        existing = {str(row[0]).strip().lower() for row in rows}
+        if not existing:
+            return
+        additions = {
+            "dedup_key": "VARCHAR",
+            "dedup_rule": "VARCHAR",
+            "rows_before_dedup": "INTEGER",
+            "rows_dropped_by_dedup": "INTEGER",
+            "blocking_quality_flags_json": "VARCHAR",
+            "warning_quality_flags_json": "VARCHAR",
+        }
+        for column_name, column_type in additions.items():
+            if column_name not in existing:
+                conn.execute(
+                    f"ALTER TABLE dataset_manifests ADD COLUMN {column_name} {column_type}"
+                )
+        conn.execute(
+            "UPDATE dataset_manifests SET dedup_key = '' WHERE dedup_key IS NULL"
+        )
+        conn.execute(
+            "UPDATE dataset_manifests SET dedup_rule = '' WHERE dedup_rule IS NULL"
+        )
+        conn.execute(
+            "UPDATE dataset_manifests SET rows_before_dedup = 0 "
+            "WHERE rows_before_dedup IS NULL"
+        )
+        conn.execute(
+            "UPDATE dataset_manifests SET rows_dropped_by_dedup = 0 "
+            "WHERE rows_dropped_by_dedup IS NULL"
+        )
+        conn.execute(
+            "UPDATE dataset_manifests SET blocking_quality_flags_json = '[]' "
+            "WHERE blocking_quality_flags_json IS NULL"
+        )
+        conn.execute(
+            "UPDATE dataset_manifests SET warning_quality_flags_json = '[]' "
+            "WHERE warning_quality_flags_json IS NULL"
         )
 
 
@@ -622,7 +725,42 @@ _MANIFEST_COLUMNS = (
     "dropped_reason_breakdown_json",
     "split_plan_json",
     "generated_at",
+    "dedup_key",
+    "dedup_rule",
+    "rows_before_dedup",
+    "rows_dropped_by_dedup",
+    "blocking_quality_flags_json",
+    "warning_quality_flags_json",
 )
+
+# 未迁移旧表的降级列集（无 v2 去重字段，读取时映射默认值）。
+_MANIFEST_LEGACY_COLUMNS = (
+    "dataset_manifest_id",
+    "schema_version",
+    "source_store_version",
+    "feature_schema_id",
+    "feature_schema_hash",
+    "label_policy_id",
+    "label_policy_hash",
+    "sample_selection_rule",
+    "time_window_start",
+    "time_window_end",
+    "fidelity_filter_json",
+    "included_snapshot_count",
+    "included_outcome_count",
+    "fidelity_breakdown_json",
+    "dropped_reason_breakdown_json",
+    "split_plan_json",
+    "generated_at",
+)
+
+def _is_missing_dedup_column_error(exc: Exception) -> bool:
+    message = str(exc).strip().lower()
+    return (
+        ("not found" in message or "does not exist" in message)
+        and ("dedup_" in message or "quality_flags" in message)
+    )
+
 
 _MANIFEST_ITEM_COLUMNS = (
     "dataset_manifest_id",
@@ -700,6 +838,12 @@ def _manifest_parameters(manifest: DatasetManifest) -> list[object]:
         _dump_json(manifest.dropped_reason_breakdown),
         _dump_json([item.model_dump(mode="json") for item in manifest.split_plan]),
         _dump_datetime(manifest.generated_at),
+        manifest.dedup_key,
+        manifest.dedup_rule,
+        manifest.rows_before_dedup,
+        manifest.rows_dropped_by_dedup,
+        _dump_json(list(manifest.blocking_quality_flags)),
+        _dump_json(list(manifest.warning_quality_flags)),
     ]
 
 
@@ -765,6 +909,34 @@ def _row_to_outcome(row: Sequence[object]) -> OutcomeRecord:
 
 
 def _row_to_manifest(row: Sequence[object]) -> DatasetManifest:
+    # 兼容两种行宽：23 列（含 v2 去重字段）/ 17 列（未迁移旧表降级查询）。
+    has_v2_columns = len(row) >= 23
+    if has_v2_columns:
+        # v2 列序：... split_plan(15), generated_at(16), dedup_key(17),
+        # dedup_rule(18), rows_before(19), rows_dropped(20), blocking(21), warning(22)
+        dedup_key = str(row[17] or "")
+        dedup_rule = str(row[18] or "")
+        rows_before_dedup = int(str(row[19]))
+        rows_dropped_by_dedup = int(str(row[20]))
+        blocking_flags = [
+            str(item)
+            for item in _load_json_list(row[21])
+            if str(item).strip()
+        ]
+        warning_flags = [
+            str(item)
+            for item in _load_json_list(row[22])
+            if str(item).strip()
+        ]
+        generated_index = 16
+    else:
+        dedup_key = ""
+        dedup_rule = ""
+        rows_before_dedup = 0
+        rows_dropped_by_dedup = 0
+        blocking_flags = []
+        warning_flags = []
+        generated_index = 16
     split_plan_raw = _load_json_list(row[15])
     split_plan = [DatasetSplitPlanEntry.model_validate(item) for item in split_plan_raw]
     return DatasetManifest(
@@ -788,7 +960,13 @@ def _row_to_manifest(row: Sequence[object]) -> DatasetManifest:
         fidelity_breakdown=_load_json_dict_int(row[13]),
         dropped_reason_breakdown=_load_json_dict_int(row[14]),
         split_plan=split_plan,
-        generated_at=_parse_datetime(row[16]),
+        dedup_key=dedup_key,
+        dedup_rule=dedup_rule,
+        rows_before_dedup=rows_before_dedup,
+        rows_dropped_by_dedup=rows_dropped_by_dedup,
+        blocking_quality_flags=blocking_flags,
+        warning_quality_flags=warning_flags,
+        generated_at=_parse_datetime(row[generated_index]),
     )
 
 

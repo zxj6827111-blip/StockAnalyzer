@@ -1660,6 +1660,19 @@ class AnalyzerPipeline:
                 normalization_hint="t1_shifted",
             )
             label_policy = self._label_policy_registry.register_from_config(self._config.labels)
+            # 上游幂等（P1-a）：同一 (symbol, strategy, 决策日) 已有快照时跳过写入，
+            # 阻断 NAS 实测确认的“同日反复 pipeline_run_once 重复入库”根因。
+            if self._sample_store.has_snapshot_for_decision_date(
+                symbol=symbol,
+                strategy=strategy,
+                decision_time=decision_time,
+            ):
+                return {
+                    "snapshot_id": "",
+                    "skipped": "duplicate_decision_date_snapshot",
+                    "symbol": symbol,
+                    "strategy": strategy,
+                }
             latest_features = features.iloc[-1]
             snapshot_id = f"snap_{decision_time.strftime('%Y%m%d%H%M%S')}_{uuid4().hex[:8]}"
             snapshot = SignalSnapshot(

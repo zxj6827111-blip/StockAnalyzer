@@ -97,7 +97,8 @@ def test_model_trainer_trains_directly_from_sample_store(tmp_path: Path) -> None
     assert result.samples_train > result.samples_test
     assert result.artifact.feature_schema_id == feature_record.feature_schema_id
     assert result.artifact.label_policy_hash == label_record.label_policy_hash
-    assert str(result.artifact.dataset_manifest_id).startswith("dataset_manifest_v1_")
+    # Commit 3 后新建 manifest 恒为 schema v2，ID 前缀相应变化。
+    assert str(result.artifact.dataset_manifest_id).startswith("dataset_manifest_v2_")
     assert result.artifact.metadata["dataset_split_strategy"] == "manifest"
 
 

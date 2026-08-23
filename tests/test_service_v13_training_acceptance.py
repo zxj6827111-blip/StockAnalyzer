@@ -225,7 +225,7 @@ def test_service_full_market_training_prefers_learning_protocol_when_samples_exi
     assert payload["input_mode"] == "sample_store"
     assert payload["protocol_attempted"] is True
     assert payload["protocol_fallback_reason"] == ""
-    assert str(payload["dataset_manifest_id"]).startswith("dataset_manifest_v1_")
+    assert str(payload["dataset_manifest_id"]).startswith("dataset_manifest_v2_")
     artifact_payload = _as_mapping(_as_mapping(payload["result"])["artifact"])
     assert artifact_payload["dataset_manifest_id"] == payload["dataset_manifest_id"]
     assert artifact_payload["feature_schema_id"] != ""

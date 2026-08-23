@@ -211,6 +211,14 @@ class ModelTrainer:
         )
         if manifest is None:
             raise ValueError(f"dataset manifest not found: {dataset_manifest}")
+        blocking_flags = list(getattr(manifest, "blocking_quality_flags", []) or [])
+        if blocking_flags:
+            # trainer 防御（P1-a）：manifest 带 blocking 质量旗标时拒绝训练，
+            # 例如去重后样本被丢弃过半（duplicate_dominance）或去重后为空。
+            raise ValueError(
+                "dataset manifest blocked by quality flags "
+                f"{sorted(blocking_flags)}: {manifest.dataset_manifest_id}"
+            )
         manifest_items = store.list_manifest_items(manifest.dataset_manifest_id)
         if not manifest_items:
             raise ValueError(
@@ -286,7 +294,7 @@ class ModelTrainer:
                 names=["symbol", "decision_time", "snapshot_id"],
             ),
         )
-        return self._train_aligned_dataset(
+        result = self._train_aligned_dataset(
             aligned=aligned,
             feature_columns=feature_columns,
             label_column=label_column,
@@ -304,6 +312,29 @@ class ModelTrainer:
             label_policy_hash=manifest.label_policy_hash,
             dataset_manifest_id=manifest.dataset_manifest_id,
         )
+        # 去重与质量透传：metrics 供晋级门消费，metadata 留档完整旗标。
+        dedup_metadata = {
+            "dedup_key": str(getattr(manifest, "dedup_key", "") or ""),
+            "dedup_rule": str(getattr(manifest, "dedup_rule", "") or ""),
+            "rows_before_dedup": int(getattr(manifest, "rows_before_dedup", 0) or 0),
+            "rows_dropped_by_dedup": int(
+                getattr(manifest, "rows_dropped_by_dedup", 0) or 0
+            ),
+            "blocking_quality_flags": list(
+                getattr(manifest, "blocking_quality_flags", []) or []
+            ),
+            "warning_quality_flags": list(
+                getattr(manifest, "warning_quality_flags", []) or []
+            ),
+        }
+        result.metrics["rows_before_dedup"] = float(
+            str(dedup_metadata["rows_before_dedup"])
+        )
+        result.metrics["rows_dropped_by_dedup"] = float(
+            str(dedup_metadata["rows_dropped_by_dedup"])
+        )
+        result.artifact.metadata["dataset_dedup_quality"] = dedup_metadata
+        return result
 
     def train_on_feature_label(self, features: pd.DataFrame, labels: pd.Series) -> TrainResult:
         aligned = features.join(labels, how="inner")

@@ -25,6 +25,14 @@ _DEFAULT_MATURITY_STATUSES = (
     MaturityStatus.FULLY_MATURED,
 )
 
+# schema v2 去重契约：NAS 实测 (symbol, strategy, decision_date) 大面积重复
+# （5387 组/72916 行，单键最多 75+），重复源于同日反复 pipeline_run_once 写入。
+DEDUP_KEY = "symbol+strategy+decision_date_sh"
+DEDUP_RULE = "keep_first_by_decision_time"
+# 去重丢弃占比超过该阈值视为 blocking（数据集以重复为主，训练无意义）。
+_DUPLICATE_DOMINANCE_RATIO = 0.5
+_MANIFEST_SCHEMA_VERSION = "2"
+
 
 class DatasetManifestBuilder:
     """Build deterministic dataset manifests from one sample store."""
@@ -102,8 +110,13 @@ class DatasetManifestBuilder:
             fidelity_filter=normalized_fidelity,
             maturity_statuses=normalized_maturity,
         )
+        deduped_pairs, dedup_stats = _deduplicate_by_trading_day(included_pairs)
+        blocking_flags, warning_flags = _dedup_quality_flags(
+            rows_before=dedup_stats["rows_before"],
+            rows_dropped=dedup_stats["rows_dropped"],
+        )
         item_blueprints, split_plan = _build_manifest_items_and_split_plan(
-            included_pairs=included_pairs,
+            included_pairs=deduped_pairs,
             calibration_ratio=calibration_ratio,
             test_ratio=test_ratio,
             embargo_days=embargo_days,
@@ -118,8 +131,11 @@ class DatasetManifestBuilder:
                 time_window_end=time_window_end,
             )
         )
-        fidelity_breakdown = _build_fidelity_breakdown(included_pairs)
+        fidelity_breakdown = _build_fidelity_breakdown(deduped_pairs)
         manifest_id = _build_dataset_manifest_id(
+            schema_version=_MANIFEST_SCHEMA_VERSION,
+            dedup_key=DEDUP_KEY,
+            dedup_rule=DEDUP_RULE,
             source_store_version=self._source_store_version,
             feature_schema_id=feature_schema_id,
             feature_schema_hash=feature_schema_hash,
@@ -144,6 +160,7 @@ class DatasetManifestBuilder:
         ]
         manifest = DatasetManifest(
             dataset_manifest_id=manifest_id,
+            schema_version=_MANIFEST_SCHEMA_VERSION,
             source_store_version=self._source_store_version,
             feature_schema_id=feature_schema_id,
             feature_schema_hash=feature_schema_hash,
@@ -154,13 +171,25 @@ class DatasetManifestBuilder:
             time_window_end=time_window_end,
             fidelity_filter=list(normalized_fidelity),
             included_snapshot_count=len(manifest_items),
-            included_outcome_count=len(included_pairs),
+            included_outcome_count=len(deduped_pairs),
             fidelity_breakdown=fidelity_breakdown,
             dropped_reason_breakdown=dropped_reason_breakdown,
             split_plan=split_plan,
+            dedup_key=DEDUP_KEY,
+            dedup_rule=DEDUP_RULE,
+            rows_before_dedup=dedup_stats["rows_before"],
+            rows_dropped_by_dedup=dedup_stats["rows_dropped"],
+            blocking_quality_flags=blocking_flags,
+            warning_quality_flags=warning_flags,
         )
 
         existing = self._store.get_manifest(manifest.dataset_manifest_id)
+        if existing is not None and existing.schema_version != manifest.schema_version:
+            # v2 ID 绝不允许解析到 v1 记录（正常情况下前缀已隔离，此处兜底）。
+            raise ValueError(
+                "dataset manifest id collision across schema versions: "
+                f"{manifest.dataset_manifest_id} stored_schema={existing.schema_version}"
+            )
         if existing is None:
             self._store.write_manifest(manifest)
         stored_items = self._store.list_manifest_items(manifest.dataset_manifest_id)
@@ -319,6 +348,66 @@ def _build_grouped_split_and_purge(
             split_times.setdefault(split_name, []).append(snapshot.decision_time)
 
     return items, _build_split_plan(split_times)
+
+
+def _deduplicate_by_trading_day(
+    included_pairs: Sequence[tuple[SignalSnapshot, OutcomeRecord]],
+) -> tuple[list[tuple[SignalSnapshot, OutcomeRecord]], dict[str, int]]:
+    """按 (symbol, strategy, decision_date_sh) 去重，保留最早快照。
+
+    decision_date 取 decision_time + 8h（Asia/Shanghai 固定偏移，无夏令时）的
+    日历日；同键多条时保留 decision_time 最早的一条（平局取 snapshot_id 最小，
+    保证确定性）。重复行多为同日反复 pipeline_run_once 写入、outcome 完全
+    相同（见 NAS 8/23 诊断），保留首条即可代表当日决策。
+    """
+
+    if not included_pairs:
+        return [], {"rows_before": 0, "rows_dropped": 0}
+    best: dict[tuple[str, str, date], tuple[SignalSnapshot, OutcomeRecord]] = {}
+    for snapshot, outcome in included_pairs:
+        decision_date_sh = _decision_date_shanghai(snapshot.decision_time)
+        key = (snapshot.symbol, snapshot.strategy, decision_date_sh)
+        current = best.get(key)
+        if current is None or (
+            snapshot.decision_time,
+            snapshot.snapshot_id,
+        ) < (current[0].decision_time, current[0].snapshot_id):
+            best[key] = (snapshot, outcome)
+    kept = sorted(
+        best.values(),
+        key=lambda pair: (pair[0].decision_time, pair[0].snapshot_id),
+    )
+    rows_before = len(included_pairs)
+    return kept, {"rows_before": rows_before, "rows_dropped": rows_before - len(kept)}
+
+
+def _decision_date_shanghai(decision_time: datetime) -> date:
+    return (decision_time + timedelta(hours=8)).date()
+
+
+def _dedup_quality_flags(
+    *,
+    rows_before: int,
+    rows_dropped: int,
+) -> tuple[list[str], list[str]]:
+    """由去重统计推导 blocking/warning 质量旗标。
+
+    - blocking ``duplicate_dominance``：丢弃占比 > 50%，数据集以重复为主；
+    - blocking ``empty_after_dedup``：去重后无样本；
+    - warning ``duplicate_rows_present``：存在任意被丢弃的重复行。
+    （旗标规则为按诊断证据重建的实现细节，规格原文在会话截断中丢失。）
+    """
+
+    blocking: list[str] = []
+    warning: list[str] = []
+    if rows_before > 0:
+        if rows_before - rows_dropped <= 0:
+            blocking.append("empty_after_dedup")
+        elif rows_dropped / rows_before > _DUPLICATE_DOMINANCE_RATIO:
+            blocking.append("duplicate_dominance")
+    if rows_dropped > 0:
+        warning.append("duplicate_rows_present")
+    return blocking, warning
 
 
 def _manifest_item(snapshot: SignalSnapshot, split_name: str, ordinal: int) -> dict[str, object]:
@@ -484,6 +573,9 @@ def _build_selection_rule(
 
 def _build_dataset_manifest_id(
     *,
+    schema_version: str,
+    dedup_key: str,
+    dedup_rule: str,
     source_store_version: str,
     feature_schema_id: str,
     feature_schema_hash: str,
@@ -497,6 +589,9 @@ def _build_dataset_manifest_id(
     item_blueprints: Sequence[dict[str, object]],
 ) -> str:
     payload = {
+        "schema_version": schema_version,
+        "dedup_key": dedup_key,
+        "dedup_rule": dedup_rule,
         "source_store_version": source_store_version,
         "feature_schema_id": feature_schema_id,
         "feature_schema_hash": feature_schema_hash,
@@ -518,7 +613,7 @@ def _build_dataset_manifest_id(
     }
     serialized = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
-    return f"dataset_manifest_v1_{digest[:12]}"
+    return f"dataset_manifest_v{schema_version}_{digest[:12]}"
 
 
 def _normalize_fidelity_filter(
