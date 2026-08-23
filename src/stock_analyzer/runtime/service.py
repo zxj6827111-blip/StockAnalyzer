@@ -1330,7 +1330,9 @@ class StockAnalyzerService:
                 return record
         return None
 
-    def _approve_existing_registry_record_for_champion_bootstrap(self, record):
+    def _approve_existing_registry_record_for_champion_bootstrap(
+        self, record: ModelRegistryRecord
+    ) -> ModelRegistryRecord:
         current = record
         if current.lifecycle_state == ModelLifecycleState.REVOKED:
             raise ValueError("revoked_model_cannot_be_bootstrapped")
@@ -11855,6 +11857,9 @@ class StockAnalyzerService:
                     require_full_gates=True,
                     min_test_trade_dates=max(
                         1, int(self._config.training.min_test_trade_dates)
+                    ),
+                    min_hard_class_samples=max(
+                        1, int(self._config.training.min_hard_class_samples)
                     ),
                     test_stats={
                         "unique_trade_dates": _as_float(

@@ -681,6 +681,7 @@ training:
   model_archive_dir: "artifacts/model_archive"
   # 晋级硬门：完整 test split 去重交易日下限（P1-b）
   min_test_trade_dates: 20
+  min_hard_class_samples: 30
   baseline_report_path: "artifacts/acceptance/baseline_report.json"
   bootstrap_auto_run_on_first_start: true
   bootstrap_require_completion_for_runtime: true

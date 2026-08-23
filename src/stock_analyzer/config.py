@@ -965,6 +965,7 @@ class TrainingConfig(_StrictModel):
     model_archive_dir: str = "artifacts/model_archive"
     # 晋级硬门（P1-b 补救）：完整 test split 的去重交易日下限。
     min_test_trade_dates: int = 20
+    min_hard_class_samples: int = 30
     baseline_report_path: str = "artifacts/acceptance/baseline_report.json"
     bootstrap_auto_run_on_first_start: bool = True
     bootstrap_require_completion_for_runtime: bool = True
