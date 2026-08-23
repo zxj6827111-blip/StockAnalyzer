@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 from numpy.typing import NDArray
@@ -12,11 +12,21 @@ from stock_analyzer.evolution.modules.m11_shadow_loader import (
     M11ShadowObservation,
     parse_m11_shadow_records,
 )
+from stock_analyzer.learning.slot_occupied_nav import (
+    DEFAULT_MAX_POSITIONS,
+    EventSlotPositionInput,
+    simulate_event_driven_slot_nav,
+)
 
 
 @dataclass(frozen=True, slots=True)
 class M11ShadowMetrics:
-    """M11 summary metrics."""
+    """M11 summary metrics.
+
+    主口径（cum_return/max_drawdown 等）自补救版起基于**事件驱动 slot NAV**
+    （P1-b）；旧“逐笔全仓复利”数值保留在 ``legacy_*`` 字段仅作对照，
+    不参与 redline 判定。
+    """
 
     valid_samples: int
     champion_cum_return: float
@@ -29,6 +39,20 @@ class M11ShadowMetrics:
     champion_win_rate: float
     challenger_win_rate: float
     mean_return_diff: float
+    # —— 事件驱动 slot 口径（主）——
+    champion_slot_final_nav: float = 1.0
+    challenger_slot_final_nav: float = 1.0
+    champion_open_positions: int = 0
+    challenger_open_positions: int = 0
+    champion_event_days: int = 0
+    challenger_event_days: int = 0
+    insufficient_date_coverage: bool = False
+    coverage_defects: list[str] = field(default_factory=list)
+    # —— legacy 逐笔全仓复利对照（不参与 redline）——
+    legacy_champion_cum_return: float = 0.0
+    legacy_challenger_cum_return: float = 0.0
+    legacy_champion_max_drawdown: float = 0.0
+    legacy_challenger_max_drawdown: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +84,7 @@ def evaluate_m11_shadow_portfolio(
     drawdown_delta_limit: float = 0.05,
     tail_loss_delta_limit: float = 0.03,
     execution_divergence_limit: float = 0.35,
+    m11_max_positions: int = DEFAULT_MAX_POSITIONS,
 ) -> M11ShadowResult:
     """Evaluate M11 redline state from shadow return/signal observations.
 
@@ -67,12 +92,17 @@ def evaluate_m11_shadow_portfolio(
     - ``shadow_observations`` from independent shadow-result artifacts, or
     - ``records`` that carry inline shadow fields.
 
+    主口径：两侧各自跑**事件驱动 slot NAV**（入场/退出日 + 概率排序 +
+    max_positions 仓位上限）；``insufficient_date_coverage`` 作为独立
+    redline 显式暴露输入缺陷。旧逐笔全仓复利仅保留在 ``legacy_*`` 字段。
+
     Args:
         records: Optional raw records with inline shadow fields.
         shadow_observations: Optional preloaded normalized shadow observations.
         drawdown_delta_limit: Drawdown delta redline threshold.
         tail_loss_delta_limit: Tail-loss delta redline threshold.
         execution_divergence_limit: Execution divergence redline threshold.
+        m11_max_positions: 事件驱动模拟的同侧仓位上限。
 
     Returns:
         M11 redline assessment result.
@@ -86,6 +116,8 @@ def evaluate_m11_shadow_portfolio(
     champion_returns: list[float] = []
     challenger_returns: list[float] = []
     signal_divergence_flags: list[int] = []
+    champion_events: list[EventSlotPositionInput] = []
+    challenger_events: list[EventSlotPositionInput] = []
 
     for observation in observations:
         champion_returns.append(observation.champion_shadow_return)
@@ -94,9 +126,64 @@ def evaluate_m11_shadow_portfolio(
         challenger_signal = observation.challenger_signal
         if champion_signal is not None and challenger_signal is not None:
             signal_divergence_flags.append(1 if champion_signal != challenger_signal else 0)
+        # 信号触发的行才构成仓位；shadow_return 在 signal==1 时即原始 realized_return。
+        if champion_signal == 1:
+            champion_events.append(
+                EventSlotPositionInput(
+                    symbol=observation.symbol,
+                    entry_date=observation.trade_date,
+                    exit_date=observation.label_mature_time,
+                    realized_return=observation.champion_shadow_return,
+                    probability=(
+                        observation.champion_probability
+                        if observation.champion_probability is not None
+                        else 0.5
+                    ),
+                )
+            )
+        if challenger_signal == 1:
+            challenger_events.append(
+                EventSlotPositionInput(
+                    symbol=observation.symbol,
+                    entry_date=observation.trade_date,
+                    exit_date=observation.label_mature_time,
+                    realized_return=observation.challenger_shadow_return,
+                    probability=(
+                        observation.challenger_probability
+                        if observation.challenger_probability is not None
+                        else 0.5
+                    ),
+                )
+            )
 
     valid_samples = min(len(champion_returns), len(challenger_returns))
-    if valid_samples == 0:
+    champion_slot = simulate_event_driven_slot_nav(
+        champion_events, max_positions=m11_max_positions
+    )
+    challenger_slot = simulate_event_driven_slot_nav(
+        challenger_events, max_positions=m11_max_positions
+    )
+    insufficient_coverage = (
+        champion_slot.insufficient_date_coverage or challenger_slot.insufficient_date_coverage
+    )
+    coverage_defects = sorted(
+        {
+            *(f"champion:{item}" for item in champion_slot.coverage_defects),
+            *(f"challenger:{item}" for item in challenger_slot.coverage_defects),
+        }
+    )
+    legacy_champion_cum = (
+        float(np.prod(1.0 + np.asarray(champion_returns)) - 1.0)
+        if champion_returns
+        else 0.0
+    )
+    legacy_challenger_cum = (
+        float(np.prod(1.0 + np.asarray(challenger_returns)) - 1.0)
+        if challenger_returns
+        else 0.0
+    )
+
+    if valid_samples == 0 and not champion_events and not challenger_events:
         metrics = M11ShadowMetrics(
             valid_samples=0,
             champion_cum_return=0.0,
@@ -109,6 +196,14 @@ def evaluate_m11_shadow_portfolio(
             champion_win_rate=0.0,
             challenger_win_rate=0.0,
             mean_return_diff=0.0,
+            champion_slot_final_nav=champion_slot.final_nav,
+            challenger_slot_final_nav=challenger_slot.final_nav,
+            champion_open_positions=champion_slot.open_position_count,
+            challenger_open_positions=challenger_slot.open_position_count,
+            champion_event_days=champion_slot.event_days,
+            challenger_event_days=challenger_slot.event_days,
+            insufficient_date_coverage=insufficient_coverage,
+            coverage_defects=coverage_defects,
         )
         return M11ShadowResult(
             score=50.0,
@@ -117,6 +212,7 @@ def evaluate_m11_shadow_portfolio(
                 "drawdown_delta": False,
                 "tail_loss_delta": False,
                 "execution_divergence": False,
+                "insufficient_date_coverage": insufficient_coverage,
             },
             metrics=metrics,
             attribution=[],
@@ -126,10 +222,11 @@ def evaluate_m11_shadow_portfolio(
     challenger_arr = np.asarray(challenger_returns, dtype=float)
     diff_arr = challenger_arr - champion_arr
 
-    champion_cum_return = float(np.prod(1.0 + champion_arr) - 1.0)
-    challenger_cum_return = float(np.prod(1.0 + challenger_arr) - 1.0)
-    champion_drawdown = _max_drawdown(champion_arr)
-    challenger_drawdown = _max_drawdown(challenger_arr)
+    # —— 主口径：事件驱动 slot NAV ——
+    champion_cum_return = float(champion_slot.total_return)
+    challenger_cum_return = float(challenger_slot.total_return)
+    champion_drawdown = float(champion_slot.max_drawdown)
+    challenger_drawdown = float(challenger_slot.max_drawdown)
     drawdown_delta = max(0.0, challenger_drawdown - champion_drawdown)
     champion_tail = abs(float(np.percentile(champion_arr, 10)))
     challenger_tail = abs(float(np.percentile(challenger_arr, 10)))
@@ -147,6 +244,7 @@ def evaluate_m11_shadow_portfolio(
         "drawdown_delta": drawdown_delta > max(drawdown_delta_limit, 1e-9),
         "tail_loss_delta": tail_loss_delta > max(tail_loss_delta_limit, 1e-9),
         "execution_divergence": execution_divergence_ratio > max(execution_divergence_limit, 1e-9),
+        "insufficient_date_coverage": insufficient_coverage,
     }
     any_redline = any(redlines.values())
 
@@ -157,7 +255,11 @@ def evaluate_m11_shadow_portfolio(
         execution_divergence_ratio / max(execution_divergence_limit, 1e-9) * 25.0,
     )
     score = _clamp100(92.0 - drawdown_penalty - tail_penalty - divergence_penalty)
-    status = "redline_breach" if any_redline else "stable"
+    status = (
+        "insufficient_date_coverage"
+        if insufficient_coverage
+        else ("redline_breach" if any_redline else "stable")
+    )
 
     metrics = M11ShadowMetrics(
         valid_samples=valid_samples,
@@ -171,6 +273,18 @@ def evaluate_m11_shadow_portfolio(
         champion_win_rate=champion_win_rate,
         challenger_win_rate=challenger_win_rate,
         mean_return_diff=mean_return_diff,
+        champion_slot_final_nav=champion_slot.final_nav,
+        challenger_slot_final_nav=challenger_slot.final_nav,
+        champion_open_positions=champion_slot.open_position_count,
+        challenger_open_positions=challenger_slot.open_position_count,
+        champion_event_days=champion_slot.event_days,
+        challenger_event_days=challenger_slot.event_days,
+        insufficient_date_coverage=insufficient_coverage,
+        coverage_defects=coverage_defects,
+        legacy_champion_cum_return=legacy_champion_cum,
+        legacy_challenger_cum_return=legacy_challenger_cum,
+        legacy_champion_max_drawdown=_max_drawdown(champion_arr),
+        legacy_challenger_max_drawdown=_max_drawdown(challenger_arr),
     )
     attribution = [
         M11AttributionItem(

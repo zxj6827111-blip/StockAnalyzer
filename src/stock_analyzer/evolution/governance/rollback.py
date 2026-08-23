@@ -49,6 +49,9 @@ class RollbackContext(BaseModel):
 
     trade_count: int = Field(default=0, ge=0)
     observed_days: int = Field(default=0, ge=0)
+    # 事件驱动口径（P1-b）：entry/exit 事件日的去重天数；与 observed_days
+    # （旧行数口径）并存，回滚判定逐步切到本字段。
+    observed_event_days: int = Field(default=0, ge=0)
     consecutive_soft_days: int = Field(default=0, ge=0)
     consecutive_hard_days: int = Field(default=0, ge=0)
     pending_confirmation_since: datetime | None = None

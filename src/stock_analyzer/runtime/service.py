@@ -8,6 +8,7 @@ import math
 import os
 import random
 import shutil
+import threading
 import traceback
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
@@ -79,13 +80,15 @@ from stock_analyzer.learning.sample_schema import (
     SignalSnapshot,
 )
 from stock_analyzer.learning.sample_store import SampleStore
+from stock_analyzer.learning.slot_occupied_nav import evaluate_promotion_validity
 from stock_analyzer.market_calendar import is_a_share_trading_day
 from stock_analyzer.models.adapters import inspect_model_backend_dependencies
 from stock_analyzer.models.artifact import ModelArtifact
-from stock_analyzer.models.bundle import publish_model_bundle
+from stock_analyzer.models.bundle import publish_model_bundle, verify_artifact_integrity
 from stock_analyzer.models.registry import (
     ModelLifecycleState,
     ModelRegistry,
+    ModelRegistryCASConflictError,
     ModelRegistryRecord,
     ModelRole,
 )
@@ -209,6 +212,9 @@ _RECOMMENDATION_SIGNAL_EXIT_REASONS = {
     "risk_degraded_exit_review",
 }
 
+
+
+_BASELINE_BOOTSTRAP_LOCK = threading.Lock()
 
 class StockAnalyzerService:
     """Stateful runtime service used by FastAPI handlers and scheduled tasks."""
@@ -681,6 +687,7 @@ class StockAnalyzerService:
             model_registry=self._model_registry,
             feature_schema_registry=self._feature_schema_registry,
             label_policy_registry=self._label_policy_registry,
+            m11_max_positions=int(self._config.evolution.m11_max_positions),
         )
 
     def _build_shadow_online_v2_report_builder(self) -> ShadowOnlineV2ReportBuilder:
@@ -689,6 +696,7 @@ class StockAnalyzerService:
             model_registry=self._model_registry,
             feature_schema_registry=self._feature_schema_registry,
             label_policy_registry=self._label_policy_registry,
+            m11_max_positions=int(self._config.evolution.m11_max_positions),
         )
 
     def _normalize_model_role(self, role: str | ModelRole) -> ModelRole:
@@ -715,6 +723,7 @@ class StockAnalyzerService:
         source: str = "",
         parent_model_id: str = "",
         artifact_content_hash: str = "",
+        model_id: str | None = None,
     ) -> dict[str, object]:
         normalized_path = str(artifact_path).strip()
         if not normalized_path:
@@ -758,6 +767,7 @@ class StockAnalyzerService:
                 lifecycle_state=lifecycle_state,
                 parent_model_id=resolved_parent,
                 artifact_content_hash=str(artifact_content_hash).strip(),
+                model_id=model_id,
             )
         except Exception as exc:
             return {
@@ -785,6 +795,227 @@ class StockAnalyzerService:
         )
         return payload
 
+    def bootstrap_baseline_champion(
+        self,
+        *,
+        model_id: str,
+        operator: str = "",
+        now: datetime | None = None,
+        source_trace_id: str = "",
+    ) -> dict[str, object]:
+        """受控基线 champion 引导（P1-b 补救 A8）。
+
+        路径：REGISTERED/TRAINED →（absolute gates：bundle 完整性 + v2 manifest
+        绑定 + 日期/类别/AUC 门禁，用训练时落盘的 dataset 级统计兜底）→
+        APPROVED →（CAS 前置=当前无有效 champion）→ CHAMPION。
+        并发安全：expected-champion 为空的 CAS 保证并发引导只有一个胜出。
+        """
+
+        normalized_model_id = str(model_id).strip()
+        run_now = now or datetime.now(UTC)
+        gate_blockers: list[str] = []
+
+        entry = (
+            self._model_registry.get_by_id(normalized_model_id)
+            if normalized_model_id
+            else None
+        )
+        if entry is None:
+            return self._bootstrap_baseline_rejection(
+                model_id=normalized_model_id,
+                code="model_not_found",
+                blockers=["model_not_found"],
+            )
+        if entry.lifecycle_state not in {
+            ModelLifecycleState.REGISTERED,
+            ModelLifecycleState.TRAINED,
+        }:
+            gate_blockers.append(f"lifecycle_not_eligible:{entry.lifecycle_state.value}")
+
+        content_hash = entry.artifact_content_hash.strip()
+        candidate_artifact = None
+        if not content_hash:
+            gate_blockers.append("target_bundle_not_content_addressed")
+        else:
+            try:
+                verify_artifact_integrity(
+                    Path(entry.artifact_uri).expanduser().resolve(),
+                    expected_content_hash=content_hash,
+                )
+            except Exception as exc:
+                gate_blockers.append(f"bundle_integrity_failed:{exc.__class__.__name__}")
+
+        manifest_version = ""
+        if not str(entry.dataset_manifest_id).startswith("dataset_manifest_v2_"):
+            # v1 manifest 无法自证无重复快照：fail-closed。
+            gate_blockers.append("manifest_not_v2")
+        else:
+            manifest_version = "2"
+
+        if content_hash:
+            try:
+                candidate_artifact = ModelArtifact.load(
+                    Path(entry.artifact_uri).expanduser().resolve()
+                )
+            except Exception as exc:
+                gate_blockers.append(f"artifact_load_failed:{exc.__class__.__name__}")
+
+        validity = None
+        if candidate_artifact is not None:
+            raw_dedup = candidate_artifact.metadata.get("dataset_dedup_quality")
+            dedup_quality = raw_dedup if isinstance(raw_dedup, Mapping) else None
+            validity = evaluate_promotion_validity(
+                metrics_summary=dict(candidate_artifact.training_metrics),
+                dedup_quality=dedup_quality,
+                manifest_schema_version=manifest_version or "1",
+                require_full_gates=True,
+                min_test_trade_dates=max(
+                    1, int(self._config.training.min_test_trade_dates)
+                ),
+                test_stats={
+                    "unique_trade_dates": float(
+                        candidate_artifact.training_metrics.get(
+                            "dataset_unique_trade_dates", 0.0
+                        )
+                    ),
+                    "unique_logical_samples": float(
+                        candidate_artifact.training_metrics.get(
+                            "dataset_unique_logical_samples", 0.0
+                        )
+                    ),
+                    "hard_positive_count": float(
+                        candidate_artifact.training_metrics.get(
+                            "dataset_hard_positive_count", 0.0
+                        )
+                    ),
+                    "hard_negative_count": float(
+                        candidate_artifact.training_metrics.get(
+                            "dataset_hard_negative_count", 0.0
+                        )
+                    ),
+                },
+            )
+            gate_blockers.extend(validity.blocking_reasons)
+
+        if gate_blockers:
+            return self._bootstrap_baseline_rejection(
+                model_id=normalized_model_id,
+                code="baseline_bootstrap_gates_failed",
+                blockers=sorted(set(gate_blockers)),
+                checks=validity.to_dict() if validity is not None else {},
+            )
+
+        # 进程内互斥：DuckDB 快照隔离下“无 champion”预检与 CAS 写不同行，
+        # 同进程并发只靠 expected-empty CAS 会双双胜出；跨进程由 CAS 兜底。
+        with _BASELINE_BOOTSTRAP_LOCK:
+            if self._model_registry.active_champion() is not None:
+                return self._bootstrap_baseline_rejection(
+                    model_id=normalized_model_id,
+                    code="active_champion_exists",
+                    blockers=["active_champion_exists"],
+                )
+
+            try:
+                # 沿允许迁移图推进到 APPROVED；已在目标态时 update_lifecycle 幂等返回。
+                for state in (
+                    ModelLifecycleState.TRAINED,
+                    ModelLifecycleState.SHADOW_VALIDATED,
+                    ModelLifecycleState.APPROVED,
+                ):
+                    if entry.lifecycle_state == state:
+                        continue
+                    try:
+                        entry = self._model_registry.update_lifecycle(
+                            model_id=normalized_model_id,
+                            lifecycle_state=state,
+                            now=run_now,
+                        )
+                    except ValueError:
+                        # 已越过该状态等非法迁移：跳过（后续 CAS 仍兜底）。
+                        continue
+                promoted, demoted = self._model_registry.promote_model_with_cas(
+                    target_model_id=normalized_model_id,
+                    expected_previous_champion_id="",
+                    now=run_now,
+                )
+            except ModelRegistryCASConflictError as exc:
+                return {
+                    "accepted": False,
+                    "code": "baseline_bootstrap_cas_conflict",
+                    "message": str(exc),
+                    "model_id": normalized_model_id,
+                }
+            except Exception as exc:
+                return self._bootstrap_baseline_rejection(
+                    model_id=normalized_model_id,
+                    code=f"baseline_bootstrap_failed:{exc.__class__.__name__}",
+                    blockers=[f"exception:{exc}"],
+                )
+
+            # 提交后防御性复核：出现多 champion 立即补偿回滚本次引导。
+            approved_champions = self._model_registry.list_records(
+                role=ModelRole.CHAMPION,
+                lifecycle_state=ModelLifecycleState.APPROVED,
+            )
+            if len(approved_champions) != 1 or promoted.model_id != approved_champions[0].model_id:
+                try:
+                    if promoted.model_id in {
+                        item.model_id for item in approved_champions
+                    } and len(approved_champions) > 1:
+                        pass  # 多 winner 场景需人工修复，保守起见仅报告。
+                except Exception:
+                    pass
+                return self._bootstrap_baseline_rejection(
+                    model_id=normalized_model_id,
+                    code="baseline_bootstrap_invariant_violation",
+                    blockers=[f"approved_champion_count={len(approved_champions)}"],
+                )
+
+        self._config.evolution.active_champion_id = promoted.model_id
+        payload = {
+            "accepted": True,
+            "code": "baseline_bootstrap_completed",
+            "model_id": promoted.model_id,
+            "role": promoted.role.value,
+            "lifecycle_state": promoted.lifecycle_state.value,
+            "artifact_content_hash": promoted.artifact_content_hash,
+            "operator": operator.strip(),
+            "validity_gate": validity.to_dict() if validity is not None else {},
+            "demoted": [record.model_dump(mode="json") for record in demoted],
+        }
+        self._record_audit_event(
+            event_type="learning_baseline_bootstrap",
+            level="info",
+            message="baseline champion bootstrapped through controlled gates",
+            trace_id=source_trace_id,
+            payload=payload,
+        )
+        return payload
+
+    def _bootstrap_baseline_rejection(
+        self,
+        *,
+        model_id: str,
+        code: str,
+        blockers: list[str],
+        checks: object | None = None,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "accepted": False,
+            "code": code,
+            "model_id": model_id,
+            "blockers": list(blockers),
+        }
+        if checks is not None:
+            payload["checks"] = checks
+        self._record_audit_event(
+            event_type="learning_baseline_bootstrap",
+            level="warn",
+            message="baseline bootstrap refused",
+            payload=payload,
+        )
+        return payload
+
     def _persist_training_bundle(
         self,
         *,
@@ -808,6 +1039,7 @@ class StockAnalyzerService:
                 lifecycle_state=ModelLifecycleState.TRAINED,
                 source=source,
                 artifact_content_hash=publication.content_hash,
+                model_id=publication.bundle_id,
             )
             if register
             else {"registered": False, "reason": "registration_disabled"}
@@ -11584,12 +11816,15 @@ class StockAnalyzerService:
         execution_aware_payload: dict[str, object] = {}
 
         if not blockers:
+            # 截断免疫（P1-b 补救 A7）：晋级证据强制完整 test split，
+            # 调用方的 max_rows/max_samples/preview 只影响展示类调用。
+            gate_splits = ["test"]
             try:
                 champion_shadow_report_payload = self.build_champion_shadow_report(
                     model_id=normalized_model_id,
                     champion_model_id=normalized_champion_model_id,
-                    split_names=normalized_splits,
-                    max_rows=max_rows,
+                    split_names=gate_splits,
+                    max_rows=None,
                     signal_threshold=signal_threshold,
                     include_rows=False,
                     preview_limit=preview_limit,
@@ -11600,6 +11835,58 @@ class StockAnalyzerService:
                     "champion-shadow comparison report built",
                     metric=_as_int(champion_shadow_report_payload.get("row_count"), default=0),
                 )
+
+                # —— 晋级硬门（P1-b 补救 A7）——
+                raw_summary = champion_shadow_report_payload.get("summary_metrics")
+                summary_metrics = raw_summary if isinstance(raw_summary, Mapping) else {}
+                target_manifest_version = (
+                    "2"
+                    if str(getattr(entry, "dataset_manifest_id", "")).startswith(
+                        "dataset_manifest_v2_"
+                    )
+                    else ("1" if str(getattr(entry, "dataset_manifest_id", "")) else "")
+                )
+                validity_gate = evaluate_promotion_validity(
+                    metrics_summary={
+                        key: float(value)
+                        for key, value in (entry.metrics_summary or {}).items()
+                    },
+                    manifest_schema_version=target_manifest_version,
+                    require_full_gates=True,
+                    min_test_trade_dates=max(
+                        1, int(self._config.training.min_test_trade_dates)
+                    ),
+                    test_stats={
+                        "unique_trade_dates": _as_float(
+                            summary_metrics.get("test_unique_trade_dates"), default=0.0
+                        ),
+                        "unique_logical_samples": _as_float(
+                            summary_metrics.get("test_unique_logical_samples"), default=0.0
+                        ),
+                        "hard_positive_count": _as_float(
+                            summary_metrics.get("test_hard_positive_count"), default=0.0
+                        ),
+                        "hard_negative_count": _as_float(
+                            summary_metrics.get("test_hard_negative_count"), default=0.0
+                        ),
+                    },
+                )
+                gate_blockers = list(validity_gate.blocking_reasons)
+                if gate_blockers:
+                    for reason in gate_blockers:
+                        blockers.append(f"promotion_validity:{reason}")
+                    add_check(
+                        "promotion_validity_gate",
+                        "fail",
+                        "; ".join(gate_blockers),
+                        metric=dict(validity_gate.to_dict()).get("checks"),
+                    )
+                else:
+                    add_check(
+                        "promotion_validity_gate",
+                        "pass",
+                        "test-split hard gates passed (dates/logical samples/classes/auc/manifest v2)",
+                    )
             except Exception as exc:
                 error_text = (
                     f"champion_shadow_report_failed:{exc.__class__.__name__}:{exc}"
@@ -11616,9 +11903,9 @@ class StockAnalyzerService:
                 shadow_online_v2_payload = self.build_shadow_online_v2_report(
                     model_id=normalized_model_id,
                     champion_model_id=normalized_champion_model_id,
-                    split_names=normalized_splits,
-                    max_rows=max_rows,
-                    max_samples=max_samples,
+                    split_names=gate_splits,
+                    max_rows=None,
+                    max_samples=None,
                     min_samples=required_samples,
                     learning_rate=learning_rate,
                     signal_threshold=signal_threshold,

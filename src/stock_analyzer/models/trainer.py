@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import TypeAlias
 
@@ -251,6 +251,9 @@ class ModelTrainer:
         split_labels: list[str] = []
         sample_weights: list[float] = []
         realized_returns: list[float] = []
+        dataset_trade_dates: set[str] = set()
+        dataset_logical_keys: set[str] = set()
+        duplicate_logical_rows = 0
         feedback_rows = []
         for item in manifest_items:
             snapshot = snapshots.get(item.snapshot_id)
@@ -286,6 +289,20 @@ class ModelTrainer:
             realized_returns.append(
                 float(outcome_return) if outcome_return is not None else 0.0
             )
+            # 数据集级统计（P1-b 硬门）：上海决策日与逻辑样本键去重计数。
+            decision_date_sh = (
+                snapshot.decision_time + timedelta(hours=8)
+            ).date().isoformat()
+            dataset_trade_dates.add(decision_date_sh)
+            logical_key = f"{snapshot.symbol}|{snapshot.strategy}|{decision_date_sh}"
+            if logical_key in dataset_logical_keys:
+                duplicate_logical_rows += 1
+                if str(getattr(manifest, "schema_version", "1")) == "2":
+                    raise ValueError(
+                        "v2 manifest contains duplicate logical sample: "
+                        f"{logical_key}"
+                    )
+            dataset_logical_keys.add(logical_key)
 
         if not row_payloads:
             raise ValueError(
@@ -356,6 +373,23 @@ class ModelTrainer:
         result.metrics["dataset_nav_compounding_explosion"] = (
             1.0 if nav_report.compounding_explosion else 0.0
         )
+        result.metrics["dataset_unique_trade_dates"] = float(len(dataset_trade_dates))
+        result.metrics["dataset_unique_logical_samples"] = float(
+            len(dataset_logical_keys)
+        )
+        result.metrics["dataset_duplicate_logical_rows"] = float(duplicate_logical_rows)
+        label_values = [
+            float(payload.get(label_column, 0.0)) for payload in row_payloads
+        ]
+        result.metrics["dataset_hard_positive_count"] = float(
+            sum(1 for value in label_values if value == 1.0)
+        )
+        result.metrics["dataset_hard_negative_count"] = float(
+            sum(1 for value in label_values if value == 0.0)
+        )
+        # ModelArtifact.create 对 training_metrics 做过拷贝：把本函数追加的
+        # 去重/NAV/数据集统计指标回写进工件，供注册记录与晋级门读取。
+        result.artifact.training_metrics.update(result.metrics)
         return result
 
     def train_on_feature_label(self, features: pd.DataFrame, labels: pd.Series) -> TrainResult:

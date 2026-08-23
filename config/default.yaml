@@ -679,6 +679,8 @@ training:
   artifact_path: "artifacts/model_v1.json"
   # 内容寻址 bundle 归档根目录（训练产物只进这里，别名仅由发布流程切换）
   model_archive_dir: "artifacts/model_archive"
+  # 晋级硬门：完整 test split 去重交易日下限（P1-b）
+  min_test_trade_dates: 20
   baseline_report_path: "artifacts/acceptance/baseline_report.json"
   bootstrap_auto_run_on_first_start: true
   bootstrap_require_completion_for_runtime: true

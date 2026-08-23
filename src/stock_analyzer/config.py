@@ -963,6 +963,8 @@ class TrainingConfig(_StrictModel):
     # 内容寻址 bundle 归档根目录（P0-a）：训练产物只进这里并注册 challenger，
     # 运行时别名 artifact_path 仅由两阶段发布流程原子切换。
     model_archive_dir: str = "artifacts/model_archive"
+    # 晋级硬门（P1-b 补救）：完整 test split 的去重交易日下限。
+    min_test_trade_dates: int = 20
     baseline_report_path: str = "artifacts/acceptance/baseline_report.json"
     bootstrap_auto_run_on_first_start: bool = True
     bootstrap_require_completion_for_runtime: bool = True
@@ -1237,6 +1239,7 @@ class EvolutionConfig(_StrictModel):
     m10_conflict_degraded_ratio: float = 0.50
     m10_calibration_degraded_multiplier: float = 1.5
     m10_limited_observability_score: float = 65.0
+    m11_max_positions: int = 10
     m11_drawdown_delta_limit: float = 0.05
     m11_tail_loss_delta_limit: float = 0.03
     m11_execution_divergence_limit: float = 0.35

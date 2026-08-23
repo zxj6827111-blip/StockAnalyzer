@@ -368,10 +368,20 @@ def _deduplicate_by_trading_day(
         decision_date_sh = _decision_date_shanghai(snapshot.decision_time)
         key = (snapshot.symbol, snapshot.strategy, decision_date_sh)
         current = best.get(key)
-        if current is None or (
+        candidate_order = (
             snapshot.decision_time,
+            snapshot.created_at,
             snapshot.snapshot_id,
-        ) < (current[0].decision_time, current[0].snapshot_id):
+        )
+        if current is None:
+            best[key] = (snapshot, outcome)
+            continue
+        current_order = (
+            current[0].decision_time,
+            current[0].created_at,
+            current[0].snapshot_id,
+        )
+        if candidate_order < current_order:
             best[key] = (snapshot, outcome)
     kept = sorted(
         best.values(),

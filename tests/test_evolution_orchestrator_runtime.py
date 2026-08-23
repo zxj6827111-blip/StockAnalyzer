@@ -778,11 +778,14 @@ def test_orchestrator_rollback_uses_m11_redlines_from_shadow_loader(tmp_path: Pa
         "\n".join(
             [
                 '{"symbol":"600000.SH","champion_shadow_return":0.010,'
-                '"challenger_shadow_return":-0.050,"champion_signal":1,"challenger_signal":1}',
-                '{"symbol":"600000.SH","champion_shadow_return":0.010,'
-                '"challenger_shadow_return":-0.060,"champion_signal":1,"challenger_signal":1}',
-                '{"symbol":"600000.SH","champion_shadow_return":0.010,'
-                '"challenger_shadow_return":-0.070,"champion_signal":1,"challenger_signal":1}',
+                '"challenger_shadow_return":-0.500,"champion_signal":1,"challenger_signal":1,'
+                '"trade_date":"2026-02-01","label_mature_time":"2026-02-05"}',
+                '{"symbol":"000001.SZ","champion_shadow_return":0.010,'
+                '"challenger_shadow_return":-0.600,"champion_signal":1,"challenger_signal":1,'
+                '"trade_date":"2026-02-02","label_mature_time":"2026-02-06"}',
+                '{"symbol":"600036.SH","champion_shadow_return":0.010,'
+                '"challenger_shadow_return":-0.700,"champion_signal":1,"challenger_signal":1,'
+                '"trade_date":"2026-02-03","label_mature_time":"2026-02-07"}', 
             ]
         ),
         encoding="utf-8",

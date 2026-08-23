@@ -48,6 +48,7 @@ COPY config /app/config
 COPY scripts /app/scripts
 COPY --from=frontend-builder /frontend/dist /app/frontend_dist
 COPY artifacts/model_v1.json /app/bootstrap_seed/model_v1.json
+COPY artifacts/model_v1_sidecars /app/bootstrap_seed/model_v1_sidecars
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --retries ${PIP_RETRIES} --timeout ${PIP_TIMEOUT} --no-deps --no-build-isolation -e .
