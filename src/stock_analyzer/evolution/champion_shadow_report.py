@@ -12,11 +12,12 @@ import pandas as pd
 
 from stock_analyzer.evolution.modules.m11_shadow_loader import M11ShadowObservation
 from stock_analyzer.evolution.modules.m11_shadow_portfolio import evaluate_m11_shadow_portfolio
-from stock_analyzer.evolution.shadow_dataset_builder import ShadowDatasetBuilder, ShadowDatasetRow
+from stock_analyzer.evolution.shadow_dataset_builder import ShadowDatasetBuilder
 from stock_analyzer.learning.feature_schema_registry import FeatureSchemaRegistry
 from stock_analyzer.learning.label_policy_registry import LabelPolicyRegistry
 from stock_analyzer.learning.sample_store import SampleStore
 from stock_analyzer.models.artifact import ModelArtifact
+from stock_analyzer.models.bundle import verify_artifact_integrity
 from stock_analyzer.models.predictor import SignalPredictor
 from stock_analyzer.models.registry import ModelRegistry, ModelRegistryRecord
 
@@ -368,6 +369,12 @@ class ChampionShadowReportBuilder:
 
 def _load_predictor(*, record: ModelRegistryRecord) -> tuple[SignalPredictor, dict[str, object]]:
     artifact_path = Path(record.artifact_uri).expanduser().resolve()
+    # 双侧 fail-closed：champion 与 shadow 工件都必须通过完整性校验
+    # （可加载 + sidecar sha256；内容寻址记录还要求整目录哈希一致）。
+    verify_artifact_integrity(
+        artifact_path,
+        expected_content_hash=record.artifact_content_hash,
+    )
     artifact = ModelArtifact.load(artifact_path)
     predictor = SignalPredictor.from_artifact(artifact, artifact_root=artifact_path.parent)
     return predictor, predictor.mode_details()

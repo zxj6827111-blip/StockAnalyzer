@@ -174,7 +174,8 @@ def test_service_single_symbol_training_includes_intraday_summary_features(tmp_p
     )
 
     assert payload["predictor_loaded"] is True
-    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    # 训练产物发布为内容寻址 bundle，从返回的 bundle 工件路径校验特征列。
+    artifact = json.loads(Path(str(payload["artifact_path"])).read_text(encoding="utf-8"))
     feature_columns = artifact.get("feature_columns", [])
     assert any(str(name).startswith("i1m_") for name in feature_columns)
     assert any(str(name).startswith("i5m_") for name in feature_columns)

@@ -31,6 +31,11 @@ os.environ.setdefault(
         / "bootstrap_state_conftest.json"
     ),
 )
+# 内容寻址 bundle 归档目录同样隔离出仓库 artifacts/，避免训练入口测试污染工作区。
+os.environ.setdefault(
+    "SA__TRAINING__MODEL_ARCHIVE_DIR",
+    str(Path(tempfile.gettempdir()) / "stock_analyzer_tests" / "model_archive"),
+)
 # Local config files may enable API authentication for a developer runtime.
 # Tests start with authentication disabled unless a test explicitly overrides it.
 os.environ["SA__SECURITY__API_AUTH_ENABLED"] = "false"

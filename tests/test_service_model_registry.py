@@ -259,9 +259,10 @@ def test_service_bootstrap_active_champion_from_existing_artifact(
     )
     registry_payload = _as_mapping(training["model_registry"])
 
+    # 训练产物现在发布为内容寻址 bundle；引导应基于注册返回的 bundle 路径。
     payload = _as_mapping(
         service.bootstrap_active_champion_from_artifact(
-            artifact_path=str(tmp_path / "protocol_model.json"),
+            artifact_path=str(registry_payload["artifact_uri"]),
             source="test_bootstrap",
         )
     )

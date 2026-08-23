@@ -120,6 +120,9 @@ class SignalPredictor:
             "created_at": str(self.artifact_metadata.get("artifact_created_at", "")),
             "calibration_method": str(self.artifact_metadata.get("calibration_method", "")),
             "meta_blend_weights": dict(self.meta_weights),
+            # 发布别名自描述字段：当前加载模型在 registry 中的身份与 bundle 内容哈希。
+            "registry_model_id": str(self.artifact_metadata.get("registry_model_id", "")),
+            "bundle_content_hash": str(self.artifact_metadata.get("bundle_content_hash", "")),
         }
 
     def inference_blocked_reason(self) -> str:

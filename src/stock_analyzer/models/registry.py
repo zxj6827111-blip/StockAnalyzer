@@ -48,6 +48,8 @@ class ModelRegistryRecord(BaseModel):
     feature_schema_hash: str = ""
     label_policy_id: str = ""
     label_policy_hash: str = ""
+    # 内容寻址 bundle 的 SHA256（64 hex）；空串表示旧版松散工件（未迁移记录）。
+    artifact_content_hash: str = ""
     metrics_summary: dict[str, float] = Field(default_factory=dict)
     blocked_reason: str = ""
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
@@ -109,6 +111,10 @@ class _DuckConnection(Protocol):
     def close(self) -> None: ...
 
 
+class ModelRegistryCASConflictError(RuntimeError):
+    """Raised when the expected-champion precondition fails inside a CAS promotion."""
+
+
 def build_model_registry_record_from_artifact(
     *,
     artifact: ModelArtifact,
@@ -118,6 +124,7 @@ def build_model_registry_record_from_artifact(
     parent_model_id: str = "",
     metrics_summary: Mapping[str, float] | None = None,
     model_id: str | None = None,
+    artifact_content_hash: str = "",
     created_at: datetime | None = None,
     updated_at: datetime | None = None,
 ) -> ModelRegistryRecord:
@@ -145,6 +152,7 @@ def build_model_registry_record_from_artifact(
         feature_schema_hash=artifact.feature_schema_hash,
         label_policy_id=artifact.label_policy_id,
         label_policy_hash=artifact.label_policy_hash,
+        artifact_content_hash=str(artifact_content_hash).strip(),
         metrics_summary=metrics_payload,
         created_at=now,
         updated_at=updated_at or now,
@@ -165,6 +173,24 @@ class ModelRegistry:
         self._table_name = table_name
         self._connection_factory = connection_factory or _default_connection_factory
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        # schema 迁移只跑一次的缓存标记：写路径首次执行后置 True，只读路径不触发。
+        self._schema_ready = False
+
+    def ensure_schema(self) -> None:
+        """Create/migrate the registry table once via a writable connection.
+
+        服务启动时调用一次；迁移幂等（CREATE IF NOT EXISTS + 条件 ALTER +
+        NULL 回填）。只读路径绝不调用本方法，避免重复取写锁。
+        """
+
+        if self._schema_ready:
+            return
+        conn = self._connection_factory(str(self._db_path))
+        try:
+            self._ensure_table(conn=conn)
+            self._schema_ready = True
+        finally:
+            conn.close()
 
     def register(self, record: ModelRegistryRecord) -> ModelRegistryRecord:
         """Insert one registry record, returning the existing copy on idempotent replays."""
@@ -181,15 +207,16 @@ class ModelRegistry:
         conn = self._connection_factory(str(self._db_path))
         try:
             self._ensure_table(conn=conn)
+            self._schema_ready = True
             conn.execute(
                 (
                     f"INSERT INTO {self._table_name} ("
                     "model_id, schema_version, role, lifecycle_state, parent_model_id, "
                     "artifact_uri, artifact_created_at, dataset_manifest_id, feature_schema_id, "
                     "feature_schema_hash, label_policy_id, label_policy_hash, "
-                    "metrics_summary_json, blocked_reason, created_at, updated_at, "
-                    "promoted_at, revoked_at"
-                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    "artifact_content_hash, metrics_summary_json, blocked_reason, "
+                    "created_at, updated_at, promoted_at, revoked_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 ),
                 _record_parameters(record),
             )
@@ -222,6 +249,7 @@ class ModelRegistry:
         parent_model_id: str = "",
         metrics_summary: Mapping[str, float] | None = None,
         model_id: str | None = None,
+        artifact_content_hash: str = "",
         now: datetime | None = None,
     ) -> ModelRegistryRecord:
         """Build and persist one record directly from a model artifact."""
@@ -235,6 +263,7 @@ class ModelRegistry:
                 parent_model_id=parent_model_id,
                 metrics_summary=metrics_summary,
                 model_id=model_id,
+                artifact_content_hash=artifact_content_hash,
                 created_at=now,
                 updated_at=now,
             )
@@ -257,12 +286,12 @@ class ModelRegistry:
         if conn is None:
             return None
         try:
-            row = conn.execute(
-                f"SELECT {', '.join(_SELECT_COLUMNS)} "
-                f"FROM {self._table_name} WHERE model_id = ? LIMIT 1",
-                [model_id],
-            ).fetchone()
-            return None if row is None else _row_to_record(row)
+            records = self._fetch_records(
+                conn,
+                where_clause=" WHERE model_id = ? LIMIT 1",
+                parameters=[model_id],
+            )
+            return records[0] if records else None
         except Exception as exc:
             if self._is_missing_table_error(exc):
                 return None
@@ -308,14 +337,15 @@ class ModelRegistry:
         if conn is None:
             return []
         try:
-            rows = conn.execute(
-                f"SELECT {', '.join(_SELECT_COLUMNS)} "
-                f"FROM {self._table_name}{where_clause} "
-                "ORDER BY updated_at DESC, created_at DESC, model_id DESC"
-                f"{limit_clause}",
-                parameters,
-            ).fetchall()
-            return [_row_to_record(row) for row in rows]
+            return self._fetch_records(
+                conn,
+                where_clause=where_clause,
+                parameters=parameters,
+                order_clause=(
+                    " ORDER BY updated_at DESC, created_at DESC, model_id DESC"
+                    f"{limit_clause}"
+                ),
+            )
         except Exception as exc:
             if self._is_missing_table_error(exc):
                 return []
@@ -389,11 +419,133 @@ class ModelRegistry:
         )
         return champions[0] if champions else None
 
+    def promote_model_with_cas(
+        self,
+        *,
+        target_model_id: str,
+        expected_previous_champion_id: str = "",
+        now: datetime | None = None,
+    ) -> tuple[ModelRegistryRecord, list[ModelRegistryRecord]]:
+        """Demote the expected champion and promote the target in ONE transaction.
+
+        CAS 语义：事务内校验当前 approved champion 集合必须恰好等于
+        ``expected_previous_champion_id``（为空则要求当前无 champion），
+        否则整体回滚并抛出 :class:`ModelRegistryCASConflictError`，
+        防止并发发布产生双 champion / 无 champion。
+        """
+
+        normalized_target = str(target_model_id).strip()
+        normalized_expected = str(expected_previous_champion_id).strip()
+        timestamp = _dump_datetime(now or datetime.now(UTC))
+        conn = self._connection_factory(str(self._db_path))
+        try:
+            self._ensure_table(conn=conn)
+            self._schema_ready = True
+            conn.execute("BEGIN TRANSACTION")
+            try:
+                rows = conn.execute(
+                    f"SELECT {', '.join(_SELECT_COLUMNS)} "
+                    f"FROM {self._table_name} WHERE role = ?",
+                    [ModelRole.CHAMPION.value],
+                ).fetchall()
+                current_champions = [_row_to_record(row) for row in rows]
+                approved_ids = sorted(
+                    item.model_id
+                    for item in current_champions
+                    if item.lifecycle_state == ModelLifecycleState.APPROVED
+                )
+                expected_ids = [normalized_expected] if normalized_expected else []
+                if approved_ids != expected_ids:
+                    raise ModelRegistryCASConflictError(
+                        "expected-champion precondition failed: "
+                        f"expected={expected_ids} actual={approved_ids}"
+                    )
+                for demoted_id in expected_ids:
+                    conn.execute(
+                        f"UPDATE {self._table_name} SET role = ?, updated_at = ? "
+                        "WHERE model_id = ?",
+                        [ModelRole.CHALLENGER.value, timestamp, demoted_id],
+                    )
+                target_row = conn.execute(
+                    f"SELECT {', '.join(_SELECT_COLUMNS)} "
+                    f"FROM {self._table_name} WHERE model_id = ? LIMIT 1",
+                    [normalized_target],
+                ).fetchone()
+                if target_row is None:
+                    raise ValueError(f"model_id not found: {normalized_target}")
+                target_record = _row_to_record(target_row)
+                if target_record.lifecycle_state != ModelLifecycleState.APPROVED:
+                    raise ValueError(
+                        "champion role requires approved lifecycle state: "
+                        f"{normalized_target}"
+                    )
+                conn.execute(
+                    f"UPDATE {self._table_name} SET role = ?, updated_at = ?, "
+                    "promoted_at = COALESCE(promoted_at, ?) WHERE model_id = ?",
+                    [ModelRole.CHAMPION.value, timestamp, timestamp, normalized_target],
+                )
+                post_count_row = conn.execute(
+                    f"SELECT COUNT(*) FROM {self._table_name} "
+                    "WHERE role = ? AND lifecycle_state = ?",
+                    [ModelRole.CHAMPION.value, ModelLifecycleState.APPROVED.value],
+                ).fetchone()
+                champion_count_after = (
+                    0 if post_count_row is None else int(str(post_count_row[0]))
+                )
+                if champion_count_after != 1:
+                    raise ModelRegistryCASConflictError(
+                        "promotion produced invalid champion count: "
+                        f"{champion_count_after}"
+                    )
+                conn.execute("COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+            promoted = self.get_by_id(normalized_target)
+            if promoted is None:
+                raise ValueError(f"model_id not found after promotion: {normalized_target}")
+            demoted = [
+                record
+                for record in (self.get_by_id(item) for item in expected_ids)
+                if record is not None
+            ]
+            return promoted, demoted
+        finally:
+            conn.close()
+
+    def _fetch_records(
+        self,
+        conn: _DuckConnection,
+        *,
+        where_clause: str = "",
+        parameters: Sequence[object] | None = None,
+        order_clause: str = "",
+    ) -> list[ModelRegistryRecord]:
+        # 先按新 schema 查询；旧库缺列（未迁移）时降级到旧列集，绝不触发写迁移。
+        query_parameters = list(parameters or [])
+        for columns in (_SELECT_COLUMNS, _LEGACY_SELECT_COLUMNS):
+            query = (
+                f"SELECT {', '.join(columns)} "
+                f"FROM {self._table_name}{where_clause}{order_clause}"
+            )
+            try:
+                rows = conn.execute(query, query_parameters).fetchall()
+            except Exception as exc:
+                if columns is _SELECT_COLUMNS and self._is_missing_column_error(exc):
+                    continue
+                raise
+            return [_row_to_record(row) for row in rows]
+        return []
+
     def _replace_record(self, record: ModelRegistryRecord) -> ModelRegistryRecord:
         _validate_lifecycle_requirements(record)
         conn = self._connection_factory(str(self._db_path))
         try:
             self._ensure_table(conn=conn)
+            self._schema_ready = True
             conn.execute(f"DELETE FROM {self._table_name} WHERE model_id = ?", [record.model_id])
             conn.execute(
                 (
@@ -401,9 +553,9 @@ class ModelRegistry:
                     "model_id, schema_version, role, lifecycle_state, parent_model_id, "
                     "artifact_uri, artifact_created_at, dataset_manifest_id, feature_schema_id, "
                     "feature_schema_hash, label_policy_id, label_policy_hash, "
-                    "metrics_summary_json, blocked_reason, created_at, updated_at, "
-                    "promoted_at, revoked_at"
-                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    "artifact_content_hash, metrics_summary_json, blocked_reason, "
+                    "created_at, updated_at, promoted_at, revoked_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 ),
                 _record_parameters(record),
             )
@@ -426,6 +578,7 @@ class ModelRegistry:
             "feature_schema_hash VARCHAR NOT NULL, "
             "label_policy_id VARCHAR NOT NULL, "
             "label_policy_hash VARCHAR NOT NULL, "
+            "artifact_content_hash VARCHAR NOT NULL DEFAULT '', "
             "metrics_summary_json VARCHAR NOT NULL, "
             "blocked_reason VARCHAR NOT NULL, "
             "created_at VARCHAR NOT NULL, "
@@ -433,6 +586,28 @@ class ModelRegistry:
             "promoted_at VARCHAR, "
             "revoked_at VARCHAR"
             ")"
+        )
+        self._migrate_table_columns(conn=conn)
+
+    def _migrate_table_columns(self, conn: _DuckConnection) -> None:
+        """逐列迁移：缺 artifact_content_hash 的旧表补列并回填空串（幂等）。"""
+
+        rows = conn.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
+            [self._table_name],
+        ).fetchall()
+        existing_columns = {str(row[0]).strip().lower() for row in rows}
+        if not existing_columns:
+            return
+        if "artifact_content_hash" not in existing_columns:
+            # DuckDB 不支持 ALTER ADD COLUMN 带 NOT NULL/DEFAULT 约束，
+            # 先加可空列，再统一回填空串（写入路径始终显式提供值）。
+            conn.execute(
+                f"ALTER TABLE {self._table_name} ADD COLUMN artifact_content_hash VARCHAR"
+            )
+        conn.execute(
+            f"UPDATE {self._table_name} SET artifact_content_hash = '' "
+            "WHERE artifact_content_hash IS NULL"
         )
 
     def _open_connection(self, *, read_only: bool = False) -> _DuckConnection:
@@ -486,12 +661,45 @@ class ModelRegistry:
             and "does not exist" in message
         )
 
+    def _is_missing_column_error(self, exc: Exception) -> bool:
+        # DuckDB 两种典型文案：
+        # - Binder Error: Referenced column "x" not found in FROM clause!
+        # - Catalog Error: Column "x" does not exist!
+        message = str(exc).strip().lower()
+        return (
+            "artifact_content_hash" in message
+            and ("not found" in message or "does not exist" in message)
+        )
+
     def _is_incompatible_connection_config_error(self, exc: Exception) -> bool:
         message = str(exc).strip().lower()
         return "same database file with a different configuration" in message
 
 
 _SELECT_COLUMNS = (
+    "model_id",
+    "schema_version",
+    "role",
+    "lifecycle_state",
+    "parent_model_id",
+    "artifact_uri",
+    "artifact_created_at",
+    "dataset_manifest_id",
+    "feature_schema_id",
+    "feature_schema_hash",
+    "label_policy_id",
+    "label_policy_hash",
+    "artifact_content_hash",
+    "metrics_summary_json",
+    "blocked_reason",
+    "created_at",
+    "updated_at",
+    "promoted_at",
+    "revoked_at",
+)
+
+# 未迁移旧表的降级列集（无 artifact_content_hash，读取时映射为空串）。
+_LEGACY_SELECT_COLUMNS = (
     "model_id",
     "schema_version",
     "role",
@@ -563,6 +771,7 @@ def _record_parameters(record: ModelRegistryRecord) -> list[object]:
         record.feature_schema_hash,
         record.label_policy_id,
         record.label_policy_hash,
+        record.artifact_content_hash,
         json.dumps(record.metrics_summary, ensure_ascii=True, sort_keys=True),
         record.blocked_reason,
         _dump_datetime(record.created_at),
@@ -573,7 +782,15 @@ def _record_parameters(record: ModelRegistryRecord) -> list[object]:
 
 
 def _row_to_record(row: Sequence[object]) -> ModelRegistryRecord:
-    metrics_summary = _load_json_dict_float(row[12])
+    # 兼容两种行宽：19 列（含 artifact_content_hash）/ 18 列（旧表降级查询）。
+    has_content_hash_column = len(row) >= 19
+    if has_content_hash_column:
+        artifact_content_hash = str(row[12] or "").strip()
+        metrics_index, tail_start = 13, 14
+    else:
+        artifact_content_hash = ""
+        metrics_index, tail_start = 12, 13
+    metrics_summary = _load_json_dict_float(row[metrics_index])
     return ModelRegistryRecord(
         model_id=str(row[0]),
         schema_version=str(row[1]),
@@ -587,12 +804,13 @@ def _row_to_record(row: Sequence[object]) -> ModelRegistryRecord:
         feature_schema_hash=str(row[9]),
         label_policy_id=str(row[10]),
         label_policy_hash=str(row[11]),
+        artifact_content_hash=artifact_content_hash,
         metrics_summary=metrics_summary,
-        blocked_reason=str(row[13]),
-        created_at=_parse_datetime(row[14]),
-        updated_at=_parse_datetime(row[15]),
-        promoted_at=_parse_optional_datetime(row[16]),
-        revoked_at=_parse_optional_datetime(row[17]),
+        blocked_reason=str(row[tail_start]),
+        created_at=_parse_datetime(row[tail_start + 1]),
+        updated_at=_parse_datetime(row[tail_start + 2]),
+        promoted_at=_parse_optional_datetime(row[tail_start + 3]),
+        revoked_at=_parse_optional_datetime(row[tail_start + 4]),
     )
 
 

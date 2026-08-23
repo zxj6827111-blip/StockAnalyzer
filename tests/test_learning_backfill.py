@@ -1136,9 +1136,11 @@ def test_service_train_learning_manifest_uses_latest_manifest_without_registry_s
     assert payload["label_policy_id"] == label_record.label_policy_id
     assert _as_mapping(payload["model_registry"])["registered"] is False
     assert _as_mapping(payload["model_registry"])["reason"] == "registration_disabled"
+    # 训练产物发布为内容寻址 bundle：<archive>/<model_v2_x>/model.json。
     assert artifact_path.exists()
     assert artifact_path != Path(config.training.artifact_path)
-    assert artifact_path.parent == tmp_path / "learning_manifest_artifacts"
+    assert artifact_path.name == "model.json"
+    assert artifact_path.parent.name.startswith("model_v2_")
     assert artifact.dataset_manifest_id == manifest["dataset_manifest_id"]
     assert artifact.feature_schema_id == current_record.feature_schema_id
     assert artifact.label_policy_id == label_record.label_policy_id

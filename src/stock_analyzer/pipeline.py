@@ -714,6 +714,16 @@ class AnalyzerPipeline:
         self._predictor, self._predictor_status = _load_predictor(path)
         return self._predictor is not None
 
+    def swap_predictor(self, predictor: SignalPredictor) -> dict[str, object]:
+        """原子替换内存 predictor（发布流程专用，不做磁盘 IO）。
+
+        返回新的 predictor 状态快照；调用方负责在失败时把旧实例换回。
+        """
+
+        self._predictor = predictor
+        self._predictor_status = predictor.mode_details()
+        return dict(self._predictor_status)
+
     def _prefetch_intraday_summaries(
         self,
         *,

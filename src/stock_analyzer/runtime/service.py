@@ -82,6 +82,7 @@ from stock_analyzer.learning.sample_store import SampleStore
 from stock_analyzer.market_calendar import is_a_share_trading_day
 from stock_analyzer.models.adapters import inspect_model_backend_dependencies
 from stock_analyzer.models.artifact import ModelArtifact
+from stock_analyzer.models.bundle import publish_model_bundle
 from stock_analyzer.models.registry import (
     ModelLifecycleState,
     ModelRegistry,
@@ -545,6 +546,12 @@ class StockAnalyzerService:
         self._label_policy_registry = LabelPolicyRegistry(db_path=db_path)
         self._sample_store = SampleStore(db_path=db_path)
         self._model_registry = ModelRegistry(db_path=db_path)
+        # registry schema 迁移（artifact_content_hash 列）在启动时用可写连接跑一次；
+        # 只读查询路径不触发迁移、不重复取写锁。启动失败无害：首个写路径会重试迁移。
+        try:
+            self._model_registry.ensure_schema()
+        except Exception:
+            pass
         self._pipeline.configure_learning_protocol(
             sample_store=self._sample_store,
             feature_schema_registry=self._feature_schema_registry,
@@ -707,6 +714,7 @@ class StockAnalyzerService:
         lifecycle_state: ModelLifecycleState = ModelLifecycleState.TRAINED,
         source: str = "",
         parent_model_id: str = "",
+        artifact_content_hash: str = "",
     ) -> dict[str, object]:
         normalized_path = str(artifact_path).strip()
         if not normalized_path:
@@ -749,6 +757,7 @@ class StockAnalyzerService:
                 role=role,
                 lifecycle_state=lifecycle_state,
                 parent_model_id=resolved_parent,
+                artifact_content_hash=str(artifact_content_hash).strip(),
             )
         except Exception as exc:
             return {
@@ -762,6 +771,7 @@ class StockAnalyzerService:
             "role": record.role.value,
             "lifecycle_state": record.lifecycle_state.value,
             "artifact_uri": record.artifact_uri,
+            "artifact_content_hash": record.artifact_content_hash,
             "dataset_manifest_id": record.dataset_manifest_id,
             "feature_schema_id": record.feature_schema_id,
             "label_policy_id": record.label_policy_id,
@@ -774,6 +784,41 @@ class StockAnalyzerService:
             payload=payload,
         )
         return payload
+
+    def _persist_training_bundle(
+        self,
+        *,
+        artifact: ModelArtifact,
+        source: str,
+        register: bool = True,
+    ) -> dict[str, object]:
+        """训练产物发布为内容寻址 bundle（P0-a）。
+
+        训练入口绝不写运行时别名 artifact_path——别名只由两阶段发布流程
+        原子切换，保证 champion 工件完整性。``register=False`` 时仅落 bundle、
+        不产生 registry 副作用。
+        """
+
+        archive_root = Path(str(self._config.training.model_archive_dir).strip()).expanduser()
+        publication = publish_model_bundle(artifact, archive_root=archive_root)
+        registration = (
+            self._register_model_artifact_if_supported(
+                artifact_path=str(publication.artifact_path),
+                role=ModelRole.CHALLENGER,
+                lifecycle_state=ModelLifecycleState.TRAINED,
+                source=source,
+                artifact_content_hash=publication.content_hash,
+            )
+            if register
+            else {"registered": False, "reason": "registration_disabled"}
+        )
+        return {
+            "bundle_id": publication.bundle_id,
+            "bundle_content_hash": publication.content_hash,
+            "bundle_root": str(publication.root),
+            "artifact_path": str(publication.artifact_path),
+            "model_registry": registration,
+        }
 
     def model_registry_entries(
         self,
@@ -8663,8 +8708,12 @@ class StockAnalyzerService:
                 time_window_start=time_window_start,
                 time_window_end=time_window_end,
             )
-            output_path = artifact_path or self._config.training.artifact_path
-            result.artifact.save(output_path)
+            # 训练产物只进内容寻址 bundle + 注册 challenger，不写运行时别名。
+            bundle_payload = self._persist_training_bundle(
+                artifact=result.artifact,
+                source="train_models_learning_protocol",
+            )
+            output_path = str(bundle_payload["artifact_path"])
             unique_symbols = {
                 _normalize_a_share_symbol(snapshot.symbol) or snapshot.symbol.strip()
                 for snapshot in selected_snapshots
@@ -8679,6 +8728,9 @@ class StockAnalyzerService:
                     else "ok_learning_protocol"
                 ),
                 "artifact_path": output_path,
+                "bundle_id": bundle_payload["bundle_id"],
+                "bundle_content_hash": bundle_payload["bundle_content_hash"],
+                "model_registry": bundle_payload["model_registry"],
                 "symbols_used": len(unique_symbols),
                 "dataset_rows": int(result.samples_total),
                 "truncated": bool(best_candidate["truncated"]),
@@ -8734,24 +8786,26 @@ class StockAnalyzerService:
                 lookback_days=max(lookback_days, len(bars) + 5),
             )
             trainer = self._build_model_trainer()
-            result = trainer.train_and_save(
+            result = trainer.train_on_bars(
                 bars=bars,
-                output_path=artifact_path,
                 intraday_1m=intraday_1m,
                 intraday_5m=intraday_5m,
             )
-            output_path = artifact_path or self._config.training.artifact_path
-            loaded = self._pipeline.reload_predictor(artifact_path=artifact_path)
-            model_registry_payload = self._register_model_artifact_if_supported(
-                artifact_path=output_path,
-                role=ModelRole.CHALLENGER,
-                lifecycle_state=ModelLifecycleState.TRAINED,
+            # 训练产物发布为内容寻址 bundle + 注册 challenger，不再写运行时别名；
+            # 单符号训练保留既有“训练后热载 predictor”契约（仅内存，不动别名）。
+            bundle_payload = self._persist_training_bundle(
+                artifact=result.artifact,
                 source="train_models_single_symbol",
             )
+            output_path = str(bundle_payload["artifact_path"])
+            loaded = self._pipeline.reload_predictor(artifact_path=output_path)
+            model_registry_payload = bundle_payload["model_registry"]
             return {
                 "mode": "single_symbol",
                 "symbol": normalized_symbol,
                 "artifact_path": output_path,
+                "bundle_id": bundle_payload["bundle_id"],
+                "bundle_content_hash": bundle_payload["bundle_content_hash"],
                 "predictor_loaded": loaded,
                 "result": result.to_dict(),
                 "input_mode": "bars",
@@ -8816,12 +8870,24 @@ class StockAnalyzerService:
         if bool(training_payload.get("ok", False)):
             self._maybe_seed_watchlist_after_bootstrap()
 
-        model_registry_payload = self._register_model_artifact_if_supported(
-            artifact_path=str(training_payload.get("artifact_path", "")),
-            role=ModelRole.CHALLENGER,
-            lifecycle_state=ModelLifecycleState.TRAINED,
-            source="train_models_full_market",
-        )
+        # 训练子路径（协议/bars/单符号）已把产物发布为 bundle 并注册 challenger；
+        # 这里仅在其未注册时兜底补注册，并透传内容哈希避免同一模型重复注册冲突。
+        inner_registry_payload = training_payload.get("model_registry")
+        if (
+            isinstance(inner_registry_payload, Mapping)
+            and bool(inner_registry_payload.get("registered", False))
+        ):
+            model_registry_payload = dict(inner_registry_payload)
+        else:
+            model_registry_payload = self._register_model_artifact_if_supported(
+                artifact_path=str(training_payload.get("artifact_path", "")),
+                role=ModelRole.CHALLENGER,
+                lifecycle_state=ModelLifecycleState.TRAINED,
+                source="train_models_full_market",
+                artifact_content_hash=str(
+                    training_payload.get("bundle_content_hash", "")
+                ).strip(),
+            )
         return {
             "mode": "full_market",
             "ok": bool(training_payload.get("ok", False)),
@@ -8962,13 +9028,20 @@ class StockAnalyzerService:
         features = dataset.drop(columns=[label_name])
         try:
             result = trainer.train_on_feature_label(features=features, labels=labels)
-            output_path = artifact_path or self._config.training.artifact_path
-            result.artifact.save(output_path)
+            # 训练产物只进内容寻址 bundle + 注册 challenger，不写运行时别名。
+            bundle_payload = self._persist_training_bundle(
+                artifact=result.artifact,
+                source="train_models_bars_fallback",
+            )
+            output_path = str(bundle_payload["artifact_path"])
             status = "ok" if not truncated else "ok_truncated"
             return {
                 "ok": True,
                 "status": status,
                 "artifact_path": output_path,
+                "bundle_id": bundle_payload["bundle_id"],
+                "bundle_content_hash": bundle_payload["bundle_content_hash"],
+                "model_registry": bundle_payload["model_registry"],
                 "symbols_used": symbols_used,
                 "dataset_rows": int(len(dataset)),
                 "truncated": truncated,
@@ -11094,19 +11167,21 @@ class StockAnalyzerService:
                 feature_schema_registry=self._feature_schema_registry,
                 label_policy_registry=self._label_policy_registry,
             )
-            result.artifact.save(resolved_output_path)
+            # 训练产物只进内容寻址 bundle，不写运行时别名；
+            # register_model=False 时保持“无 registry 副作用”的既有契约。
+            bundle_payload = self._persist_training_bundle(
+                artifact=result.artifact,
+                source="train_learning_manifest",
+                register=register_model,
+            )
+            resolved_output_path = Path(str(bundle_payload["artifact_path"]))
             predictor_loaded = (
                 self._pipeline.reload_predictor(artifact_path=str(resolved_output_path))
                 if load_predictor
                 else False
             )
             model_registry_payload = (
-                self._register_model_artifact_if_supported(
-                    artifact_path=str(resolved_output_path),
-                    role=ModelRole.CHALLENGER,
-                    lifecycle_state=ModelLifecycleState.TRAINED,
-                    source="train_learning_manifest",
-                )
+                bundle_payload["model_registry"]
                 if register_model
                 else {"registered": False, "reason": "registration_disabled"}
             )

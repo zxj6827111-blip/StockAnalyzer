@@ -677,6 +677,8 @@ training:
   embargo_days: 0
   precision_at_k_ratio: 0.1
   artifact_path: "artifacts/model_v1.json"
+  # 内容寻址 bundle 归档根目录（训练产物只进这里，别名仅由发布流程切换）
+  model_archive_dir: "artifacts/model_archive"
   baseline_report_path: "artifacts/acceptance/baseline_report.json"
   bootstrap_auto_run_on_first_start: true
   bootstrap_require_completion_for_runtime: true

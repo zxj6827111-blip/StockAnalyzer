@@ -960,6 +960,9 @@ class TrainingConfig(_StrictModel):
     learning_feedback_weight_clip_low: float = 0.35
     learning_feedback_weight_clip_high: float = 3.0
     artifact_path: str = "artifacts/model_v1.json"
+    # 内容寻址 bundle 归档根目录（P0-a）：训练产物只进这里并注册 challenger，
+    # 运行时别名 artifact_path 仅由两阶段发布流程原子切换。
+    model_archive_dir: str = "artifacts/model_archive"
     baseline_report_path: str = "artifacts/acceptance/baseline_report.json"
     bootstrap_auto_run_on_first_start: bool = True
     bootstrap_require_completion_for_runtime: bool = True
