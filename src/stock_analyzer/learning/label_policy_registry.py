@@ -178,7 +178,9 @@ class LabelPolicyRegistry:
         self,
         labels: LabelsConfig,
         *,
-        schema_version: str = "1",
+        # 新注册的运行时契约默认走 schema v2（bar_shape_heuristic 冲突按软标签处理）；
+        # 显式传 schema_version="1" 可继续登记旧口径，v1/v2 共存。
+        schema_version: str = "2",
         maturity_rule: str = "label_mature_time_v1",
         label_policy_id: str | None = None,
         created_at: datetime | None = None,
