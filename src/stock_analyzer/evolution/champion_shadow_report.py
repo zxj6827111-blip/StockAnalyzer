@@ -6,17 +6,23 @@ import hashlib
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
 
 from stock_analyzer.evolution.modules.m11_shadow_loader import M11ShadowObservation
 from stock_analyzer.evolution.modules.m11_shadow_portfolio import evaluate_m11_shadow_portfolio
-from stock_analyzer.evolution.shadow_dataset_builder import ShadowDatasetBuilder, ShadowDatasetRow
+from stock_analyzer.evolution.shadow_dataset_builder import (
+    ShadowDatasetBuilder,
+    ShadowDatasetRow,
+)
 from stock_analyzer.learning.feature_schema_registry import FeatureSchemaRegistry
 from stock_analyzer.learning.label_policy_registry import LabelPolicyRegistry
 from stock_analyzer.learning.sample_store import SampleStore
+from stock_analyzer.learning.slot_occupied_nav import DEFAULT_MAX_POSITIONS
 from stock_analyzer.models.artifact import ModelArtifact
+from stock_analyzer.models.bundle import verify_artifact_integrity
 from stock_analyzer.models.predictor import SignalPredictor
 from stock_analyzer.models.registry import ModelRegistry, ModelRegistryRecord
 
@@ -137,6 +143,9 @@ class ChampionShadowComparisonReport:
             "summary_metrics": dict(self.summary_metrics),
             "champion_predictor_mode": dict(self.champion_predictor_mode),
             "shadow_predictor_mode": dict(self.shadow_predictor_mode),
+            "dedup_row_count": int(self.summary_metrics.get("dedup_row_count", 0.0)),
+            "duplicate_row_count": int(self.summary_metrics.get("duplicate_row_count", 0.0)),
+            "cum_return_suspect": bool(self.summary_metrics.get("cum_return_suspect", False)),
             "preview": [row.preview_dict() for row in self.rows[: max(1, int(preview_limit))]],
         }
         if include_rows:
@@ -154,9 +163,11 @@ class ChampionShadowReportBuilder:
         model_registry: ModelRegistry,
         feature_schema_registry: FeatureSchemaRegistry | None = None,
         label_policy_registry: LabelPolicyRegistry | None = None,
+        m11_max_positions: int = DEFAULT_MAX_POSITIONS,
     ) -> None:
         self._store = store
         self._model_registry = model_registry
+        self._m11_max_positions = max(1, int(m11_max_positions))
         self._shadow_dataset_builder = ShadowDatasetBuilder(
             store=store,
             model_registry=model_registry,
@@ -199,12 +210,16 @@ class ChampionShadowReportBuilder:
         rows: list[ChampionShadowComparisonRow] = []
         m11_observations: list[M11ShadowObservation] = []
         split_counts: dict[str, int] = {}
+        dataset_rows, duplicate_row_count = _deduplicate_shadow_dataset_rows(
+            shadow_dataset.rows
+        )
+        dedup_row_count = len(dataset_rows)
         meta_deltas: list[float] = []
         meta_abs_deltas: list[float] = []
         champion_probs: list[float] = []
         shadow_probs: list[float] = []
 
-        for dataset_row in shadow_dataset.rows:
+        for dataset_row in dataset_rows:
             snapshot = raw_snapshots.get(dataset_row.snapshot_id)
             if snapshot is None:
                 raise ValueError(f"snapshot missing for comparison row: {dataset_row.snapshot_id}")
@@ -221,7 +236,7 @@ class ChampionShadowReportBuilder:
                 snapshot_id=dataset_row.snapshot_id,
                 symbol=dataset_row.symbol,
                 strategy=dataset_row.strategy,
-                trade_date=dataset_row.decision_time.date().isoformat(),
+                trade_date=_shanghai_trade_date(dataset_row.decision_time),
                 decision_time=dataset_row.decision_time.isoformat(),
                 label_mature_time=(
                     dataset_row.label_mature_time.isoformat()
@@ -265,15 +280,32 @@ class ChampionShadowReportBuilder:
                     challenger_shadow_return=comparison_row.challenger_shadow_return,
                     champion_signal=comparison_row.champion_signal,
                     challenger_signal=comparison_row.shadow_signal,
+                    # 事件驱动 NAV 所需：入场/退出日与两侧概率（确定性排序键）。
+                    trade_date=comparison_row.trade_date,
+                    label_mature_time=comparison_row.label_mature_time,
+                    champion_probability=round(champion_meta, 6),
+                    challenger_probability=round(shadow_meta, 6),
                 )
             )
-            split_counts[comparison_row.split_name] = split_counts.get(comparison_row.split_name, 0) + 1
+            split_counts[comparison_row.split_name] = (
+                split_counts.get(comparison_row.split_name, 0) + 1
+            )
             meta_deltas.append(float(comparison_row.p_meta_delta))
             meta_abs_deltas.append(abs(float(comparison_row.p_meta_delta)))
             champion_probs.append(champion_meta)
             shadow_probs.append(shadow_meta)
 
-        m11_result = evaluate_m11_shadow_portfolio(shadow_observations=m11_observations)
+        m11_result = evaluate_m11_shadow_portfolio(
+            shadow_observations=m11_observations,
+            m11_max_positions=self._m11_max_positions,
+        )
+        test_rows = [row for row in rows if row.split_name == "test"]
+        test_trade_dates = sorted({row.trade_date for row in test_rows if row.trade_date})
+        test_logical_keys = {
+            f"{row.symbol}|{row.trade_date}"
+            for row in test_rows
+            if row.trade_date
+        }
         summary_metrics = {
             "mean_p_meta_delta": _safe_mean(meta_deltas),
             "mean_abs_p_meta_delta": _safe_mean(meta_abs_deltas),
@@ -284,6 +316,18 @@ class ChampionShadowReportBuilder:
             "shadow_mean_p_meta": _safe_mean(shadow_probs),
             "champion_positive_rate": _safe_mean([float(row.champion_signal) for row in rows]),
             "shadow_positive_rate": _safe_mean([float(row.shadow_signal) for row in rows]),
+            "dedup_row_count": float(dedup_row_count),
+            "duplicate_row_count": float(duplicate_row_count),
+            "cum_return_suspect": bool(duplicate_row_count > 0),
+            # —— 晋级硬门（P1-b）测试段统计：与 include_rows 无关始终暴露 ——
+            "test_unique_trade_dates": float(len(test_trade_dates)),
+            "test_unique_logical_samples": float(len(test_logical_keys)),
+            "test_hard_positive_count": float(
+                sum(1 for row in test_rows if float(row.label) == 1.0)
+            ),
+            "test_hard_negative_count": float(
+                sum(1 for row in test_rows if float(row.label) == 0.0)
+            ),
         }
         report_id = _build_report_id(
             champion_model_id=champion_record.model_id,
@@ -305,6 +349,9 @@ class ChampionShadowReportBuilder:
                 "score": float(m11_result.score),
                 "status": m11_result.status,
                 "redlines": dict(m11_result.redlines),
+                "dedup_row_count": dedup_row_count,
+                "duplicate_row_count": duplicate_row_count,
+                "cum_return_suspect": duplicate_row_count > 0,
                 "metrics": {
                     "valid_samples": int(m11_result.metrics.valid_samples),
                     "champion_cum_return": float(m11_result.metrics.champion_cum_return),
@@ -319,6 +366,27 @@ class ChampionShadowReportBuilder:
                     "champion_win_rate": float(m11_result.metrics.champion_win_rate),
                     "challenger_win_rate": float(m11_result.metrics.challenger_win_rate),
                     "mean_return_diff": float(m11_result.metrics.mean_return_diff),
+                    "champion_slot_final_nav": float(
+                        m11_result.metrics.champion_slot_final_nav
+                    ),
+                    "challenger_slot_final_nav": float(
+                        m11_result.metrics.challenger_slot_final_nav
+                    ),
+                    "champion_open_positions": int(
+                        m11_result.metrics.champion_open_positions
+                    ),
+                    "challenger_open_positions": int(
+                        m11_result.metrics.challenger_open_positions
+                    ),
+                    "insufficient_date_coverage": bool(
+                        m11_result.metrics.insufficient_date_coverage
+                    ),
+                    "legacy_champion_cum_return": float(
+                        m11_result.metrics.legacy_champion_cum_return
+                    ),
+                    "legacy_challenger_cum_return": float(
+                        m11_result.metrics.legacy_challenger_cum_return
+                    ),
                 },
                 "attribution": [
                     {
@@ -368,9 +436,22 @@ class ChampionShadowReportBuilder:
 
 def _load_predictor(*, record: ModelRegistryRecord) -> tuple[SignalPredictor, dict[str, object]]:
     artifact_path = Path(record.artifact_uri).expanduser().resolve()
+    # 双侧 fail-closed：champion 与 shadow 工件都必须通过完整性校验
+    # （可加载 + sidecar sha256；内容寻址记录还要求整目录哈希一致）。
+    verify_artifact_integrity(
+        artifact_path,
+        expected_content_hash=record.artifact_content_hash,
+    )
     artifact = ModelArtifact.load(artifact_path)
     predictor = SignalPredictor.from_artifact(artifact, artifact_root=artifact_path.parent)
-    return predictor, predictor.mode_details()
+    mode = predictor.mode_details()
+    if not record.artifact_content_hash.strip():
+        # 旧 registry 记录兼容豁免：允许报告读取，但明确标记未验证，
+        # 供 NAS 收尾恢复 bundle identity 后审计确认并自然消失。
+        mode["artifact_integrity"] = "unverified"
+    else:
+        mode["artifact_integrity"] = "verified"
+    return predictor, mode
 
 
 def _normalize_probability_scores(payload: dict[str, float] | None) -> dict[str, float]:
@@ -397,6 +478,34 @@ def _safe_mean(values: Sequence[float]) -> float:
     if not values:
         return 0.0
     return round(float(sum(values) / len(values)), 6)
+
+
+def _shanghai_trade_date(value: datetime) -> str:
+    return (value + timedelta(hours=8)).date().isoformat()
+
+
+def _deduplicate_shadow_dataset_rows(
+    rows: Sequence[ShadowDatasetRow],
+) -> tuple[list[ShadowDatasetRow], int]:
+    """Keep the maximum manifest ordinal for each symbol and Shanghai trade day."""
+
+    best: dict[tuple[str, str], ShadowDatasetRow] = {}
+    for row in rows:
+        key = (row.symbol, _shanghai_trade_date(row.decision_time))
+        current = best.get(key)
+        if current is None or (
+            int(row.ordinal), row.decision_time, row.snapshot_id
+        ) > (
+            int(current.ordinal),
+            current.decision_time,
+            current.snapshot_id,
+        ):
+            best[key] = row
+    kept = sorted(
+        best.values(),
+        key=lambda row: (int(row.ordinal), row.decision_time, row.snapshot_id),
+    )
+    return kept, len(rows) - len(kept)
 
 
 def _build_report_id(

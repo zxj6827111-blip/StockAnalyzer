@@ -167,10 +167,15 @@ class PatternMemoryStore:
             modified = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
             if run_now - modified < self._delete_delay:
                 continue
-            if path.is_dir():
-                shutil.rmtree(path)
-            else:
-                path.unlink(missing_ok=True)
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink(missing_ok=True)
+            except FileNotFoundError:
+                # Another cleanup pass may have removed it during traversal.
+                purged.append(path)
+                continue
             purged.append(path)
         return purged
 

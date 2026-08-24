@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import shutil
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import TypeAlias
+from typing import TypeAlias, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -39,6 +40,7 @@ from stock_analyzer.learning.sample_schema import (
     OutcomeRecord,
 )
 from stock_analyzer.learning.sample_store import SampleStore
+from stock_analyzer.learning.slot_occupied_nav import simulate_slot_occupied_realized_nav
 from stock_analyzer.models.adapters import (
     LightGBMAdapter,
     XGBoostAdapter,
@@ -186,6 +188,14 @@ class ModelTrainer:
             calibration_ratio=max(0.0, float(self._training.calibration_ratio)),
             test_ratio=max(0.0, float(self._training.test_ratio)),
             embargo_days=max(0, int(self._labels.horizon_days) + self._settlement_lag_days),
+            min_test_split_window_days=max(
+                0,
+                int(self._training.min_test_split_window_days),
+            ),
+            min_test_split_unique_symbol_dates=max(
+                0,
+                int(self._training.min_test_split_unique_symbol_dates),
+            ),
         )
         return self.train_on_dataset_manifest(
             store=store,
@@ -211,6 +221,23 @@ class ModelTrainer:
         )
         if manifest is None:
             raise ValueError(f"dataset manifest not found: {dataset_manifest}")
+        blocking_flags = list(getattr(manifest, "blocking_quality_flags", []) or [])
+        if blocking_flags:
+            # trainer 防御（P1-a）：manifest 带 blocking 质量旗标时拒绝训练，
+            # 例如去重后样本被丢弃过半（duplicate_dominance）或去重后为空。
+            raise ValueError(
+                "dataset manifest blocked by quality flags "
+                f"{sorted(blocking_flags)}: {manifest.dataset_manifest_id}"
+            )
+        manifest_quality_flags = list(
+            getattr(manifest, "manifest_quality_flags", []) or []
+        )
+        if manifest_quality_flags:
+            # Reject low-coverage test splits before any model fitting occurs.
+            raise ValueError(
+                "dataset manifest blocked by manifest quality flags "
+                f"{sorted(manifest_quality_flags)}: {manifest.dataset_manifest_id}"
+            )
         manifest_items = store.list_manifest_items(manifest.dataset_manifest_id)
         if not manifest_items:
             raise ValueError(
@@ -241,6 +268,10 @@ class ModelTrainer:
         row_payloads: list[dict[str, float]] = []
         split_labels: list[str] = []
         sample_weights: list[float] = []
+        realized_returns: list[float] = []
+        dataset_trade_dates: set[str] = set()
+        dataset_logical_keys: set[str] = set()
+        duplicate_logical_rows = 0
         feedback_rows = []
         for item in manifest_items:
             snapshot = snapshots.get(item.snapshot_id)
@@ -272,6 +303,24 @@ class ModelTrainer:
             )
             feedback_rows.append(feedback_weight)
             sample_weights.append(float(feedback_weight.final_weight))
+            outcome_return = outcome.realized_return
+            realized_returns.append(
+                float(outcome_return) if outcome_return is not None else 0.0
+            )
+            # 数据集级统计（P1-b 硬门）：上海决策日与逻辑样本键去重计数。
+            decision_date_sh = (
+                snapshot.decision_time + timedelta(hours=8)
+            ).date().isoformat()
+            dataset_trade_dates.add(decision_date_sh)
+            logical_key = f"{snapshot.symbol}|{snapshot.strategy}|{decision_date_sh}"
+            if logical_key in dataset_logical_keys:
+                duplicate_logical_rows += 1
+                if str(getattr(manifest, "schema_version", "1")) == "2":
+                    raise ValueError(
+                        "v2 manifest contains duplicate logical sample: "
+                        f"{logical_key}"
+                    )
+            dataset_logical_keys.add(logical_key)
 
         if not row_payloads:
             raise ValueError(
@@ -286,7 +335,7 @@ class ModelTrainer:
                 names=["symbol", "decision_time", "snapshot_id"],
             ),
         )
-        return self._train_aligned_dataset(
+        result = self._train_aligned_dataset(
             aligned=aligned,
             feature_columns=feature_columns,
             label_column=label_column,
@@ -304,10 +353,77 @@ class ModelTrainer:
             label_policy_hash=manifest.label_policy_hash,
             dataset_manifest_id=manifest.dataset_manifest_id,
         )
+        # 去重与质量透传：metrics 供晋级门消费，metadata 留档完整旗标。
+        dedup_metadata = {
+            "dedup_key": str(getattr(manifest, "dedup_key", "") or ""),
+            "dedup_rule": str(getattr(manifest, "dedup_rule", "") or ""),
+            "rows_before_dedup": int(getattr(manifest, "rows_before_dedup", 0) or 0),
+            "rows_dropped_by_dedup": int(
+                getattr(manifest, "rows_dropped_by_dedup", 0) or 0
+            ),
+            "blocking_quality_flags": list(
+                getattr(manifest, "blocking_quality_flags", []) or []
+            ),
+            "warning_quality_flags": list(
+                getattr(manifest, "warning_quality_flags", []) or []
+            ),
+            "manifest_quality_flags": list(
+                getattr(manifest, "manifest_quality_flags", []) or []
+            ),
+            "test_split_window_days": int(
+                getattr(manifest, "test_split_window_days", 0) or 0
+            ),
+            "test_split_unique_symbol_dates": int(
+                getattr(manifest, "test_split_unique_symbol_dates", 0) or 0
+            ),
+        }
+        result.metrics["rows_before_dedup"] = float(
+            str(dedup_metadata["rows_before_dedup"])
+        )
+        result.metrics["rows_dropped_by_dedup"] = float(
+            str(dedup_metadata["rows_dropped_by_dedup"])
+        )
+        result.artifact.metadata["dataset_dedup_quality"] = dedup_metadata
+        # 数据集级 NAV 口径（P1-b）：slot 占用固定基数模拟 + 旧复利参照，
+        # 用于晋级有效性门识别“逐笔全仓复利×重复快照”式口径爆炸。
+        nav_report = simulate_slot_occupied_realized_nav(realized_returns=realized_returns)
+        nav_cap = 1.0e18
+        naive_value = (
+            float(nav_report.naive_compounded_nav)
+            if nav_report.naive_compounded_nav <= nav_cap
+            else nav_cap
+        )
+        result.metrics["dataset_slot_occupied_realized_nav"] = round(
+            nav_report.slot_occupied_realized_nav, 6
+        )
+        result.metrics["dataset_naive_compounded_nav"] = round(naive_value, 6)
+        result.metrics["dataset_nav_compounding_explosion"] = (
+            1.0 if nav_report.compounding_explosion else 0.0
+        )
+        result.metrics["dataset_unique_trade_dates"] = float(len(dataset_trade_dates))
+        result.metrics["dataset_unique_logical_samples"] = float(
+            len(dataset_logical_keys)
+        )
+        result.metrics["dataset_duplicate_logical_rows"] = float(duplicate_logical_rows)
+        label_values = [
+            float(payload.get(label_column, 0.0)) for payload in row_payloads
+        ]
+        result.metrics["dataset_hard_positive_count"] = float(
+            sum(1 for value in label_values if value == 1.0)
+        )
+        result.metrics["dataset_hard_negative_count"] = float(
+            sum(1 for value in label_values if value == 0.0)
+        )
+        # ModelArtifact.create 对 training_metrics 做过拷贝：把本函数追加的
+        # 去重/NAV/数据集统计指标回写进工件，供注册记录与晋级门读取。
+        result.artifact.training_metrics.update(result.metrics)
+        return result
 
     def train_on_feature_label(self, features: pd.DataFrame, labels: pd.Series) -> TrainResult:
         aligned = features.join(labels, how="inner")
-        label_column = labels.name or "label_soup_tp_before_sl"
+        label_column = (
+            str(labels.name) if labels.name is not None else "label_soup_tp_before_sl"
+        )
         aligned = aligned.dropna(subset=[label_column])
         aligned, time_gate = apply_time_invariants_to_frame(
             aligned,
@@ -583,6 +699,10 @@ class ModelTrainer:
             market_index=market_index,
         )
         path = Path(output_path) if output_path else Path(self._training.artifact_path)
+        _backup_existing_artifact(
+            path,
+            retention_count=max(1, int(self._training.model_archive_retention_count)),
+        )
         result.artifact.save(path)
         return result
 
@@ -755,9 +875,10 @@ def _build_meta_weights(
     lgbm: FloatArray,
     xgb: FloatArray,
 ) -> dict[str, float]:
-    y_binary = (y_true >= 0.5).astype(float)
-    lgbm_brier = float(np.mean((lgbm - y_binary) ** 2))
-    xgb_brier = float(np.mean((xgb - y_binary) ** 2))
+    # Brier 按原始软标签目标计算（含 0.5 冲突标签）；二值化会抹掉冲突样本的
+    # 校准信息，导致 meta 权重偏向把 0.5 预测成极端概率的分支。
+    lgbm_brier = float(np.mean((lgbm - y_true) ** 2))
+    xgb_brier = float(np.mean((xgb - y_true) ** 2))
     lgbm_weight = 1.0 / max(lgbm_brier, 1e-6)
     xgb_weight = 1.0 / max(xgb_brier, 1e-6)
     total = lgbm_weight + xgb_weight
@@ -775,20 +896,33 @@ def _evaluate_metrics(
     meta: FloatArray,
     precision_at_k_ratio: float,
 ) -> dict[str, float]:
-    y_binary = (y_true >= 0.5).astype(float)
-    meta_pred = (meta >= 0.5).astype(float)
+    # 口径分离：AUC/accuracy/precision/recall/spread 仅在 {0,1} 硬标签子集上
+    # 计算；Brier 用全部样本的原始软标签目标。全硬标签数据（v1 契约）下两套
+    # 口径逐位一致。
+    hard_mask = (y_true == 0.0) | (y_true == 1.0)
+    y_hard = y_true[hard_mask].astype(float)
+    meta_hard = meta[hard_mask]
+    meta_pred_hard = (meta_hard >= 0.5).astype(float)
+    soft_label_count = int(np.count_nonzero(~hard_mask))
+    hard_label_count = int(np.count_nonzero(hard_mask))
+    hard_positive_count = int(np.count_nonzero(y_hard >= 0.5))
+    hard_negative_count = int(np.count_nonzero(y_hard < 0.5))
 
-    accuracy = float(np.mean(meta_pred == y_binary))
-    brier = float(np.mean((meta - y_binary) ** 2))
-    positive_rate = float(np.mean(meta_pred))
-    auc = _binary_auc(y_binary, meta)
+    if hard_label_count:
+        accuracy = float(np.mean(meta_pred_hard == y_hard))
+    else:
+        accuracy = 0.0
+    brier = float(np.mean((meta - y_true) ** 2))
+    positive_rate = float(np.mean((meta >= 0.5).astype(float)))
+    auc = _binary_auc(y_hard, meta_hard) if hard_label_count else 0.5
+    auc_valid = 1.0 if (hard_positive_count > 0 and hard_negative_count > 0) else 0.0
     precision_at_k, recall_at_k = _precision_recall_at_k(
-        y_true=y_binary,
-        probabilities=meta,
+        y_true=y_hard,
+        probabilities=meta_hard,
         top_ratio=precision_at_k_ratio,
     )
-    positive_probs = meta[y_binary >= 0.5]
-    negative_probs = meta[y_binary < 0.5]
+    positive_probs = meta[hard_mask & (y_true >= 0.5)]
+    negative_probs = meta[hard_mask & (y_true < 0.5)]
     mean_prob_spread = (
         float(positive_probs.mean() - negative_probs.mean())
         if len(positive_probs) and len(negative_probs)
@@ -797,12 +931,17 @@ def _evaluate_metrics(
     return {
         "accuracy": round(accuracy, 6),
         "auc": round(auc, 6),
+        "auc_valid": round(auc_valid, 6),
         "brier": round(brier, 6),
         "precision_at_k": round(precision_at_k, 6),
         "recall_at_k": round(recall_at_k, 6),
         "positive_rate": round(positive_rate, 6),
         "mean_prob_spread": round(mean_prob_spread, 6),
         "validation_samples": float(y_true.shape[0]),
+        "soft_label_count": float(soft_label_count),
+        "hard_label_count": float(hard_label_count),
+        "hard_positive_count": float(hard_positive_count),
+        "hard_negative_count": float(hard_negative_count),
         "meta_mean_prob": round(float(np.mean(meta)), 6),
         "lgbm_mean_prob": round(float(np.mean(lgbm)), 6),
         "xgb_mean_prob": round(float(np.mean(xgb)), 6),
@@ -895,7 +1034,7 @@ def _split_weights_by_manifest_labels(
     if len(normalized) != len(weights):
         raise ValueError("split_labels length must match weight rows")
     train_mask = np.asarray([label == "train" for label in normalized], dtype=bool)
-    return weights[train_mask]
+    return cast(FloatArray, weights[train_mask])
 
 
 def _normalize_split_name(value: str) -> str:
@@ -923,6 +1062,43 @@ def _label_from_outcome(
     outcome: OutcomeRecord,
     policy: LabelPolicyRecord,
 ) -> float | None:
+    normalized_schema = policy.schema_version.strip()
+    if normalized_schema == "1":
+        return _label_from_outcome_schema_v1(outcome=outcome, policy=policy)
+    if normalized_schema == "2":
+        return _label_from_outcome_schema_v2(outcome=outcome, policy=policy)
+    raise ValueError(
+        f"unsupported label policy schema_version: {policy.schema_version!r} "
+        f"(policy_id={policy.label_policy_id})"
+    )
+
+
+def _conflict_label_for_policy(*, policy: LabelPolicyRecord, allow_soft: bool) -> float:
+    """Resolve the TP/SL conflict label for one policy under schema v2 rules.
+
+    ``bar_shape_heuristic`` was never implemented as a real heuristic and
+    silently degraded to a hard 0.0 (systematically negative labels for
+    high-volatility samples); under v2 it maps to the configured soft value.
+    """
+
+    normalized_policy = policy.conflict_policy.strip().lower()
+    if normalized_policy == "conservative_zero":
+        return 0.0
+    if normalized_policy in ("soft_label", "bar_shape_heuristic"):
+        if allow_soft:
+            return float(max(0.0, min(1.0, policy.conflict_soft_label_value)))
+        return 0.0
+    raise ValueError(
+        f"unsupported conflict_policy {policy.conflict_policy!r} for label policy "
+        f"schema v2 (policy_id={policy.label_policy_id})"
+    )
+
+
+def _label_from_outcome_schema_v1(
+    *,
+    outcome: OutcomeRecord,
+    policy: LabelPolicyRecord,
+) -> float | None:
     take_profit_hit = outcome.max_favorable_excursion is not None and float(
         outcome.max_favorable_excursion
     ) >= float(policy.take_profit_pct)
@@ -930,10 +1106,41 @@ def _label_from_outcome(
         outcome.max_adverse_excursion
     ) <= -float(policy.stop_loss_pct)
     if take_profit_hit and stop_loss_hit:
+        # v1 历史口径逐位保留：仅 soft_label 给软值，其余一律 0.0。
         normalized_policy = policy.conflict_policy.strip().lower()
         if normalized_policy == "soft_label":
             return float(max(0.0, min(1.0, policy.conflict_soft_label_value)))
         return 0.0
+    return _non_conflict_label(outcome=outcome, policy=policy)
+
+
+def _label_from_outcome_schema_v2(
+    *,
+    outcome: OutcomeRecord,
+    policy: LabelPolicyRecord,
+) -> float | None:
+    take_profit_hit = outcome.max_favorable_excursion is not None and float(
+        outcome.max_favorable_excursion
+    ) >= float(policy.take_profit_pct)
+    stop_loss_hit = outcome.max_adverse_excursion is not None and float(
+        outcome.max_adverse_excursion
+    ) <= -float(policy.stop_loss_pct)
+    if take_profit_hit and stop_loss_hit:
+        return _conflict_label_for_policy(policy=policy, allow_soft=True)
+    return _non_conflict_label(outcome=outcome, policy=policy)
+
+
+def _non_conflict_label(
+    *,
+    outcome: OutcomeRecord,
+    policy: LabelPolicyRecord,
+) -> float | None:
+    take_profit_hit = outcome.max_favorable_excursion is not None and float(
+        outcome.max_favorable_excursion
+    ) >= float(policy.take_profit_pct)
+    stop_loss_hit = outcome.max_adverse_excursion is not None and float(
+        outcome.max_adverse_excursion
+    ) <= -float(policy.stop_loss_pct)
     if take_profit_hit:
         return 1.0
     if stop_loss_hit:
@@ -953,3 +1160,27 @@ def _as_float(value: object, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _backup_existing_artifact(path: Path, *, retention_count: int) -> Path | None:
+    """Preserve an existing alias and its sidecars before a legacy direct write."""
+
+    if not path.is_file():
+        return None
+    backup_root = path.parent / f".{path.stem}_overwrites"
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    backup_dir = backup_root / timestamp
+    backup_dir.mkdir(parents=True, exist_ok=False)
+    shutil.copy2(path, backup_dir / path.name)
+    sidecar_dir = path.parent / f"{path.stem}_sidecars"
+    if sidecar_dir.is_dir():
+        shutil.copytree(sidecar_dir, backup_dir / sidecar_dir.name)
+
+    backups = sorted(
+        (item for item in backup_root.iterdir() if item.is_dir()),
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+    for stale in backups[max(1, int(retention_count)) :]:
+        shutil.rmtree(stale)
+    return backup_dir

@@ -81,6 +81,9 @@ def _load_test_config(base_dir: Path | None = None) -> StockAnalyzerConfig:
     config.labels.horizon_days = 2
     temp_root = base_dir or Path(tempfile.mkdtemp(prefix="stock_analyzer_tests_"))
     config.training.bootstrap_state_path = str(temp_root / "test_bootstrap_state_v13.json")
+    config.training.model_archive_dir = str(temp_root / "model_archive")
+    config.training.min_test_split_window_days = 1
+    config.training.min_test_split_unique_symbol_dates = 1
     return config
 
 
@@ -134,7 +137,8 @@ def _seed_learning_protocol_samples(
             outcome = OutcomeRecord(
                 snapshot_id=snapshot.snapshot_id,
                 maturity_status=MaturityStatus.RECONCILED,
-                label_mature_time=decision_time + timedelta(days=service._config.labels.horizon_days),
+                label_mature_time=decision_time
+                + timedelta(days=service._config.labels.horizon_days),
                 realized_return=0.08 if row_index % 2 == 0 else -0.05,
                 max_favorable_excursion=0.09 if row_index % 2 == 0 else 0.01,
                 max_adverse_excursion=-0.01 if row_index % 2 == 0 else -0.07,
@@ -174,7 +178,8 @@ def test_service_single_symbol_training_includes_intraday_summary_features(tmp_p
     )
 
     assert payload["predictor_loaded"] is True
-    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    # 训练产物发布为内容寻址 bundle，从返回的 bundle 工件路径校验特征列。
+    artifact = json.loads(Path(str(payload["artifact_path"])).read_text(encoding="utf-8"))
     feature_columns = artifact.get("feature_columns", [])
     assert any(str(name).startswith("i1m_") for name in feature_columns)
     assert any(str(name).startswith("i5m_") for name in feature_columns)
@@ -224,7 +229,7 @@ def test_service_full_market_training_prefers_learning_protocol_when_samples_exi
     assert payload["input_mode"] == "sample_store"
     assert payload["protocol_attempted"] is True
     assert payload["protocol_fallback_reason"] == ""
-    assert str(payload["dataset_manifest_id"]).startswith("dataset_manifest_v1_")
+    assert str(payload["dataset_manifest_id"]).startswith("dataset_manifest_v2_")
     artifact_payload = _as_mapping(_as_mapping(payload["result"])["artifact"])
     assert artifact_payload["dataset_manifest_id"] == payload["dataset_manifest_id"]
     assert artifact_payload["feature_schema_id"] != ""

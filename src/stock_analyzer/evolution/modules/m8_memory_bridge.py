@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
+
 from stock_analyzer.evolution.m3_vector_profile import (
     build_default_m3_vector_profile,
     build_m3_vector_from_record,

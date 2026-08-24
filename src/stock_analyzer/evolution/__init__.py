@@ -28,6 +28,11 @@ from stock_analyzer.evolution.modules.m7_event_ledger import (
     M7EventLedgerRunReport,
 )
 from stock_analyzer.evolution.orchestrator import OffhoursEvolutionOrchestrator
+from stock_analyzer.evolution.shadow_dataset_builder import (
+    ShadowDataset,
+    ShadowDatasetBuilder,
+    ShadowDatasetRow,
+)
 from stock_analyzer.evolution.shadow_online_v2_metrics_store import ShadowOnlineV2MetricsStore
 from stock_analyzer.evolution.shadow_online_v2_report import (
     ShadowOnlineV2Report,
@@ -35,11 +40,6 @@ from stock_analyzer.evolution.shadow_online_v2_report import (
     ShadowOnlineV2ReportRow,
 )
 from stock_analyzer.evolution.shadow_online_v2_state_store import ShadowOnlineV2StateStore
-from stock_analyzer.evolution.shadow_dataset_builder import (
-    ShadowDataset,
-    ShadowDatasetBuilder,
-    ShadowDatasetRow,
-)
 
 __all__ = [
     "BootstrapTestResult",

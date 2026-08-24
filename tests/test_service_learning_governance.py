@@ -52,8 +52,15 @@ def _load_test_config(base_dir: Path | None = None) -> StockAnalyzerConfig:
     temp_root = base_dir or (root / "tmp_learning_governance")
     config.training.bootstrap_state_path = str(temp_root / "test_bootstrap_state.json")
     config.training.artifact_path = str(temp_root / "protocol_model.json")
+    config.training.model_archive_dir = str(temp_root / "model_archive")
     config.training.min_samples = 20
+
+    # 晋级硬门阈值适配夹具规模（60 行 / ~6 test 日）。
+    config.training.min_test_trade_dates = 2
     # 缩小标签 horizon，使合成样本的标签窗口不跨切分边界被 purge。
+    config.training.min_hard_class_samples = 2
+    config.training.min_test_split_window_days = 1
+    config.training.min_test_split_unique_symbol_dates = 1
     config.labels.horizon_days = 2
     config.command_channel.state_persist_enabled = False
     config.command_channel.history_archive_enabled = False
@@ -117,7 +124,8 @@ def _seed_learning_protocol_samples(
             outcome = OutcomeRecord(
                 snapshot_id=snapshot.snapshot_id,
                 maturity_status=MaturityStatus.RECONCILED,
-                label_mature_time=decision_time + timedelta(days=service._config.labels.horizon_days),
+                label_mature_time=decision_time
+                + timedelta(days=service._config.labels.horizon_days),
                 realized_return=0.08 if row_index % 2 == 0 else -0.05,
                 max_favorable_excursion=0.09 if row_index % 2 == 0 else 0.01,
                 max_adverse_excursion=-0.01 if row_index % 2 == 0 else -0.07,
@@ -176,7 +184,13 @@ def _prepare_learning_governance_service(
 
 def _prepare_learning_model_proposal(
     tmp_path: Path,
-) -> tuple[StockAnalyzerService, Mapping[str, object], str, dict[str, object], list[dict[str, object]]]:
+) -> tuple[
+    StockAnalyzerService,
+    Mapping[str, object],
+    str,
+    dict[str, object],
+    list[dict[str, object]],
+]:
     service, manifest, champion_model_id, notifications = _prepare_learning_governance_service(
         tmp_path
     )
@@ -426,7 +440,9 @@ def test_service_shadow_proposal_auto_promotion_binds_generated_proposal_and_tic
 def test_service_shadow_proposal_notifies_rejection_when_gate_is_blocked(
     tmp_path: Path,
 ) -> None:
-    service, manifest, champion_model_id, notifications = _prepare_learning_governance_service(tmp_path)
+    service, manifest, champion_model_id, notifications = (
+        _prepare_learning_governance_service(tmp_path)
+    )
     governance = service._learning_governance_service
     before_notifications = len(notifications)
 
@@ -474,7 +490,11 @@ def test_service_shadow_proposal_notifies_rejection_when_gate_is_blocked(
             "errors": ["shadow_underperform"],
         }
 
-    object.__setattr__(service, "run_learning_manifest_shadow_promotion_gate", _fake_run_shadow_gate)
+    object.__setattr__(
+        service,
+        "run_learning_manifest_shadow_promotion_gate",
+        _fake_run_shadow_gate,
+    )
     object.__setattr__(
         governance,
         "_create_learning_model_proposal_from_gate_payload",
@@ -785,8 +805,12 @@ def test_service_learning_governance_compliance_fallback_appends_jsonl(
             preview_limit=3,
         )
     )
-    first_compliance = _as_mapping(_as_mapping(_as_mapping(first["proposal"])["compliance"])["generated"])
-    second_compliance = _as_mapping(_as_mapping(_as_mapping(second["proposal"])["compliance"])["validated"])
+    first_compliance = _as_mapping(
+        _as_mapping(_as_mapping(first["proposal"])["compliance"])["generated"]
+    )
+    second_compliance = _as_mapping(
+        _as_mapping(_as_mapping(second["proposal"])["compliance"])["validated"]
+    )
     fallback_path = Path(str(first_compliance["fallback_path"]))
     lines = fallback_path.read_text(encoding="utf-8").splitlines()
     new_lines = lines[len(existing_lines) :]

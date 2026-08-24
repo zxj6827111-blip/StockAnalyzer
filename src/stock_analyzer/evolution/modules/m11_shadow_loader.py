@@ -5,18 +5,28 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 
 @dataclass(frozen=True, slots=True)
 class M11ShadowObservation:
-    """One normalized M11 shadow observation."""
+    """One normalized M11 shadow observation.
+
+    ``trade_date``（入场日）与 ``label_mature_time``（退出/成熟时点）为事件驱动
+    slot NAV 模拟（P1-b）的必需字段；概率用于日内开仓的确定性排序。旧调用方
+    未提供时保持空值/None，由消费方判定 ``insufficient_date_coverage``。
+    """
 
     symbol: str
     champion_shadow_return: float
     challenger_shadow_return: float
     champion_signal: int | None
     challenger_signal: int | None
+    trade_date: str = ""
+    label_mature_time: str = ""
+    champion_probability: float | None = None
+    challenger_probability: float | None = None
 
 
 def load_m11_shadow_records(path: str | Path) -> list[dict[str, object]]:
@@ -132,7 +142,66 @@ def _parse_one(record: Mapping[str, object]) -> M11ShadowObservation | None:
         challenger_shadow_return=challenger_ret,
         champion_signal=champion_signal,
         challenger_signal=challenger_signal,
+        trade_date=_normalize_date_text(
+            _read_string(
+                record,
+                keys=("trade_date", "entry_date", "decision_date"),
+            )
+        ),
+        label_mature_time=_normalize_datetime_text(
+            _read_string(
+                record,
+                keys=("label_mature_time", "exit_time", "exit_date", "mature_time"),
+            )
+        ),
+        champion_probability=_read_float(
+            record,
+            keys=(
+                "champion_probability",
+                "champion_prob",
+                "champion_p_meta",
+                "p_champion",
+            ),
+        ),
+        challenger_probability=_read_float(
+            record,
+            keys=(
+                "challenger_probability",
+                "challenger_prob",
+                "shadow_v2_probability",
+                "shadow_probability",
+                "p_challenger",
+            ),
+        ),
     )
+
+
+def _normalize_date_text(value: str | None) -> str:
+    """归一为 ISO 日期（YYYY-MM-DD）；无法解析返回空串（由消费方判缺陷）。"""
+
+    text = (value or "").strip()
+    if not text:
+        return ""
+    try:
+        return datetime.fromisoformat(text).date().isoformat()
+    except ValueError:
+        # 纯日期串 fromisoformat 已支持；此处兜底截断式时间戳。
+        try:
+            return datetime.fromisoformat(text[:10]).date().isoformat()
+        except ValueError:
+            return ""
+
+
+def _normalize_datetime_text(value: str | None) -> str:
+    """保留完整 ISO 时间文本；无法解析返回空串。"""
+
+    text = (value or "").strip()
+    if not text:
+        return ""
+    try:
+        return datetime.fromisoformat(text).isoformat()
+    except ValueError:
+        return text
 
 
 def _read_from_scopes(record: Mapping[str, object], key: str) -> object:

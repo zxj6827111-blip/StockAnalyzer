@@ -49,6 +49,9 @@ class RollbackContext(BaseModel):
 
     trade_count: int = Field(default=0, ge=0)
     observed_days: int = Field(default=0, ge=0)
+    # 事件驱动口径（P1-b）：entry/exit 事件日的去重天数；与 observed_days
+    # （旧行数口径）并存，回滚判定逐步切到本字段。
+    observed_event_days: int = Field(default=0, ge=0)
     consecutive_soft_days: int = Field(default=0, ge=0)
     consecutive_hard_days: int = Field(default=0, ge=0)
     pending_confirmation_since: datetime | None = None
@@ -130,6 +133,14 @@ def evaluate_rollback(
         shadow_champion_vol=shadow_champion_vol,
     )
 
+    # 观察天数优先用事件日口径（entry/exit 去重天数）；未提供时回退
+    # 旧行数口径，兼容非 M11 路径的 RollbackContext 构造方。
+    effective_observed_days = (
+        context.observed_event_days
+        if context.observed_event_days > 0
+        else context.observed_days
+    )
+
     if hard_drawdown_breach or tail_loss_triggered:
         return RollbackAssessment(
             state=RollbackState.ROLLED_BACK,
@@ -141,8 +152,8 @@ def evaluate_rollback(
 
     if (
         context.trade_count < active_policy.min_trades
-        and context.observed_days < active_policy.observation_window
-        and context.observed_days < active_policy.max_extension_days
+        and effective_observed_days < active_policy.observation_window
+        and effective_observed_days < active_policy.max_extension_days
     ):
         return RollbackAssessment(
             state=RollbackState.STABLE,

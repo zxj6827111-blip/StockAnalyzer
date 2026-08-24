@@ -114,7 +114,12 @@ def test_service_restart_preserves_native_sidecar_backends(tmp_path: Path) -> No
 
     assert training["predictor_loaded"] is True
 
-    restarted = StockAnalyzerService(config=config)
+    # 训练产物现在是内容寻址 bundle，运行时别名只由发布流程写；
+    # 重启验证改为直接从 bundle 工件加载（原生 sidecar 跨进程持久性不变）。
+    restarted_config = load_config(root / "config" / "default.yaml")
+    restarted_config.data_source.primary = "synthetic"
+    restarted_config.training.artifact_path = str(training["artifact_path"])
+    restarted = StockAnalyzerService(config=restarted_config)
     status = _as_mapping(restarted.provider_status())
 
     assert status["predictor_mode"] == "artifact_loaded"

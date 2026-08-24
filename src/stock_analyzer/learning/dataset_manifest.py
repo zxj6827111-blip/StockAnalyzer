@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timedelta
 
 from stock_analyzer.learning.feature_schema_registry import FeatureSchemaRegistry
@@ -24,6 +24,14 @@ _DEFAULT_MATURITY_STATUSES = (
     MaturityStatus.RECONCILED,
     MaturityStatus.FULLY_MATURED,
 )
+
+# schema v2 去重契约：同一股票同一交易日只允许一条样本，保留最新快照。
+# “最新”按构建前的稳定 ordinal（decision_time、created_at、snapshot_id）取最大值。
+DEDUP_KEY = "symbol+trade_date"
+DEDUP_RULE = "keep_max_ordinal_latest_snapshot"
+# 去重丢弃占比超过该阈值视为 blocking（数据集以重复为主，训练无意义）。
+_DUPLICATE_DOMINANCE_RATIO = 0.5
+_MANIFEST_SCHEMA_VERSION = "2"
 
 
 class DatasetManifestBuilder:
@@ -56,6 +64,8 @@ class DatasetManifestBuilder:
         calibration_ratio: float = 0.1,
         test_ratio: float = 0.1,
         embargo_days: int = 0,
+        min_test_split_window_days: int = 0,
+        min_test_split_unique_symbol_dates: int = 0,
     ) -> DatasetManifest:
         """Create or reuse one deterministic manifest and persist its membership.
 
@@ -102,11 +112,22 @@ class DatasetManifestBuilder:
             fidelity_filter=normalized_fidelity,
             maturity_statuses=normalized_maturity,
         )
+        deduped_pairs, dedup_stats = _deduplicate_by_trading_day(included_pairs)
+        blocking_flags, warning_flags = _dedup_quality_flags(
+            rows_before=dedup_stats["rows_before"],
+            rows_dropped=dedup_stats["rows_dropped"],
+        )
         item_blueprints, split_plan = _build_manifest_items_and_split_plan(
-            included_pairs=included_pairs,
+            included_pairs=deduped_pairs,
             calibration_ratio=calibration_ratio,
             test_ratio=test_ratio,
             embargo_days=embargo_days,
+        )
+        manifest_quality = build_manifest_quality_report(
+            item_blueprints=item_blueprints,
+            snapshots={snapshot.snapshot_id: snapshot for snapshot, _ in deduped_pairs},
+            min_test_split_window_days=min_test_split_window_days,
+            min_test_split_unique_symbol_dates=min_test_split_unique_symbol_dates,
         )
         selection_rule = (
             sample_selection_rule.strip()
@@ -118,8 +139,11 @@ class DatasetManifestBuilder:
                 time_window_end=time_window_end,
             )
         )
-        fidelity_breakdown = _build_fidelity_breakdown(included_pairs)
+        fidelity_breakdown = _build_fidelity_breakdown(deduped_pairs)
         manifest_id = _build_dataset_manifest_id(
+            schema_version=_MANIFEST_SCHEMA_VERSION,
+            dedup_key=DEDUP_KEY,
+            dedup_rule=DEDUP_RULE,
             source_store_version=self._source_store_version,
             feature_schema_id=feature_schema_id,
             feature_schema_hash=feature_schema_hash,
@@ -131,19 +155,22 @@ class DatasetManifestBuilder:
             fidelity_filter=normalized_fidelity,
             snapshot_ids=normalized_snapshot_ids,
             item_blueprints=item_blueprints,
+            min_test_split_window_days=min_test_split_window_days,
+            min_test_split_unique_symbol_dates=min_test_split_unique_symbol_dates,
         )
         manifest_items = [
             DatasetManifestItem(
                 dataset_manifest_id=manifest_id,
                 snapshot_id=item_blueprint["snapshot_id"],
                 split_name=item_blueprint["split_name"],
-                ordinal=int(item_blueprint["ordinal"]),
+                ordinal=_as_int(item_blueprint.get("ordinal")),
                 decision_time=item_blueprint["decision_time"],
             )
             for item_blueprint in item_blueprints
         ]
         manifest = DatasetManifest(
             dataset_manifest_id=manifest_id,
+            schema_version=_MANIFEST_SCHEMA_VERSION,
             source_store_version=self._source_store_version,
             feature_schema_id=feature_schema_id,
             feature_schema_hash=feature_schema_hash,
@@ -154,13 +181,32 @@ class DatasetManifestBuilder:
             time_window_end=time_window_end,
             fidelity_filter=list(normalized_fidelity),
             included_snapshot_count=len(manifest_items),
-            included_outcome_count=len(included_pairs),
+            included_outcome_count=len(deduped_pairs),
             fidelity_breakdown=fidelity_breakdown,
             dropped_reason_breakdown=dropped_reason_breakdown,
             split_plan=split_plan,
+            dedup_key=DEDUP_KEY,
+            dedup_rule=DEDUP_RULE,
+            rows_before_dedup=dedup_stats["rows_before"],
+            rows_dropped_by_dedup=dedup_stats["rows_dropped"],
+            blocking_quality_flags=blocking_flags,
+            warning_quality_flags=warning_flags,
+            manifest_quality_flags=_as_str_list(manifest_quality.get("flags")),
+            test_split_window_days=_as_int(
+                manifest_quality.get("test_split_window_days")
+            ),
+            test_split_unique_symbol_dates=_as_int(
+                manifest_quality.get("test_split_unique_symbol_dates")
+            ),
         )
 
         existing = self._store.get_manifest(manifest.dataset_manifest_id)
+        if existing is not None and existing.schema_version != manifest.schema_version:
+            # v2 ID 绝不允许解析到 v1 记录（正常情况下前缀已隔离，此处兜底）。
+            raise ValueError(
+                "dataset manifest id collision across schema versions: "
+                f"{manifest.dataset_manifest_id} stored_schema={existing.schema_version}"
+            )
         if existing is None:
             self._store.write_manifest(manifest)
         stored_items = self._store.list_manifest_items(manifest.dataset_manifest_id)
@@ -319,6 +365,122 @@ def _build_grouped_split_and_purge(
             split_times.setdefault(split_name, []).append(snapshot.decision_time)
 
     return items, _build_split_plan(split_times)
+
+
+def _deduplicate_by_trading_day(
+    included_pairs: Sequence[tuple[SignalSnapshot, OutcomeRecord]],
+) -> tuple[list[tuple[SignalSnapshot, OutcomeRecord]], dict[str, int]]:
+    """按 (symbol, trade_date) 去重，保留稳定 ordinal 最大的最新快照。
+
+    先按时间与 snapshot_id 建立稳定 ordinal，再对同一 symbol-day 取最大
+    ordinal。这样跨 strategy 的同日重复也会被压缩，manifest 与报告拥有同一
+    个样本身份边界。
+    """
+
+    if not included_pairs:
+        return [], {"rows_before": 0, "rows_dropped": 0}
+    ordered_pairs = sorted(
+        included_pairs,
+        key=lambda pair: (
+            pair[0].decision_time,
+            pair[0].created_at,
+            pair[0].snapshot_id,
+        ),
+    )
+    best: dict[
+        tuple[str, date],
+        tuple[int, tuple[SignalSnapshot, OutcomeRecord]],
+    ] = {}
+    for ordinal, pair in enumerate(ordered_pairs):
+        snapshot, _outcome = pair
+        key = (snapshot.symbol, _decision_date_shanghai(snapshot.decision_time))
+        current = best.get(key)
+        if current is None or ordinal > current[0]:
+            best[key] = (ordinal, pair)
+    kept = sorted(
+        (pair for _ordinal, pair in best.values()),
+        key=lambda pair: (pair[0].decision_time, pair[0].snapshot_id),
+    )
+    rows_before = len(included_pairs)
+    return kept, {"rows_before": rows_before, "rows_dropped": rows_before - len(kept)}
+
+
+def _decision_date_shanghai(decision_time: datetime) -> date:
+    return (decision_time + timedelta(hours=8)).date()
+
+
+def _dedup_quality_flags(
+    *,
+    rows_before: int,
+    rows_dropped: int,
+) -> tuple[list[str], list[str]]:
+    """由去重统计推导 blocking/warning 质量旗标。
+
+    - blocking ``duplicate_dominance``：丢弃占比 > 50%，数据集以重复为主；
+    - blocking ``empty_after_dedup``：去重后无样本；
+    - warning ``duplicate_rows_present``：存在任意被丢弃的重复行。
+    （旗标规则为按诊断证据重建的实现细节，规格原文在会话截断中丢失。）
+    """
+
+    blocking: list[str] = []
+    warning: list[str] = []
+    if rows_before > 0:
+        if rows_before - rows_dropped <= 0:
+            blocking.append("empty_after_dedup")
+        elif rows_dropped / rows_before > _DUPLICATE_DOMINANCE_RATIO:
+            blocking.append("duplicate_dominance")
+    if rows_dropped > 0:
+        warning.append("duplicate_rows_present")
+    return blocking, warning
+
+
+def build_manifest_quality_report(
+    *,
+    item_blueprints: Sequence[Mapping[str, object]],
+    snapshots: Mapping[str, SignalSnapshot],
+    min_test_split_window_days: int,
+    min_test_split_unique_symbol_dates: int,
+) -> dict[str, object]:
+    """Calculate manifest-generation quality gates from the final membership."""
+
+    test_items = [
+        item
+        for item in item_blueprints
+        if str(item.get("split_name", "")).strip().lower() == "test"
+    ]
+    test_snapshots = [
+        snapshots[str(item.get("snapshot_id", ""))]
+        for item in test_items
+        if str(item.get("snapshot_id", "")) in snapshots
+    ]
+    test_trade_dates = [
+        _decision_date_shanghai(snapshot.decision_time)
+        for snapshot in test_snapshots
+    ]
+    if test_trade_dates:
+        window_days = (max(test_trade_dates) - min(test_trade_dates)).days + 1
+    else:
+        window_days = 0
+    unique_symbol_dates = len(
+        {
+            (snapshot.symbol, _decision_date_shanghai(snapshot.decision_time))
+            for snapshot in test_snapshots
+        }
+    )
+    flags: list[str] = []
+    min_window = max(0, int(min_test_split_window_days))
+    min_coverage = max(0, int(min_test_split_unique_symbol_dates))
+    if min_window > 0 and window_days < min_window:
+        flags.append("test_window_too_narrow")
+    if min_coverage > 0 and unique_symbol_dates < min_coverage:
+        flags.append("test_coverage_insufficient")
+    return {
+        "flags": flags,
+        "test_split_window_days": window_days,
+        "test_split_unique_symbol_dates": unique_symbol_dates,
+        "min_test_split_window_days": min_window,
+        "min_test_split_unique_symbol_dates": min_coverage,
+    }
 
 
 def _manifest_item(snapshot: SignalSnapshot, split_name: str, ordinal: int) -> dict[str, object]:
@@ -484,6 +646,9 @@ def _build_selection_rule(
 
 def _build_dataset_manifest_id(
     *,
+    schema_version: str,
+    dedup_key: str,
+    dedup_rule: str,
     source_store_version: str,
     feature_schema_id: str,
     feature_schema_hash: str,
@@ -495,8 +660,13 @@ def _build_dataset_manifest_id(
     fidelity_filter: Sequence[BackfillFidelityTier],
     snapshot_ids: Sequence[str],
     item_blueprints: Sequence[dict[str, object]],
+    min_test_split_window_days: int = 0,
+    min_test_split_unique_symbol_dates: int = 0,
 ) -> str:
     payload = {
+        "schema_version": schema_version,
+        "dedup_key": dedup_key,
+        "dedup_rule": dedup_rule,
         "source_store_version": source_store_version,
         "feature_schema_id": feature_schema_id,
         "feature_schema_hash": feature_schema_hash,
@@ -507,18 +677,34 @@ def _build_dataset_manifest_id(
         "time_window_end": time_window_end.isoformat() if time_window_end else "",
         "fidelity_filter": [item.value for item in fidelity_filter],
         "snapshot_ids": list(snapshot_ids),
+        "min_test_split_window_days": max(0, int(min_test_split_window_days)),
+        "min_test_split_unique_symbol_dates": max(
+            0, int(min_test_split_unique_symbol_dates)
+        ),
         "items": [
             {
                 "snapshot_id": str(item.get("snapshot_id", "")),
                 "split_name": str(item.get("split_name", "")),
-                "ordinal": int(item.get("ordinal", 0)),
+                "ordinal": _as_int(item.get("ordinal")),
             }
             for item in item_blueprints
         ],
     }
     serialized = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
-    return f"dataset_manifest_v1_{digest[:12]}"
+    return f"dataset_manifest_v{schema_version}_{digest[:12]}"
+
+
+def _as_int(value: object, default: int = 0) -> int:
+    if isinstance(value, (int, float, str, bytes, bytearray)):
+        return int(value)
+    return default
+
+
+def _as_str_list(value: object) -> list[str]:
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [str(item) for item in value]
+    return []
 
 
 def _normalize_fidelity_filter(

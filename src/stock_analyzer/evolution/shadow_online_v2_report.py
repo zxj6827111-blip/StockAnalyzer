@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from stock_analyzer.evolution.champion_shadow_report import (
+    ChampionShadowComparisonRow,
     ChampionShadowReportBuilder,
 )
 from stock_analyzer.evolution.modules.m11_shadow_loader import M11ShadowObservation
@@ -21,6 +22,11 @@ from stock_analyzer.evolution.modules.shadow_online_model_v2 import (
 from stock_analyzer.learning.feature_schema_registry import FeatureSchemaRegistry
 from stock_analyzer.learning.label_policy_registry import LabelPolicyRegistry
 from stock_analyzer.learning.sample_store import SampleStore
+from stock_analyzer.learning.slot_occupied_nav import (
+    DEFAULT_MAX_POSITIONS,
+    EventSlotPositionInput,
+    simulate_event_driven_slot_nav,
+)
 from stock_analyzer.models.registry import ModelRegistry
 
 _EFFECTIVE_MATURE_STATUSES = {"reconciled", "fully_matured"}
@@ -33,6 +39,7 @@ class ShadowOnlineV2ReportRow:
     snapshot_id: str
     symbol: str
     trade_date: str
+    label_mature_time: str
     split_name: str
     label: float
     realized_return: float
@@ -58,6 +65,7 @@ class ShadowOnlineV2ReportRow:
             "snapshot_id": self.snapshot_id,
             "symbol": self.symbol,
             "trade_date": self.trade_date,
+            "label_mature_time": self.label_mature_time,
             "split_name": self.split_name,
             "label": self.label,
             "realized_return": self.realized_return,
@@ -108,7 +116,7 @@ class ShadowOnlineV2Report:
     signal_threshold: float
     rows: list[ShadowOnlineV2ReportRow] = field(default_factory=list)
     run_result: dict[str, object] = field(default_factory=dict)
-    return_summary: dict[str, float] = field(default_factory=dict)
+    return_summary: dict[str, object] = field(default_factory=dict)
     calibration_summary: dict[str, list[dict[str, object]]] = field(default_factory=dict)
     execution_summary: dict[str, float] = field(default_factory=dict)
     m11_v2_report: dict[str, object] = field(default_factory=dict)
@@ -152,12 +160,17 @@ class ShadowOnlineV2ReportBuilder:
         model_registry: ModelRegistry,
         feature_schema_registry: FeatureSchemaRegistry | None = None,
         label_policy_registry: LabelPolicyRegistry | None = None,
+        m11_max_positions: int = DEFAULT_MAX_POSITIONS,
     ) -> None:
+        self._m11_max_positions = max(1, int(m11_max_positions))
+        # 内部 comparison 报告的 M11 口径必须与本 builder 一致，否则
+        # m11_max_positions 配置非默认值时两侧口径分裂。
         self._comparison_builder = ChampionShadowReportBuilder(
             store=store,
             model_registry=model_registry,
             feature_schema_registry=feature_schema_registry,
             label_policy_registry=label_policy_registry,
+            m11_max_positions=self._m11_max_positions,
         )
 
     def build_report(
@@ -219,6 +232,7 @@ class ShadowOnlineV2ReportBuilder:
                 snapshot_id=item.snapshot_id,
                 symbol=item.symbol,
                 trade_date=item.trade_date,
+                label_mature_time=item.label_mature_time,
                 split_name=item.split_name,
                 label=label,
                 realized_return=realized_return,
@@ -253,10 +267,18 @@ class ShadowOnlineV2ReportBuilder:
                     challenger_shadow_return=row.shadow_v2_return,
                     champion_signal=row.champion_signal,
                     challenger_signal=row.shadow_v2_signal,
+                    # 事件驱动 NAV 所需：入场/退出日与两侧概率（确定性排序键）。
+                    trade_date=row.trade_date,
+                    label_mature_time=row.label_mature_time,
+                    champion_probability=round(champion_probability, 6),
+                    challenger_probability=round(shadow_v2_probability, 6),
                 )
             )
 
-        m11_result = evaluate_m11_shadow_portfolio(shadow_observations=observations)
+        m11_result = evaluate_m11_shadow_portfolio(
+            shadow_observations=observations,
+            m11_max_positions=self._m11_max_positions,
+        )
         report_id = _build_report_id(
             comparison_report_id=comparison_report.comparison_report_id,
             engine=run_result.engine,
@@ -274,7 +296,18 @@ class ShadowOnlineV2ReportBuilder:
             signal_threshold=float(signal_threshold),
             rows=rows,
             run_result=run_payload,
-            return_summary=_build_return_summary(rows),
+            return_summary=_build_return_summary(
+                rows,
+                m11_max_positions=self._m11_max_positions,
+                dedup_row_count=int(
+                    comparison_report.summary_metrics.get(
+                        "dedup_row_count", float(len(comparison_report.rows))
+                    )
+                ),
+                duplicate_row_count=int(
+                    comparison_report.summary_metrics.get("duplicate_row_count", 0.0)
+                ),
+            ),
             calibration_summary=_build_calibration_summary(rows),
             execution_summary=_build_execution_summary(rows),
             m11_v2_report={
@@ -296,10 +329,10 @@ class ShadowOnlineV2ReportBuilder:
 
 
 def _order_comparison_rows(
-    rows: Sequence[object],
+    rows: Sequence[ChampionShadowComparisonRow],
     *,
     now: datetime,
-) -> list[object]:
+) -> list[ChampionShadowComparisonRow]:
     filtered = []
     normalized_now = _normalize_datetime(now)
     for row in rows:
@@ -331,11 +364,87 @@ def _row_is_effectively_mature(
     return mature_dt <= normalized_now
 
 
-def _build_return_summary(rows: Sequence[ShadowOnlineV2ReportRow]) -> dict[str, float]:
+def _build_return_summary(
+    rows: Sequence[ShadowOnlineV2ReportRow],
+    *,
+    m11_max_positions: int = DEFAULT_MAX_POSITIONS,
+    dedup_row_count: int | None = None,
+    duplicate_row_count: int = 0,
+) -> dict[str, object]:
     champion_returns = [row.champion_shadow_return for row in rows]
     shadow_returns = [row.shadow_shadow_return for row in rows]
     v2_returns = [row.shadow_v2_return for row in rows]
+    # 事件驱动 slot 口径（P1-b 主口径）：仅 signal==1 的行构成仓位；
+    # legacy_* 逐笔复利键仅作对照，禁止再作为门禁依据。
+    def _events(
+        *,
+        signal_attr: str,
+        return_attr: str,
+        probability_attr: str,
+    ) -> list[EventSlotPositionInput]:
+        events: list[EventSlotPositionInput] = []
+        for row in rows:
+            if getattr(row, signal_attr) != 1:
+                continue
+            events.append(
+                EventSlotPositionInput(
+                    symbol=row.symbol,
+                    entry_date=row.trade_date,
+                    exit_date=row.label_mature_time,
+                    realized_return=getattr(row, return_attr),
+                    probability=getattr(row, probability_attr),
+                )
+            )
+        return events
+
+    champion_slot = simulate_event_driven_slot_nav(
+        _events(
+            signal_attr="champion_signal",
+            return_attr="champion_shadow_return",
+            probability_attr="champion_probability",
+        ),
+        max_positions=m11_max_positions,
+    )
+    shadow_slot = simulate_event_driven_slot_nav(
+        _events(
+            signal_attr="shadow_signal",
+            return_attr="shadow_shadow_return",
+            probability_attr="shadow_probability",
+        ),
+        max_positions=m11_max_positions,
+    )
+    v2_slot = simulate_event_driven_slot_nav(
+        _events(
+            signal_attr="shadow_v2_signal",
+            return_attr="shadow_v2_return",
+            probability_attr="shadow_v2_probability",
+        ),
+        max_positions=m11_max_positions,
+    )
+    insufficient_coverage = (
+        champion_slot.insufficient_date_coverage
+        or shadow_slot.insufficient_date_coverage
+        or v2_slot.insufficient_date_coverage
+    )
     return {
+        "dedup_row_count": int(
+            len(rows) if dedup_row_count is None else max(0, int(dedup_row_count))
+        ),
+        "duplicate_row_count": max(0, int(duplicate_row_count)),
+        "cum_return_suspect": bool(duplicate_row_count > 0),
+        # —— legacy 逐笔全仓复利口径（对照审计，非门禁依据）——
+        "legacy_champion_cum_return": round(_compound_returns(champion_returns), 6),
+        "legacy_shadow_cum_return": round(_compound_returns(shadow_returns), 6),
+        "legacy_shadow_v2_cum_return": round(_compound_returns(v2_returns), 6),
+        "legacy_shadow_v2_minus_shadow_return": round(
+            _compound_returns(v2_returns) - _compound_returns(shadow_returns),
+            6,
+        ),
+        "legacy_shadow_v2_minus_champion_return": round(
+            _compound_returns(v2_returns) - _compound_returns(champion_returns),
+            6,
+        ),
+        # 旧 API 键保留为兼容别名；晋级门禁只消费 slot 口径。
         "champion_cum_return": round(_compound_returns(champion_returns), 6),
         "shadow_cum_return": round(_compound_returns(shadow_returns), 6),
         "shadow_v2_cum_return": round(_compound_returns(v2_returns), 6),
@@ -347,6 +456,26 @@ def _build_return_summary(rows: Sequence[ShadowOnlineV2ReportRow]) -> dict[str, 
             _compound_returns(v2_returns) - _compound_returns(champion_returns),
             6,
         ),
+        # —— 事件驱动 slot 口径（主口径）——
+        "champion_slot_return": round(champion_slot.total_return, 6),
+        "shadow_slot_return": round(shadow_slot.total_return, 6),
+        "shadow_v2_slot_return": round(v2_slot.total_return, 6),
+        "shadow_v2_minus_champion_slot_return": round(
+            v2_slot.total_return - champion_slot.total_return,
+            6,
+        ),
+        "shadow_v2_minus_shadow_slot_return": round(
+            v2_slot.total_return - shadow_slot.total_return,
+            6,
+        ),
+        "slot_max_positions": float(m11_max_positions),
+        "slot_open_position_count": int(
+            champion_slot.open_position_count
+            + shadow_slot.open_position_count
+            + v2_slot.open_position_count
+        ),
+        "slot_event_days": int(max(champion_slot.event_days, v2_slot.event_days)),
+        "slot_insufficient_date_coverage": 1.0 if insufficient_coverage else 0.0,
     }
 
 
@@ -409,7 +538,9 @@ def _build_execution_summary(rows: Sequence[ShadowOnlineV2ReportRow]) -> dict[st
     v2_exec = [row for row in rows if row.shadow_v2_signal > 0]
     changed_exec = [row for row in rows if row.shadow_signal != row.shadow_v2_signal]
     return {
-        "champion_avg_fill_ratio": _avg_optional([row.execution_fill_ratio for row in champion_exec]),
+        "champion_avg_fill_ratio": _avg_optional(
+            [row.execution_fill_ratio for row in champion_exec]
+        ),
         "shadow_avg_fill_ratio": _avg_optional([row.execution_fill_ratio for row in shadow_exec]),
         "shadow_v2_avg_fill_ratio": _avg_optional([row.execution_fill_ratio for row in v2_exec]),
         "changed_trade_avg_fill_ratio": _avg_optional(

@@ -23,6 +23,7 @@ from stock_analyzer.deferred_registry import (
     build_deferred_items_registry,
     write_deferred_items_registry,
 )
+from stock_analyzer.models.bundle import latest_bundle_artifact_path
 from stock_analyzer.phase_d_status import (
     build_phase_d_status_report,
     persist_phase_d_status_report,
@@ -37,6 +38,18 @@ from stock_analyzer.v13_acceptance import (
     persist_v13_acceptance_report,
     summarize_model_artifact,
 )
+
+
+def _effective_artifact_summary_path(service: Any) -> Path:
+    """验收报告的工件来源：优先运行时别名，缺失时回退最新 bundle。"""
+
+    config = service._config
+    configured = Path(str(config.training.artifact_path)).expanduser()
+    if configured.exists():
+        return configured
+    archive_root = Path(str(config.training.model_archive_dir)).expanduser()
+    latest_bundle = latest_bundle_artifact_path(archive_root)
+    return latest_bundle if latest_bundle is not None else configured
 
 
 def _resolve_acceptance_safe_timestamp(now: datetime | None = None) -> datetime:
@@ -1218,7 +1231,7 @@ class RuntimeAcceptanceService:
             baseline_report=baseline_payload,
             provider_status=service.provider_status(),
             artifact_summary=summarize_model_artifact(
-                artifact_path=service._config.training.artifact_path
+                artifact_path=str(_effective_artifact_summary_path(service))
             ),
             week5_report=active_week5,
             positions=service.portfolio_positions(),

@@ -865,6 +865,28 @@ def train_learning_manifest(
     typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
 
 
+@app.command("learning-bootstrap-baseline-champion")
+def learning_bootstrap_baseline_champion(
+    model_id: str = typer.Option(..., help="Trained challenger model id to bootstrap"),
+    operator: str = typer.Option("", help="Human operator approving the baseline bootstrap"),
+    source_trace_id: str = typer.Option("", help="Optional source trace id for audit"),
+) -> None:
+    """Controlled baseline champion bootstrap (no active champion required).
+
+    Absolute gates: content-addressed bundle integrity + v2 manifest binding +
+    test date/class validity; CAS precondition = no active champion exists.
+    Emits an independent ``learning_baseline_bootstrap`` audit event.
+    """
+    config = get_config()
+    service = StockAnalyzerService(config=config)
+    result = service.bootstrap_baseline_champion(
+        model_id=model_id,
+        operator=operator,
+        source_trace_id=source_trace_id,
+    )
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
+
 @app.command("train-learning-manifest-shadow-validate")
 def train_learning_manifest_shadow_validate(
     dataset_manifest_id: str = typer.Option(

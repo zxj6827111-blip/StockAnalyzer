@@ -3,10 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 
 from stock_analyzer.config import StockAnalyzerConfig, load_config
+from stock_analyzer.learning.feature_schema_registry import FeatureSchemaRegistry
 from stock_analyzer.learning.feedback_features import (
     LEARNING_PROTOCOL_FEEDBACK_FEATURE_COLUMNS,
 )
-from stock_analyzer.learning.feature_schema_registry import FeatureSchemaRegistry
 from stock_analyzer.learning.label_policy_registry import LabelPolicyRegistry
 from stock_analyzer.learning.sample_schema import MaturityStatus
 from stock_analyzer.learning.sample_store import SampleStore

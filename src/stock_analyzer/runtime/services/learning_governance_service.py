@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import uuid
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from datetime import datetime, timedelta
@@ -16,9 +18,23 @@ from stock_analyzer.evolution.governance.compliance import (
     ComplianceLogger,
     ComplianceState,
 )
+from stock_analyzer.learning.slot_occupied_nav import (
+    PromotionValidityReport,
+    evaluate_promotion_validity,
+)
+from stock_analyzer.models.artifact import ModelArtifact
+from stock_analyzer.models.bundle import (
+    ARTIFACT_FILENAME,
+    BundleIntegrityError,
+    build_release_alias_payload,
+    verify_artifact_integrity,
+)
+from stock_analyzer.models.predictor import SignalPredictor
 from stock_analyzer.models.registry import (
     ModelLifecycleState,
+    ModelRegistryCASConflictError,
     ModelRegistryReadError,
+    ModelRegistryRecord,
     ModelRole,
 )
 
@@ -831,104 +847,170 @@ class RuntimeLearningGovernanceService:
                 "expected_champion_model_id": previous_champion_id,
             }
 
-        transition_records: list[dict[str, object]] = []
-        if previous_champion is not None and previous_champion.model_id != shadow_model_id:
-            transition_records.append(
-                service.update_model_registry_role(
-                    model_id=previous_champion.model_id,
-                    role=ModelRole.CHALLENGER.value,
-                    timestamp=now,
-                )
-            )
-        if target_entry.role != ModelRole.CHAMPION:
-            transition_records.append(
-                service.update_model_registry_role(
-                    model_id=shadow_model_id,
-                    role=ModelRole.CHAMPION.value,
-                    timestamp=now,
-                )
-            )
-        service._config.evolution.active_champion_id = shadow_model_id
-
-        checklist = _normalize_checklist(ticket.get("checklist", []))
-        checklist = _set_checklist_flag(checklist, "release_window_confirmed", True)
-        checklist = _set_checklist_flag(checklist, "release_execution_completed", True)
-        checklist = _set_checklist_flag(checklist, "manual_confirmation_received", False)
-
-        confirmation_required = bool(service._config.evolution.release_confirmation_required)
-        confirmation_ttl_days = max(1, service._config.evolution.release_confirmation_ttl_days)
-        pending_confirmation = {
-            "required": confirmation_required,
-            "state": "pending" if confirmation_required else "not_required",
-            "due_at": (
-                (now + timedelta(days=confirmation_ttl_days)).isoformat()
-                if confirmation_required
-                else ""
-            ),
-            "ttl_days": confirmation_ttl_days if confirmation_required else 0,
-            "confirmed_by": "",
-            "confirmed_at": "",
-            "confirmation_note": "",
-        }
-
-        executed_at = now.isoformat()
-        ticket["status"] = "executed"
-        ticket["executed_at"] = executed_at
-        ticket["checklist"] = checklist
-        ticket["execution"] = {
-            "executor": normalized_executor,
-            "timestamp": executed_at,
-            "note": note.strip(),
-            "source_trace_id": source_trace_id,
-        }
-        ticket["pending_confirmation"] = pending_confirmation
-        ticket["release_transition"] = {
-            "updated": bool(transition_records),
-            "records": transition_records,
-            "previous_champion_model_id": previous_champion_id,
-            "active_champion_model_id": shadow_model_id,
-        }
-
-        updated_proposal = self._append_learning_proposal_snapshot(
-            proposal=proposal,
-            update={
-                "status": "executed",
-                "release_state": ("pending_confirmation" if confirmation_required else "confirmed"),
-                "released_at": executed_at,
-                "ticket": {
-                    "ticket_id": str(ticket.get("ticket_id", "")),
-                    "timestamp": executed_at,
-                    "operator": str(ticket.get("operator", "")),
-                    "status": "executed",
-                },
-                "release_execution": {
-                    "executor": normalized_executor,
-                    "timestamp": executed_at,
-                    "note": note.strip(),
-                    "previous_champion_model_id": previous_champion_id,
-                    "active_champion_model_id": shadow_model_id,
-                },
-            },
+        # —— 两阶段发布（P0-a）：别名与 registry 角色变更的唯一入口 ——
+        flow = _TwoPhaseReleaseExecutor(
+            service=service,
+            target_entry=target_entry,
+            previous_champion=previous_champion,
+            source_trace_id=source_trace_id,
         )
-        compliance_update = self._write_learning_compliance_event(
-            state=ComplianceState.PROMOTED,
-            proposal=updated_proposal,
-            event_time=now,
-            trace_id=source_trace_id or f"learning-release-{ticket['ticket_id']}",
-            metadata={
+        alias_switched = False
+        try:
+            release_intent = flow.prepare()
+            flow.load_candidate()
+            candidate_mode_details = flow.switch_alias_and_predictor()
+            alias_switched = True
+            cas_result = flow.commit_registry_cas(now=now)
+        except _ReleaseFlowError as exc:
+            recovery = flow.rollback(alias_switched=alias_switched)
+            return {
+                "accepted": False,
+                "code": exc.code,
+                "message": str(exc),
                 "ticket_id": str(ticket.get("ticket_id", "")),
-                "executor": normalized_executor,
-                "previous_champion_model_id": previous_champion_id,
-            },
-        )
-        ticket["compliance_update"] = compliance_update
-        updated_proposal["compliance_update"] = compliance_update
+                "release_flow_recovery": recovery,
+            }
+        except ModelRegistryCASConflictError as exc:
+            recovery = flow.rollback(alias_switched=alias_switched)
+            return {
+                "accepted": False,
+                "code": "registry_cas_conflict",
+                "message": str(exc),
+                "ticket_id": str(ticket.get("ticket_id", "")),
+                "release_flow_recovery": recovery,
+            }
+        except Exception as exc:
+            recovery = flow.rollback(alias_switched=alias_switched)
+            return {
+                "accepted": False,
+                "code": "release_flow_failed",
+                "message": f"two-phase release failed: {exc.__class__.__name__}: {exc}",
+                "ticket_id": str(ticket.get("ticket_id", "")),
+                "release_flow_recovery": recovery,
+            }
 
-        self._append_history(
-            history_attr="_learning_model_release_ticket_history",
-            latest_attr="_last_learning_model_release_ticket",
-            record=ticket,
-        )
+        try:
+            checklist = _normalize_checklist(ticket.get("checklist", []))
+            checklist = _set_checklist_flag(checklist, "release_window_confirmed", True)
+            checklist = _set_checklist_flag(checklist, "release_execution_completed", True)
+            checklist = _set_checklist_flag(checklist, "manual_confirmation_received", False)
+
+            confirmation_required = bool(service._config.evolution.release_confirmation_required)
+            confirmation_ttl_days = max(1, service._config.evolution.release_confirmation_ttl_days)
+            pending_confirmation = {
+                "required": confirmation_required,
+                "state": "pending" if confirmation_required else "not_required",
+                "due_at": (
+                    (now + timedelta(days=confirmation_ttl_days)).isoformat()
+                    if confirmation_required
+                    else ""
+                ),
+                "ttl_days": confirmation_ttl_days if confirmation_required else 0,
+                "confirmed_by": "",
+                "confirmed_at": "",
+                "confirmation_note": "",
+            }
+
+            executed_at = now.isoformat()
+            ticket["status"] = "executed"
+            ticket["executed_at"] = executed_at
+            ticket["checklist"] = checklist
+            ticket["execution"] = {
+                "executor": normalized_executor,
+                "timestamp": executed_at,
+                "note": note.strip(),
+                "source_trace_id": source_trace_id,
+            }
+            ticket["pending_confirmation"] = pending_confirmation
+            ticket["release_transition"] = {
+                "updated": True,
+                "records": [
+                    cas_result["promoted"],
+                    *cast(list[object], cas_result["demoted"]),
+                ],
+                "previous_champion_model_id": previous_champion_id,
+                "active_champion_model_id": shadow_model_id,
+                "mode": "two_phase_bundle_cas",
+            }
+            ticket["release_intent"] = release_intent
+            ticket["release_flow"] = {
+                "mode": "two_phase_bundle_cas",
+                "bundle_root": str(flow.bundle_root),
+                "bundle_content_hash": flow.content_hash,
+                "expected_previous_champion_model_id": flow.expected_previous_champion_id(),
+                "candidate_mode_details": {
+                    key: candidate_mode_details.get(key)
+                    for key in ("registry_model_id", "bundle_content_hash")
+                },
+            }
+
+            updated_proposal = self._append_learning_proposal_snapshot(
+                proposal=proposal,
+                update={
+                    "status": "executed",
+                    "release_state": (
+                        "pending_confirmation" if confirmation_required else "confirmed"
+                    ),
+                    "released_at": executed_at,
+                    "ticket": {
+                        "ticket_id": str(ticket.get("ticket_id", "")),
+                        "timestamp": executed_at,
+                        "operator": str(ticket.get("operator", "")),
+                        "status": "executed",
+                    },
+                    "release_execution": {
+                        "executor": normalized_executor,
+                        "timestamp": executed_at,
+                        "note": note.strip(),
+                        "previous_champion_model_id": previous_champion_id,
+                        "active_champion_model_id": shadow_model_id,
+                    },
+                },
+            )
+            compliance_update = self._write_learning_compliance_event(
+                state=ComplianceState.PROMOTED,
+                proposal=updated_proposal,
+                event_time=now,
+                trace_id=source_trace_id or f"learning-release-{ticket['ticket_id']}",
+                metadata={
+                    "ticket_id": str(ticket.get("ticket_id", "")),
+                    "executor": normalized_executor,
+                    "previous_champion_model_id": previous_champion_id,
+                },
+            )
+            ticket["compliance_update"] = compliance_update
+            updated_proposal["compliance_update"] = compliance_update
+
+            self._append_history(
+                history_attr="_learning_model_release_ticket_history",
+                latest_attr="_last_learning_model_release_ticket",
+                record=ticket,
+            )
+        except Exception as exc:
+            # 票据持久化失败：registry 可能已提交，必须整体回滚（fail-closed）。
+            recovery = flow.rollback(alias_switched=True)
+            service._record_audit_event(
+                event_type="learning_model_release_ticket_execute_rolled_back",
+                level="error",
+                trace_id=source_trace_id,
+                payload={
+                    "ticket_id": str(ticket.get("ticket_id", "")),
+                    "reason": f"{exc.__class__.__name__}: {exc}",
+                    "recovery": recovery,
+                },
+            )
+            return {
+                "accepted": False,
+                "code": "ticket_persistence_failed",
+                "message": (
+                    "release rolled back after persistence failure: "
+                    f"{exc.__class__.__name__}: {exc}"
+                ),
+                "ticket_id": str(ticket.get("ticket_id", "")),
+                "release_flow_recovery": recovery,
+            }
+
+        service._config.evolution.active_champion_id = shadow_model_id
         service._record_audit_event(
             event_type="learning_model_release_ticket_execute",
             trace_id=source_trace_id,
@@ -2110,3 +2192,260 @@ def _parse_iso_datetime(value: object) -> datetime | None:
         return datetime.fromisoformat(text)
     except ValueError:
         return None
+
+
+class _ReleaseFlowError(RuntimeError):
+    """两阶段发布中某一步的 fail-closed 失败（带机器可读 code）。"""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class _TwoPhaseReleaseExecutor:
+    """学习模型两阶段发布执行器（P0-a）。
+
+    六步协议：
+    ① 校验目标 bundle（可加载 + sidecar 完整 + 内容哈希与 registry 一致）；
+    ② 准备临时别名 JSON（sidecar 指向不可变 bundle 目录）+ 持久化 release intent；
+    ③ 从临时别名加载候选 predictor 并核对身份（不修改当前实例）——规避
+       reload_predictor 失败后留下空 predictor 的旧缺陷；
+    ④ os.replace() 原子切换别名 → 原子替换内存 predictor；
+    ⑤ champion 降级 + 目标晋级在单个 DuckDB 事务内以 expected-champion CAS 完成；
+    ⑥ 任一步失败按已完成步骤逆序恢复旧别名、旧 predictor、旧 registry 状态。
+    """
+
+    def __init__(
+        self,
+        *,
+        service: StockAnalyzerService,
+        target_entry: ModelRegistryRecord,
+        previous_champion: ModelRegistryRecord | None,
+        source_trace_id: str,
+    ) -> None:
+        self._service = service
+        self._target = target_entry
+        self._previous_champion = previous_champion
+        self._source_trace_id = source_trace_id
+        self._alias_path = Path(str(service._config.training.artifact_path)).expanduser()
+        self._temp_alias_path: Path | None = None
+        self._previous_alias_bytes: bytes | None = None
+        self._previous_predictor: SignalPredictor | None = None
+        self._candidate: SignalPredictor | None = None
+        self._registry_committed = False
+
+    @property
+    def content_hash(self) -> str:
+        return self._target.artifact_content_hash.strip()
+
+    @property
+    def _target_artifact_path(self) -> Path:
+        """目标工件的 JSON 路径：artifact_uri 可指向 bundle 目录或其中 JSON。"""
+
+        uri = Path(self._target.artifact_uri).expanduser().resolve()
+        return (uri / ARTIFACT_FILENAME) if uri.is_dir() else uri
+
+    @property
+    def bundle_root(self) -> Path:
+        return self._target_artifact_path.parent
+
+    def expected_previous_champion_id(self) -> str:
+        if self._previous_champion is None:
+            return ""
+        return self._previous_champion.model_id
+
+    def prepare(self) -> dict[str, object]:
+        """步骤①②：校验 bundle、写临时别名、持久化 release intent。"""
+
+        content_hash = self.content_hash
+        if not content_hash:
+            raise _ReleaseFlowError(
+                "target_bundle_not_content_addressed",
+                "target model has no artifact_content_hash; "
+                "register it through the content-addressed bundle flow first",
+            )
+        artifact_path = self._target_artifact_path
+        try:
+            verify_artifact_integrity(artifact_path, expected_content_hash=content_hash)
+        except BundleIntegrityError as exc:
+            raise _ReleaseFlowError("target_bundle_integrity_failed", str(exc)) from exc
+
+        # 晋级有效性门（P1-b）：对候选评估产物做口径与有限性检查，
+        # blocking 命中一律拒绝发布（fail-closed）。
+        candidate_artifact = ModelArtifact.load(artifact_path)
+        raw_dedup_quality = candidate_artifact.metadata.get("dataset_dedup_quality")
+        dedup_quality = raw_dedup_quality if isinstance(raw_dedup_quality, Mapping) else None
+        validity_report = self._evaluate_candidate_validity(
+            metrics_summary=candidate_artifact.training_metrics,
+            dedup_quality=dedup_quality,
+        )
+        if not validity_report.valid:
+            raise _ReleaseFlowError(
+                "promotion_validity_failed",
+                "candidate evaluation failed promotion validity gate: "
+                + ", ".join(validity_report.blocking_reasons),
+            )
+
+        alias_payload = build_release_alias_payload(
+            bundle_root=self.bundle_root,
+            registry_model_id=self._target.model_id,
+            content_hash=content_hash,
+            alias_parent=self._alias_path.parent,
+        )
+        self._alias_path.parent.mkdir(parents=True, exist_ok=True)
+        self._temp_alias_path = self._alias_path.parent / (
+            f".release_alias_{uuid.uuid4().hex}.tmp"
+        )
+        self._temp_alias_path.write_text(
+            json.dumps(alias_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        intent: dict[str, object] = {
+            "target_model_id": self._target.model_id,
+            "bundle_root": str(self.bundle_root),
+            "bundle_content_hash": content_hash,
+            "expected_previous_champion_model_id": self.expected_previous_champion_id(),
+            "alias_path": str(self._alias_path),
+            "promotion_validity": validity_report.to_dict(),
+        }
+        self._service._record_audit_event(
+            event_type="learning_release_intent",
+            trace_id=self._source_trace_id,
+            payload=intent,
+        )
+        return intent
+
+    def load_candidate(self) -> SignalPredictor:
+        """步骤③：从临时别名加载候选 predictor 并核对身份与推理安全门。"""
+
+        if self._temp_alias_path is None:
+            raise _ReleaseFlowError("release_flow_not_prepared", "prepare() must run first")
+        candidate = SignalPredictor.load(self._temp_alias_path)
+        metadata = candidate.artifact_metadata
+        identity_ok = str(metadata.get("registry_model_id", "")) == self._target.model_id
+        hash_ok = (
+            str(metadata.get("bundle_content_hash", "")).strip().lower() == self.content_hash
+        )
+        if not identity_ok or not hash_ok:
+            raise _ReleaseFlowError(
+                "candidate_identity_mismatch",
+                "candidate predictor metadata does not match registry record: "
+                f"registry_model_id_match={identity_ok} content_hash_match={hash_ok}",
+            )
+        blocked_reason = candidate.inference_blocked_reason()
+        if blocked_reason:
+            raise _ReleaseFlowError(
+                "candidate_inference_blocked",
+                f"candidate predictor refused production inference: {blocked_reason}",
+            )
+        self._candidate = candidate
+        return candidate
+
+    def switch_alias_and_predictor(self) -> dict[str, object]:
+        """步骤④：os.replace 原子切换别名 + 原子替换内存 predictor。"""
+
+        if self._candidate is None:
+            raise _ReleaseFlowError(
+                "release_flow_candidate_missing", "load_candidate() must run first"
+            )
+        self._previous_alias_bytes = (
+            self._alias_path.read_bytes() if self._alias_path.exists() else None
+        )
+        pipeline = getattr(self._service, "_pipeline", None)
+        self._previous_predictor = getattr(pipeline, "_predictor", None)
+        if self._temp_alias_path is None:
+            raise _ReleaseFlowError("release_flow_not_prepared", "temp alias missing")
+        os.replace(self._temp_alias_path, self._alias_path)
+        mode_details: dict[str, object] = {}
+        if pipeline is not None:
+            mode_details = pipeline.swap_predictor(self._candidate)
+        return mode_details
+
+    def commit_registry_cas(self, *, now: datetime) -> dict[str, object]:
+        """步骤⑤：单事务 expected-champion CAS 完成 champion 降级 + 目标晋级。"""
+
+        promoted, demoted = self._service._model_registry.promote_model_with_cas(
+            target_model_id=self._target.model_id,
+            expected_previous_champion_id=self.expected_previous_champion_id(),
+            now=now,
+        )
+        self._registry_committed = True
+        return {
+            "promoted": promoted.model_dump(mode="json"),
+            "demoted": [record.model_dump(mode="json") for record in demoted],
+        }
+
+    def _evaluate_candidate_validity(
+        self,
+        *,
+        metrics_summary: Mapping[str, float],
+        dedup_quality: Mapping[str, object] | None,
+    ) -> PromotionValidityReport:
+        """有效性门入口（独立方法便于故障注入测试）。"""
+
+        return evaluate_promotion_validity(
+            metrics_summary=metrics_summary,
+            dedup_quality=dedup_quality,
+        )
+
+    def rollback(self, *, alias_switched: bool) -> dict[str, object]:
+        """步骤⑥失败恢复：逆序还原 predictor、别名与 registry 状态。"""
+
+        recovery: dict[str, object] = {
+            "alias_restored": False,
+            "predictor_restored": False,
+            "registry_restored": False,
+        }
+        pipeline = getattr(self._service, "_pipeline", None)
+        if alias_switched:
+            # 先还原内存 predictor（直接用旧实例，不依赖磁盘）。
+            if pipeline is not None and self._previous_predictor is not None:
+                pipeline.swap_predictor(self._previous_predictor)
+                recovery["predictor_restored"] = True
+            # 再还原磁盘别名。
+            try:
+                if self._previous_alias_bytes is None:
+                    try:
+                        self._alias_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                else:
+                    restore_tmp = self._alias_path.parent / (
+                        f".rollback_alias_{uuid.uuid4().hex}.tmp"
+                    )
+                    restore_tmp.write_bytes(self._previous_alias_bytes)
+                    os.replace(restore_tmp, self._alias_path)
+                recovery["alias_restored"] = True
+            except OSError as exc:
+                logger.error("release rollback failed to restore alias: %s", exc)
+            # 旧实例不存在（发布前本无 predictor）时从恢复后的磁盘别名重载。
+            if pipeline is not None and self._previous_predictor is None:
+                pipeline.reload_predictor()
+                recovery["predictor_restored"] = True
+        if self._registry_committed:
+            # 补偿事务：旧 champion 升回、目标降级（CAS 期望值对调）。
+            if self._previous_champion is None:
+                logger.error(
+                    "release rollback cannot compensate: registry committed without a "
+                    "previous champion; manual registry repair required (target=%s)",
+                    self._target.model_id,
+                )
+            else:
+                try:
+                    self._service._model_registry.promote_model_with_cas(
+                        target_model_id=self._previous_champion.model_id,
+                        expected_previous_champion_id=self._target.model_id,
+                        now=datetime.now(),
+                    )
+                    self._registry_committed = False
+                    recovery["registry_restored"] = True
+                except Exception as exc:
+                    logger.error(
+                        "release rollback failed to restore registry roles: %s", exc
+                    )
+        if self._temp_alias_path is not None and self._temp_alias_path.exists():
+            try:
+                self._temp_alias_path.unlink()
+            except OSError:
+                pass
+        return recovery

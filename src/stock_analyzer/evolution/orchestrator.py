@@ -456,6 +456,9 @@ class OffhoursEvolutionOrchestrator:
                     "loaded_samples": rollback_input["loaded_samples"],
                     "m11_status": rollback_input["m11_status"],
                     "observed_days": rollback_context.observed_days,
+                    # 事件日口径（entry/exit 去重天数）是回滚判定的优先输入；
+                    # 0 表示观测缺日期、已回退旧行数口径。
+                    "observed_event_days": rollback_context.observed_event_days,
                     "trade_count": rollback_context.trade_count,
                     "consecutive_soft_days": rollback_context.consecutive_soft_days,
                     "consecutive_hard_days": rollback_context.consecutive_hard_days,
@@ -892,6 +895,7 @@ class OffhoursEvolutionOrchestrator:
                 drawdown_delta_limit=self._config.m11_drawdown_delta_limit,
                 tail_loss_delta_limit=self._config.m11_tail_loss_delta_limit,
                 execution_divergence_limit=self._config.m11_execution_divergence_limit,
+                m11_max_positions=self._config.m11_max_positions,
             )
 
             checkpoints.extend(
@@ -1588,6 +1592,7 @@ class OffhoursEvolutionOrchestrator:
             drawdown_delta_limit=self._config.m11_drawdown_delta_limit,
             tail_loss_delta_limit=self._config.m11_tail_loss_delta_limit,
             execution_divergence_limit=self._config.m11_execution_divergence_limit,
+            m11_max_positions=self._config.m11_max_positions,
         )
         checkpoints.append(
             ManifestCheckpoint(
@@ -3200,7 +3205,9 @@ def _gate_reason_codes(value: object) -> list[str]:
     return _dedupe_strings([str(item) for item in raw_reasons if isinstance(item, str)])
 
 
-def _summarize_intraday_loader_records(records: Sequence[Mapping[str, object]]) -> dict[str, object]:
+def _summarize_intraday_loader_records(
+    records: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
     total = len(records)
     intraday_1m_records = sum(
         1 for record in records if _record_has_intraday_context(record, prefix="intraday_1m")
@@ -3255,9 +3262,18 @@ def _build_rollback_context_from_m11(
     )
     hard_floor = min(-0.001, -0.10 * max(shadow_vol, 0.001))
     hard_days = _trailing_condition_streak(diff_returns, threshold=hard_floor)
+    # 事件日并集（P1-b）：入场/退出日期归一后的去重天数；观测缺日期时退回
+    # 旧行数口径并在事件输入中标注。
+    event_dates: set[str] = set()
+    for observation in observations:
+        if observation.trade_date:
+            event_dates.add(observation.trade_date[:10])
+        if observation.label_mature_time:
+            event_dates.add(observation.label_mature_time[:10])
     context = RollbackContext(
         trade_count=trade_count,
         observed_days=len(diff_returns),
+        observed_event_days=len(event_dates),
         consecutive_soft_days=soft_days,
         consecutive_hard_days=hard_days,
     )

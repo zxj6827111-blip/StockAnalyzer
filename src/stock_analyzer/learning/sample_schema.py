@@ -208,6 +208,18 @@ class DatasetManifest(_StrictModel):
     fidelity_breakdown: dict[str, int] = Field(default_factory=dict)
     dropped_reason_breakdown: dict[str, int] = Field(default_factory=dict)
     split_plan: list[DatasetSplitPlanEntry] = Field(default_factory=list)
+    # —— schema v2 去重与质量字段（v1 记录保持默认空值）——
+    dedup_key: str = ""
+    dedup_rule: str = ""
+    rows_before_dedup: int = 0
+    rows_dropped_by_dedup: int = 0
+    # blocking：trainer 必须 fail-closed 拒绝训练；warning：仅记录。
+    blocking_quality_flags: list[str] = Field(default_factory=list)
+    warning_quality_flags: list[str] = Field(default_factory=list)
+    # manifest 生成期质量门；与去重质量旗标分离，便于审计具体阻断原因。
+    manifest_quality_flags: list[str] = Field(default_factory=list)
+    test_split_window_days: int = 0
+    test_split_unique_symbol_dates: int = 0
     generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     @field_validator(
@@ -233,3 +245,33 @@ class DatasetManifest(_StrictModel):
         if parsed < 0:
             raise ValueError("count fields must be >= 0")
         return parsed
+
+    @field_validator("rows_before_dedup", "rows_dropped_by_dedup")
+    @classmethod
+    def _validate_non_negative_dedup_counts(cls, value: int) -> int:
+        parsed = int(value)
+        if parsed < 0:
+            raise ValueError("dedup count fields must be >= 0")
+        return parsed
+
+    @field_validator("test_split_window_days", "test_split_unique_symbol_dates")
+    @classmethod
+    def _validate_non_negative_test_quality_counts(cls, value: int) -> int:
+        parsed = int(value)
+        if parsed < 0:
+            raise ValueError("test split quality counts must be >= 0")
+        return parsed
+
+    @field_validator(
+        "blocking_quality_flags",
+        "warning_quality_flags",
+        "manifest_quality_flags",
+    )
+    @classmethod
+    def _normalize_quality_flags(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for item in value:
+            text = str(item).strip()
+            if text and text not in normalized:
+                normalized.append(text)
+        return normalized

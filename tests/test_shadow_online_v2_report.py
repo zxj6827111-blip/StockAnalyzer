@@ -98,7 +98,13 @@ def test_shadow_online_v2_report_builder_produces_return_calibration_and_executi
     assert report.champion_model_id == champion_record.model_id
     assert report.status == "updated"
     assert len(report.rows) >= 1
-    assert "shadow_v2_cum_return" in report.return_summary
+    assert "legacy_shadow_v2_cum_return" in report.return_summary
+    assert report.return_summary["dedup_row_count"] == len(report.rows)
+    assert report.return_summary["duplicate_row_count"] == 0
+    assert report.return_summary["cum_return_suspect"] is False
+    # slot 口径是主口径：必须同时透出 slot 键与生效的仓位上限。
+    assert "shadow_v2_slot_return" in report.return_summary
+    assert report.return_summary["slot_max_positions"] >= 1
     assert set(report.calibration_summary.keys()) == {"champion", "shadow", "shadow_v2"}
     assert len(report.calibration_summary["shadow_v2"]) == 5
     assert "shadow_v2_signal_divergence_ratio" in report.execution_summary
@@ -204,6 +210,8 @@ def _build_learning_protocol_fixture(
     config.training.validation_ratio = 0.2
     config.training.calibration_ratio = 0.1
     config.training.test_ratio = 0.1
+    config.training.min_test_split_window_days = 1
+    config.training.min_test_split_unique_symbol_dates = 1
 
     store = SampleStore(db_path=tmp_path / "sample_store.duckdb")
     feature_registry = FeatureSchemaRegistry(db_path=tmp_path / "feature_schema.duckdb")
