@@ -303,7 +303,7 @@ def main() -> int:
         )
         training_payload = service.train_learning_manifest(
             dataset_manifest_id=manifest_id,
-            load_predictor=True,
+            load_predictor=False,
             register_model=True,
         )
         result["steps"]["train_learning_manifest"] = training_payload
