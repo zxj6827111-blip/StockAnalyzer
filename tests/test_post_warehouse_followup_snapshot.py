@@ -38,6 +38,7 @@ class _FakeService:
 
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.train_kwargs: dict[str, object] = {}
 
     def run_week5_scan(self, **kwargs: object) -> dict[str, object]:
         self.calls.append("run_week5_scan")
@@ -55,7 +56,8 @@ class _FakeService:
 
     def train_learning_manifest(self, **kwargs: object) -> dict[str, object]:
         self.calls.append("train_learning_manifest")
-        return {"ok": True, "artifact_path": "/tmp/model.bin", "predictor_loaded": True,
+        self.train_kwargs = dict(kwargs)
+        return {"ok": True, "artifact_path": "/tmp/model.bin", "predictor_loaded": False,
                 "model_registry": {"registered": True, "model_id": "model-1"}}
 
     def build_phase_d_tabular_deep_report(self, **kwargs: object) -> dict[str, object]:
@@ -101,6 +103,7 @@ def test_main_step_order_feature_snapshot_preflight_then_scan(
     assert step_keys.index("build_feature_snapshot") < step_keys.index("data_preflight")
     assert step_keys.index("data_preflight") < step_keys.index("week5_scan")
     assert fake_service.calls[0] == "run_week5_scan"
+    assert fake_service.train_kwargs["load_predictor"] is False
 
 
 def test_main_preflight_blocked_skips_scan(

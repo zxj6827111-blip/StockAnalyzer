@@ -55,5 +55,11 @@ staging/idle_cache/
 tmp_*
 .workbuddy/
 
-# ZCode 辅助脚本（含本地 NAS SSH 凭据，不入库）
+# ZCode 辅助脚本
 .zcode/
+
+# NAS 诊断一次性脚本（可能含 SSH 凭据，绝不入库）
+.tmp_*.py
+
+# 构建/重训产物
+*.bundle
