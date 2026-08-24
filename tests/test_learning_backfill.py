@@ -1198,3 +1198,52 @@ def test_service_train_learning_manifest_returns_quality_flags_before_training(
         "reason": "manifest_quality_gate_failed",
     }
     assert registry["records"] == 0
+
+
+def test_service_train_learning_manifest_recomputes_quality_for_legacy_manifest(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config(tmp_path)
+    config.training.min_test_split_window_days = 1
+    config.training.min_test_split_unique_symbol_dates = 1
+    service = StockAnalyzerService(config=config)
+    _seed_projection_compatible_trainable_samples(
+        config=config,
+        store=service._sample_store,
+        feature_registry=service._feature_schema_registry,
+        label_registry=service._label_policy_registry,
+        symbol="600000.SH",
+    )
+
+    manifest_payload = _as_mapping(
+        service.build_learning_trainable_manifest(symbols=["600000"])
+    )
+    manifest = service._sample_store.get_manifest(
+        str(manifest_payload["dataset_manifest_id"])
+    )
+    assert manifest is not None
+    assert manifest.manifest_quality_flags == []
+
+    # Simulate a legacy manifest whose stored quality fields predate the
+    # current production thresholds.
+    config.training.min_test_split_window_days = 100
+    config.training.min_test_split_unique_symbol_dates = 100
+    payload = _as_mapping(
+        service.train_learning_manifest(
+            dataset_manifest_id=str(manifest_payload["dataset_manifest_id"]),
+            register_model=True,
+        )
+    )
+
+    assert payload["ok"] is False
+    assert set(payload["manifest_quality_flags"]) == {
+        "test_window_too_narrow",
+        "test_coverage_insufficient",
+    }
+    assert int(payload["test_split_window_days"]) < 100
+    assert int(payload["test_split_unique_symbol_dates"]) < 100
+    assert payload["model_registry"] == {
+        "registered": False,
+        "reason": "manifest_quality_gate_failed",
+    }
+    assert not Path(str(payload["artifact_path"])).exists()
