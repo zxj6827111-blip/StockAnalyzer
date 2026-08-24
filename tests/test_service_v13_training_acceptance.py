@@ -81,6 +81,9 @@ def _load_test_config(base_dir: Path | None = None) -> StockAnalyzerConfig:
     config.labels.horizon_days = 2
     temp_root = base_dir or Path(tempfile.mkdtemp(prefix="stock_analyzer_tests_"))
     config.training.bootstrap_state_path = str(temp_root / "test_bootstrap_state_v13.json")
+    config.training.model_archive_dir = str(temp_root / "model_archive")
+    config.training.min_test_split_window_days = 1
+    config.training.min_test_split_unique_symbol_dates = 1
     return config
 
 
@@ -134,7 +137,8 @@ def _seed_learning_protocol_samples(
             outcome = OutcomeRecord(
                 snapshot_id=snapshot.snapshot_id,
                 maturity_status=MaturityStatus.RECONCILED,
-                label_mature_time=decision_time + timedelta(days=service._config.labels.horizon_days),
+                label_mature_time=decision_time
+                + timedelta(days=service._config.labels.horizon_days),
                 realized_return=0.08 if row_index % 2 == 0 else -0.05,
                 max_favorable_excursion=0.09 if row_index % 2 == 0 else 0.01,
                 max_adverse_excursion=-0.01 if row_index % 2 == 0 else -0.07,

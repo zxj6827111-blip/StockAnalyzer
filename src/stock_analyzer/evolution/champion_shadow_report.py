@@ -6,13 +6,17 @@ import hashlib
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
 
 from stock_analyzer.evolution.modules.m11_shadow_loader import M11ShadowObservation
 from stock_analyzer.evolution.modules.m11_shadow_portfolio import evaluate_m11_shadow_portfolio
-from stock_analyzer.evolution.shadow_dataset_builder import ShadowDatasetBuilder
+from stock_analyzer.evolution.shadow_dataset_builder import (
+    ShadowDatasetBuilder,
+    ShadowDatasetRow,
+)
 from stock_analyzer.learning.feature_schema_registry import FeatureSchemaRegistry
 from stock_analyzer.learning.label_policy_registry import LabelPolicyRegistry
 from stock_analyzer.learning.sample_store import SampleStore
@@ -139,7 +143,9 @@ class ChampionShadowComparisonReport:
             "summary_metrics": dict(self.summary_metrics),
             "champion_predictor_mode": dict(self.champion_predictor_mode),
             "shadow_predictor_mode": dict(self.shadow_predictor_mode),
+            "dedup_row_count": int(self.summary_metrics.get("dedup_row_count", 0.0)),
             "duplicate_row_count": int(self.summary_metrics.get("duplicate_row_count", 0.0)),
+            "cum_return_suspect": bool(self.summary_metrics.get("cum_return_suspect", False)),
             "preview": [row.preview_dict() for row in self.rows[: max(1, int(preview_limit))]],
         }
         if include_rows:
@@ -204,14 +210,16 @@ class ChampionShadowReportBuilder:
         rows: list[ChampionShadowComparisonRow] = []
         m11_observations: list[M11ShadowObservation] = []
         split_counts: dict[str, int] = {}
-        duplicate_row_count = 0
-        seen_logical_keys: set[tuple[str, str, str, str]] = set()
+        dataset_rows, duplicate_row_count = _deduplicate_shadow_dataset_rows(
+            shadow_dataset.rows
+        )
+        dedup_row_count = len(dataset_rows)
         meta_deltas: list[float] = []
         meta_abs_deltas: list[float] = []
         champion_probs: list[float] = []
         shadow_probs: list[float] = []
 
-        for dataset_row in shadow_dataset.rows:
+        for dataset_row in dataset_rows:
             snapshot = raw_snapshots.get(dataset_row.snapshot_id)
             if snapshot is None:
                 raise ValueError(f"snapshot missing for comparison row: {dataset_row.snapshot_id}")
@@ -224,21 +232,11 @@ class ChampionShadowReportBuilder:
             champion_signal = int(champion_meta >= threshold)
             shadow_signal = int(shadow_meta >= threshold)
             realized_return = float(dataset_row.realized_return or 0.0)
-            logical_key = (
-                dataset_row.symbol,
-                dataset_row.strategy,
-                dataset_row.decision_time.date().isoformat(),
-                dataset_row.split_name,
-            )
-            if logical_key in seen_logical_keys:
-                duplicate_row_count += 1
-                continue
-            seen_logical_keys.add(logical_key)
             comparison_row = ChampionShadowComparisonRow(
                 snapshot_id=dataset_row.snapshot_id,
                 symbol=dataset_row.symbol,
                 strategy=dataset_row.strategy,
-                trade_date=dataset_row.decision_time.date().isoformat(),
+                trade_date=_shanghai_trade_date(dataset_row.decision_time),
                 decision_time=dataset_row.decision_time.isoformat(),
                 label_mature_time=(
                     dataset_row.label_mature_time.isoformat()
@@ -304,7 +302,7 @@ class ChampionShadowReportBuilder:
         test_rows = [row for row in rows if row.split_name == "test"]
         test_trade_dates = sorted({row.trade_date for row in test_rows if row.trade_date})
         test_logical_keys = {
-            f"{row.symbol}|{row.strategy}|{row.trade_date}"
+            f"{row.symbol}|{row.trade_date}"
             for row in test_rows
             if row.trade_date
         }
@@ -318,7 +316,9 @@ class ChampionShadowReportBuilder:
             "shadow_mean_p_meta": _safe_mean(shadow_probs),
             "champion_positive_rate": _safe_mean([float(row.champion_signal) for row in rows]),
             "shadow_positive_rate": _safe_mean([float(row.shadow_signal) for row in rows]),
+            "dedup_row_count": float(dedup_row_count),
             "duplicate_row_count": float(duplicate_row_count),
+            "cum_return_suspect": bool(duplicate_row_count > 0),
             # —— 晋级硬门（P1-b）测试段统计：与 include_rows 无关始终暴露 ——
             "test_unique_trade_dates": float(len(test_trade_dates)),
             "test_unique_logical_samples": float(len(test_logical_keys)),
@@ -349,6 +349,9 @@ class ChampionShadowReportBuilder:
                 "score": float(m11_result.score),
                 "status": m11_result.status,
                 "redlines": dict(m11_result.redlines),
+                "dedup_row_count": dedup_row_count,
+                "duplicate_row_count": duplicate_row_count,
+                "cum_return_suspect": duplicate_row_count > 0,
                 "metrics": {
                     "valid_samples": int(m11_result.metrics.valid_samples),
                     "champion_cum_return": float(m11_result.metrics.champion_cum_return),
@@ -475,6 +478,34 @@ def _safe_mean(values: Sequence[float]) -> float:
     if not values:
         return 0.0
     return round(float(sum(values) / len(values)), 6)
+
+
+def _shanghai_trade_date(value: datetime) -> str:
+    return (value + timedelta(hours=8)).date().isoformat()
+
+
+def _deduplicate_shadow_dataset_rows(
+    rows: Sequence[ShadowDatasetRow],
+) -> tuple[list[ShadowDatasetRow], int]:
+    """Keep the maximum manifest ordinal for each symbol and Shanghai trade day."""
+
+    best: dict[tuple[str, str], ShadowDatasetRow] = {}
+    for row in rows:
+        key = (row.symbol, _shanghai_trade_date(row.decision_time))
+        current = best.get(key)
+        if current is None or (
+            int(row.ordinal), row.decision_time, row.snapshot_id
+        ) > (
+            int(current.ordinal),
+            current.decision_time,
+            current.snapshot_id,
+        ):
+            best[key] = row
+    kept = sorted(
+        best.values(),
+        key=lambda row: (int(row.ordinal), row.decision_time, row.snapshot_id),
+    )
+    return kept, len(rows) - len(kept)
 
 
 def _build_report_id(

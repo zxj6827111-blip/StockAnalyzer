@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timedelta
 
 from stock_analyzer.learning.feature_schema_registry import FeatureSchemaRegistry
@@ -25,10 +25,10 @@ _DEFAULT_MATURITY_STATUSES = (
     MaturityStatus.FULLY_MATURED,
 )
 
-# schema v2 去重契约：NAS 实测 (symbol, strategy, decision_date) 大面积重复
-# （5387 组/72916 行，单键最多 75+），重复源于同日反复 pipeline_run_once 写入。
-DEDUP_KEY = "symbol+strategy+decision_date_sh"
-DEDUP_RULE = "keep_first_by_decision_time"
+# schema v2 去重契约：同一股票同一交易日只允许一条样本，保留最新快照。
+# “最新”按构建前的稳定 ordinal（decision_time、created_at、snapshot_id）取最大值。
+DEDUP_KEY = "symbol+trade_date"
+DEDUP_RULE = "keep_max_ordinal_latest_snapshot"
 # 去重丢弃占比超过该阈值视为 blocking（数据集以重复为主，训练无意义）。
 _DUPLICATE_DOMINANCE_RATIO = 0.5
 _MANIFEST_SCHEMA_VERSION = "2"
@@ -64,6 +64,8 @@ class DatasetManifestBuilder:
         calibration_ratio: float = 0.1,
         test_ratio: float = 0.1,
         embargo_days: int = 0,
+        min_test_split_window_days: int = 0,
+        min_test_split_unique_symbol_dates: int = 0,
     ) -> DatasetManifest:
         """Create or reuse one deterministic manifest and persist its membership.
 
@@ -121,6 +123,12 @@ class DatasetManifestBuilder:
             test_ratio=test_ratio,
             embargo_days=embargo_days,
         )
+        manifest_quality = build_manifest_quality_report(
+            item_blueprints=item_blueprints,
+            snapshots={snapshot.snapshot_id: snapshot for snapshot, _ in deduped_pairs},
+            min_test_split_window_days=min_test_split_window_days,
+            min_test_split_unique_symbol_dates=min_test_split_unique_symbol_dates,
+        )
         selection_rule = (
             sample_selection_rule.strip()
             or _build_selection_rule(
@@ -147,13 +155,15 @@ class DatasetManifestBuilder:
             fidelity_filter=normalized_fidelity,
             snapshot_ids=normalized_snapshot_ids,
             item_blueprints=item_blueprints,
+            min_test_split_window_days=min_test_split_window_days,
+            min_test_split_unique_symbol_dates=min_test_split_unique_symbol_dates,
         )
         manifest_items = [
             DatasetManifestItem(
                 dataset_manifest_id=manifest_id,
                 snapshot_id=item_blueprint["snapshot_id"],
                 split_name=item_blueprint["split_name"],
-                ordinal=int(item_blueprint["ordinal"]),
+                ordinal=_as_int(item_blueprint.get("ordinal")),
                 decision_time=item_blueprint["decision_time"],
             )
             for item_blueprint in item_blueprints
@@ -181,6 +191,13 @@ class DatasetManifestBuilder:
             rows_dropped_by_dedup=dedup_stats["rows_dropped"],
             blocking_quality_flags=blocking_flags,
             warning_quality_flags=warning_flags,
+            manifest_quality_flags=_as_str_list(manifest_quality.get("flags")),
+            test_split_window_days=_as_int(
+                manifest_quality.get("test_split_window_days")
+            ),
+            test_split_unique_symbol_dates=_as_int(
+                manifest_quality.get("test_split_unique_symbol_dates")
+            ),
         )
 
         existing = self._store.get_manifest(manifest.dataset_manifest_id)
@@ -353,38 +370,35 @@ def _build_grouped_split_and_purge(
 def _deduplicate_by_trading_day(
     included_pairs: Sequence[tuple[SignalSnapshot, OutcomeRecord]],
 ) -> tuple[list[tuple[SignalSnapshot, OutcomeRecord]], dict[str, int]]:
-    """按 (symbol, strategy, decision_date_sh) 去重，保留最早快照。
+    """按 (symbol, trade_date) 去重，保留稳定 ordinal 最大的最新快照。
 
-    decision_date 取 decision_time + 8h（Asia/Shanghai 固定偏移，无夏令时）的
-    日历日；同键多条时保留 decision_time 最早的一条（平局取 snapshot_id 最小，
-    保证确定性）。重复行多为同日反复 pipeline_run_once 写入、outcome 完全
-    相同（见 NAS 8/23 诊断），保留首条即可代表当日决策。
+    先按时间与 snapshot_id 建立稳定 ordinal，再对同一 symbol-day 取最大
+    ordinal。这样跨 strategy 的同日重复也会被压缩，manifest 与报告拥有同一
+    个样本身份边界。
     """
 
     if not included_pairs:
         return [], {"rows_before": 0, "rows_dropped": 0}
-    best: dict[tuple[str, str, date], tuple[SignalSnapshot, OutcomeRecord]] = {}
-    for snapshot, outcome in included_pairs:
-        decision_date_sh = _decision_date_shanghai(snapshot.decision_time)
-        key = (snapshot.symbol, snapshot.strategy, decision_date_sh)
+    ordered_pairs = sorted(
+        included_pairs,
+        key=lambda pair: (
+            pair[0].decision_time,
+            pair[0].created_at,
+            pair[0].snapshot_id,
+        ),
+    )
+    best: dict[
+        tuple[str, date],
+        tuple[int, tuple[SignalSnapshot, OutcomeRecord]],
+    ] = {}
+    for ordinal, pair in enumerate(ordered_pairs):
+        snapshot, _outcome = pair
+        key = (snapshot.symbol, _decision_date_shanghai(snapshot.decision_time))
         current = best.get(key)
-        candidate_order = (
-            snapshot.decision_time,
-            snapshot.created_at,
-            snapshot.snapshot_id,
-        )
-        if current is None:
-            best[key] = (snapshot, outcome)
-            continue
-        current_order = (
-            current[0].decision_time,
-            current[0].created_at,
-            current[0].snapshot_id,
-        )
-        if candidate_order < current_order:
-            best[key] = (snapshot, outcome)
+        if current is None or ordinal > current[0]:
+            best[key] = (ordinal, pair)
     kept = sorted(
-        best.values(),
+        (pair for _ordinal, pair in best.values()),
         key=lambda pair: (pair[0].decision_time, pair[0].snapshot_id),
     )
     rows_before = len(included_pairs)
@@ -418,6 +432,55 @@ def _dedup_quality_flags(
     if rows_dropped > 0:
         warning.append("duplicate_rows_present")
     return blocking, warning
+
+
+def build_manifest_quality_report(
+    *,
+    item_blueprints: Sequence[Mapping[str, object]],
+    snapshots: Mapping[str, SignalSnapshot],
+    min_test_split_window_days: int,
+    min_test_split_unique_symbol_dates: int,
+) -> dict[str, object]:
+    """Calculate manifest-generation quality gates from the final membership."""
+
+    test_items = [
+        item
+        for item in item_blueprints
+        if str(item.get("split_name", "")).strip().lower() == "test"
+    ]
+    test_snapshots = [
+        snapshots[str(item.get("snapshot_id", ""))]
+        for item in test_items
+        if str(item.get("snapshot_id", "")) in snapshots
+    ]
+    test_trade_dates = [
+        _decision_date_shanghai(snapshot.decision_time)
+        for snapshot in test_snapshots
+    ]
+    if test_trade_dates:
+        window_days = (max(test_trade_dates) - min(test_trade_dates)).days + 1
+    else:
+        window_days = 0
+    unique_symbol_dates = len(
+        {
+            (snapshot.symbol, _decision_date_shanghai(snapshot.decision_time))
+            for snapshot in test_snapshots
+        }
+    )
+    flags: list[str] = []
+    min_window = max(0, int(min_test_split_window_days))
+    min_coverage = max(0, int(min_test_split_unique_symbol_dates))
+    if min_window > 0 and window_days < min_window:
+        flags.append("test_window_too_narrow")
+    if min_coverage > 0 and unique_symbol_dates < min_coverage:
+        flags.append("test_coverage_insufficient")
+    return {
+        "flags": flags,
+        "test_split_window_days": window_days,
+        "test_split_unique_symbol_dates": unique_symbol_dates,
+        "min_test_split_window_days": min_window,
+        "min_test_split_unique_symbol_dates": min_coverage,
+    }
 
 
 def _manifest_item(snapshot: SignalSnapshot, split_name: str, ordinal: int) -> dict[str, object]:
@@ -597,6 +660,8 @@ def _build_dataset_manifest_id(
     fidelity_filter: Sequence[BackfillFidelityTier],
     snapshot_ids: Sequence[str],
     item_blueprints: Sequence[dict[str, object]],
+    min_test_split_window_days: int = 0,
+    min_test_split_unique_symbol_dates: int = 0,
 ) -> str:
     payload = {
         "schema_version": schema_version,
@@ -612,11 +677,15 @@ def _build_dataset_manifest_id(
         "time_window_end": time_window_end.isoformat() if time_window_end else "",
         "fidelity_filter": [item.value for item in fidelity_filter],
         "snapshot_ids": list(snapshot_ids),
+        "min_test_split_window_days": max(0, int(min_test_split_window_days)),
+        "min_test_split_unique_symbol_dates": max(
+            0, int(min_test_split_unique_symbol_dates)
+        ),
         "items": [
             {
                 "snapshot_id": str(item.get("snapshot_id", "")),
                 "split_name": str(item.get("split_name", "")),
-                "ordinal": int(item.get("ordinal", 0)),
+                "ordinal": _as_int(item.get("ordinal")),
             }
             for item in item_blueprints
         ],
@@ -624,6 +693,18 @@ def _build_dataset_manifest_id(
     serialized = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
     return f"dataset_manifest_v{schema_version}_{digest[:12]}"
+
+
+def _as_int(value: object, default: int = 0) -> int:
+    if isinstance(value, (int, float, str, bytes, bytearray)):
+        return int(value)
+    return default
+
+
+def _as_str_list(value: object) -> list[str]:
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [str(item) for item in value]
+    return []
 
 
 def _normalize_fidelity_filter(

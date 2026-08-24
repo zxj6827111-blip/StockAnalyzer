@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import shutil
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import TypeAlias
+from typing import TypeAlias, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -187,6 +188,14 @@ class ModelTrainer:
             calibration_ratio=max(0.0, float(self._training.calibration_ratio)),
             test_ratio=max(0.0, float(self._training.test_ratio)),
             embargo_days=max(0, int(self._labels.horizon_days) + self._settlement_lag_days),
+            min_test_split_window_days=max(
+                0,
+                int(self._training.min_test_split_window_days),
+            ),
+            min_test_split_unique_symbol_dates=max(
+                0,
+                int(self._training.min_test_split_unique_symbol_dates),
+            ),
         )
         return self.train_on_dataset_manifest(
             store=store,
@@ -219,6 +228,15 @@ class ModelTrainer:
             raise ValueError(
                 "dataset manifest blocked by quality flags "
                 f"{sorted(blocking_flags)}: {manifest.dataset_manifest_id}"
+            )
+        manifest_quality_flags = list(
+            getattr(manifest, "manifest_quality_flags", []) or []
+        )
+        if manifest_quality_flags:
+            # Reject low-coverage test splits before any model fitting occurs.
+            raise ValueError(
+                "dataset manifest blocked by manifest quality flags "
+                f"{sorted(manifest_quality_flags)}: {manifest.dataset_manifest_id}"
             )
         manifest_items = store.list_manifest_items(manifest.dataset_manifest_id)
         if not manifest_items:
@@ -349,6 +367,15 @@ class ModelTrainer:
             "warning_quality_flags": list(
                 getattr(manifest, "warning_quality_flags", []) or []
             ),
+            "manifest_quality_flags": list(
+                getattr(manifest, "manifest_quality_flags", []) or []
+            ),
+            "test_split_window_days": int(
+                getattr(manifest, "test_split_window_days", 0) or 0
+            ),
+            "test_split_unique_symbol_dates": int(
+                getattr(manifest, "test_split_unique_symbol_dates", 0) or 0
+            ),
         }
         result.metrics["rows_before_dedup"] = float(
             str(dedup_metadata["rows_before_dedup"])
@@ -394,7 +421,9 @@ class ModelTrainer:
 
     def train_on_feature_label(self, features: pd.DataFrame, labels: pd.Series) -> TrainResult:
         aligned = features.join(labels, how="inner")
-        label_column = labels.name or "label_soup_tp_before_sl"
+        label_column = (
+            str(labels.name) if labels.name is not None else "label_soup_tp_before_sl"
+        )
         aligned = aligned.dropna(subset=[label_column])
         aligned, time_gate = apply_time_invariants_to_frame(
             aligned,
@@ -670,6 +699,10 @@ class ModelTrainer:
             market_index=market_index,
         )
         path = Path(output_path) if output_path else Path(self._training.artifact_path)
+        _backup_existing_artifact(
+            path,
+            retention_count=max(1, int(self._training.model_archive_retention_count)),
+        )
         result.artifact.save(path)
         return result
 
@@ -1001,7 +1034,7 @@ def _split_weights_by_manifest_labels(
     if len(normalized) != len(weights):
         raise ValueError("split_labels length must match weight rows")
     train_mask = np.asarray([label == "train" for label in normalized], dtype=bool)
-    return weights[train_mask]
+    return cast(FloatArray, weights[train_mask])
 
 
 def _normalize_split_name(value: str) -> str:
@@ -1127,3 +1160,27 @@ def _as_float(value: object, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _backup_existing_artifact(path: Path, *, retention_count: int) -> Path | None:
+    """Preserve an existing alias and its sidecars before a legacy direct write."""
+
+    if not path.is_file():
+        return None
+    backup_root = path.parent / f".{path.stem}_overwrites"
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    backup_dir = backup_root / timestamp
+    backup_dir.mkdir(parents=True, exist_ok=False)
+    shutil.copy2(path, backup_dir / path.name)
+    sidecar_dir = path.parent / f"{path.stem}_sidecars"
+    if sidecar_dir.is_dir():
+        shutil.copytree(sidecar_dir, backup_dir / sidecar_dir.name)
+
+    backups = sorted(
+        (item for item in backup_root.iterdir() if item.is_dir()),
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+    for stale in backups[max(1, int(retention_count)) :]:
+        shutil.rmtree(stale)
+    return backup_dir

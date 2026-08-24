@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from stock_analyzer.evolution.champion_shadow_report import (
+    ChampionShadowComparisonRow,
     ChampionShadowReportBuilder,
 )
 from stock_analyzer.evolution.modules.m11_shadow_loader import M11ShadowObservation
@@ -115,7 +116,7 @@ class ShadowOnlineV2Report:
     signal_threshold: float
     rows: list[ShadowOnlineV2ReportRow] = field(default_factory=list)
     run_result: dict[str, object] = field(default_factory=dict)
-    return_summary: dict[str, float] = field(default_factory=dict)
+    return_summary: dict[str, object] = field(default_factory=dict)
     calibration_summary: dict[str, list[dict[str, object]]] = field(default_factory=dict)
     execution_summary: dict[str, float] = field(default_factory=dict)
     m11_v2_report: dict[str, object] = field(default_factory=dict)
@@ -161,13 +162,16 @@ class ShadowOnlineV2ReportBuilder:
         label_policy_registry: LabelPolicyRegistry | None = None,
         m11_max_positions: int = DEFAULT_MAX_POSITIONS,
     ) -> None:
+        self._m11_max_positions = max(1, int(m11_max_positions))
+        # 内部 comparison 报告的 M11 口径必须与本 builder 一致，否则
+        # m11_max_positions 配置非默认值时两侧口径分裂。
         self._comparison_builder = ChampionShadowReportBuilder(
             store=store,
             model_registry=model_registry,
             feature_schema_registry=feature_schema_registry,
             label_policy_registry=label_policy_registry,
+            m11_max_positions=self._m11_max_positions,
         )
-        self._m11_max_positions = max(1, int(m11_max_positions))
 
     def build_report(
         self,
@@ -292,7 +296,18 @@ class ShadowOnlineV2ReportBuilder:
             signal_threshold=float(signal_threshold),
             rows=rows,
             run_result=run_payload,
-            return_summary=_build_return_summary(rows),
+            return_summary=_build_return_summary(
+                rows,
+                m11_max_positions=self._m11_max_positions,
+                dedup_row_count=int(
+                    comparison_report.summary_metrics.get(
+                        "dedup_row_count", float(len(comparison_report.rows))
+                    )
+                ),
+                duplicate_row_count=int(
+                    comparison_report.summary_metrics.get("duplicate_row_count", 0.0)
+                ),
+            ),
             calibration_summary=_build_calibration_summary(rows),
             execution_summary=_build_execution_summary(rows),
             m11_v2_report={
@@ -314,10 +329,10 @@ class ShadowOnlineV2ReportBuilder:
 
 
 def _order_comparison_rows(
-    rows: Sequence[object],
+    rows: Sequence[ChampionShadowComparisonRow],
     *,
     now: datetime,
-) -> list[object]:
+) -> list[ChampionShadowComparisonRow]:
     filtered = []
     normalized_now = _normalize_datetime(now)
     for row in rows:
@@ -349,12 +364,18 @@ def _row_is_effectively_mature(
     return mature_dt <= normalized_now
 
 
-def _build_return_summary(rows: Sequence[ShadowOnlineV2ReportRow]) -> dict[str, float]:
+def _build_return_summary(
+    rows: Sequence[ShadowOnlineV2ReportRow],
+    *,
+    m11_max_positions: int = DEFAULT_MAX_POSITIONS,
+    dedup_row_count: int | None = None,
+    duplicate_row_count: int = 0,
+) -> dict[str, object]:
     champion_returns = [row.champion_shadow_return for row in rows]
     shadow_returns = [row.shadow_shadow_return for row in rows]
     v2_returns = [row.shadow_v2_return for row in rows]
     # 事件驱动 slot 口径（P1-b 主口径）：仅 signal==1 的行构成仓位；
-    # legacy 逐笔复利键保留原样作对照。
+    # legacy_* 逐笔复利键仅作对照，禁止再作为门禁依据。
     def _events(
         *,
         signal_attr: str,
@@ -381,21 +402,24 @@ def _build_return_summary(rows: Sequence[ShadowOnlineV2ReportRow]) -> dict[str, 
             signal_attr="champion_signal",
             return_attr="champion_shadow_return",
             probability_attr="champion_probability",
-        )
+        ),
+        max_positions=m11_max_positions,
     )
     shadow_slot = simulate_event_driven_slot_nav(
         _events(
             signal_attr="shadow_signal",
             return_attr="shadow_shadow_return",
             probability_attr="shadow_probability",
-        )
+        ),
+        max_positions=m11_max_positions,
     )
     v2_slot = simulate_event_driven_slot_nav(
         _events(
             signal_attr="shadow_v2_signal",
             return_attr="shadow_v2_return",
             probability_attr="shadow_v2_probability",
-        )
+        ),
+        max_positions=m11_max_positions,
     )
     insufficient_coverage = (
         champion_slot.insufficient_date_coverage
@@ -403,6 +427,24 @@ def _build_return_summary(rows: Sequence[ShadowOnlineV2ReportRow]) -> dict[str, 
         or v2_slot.insufficient_date_coverage
     )
     return {
+        "dedup_row_count": int(
+            len(rows) if dedup_row_count is None else max(0, int(dedup_row_count))
+        ),
+        "duplicate_row_count": max(0, int(duplicate_row_count)),
+        "cum_return_suspect": bool(duplicate_row_count > 0),
+        # —— legacy 逐笔全仓复利口径（对照审计，非门禁依据）——
+        "legacy_champion_cum_return": round(_compound_returns(champion_returns), 6),
+        "legacy_shadow_cum_return": round(_compound_returns(shadow_returns), 6),
+        "legacy_shadow_v2_cum_return": round(_compound_returns(v2_returns), 6),
+        "legacy_shadow_v2_minus_shadow_return": round(
+            _compound_returns(v2_returns) - _compound_returns(shadow_returns),
+            6,
+        ),
+        "legacy_shadow_v2_minus_champion_return": round(
+            _compound_returns(v2_returns) - _compound_returns(champion_returns),
+            6,
+        ),
+        # 旧 API 键保留为兼容别名；晋级门禁只消费 slot 口径。
         "champion_cum_return": round(_compound_returns(champion_returns), 6),
         "shadow_cum_return": round(_compound_returns(shadow_returns), 6),
         "shadow_v2_cum_return": round(_compound_returns(v2_returns), 6),
@@ -414,7 +456,7 @@ def _build_return_summary(rows: Sequence[ShadowOnlineV2ReportRow]) -> dict[str, 
             _compound_returns(v2_returns) - _compound_returns(champion_returns),
             6,
         ),
-        # —— 事件驱动 slot 口径 ——
+        # —— 事件驱动 slot 口径（主口径）——
         "champion_slot_return": round(champion_slot.total_return, 6),
         "shadow_slot_return": round(shadow_slot.total_return, 6),
         "shadow_v2_slot_return": round(v2_slot.total_return, 6),
@@ -422,6 +464,11 @@ def _build_return_summary(rows: Sequence[ShadowOnlineV2ReportRow]) -> dict[str, 
             v2_slot.total_return - champion_slot.total_return,
             6,
         ),
+        "shadow_v2_minus_shadow_slot_return": round(
+            v2_slot.total_return - shadow_slot.total_return,
+            6,
+        ),
+        "slot_max_positions": float(m11_max_positions),
         "slot_open_position_count": int(
             champion_slot.open_position_count
             + shadow_slot.open_position_count

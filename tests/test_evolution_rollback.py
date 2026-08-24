@@ -64,3 +64,30 @@ def test_evaluate_rollback_hard_circuit_breaker_short_circuit() -> None:
     )
     assert assessment.state == RollbackState.ROLLED_BACK
     assert assessment.reason == "hard_circuit_breaker"
+
+
+def test_evaluate_rollback_prefers_event_days_for_low_frequency_extension() -> None:
+    """事件日口径优先：行数虚高不代表观察充分，事件日不足仍按低频延长处理。"""
+    event_day_starved = evaluate_rollback(
+        diff_returns=[-0.001] * 30,
+        shadow_champion_vol=0.01,
+        context=RollbackContext(
+            trade_count=1,
+            observed_days=30,
+            observed_event_days=2,
+        ),
+    )
+    assert event_day_starved.state == RollbackState.STABLE
+    assert event_day_starved.reason == "low_frequency_extension"
+
+    # 未提供事件日（0）时回退旧行数口径，保持非 M11 路径兼容。
+    legacy_fallback = evaluate_rollback(
+        diff_returns=[-0.001] * 30,
+        shadow_champion_vol=0.01,
+        context=RollbackContext(
+            trade_count=1,
+            observed_days=30,
+            observed_event_days=0,
+        ),
+    )
+    assert legacy_fallback.reason != "low_frequency_extension"

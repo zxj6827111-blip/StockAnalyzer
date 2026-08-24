@@ -148,6 +148,8 @@ def test_model_trainer_uses_projection_compatible_legacy_snapshots_from_sample_s
     config.training.validation_ratio = 0.2
     config.training.calibration_ratio = 0.1
     config.training.test_ratio = 0.1
+    config.training.min_test_split_window_days = 1
+    config.training.min_test_split_unique_symbol_dates = 1
 
     store = SampleStore(db_path=tmp_path / "sample_store.duckdb")
     feature_registry = FeatureSchemaRegistry(db_path=tmp_path / "feature_schema.duckdb")
@@ -279,6 +281,8 @@ def _build_learning_protocol_fixture(
     config.training.validation_ratio = 0.2
     config.training.calibration_ratio = 0.1
     config.training.test_ratio = 0.1
+    config.training.min_test_split_window_days = 1
+    config.training.min_test_split_unique_symbol_dates = 1
 
     store = SampleStore(db_path=tmp_path / "sample_store.duckdb")
     feature_registry = FeatureSchemaRegistry(db_path=tmp_path / "feature_schema.duckdb")
@@ -329,9 +333,7 @@ def _build_learning_protocol_fixture(
                     else {}
                 ),
                 regime_context=(
-                    {"m3_match_score": 0.7}
-                    if include_feedback_context and index % 3 == 0
-                    else {}
+                    {"m3_match_score": 0.7} if include_feedback_context and index % 3 == 0 else {}
                 ),
                 add_missing_columns=True,
             ),
@@ -358,9 +360,7 @@ def _build_learning_protocol_fixture(
                 else {}
             ),
             regime_context=(
-                {"m3_match_score": 0.7}
-                if include_feedback_context and index % 3 == 0
-                else {}
+                {"m3_match_score": 0.7} if include_feedback_context and index % 3 == 0 else {}
             ),
         )
         outcome = OutcomeRecord(

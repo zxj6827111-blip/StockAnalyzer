@@ -52,11 +52,15 @@ def _load_test_config(base_dir: Path | None = None) -> StockAnalyzerConfig:
     temp_root = base_dir or Path(tempfile.mkdtemp(prefix="stock_analyzer_registry_tests_"))
     config.training.bootstrap_state_path = str(temp_root / "test_bootstrap_state.json")
     config.training.artifact_path = str(temp_root / "protocol_model.json")
+    config.training.model_archive_dir = str(temp_root / "model_archive")
     config.training.min_samples = 20
 
     # 晋级硬门阈值适配夹具规模（60 行 / ~6 test 日）。
     config.training.min_test_trade_dates = 2
-    config.training.min_hard_class_samples = 2    # 缩小标签 horizon，使合成样本的标签窗口不跨切分边界被 purge。
+    config.training.min_hard_class_samples = 2
+    config.training.min_test_split_window_days = 1
+    config.training.min_test_split_unique_symbol_dates = 1
+    # 缩小标签 horizon，使合成样本的标签窗口不跨切分边界被 purge。
     config.labels.horizon_days = 2
     config.command_channel.state_persist_enabled = False
     config.command_channel.history_archive_enabled = False
@@ -620,7 +624,8 @@ def test_service_build_shadow_online_v2_report_emits_detailed_payload(tmp_path: 
     assert report_payload["champion_model_id"] == champion_registry["model_id"]
     assert report_payload["shadow_model_id"] == shadow_registry["model_id"]
     assert int(report_payload["row_count"]) >= 1
-    assert "shadow_v2_cum_return" in _as_mapping(report_payload["return_summary"])
+    assert "legacy_shadow_v2_cum_return" in _as_mapping(report_payload["return_summary"])
+    assert "shadow_v2_slot_return" in _as_mapping(report_payload["return_summary"])
     assert "shadow_v2" in _as_mapping(report_payload["calibration_summary"])
     assert "shadow_v2_signal_divergence_ratio" in _as_mapping(
         report_payload["execution_summary"]
@@ -1110,8 +1115,11 @@ def test_service_evaluate_learning_model_promotion_gate_can_block_failed_model(
             },
         },
         "return_summary": {
-            "shadow_v2_minus_champion_return": -0.12,
-            "shadow_v2_minus_shadow_return": -0.03,
+            "legacy_shadow_v2_minus_champion_return": -0.12,
+            "legacy_shadow_v2_minus_shadow_return": -0.03,
+            # 门禁消费 slot 口径（主口径）。
+            "shadow_v2_minus_champion_slot_return": -0.12,
+            "shadow_v2_minus_shadow_slot_return": -0.03,
         },
         "execution_summary": {
             "shadow_v2_signal_divergence_ratio": 0.72,

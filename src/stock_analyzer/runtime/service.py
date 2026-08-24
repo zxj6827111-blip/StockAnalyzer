@@ -84,7 +84,11 @@ from stock_analyzer.learning.slot_occupied_nav import evaluate_promotion_validit
 from stock_analyzer.market_calendar import is_a_share_trading_day
 from stock_analyzer.models.adapters import inspect_model_backend_dependencies
 from stock_analyzer.models.artifact import ModelArtifact
-from stock_analyzer.models.bundle import publish_model_bundle, verify_artifact_integrity
+from stock_analyzer.models.bundle import (
+    prune_model_bundle_archive,
+    publish_model_bundle,
+    verify_artifact_integrity,
+)
 from stock_analyzer.models.registry import (
     ModelLifecycleState,
     ModelRegistry,
@@ -1044,12 +1048,35 @@ class StockAnalyzerService:
             if register
             else {"registered": False, "reason": "registration_disabled"}
         )
+        protected_bundle_ids: set[str] = set()
+        if register:
+            try:
+                archive_root_resolved = archive_root.resolve()
+                for record in self._model_registry.list_records(
+                    limit=None,
+                    suppress_read_errors=True,
+                ):
+                    artifact_parent = Path(record.artifact_uri).expanduser().resolve().parent
+                    if artifact_parent.parent == archive_root_resolved:
+                        protected_bundle_ids.add(artifact_parent.name)
+            except Exception:
+                # Retention must never make a successful registration fail.
+                protected_bundle_ids = set()
+        pruned_bundle_ids = prune_model_bundle_archive(
+            archive_root,
+            retention_count=max(
+                1,
+                int(self._config.training.model_archive_retention_count),
+            ),
+            protected_bundle_ids=protected_bundle_ids,
+        )
         return {
             "bundle_id": publication.bundle_id,
             "bundle_content_hash": publication.content_hash,
             "bundle_root": str(publication.root),
             "artifact_path": str(publication.artifact_path),
             "model_registry": registration,
+            "pruned_bundle_ids": pruned_bundle_ids,
         }
 
     def model_registry_entries(
@@ -11393,6 +11420,40 @@ class StockAnalyzerService:
             dataset_manifest_id=manifest.dataset_manifest_id,
             artifact_path=artifact_path,
         )
+        manifest_quality_flags = list(manifest.manifest_quality_flags or [])
+        if manifest_quality_flags:
+            payload = {
+                "ok": False,
+                "mode": "dataset_manifest_training",
+                "input_mode": "dataset_manifest",
+                "manifest_source": manifest_source,
+                "dataset_manifest_id": manifest.dataset_manifest_id,
+                "artifact_path": str(resolved_output_path),
+                "predictor_loaded": False,
+                "included_snapshot_count": manifest.included_snapshot_count,
+                "included_outcome_count": manifest.included_outcome_count,
+                "feature_schema_id": manifest.feature_schema_id,
+                "feature_schema_hash": manifest.feature_schema_hash,
+                "label_policy_id": manifest.label_policy_id,
+                "label_policy_hash": manifest.label_policy_hash,
+                "manifest_quality_flags": manifest_quality_flags,
+                "test_split_window_days": manifest.test_split_window_days,
+                "test_split_unique_symbol_dates": manifest.test_split_unique_symbol_dates,
+                "model_registry": {
+                    "registered": False,
+                    "reason": "manifest_quality_gate_failed",
+                },
+                "errors": [
+                    f"manifest_quality_flags:{flag}" for flag in manifest_quality_flags
+                ],
+            }
+            self._record_audit_event(
+                event_type="learning_manifest_trained",
+                level="warn",
+                message="learning manifest training blocked by manifest quality gate",
+                payload=payload,
+            )
+            return payload
         try:
             trainer = self._build_model_trainer()
             result = trainer.train_on_dataset_manifest(
@@ -11433,6 +11494,9 @@ class StockAnalyzerService:
                 "feature_schema_hash": manifest.feature_schema_hash,
                 "label_policy_id": manifest.label_policy_id,
                 "label_policy_hash": manifest.label_policy_hash,
+                "manifest_quality_flags": [],
+                "test_split_window_days": manifest.test_split_window_days,
+                "test_split_unique_symbol_dates": manifest.test_split_unique_symbol_dates,
                 "model_registry": model_registry_payload,
                 "result": result.to_dict(),
                 "errors": [],
@@ -11457,6 +11521,7 @@ class StockAnalyzerService:
                 "included_outcome_count": manifest.included_outcome_count,
                 "feature_schema_id": manifest.feature_schema_id,
                 "label_policy_id": manifest.label_policy_id,
+                "manifest_quality_flags": list(manifest.manifest_quality_flags or []),
                 "model_registry": {"registered": False, "reason": "training_failed"},
                 "errors": [f"manifest_training_failed:{exc.__class__.__name__}:{exc}"],
             }
@@ -12153,7 +12218,7 @@ class StockAnalyzerService:
                 )
 
             return_delta = _as_float(
-                shadow_return_summary.get("shadow_v2_minus_champion_return"),
+                shadow_return_summary.get("shadow_v2_minus_champion_slot_return"),
                 default=0.0,
             )
             if shadow_hard_gate_enabled and return_delta < float(min_shadow_v2_minus_champion_return):
@@ -12162,7 +12227,7 @@ class StockAnalyzerService:
                     "shadow_v2_return_delta",
                     "fail",
                     (
-                        f"shadow_v2_minus_champion_return={return_delta:.6f}, "
+                        f"shadow_v2_minus_champion_slot_return={return_delta:.6f}, "
                         f"required>={float(min_shadow_v2_minus_champion_return):.6f}"
                     ),
                     metric=round(return_delta, 6),
@@ -12478,12 +12543,29 @@ class StockAnalyzerService:
             ),
             "shadow_online_v2_hard_block_min_samples": shadow_hard_block_min_samples,
             "shadow_online_v2_hard_gate_deferred": not shadow_hard_gate_enabled,
+            "legacy_shadow_v2_minus_champion_return": _as_float(
+                shadow_return_summary.get("legacy_shadow_v2_minus_champion_return"),
+                default=0.0,
+            ),
+            "legacy_shadow_v2_minus_shadow_return": _as_float(
+                shadow_return_summary.get("legacy_shadow_v2_minus_shadow_return"),
+                default=0.0,
+            ),
+            # 旧字段保留给现有 API 消费者；主门禁使用 slot 字段。
             "shadow_v2_minus_champion_return": _as_float(
                 shadow_return_summary.get("shadow_v2_minus_champion_return"),
                 default=0.0,
             ),
             "shadow_v2_minus_shadow_return": _as_float(
                 shadow_return_summary.get("shadow_v2_minus_shadow_return"),
+                default=0.0,
+            ),
+            "shadow_v2_minus_champion_slot_return": _as_float(
+                shadow_return_summary.get("shadow_v2_minus_champion_slot_return"),
+                default=0.0,
+            ),
+            "shadow_v2_minus_shadow_slot_return": _as_float(
+                shadow_return_summary.get("shadow_v2_minus_shadow_slot_return"),
                 default=0.0,
             ),
             "shadow_v2_delta_brier": _as_float(

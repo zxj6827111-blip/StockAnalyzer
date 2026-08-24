@@ -679,9 +679,13 @@ training:
   artifact_path: "artifacts/model_v1.json"
   # 内容寻址 bundle 归档根目录（训练产物只进这里，别名仅由发布流程切换）
   model_archive_dir: "artifacts/model_archive"
+  model_archive_retention_count: 5
   # 晋级硬门：完整 test split 去重交易日下限（P1-b）
   min_test_trade_dates: 20
   min_hard_class_samples: 30
+  # manifest 生成期硬门：test split 的最小日历窗口与 symbol-day 覆盖
+  min_test_split_window_days: 20
+  min_test_split_unique_symbol_dates: 30
   baseline_report_path: "artifacts/acceptance/baseline_report.json"
   bootstrap_auto_run_on_first_start: true
   bootstrap_require_completion_for_runtime: true
@@ -849,6 +853,7 @@ evolution:
   m11_drawdown_delta_limit: 0.05
   m11_tail_loss_delta_limit: 0.03
   m11_execution_divergence_limit: 0.35
+  m11_max_positions: 10
   m11_shadow_results_path: ""
   m8_top_k: 5
   m8_promote_similarity: 0.80

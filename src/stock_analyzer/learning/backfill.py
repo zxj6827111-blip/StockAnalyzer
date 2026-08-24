@@ -622,6 +622,14 @@ class LearningBackfillEngine:
                 int(self._config.labels.horizon_days)
                 + max(0, int(getattr(self._config.evolution.execution_spec, "settlement_lag", 1))),
             ),
+            min_test_split_window_days=max(
+                0,
+                int(self._config.training.min_test_split_window_days),
+            ),
+            min_test_split_unique_symbol_dates=max(
+                0,
+                int(self._config.training.min_test_split_unique_symbol_dates),
+            ),
         )
         split_counts = {
             item.split_name: int(item.row_count) for item in manifest.split_plan

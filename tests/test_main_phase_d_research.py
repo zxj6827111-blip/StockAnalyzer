@@ -47,7 +47,10 @@ def _load_test_config(base_dir: Path | None = None) -> StockAnalyzerConfig:
     config.training.bootstrap_auto_seed_watchlist = False
     config.training.bootstrap_state_path = str(temp_root / "test_bootstrap_state.json")
     config.training.artifact_path = str(temp_root / "protocol_model.json")
+    config.training.model_archive_dir = str(temp_root / "model_archive")
     config.training.min_samples = 20
+    config.training.min_test_split_window_days = 1
+    config.training.min_test_split_unique_symbol_dates = 1
     # 缩小标签 horizon，使 1 天间隔的合成样本标签窗口不跨切分边界
     # （embargo purge 生效后需要留出足够的无污染样本）。
     config.labels.horizon_days = 2
@@ -181,18 +184,12 @@ def test_service_phase_d_research_reports_run_and_persist(tmp_path: Path) -> Non
     alphalens = _as_mapping(
         service.build_phase_d_alphalens_report(split_names=["test"], horizons=(1, 2), quantiles=3)
     )
-    shap = _as_mapping(
-        service.build_phase_d_shap_report(split_names=["test"], top_k=2)
-    )
+    shap = _as_mapping(service.build_phase_d_shap_report(split_names=["test"], top_k=2))
     catboost = _as_mapping(
         service.build_phase_d_catboost_shadow_report(split_names=["test"], test_ratio=0.25)
     )
-    qlib = _as_mapping(
-        service.build_phase_d_qlib_bridge_report(split_names=["test"])
-    )
-    audit = _as_mapping(
-        service.audit_events(limit=20, event_type="phase_d_research_report_built")
-    )
+    qlib = _as_mapping(service.build_phase_d_qlib_bridge_report(split_names=["test"]))
+    audit = _as_mapping(service.audit_events(limit=20, event_type="phase_d_research_report_built"))
 
     assert alphalens["research_id"] == "alphalens_sidecar"
     assert Path(str(alphalens["output_path"])).exists() is True

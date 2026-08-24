@@ -14,7 +14,6 @@ from stock_analyzer.research.heavy_ts_shadow import (
     run_heavy_ts_shadow,
 )
 from stock_analyzer.research.tabular_deep_shadow import (
-    persist_tabular_deep_shadow_report,
     run_tabular_deep_shadow,
 )
 from stock_analyzer.research.tft_sidecar import persist_tft_sidecar_report, run_tft_sidecar

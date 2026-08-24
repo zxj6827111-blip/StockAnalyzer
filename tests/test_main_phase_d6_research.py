@@ -46,7 +46,10 @@ def _load_test_config(base_dir: Path | None = None) -> StockAnalyzerConfig:
     config.training.bootstrap_auto_seed_watchlist = False
     config.training.bootstrap_state_path = str(temp_root / "test_bootstrap_state.json")
     config.training.artifact_path = str(temp_root / "protocol_model.json")
+    config.training.model_archive_dir = str(temp_root / "model_archive")
     config.training.min_samples = 20
+    config.training.min_test_split_window_days = 1
+    config.training.min_test_split_unique_symbol_dates = 1
     # 缩小标签 horizon，使合成样本的标签窗口不跨切分边界被 purge。
     config.labels.horizon_days = 2
     config.command_channel.state_persist_enabled = False
@@ -118,7 +121,8 @@ def _seed_learning_protocol_samples(
             outcome = OutcomeRecord(
                 snapshot_id=snapshot.snapshot_id,
                 maturity_status=MaturityStatus.RECONCILED,
-                label_mature_time=decision_time + timedelta(days=service._config.labels.horizon_days),
+                label_mature_time=decision_time
+                + timedelta(days=service._config.labels.horizon_days),
                 realized_return=0.08 if row_index % 2 == 0 else -0.05,
                 max_favorable_excursion=0.09 if row_index % 2 == 0 else 0.01,
                 max_adverse_excursion=-0.01 if row_index % 2 == 0 else -0.07,
@@ -169,9 +173,15 @@ def test_service_phase_d6_reports_run_and_persist(tmp_path: Path) -> None:
     service = _prepare_phase_d6_service(tmp_path)
 
     tabular = _as_mapping(service.build_phase_d_tabular_deep_report(split_names=["test"]))
-    tft = _as_mapping(service.build_phase_d_tft_report(split_names=["test"], horizon=1, encoder_length=4))
-    finrl = _as_mapping(service.build_phase_d_finrl_report(split_names=["test"], action_threshold=0.5))
-    heavy_ts = _as_mapping(service.build_phase_d_heavy_ts_report(split_names=["test"], horizon=2, lookback=5))
+    tft = _as_mapping(
+        service.build_phase_d_tft_report(split_names=["test"], horizon=1, encoder_length=4)
+    )
+    finrl = _as_mapping(
+        service.build_phase_d_finrl_report(split_names=["test"], action_threshold=0.5)
+    )
+    heavy_ts = _as_mapping(
+        service.build_phase_d_heavy_ts_report(split_names=["test"], horizon=2, lookback=5)
+    )
     audit = _as_mapping(service.audit_events(limit=20, event_type="phase_d_research_report_built"))
 
     assert tabular["research_id"] == "tabnet_ft_transformer"

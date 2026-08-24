@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import datetime, time
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -23,6 +23,7 @@ from stock_analyzer.deferred_registry import (
     build_deferred_items_registry,
     write_deferred_items_registry,
 )
+from stock_analyzer.models.bundle import latest_bundle_artifact_path
 from stock_analyzer.phase_d_status import (
     build_phase_d_status_report,
     persist_phase_d_status_report,
@@ -31,19 +32,18 @@ from stock_analyzer.training_diagnostics import (
     build_label_conflict_shadow_report,
     persist_diagnostic_report,
 )
-from stock_analyzer.models.bundle import latest_bundle_artifact_path
 from stock_analyzer.types import PipelineSignal
 from stock_analyzer.v13_acceptance import (
     build_v13_acceptance_report,
     persist_v13_acceptance_report,
     summarize_model_artifact,
 )
-def _effective_artifact_summary_path(service: object) -> Path:
+
+
+def _effective_artifact_summary_path(service: Any) -> Path:
     """验收报告的工件来源：优先运行时别名，缺失时回退最新 bundle。"""
 
-    from stock_analyzer.config import StockAnalyzerConfig
-
-    config = cast(StockAnalyzerConfig, getattr(service, "_config"))
+    config = service._config
     configured = Path(str(config.training.artifact_path)).expanduser()
     if configured.exists():
         return configured
@@ -469,7 +469,7 @@ class RuntimeAcceptanceService:
         report["lookback_days"] = lookback_days
         target = Path(output_path or "artifacts/acceptance/label_conflict_shadow_report.json")
         report["output_path"] = persist_diagnostic_report(report=report, output_path=target)
-        return cast(dict[str, object], report)
+        return report
 
     def generate_m9_failure_retention_report(
         self,
@@ -1105,7 +1105,7 @@ class RuntimeAcceptanceService:
         )
         written = write_checkpoint(checkpoint=checkpoint, output_path=target)
         checkpoint["output_path"] = written
-        return cast(dict[str, object], checkpoint)
+        return checkpoint
 
     def generate_v13_acceptance_report(
         self,
@@ -1242,7 +1242,7 @@ class RuntimeAcceptanceService:
         )
         target = Path(output_path or "artifacts/acceptance/v13_acceptance_report.json")
         report["output_path"] = persist_v13_acceptance_report(report=report, output_path=target)
-        return cast(dict[str, object], report)
+        return report
 
     def generate_v13_acceptance_bundle(
         self,
@@ -1333,7 +1333,7 @@ class RuntimeAcceptanceService:
             report=report,
             output_path=target,
         )
-        return cast(dict[str, object], report)
+        return report
 
     def generate_phase_d_status_report(
         self,
@@ -1346,7 +1346,7 @@ class RuntimeAcceptanceService:
             report=report,
             output_path=target,
         )
-        return cast(dict[str, object], report)
+        return report
 
     def generate_phase_d6_registry_report(
         self,
@@ -1359,7 +1359,7 @@ class RuntimeAcceptanceService:
             registry=report,
             output_path=target,
         )
-        return cast(dict[str, object], report)
+        return report
 
 
 def _path_exists_in_mapping(payload: Mapping[str, object], dotted_path: str) -> bool:

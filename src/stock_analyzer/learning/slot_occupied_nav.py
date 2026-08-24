@@ -146,6 +146,13 @@ def simulate_event_driven_slot_nav(
     defects: list[str] = []
     valid_entries: list[tuple[date, date, float, str, float]] = []
     all_dates: set[date] = set()
+    horizon: date | None = None
+    if horizon_date:
+        horizon = _parse_event_date(horizon_date)
+        if horizon is None:
+            # horizon 是调用参数而非样本字段：非法值必须显式失败，
+            # 不允许静默降级为“无观察期”。
+            raise ValueError(f"horizon_date is not parseable: {horizon_date!r}")
 
     for index, event in enumerate(events):
         label = f"#{index}:{event.symbol}"
@@ -161,6 +168,15 @@ def simulate_event_driven_slot_nav(
         if exit_day < entry_day:
             defects.append(f"{label}:exit_before_entry")
             continue
+        if exit_day == entry_day:
+            # 同日进出在 horizon>0 的标签语义下不可能合法出现，
+            # 视为数据缺陷 fail-closed（不参与模拟、不静默漏算）。
+            defects.append(f"{label}:same_day_entry_exit")
+            continue
+        if horizon is not None and entry_day > horizon:
+            # 观察期截止之后才入场：整条事件不参与模拟与日级序列。
+            defects.append(f"{label}:entry_after_horizon")
+            continue
         if realized is None or not math.isfinite(float(realized)):
             defects.append(f"{label}:missing_or_invalid_realized_return")
             continue
@@ -175,7 +191,6 @@ def simulate_event_driven_slot_nav(
             )
         )
         all_dates.add(entry_day)
-        horizon = _parse_event_date(horizon_date or "") if horizon_date else None
         all_dates.add(min(exit_day, horizon) if horizon is not None else exit_day)
 
     entries_by_day: dict[date, list[tuple[float, str, date, float, int]]] = {}
@@ -210,7 +225,9 @@ def simulate_event_driven_slot_nav(
                 continue
             symbol, (_idx, size) = holder
             _entry_day, _exit_day, trade_return, _sym, _prob = valid_entries[order_index]
-            current_nav += size * trade_return
+            # NAV 钳到 0：旧仓位以更高 NAV 定价、结算时 NAV 已回落的情况下，
+            # 极端亏损叠加可能把 NAV 压成负数；破产即停，保持口径可解释。
+            current_nav = max(0.0, current_nav + size * trade_return)
             del open_positions[symbol]
             settled += 1
         # ② 再开新仓：概率 desc、symbol asc；同 symbol 已有未平仓 → 冲突跳过。

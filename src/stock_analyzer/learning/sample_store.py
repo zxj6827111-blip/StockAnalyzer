@@ -269,9 +269,10 @@ class SampleStore:
                     "included_outcome_count, fidelity_breakdown_json, "
                     "dropped_reason_breakdown_json, split_plan_json, generated_at, "
                     "dedup_key, dedup_rule, rows_before_dedup, rows_dropped_by_dedup, "
-                    "blocking_quality_flags_json, warning_quality_flags_json"
-                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                    "?, ?, ?, ?, ?, ?)"
+                    "blocking_quality_flags_json, warning_quality_flags_json, "
+                    "manifest_quality_flags_json, test_split_window_days, "
+                    "test_split_unique_symbol_dates"
+                    ") VALUES (" + ", ".join(["?"] * 26) + ")"
                 ),
                 _manifest_parameters(manifest),
             )
@@ -601,6 +602,9 @@ class SampleStore:
             "rows_dropped_by_dedup INTEGER NOT NULL DEFAULT 0, "
             "blocking_quality_flags_json VARCHAR NOT NULL DEFAULT '[]', "
             "warning_quality_flags_json VARCHAR NOT NULL DEFAULT '[]', "
+            "manifest_quality_flags_json VARCHAR NOT NULL DEFAULT '[]', "
+            "test_split_window_days INTEGER NOT NULL DEFAULT 0, "
+            "test_split_unique_symbol_dates INTEGER NOT NULL DEFAULT 0, "
             "generated_at VARCHAR NOT NULL"
             ")"
         )
@@ -633,6 +637,9 @@ class SampleStore:
             "rows_dropped_by_dedup": "INTEGER",
             "blocking_quality_flags_json": "VARCHAR",
             "warning_quality_flags_json": "VARCHAR",
+            "manifest_quality_flags_json": "VARCHAR",
+            "test_split_window_days": "INTEGER",
+            "test_split_unique_symbol_dates": "INTEGER",
         }
         for column_name, column_type in additions.items():
             if column_name not in existing:
@@ -660,6 +667,18 @@ class SampleStore:
         conn.execute(
             "UPDATE dataset_manifests SET warning_quality_flags_json = '[]' "
             "WHERE warning_quality_flags_json IS NULL"
+        )
+        conn.execute(
+            "UPDATE dataset_manifests SET manifest_quality_flags_json = '[]' "
+            "WHERE manifest_quality_flags_json IS NULL"
+        )
+        conn.execute(
+            "UPDATE dataset_manifests SET test_split_window_days = 0 "
+            "WHERE test_split_window_days IS NULL"
+        )
+        conn.execute(
+            "UPDATE dataset_manifests SET test_split_unique_symbol_dates = 0 "
+            "WHERE test_split_unique_symbol_dates IS NULL"
         )
 
 
@@ -731,6 +750,9 @@ _MANIFEST_COLUMNS = (
     "rows_dropped_by_dedup",
     "blocking_quality_flags_json",
     "warning_quality_flags_json",
+    "manifest_quality_flags_json",
+    "test_split_window_days",
+    "test_split_unique_symbol_dates",
 )
 
 # 未迁移旧表的降级列集（无 v2 去重字段，读取时映射默认值）。
@@ -844,6 +866,9 @@ def _manifest_parameters(manifest: DatasetManifest) -> list[object]:
         manifest.rows_dropped_by_dedup,
         _dump_json(list(manifest.blocking_quality_flags)),
         _dump_json(list(manifest.warning_quality_flags)),
+        _dump_json(list(manifest.manifest_quality_flags)),
+        manifest.test_split_window_days,
+        manifest.test_split_unique_symbol_dates,
     ]
 
 
@@ -909,8 +934,10 @@ def _row_to_outcome(row: Sequence[object]) -> OutcomeRecord:
 
 
 def _row_to_manifest(row: Sequence[object]) -> DatasetManifest:
-    # 兼容两种行宽：23 列（含 v2 去重字段）/ 17 列（未迁移旧表降级查询）。
+    # 兼容三种行宽：26 列（含 manifest 质量字段）/ 23 列（v2 去重）/
+    # 17 列（未迁移旧表降级查询）。
     has_v2_columns = len(row) >= 23
+    has_manifest_quality_columns = len(row) >= 26
     if has_v2_columns:
         # v2 列序：... split_plan(15), generated_at(16), dedup_key(17),
         # dedup_rule(18), rows_before(19), rows_dropped(20), blocking(21), warning(22)
@@ -928,6 +955,18 @@ def _row_to_manifest(row: Sequence[object]) -> DatasetManifest:
             for item in _load_json_list(row[22])
             if str(item).strip()
         ]
+        if has_manifest_quality_columns:
+            manifest_quality_flags = [
+                str(item)
+                for item in _load_json_list(row[23])
+                if str(item).strip()
+            ]
+            test_split_window_days = int(row[24] or 0)
+            test_split_unique_symbol_dates = int(row[25] or 0)
+        else:
+            manifest_quality_flags = []
+            test_split_window_days = 0
+            test_split_unique_symbol_dates = 0
         generated_index = 16
     else:
         dedup_key = ""
@@ -936,6 +975,9 @@ def _row_to_manifest(row: Sequence[object]) -> DatasetManifest:
         rows_dropped_by_dedup = 0
         blocking_flags = []
         warning_flags = []
+        manifest_quality_flags = []
+        test_split_window_days = 0
+        test_split_unique_symbol_dates = 0
         generated_index = 16
     split_plan_raw = _load_json_list(row[15])
     split_plan = [DatasetSplitPlanEntry.model_validate(item) for item in split_plan_raw]
@@ -966,6 +1008,9 @@ def _row_to_manifest(row: Sequence[object]) -> DatasetManifest:
         rows_dropped_by_dedup=rows_dropped_by_dedup,
         blocking_quality_flags=blocking_flags,
         warning_quality_flags=warning_flags,
+        manifest_quality_flags=manifest_quality_flags,
+        test_split_window_days=test_split_window_days,
+        test_split_unique_symbol_dates=test_split_unique_symbol_dates,
         generated_at=_parse_datetime(row[generated_index]),
     )
 

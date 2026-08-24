@@ -40,13 +40,13 @@ from stock_analyzer.evolution.modules.m6_counterparty import (
     M6CounterpartyResult,
     evaluate_m6_counterparty,
 )
-from stock_analyzer.evolution.modules.m7_news_loader import load_m7_news_records
 from stock_analyzer.evolution.modules.m7_event_ledger import (
     M7EventLedger,
     M7EventLedgerEffectivenessSummary,
     M7EventLedgerIngestSummary,
     M7EventLedgerRunReport,
 )
+from stock_analyzer.evolution.modules.m7_news_loader import load_m7_news_records
 from stock_analyzer.evolution.modules.m7_news_sentiment import (
     M7ClusterSummary,
     M7NewsMetrics,

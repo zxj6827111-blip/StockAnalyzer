@@ -7,10 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from stock_analyzer.learning.dataset_manifest import DatasetManifestBuilder
+from stock_analyzer.learning.dataset_manifest import (
+    DatasetManifestBuilder,
+    _build_dataset_manifest_id,
+)
 from stock_analyzer.learning.sample_schema import (
     BackfillFidelityTier,
-    DatasetManifest,
     MaturityStatus,
     OutcomeRecord,
     SignalSnapshot,
@@ -55,20 +57,64 @@ def _store(tmp_path: Path) -> SampleStore:
 
 def test_manifest_identity_changes_with_schema_and_dedup_rule(tmp_path: Path) -> None:
     store = _store(tmp_path)
-    first = DatasetManifestBuilder(store=store).create_manifest(
+    manifest = DatasetManifestBuilder(store=store).create_manifest(
         feature_schema_id="fs",
         feature_schema_hash="fsh",
         label_policy_id="lp",
         label_policy_hash="lph",
     )
-    second = first.model_copy(
-        update={
-            "dataset_manifest_id": "dataset_manifest_v2_forced-different",
-            "dedup_rule": "keep_last_by_decision_time",
-        }
+    # 端到端：新 manifest 的 ID 必须携带 v2 前缀。
+    assert manifest.dataset_manifest_id.startswith("dataset_manifest_v2_")
+
+    # 单元级：同一份成员/协议绑定输入下，直接驱动 ID 派生函数——
+    # schema_version 或 dedup_rule 任一变化都必须改变派生 ID（防止
+    # 去重协议演进后新旧身份撞车）。
+    base_kwargs = dict(
+        source_store_version="test",
+        feature_schema_id="fs",
+        feature_schema_hash="fsh",
+        label_policy_id="lp",
+        label_policy_hash="lph",
+        sample_selection_rule="all",
+        time_window_start=None,
+        time_window_end=None,
+        fidelity_filter=[],
+        snapshot_ids=["snap-0", "snap-1"],
+        item_blueprints=[
+            {"snapshot_id": "snap-0", "split_name": "train", "ordinal": 0},
+            {"snapshot_id": "snap-1", "split_name": "test", "ordinal": 1},
+        ],
     )
-    assert first.dataset_manifest_id != second.dataset_manifest_id
-    assert first.dedup_rule != second.dedup_rule
+    v2_id = _build_dataset_manifest_id(
+        schema_version="2",
+        dedup_key="symbol+strategy+decision_date_sh",
+        dedup_rule="keep_first_by_decision_time",
+        **base_kwargs,
+    )
+    v1_id = _build_dataset_manifest_id(
+        schema_version="1",
+        dedup_key="symbol+strategy+decision_date_sh",
+        dedup_rule="keep_first_by_decision_time",
+        **base_kwargs,
+    )
+    assert v2_id != v1_id
+    assert v1_id.startswith("dataset_manifest_v1_")
+
+    alt_rule_id = _build_dataset_manifest_id(
+        schema_version="2",
+        dedup_key="symbol+strategy+decision_date_sh",
+        dedup_rule="keep_last_by_decision_time",
+        **base_kwargs,
+    )
+    assert alt_rule_id != v2_id
+
+    alt_key_id = _build_dataset_manifest_id(
+        schema_version="2",
+        dedup_key="symbol+decision_date_sh",
+        dedup_rule="keep_first_by_decision_time",
+        **base_kwargs,
+    )
+    assert alt_key_id != v2_id
 
 
 def test_v2_id_never_returns_v1_record_on_schema_collision(tmp_path: Path) -> None:

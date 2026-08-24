@@ -963,9 +963,13 @@ class TrainingConfig(_StrictModel):
     # 内容寻址 bundle 归档根目录（P0-a）：训练产物只进这里并注册 challenger，
     # 运行时别名 artifact_path 仅由两阶段发布流程原子切换。
     model_archive_dir: str = "artifacts/model_archive"
+    model_archive_retention_count: int = 5
     # 晋级硬门（P1-b 补救）：完整 test split 的去重交易日下限。
     min_test_trade_dates: int = 20
     min_hard_class_samples: int = 30
+    # manifest 生成期硬门：test split 必须覆盖足够的时间窗口与 symbol-day 样本。
+    min_test_split_window_days: int = 20
+    min_test_split_unique_symbol_dates: int = 30
     baseline_report_path: str = "artifacts/acceptance/baseline_report.json"
     bootstrap_auto_run_on_first_start: bool = True
     bootstrap_require_completion_for_runtime: bool = True

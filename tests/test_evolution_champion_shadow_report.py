@@ -98,6 +98,11 @@ def test_champion_shadow_report_builder_compares_shadow_manifest_against_active_
     assert report.split_counts == {"test": report.row_count}
     assert report.m11_report["metrics"]["valid_samples"] == report.row_count
     assert "signal_divergence_ratio" in report.summary_metrics
+    assert report.summary_metrics["dedup_row_count"] == float(report.row_count)
+    assert report.summary_metrics["duplicate_row_count"] == 0.0
+    assert report.summary_metrics["cum_return_suspect"] is False
+    assert report.m11_report["dedup_row_count"] == report.row_count
+    assert report.m11_report["duplicate_row_count"] == 0
 
     first_row = report.rows[0]
     assert first_row.split_name == "test"
@@ -126,6 +131,8 @@ def _build_learning_protocol_fixture(
     config.training.validation_ratio = 0.2
     config.training.calibration_ratio = 0.1
     config.training.test_ratio = 0.1
+    config.training.min_test_split_window_days = 1
+    config.training.min_test_split_unique_symbol_dates = 1
 
     store = SampleStore(db_path=tmp_path / "sample_store.duckdb")
     feature_registry = FeatureSchemaRegistry(db_path=tmp_path / "feature_schema.duckdb")

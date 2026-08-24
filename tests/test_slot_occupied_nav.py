@@ -15,6 +15,7 @@ import pytest
 
 from stock_analyzer.learning.slot_occupied_nav import (
     DEFAULT_EXPLOSION_THRESHOLD,
+    EventSlotPositionInput,
     simulate_slot_occupied_realized_nav,
 )
 from stock_analyzer.learning.slot_occupied_nav import (
@@ -213,3 +214,104 @@ def test_release_refuses_when_validity_gate_fails(tmp_path: Path) -> None:
     assert roles[ctx["champion_model_id"]] == __import__(
         "stock_analyzer.models.registry", fromlist=["ModelRole"]
     ).ModelRole.CHAMPION
+
+
+# ---------------------------------------------------------------------------
+# 补救验收后的边界补充：事件模拟器缺陷口径与重复注水门禁
+# ---------------------------------------------------------------------------
+
+
+def test_event_simulator_marks_same_day_and_post_horizon_as_defects() -> None:
+    from stock_analyzer.learning.slot_occupied_nav import simulate_event_driven_slot_nav
+
+    same_day = simulate_event_driven_slot_nav(
+        [
+            EventSlotPositionInput(
+                symbol="600000.SH",
+                entry_date="2026-06-01",
+                exit_date="2026-06-01",
+                realized_return=0.10,
+                probability=0.9,
+            )
+        ]
+    )
+    assert same_day.insufficient_date_coverage is True
+    assert any("same_day_entry_exit" in item for item in same_day.coverage_defects)
+    assert same_day.settled_position_count == 0
+
+    post_horizon = simulate_event_driven_slot_nav(
+        [
+            EventSlotPositionInput(
+                symbol="600000.SH",
+                entry_date="2026-06-10",
+                exit_date="2026-06-15",
+                realized_return=0.10,
+                probability=0.9,
+            )
+        ],
+        horizon_date="2026-06-05",
+    )
+    assert post_horizon.insufficient_date_coverage is True
+    assert any("entry_after_horizon" in item for item in post_horizon.coverage_defects)
+    # 观察期外入场不进入日级序列与模拟。
+    assert post_horizon.event_days == 0
+    assert post_horizon.final_nav == 1.0
+
+    with pytest.raises(ValueError, match="horizon_date"):
+        simulate_event_driven_slot_nav(
+            [],
+            horizon_date="not-a-date",
+        )
+
+
+def test_event_simulator_never_lets_nav_go_negative() -> None:
+    from stock_analyzer.learning.slot_occupied_nav import simulate_event_driven_slot_nav
+
+    report = simulate_event_driven_slot_nav(
+        [
+            EventSlotPositionInput(
+                symbol="600000.SH",
+                entry_date="2026-06-01",
+                exit_date="2026-06-02",
+                realized_return=-1.0,
+                probability=0.9,
+            ),
+            EventSlotPositionInput(
+                symbol="000001.SZ",
+                entry_date="2026-06-03",
+                exit_date="2026-06-04",
+                realized_return=-1.0,
+                probability=0.8,
+            ),
+        ],
+        max_positions=1,
+    )
+    assert report.final_nav >= 0.0
+    assert all(value >= 0.0 for value in report.daily_nav_series.values())
+
+
+def test_gate_blocks_when_rows_are_duplicate_inflated() -> None:
+    """重复快照注水：行数再多，逻辑样本不足仍必须拦截。"""
+    inflated = gate_evaluate(
+        metrics_summary=_healthy_metrics(),
+        test_stats={
+            "unique_trade_dates": 25,
+            # NAS 事故形态：3936 行重复快照只有个位数独立逻辑样本。
+            "unique_logical_samples": 5,
+            "hard_positive_count": 40,
+            "hard_negative_count": 40,
+        },
+    )
+    assert "insufficient_unique_logical_samples" in inflated.blocking_reasons
+    assert inflated.valid is False
+
+    healthy = gate_evaluate(
+        metrics_summary=_healthy_metrics(),
+        test_stats={
+            "unique_trade_dates": 25,
+            "unique_logical_samples": 60,
+            "hard_positive_count": 40,
+            "hard_negative_count": 40,
+        },
+    )
+    assert "insufficient_unique_logical_samples" not in healthy.blocking_reasons

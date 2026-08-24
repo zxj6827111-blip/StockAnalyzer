@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import struct
 from copy import deepcopy
 from pathlib import Path
@@ -18,6 +19,7 @@ from stock_analyzer.models.bundle import (
     BundleIntegrityError,
     bundle_id_from_content_hash,
     compute_bundle_content_hash,
+    prune_model_bundle_archive,
     publish_bundle_from_artifact_directory,
     publish_model_bundle,
     verify_artifact_integrity,
@@ -103,6 +105,36 @@ def test_publish_model_bundle_is_idempotent_for_identical_content(tmp_path: Path
     assert len(first.bundle_id) == len("model_v2_") + 20
     # staging 目录不残留。
     assert not list(archive.glob(".staging_*"))
+
+
+def test_prune_model_bundle_archive_keeps_recent_and_referenced_bundles(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive"
+    publications = []
+    for index in range(7):
+        artifact = ModelArtifact.create(
+            feature_columns=["f"],
+            lgbm_model={"kind": "fallback", "index": index},
+            xgb_model={},
+            lgbm_calibrator={},
+            xgb_calibrator={},
+            training_metrics={"auc": 0.60 + index / 100.0},
+        )
+        publication = publish_model_bundle(artifact, archive_root=archive)
+        os.utime(publication.root, (1_000 + index, 1_000 + index))
+        publications.append(publication)
+
+    removed = prune_model_bundle_archive(
+        archive,
+        retention_count=5,
+        protected_bundle_ids={publications[0].bundle_id},
+    )
+
+    assert publications[0].root.is_dir()
+    assert not publications[1].root.exists()
+    assert len(removed) == 1
+    assert len(list(archive.glob("model_v2_*"))) == 6
 
 
 def test_publish_model_bundle_collision_fails_closed(tmp_path: Path, monkeypatch) -> None:

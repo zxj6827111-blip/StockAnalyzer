@@ -29,9 +29,7 @@ def _as_mapping(value: object) -> Mapping[str, object]:
 def _load_test_config(base_dir: Path | None = None) -> StockAnalyzerConfig:
     root = Path(__file__).resolve().parents[1]
     config = load_config(root / "config" / "default.yaml")
-    external_temp_root = base_dir or Path(
-        tempfile.mkdtemp(prefix="stock_analyzer_runtime_status_")
-    )
+    external_temp_root = base_dir or Path(tempfile.mkdtemp(prefix="stock_analyzer_runtime_status_"))
     temp_root = root / "tmp_runtime_status" / external_temp_root.name
     shutil.rmtree(temp_root, ignore_errors=True)
     temp_root.mkdir(parents=True, exist_ok=True)
@@ -46,7 +44,10 @@ def _load_test_config(base_dir: Path | None = None) -> StockAnalyzerConfig:
     config.training.bootstrap_auto_seed_watchlist = False
     config.training.bootstrap_state_path = str(temp_root / "test_bootstrap_state.json")
     config.training.artifact_path = str(temp_root / "protocol_model.json")
+    config.training.model_archive_dir = str(temp_root / "model_archive")
     config.training.min_samples = 20
+    config.training.min_test_split_window_days = 1
+    config.training.min_test_split_unique_symbol_dates = 1
     # 缩小标签 horizon，使合成样本的标签窗口不跨切分边界被 purge。
     config.labels.horizon_days = 2
     config.command_channel.state_persist_enabled = False
@@ -123,7 +124,8 @@ def _seed_learning_protocol_samples(
             outcome = OutcomeRecord(
                 snapshot_id=snapshot.snapshot_id,
                 maturity_status=maturity,
-                label_mature_time=decision_time + timedelta(days=service._config.labels.horizon_days),
+                label_mature_time=decision_time
+                + timedelta(days=service._config.labels.horizon_days),
                 realized_return=0.08 if row_index % 2 == 0 else -0.05,
                 max_favorable_excursion=0.09 if row_index % 2 == 0 else 0.01,
                 max_adverse_excursion=-0.01 if row_index % 2 == 0 else -0.07,

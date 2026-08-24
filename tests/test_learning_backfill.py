@@ -38,8 +38,12 @@ def _load_test_config(tmp_path: Path) -> StockAnalyzerConfig:
     config.training.bootstrap_auto_run_on_first_start = False
     config.training.bootstrap_require_completion_for_runtime = False
     config.training.bootstrap_auto_seed_watchlist = False
+    # 这些用例使用小型合成数据；生产默认门禁由专门的负例测试覆盖。
+    config.training.min_test_split_window_days = 1
+    config.training.min_test_split_unique_symbol_dates = 1
     config.training.bootstrap_state_path = str(tmp_path / "bootstrap_state.json")
     config.training.artifact_path = str(tmp_path / "model.json")
+    config.training.model_archive_dir = str(tmp_path / "model_archive")
     config.evolution.auto_run = False
     config.cloud_backup.enabled = False
     config.market_warehouse.auto_run = False
@@ -1149,3 +1153,48 @@ def test_service_train_learning_manifest_uses_latest_manifest_without_registry_s
     assert latest_payload["dataset_manifest_id"] == payload["dataset_manifest_id"]
     assert latest_payload["artifact_path"] == payload["artifact_path"]
     assert model_registry["records"] == 0
+
+
+def test_service_train_learning_manifest_returns_quality_flags_before_training(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config(tmp_path)
+    config.training.min_samples = 20
+    config.training.min_test_split_window_days = 100
+    config.training.min_test_split_unique_symbol_dates = 30
+    service = StockAnalyzerService(config=config)
+    _seed_projection_compatible_trainable_samples(
+        config=config,
+        store=service._sample_store,
+        feature_registry=service._feature_schema_registry,
+        label_registry=service._label_policy_registry,
+        symbol="600000.SH",
+    )
+
+    manifest_payload = _as_mapping(
+        service.build_learning_trainable_manifest(symbols=["600000"])
+    )
+    manifest = service._sample_store.get_manifest(
+        str(manifest_payload["dataset_manifest_id"])
+    )
+    assert manifest is not None
+    assert set(manifest.manifest_quality_flags) == {
+        "test_window_too_narrow",
+        "test_coverage_insufficient",
+    }
+
+    payload = _as_mapping(
+        service.train_learning_manifest(
+            dataset_manifest_id=str(manifest_payload["dataset_manifest_id"]),
+            register_model=True,
+        )
+    )
+    registry = _as_mapping(service.model_registry_entries(limit=10))
+
+    assert payload["ok"] is False
+    assert payload["manifest_quality_flags"] == manifest.manifest_quality_flags
+    assert payload["model_registry"] == {
+        "registered": False,
+        "reason": "manifest_quality_gate_failed",
+    }
+    assert registry["records"] == 0

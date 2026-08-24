@@ -5,9 +5,9 @@ from __future__ import annotations
 import duckdb
 
 from stock_analyzer.data.market_warehouse import (
+    MarketWarehouse,
     _connect_with_lock_retry,
     _is_retryable_duckdb_lock_error,
-    MarketWarehouse,
 )
 
 

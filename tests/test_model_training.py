@@ -34,6 +34,29 @@ def test_model_training_and_predictor_roundtrip(tmp_path: Path) -> None:
     assert set(probabilities.keys()) == {"lgbm", "xgb", "meta"}
 
 
+def test_train_and_save_backups_existing_alias_before_overwrite(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = load_config(root / "config" / "default.yaml")
+    config.training.min_samples = 40
+    config.training.model_archive_retention_count = 5
+    artifact_path = tmp_path / "model.json"
+    bars = SyntheticProvider(seed_offset=1357).fetch_daily_bars(
+        symbol="600000",
+        lookback_days=320,
+    )
+    trainer = ModelTrainer(training=config.training, labels=config.labels, models=config.models)
+
+    trainer.train_and_save(bars=bars, output_path=artifact_path)
+    trainer.train_and_save(bars=bars, output_path=artifact_path)
+
+    backups = list((tmp_path / ".model_overwrites").iterdir())
+    assert len(backups) == 1
+    assert (backups[0] / "model.json").is_file()
+    assert (backups[0] / "model_sidecars").is_dir() or not (
+        tmp_path / "model_sidecars"
+    ).exists()
+
+
 def test_model_training_persists_native_sidecars_when_dependencies_are_available(
     tmp_path: Path,
 ) -> None:

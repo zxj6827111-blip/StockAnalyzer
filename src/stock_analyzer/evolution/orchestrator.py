@@ -456,6 +456,9 @@ class OffhoursEvolutionOrchestrator:
                     "loaded_samples": rollback_input["loaded_samples"],
                     "m11_status": rollback_input["m11_status"],
                     "observed_days": rollback_context.observed_days,
+                    # 事件日口径（entry/exit 去重天数）是回滚判定的优先输入；
+                    # 0 表示观测缺日期、已回退旧行数口径。
+                    "observed_event_days": rollback_context.observed_event_days,
                     "trade_count": rollback_context.trade_count,
                     "consecutive_soft_days": rollback_context.consecutive_soft_days,
                     "consecutive_hard_days": rollback_context.consecutive_hard_days,
@@ -3202,7 +3205,9 @@ def _gate_reason_codes(value: object) -> list[str]:
     return _dedupe_strings([str(item) for item in raw_reasons if isinstance(item, str)])
 
 
-def _summarize_intraday_loader_records(records: Sequence[Mapping[str, object]]) -> dict[str, object]:
+def _summarize_intraday_loader_records(
+    records: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
     total = len(records)
     intraday_1m_records = sum(
         1 for record in records if _record_has_intraday_context(record, prefix="intraday_1m")

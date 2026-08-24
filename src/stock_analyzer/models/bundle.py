@@ -17,6 +17,7 @@ import json
 import os
 import shutil
 import struct
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -176,9 +177,8 @@ def publish_bundle_from_artifact_directory(
                 continue
             for sidecar_key in ("sidecar_path", "fallback_sidecar_path"):
                 sidecar_value = model_payload.get(sidecar_key)
-                if (
-                    isinstance(sidecar_value, str)
-                    and sidecar_value.startswith(legacy_sidecar_prefix)
+                if isinstance(sidecar_value, str) and sidecar_value.startswith(
+                    legacy_sidecar_prefix
                 ):
                     model_payload[sidecar_key] = sidecar_value.replace(
                         legacy_sidecar_prefix,
@@ -231,7 +231,15 @@ def _finalize_staged_bundle(*, staging: Path, root: Path) -> BundlePublication:
             f"existing_hash={existing_hash} root={final_root}"
         )
     try:
-        os.rename(staging, final_root)
+        # Retry transient Windows directory-handle races without weakening conflict checks.
+        for attempt in range(5):
+            try:
+                os.rename(staging, final_root)
+                break
+            except PermissionError:
+                if final_root.exists() or not staging.exists() or attempt == 4:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
     except OSError:
         # 并发竞态：目标目录在检查后被他人创建——内容一致则幂等，否则冲突。
         if not final_root.exists():
@@ -274,8 +282,16 @@ def build_release_alias_payload(
             if not isinstance(sidecar_value, str) or not sidecar_value.strip():
                 continue
             sidecar_absolute = (Path(bundle_root) / sidecar_value).resolve()
-            relative = os.path.relpath(sidecar_absolute, start=alias_parent_path.resolve())
-            model_payload[sidecar_key] = Path(relative).as_posix()
+            try:
+                relative = os.path.relpath(
+                    sidecar_absolute,
+                    start=alias_parent_path.resolve(),
+                )
+                model_payload[sidecar_key] = Path(relative).as_posix()
+            except ValueError:
+                # Windows 不允许在不同盘符之间计算相对路径；跨盘测试与
+                # 部署场景使用绝对 sidecar 路径，避免发布流程误报失败。
+                model_payload[sidecar_key] = sidecar_absolute.as_posix()
     metadata = payload.get("metadata")
     if not isinstance(metadata, dict):
         metadata = {}
@@ -295,14 +311,44 @@ def latest_bundle_artifact_path(archive_root: str | Path) -> Path | None:
     root = Path(archive_root)
     if not root.is_dir():
         return None
-    candidates = [
-        item
-        for item in root.glob(f"model_v2_*/{ARTIFACT_FILENAME}")
-        if item.is_file()
-    ]
+    candidates = [item for item in root.glob(f"model_v2_*/{ARTIFACT_FILENAME}") if item.is_file()]
     if not candidates:
         return None
     return max(candidates, key=lambda item: item.stat().st_mtime)
+
+
+def prune_model_bundle_archive(
+    archive_root: str | Path,
+    *,
+    retention_count: int = 5,
+    protected_bundle_ids: set[str] | None = None,
+) -> list[str]:
+    """Remove old unreferenced content-addressed bundles and return their ids."""
+
+    root = Path(archive_root).expanduser().resolve()
+    if not root.is_dir():
+        return []
+    candidates = sorted(
+        (
+            item
+            for item in root.glob("model_v2_*")
+            if item.is_dir() and (item / ARTIFACT_FILENAME).is_file()
+        ),
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+    keep_count = max(1, int(retention_count))
+    keep_ids = {item.name for item in candidates[:keep_count]}
+    keep_ids.update(
+        str(item).strip() for item in (protected_bundle_ids or set()) if str(item).strip()
+    )
+    removed: list[str] = []
+    for item in candidates:
+        if item.name in keep_ids:
+            continue
+        shutil.rmtree(item)
+        removed.append(item.name)
+    return removed
 
 
 def _verify_declared_sidecars(

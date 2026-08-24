@@ -757,6 +757,8 @@ def test_orchestrator_m11_uses_shadow_loader_when_path_is_configured(tmp_path: P
     assert rollback_input["m11_status"] == m11["status"]
     assert rollback_input["diff_return_count"] == 3
     assert rollback_input["observed_days"] == 3
+    # 旧格式观测无 trade_date/exit：事件日口径为 0，判定回退旧行数口径。
+    assert rollback_input["observed_event_days"] == 0
     assert rollback_input["trade_count"] == 2
     assert rollback_input["shadow_champion_vol"] > 0.0
     assert rollback_input["hard_drawdown_breach"] is False
@@ -824,6 +826,7 @@ def test_orchestrator_rollback_uses_m11_redlines_from_shadow_loader(tmp_path: Pa
     assert rollback_input["m11_input_source"] == "shadow_loader"
     assert rollback_input["loaded_samples"] == 3
     assert rollback_input["observed_days"] == 3
+    assert rollback_input["observed_event_days"] >= 1
     assert rollback_input["trade_count"] == 3
     assert rollback_input["hard_drawdown_breach"] is True
     assert rollback_input["tail_loss_triggered"] is True

@@ -24,6 +24,7 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from evaluate_fall_then_rise import list_universe, read_day_bars  # noqa: E402
+
 from stock_analyzer.config import BacktestMatcherConfig  # noqa: E402
 from stock_analyzer.feature.tdx_indicators import compute_fall_then_rise  # noqa: E402
 

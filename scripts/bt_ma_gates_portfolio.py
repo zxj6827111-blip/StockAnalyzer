@@ -30,6 +30,7 @@ from evaluate_fall_then_rise import (  # noqa: E402
     effective_signal_date,
     read_day_bars,
 )
+
 from stock_analyzer.config import BacktestMatcherConfig  # noqa: E402
 from stock_analyzer.feature.tdx_indicators import compute_fall_then_rise  # noqa: E402
 

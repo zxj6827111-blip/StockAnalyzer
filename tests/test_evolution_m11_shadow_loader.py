@@ -3,8 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from stock_analyzer.evolution.modules.m11_shadow_loader import (
-    load_m11_shadow_records,
     load_m11_shadow_observations,
+    load_m11_shadow_records,
     parse_m11_shadow_records,
 )
 

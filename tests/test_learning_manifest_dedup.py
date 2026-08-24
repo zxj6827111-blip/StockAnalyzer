@@ -1,9 +1,7 @@
 """Commit 3（P1-a）验收测试：manifest v2 去重 + trainer 防御 + 上游幂等。
 
-去重键/规则为按 NAS 8/23 诊断证据重建的实现：
-- 键 = (symbol, strategy, decision_date[Asia/Shanghai])；
-- 规则 = keep_first_by_decision_time（重复多为同日反复 pipeline_run_once、
-  outcome 完全相同）。
+Manifest v2 uses one sample per (symbol, Shanghai trade_date) and keeps the
+largest stable ordinal, representing the latest snapshot.
 """
 
 from __future__ import annotations
@@ -17,6 +15,7 @@ from stock_analyzer.learning.dataset_manifest import (
     DEDUP_KEY,
     DEDUP_RULE,
     DatasetManifestBuilder,
+    build_manifest_quality_report,
     _decision_date_shanghai,
     _dedup_quality_flags,
 )
@@ -97,7 +96,7 @@ def _create_manifest(store: SampleStore, ids: tuple[str, str, str, str]):
     )
 
 
-def test_manifest_v2_dedupes_by_symbol_strategy_decision_date(tmp_path: Path) -> None:
+def test_manifest_v2_dedupes_by_symbol_trade_date_keeps_latest(tmp_path: Path) -> None:
     ids_tuple = _build_store_with_duplicates(tmp_path)
     store = ids_tuple[0]
     manifest = _create_manifest(store, ids_tuple[1:])
@@ -119,19 +118,25 @@ def test_manifest_v2_dedupes_by_symbol_strategy_decision_date(tmp_path: Path) ->
         snapshot.snapshot_id: snapshot
         for snapshot in store.list_snapshots()
     }
-    # 每个保留项必须是该键当天最早的快照（base_time 起的第一条）。
+    # Each retained row must be the latest snapshot for its symbol-day key.
     for snapshot_id in item_ids:
         snapshot = stored_snapshots[snapshot_id]
-        same_key_later = [
+        same_key_rows = [
             other
             for other in stored_snapshots.values()
             if other.symbol == snapshot.symbol
-            and other.strategy == snapshot.strategy
             and _decision_date_shanghai(other.decision_time)
             == _decision_date_shanghai(snapshot.decision_time)
-            and other.decision_time < snapshot.decision_time
         ]
-        assert not same_key_later, f"kept a non-earliest snapshot: {snapshot_id}"
+        expected = max(
+            same_key_rows,
+            key=lambda other: (
+                other.decision_time,
+                other.created_at,
+                other.snapshot_id,
+            ),
+        )
+        assert snapshot_id == expected.snapshot_id
 
     # 幂等重放：同输入再建返回同一 v2 记录，绝不回落 v1。
     replayed = _create_manifest(store, ids_tuple[1:])
@@ -139,7 +144,7 @@ def test_manifest_v2_dedupes_by_symbol_strategy_decision_date(tmp_path: Path) ->
     assert replayed.schema_version == "2"
 
 
-def test_dedup_preserves_distinct_strategies_and_shanghai_date_boundary(
+def test_dedup_collapses_strategies_and_respects_shanghai_date_boundary(
     tmp_path: Path,
 ) -> None:
     store = SampleStore(db_path=tmp_path / "boundary.duckdb")
@@ -190,9 +195,76 @@ def test_dedup_preserves_distinct_strategies_and_shanghai_date_boundary(
         label_policy_hash="lph",
     )
     assert manifest.rows_before_dedup == 3
-    assert manifest.rows_dropped_by_dedup == 0
-    assert manifest.included_snapshot_count == 3
+    assert manifest.rows_dropped_by_dedup == 1
+    assert manifest.included_snapshot_count == 2
+    assert set(store.list_manifest_snapshot_ids(manifest.dataset_manifest_id)) == {
+        "snap-b",
+        "snap-c",
+    }
 
+
+def test_manifest_quality_flags_are_recorded_for_narrow_test_split(tmp_path: Path) -> None:
+    ids_tuple = _build_store_with_duplicates(tmp_path, duplicate_symbol_day=False)
+    store = ids_tuple[0]
+    manifest = DatasetManifestBuilder(store=store).create_manifest(
+        feature_schema_id=ids_tuple[1],
+        feature_schema_hash=ids_tuple[2],
+        label_policy_id=ids_tuple[3],
+        label_policy_hash=ids_tuple[4],
+        min_test_split_window_days=20,
+        min_test_split_unique_symbol_dates=30,
+    )
+
+    assert "test_window_too_narrow" in manifest.manifest_quality_flags
+    assert "test_coverage_insufficient" in manifest.manifest_quality_flags
+    assert manifest.test_split_window_days < 20
+    assert manifest.test_split_unique_symbol_dates < 30
+
+    trainer = ModelTrainer(
+        training=_minimal_training_config(),
+        labels=_minimal_labels_config(),
+    )
+    with pytest.raises(ValueError, match="manifest quality flags"):
+        trainer.train_on_dataset_manifest(store=store, dataset_manifest=manifest)
+
+
+def test_manifest_quality_window_uses_shanghai_trade_dates() -> None:
+    snapshots = {}
+    common = dict(
+        code_version="git:test",
+        feature_vector={"f": 1.0},
+        feature_schema_id="fs",
+        feature_schema_hash="fsh",
+        runtime_config_hash="rc",
+        label_policy_id="lp",
+        label_policy_hash="lph",
+    )
+    # 15:59 UTC is still the same Shanghai trade date; 16:00 UTC is the next one.
+    for snapshot_id, decision_time in (
+        ("snap-a", datetime(2026, 3, 2, 15, 59, tzinfo=UTC)),
+        ("snap-b", datetime(2026, 3, 2, 16, 0, tzinfo=UTC)),
+    ):
+        snapshots[snapshot_id] = SignalSnapshot(
+            snapshot_id=snapshot_id,
+            symbol="600000.SH",
+            strategy="trend",
+            decision_time=decision_time,
+            **common,
+        )
+
+    report = build_manifest_quality_report(
+        item_blueprints=[
+            {"snapshot_id": "snap-a", "split_name": "test"},
+            {"snapshot_id": "snap-b", "split_name": "test"},
+        ],
+        snapshots=snapshots,
+        min_test_split_window_days=2,
+        min_test_split_unique_symbol_dates=1,
+    )
+
+    # Both rows are on consecutive Shanghai dates, so the inclusive window is 2.
+    assert report["test_split_window_days"] == 2
+    assert report["flags"] == []
 
 def test_duplicate_dominance_blocks_training_fail_closed(tmp_path: Path) -> None:
     store, *ids = _build_store_with_duplicates_force_dominance(tmp_path)

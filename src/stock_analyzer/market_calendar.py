@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import date, datetime
 
-
 _A_SHARE_2026_CLOSED_RANGES: tuple[tuple[date, date, str], ...] = (
     (date(2026, 1, 1), date(2026, 1, 3), "new_year"),
     (date(2026, 2, 15), date(2026, 2, 23), "spring_festival"),
