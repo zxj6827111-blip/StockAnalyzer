@@ -71,10 +71,12 @@ from stock_analyzer.feature.snapshot import (
 from stock_analyzer.infra.cache import CacheStore, InMemoryCache, RedisCache
 from stock_analyzer.labels.soup import build_soup_labels
 from stock_analyzer.learning.backfill import LearningBackfillEngine
+from stock_analyzer.learning.dataset_manifest import build_manifest_quality_report
 from stock_analyzer.learning.feature_schema_registry import FeatureSchemaRegistry
 from stock_analyzer.learning.label_policy_registry import LabelPolicyRegistry
 from stock_analyzer.learning.sample_schema import (
     BackfillFidelityTier,
+    DatasetManifest,
     MaturityStatus,
     OutcomeRecord,
     SignalSnapshot,
@@ -11368,6 +11370,52 @@ class StockAnalyzerService:
     def m3_profile_status(self) -> dict[str, object]:
         return self._runtime_ops_service.m3_profile_status()
 
+    def _recompute_manifest_quality_for_training(
+        self,
+        manifest: DatasetManifest,
+    ) -> dict[str, object]:
+        """Re-evaluate split quality from persisted membership before training.
+
+        Older manifests may have been stored before the quality fields existed.
+        The training boundary must therefore derive the gate from the actual
+        membership instead of trusting zero-valued legacy metadata.
+        """
+
+        manifest_items = self._sample_store.list_manifest_items(
+            manifest.dataset_manifest_id
+        )
+        snapshot_ids = [item.snapshot_id for item in manifest_items]
+        snapshots = {
+            snapshot.snapshot_id: snapshot
+            for snapshot in self._sample_store.list_snapshots(snapshot_ids=snapshot_ids)
+        }
+        item_blueprints = [
+            {
+                "snapshot_id": item.snapshot_id,
+                "split_name": item.split_name,
+                "ordinal": item.ordinal,
+                "decision_time": item.decision_time,
+            }
+            for item in manifest_items
+        ]
+        quality = build_manifest_quality_report(
+            item_blueprints=item_blueprints,
+            snapshots=snapshots,
+            min_test_split_window_days=max(
+                0, int(self._config.training.min_test_split_window_days)
+            ),
+            min_test_split_unique_symbol_dates=max(
+                0, int(self._config.training.min_test_split_unique_symbol_dates)
+            ),
+        )
+        stored_flags = list(manifest.manifest_quality_flags or [])
+        computed_flags = [
+            str(flag).strip()
+            for flag in quality.get("flags", [])
+            if str(flag).strip()
+        ]
+        quality["flags"] = list(dict.fromkeys([*stored_flags, *computed_flags]))
+        return quality
     def train_learning_manifest(
         self,
         *,
@@ -11420,7 +11468,20 @@ class StockAnalyzerService:
             dataset_manifest_id=manifest.dataset_manifest_id,
             artifact_path=artifact_path,
         )
-        manifest_quality_flags = list(manifest.manifest_quality_flags or [])
+        manifest_quality = self._recompute_manifest_quality_for_training(manifest)
+        manifest_quality_flags = list(manifest_quality.get("flags", []))
+        test_split_window_days = int(
+            manifest_quality.get(
+                "test_split_window_days",
+                manifest.test_split_window_days,
+            )
+        )
+        test_split_unique_symbol_dates = int(
+            manifest_quality.get(
+                "test_split_unique_symbol_dates",
+                manifest.test_split_unique_symbol_dates,
+            )
+        )
         if manifest_quality_flags:
             payload = {
                 "ok": False,
@@ -11437,8 +11498,8 @@ class StockAnalyzerService:
                 "label_policy_id": manifest.label_policy_id,
                 "label_policy_hash": manifest.label_policy_hash,
                 "manifest_quality_flags": manifest_quality_flags,
-                "test_split_window_days": manifest.test_split_window_days,
-                "test_split_unique_symbol_dates": manifest.test_split_unique_symbol_dates,
+                "test_split_window_days": test_split_window_days,
+                "test_split_unique_symbol_dates": test_split_unique_symbol_dates,
                 "model_registry": {
                     "registered": False,
                     "reason": "manifest_quality_gate_failed",
@@ -11494,9 +11555,9 @@ class StockAnalyzerService:
                 "feature_schema_hash": manifest.feature_schema_hash,
                 "label_policy_id": manifest.label_policy_id,
                 "label_policy_hash": manifest.label_policy_hash,
-                "manifest_quality_flags": [],
-                "test_split_window_days": manifest.test_split_window_days,
-                "test_split_unique_symbol_dates": manifest.test_split_unique_symbol_dates,
+                "manifest_quality_flags": manifest_quality_flags,
+                "test_split_window_days": test_split_window_days,
+                "test_split_unique_symbol_dates": test_split_unique_symbol_dates,
                 "model_registry": model_registry_payload,
                 "result": result.to_dict(),
                 "errors": [],
@@ -11521,7 +11582,9 @@ class StockAnalyzerService:
                 "included_outcome_count": manifest.included_outcome_count,
                 "feature_schema_id": manifest.feature_schema_id,
                 "label_policy_id": manifest.label_policy_id,
-                "manifest_quality_flags": list(manifest.manifest_quality_flags or []),
+                "manifest_quality_flags": manifest_quality_flags,
+                "test_split_window_days": test_split_window_days,
+                "test_split_unique_symbol_dates": test_split_unique_symbol_dates,
                 "model_registry": {"registered": False, "reason": "training_failed"},
                 "errors": [f"manifest_training_failed:{exc.__class__.__name__}:{exc}"],
             }
