@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import datetime, time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -469,7 +469,7 @@ class RuntimeAcceptanceService:
         report["lookback_days"] = lookback_days
         target = Path(output_path or "artifacts/acceptance/label_conflict_shadow_report.json")
         report["output_path"] = persist_diagnostic_report(report=report, output_path=target)
-        return report
+        return cast(dict[str, object], report)
 
     def generate_m9_failure_retention_report(
         self,
@@ -1105,7 +1105,7 @@ class RuntimeAcceptanceService:
         )
         written = write_checkpoint(checkpoint=checkpoint, output_path=target)
         checkpoint["output_path"] = written
-        return checkpoint
+        return cast(dict[str, object], checkpoint)
 
     def generate_v13_acceptance_report(
         self,
@@ -1242,7 +1242,7 @@ class RuntimeAcceptanceService:
         )
         target = Path(output_path or "artifacts/acceptance/v13_acceptance_report.json")
         report["output_path"] = persist_v13_acceptance_report(report=report, output_path=target)
-        return report
+        return cast(dict[str, object], report)
 
     def generate_v13_acceptance_bundle(
         self,
@@ -1333,7 +1333,7 @@ class RuntimeAcceptanceService:
             report=report,
             output_path=target,
         )
-        return report
+        return cast(dict[str, object], report)
 
     def generate_phase_d_status_report(
         self,
@@ -1346,7 +1346,7 @@ class RuntimeAcceptanceService:
             report=report,
             output_path=target,
         )
-        return report
+        return cast(dict[str, object], report)
 
     def generate_phase_d6_registry_report(
         self,
@@ -1359,7 +1359,7 @@ class RuntimeAcceptanceService:
             registry=report,
             output_path=target,
         )
-        return report
+        return cast(dict[str, object], report)
 
 
 def _path_exists_in_mapping(payload: Mapping[str, object], dotted_path: str) -> bool:
