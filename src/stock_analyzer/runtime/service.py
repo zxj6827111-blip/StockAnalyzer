@@ -8220,7 +8220,7 @@ class StockAnalyzerService:
                 auto_promotion_enabled = bool(self._config.auto_promotion.enabled)
                 proposal_payload = self.run_learning_manifest_shadow_proposal(
                     dataset_manifest_id=manifest_id,
-                    load_predictor=not auto_promotion_enabled,
+                    load_predictor=False,
                     approve_if_passed=True,
                     auto_approve=auto_promotion_enabled,
                     auto_release=auto_promotion_enabled,

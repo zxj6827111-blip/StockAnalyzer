@@ -344,6 +344,7 @@ class RuntimeIdleQueueWeekendService:
         min_remaining_minutes = _as_int(manifest.get("min_remaining_minutes"), default=0)
         min_interval_days = _as_int(manifest.get("min_interval_days"), default=7)
         symbol_cap = max(1, _as_int(manifest.get("symbol_cap"), default=80))
+        training_enabled = bool(service._config.training.enabled)
         auto_promotion_enabled = bool(service._config.auto_promotion.enabled)
 
         report: dict[str, object] = {
@@ -358,6 +359,7 @@ class RuntimeIdleQueueWeekendService:
             "min_remaining_minutes": min_remaining_minutes,
             "min_interval_days": min_interval_days,
             "symbol_cap": symbol_cap,
+            "training_enabled": training_enabled,
             "manifest_symbol_count": 0,
             "auto_promotion_enabled": auto_promotion_enabled,
             "online_effect": "none",
@@ -396,6 +398,9 @@ class RuntimeIdleQueueWeekendService:
                 "proposal_id": str(report.get("proposal_id", "")),
                 "online_effect": str(report.get("online_effect", "none")),
             }
+
+        if not training_enabled:
+            return finish("skipped", "skipped: training_disabled")
 
         if min_remaining_minutes > 0 and remaining_minutes < min_remaining_minutes:
             return finish("skipped", "skipped: insufficient_weekend_time_budget")
@@ -483,7 +488,7 @@ class RuntimeIdleQueueWeekendService:
         try:
             proposal_payload = service.run_learning_manifest_shadow_proposal(
                 dataset_manifest_id=manifest_id,
-                load_predictor=not auto_promotion_enabled,
+                load_predictor=False,
                 approve_if_passed=True,
                 auto_approve=auto_promotion_enabled,
                 auto_release=auto_promotion_enabled,

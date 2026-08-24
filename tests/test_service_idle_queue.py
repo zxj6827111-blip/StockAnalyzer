@@ -353,6 +353,7 @@ def test_idle_queue_we_learn_01_dispatch_uses_learning_governance_chain(
     tmp_path: Path,
 ) -> None:
     config = _load_test_config(tmp_path)
+    config.training.enabled = True
     config.auto_promotion.notify_on_training_summary = False
     service = StockAnalyzerService(config=config)
     service._evolution_project_root = tmp_path
@@ -400,7 +401,7 @@ def test_idle_queue_we_learn_01_dispatch_uses_learning_governance_chain(
                     "ok": True,
                     "training": {
                         "ok": True,
-                        "predictor_loaded": True,
+                        "predictor_loaded": False,
                         "artifact_path": "artifacts/evolution/shadow.json",
                     },
                 },
@@ -412,13 +413,17 @@ def test_idle_queue_we_learn_01_dispatch_uses_learning_governance_chain(
             },
             "auto_promotion": {
                 "enabled": False,
-                "predictor_loaded": True,
+                "predictor_loaded": False,
                 "ticket_id": "",
             },
             "errors": [],
         }
 
-    _patch_attr(service, "build_learning_trainable_manifest", _fake_build_learning_trainable_manifest)
+    _patch_attr(
+        service,
+        "build_learning_trainable_manifest",
+        _fake_build_learning_trainable_manifest,
+    )
     _patch_attr(
         service,
         "run_learning_manifest_shadow_proposal",
@@ -447,20 +452,74 @@ def test_idle_queue_we_learn_01_dispatch_uses_learning_governance_chain(
     build_symbols = _as_text_list(calls[0][1].get("symbols"))
     assert len(build_symbols) == 1
     assert build_symbols[0]
+    assert calls[1][1]["load_predictor"] is False
+    assert calls[1][1]["auto_approve"] is False
+    assert calls[1][1]["auto_release"] is False
     assert payload["dataset_manifest_id"] == "manifest-01"
     assert payload["proposal_id"] == "LRN-PROP-01"
     assert payload["symbol_cap"] == 1
     assert payload["manifest_symbol_count"] == 1
-    assert payload["online_effect"] == "predictor_reloaded"
+    assert payload["online_effect"] == "none"
     assert payload["blocked_after_run"] is False
     assert _as_mapping(payload["gates"])["market_warehouse"]["ok"] is True
     assert _as_mapping(payload["gates"])["sample_maturity"]["ok"] is True
+
+
+def test_idle_queue_we_learn_01_respects_training_enabled_switch(
+    tmp_path: Path,
+) -> None:
+    config = _load_test_config(tmp_path)
+    config.training.enabled = False
+    config.auto_promotion.notify_on_training_summary = False
+    service = StockAnalyzerService(config=config)
+    service._evolution_project_root = tmp_path
+
+    def _unexpected_build_learning_trainable_manifest(**kwargs: object) -> dict[str, object]:
+        _ = kwargs
+        pytest.fail("disabled automatic training must not build a manifest")
+
+    def _unexpected_run_learning_manifest_shadow_proposal(**kwargs: object) -> dict[str, object]:
+        _ = kwargs
+        pytest.fail("disabled automatic training must not create a shadow proposal")
+
+    _patch_attr(
+        service,
+        "build_learning_trainable_manifest",
+        _unexpected_build_learning_trainable_manifest,
+    )
+    _patch_attr(
+        service,
+        "run_learning_manifest_shadow_proposal",
+        _unexpected_run_learning_manifest_shadow_proposal,
+    )
+
+    result = service._idle_task_we_learn_01(
+        context={
+            "trade_date": "20260306",
+            "now": "2026-03-07T13:00:00",
+        }
+    )
+
+    output = (
+        Path(config.idle_queue.output_root)
+        / "20260306"
+        / "WE-LEARN-01"
+        / "model_learning"
+        / "learning_report.json"
+    )
+    payload = _as_mapping(json.loads(output.read_text(encoding="utf-8")))
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "skipped: training_disabled"
+    assert payload["training_enabled"] is False
+    assert payload["online_effect"] == "none"
 
 
 def test_idle_queue_we_learn_01_blocks_stale_market_warehouse_report(
     tmp_path: Path,
 ) -> None:
     config = _load_test_config(tmp_path)
+    config.training.enabled = True
     config.market_warehouse.enabled = True
     config.auto_promotion.notify_on_training_summary = False
     service = StockAnalyzerService(config=config)
@@ -526,6 +585,7 @@ def test_idle_queue_we_learn_01_respects_min_interval_and_min_remaining_budget(
     tmp_path: Path,
 ) -> None:
     config = _load_test_config(tmp_path)
+    config.training.enabled = True
     service = StockAnalyzerService(config=config)
     service._evolution_project_root = tmp_path
     _patch_attr(service, "_provider", _MockProvider())
@@ -542,7 +602,9 @@ def test_idle_queue_we_learn_01_respects_min_interval_and_min_remaining_budget(
     assert skipped_interval["status"] == "skipped"
     assert skipped_interval["reason"] == "skipped: min_interval_not_reached"
 
-    budget_service = StockAnalyzerService(config=_load_test_config(tmp_path))
+    budget_config = _load_test_config(tmp_path)
+    budget_config.training.enabled = True
+    budget_service = StockAnalyzerService(config=budget_config)
     budget_service._evolution_project_root = tmp_path
     _patch_attr(budget_service, "_provider", _MockProvider())
 
@@ -745,7 +807,10 @@ def test_idle_queue_state_reports_blocked_metadata(tmp_path: Path) -> None:
     assert item["reason"] == "fallback_streak=2"
     assert (
         item["reason_detail"]
-        == "任务连续 2 轮进入回退/降级结果（触发阈值 2 轮），系统已暂停自动执行，需人工确认后再恢复观察"
+        == (
+            "任务连续 2 轮进入回退/降级结果（触发阈值 2 轮），"
+            "系统已暂停自动执行，需人工确认后再恢复观察"
+        )
     )
     assert item["blocked_since"] == "2026-03-02T21:00:00"
     progress = item["recovery_progress"]
@@ -774,7 +839,8 @@ def test_idle_queue_blocked_notification_explains_reason(tmp_path: Path) -> None
     assert level == "warn"
     assert "原因=fallback_streak=2" in content
     assert (
-        "含义=任务连续 2 轮进入回退/降级结果（触发阈值 2 轮），系统已暂停自动执行，需人工确认后再恢复观察"
+        "含义=任务连续 2 轮进入回退/降级结果（触发阈值 2 轮），"
+        "系统已暂停自动执行，需人工确认后再恢复观察"
         in content
     )
     assert "处理建议=需要人工确认" in content
