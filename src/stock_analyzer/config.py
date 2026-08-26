@@ -401,6 +401,46 @@ class Week5Config(_StrictModel):
     market_radar_window_intervals: list[str] = Field(
         default_factory=lambda: ["09:35-11:20@10", "13:05-14:50@10"]
     )
+    full_market_automation_enabled: bool = False
+    candidate_state_path: str = "artifacts/runtime/week5_candidate_state.json"
+    market_snapshot_root: str = "artifacts/runtime/week5_market_snapshots"
+    market_snapshot_timeout_sec: int = 10
+    market_snapshot_retention_hours: float = 72.0
+    market_snapshot_max_files: int = 500
+    # 全市场快照最低行数门禁：实时源低于该行数视为部分数据，触发备源
+    # 补齐（合并去重）或整体拒绝，防止残缺快照冒充全市场行情。
+    # 口径锚定全市场原始输入 ~5500（>=5000 为输入层常态，见 default.yaml
+    # offhours 段拍板注释）；覆盖率一律按去重股票数判定。
+    market_snapshot_min_rows: int = 5000
+    candidate_pool_target: int = 30
+    candidate_pool_max_symbols: int = 50
+    overnight_top_k: int = 5
+    night_quality_target: int = 300
+    night_light_candidate_target: int = 100
+    night_deep_candidate_target: int = 50
+    # 夜间池有效期（自 night_pool_updated_at 起算，跨交易日口径）：默认
+    # 覆盖"前一晚生成、次日整个交易时段消费"，并支撑当晚 readiness 失败
+    # 时回退使用前一晚候选池。
+    night_pool_max_age_hours: float = 30.0
+    night_scan_readiness_wait_sec: int = 900
+    night_scan_readiness_poll_sec: int = 15
+    auction_focus_target: int = 10
+    auction_focus_max_symbols: int = 12
+    auction_scan_top_n: int = 20
+    auction_snapshot_max_age_sec: int = 120
+    auction_baseline_min_days: int = 5
+    market_radar_full_market_enabled: bool = True
+    market_radar_light_top_n: int = 20
+    market_radar_continuity_required: int = 2
+    market_radar_dynamic_score_margin: float = 3.0
+    market_radar_min_residency_min: int = 10
+    market_radar_circuit_breaker_failures: int = 3
+    market_radar_circuit_breaker_slow_runs: int = 2
+    market_radar_slow_run_sec: int = 120
+    market_radar_circuit_breaker_cooldown_min: int = 10
+    market_radar_timeout_sec: int = 90
+    actionable_realtime_max_age_sec: int = 120
+    weekend_learning_enabled: bool = True
     universe_prefilter_enabled: bool = True
     universe_prefilter_lookback_days: int = 240
     universe_prefilter_top_k: int = 500
@@ -900,9 +940,12 @@ class SchedulerConfig(_StrictModel):
     premarket_time: str = "08:30"
     midday_news_time: str = "12:30"
     auction_report_time: str = "09:26"
+    week5_auction_time: str = "09:25"
     close_reconcile_time: str = "15:30"
     week4_acceptance_time: str = "20:35"
     week6_daily_time: str = "15:25"
+    week5_night_scan_time: str = "21:45"
+    week5_weekend_learning_time: str = "12:00"
     # Leader election across scheduler replicas: the poll worker and the
     # manual run_due endpoint both take this file lock before executing
     # scheduler jobs (audit P2-#20). The path is relative to the shared

@@ -1156,6 +1156,7 @@ class RuntimeWeek5Service:
         prefilter_enabled_override: bool | None = None,
         prefilter_top_k_override: int | None = None,
         universe_max_symbols_override: int | None = None,
+        deep_candidate_target_override: int | None = None,
         pinned_symbols: list[str] | None = None,
         scan_profile: str = "",
         recovery_mode: bool = False,
@@ -1224,6 +1225,7 @@ class RuntimeWeek5Service:
                 prefilter_enabled_override=prefilter_enabled_override,
                 prefilter_top_k_override=prefilter_top_k_override,
                 universe_max_symbols_override=universe_max_symbols_override,
+                deep_candidate_target_override=deep_candidate_target_override,
                 pinned_symbols=pinned_symbols,
                 scan_profile=scan_profile,
                 recovery_mode=recovery_mode,
@@ -1253,6 +1255,7 @@ class RuntimeWeek5Service:
         prefilter_enabled_override: bool | None = None,
         prefilter_top_k_override: int | None = None,
         universe_max_symbols_override: int | None = None,
+        deep_candidate_target_override: int | None = None,
         pinned_symbols: list[str] | None = None,
         scan_profile: str = "",
         recovery_mode: bool = False,
@@ -1287,6 +1290,13 @@ class RuntimeWeek5Service:
             now=now,
         )
         gate_status = str(data_gate.get("status", "ok"))
+        deep_candidate_target = max(
+            1,
+            _resolve_positive_int(
+                deep_candidate_target_override,
+                fallback=_as_int(service._config.week5.deep_candidate_target, default=20),
+            ),
+        )
         intraday_scheduler_mode = self._is_intraday_scheduler_week5_scan(
             now=now,
             sync_reason=sync_reason,
@@ -1800,9 +1810,7 @@ class RuntimeWeek5Service:
                         symbols=eligible,
                         required_trade_date=required_intraday_date,  # type: ignore[arg-type]
                         interval="1m",
-                        deep_candidate_target=max(
-                            1, int(service._config.week5.deep_candidate_target)
-                        ),
+                        deep_candidate_target=deep_candidate_target,
                     )
                     report_5m = build_intraday_freshness_report(
                         warehouse=_delta_warehouse,
@@ -1810,9 +1818,7 @@ class RuntimeWeek5Service:
                         symbols=eligible,
                         required_trade_date=required_intraday_date,  # type: ignore[arg-type]
                         interval="5m",
-                        deep_candidate_target=max(
-                            1, int(service._config.week5.deep_candidate_target)
-                        ),
+                        deep_candidate_target=deep_candidate_target,
                     )
                     fresh_1m = set(report_1m.fresh_symbols)
                     fresh_5m = set(report_5m.fresh_symbols)
@@ -1864,7 +1870,6 @@ class RuntimeWeek5Service:
             # Fresh ratio gate: fail-closed for whole scan if insufficient.
             # Skip the gate when provider is synthetic (tests/local dev): synthetic
             # warehouses have no real intraday data and should not block funnel tests.
-            deep_candidate_target = max(1, int(service._config.week5.deep_candidate_target))
             fresh_ratio_min = float(
                 getattr(service._config.week5, "intraday_fresh_ratio_min", 0.95)
             )
@@ -2759,7 +2764,7 @@ class RuntimeWeek5Service:
             "funnel": {
                 **funnel_report,
                 "light_candidate_target": max(1, int(service._config.week5.light_candidate_target)),
-                "deep_candidate_target": max(1, int(service._config.week5.deep_candidate_target)),
+                "deep_candidate_target": deep_candidate_target,
                 "final_signal_cap": max(0, int(service._config.week5.final_signal_cap)),
                 "allow_zero_signal": bool(service._config.week5.allow_zero_signal),
                 "light_count": _as_int(prefilter_report.get("shortlisted_count", 0), default=0),
@@ -2932,11 +2937,17 @@ class RuntimeWeek5Service:
                 trace_id=trace_id,
                 ttl_sec=20 * 3600,
             )
-            service._notify_actionable_signals(
-                monster_report,
-                trace_id=trace_id,
-                title_prefix="week5 scan",
-            )
+            # 全市场自动化模式下 actionable 信号唯一出口是 actionable_data_gate
+            # （auction / market_radar / live_runtime），旧扫描链只保留观察类
+            # 摘要通知，不再直接发送可执行信号。
+            if not bool(
+                getattr(service._config.week5, "full_market_automation_enabled", False)
+            ):
+                service._notify_actionable_signals(
+                    monster_report,
+                    trace_id=trace_id,
+                    title_prefix="week5 scan",
+                )
 
         return report
 

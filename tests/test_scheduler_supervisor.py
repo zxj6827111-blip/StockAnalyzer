@@ -89,6 +89,9 @@ def test_scheduler_group_and_family_timeouts(tmp_path: Path) -> None:
 
     assert scheduler_group_for_job("premarket_scan") == "critical"
     assert scheduler_group_for_job("week5_live_runtime_1") == "heavy"
+    assert scheduler_group_for_job("week5_automation_auction") == "critical"
+    assert scheduler_group_for_job("week5_automation_live_runtime_1") == "critical"
+    assert scheduler_group_for_job("week5_automation_market_radar_1") == "heavy"
     assert timeout_for_job(config, group="critical", job="premarket_scan") == 900
     assert timeout_for_job(config, group="heavy", job="week5_live_runtime_1") == 1800
     assert timeout_for_job(config, group="heavy", job="evolution_offhours") == 10800

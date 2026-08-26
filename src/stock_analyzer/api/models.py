@@ -236,6 +236,10 @@ class LearningRuntimeHistoryColdStartRequest(BaseModel):
     test_ratio: float | None = None
 
 
+class WeekendLearningRunRequest(BaseModel):
+    now: str = ""
+
+
 class LearningManifestTrainingRequest(BaseModel):
     dataset_manifest_id: str = ""
     artifact_path: str | None = None
@@ -611,6 +615,13 @@ class Week5ScanRunRequest(BaseModel):
         description="Explicit emergency recovery scan: advisory only, never "
         "feeds final signals/watchlist; bypasses a stale-snapshot block",
     )
+
+
+class Week5AutomationRunRequest(BaseModel):
+    snapshot_id: str = ""
+    now: str = ""
+    notify_enabled: bool = False
+    sync_watchlist: bool = True
 
 
 class Week6RunRequest(BaseModel):

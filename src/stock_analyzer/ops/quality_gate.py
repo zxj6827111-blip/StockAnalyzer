@@ -97,6 +97,7 @@ _RUFF_TARGETS = (
     "tests/test_scheduler_worker.py",
     "tests/test_main_scheduler_run_due.py",
     "tests/test_market_warehouse.py",
+    "tests/test_week5_automation.py",
 )
 
 _MYPY_BLOCKING_TARGETS = (
@@ -123,6 +124,9 @@ _MYPY_BLOCKING_TARGETS = (
     "src/stock_analyzer/runtime/scheduler_worker.py",
     "src/stock_analyzer/runtime/scheduler_job_worker.py",
     "src/stock_analyzer/runtime/scheduler_supervisor.py",
+    "src/stock_analyzer/runtime/services/week5_automation_service.py",
+    "src/stock_analyzer/runtime/services/week5_candidate_state.py",
+    "src/stock_analyzer/runtime/services/week5_market_snapshot_service.py",
 )
 
 _MYPY_INFORMATIONAL_TARGETS = (
@@ -173,6 +177,7 @@ _INTEGRATION_TEST_NODES = _SMOKE_TEST_NODES + (
     "tests/test_service_scheduler.py::test_close_reconcile_job_reports_position_mismatch",
     "tests/test_service_evolution_scheduler.py::test_evolution_offhours_refreshes_tdx_before_run_when_enabled",
     "tests/test_service_evolution_scheduler.py::test_evolution_offhours_refreshes_market_warehouse_before_run_when_enabled",
+    "tests/test_week5_automation.py",
 )
 
 _SLOW_TEST_FILES = (

@@ -296,6 +296,8 @@ week5:
   enabled: true
   auto_run: true
   auto_notify: true
+  full_market_automation_enabled: false
+  market_radar_full_market_enabled: true
   history_limit: 500
   # P1 双轨输出：legacy=单轨 monster（现状）；dual_track=trend_candidates
   # 稳健候选 + monster_watchlist 高波动观察池（executable=false）。
@@ -309,9 +311,27 @@ week5:
   market_radar_review_pool_max_symbols: 80
   market_radar_review_pool_retention_hours: 72.0
   market_radar_min_baseline_score: 55.0
+  market_snapshot_timeout_sec: 10
+  market_snapshot_retention_hours: 72.0
+  market_snapshot_max_files: 500
+  # 全市场快照最低行数门禁：实时源低于该行数视为部分数据，触发备源补齐
+  # 或整体拒绝（0 表示关闭覆盖率门禁）。口径锚定全市场原始输入 ~5500
+  # （>=5000 为输入层常态，见 offhours 段拍板注释）；覆盖率按去重股票数
+  # 判定，重复行不得虚增覆盖。
+  market_snapshot_min_rows: 5000
+  market_radar_circuit_breaker_failures: 3
+  market_radar_circuit_breaker_slow_runs: 2
+  market_radar_slow_run_sec: 120
+  market_radar_circuit_breaker_cooldown_min: 10
+  market_radar_timeout_sec: 90
   market_radar_window_intervals:
     - "09:35-11:20@10"
     - "13:05-14:50@10"
+  night_scan_readiness_wait_sec: 900
+  night_scan_readiness_poll_sec: 15
+  # 夜间池有效期（自 night_pool_updated_at 起算，跨交易日口径）：覆盖
+  # "前一晚生成、次日盘中消费"，并支撑当晚 readiness 失败时回退前一晚池。
+  night_pool_max_age_hours: 30.0
   universe_prefilter_enabled: true
   universe_prefilter_lookback_days: 240
   universe_prefilter_top_k: 500
@@ -630,9 +650,12 @@ scheduler:
   premarket_time: "08:30"
   midday_news_time: "12:30"
   auction_report_time: "09:26"
+  week5_auction_time: "09:25"
   close_reconcile_time: "15:10"
   week4_acceptance_time: "20:35"
   week6_daily_time: "15:25"
+  week5_night_scan_time: "21:45"
+  week5_weekend_learning_time: "12:00"
   leader_lock_enabled: true
   leader_lock_stale_after_sec: 300
   leader_lock_path: "artifacts/runtime/scheduler_leader.lock"

@@ -6,8 +6,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query
 
-from stock_analyzer.api.deps import get_service, get_verify_api_auth
-from stock_analyzer.api.models import Week5ScanRunRequest
+from stock_analyzer.api.deps import get_service, get_verify_api_auth, parse_optional_datetime
+from stock_analyzer.api.models import Week5AutomationRunRequest, Week5ScanRunRequest
 
 router = APIRouter()
 
@@ -54,3 +54,85 @@ def week5_signal_pool_symbol_live(
     force_refresh: bool = Query(default=False),
 ) -> dict[str, object]:
     return get_service().week5_signal_pool_symbol_live(symbol=symbol, force_refresh=force_refresh)
+
+
+@router.post("/week5/night-scan/run")
+def week5_night_scan_run(
+    request: Week5AutomationRunRequest,
+    _auth: None = Depends(get_verify_api_auth()),
+) -> dict[str, object]:
+    return get_service().run_week5_night_scan(
+        timestamp=parse_optional_datetime(request.now),
+        notify_enabled=request.notify_enabled,
+        sync_watchlist=request.sync_watchlist,
+    )
+
+
+@router.get("/week5/night-scan/latest")
+def week5_night_scan_latest(
+    _auth: None = Depends(get_verify_api_auth()),
+) -> dict[str, object]:
+    return get_service().latest_week5_night_scan()
+
+
+@router.post("/week5/auction/run")
+def week5_auction_run(
+    request: Week5AutomationRunRequest,
+    _auth: None = Depends(get_verify_api_auth()),
+) -> dict[str, object]:
+    return get_service().run_week5_auction(
+        timestamp=parse_optional_datetime(request.now),
+        snapshot_id=request.snapshot_id,
+        notify_enabled=request.notify_enabled,
+    )
+
+
+@router.get("/week5/auction/latest")
+def week5_auction_latest(
+    _auth: None = Depends(get_verify_api_auth()),
+) -> dict[str, object]:
+    return get_service().latest_week5_auction()
+
+
+@router.post("/week5/market-radar/run")
+def week5_market_radar_automation_run(
+    request: Week5AutomationRunRequest,
+    _auth: None = Depends(get_verify_api_auth()),
+) -> dict[str, object]:
+    return get_service().run_week5_automation_market_radar(
+        timestamp=parse_optional_datetime(request.now),
+        snapshot_id=request.snapshot_id,
+        notify_enabled=request.notify_enabled,
+    )
+
+
+@router.get("/week5/market-radar/latest")
+def week5_market_radar_automation_latest(
+    _auth: None = Depends(get_verify_api_auth()),
+) -> dict[str, object]:
+    return get_service().latest_week5_automation_market_radar()
+
+
+@router.post("/week5/live-runtime/run")
+def week5_live_runtime_automation_run(
+    request: Week5AutomationRunRequest,
+    _auth: None = Depends(get_verify_api_auth()),
+) -> dict[str, object]:
+    return get_service().run_week5_automation_live_runtime(
+        timestamp=parse_optional_datetime(request.now),
+        notify_enabled=request.notify_enabled,
+    )
+
+
+@router.get("/week5/live-runtime/latest")
+def week5_live_runtime_automation_latest(
+    _auth: None = Depends(get_verify_api_auth()),
+) -> dict[str, object]:
+    return get_service().latest_week5_automation_live_runtime()
+
+
+@router.get("/week5/candidate-state")
+def week5_candidate_state(
+    _auth: None = Depends(get_verify_api_auth()),
+) -> dict[str, object]:
+    return get_service().week5_candidate_state()
