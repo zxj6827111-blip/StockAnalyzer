@@ -591,8 +591,10 @@ def _job_family_matches_selector(*, job_name: str, selector: str) -> bool:
     family = {
         "live_runtime": "week5_live_runtime",
         "week5_live_runtime": "week5_live_runtime",
+        "week5_automation_live_runtime": "week5_automation_live_runtime",
         "week5_first_board": "week5_first_board",
         "week5_market_radar": "week5_market_radar",
+        "week5_automation_market_radar": "week5_automation_market_radar",
     }.get(selector)
     return bool(family and job_name.startswith(f"{family}_"))
 

@@ -148,6 +148,9 @@ from stock_analyzer.runtime.services.reconcile_service import RuntimeReconcileSe
 from stock_analyzer.runtime.services.runtime_ops_service import RuntimeOpsService
 from stock_analyzer.runtime.services.runtime_state_service import RuntimeStateService
 from stock_analyzer.runtime.services.training_service import RuntimeTrainingService
+from stock_analyzer.runtime.services.week5_automation_service import (
+    RuntimeWeek5AutomationService,
+)
 from stock_analyzer.runtime.services.week5_service import RuntimeWeek5Service
 from stock_analyzer.runtime.services.week6_service import RuntimeWeek6Service
 from stock_analyzer.runtime.services.week7_sim_broker_service import (
@@ -467,6 +470,7 @@ class StockAnalyzerService:
         self._runtime_state_path = self._resolve_evolution_path(
             self._config.command_channel.state_persist_path
         )
+        self._week5_automation_service = RuntimeWeek5AutomationService(self)
         self._runtime_state_loaded_mtime_ns = 0
         self._runtime_state_base_revision = 0
         self._runtime_history_archive_dir = self._resolve_evolution_path(
@@ -4017,6 +4021,7 @@ class StockAnalyzerService:
         use_live_runtime: bool = False,
         dry_run_execution: bool = False,
         notify_enabled: bool = True,
+        notify_in_dry_run: bool = False,
         job_name: str = "",
         on_symbol_progress: Callable[[str, int, int, bool], None] | None = None,
         transform_max_workers: int = 1,
@@ -4025,6 +4030,9 @@ class StockAnalyzerService:
         advisory_only_mode = bool(self._config.app.advisory_only)
         execution_dry_run = bool(dry_run_execution)
         notifications_enabled = bool(notify_enabled)
+        notifications_should_emit = notifications_enabled and (
+            not execution_dry_run or bool(notify_in_dry_run)
+        )
         if advisory_only_mode:
             execution_mode = "advisory_only"
         elif execution_dry_run:
@@ -4355,6 +4363,7 @@ class StockAnalyzerService:
         payload["use_live_runtime"] = bool(use_live_runtime)
         payload["dry_run_execution"] = execution_dry_run
         payload["notify_enabled"] = notifications_enabled
+        payload["notify_in_dry_run"] = bool(notify_in_dry_run)
         payload["recommendation_update"] = recommendation_update
         payload["execution_recommendation_update"] = execution_recommendation_update
         payload["holding_recommendation_update"] = holding_recommendation_update
@@ -4422,7 +4431,7 @@ class StockAnalyzerService:
             use_live_runtime=use_live_runtime,
         )
         notify_started = perf_counter()
-        if notifications_enabled and not execution_dry_run:
+        if notifications_should_emit:
             self._notify_expired_position_exits_if_needed(
                 timestamp=timestamp,
                 closed_expired=_as_int(portfolio_update.get("exit_due"), default=0),
@@ -4438,7 +4447,7 @@ class StockAnalyzerService:
         runtime_payload = payload.get("runtime")
         if isinstance(runtime_payload, dict):
             runtime_payload["notify_ms"] = int((perf_counter() - notify_started) * 1000)
-            runtime_payload["notify_enabled"] = notifications_enabled and not execution_dry_run
+            runtime_payload["notify_enabled"] = notifications_should_emit
         self._record_audit_event(
             event_type="pipeline_run",
             trace_id=str(payload.get("trace_id", "")),
@@ -15755,6 +15764,79 @@ class StockAnalyzerService:
             notify_enabled=notify_enabled,
         )
 
+    def week5_candidate_state(self) -> dict[str, object]:
+        self._refresh_runtime_state_from_disk_if_changed()
+        return self._week5_automation_service.candidate_state()
+
+    def run_week5_night_scan(
+        self,
+        *,
+        timestamp: datetime | None = None,
+        notify_enabled: bool = False,
+        sync_watchlist: bool = True,
+    ) -> dict[str, object]:
+        return self._week5_automation_service.run_night_scan(
+            timestamp=timestamp,
+            notify_enabled=notify_enabled,
+            sync_watchlist=sync_watchlist,
+        )
+
+    def latest_week5_night_scan(self) -> dict[str, object]:
+        return self._week5_automation_service.latest_night_scan()
+
+    def run_week5_auction(
+        self,
+        *,
+        timestamp: datetime | None = None,
+        snapshot_id: str = "",
+        notify_enabled: bool = False,
+    ) -> dict[str, object]:
+        return self._week5_automation_service.run_auction(
+            timestamp=timestamp,
+            snapshot_id=snapshot_id,
+            notify_enabled=notify_enabled,
+        )
+
+    def latest_week5_auction(self) -> dict[str, object]:
+        return self._week5_automation_service.latest_auction()
+
+    def run_week5_automation_market_radar(
+        self,
+        *,
+        timestamp: datetime | None = None,
+        snapshot_id: str = "",
+        notify_enabled: bool = False,
+    ) -> dict[str, object]:
+        return self._week5_automation_service.run_market_radar(
+            timestamp=timestamp,
+            snapshot_id=snapshot_id,
+            notify_enabled=notify_enabled,
+        )
+
+    def latest_week5_automation_market_radar(self) -> dict[str, object]:
+        return self._week5_automation_service.latest_market_radar()
+
+    def run_week5_automation_live_runtime(
+        self,
+        *,
+        timestamp: datetime | None = None,
+        notify_enabled: bool = False,
+    ) -> dict[str, object]:
+        return self._week5_automation_service.run_live_runtime(
+            timestamp=timestamp,
+            notify_enabled=notify_enabled,
+        )
+
+    def latest_week5_automation_live_runtime(self) -> dict[str, object]:
+        return self._week5_automation_service.latest_live_runtime()
+
+    def run_week5_weekend_learning(
+        self,
+        *,
+        timestamp: datetime | None = None,
+    ) -> dict[str, object]:
+        return self._week5_automation_service.run_weekend_learning(timestamp=timestamp)
+
     def queue_week5_research_symbols(
         self,
         *,
@@ -15782,6 +15864,7 @@ class StockAnalyzerService:
         prefilter_enabled_override: bool | None = None,
         prefilter_top_k_override: int | None = None,
         universe_max_symbols_override: int | None = None,
+        deep_candidate_target_override: int | None = None,
         pinned_symbols: list[str] | None = None,
         scan_profile: str = "",
         recovery_mode: bool = False,
@@ -15797,6 +15880,7 @@ class StockAnalyzerService:
             prefilter_enabled_override=prefilter_enabled_override,
             prefilter_top_k_override=prefilter_top_k_override,
             universe_max_symbols_override=universe_max_symbols_override,
+            deep_candidate_target_override=deep_candidate_target_override,
             pinned_symbols=pinned_symbols,
             scan_profile=scan_profile,
             recovery_mode=recovery_mode,
@@ -17002,14 +17086,18 @@ class StockAnalyzerService:
     def _register_default_jobs(self) -> None:
         trading_weekdays = (0, 1, 2, 3, 4)
         trading_day_filter = is_a_share_trading_day
-        self._scheduler.register(
-            name="premarket_scan",
-            trigger_hhmm=self._config.scheduler.premarket_time,
-            callback=self._job_premarket_scan,
-            latest_hhmm=self._config.scheduler.auction_report_time,
-            weekdays=trading_weekdays,
-            date_predicate=trading_day_filter,
+        full_market_automation = bool(
+            getattr(self._config.week5, "full_market_automation_enabled", False)
         )
+        if not full_market_automation:
+            self._scheduler.register(
+                name="premarket_scan",
+                trigger_hhmm=self._config.scheduler.premarket_time,
+                callback=self._job_premarket_scan,
+                latest_hhmm=self._config.scheduler.auction_report_time,
+                weekdays=trading_weekdays,
+                date_predicate=trading_day_filter,
+            )
         self._scheduler.register(
             name="midday_news_brief",
             trigger_hhmm=self._config.scheduler.midday_news_time,
@@ -17018,14 +17106,15 @@ class StockAnalyzerService:
             weekdays=trading_weekdays,
             date_predicate=trading_day_filter,
         )
-        self._scheduler.register(
-            name="auction_report",
-            trigger_hhmm=self._config.scheduler.auction_report_time,
-            callback=self._job_auction_report,
-            latest_hhmm="09:35",
-            weekdays=trading_weekdays,
-            date_predicate=trading_day_filter,
-        )
+        if not full_market_automation:
+            self._scheduler.register(
+                name="auction_report",
+                trigger_hhmm=self._config.scheduler.auction_report_time,
+                callback=self._job_auction_report,
+                latest_hhmm="09:35",
+                weekdays=trading_weekdays,
+                date_predicate=trading_day_filter,
+            )
         self._scheduler.register(
             name="close_reconcile",
             trigger_hhmm=self._config.scheduler.close_reconcile_time,
@@ -17064,99 +17153,160 @@ class StockAnalyzerService:
                 date_predicate=trading_day_filter,
             )
         if self._config.week5.enabled and self._config.week5.auto_run:
-            interval_profiles: list[tuple[str, str, int]] = []
-            raw_profiles = list(self._config.week5.first_board_window_intervals)
-            for raw_profile in raw_profiles:
-                parsed_profile = _parse_hhmm_window_interval(str(raw_profile))
-                if parsed_profile is None:
-                    self._record_audit_event(
-                        event_type="scheduler_config_warning",
-                        level="warn",
-                        message=(
-                            "invalid week5.first_board_window_intervals item: "
-                            f"{raw_profile} (expect HH:MM-HH:MM@N)"
-                        ),
+            full_market_radar_enabled = bool(
+                getattr(self._config.week5, "market_radar_full_market_enabled", True)
+            )
+            if full_market_automation:
+                self._scheduler.register(
+                    name="week5_night_scan",
+                    trigger_hhmm=self._config.scheduler.week5_night_scan_time,
+                    callback=self._job_week5_night_scan,
+                    latest_hhmm="23:59",
+                    weekdays=trading_weekdays,
+                    date_predicate=trading_day_filter,
+                )
+                self._scheduler.register(
+                    name="week5_weekend_learning",
+                    trigger_hhmm=self._config.scheduler.week5_weekend_learning_time,
+                    callback=self._job_week5_weekend_learning,
+                    latest_hhmm="23:59",
+                    weekdays=(5,),
+                )
+                self._scheduler.register(
+                    name="week5_automation_auction",
+                    trigger_hhmm=self._config.scheduler.week5_auction_time,
+                    callback=self._job_week5_automation_auction,
+                    latest_hhmm="09:35",
+                    weekdays=trading_weekdays,
+                    date_predicate=trading_day_filter,
+                )
+                automation_radar_profiles = [
+                    ("09:25", "09:26", 1),
+                    ("09:30", "10:30", 2),
+                    ("10:30", "11:30", 5),
+                    ("13:00", "14:00", 3),
+                    ("14:00", "14:57", 2),
+                ]
+                for index, (start_hhmm, end_hhmm, interval_minutes) in enumerate(
+                    automation_radar_profiles, start=1
+                ):
+                    if full_market_radar_enabled:
+                        self._scheduler.register_interval(
+                            name=f"week5_automation_market_radar_{index}",
+                            window_start_hhmm=start_hhmm,
+                            window_end_hhmm=end_hhmm,
+                            interval_minutes=interval_minutes,
+                            callback=self._job_week5_automation_market_radar,
+                            weekdays=trading_weekdays,
+                            date_predicate=trading_day_filter,
+                        )
+                    self._scheduler.register_interval(
+                        name=f"week5_automation_live_runtime_{index}",
+                        window_start_hhmm=start_hhmm,
+                        window_end_hhmm=end_hhmm,
+                        interval_minutes=interval_minutes,
+                        callback=self._job_week5_automation_live_runtime,
+                        weekdays=trading_weekdays,
+                        date_predicate=trading_day_filter,
                     )
-                    continue
-                interval_profiles.append(parsed_profile)
-            if not interval_profiles:
-                fallback_interval = max(1, self._config.week5.first_board_interval_min)
-                for window in self._config.week5.first_board_windows:
-                    parsed = _parse_hhmm_window(window)
-                    if parsed is None:
+            # 全市场自动化模式下，旧 first_board 扫描链（auto_notify 可发
+            # actionable 通知）必须整体退出调度，保证 actionable_data_gate
+            # 是唯一可执行信号出口；仅在全自动化关闭时保留旧行为。
+            if not full_market_automation:
+                interval_profiles: list[tuple[str, str, int]] = []
+                raw_profiles = list(self._config.week5.first_board_window_intervals)
+                for raw_profile in raw_profiles:
+                    parsed_profile = _parse_hhmm_window_interval(str(raw_profile))
+                    if parsed_profile is None:
                         self._record_audit_event(
                             event_type="scheduler_config_warning",
                             level="warn",
-                            message=f"invalid week5.first_board_windows item: {window}",
+                            message=(
+                                "invalid week5.first_board_window_intervals item: "
+                                f"{raw_profile} (expect HH:MM-HH:MM@N)"
+                            ),
                         )
                         continue
-                    interval_profiles.append((parsed[0], parsed[1], fallback_interval))
-            for index, (start_hhmm, end_hhmm, interval_minutes) in enumerate(
-                interval_profiles,
-                start=1,
-            ):
-                try:
-                    self._scheduler.register_interval(
-                        name=f"week5_first_board_{index}",
-                        window_start_hhmm=start_hhmm,
-                        window_end_hhmm=end_hhmm,
-                        interval_minutes=interval_minutes,
-                        callback=self._job_week5_scan,
-                        weekdays=trading_weekdays,
-                        date_predicate=trading_day_filter,
-                    )
-                except ValueError as exc:
-                    self._record_audit_event(
-                        event_type="scheduler_config_warning",
-                        level="warn",
-                        message=(
-                            "failed to register week5 interval profile "
-                            f"{start_hhmm}-{end_hhmm}@{interval_minutes}: {exc}"
-                        ),
-                    )
+                    interval_profiles.append(parsed_profile)
+                if not interval_profiles:
+                    fallback_interval = max(1, self._config.week5.first_board_interval_min)
+                    for window in self._config.week5.first_board_windows:
+                        parsed = _parse_hhmm_window(window)
+                        if parsed is None:
+                            self._record_audit_event(
+                                event_type="scheduler_config_warning",
+                                level="warn",
+                                message=f"invalid week5.first_board_windows item: {window}",
+                            )
+                            continue
+                        interval_profiles.append((parsed[0], parsed[1], fallback_interval))
+                for index, (start_hhmm, end_hhmm, interval_minutes) in enumerate(
+                    interval_profiles,
+                    start=1,
+                ):
+                    try:
+                        self._scheduler.register_interval(
+                            name=f"week5_first_board_{index}",
+                            window_start_hhmm=start_hhmm,
+                            window_end_hhmm=end_hhmm,
+                            interval_minutes=interval_minutes,
+                            callback=self._job_week5_scan,
+                            weekdays=trading_weekdays,
+                            date_predicate=trading_day_filter,
+                        )
+                    except ValueError as exc:
+                        self._record_audit_event(
+                            event_type="scheduler_config_warning",
+                            level="warn",
+                            message=(
+                                "failed to register week5 interval profile "
+                                f"{start_hhmm}-{end_hhmm}@{interval_minutes}: {exc}"
+                            ),
+                        )
             live_interval_profiles: list[tuple[str, str, int]] = []
-            for raw_profile in self._config.week5.live_runtime_window_intervals:
-                parsed_profile = _parse_hhmm_window_interval(str(raw_profile))
-                if parsed_profile is None:
-                    self._record_audit_event(
-                        event_type="scheduler_config_warning",
-                        level="warn",
-                        message=(
-                            "invalid week5.live_runtime_window_intervals item: "
-                            f"{raw_profile} (expect HH:MM-HH:MM@N)"
-                        ),
-                    )
-                    continue
-                live_interval_profiles.append(parsed_profile)
-            if not live_interval_profiles:
-                live_interval_profiles = [
-                    (start_hhmm, end_hhmm, max(5, interval_minutes))
-                    for start_hhmm, end_hhmm, interval_minutes in interval_profiles
-                ]
-            for index, (start_hhmm, end_hhmm, interval_minutes) in enumerate(
-                live_interval_profiles,
-                start=1,
-            ):
-                try:
-                    self._scheduler.register_interval(
-                        name=f"week5_live_runtime_{index}",
-                        window_start_hhmm=start_hhmm,
-                        window_end_hhmm=end_hhmm,
-                        interval_minutes=interval_minutes,
-                        callback=self._job_week5_live_runtime,
-                        weekdays=trading_weekdays,
-                        date_predicate=trading_day_filter,
-                    )
-                except ValueError as exc:
-                    self._record_audit_event(
-                        event_type="scheduler_config_warning",
-                        level="warn",
-                        message=(
-                            "failed to register week5 live runtime interval profile "
-                            f"{start_hhmm}-{end_hhmm}@{interval_minutes}: {exc}"
-                        ),
-                    )
-            if self._config.week5.market_radar_enabled:
+            if not full_market_automation:
+                for raw_profile in self._config.week5.live_runtime_window_intervals:
+                    parsed_profile = _parse_hhmm_window_interval(str(raw_profile))
+                    if parsed_profile is None:
+                        self._record_audit_event(
+                            event_type="scheduler_config_warning",
+                            level="warn",
+                            message=(
+                                "invalid week5.live_runtime_window_intervals item: "
+                                f"{raw_profile} (expect HH:MM-HH:MM@N)"
+                            ),
+                        )
+                        continue
+                    live_interval_profiles.append(parsed_profile)
+                if not live_interval_profiles:
+                    live_interval_profiles = [
+                        (start_hhmm, end_hhmm, max(5, interval_minutes))
+                        for start_hhmm, end_hhmm, interval_minutes in interval_profiles
+                    ]
+                for index, (start_hhmm, end_hhmm, interval_minutes) in enumerate(
+                    live_interval_profiles,
+                    start=1,
+                ):
+                    try:
+                        self._scheduler.register_interval(
+                            name=f"week5_live_runtime_{index}",
+                            window_start_hhmm=start_hhmm,
+                            window_end_hhmm=end_hhmm,
+                            interval_minutes=interval_minutes,
+                            callback=self._job_week5_live_runtime,
+                            weekdays=trading_weekdays,
+                            date_predicate=trading_day_filter,
+                        )
+                    except ValueError as exc:
+                        self._record_audit_event(
+                            event_type="scheduler_config_warning",
+                            level="warn",
+                            message=(
+                                "failed to register week5 live runtime interval profile "
+                                f"{start_hhmm}-{end_hhmm}@{interval_minutes}: {exc}"
+                            ),
+                        )
+            if self._config.week5.market_radar_enabled and not full_market_automation:
                 radar_profiles: list[tuple[str, str, int]] = []
                 for raw_profile in self._config.week5.market_radar_window_intervals:
                     parsed_profile = _parse_hhmm_window_interval(str(raw_profile))
@@ -19112,6 +19262,77 @@ class StockAnalyzerService:
                     else:
                         add_symbol(value, f"{source_prefix}_{section_name}_{key}")
 
+    @staticmethod
+    def _week5_scheduler_result(report: object) -> dict[str, object]:
+        normalized = dict(report) if isinstance(report, Mapping) else {}
+        status = str(normalized.get("status", "ok")).strip().lower()
+        failed_statuses = {
+            "failed",
+            "fallback",
+            "blocked",
+            "blocked_data_gate",
+            "blocked_bootstrap_required",
+            "error",
+            "shadow_failed",
+            "unavailable",
+        }
+        pipeline = normalized.get("pipeline")
+        pipeline_failed = isinstance(pipeline, Mapping) and pipeline.get("ok") is False
+        success = (
+            bool(normalized.get("ok", True))
+            and status not in failed_statuses
+            and not pipeline_failed
+        )
+        detail = status or ("ok" if success else "failed")
+        return {
+            "report": report,
+            "_scheduler_success": success,
+            "_scheduler_detail": f"week5_automation:{detail}",
+        }
+
+    def _job_week5_night_scan(self) -> dict[str, object]:
+        current = self._job_now()
+        report = self.run_week5_night_scan(
+            timestamp=current,
+            # overnight_top5 是隔夜观察池，夜间任务不得发送买入类通知。
+            notify_enabled=False,
+            sync_watchlist=True,
+        )
+        return self._week5_scheduler_result(report)
+
+    def _job_week5_weekend_learning(self) -> dict[str, object]:
+        current = self._job_now()
+        return self._week5_scheduler_result(
+            self.run_week5_weekend_learning(timestamp=current)
+        )
+
+    def _job_week5_automation_auction(self) -> dict[str, object]:
+        current = self._job_now()
+        return self._week5_scheduler_result(
+            self.run_week5_auction(
+                timestamp=current,
+                notify_enabled=self._config.week5.auto_notify,
+            )
+        )
+
+    def _job_week5_automation_market_radar(self) -> dict[str, object]:
+        current = self._job_now()
+        return self._week5_scheduler_result(
+            self.run_week5_automation_market_radar(
+                timestamp=current,
+                notify_enabled=self._config.week5.market_radar_notify,
+            )
+        )
+
+    def _job_week5_automation_live_runtime(self) -> dict[str, object]:
+        current = self._job_now()
+        return self._week5_scheduler_result(
+            self.run_week5_automation_live_runtime(
+                timestamp=current,
+                notify_enabled=self._config.week5.auto_notify,
+            )
+        )
+
     def _job_week5_scan(self) -> dict[str, object]:
         symbols = [str(item).strip() for item in self._state.watchlist if str(item).strip()]
         current = self._job_now()
@@ -20134,7 +20355,7 @@ class StockAnalyzerService:
                     ]
                 )
                 self._notify_if_changed(
-                    dedup_key=f"notify:actionable:{day_key}:{phase}:buy:{symbol}",
+                    dedup_key=f"notify:actionable:{day_key}:buy:{symbol}",
                     title=_push_title(
                         priority="P1", category="signal", summary=f"buy candidate {symbol}"
                     ),
@@ -20164,7 +20385,7 @@ class StockAnalyzerService:
                     ]
                 )
                 self._notify_if_changed(
-                    dedup_key=f"notify:actionable:{day_key}:{phase}:sell:{symbol}",
+                    dedup_key=f"notify:actionable:{day_key}:sell:{symbol}",
                     title=_push_title(
                         priority="P0", category="action", summary=f"sell instruction {symbol}"
                     ),

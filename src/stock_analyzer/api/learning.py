@@ -22,6 +22,7 @@ from stock_analyzer.api.models import (
     LearningModelReleaseTicketRequest,
     LearningModelReleaseTicketRollbackRequest,
     LearningRuntimeHistoryColdStartRequest,
+    WeekendLearningRunRequest,
 )
 
 router = APIRouter()
@@ -267,3 +268,22 @@ def learning_manifests_status(
     manifest_limit: int = Query(default=20, ge=1, le=200),
 ) -> dict[str, object]:
     return get_service().learning_manifests_status(manifest_limit=manifest_limit)
+
+
+@router.post("/learning/weekend/run")
+def learning_weekend_run(
+    request: WeekendLearningRunRequest,
+    _auth: None = Depends(get_verify_api_auth()),
+) -> dict[str, object]:
+    return get_service().run_week5_weekend_learning(
+        timestamp=parse_optional_datetime(request.now),
+    )
+
+
+@router.get("/learning/weekend/latest")
+def learning_weekend_latest(
+    _auth: None = Depends(get_verify_api_auth()),
+) -> dict[str, object]:
+    state = get_service().week5_candidate_state()
+    latest = state.get("latest_weekend_learning", {})
+    return latest if isinstance(latest, dict) else {"status": "no_report"}

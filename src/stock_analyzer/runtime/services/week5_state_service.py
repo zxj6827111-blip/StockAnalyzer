@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from datetime import datetime
+from datetime import UTC, datetime
 from functools import lru_cache
 from importlib import import_module
 from typing import TYPE_CHECKING, Any, cast
@@ -57,6 +57,33 @@ class RuntimeWeek5StateService:
         top_k_override: int | None = None,
     ) -> list[str]:
         latest = self.latest_week5_scan_report()
+        automation = getattr(self._service, "_week5_automation_service", None)
+        if automation is not None:
+            candidate_state = automation.candidate_state()
+            freshness_checker = getattr(automation, "_fresh_previous_pool", None)
+            has_candidate_state = bool(
+                candidate_state.get("night_pool")
+                or str(candidate_state.get("night_pool_updated_at", "")).strip()
+                or str(candidate_state.get("night_pool_trade_date", "")).strip()
+                or bool(candidate_state.get("candidate_data_gate"))
+                or bool(candidate_state.get("fallback"))
+            )
+            fresh_pool: list[dict[str, object]] = []
+            if callable(freshness_checker):
+                try:
+                    fresh_pool, _ = freshness_checker(candidate_state, datetime.now(UTC))
+                except Exception:
+                    fresh_pool = []
+            candidate_symbols = [
+                str(item.get("symbol", "")).strip()
+                for item in fresh_pool
+                if isinstance(item, dict) and str(item.get("symbol", "")).strip()
+            ]
+            if candidate_symbols:
+                cap = top_k_override if top_k_override is not None and top_k_override > 0 else 50
+                return _dedupe_preserve_order(candidate_symbols)[:max(1, int(cap))]
+            if has_candidate_state:
+                return []
         if not isinstance(latest, dict):
             return []
 
@@ -104,6 +131,19 @@ class RuntimeWeek5StateService:
         }
         if not allowed_actions:
             allowed_actions = {"buy", "watch"}
+
+        # A night scan publishes an advisory candidate pool independently of
+        # final_signals; it is the compatibility watchlist projection.
+        night_pool = report.get("night_pool")
+        if isinstance(night_pool, list):
+            night_symbols = [
+                _normalize_a_share_symbol(item.get("symbol"))
+                for item in night_pool
+                if isinstance(item, dict)
+            ]
+            night_symbols = [symbol for symbol in night_symbols if symbol]
+            if night_symbols:
+                return _dedupe_preserve_order(night_symbols)[:top_k]
 
         # Watchlist candidates come EXCLUSIVELY from the funnel's final
         # selection: every symbol here already passed the final gates

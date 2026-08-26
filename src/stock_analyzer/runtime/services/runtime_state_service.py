@@ -82,6 +82,13 @@ class RuntimeStateService:
             "week5_market_radar_latest": service._runtime_state_optional_dict(
                 service._last_week5_market_radar_report
             ),
+            # Candidate state is persisted in its own locked file. Do not call
+            # the public accessor here: runtime-state persistence can invoke
+            # this method while loading a malformed or missing state file,
+            # which would otherwise recurse through the disk-refresh path.
+            "week5_candidate_state": service._runtime_state_optional_dict(
+                service._week5_automation_service.candidate_state()
+            ),
             "week5_market_radar_review_pool": service._runtime_state_dict_list(
                 service._market_radar_review_pool,
                 limit=market_radar_review_pool_limit,

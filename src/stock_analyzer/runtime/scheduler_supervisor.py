@@ -25,6 +25,8 @@ CRITICAL_JOBS = frozenset(
     {
         "premarket_scan",
         "auction_report",
+        "week5_automation_auction",
+        "week5_automation_live_runtime",
         "midday_news_brief",
         "close_reconcile",
     }
@@ -45,7 +47,12 @@ def _signal_process_group(pid: int, sig: int) -> None:
 
 
 def scheduler_group_for_job(job: str) -> str:
-    return "critical" if str(job).strip() in CRITICAL_JOBS else "heavy"
+    normalized = str(job).strip()
+    if normalized in CRITICAL_JOBS:
+        return "critical"
+    if any(normalized.startswith(f"{critical_job}_") for critical_job in CRITICAL_JOBS):
+        return "critical"
+    return "heavy"
 
 
 def timeout_for_job(config: StockAnalyzerConfig, *, group: str, job: str) -> int:
