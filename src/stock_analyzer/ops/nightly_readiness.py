@@ -217,13 +217,25 @@ def _validate_daily_index(
     if not isinstance(symbols, dict) or not symbols:
         raise ValueError(f"index_path has no symbols: {path}")
 
+    # 区分有 ZIP 数据的 symbol（entries 非空）与仅索引占位的 symbol
+    # （entries 存在但为空列表）。后者典型场景是新股 IPO 当日被增量
+    # 索引发现 latest_date，但上游 ZIP 尚未归档其 CSV；delta 导入无
+    # CSV 可读会跳过它们。把这类 symbol 排除出 coverage 分母，避免 1
+    # 只新股滞后连带让 5546 只正常票整体 readiness 失败。注意：历史
+    # 索引项可能不带 entries 字段，视作有数据（向后兼容）。
     latest_dates: list[date] = []
-    for item in symbols.values():
+    hollow_symbols: list[str] = []
+    for key, item in symbols.items():
         if not isinstance(item, dict):
             continue
         parsed = _coerce_date(item.get("latest_date"))
-        if parsed is not None:
-            latest_dates.append(parsed)
+        if parsed is None:
+            continue
+        entries = item.get("entries")
+        if isinstance(entries, list) and not entries:
+            hollow_symbols.append(str(key))
+            continue
+        latest_dates.append(parsed)
     if not latest_dates:
         raise ValueError(f"index_path has no latest_date values: {path}")
 
@@ -242,6 +254,7 @@ def _validate_daily_index(
         "latest_trade_date": index_latest.isoformat(),
         "symbols_total": len(symbols),
         "symbols_on_target_date": symbols_on_target,
+        "hollow_symbols": hollow_symbols,
     }
 
 
@@ -514,14 +527,10 @@ def invalidate_nightly_readiness(
             continue
         # 中缀命名与 consumed 文件（nightly_data_ready.consumed.json）一致：
         # 前缀固定，按文件名排序即按失效时间排序。
-        target = candidate.with_name(
-            f"nightly_data_ready.stale-{marker}.json"
-        )
+        target = candidate.with_name(f"nightly_data_ready.stale-{marker}.json")
         suffix = 1
         while target.exists():
-            target = candidate.with_name(
-                f"nightly_data_ready.stale-{marker}.{suffix}.json"
-            )
+            target = candidate.with_name(f"nightly_data_ready.stale-{marker}.{suffix}.json")
             suffix += 1
         try:
             os.replace(candidate, target)
@@ -533,8 +542,7 @@ def invalidate_nightly_readiness(
         invalidated.append(candidate)
     if failures:
         raise OSError(
-            "failed to invalidate one or more nightly readiness files: "
-            + " | ".join(failures)
+            "failed to invalidate one or more nightly readiness files: " + " | ".join(failures)
         )
     return invalidated
 

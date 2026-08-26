@@ -139,6 +139,118 @@ def test_write_requires_index_and_delta_artifacts(tmp_path: Path) -> None:
         )
 
 
+def _write_artifacts_with_entries(
+    tmp_path: Path,
+    *,
+    target_trade_date: str,
+    solid_symbols: dict[str, list[dict[str, object]]],
+    hollow_symbols: tuple[str, ...] = (),
+    delta_symbols: tuple[str, ...] | None = None,
+) -> tuple[Path, Path]:
+    """构造区分 entries 非空（有 ZIP 数据）与 entries 空列表（新股占位）的索引。"""
+    index_path = tmp_path / "vendor_overlay" / "daily_index.json"
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    symbols: dict[str, dict[str, object]] = {}
+    for symbol, entries in solid_symbols.items():
+        symbols[symbol] = {"latest_date": target_trade_date, "entries": entries}
+    for symbol in hollow_symbols:
+        symbols[symbol] = {"latest_date": target_trade_date, "entries": []}
+    index_path.write_text(
+        json.dumps({"symbols_total": len(symbols), "symbols": symbols}),
+        encoding="utf-8",
+    )
+
+    db_path = tmp_path / "vendor_delta" / "market_delta.duckdb"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    stored = delta_symbols if delta_symbols is not None else tuple(solid_symbols)
+    with duckdb.connect(str(db_path)) as connection:
+        connection.execute("CREATE TABLE daily_bars (symbol VARCHAR, date DATE)")
+        connection.executemany(
+            "INSERT INTO daily_bars VALUES (?, ?)",
+            [(symbol, target_trade_date) for symbol in stored],
+        )
+    return index_path, db_path
+
+
+def test_hollow_index_symbol_excluded_from_coverage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """新股 entries 为空时不计入 coverage 分母，readiness 应成功。"""
+    auth = tmp_path / "artifacts" / "runtime" / "nightly_data_ready.json"
+    index_path, db_path = _write_artifacts_with_entries(
+        tmp_path,
+        target_trade_date="2026-08-26",
+        solid_symbols={
+            "000001": [{"year": 2026, "zip": "全A日K/2026.zip", "entry": "2026/000001.SZ.csv"}],
+            "600000": [{"year": 2026, "zip": "全A日K/2026.zip", "entry": "2026/600000.SH.csv"}],
+        },
+        hollow_symbols=("688835",),  # 新股 IPO，ZIP 里还没有 CSV
+        delta_symbols=("000001", "600000"),  # delta 只有有数据的 2 只
+    )
+    monkeypatch.setenv("SA__NIGHTLY_READINESS_PATH", str(auth))
+    write_nightly_readiness(
+        target_trade_date="2026-08-26",
+        index_path=index_path,
+        db_path=db_path,
+    )
+    payload = read_nightly_readiness()
+    assert payload is not None
+    assert payload["index"]["symbols_on_target_date"] == 2
+    assert payload["delta"]["coverage_ratio"] == 1.0
+    assert "688835" in payload["index"]["hollow_symbols"]
+    gate = check_nightly_readiness(expected_trade_date="2026-08-26")
+    assert gate.ready is True
+
+
+def test_hollow_symbol_with_real_gap_still_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """有 entries 的 symbol 在 delta 缺失时仍必须失败——过滤不放松真丢数。"""
+    auth = tmp_path / "artifacts" / "runtime" / "nightly_data_ready.json"
+    index_path, db_path = _write_artifacts_with_entries(
+        tmp_path,
+        target_trade_date="2026-08-26",
+        solid_symbols={
+            "000001": [{"year": 2026, "zip": "全A日K/2026.zip", "entry": "2026/000001.SZ.csv"}],
+            "600000": [{"year": 2026, "zip": "全A日K/2026.zip", "entry": "2026/600000.SH.csv"}],
+            "688836": [{"year": 2026, "zip": "全A日K/2026.zip", "entry": "2026/688836.SH.csv"}],
+        },
+        hollow_symbols=("688835",),
+        delta_symbols=("000001", "600000"),  # 688836 有 entries 但 delta 缺
+    )
+    monkeypatch.setenv("SA__NIGHTLY_READINESS_PATH", str(auth))
+    with pytest.raises(ValueError, match="coverage is incomplete: 2<3"):
+        write_nightly_readiness(
+            target_trade_date="2026-08-26",
+            index_path=index_path,
+            db_path=db_path,
+            path=auth,
+        )
+
+
+def test_legacy_index_without_entries_field_still_works(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """历史索引项不带 entries 字段，视作有数据（向后兼容）。"""
+    auth = tmp_path / "artifacts" / "runtime" / "nightly_data_ready.json"
+    # 用原始 _write_artifacts（不带 entries 字段）
+    index_path, db_path = _write_artifacts(
+        tmp_path,
+        target_trade_date="2026-08-20",
+    )
+    monkeypatch.setenv("SA__NIGHTLY_READINESS_PATH", str(auth))
+    write_nightly_readiness(
+        target_trade_date="2026-08-20",
+        index_path=index_path,
+        db_path=db_path,
+    )
+    payload = read_nightly_readiness()
+    assert payload is not None
+    assert payload["index"]["symbols_on_target_date"] == 2
+    assert payload["delta"]["coverage_ratio"] == 1.0
+    assert payload["index"]["hollow_symbols"] == []
+
+
 def test_write_rejects_incomplete_delta_coverage(tmp_path: Path) -> None:
     index_path, db_path = _write_artifacts(
         tmp_path,
@@ -190,9 +302,7 @@ def test_invalidate_retires_all_mirrors_and_keeps_consumed(
 
     auth = tmp_path / "auth" / "artifacts" / "runtime" / "nightly_data_ready.json"
     legacy = tmp_path / "legacy" / "artifacts" / "runtime" / "nightly_data_ready.json"
-    consumed = tmp_path / "auth" / "artifacts" / "runtime" / (
-        "nightly_data_ready.consumed.json"
-    )
+    consumed = tmp_path / "auth" / "artifacts" / "runtime" / ("nightly_data_ready.consumed.json")
     auth.parent.mkdir(parents=True, exist_ok=True)
     legacy.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps({"schema_version": 2, "target_trade_date": "2026-08-20"})
