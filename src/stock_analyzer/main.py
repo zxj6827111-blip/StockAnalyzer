@@ -181,7 +181,9 @@ app.add_middleware(GZipMiddleware, minimum_size=1024)
 _UI_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 
 
-class _ImmutableAssetStaticFiles(StaticFiles):
+# mypy 质量门以 --follow-imports skip 运行，此时 starlette 的 StaticFiles 被视为
+# Any，strict 模式的 disallow_subclassing_any 会报 misc 错误；这里显式忽略。
+class _ImmutableAssetStaticFiles(StaticFiles):  # type: ignore[misc]
     """StaticFiles that marks hashed build assets as immutable."""
 
     def file_response(self, *args: Any, **kwargs: Any) -> Response:
