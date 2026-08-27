@@ -60,6 +60,7 @@ tmp_*
 
 # NAS 诊断一次性脚本（可能含 SSH 凭据，绝不入库）
 .tmp_*.py
+nas_probe/
 
 # 构建/重训产物
 *.bundle
