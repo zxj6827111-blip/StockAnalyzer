@@ -201,6 +201,10 @@ class RuntimeNewsService:
         )
         service._persist_m7_news_records(artifact_path=artifact_path, records=merged_records)
         report["persisted_records"] = len(merged_records)
+        # 追加按日归档：保留原滚动文件不变，另写一份按抓取日期分区的 JSONL 归档，
+        # 同日重复运行时合并去重后整体重写当天文件（幂等），并顺手清理过期归档。
+        archive_report = self._archive_m7_news_records_daily(records=records, now=now)
+        report["daily_archive"] = archive_report
         report["items"] = merged_records[: min(10, len(merged_records))]
         service._record_audit_event(
             event_type="m7_live_news_sync",
@@ -600,6 +604,13 @@ class RuntimeNewsService:
                 except json.JSONDecodeError:
                     pass
         try:
+            # akshare 1.18.84 的 stock_news_em 在 pandas pyarrow string backend 下会崩溃：
+            # 它内部对 "\u3000"（全角空格）做 str.replace(..., regex=True)，pyarrow 底层用
+            # RE2 引擎解析正则，而 RE2 不支持 "\u" 转义序列，会抛
+            # ArrowInvalid: Invalid regular expression: invalid escape sequence: \u。
+            # 这里临时把 string storage 切回 python 模式规避该问题（必须保留，不能删除）。
+            # 后续若 akshare 修复此行为、或 pandas 默认存储策略变更，
+            # 可重新评估是否还需此 workaround。
             with pd.option_context("mode.string_storage", "python"):
                 ak = service._import_akshare()
                 frame: pd.DataFrame = ak.stock_news_em(symbol=normalized_symbol)
@@ -993,6 +1004,102 @@ class RuntimeNewsService:
         with artifact_path.open("w", encoding="utf-8") as fp:
             for item in records:
                 fp.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+    def _resolve_m7_news_daily_archive_dir(self) -> Path:
+        service = self._service
+        raw_dir = str(
+            getattr(
+                service._config.evolution,
+                "m7_news_daily_archive_dir",
+                "artifacts/evolution/inputs/news_daily",
+            )
+        ).strip() or "artifacts/evolution/inputs/news_daily"
+        return cast(Path, service._resolve_evolution_path(raw_dir))
+
+    def _archive_m7_news_records_daily(
+        self,
+        *,
+        records: list[dict[str, object]],
+        now: datetime,
+    ) -> dict[str, object]:
+        """按日归档当日抓取的新闻记录（幂等 + 过期清理）。
+
+        - 归档路径为 <archive_dir>/YYYY-MM-DD.jsonl，日期取抓取时刻的本地日期；
+        - 同一天多次运行时，读取当天已有归档 + 本次记录，用 event_id 去重合并后整体重写，
+          保证重复运行不会写入相同 event_id（复用 _merge_m7_news_records 的去重语义）；
+        - 每次归档顺手扫描目录删除超过保留期的历史归档文件，无需单独定时任务。
+        """
+        service = self._service
+        report: dict[str, object] = {
+            "enabled": True,
+            "date": now.strftime("%Y-%m-%d"),
+            "written_records": 0,
+            "removed_expired": 0,
+        }
+        try:
+            archive_dir = self._resolve_m7_news_daily_archive_dir()
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            day_key = now.strftime("%Y-%m-%d")
+            archive_path = archive_dir / f"{day_key}.jsonl"
+            report["archive_path"] = str(archive_path)
+
+            # 读取当天已有归档（若存在），与本次 records 合并去重后整体重写，保证幂等。
+            existing_today: list[dict[str, object]] = load_m7_news_records(path=archive_path)
+            # max_records 给一个足够大的上限，避免单日归档被 2000 条滚动上限截断。
+            merged_today = service._merge_m7_news_records(
+                current=records,
+                existing=existing_today,
+                max_records=1_000_000,
+            )
+            service._persist_m7_news_records(
+                artifact_path=archive_path,
+                records=merged_today,
+            )
+            report["written_records"] = len(merged_today)
+
+            # 过期归档清理：按文件名日期判断，删除早于 (now - retention_days) 的归档文件。
+            retention_days = max(
+                1,
+                int(
+                    getattr(
+                        service._config.evolution,
+                        "m7_news_daily_archive_retention_days",
+                        90,
+                    )
+                ),
+            )
+            report["retention_days"] = retention_days
+            removed = 0
+            cutoff_ordinal = now.date().toordinal() - retention_days
+            for candidate in archive_dir.glob("*.jsonl"):
+                try:
+                    file_date = datetime.strptime(candidate.stem, "%Y-%m-%d").date()
+                except ValueError:
+                    # 非日期命名文件不在清理范围内，跳过。
+                    continue
+                if file_date.toordinal() < cutoff_ordinal:
+                    try:
+                        candidate.unlink()
+                        removed += 1
+                    except OSError:
+                        # 删除失败不阻断主流程（可能被占用/权限问题），仅统计成功数。
+                        continue
+            report["removed_expired"] = removed
+        except Exception as exc:
+            # 归档属于旁路增强，失败不应影响主滚动文件持久化与调用方返回。
+            report["enabled"] = False
+            report["error_type"] = exc.__class__.__name__
+            report["error"] = str(exc)[:300]
+            service._record_audit_event(
+                event_type="m7_news_daily_archive_failed",
+                level="warn",
+                payload={
+                    "date": report.get("date"),
+                    "error_type": exc.__class__.__name__,
+                    "error": str(exc)[:300],
+                },
+            )
+        return report
 
     def news_score_history(
         self,
