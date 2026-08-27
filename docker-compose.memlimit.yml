@@ -1,0 +1,50 @@
+# 容器内存限制叠加层（PLAN Task 7，不可妥协项：需重启容器生效）。
+#
+# 现状（PLAN 已实测）：NAS 宿主 8 核 / 15.5G 内存，可用约 10.7G，常驻已占 3.2G，
+# swap 已用 938M（存在内存压力）。当前四个容器（api/scheduler-critical/
+# scheduler-heavy/redis）均无内存限制（Memory=0），失控任务可能连带打死宿主
+# 上的其他容器（例如 sing-box）。前人已撞过全市场特征工程吃 12G 打到 swap
+# 后性能塌陷的问题。
+#
+# 本文件默认不生效——不在 nas_deploy_update.sh 的默认 compose 组合里。
+# 需要显式追加到 compose 命令才会生效：
+#
+#   docker compose -f docker-compose.yml -f docker-compose.runtime.yml \
+#     -f docker-compose.advisory.yml -f docker-compose.vendor-overlay.yml \
+#     -f docker-compose.memlimit.yml up -d --force-recreate api \
+#     scheduler-critical scheduler-heavy redis
+#
+# 加内存限制本身需要容器重建（新增 mem_limit 属于容器创建时的 cgroup 配置，
+# 无法用 docker update 在不重建的情况下对已运行容器动态生效到位——虽然
+# `docker update --memory` 技术上可以对运行中容器调整，但为了让 compose
+# 渲染结果与实际运行状态保持一致、避免下次部署时被静默覆盖回 Memory=0，
+# 应该通过 --force-recreate 走正规流程），需要与运维确认维护时间窗口后才能
+# 实际执行——本文件本身只是设计产物，不在本次改动中自动应用。
+#
+# 内存预算（合计 9.5G，可用 10.7G，留 ~1.2G 冗余给宿主其他容器与内核）：
+#   redis            0.5G  —— 现有工作负载体量小，纯缓存
+#   api              4.0G  —— 常规请求服务 + 本次新增 as-of 回测后台任务
+#                              （Top N 默认 50、标的维度 <= 8 worker，
+#                              远小于曾导致 12G 峰值的全市场 5500 只扫描）
+#   scheduler-critical 2.0G —— 按设计跑轻量/高频任务
+#   scheduler-heavy    3.0G —— 跑全市场扫描/evolution 等重任务，预留更大余量
+#
+# memswap_limit 与 mem_limit 相等 = 禁止该容器额外使用 swap（超出 mem_limit
+# 直接 OOM kill 而非拖累宿主 swap 到影响其他容器的地步）——现在 swap 已有
+# 938M 占用，不应让新功能继续加剧 swap 压力。
+services:
+  redis:
+    mem_limit: 512m
+    memswap_limit: 512m
+
+  api:
+    mem_limit: 4g
+    memswap_limit: 4g
+
+  scheduler-critical:
+    mem_limit: 2g
+    memswap_limit: 2g
+
+  scheduler-heavy:
+    mem_limit: 3g
+    memswap_limit: 3g

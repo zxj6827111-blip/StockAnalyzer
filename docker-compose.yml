@@ -49,6 +49,7 @@ services:
       - ./artifacts:/app/artifacts
       - ./suggestions:/app/suggestions
       - ${SA_INTRADAY_SUMMARY_HOST_ROOT:-./artifacts/intraday_summary}:/data/intraday_summary:ro
+      - ${SA_FRONTEND_DIST_HOST_ROOT:-./frontend_dist}:/app/frontend_dist
     ports:
       - "${SA_API_HOST_PORT:-8001}:8000"
     depends_on:
