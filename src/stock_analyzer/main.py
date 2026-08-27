@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Header, Request
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
@@ -168,6 +169,27 @@ async def _app_lifespan(_app: FastAPI) -> Any:
 
 app = FastAPI(title="StockAnalyzer API", version="0.1.0", lifespan=_app_lifespan)
 
+# 看板 JSON 响应体偏大（/dashboard/portfolio 约 730KB、/week5/scan/latest 约 460KB），
+# 未压缩时在局域网外访问明显变慢。GZipMiddleware 只在客户端声明 Accept-Encoding
+# 时生效，企微/飞书回调不声明就不压缩，因此不影响既有集成。minimum_size 跳过
+# 小响应，避免给 /health 这类高频轻量端点增加无谓的压缩开销。
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+# Vite 产物是 hash 化文件名（index-<hash>.js），内容变更必然带来文件名变更，
+# 因此可以安全地长期强缓存。注意 index.html 不能强缓存，否则前端发版后浏览器
+# 会一直拿旧页面 —— 它由下面的 frontend_ui_page 返回，保持默认的协商缓存。
+_UI_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
+
+
+class _ImmutableAssetStaticFiles(StaticFiles):
+    """StaticFiles that marks hashed build assets as immutable."""
+
+    def file_response(self, *args: Any, **kwargs: Any) -> Response:
+        response = super().file_response(*args, **kwargs)
+        response.headers.setdefault("Cache-Control", _UI_ASSET_CACHE_CONTROL)
+        return response
+
+
 
 @app.exception_handler(RequiredIntradayDataError)
 async def required_intraday_data_error(
@@ -186,7 +208,11 @@ async def required_intraday_data_error(
 
 
 if _frontend_assets_dir is not None and _frontend_assets_dir.exists():
-    app.mount("/ui/assets", StaticFiles(directory=str(_frontend_assets_dir)), name="ui-assets")
+    app.mount(
+        "/ui/assets",
+        _ImmutableAssetStaticFiles(directory=str(_frontend_assets_dir)),
+        name="ui-assets",
+    )
 
 
 if _frontend_dist_dir is not None:

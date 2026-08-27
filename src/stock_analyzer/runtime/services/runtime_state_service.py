@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
-from time import monotonic, sleep
+from time import monotonic, sleep, time
 from typing import Any, cast
 from uuid import uuid4
 
@@ -29,6 +29,27 @@ class RuntimeStateService:
 
     def __init__(self, service: Any) -> None:
         self._service = service
+        # sidecar 读缓存：name -> ((mtime_ns, size), 已解析的全量行)
+        # runtime_state.json 每次被改写都会触发全量重载，而 17 个 history
+        # sidecar 里通常只有一两个真的变了。按 (mtime_ns, size) 判断文件是否
+        # 变化，未变则直接复用上次解析结果，避免重复 JSON 解析（这是重载耗时
+        # 的主要成分，实测 60MB/1.3 万条约 1.2s，且是纯 CPU 开销）。
+        self._sidecar_read_cache: dict[str, tuple[tuple[int, int], list[dict[str, object]]]] = {}
+        # sidecar 写指纹：name -> ((mtime_ns, size), 内容 sha256)
+        # 用于在内容未变时跳过重写，避免无意义地推进 mtime——mtime 一变就会
+        # 让其它进程（API）触发全量重载，这是接口毛刺的直接来源。
+        self._sidecar_write_fingerprints: dict[str, tuple[tuple[int, int], str]] = {}
+        # 孤儿 .tmp 清理的上次执行时间（monotonic 秒），0 表示尚未执行
+        self._sidecar_tmp_sweep_at: float = 0.0
+
+    @staticmethod
+    def _sidecar_stat_key(path: Path) -> tuple[int, int] | None:
+        """Return ``(mtime_ns, size)`` as the file-identity key, ``None`` if absent."""
+        try:
+            stat_result = path.stat()
+        except OSError:
+            return None
+        return (stat_result.st_mtime_ns, stat_result.st_size)
 
     def _default_runtime_state_payload(self) -> dict[str, object]:
         service = self._service
@@ -399,11 +420,40 @@ class RuntimeStateService:
             ),
         ]
 
+    def _sweep_stale_sidecar_tmp_files(self, base_dir: Path) -> None:
+        """Remove leftover ``*.jsonl.<uuid>.tmp`` files from interrupted atomic writes.
+
+        原子写的流程是「写临时文件 -> fsync -> os.replace」，进程在中途被杀就会
+        留下临时文件，且没有任何清理逻辑。实测线上残留 4 个共 81.7MB。
+
+        只删除超过 1 小时未修改的临时文件：正常写入耗时秒级，1 小时的阈值可以
+        确保不会误删其它进程正在写的文件。清理本身按 10 分钟节流，避免每次落盘
+        都扫目录。
+        """
+        now = monotonic()
+        if self._sidecar_tmp_sweep_at and now - self._sidecar_tmp_sweep_at < 600.0:
+            return
+        self._sidecar_tmp_sweep_at = now
+        stale_before = time() - 3600.0
+        try:
+            candidates = list(base_dir.glob("*.tmp"))
+        except OSError:
+            return
+        for candidate in candidates:
+            try:
+                if candidate.stat().st_mtime >= stale_before:
+                    continue
+                candidate.unlink()
+            except OSError:
+                # 并发删除或权限问题都不应影响状态落盘主流程
+                continue
+
     def _persist_runtime_state_history_sidecars(self, existing_raw: object) -> None:
         service = self._service
         existing = existing_raw if isinstance(existing_raw, dict) else {}
         base_dir = self._runtime_state_sidecar_dir()
         base_dir.mkdir(parents=True, exist_ok=True)
+        self._sweep_stale_sidecar_tmp_files(base_dir)
         for name, records, limit, path, identity_keys in self._runtime_state_sidecar_specs():
             existing_rows = service._merge_runtime_state_history(
                 self._load_runtime_state_history_sidecar(name, limit=limit * 2),
@@ -417,21 +467,44 @@ class RuntimeStateService:
                 limit=max(1, limit),
                 identity_keys=identity_keys,
             )
+            payload = "".join(
+                json.dumps(row, ensure_ascii=False, separators=(",", ":"), default=str) + "\n"
+                for row in rows
+            )
+            stat_key = self._sidecar_stat_key(path)
+            content_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+            fingerprint = self._sidecar_write_fingerprints.get(name)
+            if (
+                fingerprint is not None
+                and stat_key is not None
+                and fingerprint == (stat_key, content_hash)
+            ):
+                # 内容与上次写入完全一致，且文件此后未被其它进程改动：跳过重写。
+                # 这样 mtime 不会前进，其它进程（API）也就不会被误触发全量重载。
+                continue
             temp_path = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
-            with temp_path.open("w", encoding="utf-8") as fp:
-                for row in rows:
-                    fp.write(
-                        json.dumps(
-                            row,
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                            default=str,
-                        )
-                    )
-                    fp.write("\n")
-                fp.flush()
-                os.fsync(fp.fileno())
-            os.replace(temp_path, path)
+            try:
+                with temp_path.open("w", encoding="utf-8") as fp:
+                    fp.write(payload)
+                    fp.flush()
+                    os.fsync(fp.fileno())
+                os.replace(temp_path, path)
+            except OSError:
+                # 写失败时清掉临时文件，避免再留下孤儿；指纹不更新，下次重试
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+                self._sidecar_write_fingerprints.pop(name, None)
+                raise
+            written_stat_key = self._sidecar_stat_key(path)
+            if written_stat_key is not None:
+                self._sidecar_write_fingerprints[name] = (written_stat_key, content_hash)
+                # 刚写出的内容就是 rows，同步进读缓存，避免下一次重载再解析一遍
+                self._sidecar_read_cache[name] = (written_stat_key, rows)
+            else:
+                self._sidecar_write_fingerprints.pop(name, None)
+                self._sidecar_read_cache.pop(name, None)
 
     def _load_runtime_state_history_sidecar(
         self,
@@ -439,7 +512,25 @@ class RuntimeStateService:
         *,
         limit: int,
     ) -> list[dict[str, object]]:
+        """Load a history sidecar, reusing the parsed rows when the file is unchanged.
+
+        缓存命中判定基于 ``(mtime_ns, size)``：字节相同则解析结果必然相同，
+        因此复用是行为等价的。
+
+        返回值是一个新的 list，但其中的 dict 与缓存共享引用。**调用方不得就地
+        修改这些 dict**。当前两个调用方（``_load_runtime_state_from_disk`` 与
+        ``_persist_runtime_state_history_sidecars``）都会立即把结果交给
+        ``_merge_runtime_state_history``，后者对每条记录做 deepcopy，因此缓存
+        内容不会被外部改动。新增调用方时需保持该约定。
+        """
         path = self._runtime_state_sidecar_dir() / f"{name}.jsonl"
+        effective_limit = max(1, limit)
+        stat_key = self._sidecar_stat_key(path)
+        if stat_key is not None:
+            cached = self._sidecar_read_cache.get(name)
+            if cached is not None and cached[0] == stat_key:
+                return list(cached[1][-effective_limit:])
+
         rows: list[dict[str, object]] = []
         try:
             with path.open("r", encoding="utf-8") as fp:
@@ -455,9 +546,11 @@ class RuntimeStateService:
                         rows.append(cast(dict[str, object], item))
         except OSError:
             return []
-        if len(rows) > limit:
-            rows = rows[-limit:]
-        return rows
+        # 读完之后再取一次 stat：若文件在读取期间被其它进程改写，则本次结果与
+        # 任何一个稳定版本都不对应，不能进缓存（下次重新读取）。
+        if stat_key is not None and self._sidecar_stat_key(path) == stat_key:
+            self._sidecar_read_cache[name] = (stat_key, rows)
+        return rows[-effective_limit:]
 
     def _persist_runtime_state_to_disk(self, *, include_history_sidecars: bool = True) -> None:
         service = self._service
