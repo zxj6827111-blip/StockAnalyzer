@@ -436,7 +436,9 @@ class RuntimeStateService:
         self._sidecar_tmp_sweep_at = now
         stale_before = time() - 3600.0
         try:
-            candidates = list(base_dir.glob("*.tmp"))
+            # 匹配模式对齐实际生成规则 f"{path.name}.{uuid4().hex}.tmp"，避免误删
+            # 未来可能被放进该目录的其它类型临时文件
+            candidates = list(base_dir.glob("*.jsonl.*.tmp"))
         except OSError:
             return
         for candidate in candidates:
@@ -456,7 +458,13 @@ class RuntimeStateService:
         self._sweep_stale_sidecar_tmp_files(base_dir)
         for name, records, limit, path, identity_keys in self._runtime_state_sidecar_specs():
             existing_rows = service._merge_runtime_state_history(
-                self._load_runtime_state_history_sidecar(name, limit=limit * 2),
+                # 绕过读缓存：这一步的作用就是把其它进程新写入的记录合并进来，
+                # 复用缓存一旦陈旧会导致这些记录被后面的写回静默覆盖。
+                self._load_runtime_state_history_sidecar(
+                    name,
+                    limit=limit * 2,
+                    use_cache=False,
+                ),
                 existing.get(name),
                 limit=max(1, limit) * 2,
                 identity_keys=identity_keys,
@@ -511,22 +519,29 @@ class RuntimeStateService:
         name: str,
         *,
         limit: int,
+        use_cache: bool = True,
     ) -> list[dict[str, object]]:
         """Load a history sidecar, reusing the parsed rows when the file is unchanged.
 
         缓存命中判定基于 ``(mtime_ns, size)``：字节相同则解析结果必然相同，
         因此复用是行为等价的。
 
+        ``use_cache=False`` 用于**写路径**：落盘前需要把磁盘上其它进程新写入的
+        记录合并进来，这一步必须读到当下最新的字节。如果这里复用缓存而缓存又恰好
+        陈旧（``os.replace`` 后 stat 未能反映变化，例如网络文件系统的属性缓存），
+        合并结果就会缺失其它进程的记录，并在随后的写回中把它们静默覆盖掉——这是
+        数据丢失，代价远高于省下的一次解析。写路径本身低频（数十秒一次）且不在
+        用户请求的关键路径上，因此这里选择始终读盘。
+
         返回值是一个新的 list，但其中的 dict 与缓存共享引用。**调用方不得就地
-        修改这些 dict**。当前两个调用方（``_load_runtime_state_from_disk`` 与
-        ``_persist_runtime_state_history_sidecars``）都会立即把结果交给
+        修改这些 dict**。当前所有调用方都会立即把结果交给
         ``_merge_runtime_state_history``，后者对每条记录做 deepcopy，因此缓存
         内容不会被外部改动。新增调用方时需保持该约定。
         """
         path = self._runtime_state_sidecar_dir() / f"{name}.jsonl"
         effective_limit = max(1, limit)
         stat_key = self._sidecar_stat_key(path)
-        if stat_key is not None:
+        if use_cache and stat_key is not None:
             cached = self._sidecar_read_cache.get(name)
             if cached is not None and cached[0] == stat_key:
                 return list(cached[1][-effective_limit:])
@@ -550,6 +565,8 @@ class RuntimeStateService:
         # 任何一个稳定版本都不对应，不能进缓存（下次重新读取）。
         if stat_key is not None and self._sidecar_stat_key(path) == stat_key:
             self._sidecar_read_cache[name] = (stat_key, rows)
+        else:
+            self._sidecar_read_cache.pop(name, None)
         return rows[-effective_limit:]
 
     def _persist_runtime_state_to_disk(self, *, include_history_sidecars: bool = True) -> None:

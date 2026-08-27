@@ -303,6 +303,8 @@ week5:
   # 该 sidecar 在每次状态落盘时被全量读+改+写，在每次状态变更后又被 API
   # 全量重新解析，是接口延迟的主要来源，因此把保留深度收敛到 60 条
   # （约 60 个扫描时段，足够 /week5/scan/history 默认 limit=20 与看板使用）。
+  # 注意：auto_sync_watchlist_empty_grace_runs 的连续空信号计数是在这份历史里
+  # 反向扫描的，若把 grace_runs 配到超过这里的上限，计数会被截断。
   history_limit: 60
   # P1 双轨输出：legacy=单轨 monster（现状）；dual_track=trend_candidates
   # 稳健候选 + monster_watchlist 高波动观察池（executable=false）。
