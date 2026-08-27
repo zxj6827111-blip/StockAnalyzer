@@ -298,7 +298,14 @@ week5:
   auto_notify: true
   full_market_automation_enabled: false
   market_radar_full_market_enabled: true
-  history_limit: 500
+  # 单条 week5 扫描报告约 87KB（含完整 signal_pool/first_board/anomalies），
+  # 500 条会让 runtime_state_history/week5_scan_history.jsonl 涨到 44MB+。
+  # 该 sidecar 在每次状态落盘时被全量读+改+写，在每次状态变更后又被 API
+  # 全量重新解析，是接口延迟的主要来源，因此把保留深度收敛到 60 条
+  # （约 60 个扫描时段，足够 /week5/scan/history 默认 limit=20 与看板使用）。
+  # 注意：auto_sync_watchlist_empty_grace_runs 的连续空信号计数是在这份历史里
+  # 反向扫描的，若把 grace_runs 配到超过这里的上限，计数会被截断。
+  history_limit: 60
   # P1 双轨输出：legacy=单轨 monster（现状）；dual_track=trend_candidates
   # 稳健候选 + monster_watchlist 高波动观察池（executable=false）。
   # NAS 先 Shadow 对比后切换为 dual_track。
@@ -502,7 +509,9 @@ week6:
     - holder_count
     - financing_balance
     - background_data_complete
-  history_limit: 500
+  # 单条 week6 报告约 30KB，week6 每日运行；500 条会膨胀到 15MB 并进入
+  # 每次状态重载的解析路径。120 条约覆盖半年，足够趋势与看板使用。
+  history_limit: 120
   main_force:
     lookback_days: 60
     strong_score: 65
@@ -801,7 +810,9 @@ acceptance:
   runtime_sla_recent_runs: 10
   export_enabled: true
   export_dir: "artifacts/acceptance"
-  history_limit: 500
+  # 保留深度直接决定 week4_acceptance_history.jsonl 的体积，而该 sidecar 处于
+  # 每次状态重载的解析路径上；120 条足够 /acceptance/week4/history 使用。
+  history_limit: 120
 
 evolution:
   enabled: true
@@ -811,7 +822,10 @@ evolution:
   dry_run_live_modes: ["production"]
   validation_require_dry_run: true
   offhours_time: "20:30"
-  history_limit: 500
+  # 该上限同时作用于 evolution_history 与 9 个治理类 sidecar。单条 evolution
+  # 报告约 36KB，500 条会让 evolution_history.jsonl 涨到 18MB 并拖慢每次状态
+  # 重载。120 条覆盖约 4 个月，远超 evolution_window_report 的 10 天窗口需求。
+  history_limit: 120
   report_dir: "artifacts/evolution/history"
   suggestions_dir: "suggestions"
   compliance_db_path: "artifacts/evolution/compliance.duckdb"
