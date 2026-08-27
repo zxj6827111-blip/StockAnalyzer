@@ -711,3 +711,20 @@ class Week7SimBrokerRunRequest(BaseModel):
 class NewsScoreCacheClearRequest(BaseModel):
     symbol: str = ""
     strategy: str = ""
+
+
+class AsofBacktestRunRequest(BaseModel):
+    """POST /backtest/asof-scan 请求体（PLAN Task 5）。
+
+    ``date`` 用于单日回测；``start_date``/``end_date`` 用于日期区间（含端点）。
+    两者至少要提供一种——路由层负责校验并在缺失/冲突时返回 400，而不是让
+    校验散落在多个可选字段的隐式组合里。
+    """
+
+    date: str = ""
+    start_date: str = ""
+    end_date: str = ""
+    symbols: list[str] = Field(default_factory=list)
+    top_n: int | None = Field(default=None, ge=1, le=500)
+    horizon_days: int | None = Field(default=None, ge=1, le=60)
+
