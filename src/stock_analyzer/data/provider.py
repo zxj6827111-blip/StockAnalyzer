@@ -16,6 +16,34 @@ class DataSourceError(RuntimeError):
     """Raised when market data cannot be fetched."""
 
 
+class FutureDataLeakError(DataSourceError):
+    """Raised by the as-of backtest path when a fetched frame contains rows
+    dated after the requested ``as_of`` cutoff.
+
+    This is the core correctness guard for historical backtesting: every
+    provider in the chain (vendor ZIP overlay, market warehouse, cached/
+    resilient wrappers) is expected to honor ``end_date`` and truncate its
+    result accordingly. If a bug or a misconfigured provider ever returns
+    rows beyond the cutoff, this exception must fire immediately rather than
+    silently letting future information leak into an as-of scan -- a
+    dedicated unit test asserts this by injecting a provider that returns
+    future rows on purpose.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        symbol: str = "",
+        as_of: date | None = None,
+        actual_max_date: date | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.symbol = symbol
+        self.as_of = as_of
+        self.actual_max_date = actual_max_date
+
+
 class RequiredIntradayDataError(DataSourceError):
     """Raised when required pre-aggregated intraday data is unavailable."""
 

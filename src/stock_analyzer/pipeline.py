@@ -9,10 +9,10 @@ from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from contextvars import ContextVar
 from copy import deepcopy
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from time import perf_counter, perf_counter_ns
-from typing import Protocol, TypedDict
+from typing import Protocol, TypedDict, cast
 from uuid import uuid4
 
 import numpy as np
@@ -21,6 +21,7 @@ import pandas as pd
 from stock_analyzer.config import LiquidityFilterConfig, StockAnalyzerConfig
 from stock_analyzer.data.provider import (
     DataSourceError,
+    FutureDataLeakError,
     MarketDataProvider,
     RequiredIntradayDataError,
     fetch_intraday_summaries_compat,
@@ -150,6 +151,85 @@ class NeutralNewsSignalProvider:
         return 0.50
 
 
+# 历史回测决策时点固定为该日收盘之后（PLAN Task 3）：真实决策发生在当天收盘，
+# 用一个晚于常规收盘（15:00）又早于次日开盘的时刻，使 apply_time_invariants_to_frame
+# 的 decision_time > available_time 判定语义清晰、不依赖 datetime.now() 的墙钟时间。
+_AS_OF_DECISION_TIME = time(hour=15, minute=30)
+
+
+def _fetch_daily_bars_with_end_date(
+    provider: MarketDataProvider,
+    *,
+    symbol: str,
+    lookback_days: int,
+    end_date: date | None,
+) -> pd.DataFrame:
+    """Fetch daily bars, passing ``end_date`` only when set.
+
+    Mirrors the ``_fetch_daily_bars_compat`` helper duplicated across the
+    provider wrapper modules (``cached_provider``/``resilient_provider``/
+    ``hybrid_runtime_provider``): providers implementing the older
+    two-argument signature raise ``TypeError`` when given ``end_date``, so
+    the caller falls back to the legacy call. When ``end_date`` is ``None``
+    this is exactly the production call with zero behavior change.
+    """
+    if end_date is None:
+        return cast(
+            pd.DataFrame, provider.fetch_daily_bars(symbol=symbol, lookback_days=lookback_days)
+        )
+    try:
+        return cast(
+            pd.DataFrame,
+            provider.fetch_daily_bars(
+                symbol=symbol,
+                lookback_days=lookback_days,
+                end_date=end_date,
+            ),
+        )
+    except TypeError as exc:
+        if "end_date" not in str(exc):
+            raise
+        return cast(
+            pd.DataFrame, provider.fetch_daily_bars(symbol=symbol, lookback_days=lookback_days)
+        )
+
+
+def _assert_no_future_leak(
+    bars: pd.DataFrame,
+    *,
+    symbol: str,
+    as_of: date | None,
+) -> None:
+    """Raise :class:`FutureDataLeakError` if ``bars`` contains a row dated
+    after ``as_of``.
+
+    This is the core correctness guard for the as-of backtest path (PLAN
+    Task 3, section 7 review item #1): every provider in the chain is
+    expected to honor ``end_date`` truncation, but a bug in any layer (a new
+    provider that forgets the check, a caching layer with a stale key, a
+    misconfigured overlay) must be caught here rather than silently
+    producing a lookahead-biased result. No-ops when ``as_of`` is ``None``
+    (production path) or the frame is empty.
+    """
+    if as_of is None or bars.empty:
+        return
+    index = bars.index
+    if not isinstance(index, pd.DatetimeIndex):
+        index = pd.DatetimeIndex(pd.to_datetime(index, errors="coerce"))
+    valid_index = index[~pd.isna(index)]
+    if valid_index.empty:
+        return
+    actual_max = valid_index.max().date()
+    if actual_max > as_of:
+        raise FutureDataLeakError(
+            f"future data leak detected for {symbol}: as_of={as_of.isoformat()} but "
+            f"fetched bars contain a row dated {actual_max.isoformat()}",
+            symbol=symbol,
+            as_of=as_of,
+            actual_max_date=actual_max,
+        )
+
+
 class AnalyzerPipeline:
     """Run one pass of signal generation for symbols."""
 
@@ -268,13 +348,37 @@ class AnalyzerPipeline:
         on_symbol_progress: Callable[[str, int, int, bool], None] | None = None,
         transform_max_workers: int = 1,
         capture_post_scan_enrichment: bool = False,
+        as_of: date | None = None,
     ) -> PipelineReport:
+        """Run one signal-generation pass.
+
+        ``as_of`` is the historical-backtest hook (PLAN
+        docs/plan_asof_backtest_holding_curve.md Task 3): when set, every
+        internal ``fetch_daily_bars`` call passes ``end_date=as_of`` so the
+        provider chain truncates to that date, a leak-detection assertion
+        verifies the returned frame never exceeds it, intraday summaries
+        degrade to empty (NaN feature columns) instead of the production
+        fail-closed ``RequiredIntradayDataError`` behavior, and the news
+        component is forced to the neutral 0.50 baseline (historical news
+        before the fix in Task 1 cannot be recovered). ``as_of=None`` (the
+        default) preserves production behavior byte-for-byte -- see
+        ``tests/test_pipeline_asof.py::test_as_of_none_matches_production``.
+        """
         token = _PIPELINE_INTRADAY_PREFETCH.set(
             self._prefetch_intraday_summaries(
                 symbols=symbols,
                 lookback_days=self._signal_analysis_lookback_days + 5,
+                as_of=as_of,
             )
         )
+        # 历史新闻不可追回（PLAN 3.5 节结论），as_of 模式强制使用中性新闻
+        # provider（恒定 0.50），避免用当前实时新闻污染历史时点的信号计算。
+        # 用 save/restore 而非直接丢弃原 provider：as_of=None 时这段 no-op，
+        # 保证生产路径（例如注入了自定义 news_provider 的调用方）零行为变化；
+        # try/finally 保证即使 _run_once_prefetched 抛异常也一定恢复原状态。
+        original_news_provider = self._news_provider
+        if as_of is not None:
+            self._news_provider = NeutralNewsSignalProvider()
         try:
             return self._run_once_prefetched(
                 symbols=symbols,
@@ -283,9 +387,11 @@ class AnalyzerPipeline:
                 on_symbol_progress=on_symbol_progress,
                 transform_max_workers=transform_max_workers,
                 capture_post_scan_enrichment=capture_post_scan_enrichment,
+                as_of=as_of,
             )
         finally:
             _PIPELINE_INTRADAY_PREFETCH.reset(token)
+            self._news_provider = original_news_provider
 
     def _run_once_prefetched(
         self,
@@ -295,6 +401,7 @@ class AnalyzerPipeline:
         on_symbol_progress: Callable[[str, int, int, bool], None] | None = None,
         transform_max_workers: int = 1,
         capture_post_scan_enrichment: bool = False,
+        as_of: date | None = None,
     ) -> PipelineReport:
         trace_id = uuid4().hex[:16]
         signals: list[PipelineSignal] = []
@@ -330,6 +437,19 @@ class AnalyzerPipeline:
             "pool_error": "",
         }
         if max_transform_workers > 1 and total > 1:
+            if as_of is not None:
+                # _run_once_parallel 走 ProcessPoolExecutor 对 SymbolTransformInputs
+                # 做序列化，as_of 尚未接入该路径（内含 as_of 相关的 provider_status
+                # 标注/防泄露断言均在 _prepare_symbol_inputs 主线程完成，pickle 到
+                # 子进程前已经生效，理论上兼容；但未经过针对性单测验证，宁可显式
+                # 拒绝也不要在核心正确性保障未覆盖的路径上悄悄放行——as-of 回测
+                # 调用方应始终使用标的维度的外部并行（backtest/asof_scan.py），
+                # 单个 AnalyzerPipeline 调用内部保持 transform_max_workers=1。
+                raise ValueError(
+                    "run_once(as_of=...) does not support transform_max_workers > 1; "
+                    "parallelize across symbols at the caller level instead "
+                    "(see backtest/asof_scan.py)"
+                )
             signals = self._run_once_parallel(
                 symbols=symbols,
                 strategy=strategy,
@@ -344,7 +464,10 @@ class AnalyzerPipeline:
                     on_symbol_progress(symbol, index, total, True)
                 symbol_started = perf_counter()
                 signal = self._process_symbol(
-                    symbol=symbol, strategy=strategy, current_equity=current_equity
+                    symbol=symbol,
+                    strategy=strategy,
+                    current_equity=current_equity,
+                    as_of=as_of,
                 )
                 symbol_stage_ms.append(
                     {
@@ -729,6 +852,7 @@ class AnalyzerPipeline:
         *,
         symbols: list[str],
         lookback_days: int,
+        as_of: date | None = None,
     ) -> dict[tuple[str, str], tuple[int, pd.DataFrame, str]]:
         normalized_symbols = list(
             dict.fromkeys(str(symbol).strip() for symbol in symbols if str(symbol).strip())
@@ -747,10 +871,20 @@ class AnalyzerPipeline:
                 )
             except RequiredIntradayDataError as exc:
                 if not exc.missing_symbols or not exc.partial_frames:
-                    raise
-                frames = exc.partial_frames
-                missing_symbols = set(exc.missing_symbols)
-                missing_reason = str(exc)
+                    if as_of is not None:
+                        # as-of 回测独立降级路径：整批 intraday 不可用（例如
+                        # duckdb_required 下 manifest 缺失）时，把全部标的标记
+                        # 为缺失而非向上抛错中断整轮 run_once；只在 as_of 不为
+                        # None 时才生效，不触碰生产 fail-closed 语义。
+                        frames = {}
+                        missing_symbols = set(normalized_symbols)
+                        missing_reason = str(exc)
+                    else:
+                        raise
+                else:
+                    frames = exc.partial_frames
+                    missing_symbols = set(exc.missing_symbols)
+                    missing_reason = str(exc)
             except Exception:
                 continue
             for symbol in normalized_symbols:
@@ -1030,14 +1164,22 @@ class AnalyzerPipeline:
         self._last_symbol_stage_ms = symbol_stage_ms
         return signals
 
-    def _process_symbol(self, symbol: str, strategy: str, current_equity: float) -> PipelineSignal:
+    def _process_symbol(
+        self,
+        symbol: str,
+        strategy: str,
+        current_equity: float,
+        as_of: date | None = None,
+    ) -> PipelineSignal:
         """单只股票完整处理（串行路径）。
 
         Phase 2 并行路径使用相同的三段拆分（_prepare_symbol_inputs /
         _transform_symbol_features / _finalize_symbol_signal），本方法即三段
         顺序调用，保证串行与并行逐字段等价。
         """
-        fail_signal, inputs = self._prepare_symbol_inputs(symbol, strategy, current_equity)
+        fail_signal, inputs = self._prepare_symbol_inputs(
+            symbol, strategy, current_equity, as_of=as_of
+        )
         if fail_signal is not None:
             return fail_signal
         if inputs is None:
@@ -1050,12 +1192,21 @@ class AnalyzerPipeline:
         symbol: str,
         strategy: str,
         current_equity: float,
+        as_of: date | None = None,
     ) -> tuple[PipelineSignal | None, SymbolTransformInputs | None]:
         """final pipeline 主线程段：provider 读取与 transform 输入准备。
 
         返回 (None, inputs) 表示可继续进入 transform；返回 (fail_signal, None)
         表示提前失败（blacklist / 数据源错误 / 时间门 / 历史不足），不进入
         transform。health 状态记录与 fetch 计时归属主线程（single-writer 语义）。
+
+        ``as_of`` 非 None 时进入历史回测模式（PLAN Task 3）：
+        - 取数改为 ``end_date=as_of``，取回后立即校验
+          ``bars.index.max() <= as_of``（防泄露断言，核心正确性保障）；
+        - 决策时间锚定为该历史日期收盘（而非 ``datetime.now()``），使
+          T-1 时间门语义与真实历史决策时点一致；
+        - intraday 摘要缺失时降级为空表（NaN 特征列）而非生产的
+          fail-closed 语义，且仅对本次调用生效，不改动任何全局配置。
         """
         blacklist = self._config.blacklist
         matched_blacklist_pattern = blacklist.matches(symbol) if blacklist.enabled else None
@@ -1080,14 +1231,25 @@ class AnalyzerPipeline:
                 ),
                 None,
             )
-        decision_time = datetime.now()
+        decision_time = (
+            datetime.combine(as_of, _AS_OF_DECISION_TIME) if as_of is not None else datetime.now()
+        )
         start = perf_counter()
         try:
-            bars = self._provider.fetch_daily_bars(
+            bars = _fetch_daily_bars_with_end_date(
+                self._provider,
                 symbol=symbol,
                 lookback_days=self._signal_fetch_lookback_days,
+                end_date=as_of,
             )
+            _assert_no_future_leak(bars, symbol=symbol, as_of=as_of)
             self._health_monitor.record(success=True, latency_sec=perf_counter() - start)
+        except FutureDataLeakError:
+            # 防泄露断言必须原样向上传播，绝不能被下面的 DataSourceError 分支
+            # 吞掉降级成一条 hold 信号——FutureDataLeakError 是 DataSourceError
+            # 的子类，如果不在这里显式拦截重新抛出，静默降级会让"注入未来数据
+            # 应该抛错"这条核心正确性保障形同虚设。
+            raise
         except DataSourceError as exc:
             self._health_monitor.record(success=False, latency_sec=perf_counter() - start)
             self._stage_ms_accum["fetch_bars_ms"] += (perf_counter() - start) * 1000.0
@@ -1156,6 +1318,8 @@ class AnalyzerPipeline:
 
         feature_prepare_started = perf_counter()
         intraday_started = perf_counter()
+        intraday_degraded = False
+        intraday_degrade_detail = ""
         try:
             intraday_1m, intraday_5m = self._fetch_intraday_summaries(
                 symbol=symbol,
@@ -1163,29 +1327,40 @@ class AnalyzerPipeline:
             )
         except RequiredIntradayDataError as exc:
             self._stage_ms_accum["intraday_ms"] += (perf_counter() - intraday_started) * 1000.0
-            return (
-                PipelineSignal(
-                    symbol=symbol,
-                    strategy=strategy,
-                    score=0.0,
-                    grade="C",
-                    action="hold",
-                    target_position=0.0,
-                    probabilities={"lgbm": 0.0, "xgb": 0.0, "meta": 0.0},
-                    reasons=[
-                        "required_intraday_data_unavailable",
-                        f"required_intraday_data:{exc}",
-                    ],
-                    decision_trace={
-                        "intraday_gate": {
-                            "passed": False,
-                            "code": "required_intraday_data_unavailable",
-                            "detail": str(exc),
-                        }
-                    },
-                ),
-                None,
-            )
+            if as_of is not None:
+                # as-of 回测模式下的独立降级路径（PLAN Task 3，不可全局改开关）：
+                # intraday 缺失时退化为空表（FeatureEngineer 会产出 NaN 标准列，
+                # 见 engineer.py:_prepare_intraday_summary），不阻断该标的的选股，
+                # 仅对本次 _prepare_symbol_inputs 调用生效——生产 duckdb_required
+                # 的 fail-closed 语义（RequiredIntradayDataError 直接拒绝）完全
+                # 不受影响，因为这段代码只在 as_of is not None 时才走这个分支。
+                intraday_1m, intraday_5m = pd.DataFrame(), pd.DataFrame()
+                intraday_degraded = True
+                intraday_degrade_detail = str(exc)
+            else:
+                return (
+                    PipelineSignal(
+                        symbol=symbol,
+                        strategy=strategy,
+                        score=0.0,
+                        grade="C",
+                        action="hold",
+                        target_position=0.0,
+                        probabilities={"lgbm": 0.0, "xgb": 0.0, "meta": 0.0},
+                        reasons=[
+                            "required_intraday_data_unavailable",
+                            f"required_intraday_data:{exc}",
+                        ],
+                        decision_trace={
+                            "intraday_gate": {
+                                "passed": False,
+                                "code": "required_intraday_data_unavailable",
+                                "detail": str(exc),
+                            }
+                        },
+                    ),
+                    None,
+                )
         self._stage_ms_accum["intraday_ms"] += (perf_counter() - intraday_started) * 1000.0
         market_context_started = perf_counter()
         market_index = self._maybe_build_market_index(analysis_bars)
@@ -1194,6 +1369,14 @@ class AnalyzerPipeline:
         ) * 1000.0
         feature_prepare_ms = (perf_counter() - feature_prepare_started) * 1000.0
         provider_status = dict(self.provider_status())
+        if as_of is not None:
+            # 回测口径标注塞进 provider_status，_finalize_symbol_signal 读取后
+            # 写入最终 PipelineSignal.decision_trace，供 API/前端展示口径说明。
+            provider_status["as_of"] = as_of.isoformat()
+            provider_status["news_neutralized"] = True
+            provider_status["intraday_degraded"] = intraday_degraded
+            if intraday_degrade_detail:
+                provider_status["intraday_degrade_detail"] = intraday_degrade_detail
         return (
             None,
             {
@@ -1573,6 +1756,23 @@ class AnalyzerPipeline:
         ) * 1000.0
         if learning_protocol_ref:
             decision_trace["learning_protocol"] = learning_protocol_ref
+        # 历史回测口径标注（PLAN Task 3）：_prepare_symbol_inputs 在 as_of 模式下
+        # 把标注写进 provider_status，这里原样搬进最终信号的 decision_trace，
+        # 使 API/前端能感知该结果的 lookahead 偏差与降级来源。as_of=None（生产
+        # 路径）时 provider_status 里不含这些 key，decision_trace 结构与改动前
+        # 完全一致，不影响任何既有消费方。
+        provider_status_snapshot = inputs.get("provider_status")
+        if isinstance(provider_status_snapshot, Mapping) and "as_of" in provider_status_snapshot:
+            decision_trace["asof_backtest"] = {
+                "as_of": provider_status_snapshot.get("as_of", ""),
+                "news_neutralized": bool(provider_status_snapshot.get("news_neutralized", False)),
+                "intraday_degraded": bool(
+                    provider_status_snapshot.get("intraday_degraded", False)
+                ),
+                "intraday_degrade_detail": provider_status_snapshot.get(
+                    "intraday_degrade_detail", ""
+                ),
+            }
 
         return PipelineSignal(
             symbol=symbol,
