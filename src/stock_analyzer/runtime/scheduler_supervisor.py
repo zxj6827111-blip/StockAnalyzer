@@ -537,6 +537,8 @@ def _poll_interval() -> int:
 
 
 def run_supervisor(group: str) -> None:
+    from stock_analyzer.runtime.scheduler_worker import _resolve_now
+
     config = get_config()
     supervisor = SchedulerSupervisor(config=config, group=group)
     service: StockAnalyzerService | None = None
@@ -544,7 +546,7 @@ def run_supervisor(group: str) -> None:
     consecutive_failures = 0
     try:
         while True:
-            now = datetime.now()
+            now = _resolve_now()
             try:
                 if service is None:
                     service = StockAnalyzerService(config=config)
