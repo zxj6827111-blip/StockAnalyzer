@@ -65,6 +65,9 @@ nas_probe/
 # 前端构建产物挂载卷发布目录（PLAN Task 7：frontend_dist 卷挂载，容器外发布）
 /frontend_dist/
 /frontend_dist.previous/
+# 已发布产物对应的 git 子树 hash，供 nas_deploy_update.sh 判断前端是否需要重建
+# （刻意放在发布目录之外：目录内的文件会被 StaticFiles 通过 /ui/* 暴露出去）
+/frontend_dist.tree
 
 # 构建/重训产物
 *.bundle

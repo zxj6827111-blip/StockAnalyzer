@@ -155,6 +155,25 @@ echo
 echo "OK. Published $(find "${OUTPUT_DIR}" -type f | wc -l | tr -d ' ') files to ${OUTPUT_DIR}"
 echo "Previous build kept at ${OUTPUT_DIR}.previous (safe to delete once you confirm the new build works)."
 
+# 记录这份产物对应的前端源码版本，供 nas_deploy_update.sh 判断"产物是否已过期"。
+# 用 git 子树 hash 而不是 mtime：git pull 会把所有更新过的文件 mtime 刷成当前时间，
+# 拿 mtime 比对会在"pull 了但前端没变"时误判为需要重建；反过来更糟的是，历史上
+# 部署脚本只检查 index.html 是否**存在**，于是前端源码明明更新了、产物还是旧的也
+# 照样放过——2026-08-28 连续三次出现"后端镜像已更新、前端还是旧版"，其中一次直接
+# 导致鉴权修复看起来没生效。子树 hash 只在前端内容真正变化时才变，判断可靠。
+# 刻意写在发布目录之外：目录内任何文件都会被 StaticFiles 通过 /ui/* 暴露。
+if command -v git >/dev/null 2>&1 && git -C "${ROOT}" rev-parse --git-dir >/dev/null 2>&1; then
+  FRONTEND_TREE="$(git -C "${ROOT}" rev-parse "HEAD:frontend" 2>/dev/null || true)"
+  if [[ -n "${FRONTEND_TREE}" ]]; then
+    printf '%s\n' "${FRONTEND_TREE}" > "${OUTPUT_DIR}.tree"
+    echo "Recorded frontend source tree ${FRONTEND_TREE:0:12} -> ${OUTPUT_DIR}.tree"
+  else
+    # 取不到（例如 frontend/ 尚未提交）就删掉旧记录，让部署脚本走保守分支重建，
+    # 而不是留一个会导致"跳过重建"的过期 hash。
+    rm -f "${OUTPUT_DIR}.tree"
+  fi
+fi
+
 # 自检：确认容器里真的看到了这一版产物。本脚本已改为保持目录 inode 的原地同步，
 # 正常情况下无需 recreate；但如果这个 frontend_dist 目录在**过去**曾被 mv 整体
 # 替换过（旧版脚本的行为），运行中的容器可能仍绑在那个已被移走的旧 inode 上，
