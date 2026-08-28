@@ -6,20 +6,25 @@
 # 上的其他容器（例如 sing-box）。前人已撞过全市场特征工程吃 12G 打到 swap
 # 后性能塌陷的问题。
 #
-# 本文件默认不生效——不在 nas_deploy_update.sh 的默认 compose 组合里。
-# 需要显式追加到 compose 命令才会生效：
+# 本文件已于 2026-08-28 实际应用到 NAS 四个容器并验证通过，现在是
+# scripts/nas_compose_files.sh 标准基线的一部分（nas_deploy_update.sh 通过
+# source 该基线自动带上本文件），不再需要手工追加 -f。实测占用远低于上限：
+# api 394M/4G、scheduler-heavy 446M/3G、scheduler-critical 411M/2G、
+# redis 9M/512M，宿主 swap 用量已回到 0。
 #
-#   docker compose -f docker-compose.yml -f docker-compose.runtime.yml \
-#     -f docker-compose.advisory.yml -f docker-compose.vendor-overlay.yml \
-#     -f docker-compose.memlimit.yml up -d --force-recreate api \
-#     scheduler-critical scheduler-heavy redis
+# 正确的手动操作方式（禁止自己拼 -f 列表，漏掉任何一个 overlay 都会导致配置
+# 静默退化，2026-08-28 已发生过一次这类事故）：
+#
+#   source scripts/nas_compose_files.sh
+#   docker compose --env-file .env "${NAS_COMPOSE_ARGS[@]}" \
+#     up -d --force-recreate api scheduler-critical scheduler-heavy redis
 #
 # 加内存限制本身需要容器重建（新增 mem_limit 属于容器创建时的 cgroup 配置，
 # 无法用 docker update 在不重建的情况下对已运行容器动态生效到位——虽然
 # `docker update --memory` 技术上可以对运行中容器调整，但为了让 compose
 # 渲染结果与实际运行状态保持一致、避免下次部署时被静默覆盖回 Memory=0，
-# 应该通过 --force-recreate 走正规流程），需要与运维确认维护时间窗口后才能
-# 实际执行——本文件本身只是设计产物，不在本次改动中自动应用。
+# 应该通过 --force-recreate 走正规流程），首次应用或撤销限制会重建全部四个
+# 容器，在可用内存紧张的宿主上仍应安排维护窗口。
 #
 # 内存预算（合计 9.5G，可用 10.7G，留 ~1.2G 冗余给宿主其他容器与内核）：
 #   redis            0.5G  —— 现有工作负载体量小，纯缓存
