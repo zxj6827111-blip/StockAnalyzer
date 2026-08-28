@@ -105,6 +105,7 @@ _frontend_assets_dir = _frontend_dist_dir / "assets" if _frontend_dist_dir is no
 # ruff: noqa: E402, I001
 from stock_analyzer.api.acceptance import router as acceptance_router
 from stock_analyzer.api.audit import router as audit_router
+from stock_analyzer.api.backtest import router as backtest_router
 from stock_analyzer.api.commands import router as commands_router
 from stock_analyzer.api.dashboard import router as dashboard_router
 from stock_analyzer.api.evolution import router as evolution_router
@@ -237,6 +238,7 @@ if _frontend_dist_dir is not None:
 
 
 app.include_router(health_router)
+app.include_router(backtest_router)
 app.include_router(dashboard_router)
 app.include_router(news_router)
 app.include_router(notifications_router)

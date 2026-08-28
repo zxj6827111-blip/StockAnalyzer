@@ -2,6 +2,7 @@ import {
   Activity,
   Brain,
   Briefcase,
+  CalendarClock,
   ChevronDown,
   ChevronRight,
   Eye,
@@ -16,6 +17,7 @@ import { BrowserRouter, NavLink, Route, Routes, useLocation } from 'react-router
 
 import { prefetchTrainingOverview } from './lib/trainingOverviewCache';
 import DashboardPage from './pages/Dashboard';
+import HistoricalBacktestPage from './pages/HistoricalBacktest';
 import LearningOverviewPage from './pages/LearningOverview';
 import NewsPage from './pages/News';
 import ObservationPoolPage from './pages/ObservationPoolPage';
@@ -24,7 +26,7 @@ import RecommendationsPage from './pages/Recommendations';
 import RuntimeStagePage from './pages/RuntimeStage';
 import SystemOpsPage from './pages/SystemOps';
 
-const researchPaths = ['/learning-overview', '/observation-pool', '/news'];
+const researchPaths = ['/learning-overview', '/observation-pool', '/news', '/historical-backtest'];
 
 function Sidebar(props: { onWarmLearningOverview: () => void }) {
   const location = useLocation();
@@ -51,6 +53,7 @@ function Sidebar(props: { onWarmLearningOverview: () => void }) {
     { path: '/learning-overview', label: '训练总览', icon: Brain },
     { path: '/observation-pool', label: '观察池', icon: Eye },
     { path: '/news', label: '新闻与因子', icon: Newspaper },
+    { path: '/historical-backtest', label: '历史回测', icon: CalendarClock },
   ];
 
   const renderNavItem = ({
@@ -169,6 +172,7 @@ function MainLayout() {
           <Route path="/portfolio" element={<PortfolioPage />} />
           <Route path="/recommendations" element={<RecommendationsPage />} />
           <Route path="/news" element={<NewsPage />} />
+          <Route path="/historical-backtest" element={<HistoricalBacktestPage />} />
           <Route path="/ops" element={<SystemOpsPage />} />
         </Routes>
       </main>

@@ -161,6 +161,23 @@ def _load_test_config() -> StockAnalyzerConfig:
     # （由同步类测试写入真实 artifacts/runtime）会被误判为过期 block，
     # 饿死 funnel 测试的信号。
     config.week5.market_breadth_enabled = False
+    # 测试隔离修复（与 as_of 功能无关）：本函数此前完全未处理
+    # market_warehouse，enabled/auto_run 均未关闭，db_path/package_root 均未
+    # 重定向，指向仓库共享真实路径 artifacts/warehouse/market.duckdb。
+    # _market_warehouse() 在 week5 intraday 新鲜度门禁（_is_synthetic 只绕过
+    # 阻断检查，不绕过 fresh_symbols 过滤）里会被无条件调用读取该文件，若
+    # 该共享文件因同一 xdist worker 内其它测试写入而非空，会让本文件的
+    # snapshot_funnel 候选被意外裁剪（PR #37 CI flaky 根因）。
+    config.market_warehouse.enabled = False
+    config.market_warehouse.auto_run = False
+    _warehouse_temp_root = (
+        Path(tempfile.gettempdir())
+        / "stock_analyzer_tests"
+        / f"market_warehouse_week5_{time.time_ns()}"
+    )
+    config.market_warehouse.db_path = str(_warehouse_temp_root / "market_warehouse.duckdb")
+    config.market_warehouse.package_root = str(_warehouse_temp_root / "market_warehouse_package")
+    config.data_source.warehouse_db_path = str(_warehouse_temp_root / "market_warehouse.duckdb")
     # Default to legacy universe path for existing tests; tests that exercise the
     # quality selector enable it explicitly via _enable_universe_quality_selector.
     config.week5.universe_quality_selector_enabled = False

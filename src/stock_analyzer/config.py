@@ -942,6 +942,10 @@ class SchedulerConfig(_StrictModel):
     auction_report_time: str = "09:26"
     week5_auction_time: str = "09:25"
     close_reconcile_time: str = "15:30"
+    # 独立的每日新闻抓取时间：A 股 15:00 收盘后触发，且避开 close_reconcile_time(15:30)
+    # 与 week6_daily_time(15:25)、week4_acceptance_time(20:35) 等已有盘后任务，
+    # 保证 run_m7_live_news_sync 有独立调度入口而不依赖 evolution 流程。
+    daily_news_sync_time: str = "16:30"
     week4_acceptance_time: str = "20:35"
     week6_daily_time: str = "15:25"
     week5_night_scan_time: str = "21:45"
@@ -1093,6 +1097,24 @@ class WalkForwardConfig(_StrictModel):
     test_window: int = 20
     step: int = 20
     decision_threshold: float = 0.60
+
+
+class AsofBacktestConfig(_StrictModel):
+    """PLAN docs/plan_asof_backtest_holding_curve.md Task 5 落盘持久化配置。
+
+    独立于 runtime_state.json 的历史归档链路（那条链路承载全局单例状态、有
+    复杂的多进程合并语义），本功能自成一体地落到 output_dir 下，容器重启不丢，
+    也不与既有归档机制产生耦合。
+    """
+
+    enabled: bool = True
+    output_dir: str = "artifacts/backtest/asof_scan"
+    history_limit: int = 100
+    default_top_n: int = 50
+    default_horizon_days: int = 10
+    max_date_range_days: int = 30
+    take_profit_pct: float = 0.08
+    stop_loss_pct: float = 0.05
 
 
 class ReconcileConfig(_StrictModel):
@@ -1274,6 +1296,13 @@ class EvolutionConfig(_StrictModel):
     m7_live_news_per_symbol_limit: int = 5
     m7_live_news_max_age_hours: float = 24.0
     m7_live_news_artifact_max_records: int = 2000
+    # 按日归档目录与保留期：run_m7_live_news_sync 在保留原滚动文件的同时，
+    # 追加写入 artifacts/evolution/inputs/news_daily/YYYY-MM-DD.jsonl，
+    # retention_days 控制过期归档文件清理（每次归档时顺手扫描删除，默认 90 天）。
+    # 注意：m7_live_news_max_symbols=24，而当前关注池约 36 只，存在部分标的轮空风险，
+    # 是否放大到 36 需业务确认（akshare stock_news_em 为逐票串行请求，放大会增加耗时/请求频率）。
+    m7_news_daily_archive_dir: str = "artifacts/evolution/inputs/news_daily"
+    m7_news_daily_archive_retention_days: int = 90
     m7_ai_review_enabled: bool = False
     m7_ai_review_max_items_per_run: int = 12
     # 政策面新闻风险门渐进启用：off=不启用 | shadow=仅记录（默认） |
@@ -1607,6 +1636,7 @@ class StockAnalyzerConfig(_StrictModel):
     auto_promotion: AutoPromotionConfig = Field(default_factory=AutoPromotionConfig)
     backtest_matcher: BacktestMatcherConfig = Field(default_factory=BacktestMatcherConfig)
     walk_forward: WalkForwardConfig = Field(default_factory=WalkForwardConfig)
+    asof_backtest: AsofBacktestConfig = Field(default_factory=AsofBacktestConfig)
     reconcile: ReconcileConfig = Field(default_factory=ReconcileConfig)
     acceptance: AcceptanceConfig = Field(default_factory=AcceptanceConfig)
     evolution: EvolutionConfig = Field(default_factory=EvolutionConfig)

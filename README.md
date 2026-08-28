@@ -678,3 +678,27 @@ Invoke-RestMethod -Method Post -Uri 'http://localhost:8001/week6/run' -ContentTy
   elevated PowerShell session.
 - Only pass `-EnableLiveNotifications` to `scripts/start_runtime_stack_localvol.ps1`
   when you intentionally want the local stack to use real push channels.
+- The default `docker-compose.yml` also bind-mounts `${SA_FRONTEND_DIST_HOST_ROOT:-./frontend_dist}`
+  into `/app/frontend_dist` on the `api` service. This lets you replace the frontend build
+  without rebuilding the image: run `bash scripts/build_and_publish_frontend_dist.sh` (add
+  `--docker` to build inside a throwaway `node:22-slim` container instead of using a local
+  Node.js install), which builds `frontend/` and atomically publishes the output to
+  `frontend_dist/` (keeping the previous build as `frontend_dist.previous/` for one cycle).
+  Adding this volume mount for the first time still requires recreating the `api` container
+  once (`docker compose up -d --force-recreate api`) for the new mount to take effect;
+  follow-up publishes need no restart since `StaticFiles` reads from disk directly.
+  **部署顺序硬性要求（务必遵守，否则会导致 `/ui` 404）**：必须先运行
+  `scripts/build_and_publish_frontend_dist.sh` 让宿主 `frontend_dist/` 目录里已经有
+  构建产物，**之后**才能执行 `docker compose up -d --force-recreate api`。如果顺序反过来
+  —— 在 `frontend_dist/` 目录不存在或为空的情况下先 `--force-recreate` —— Docker 会
+  自动创建一个**空目录**挂载进容器，这个空目录会覆盖镜像内原本构建好的前端产物，
+  导致 `/ui` 返回 404，且不会有其它明显报错提示问题所在。首次启用该挂载卷之前，
+  务必按“先跑脚本、再 recreate”的顺序操作。
+- `docker-compose.memlimit.yml` is an optional overlay that caps container memory
+  (`api` 4G / `scheduler-critical` 2G / `scheduler-heavy` 3G / `redis` 512M, all with
+  `memswap_limit` equal to `mem_limit` to avoid pushing swap pressure onto the host). It is
+  **not** part of the default compose combination and must be explicitly appended:
+  `docker compose -f docker-compose.yml -f docker-compose.runtime.yml -f docker-compose.advisory.yml
+  -f docker-compose.vendor-overlay.yml -f docker-compose.memlimit.yml up -d --force-recreate
+  api scheduler-critical scheduler-heavy redis`. Applying it recreates all four containers and
+  requires a maintenance window on hosts with tight available memory.

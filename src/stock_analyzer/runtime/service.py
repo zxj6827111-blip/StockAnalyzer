@@ -40,7 +40,7 @@ from stock_analyzer.data.delisted_symbols import (
 )
 from stock_analyzer.data.market_depth import MarketDepthProvider
 from stock_analyzer.data.market_warehouse import MarketWarehouse
-from stock_analyzer.data.provider import MarketDataProvider
+from stock_analyzer.data.provider import DataSourceError, MarketDataProvider
 from stock_analyzer.data.provider_factory import (
     build_market_depth_provider,
     build_realtime_runtime_provider,
@@ -135,6 +135,7 @@ from stock_analyzer.runtime.news_provider_factory import build_news_provider
 from stock_analyzer.runtime.notifier_factory import build_notifier
 from stock_analyzer.runtime.scheduler import DailyScheduler
 from stock_analyzer.runtime.services.acceptance_service import RuntimeAcceptanceService
+from stock_analyzer.runtime.services.asof_backtest_service import AsofBacktestService
 from stock_analyzer.runtime.services.dashboard_service import RuntimeDashboardService
 from stock_analyzer.runtime.services.evolution_core_service import RuntimeEvolutionCoreService
 from stock_analyzer.runtime.services.evolution_release_service import RuntimeEvolutionReleaseService
@@ -232,6 +233,7 @@ class StockAnalyzerService:
         self._config = config
         self._cache = self._build_cache(config)
         self._acceptance_service = RuntimeAcceptanceService(self)
+        self._asof_backtest_service = AsofBacktestService(self)
         self._dashboard_service = RuntimeDashboardService(self)
         self._evolution_core_service = RuntimeEvolutionCoreService(self)
         self._evolution_release_service = RuntimeEvolutionReleaseService(self)
@@ -3626,6 +3628,12 @@ class StockAnalyzerService:
                 except json.JSONDecodeError:
                     pass
         try:
+            # akshare 1.18.84 的 stock_news_em 在 pandas pyarrow string backend 下会崩溃：
+            # 它内部对 "\u3000"（全角空格）做 str.replace(..., regex=True)，pyarrow 底层用
+            # RE2 引擎解析正则，而 RE2 不支持 "\u" 转义序列，会抛
+            # ArrowInvalid: Invalid regular expression: invalid escape sequence: \u。
+            # 这里临时把 string storage 切回 python 模式规避该问题（必须保留，不能删除）。
+            # 后续若 akshare 修复此行为、或 pandas 默认存储策略变更，可重新评估是否还需此 workaround。
             with pd.option_context("mode.string_storage", "python"):
                 ak = self._import_akshare()
                 frame: pd.DataFrame = ak.stock_news_em(symbol=normalized_symbol)
@@ -5261,6 +5269,78 @@ class StockAnalyzerService:
 
     def training_bootstrap_status(self) -> dict[str, object]:
         return self._training_service.training_bootstrap_status()
+
+    def watchlist_symbols(self) -> list[str]:
+        """当前运行时关注池标的清单（PLAN Task 5 as-of 回测默认候选来源）。"""
+        return list(self._state.watchlist)
+
+    def daily_bars_json(
+        self,
+        *,
+        symbol: str,
+        start: date | None = None,
+        limit: int = 250,
+    ) -> dict[str, object]:
+        """单标的日线序列（PLAN Task 5 ``GET /market/daily-bars``）。
+
+        只读查询，直接走离线 provider（不含盘中 live overlay），返回可
+        JSON 序列化的 dict 列表而非 DataFrame。``start`` 非 None 时按
+        ``bars.index >= start`` 过滤（不是 end_date 截断——这是读历史行情
+        展示用途，不是 as-of 选股决策，不受防泄露断言约束）。
+        """
+        capped_limit = max(1, min(int(limit), 2000))
+        try:
+            bars = self._provider.fetch_daily_bars(
+                symbol=symbol, lookback_days=max(capped_limit, 250) + 250
+            )
+        except DataSourceError as exc:
+            return {"symbol": symbol, "status": "data_source_error", "error": str(exc), "bars": []}
+        if bars.empty:
+            return {"symbol": symbol, "status": "no_data", "bars": []}
+        frame = bars if isinstance(bars.index, pd.DatetimeIndex) else bars.copy()
+        if not isinstance(frame.index, pd.DatetimeIndex):
+            frame.index = pd.DatetimeIndex(pd.to_datetime(frame.index, errors="coerce"))
+            frame = frame[frame.index.notna()].sort_index()
+        if start is not None:
+            frame = frame.loc[frame.index >= pd.Timestamp(start)]
+        frame = frame.tail(capped_limit)
+        if frame.empty:
+            return {"symbol": symbol, "status": "no_data", "bars": []}
+        columns = [
+            column
+            for column in ("open", "high", "low", "close", "volume", "turnover")
+            if column in frame.columns
+        ]
+        records = []
+        for ts, row in frame[columns].iterrows():
+            entry: dict[str, object] = {"date": pd.Timestamp(ts).date().isoformat()}
+            for column in columns:
+                entry[column] = float(row[column])
+            records.append(entry)
+        return {"symbol": symbol, "status": "ok", "records": len(records), "bars": records}
+
+    def run_asof_backtest(
+        self,
+        *,
+        symbols: list[str] | None,
+        start_date: date,
+        end_date: date,
+        top_n: int | None = None,
+        horizon_days: int | None = None,
+    ) -> dict[str, object]:
+        return self._asof_backtest_service.run(
+            symbols=symbols,
+            start_date=start_date,
+            end_date=end_date,
+            top_n=top_n,
+            horizon_days=horizon_days,
+        )
+
+    def latest_asof_backtest_report(self) -> dict[str, object] | None:
+        return self._asof_backtest_service.latest()
+
+    def asof_backtest_history(self, limit: int = 20) -> dict[str, object]:
+        return self._asof_backtest_service.history(limit=limit)
 
     def _bootstrap_runtime_blocked(self) -> bool:
         return self._training_service._bootstrap_runtime_blocked()
@@ -17446,6 +17526,20 @@ class StockAnalyzerService:
                 weekdays=(4,),
                 date_predicate=trading_day_filter,
             )
+        # 独立的每日新闻抓取调度：不再依赖 evolution 流程触发，仅在开启
+        # evolution.m7_live_news_enabled 时注册。盘后 daily_news_sync_time(默认16:30)
+        # 触发，直接调用 run_m7_live_news_sync 抓取并按日归档落盘。
+        if bool(getattr(self._config.evolution, "m7_live_news_enabled", False)) and str(
+            getattr(self._config.scheduler, "daily_news_sync_time", "")
+        ).strip():
+            self._scheduler.register(
+                name="daily_news_sync",
+                trigger_hhmm=self._config.scheduler.daily_news_sync_time,
+                callback=self._job_daily_news_sync,
+                latest_hhmm="23:59",
+                weekdays=trading_weekdays,
+                date_predicate=trading_day_filter,
+            )
 
     def _job_premarket_scan(self) -> dict[str, object]:
         global_snapshot_report = self._collect_global_market_snapshot(source_trace_id="premarket")
@@ -17513,6 +17607,36 @@ class StockAnalyzerService:
             "news_watchlist": news_watchlist,
             "news_briefing": news_briefing,
         }
+
+    def _job_daily_news_sync(self) -> dict[str, object]:
+        """独立的每日新闻抓取调度回调。
+
+        直接调用 run_m7_live_news_sync 抓取实时新闻并按日归档，包一层异常处理，
+        无论成功/失败都记录审计事件，保证调度器不会因抓取异常而中断。
+        """
+        try:
+            report = self.run_m7_live_news_sync()
+        except Exception as exc:
+            self._record_audit_event(
+                event_type="daily_news_sync_failed",
+                level="warn",
+                payload={
+                    "error_type": exc.__class__.__name__,
+                    "error": str(exc)[:300],
+                },
+            )
+            return {"status": "error", "error_type": exc.__class__.__name__}
+        self._record_audit_event(
+            event_type="daily_news_sync",
+            payload={
+                "status": str(report.get("status", "")),
+                "records": _as_int(report.get("records"), default=0),
+                "persisted_records": _as_int(report.get("persisted_records"), default=0),
+                "symbol_count": _as_int(report.get("symbol_count"), default=0),
+                "daily_archive": report.get("daily_archive", {}),
+            },
+        )
+        return report
 
     def _job_midday_news_brief(self) -> dict[str, object]:
         news_briefing = self.build_live_news_briefing(

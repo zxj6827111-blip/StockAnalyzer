@@ -62,5 +62,9 @@ tmp_*
 .tmp_*.py
 nas_probe/
 
+# 前端构建产物挂载卷发布目录（PLAN Task 7：frontend_dist 卷挂载，容器外发布）
+/frontend_dist/
+/frontend_dist.previous/
+
 # 构建/重训产物
 *.bundle
