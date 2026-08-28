@@ -13,6 +13,7 @@ after those definitions.
 
 from __future__ import annotations
 
+import json
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -218,6 +219,51 @@ if _frontend_assets_dir is not None and _frontend_assets_dir.exists():
     )
 
 
+def _frontend_api_token_injection_enabled() -> bool:
+    """Only inject the token when write endpoints actually require it.
+
+    Mirrors ``_verify_api_auth``'s fail-closed gate: if the operator never
+    explicitly set ``SA__SECURITY__API_AUTH_ENABLED``, auth is force-enabled,
+    so the frontend still needs the token even though the config flag reads
+    False. When auth is truly disabled, injecting a token would only expose
+    it to every visitor of ``/ui`` for no benefit.
+    """
+    return bool(_config.security.api_auth_enabled or _api_auth_force_enabled())
+
+
+def _render_index_html_with_token(index_path: Path) -> Response:
+    """Serve ``index.html`` with ``window.SA_API_TOKEN`` injected inline.
+
+    The token lets the built-in frontend (``frontend/src/lib/api.ts``) attach
+    ``X-SA-API-Key`` to every POST without the user pasting a token or the
+    value being persisted to localStorage. Injected only into the HTML
+    shell response (never cached, unlike the hashed ``/ui/assets/*`` bundle),
+    so rotating ``SA__SECURITY__API_TOKEN`` takes effect on next page load
+    with no separate cache-busting step.
+
+    Security note: anyone who can open ``/ui`` can read this token from the
+    page source. Acceptable for the current single-operator/internal-LAN
+    deployment; if this ever needs to be exposed on the public internet,
+    replace with real session-based auth instead of a shared static token.
+    """
+    html = index_path.read_text(encoding="utf-8")
+    token = _config.security.api_token.strip() if _frontend_api_token_injection_enabled() else ""
+    # json.dumps 负责 JS 字符串字面量层面的转义（引号、反斜杠、控制字符），但它
+    # **不会**转义 `<`：一个含 `</script>` 的 token 会让 HTML 解析器在那里提前
+    # 闭合 <script> 标签，后半段 token 直接变成页面里的真实 HTML 元素（XSS），
+    # 同时 window.SA_API_TOKEN 赋值残缺导致整个前端 JS 语法错误白屏。token 来自
+    # 运维自己配置的 .env 而非外部输入，实际不构成攻击面，但随机生成的 token
+    # 恰好含 `<` 就会让 UI 整体白屏、且报错只出现在浏览器控制台里极难排查。
+    # 转成 \u003c：在 JS 字符串里等价于 `<`，而 HTML 解析器不会识别为标签起始。
+    escaped_token = json.dumps(token).replace("<", "\\u003c")
+    injected = f"<script>window.SA_API_TOKEN={escaped_token};</script>\n"
+    if "<head>" in html:
+        html = html.replace("<head>", "<head>\n" + injected, 1)
+    else:
+        html = injected + html
+    return Response(content=html, media_type="text/html", headers={"Cache-Control": "no-store"})
+
+
 if _frontend_dist_dir is not None:
     _resolved_frontend_dist_dir = _frontend_dist_dir
 
@@ -231,10 +277,10 @@ if _frontend_dist_dir is not None:
             try:
                 candidate.relative_to(_resolved_frontend_dist_dir.resolve())
             except ValueError:
-                return FileResponse(str(_resolved_frontend_dist_dir / "index.html"))
-            if candidate.is_file():
+                return _render_index_html_with_token(_resolved_frontend_dist_dir / "index.html")
+            if candidate.is_file() and candidate.name != "index.html":
                 return FileResponse(str(candidate))
-        return FileResponse(str(_resolved_frontend_dist_dir / "index.html"))
+        return _render_index_html_with_token(_resolved_frontend_dist_dir / "index.html")
 
 
 app.include_router(health_router)

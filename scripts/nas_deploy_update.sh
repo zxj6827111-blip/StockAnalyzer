@@ -133,15 +133,35 @@ export STOCK_ANALYZER_BUILD_DIRTY="0"
 export STOCK_ANALYZER_BUILD_TIME_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "build_commit=${COMMIT}"
 
-COMPOSE=(docker compose --env-file "${ROOT}/.env"
-  -f docker-compose.yml
-  -f docker-compose.runtime.yml
-  -f docker-compose.advisory.yml
-  -f docker-compose.vendor-overlay.yml
-)
+COMPOSE_FILES_SRC="${ROOT}/scripts/nas_compose_files.sh"
+if [[ ! -f "${COMPOSE_FILES_SRC}" ]]; then
+  echo "ERROR: ${COMPOSE_FILES_SRC} missing; cannot resolve the required compose file combination." >&2
+  exit 1
+fi
+# shellcheck source=/dev/null
+source "${COMPOSE_FILES_SRC}"
+COMPOSE=(docker compose --env-file "${ROOT}/.env" "${NAS_COMPOSE_ARGS[@]}")
 if [[ "${ENABLE_LEARNING:-0}" = "1" ]]; then
   echo "ERROR: ENABLE_LEARNING=1 is forbidden for advisory vendor-overlay deployment" >&2
   exit 1
+fi
+
+# frontend_dist 存在性检查（返工第 2 项）：docker-compose.yml 把宿主
+# ${SA_FRONTEND_DIST_HOST_ROOT:-./frontend_dist} 挂载进容器 /app/frontend_dist。
+# 如果该目录从未构建过（不存在或为空）就执行 --force-recreate，Docker 会
+# 自动创建一个空目录挂载进容器，覆盖镜像内已构建好的前端产物，导致 /ui 返回
+# 404 且没有任何显著报错（build_and_publish_frontend_dist.sh 头部注释记录的
+# 同一个部署顺序陷阱）。这里在 recreate 之前显式检查，不可复用则直接调用
+# 构建脚本兜底，而不是放任静默退化。
+FRONTEND_DIST_HOST_ROOT="${SA_FRONTEND_DIST_HOST_ROOT:-${ROOT}/frontend_dist}"
+if [[ "${DO_RECREATE}" -eq 1 ]]; then
+  if [[ ! -f "${FRONTEND_DIST_HOST_ROOT}/index.html" ]]; then
+    echo "frontend_dist missing or empty at ${FRONTEND_DIST_HOST_ROOT}; building it now to avoid an empty-directory mount overriding the image's bundled frontend" >&2
+    if ! bash "${ROOT}/scripts/build_and_publish_frontend_dist.sh" --output-dir "${FRONTEND_DIST_HOST_ROOT}" --docker; then
+      echo "ERROR: failed to build frontend_dist; refusing to recreate api with a missing/empty mount." >&2
+      exit 1
+    fi
+  fi
 fi
 
 echo "[2/6] render and fail-closed validate advisory vendor-overlay config"
@@ -629,6 +649,44 @@ if [[ -n "${INTRADAY_REQUIRED_LATEST_DATE}" ]]; then
   )
 else
   echo "intraday summary static freshness floor disabled; runtime candidate sync is authoritative"
+fi
+# 新鲜度可观测性缺口修复（返工 P2 项，对应
+# docs/investigation_intraday_summary_stall_20260827.md 的排查结论）：此前当
+# INTRADAY_SUMMARY_REQUIRED_LATEST_DATE 未配置时，--check-reusable 只做指纹/
+# 结构校验，完全不看数据新鲜度，导致上游归档已停止更新一个多月都未被任何一次
+# 部署发现。这里不改变"未配置阈值时不强制重建"的现有行为（已知当前上游存在
+# 独立于本仓库的归档桥接缺口，见调查文档；每次部署都强制重建同样陈旧的数据
+# 只会拖慢部署，不会让数据变新），而是在每次部署时都显式打印现有摘要的
+# max_date 与陈旧天数，把"被静默掩盖"变成"每次部署都可见"。
+if [[ -s "${SUMMARY_CURRENT_MANIFEST}" ]]; then
+  "${HOST_PYTHON}" - "${SUMMARY_CURRENT_MANIFEST}" <<'PY' || true
+import json, sys
+from datetime import date, datetime
+from pathlib import Path
+manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+reports = manifest.get("interval_reports") or {}
+max_dates = {}
+for interval, report in reports.items():
+    if isinstance(report, dict) and report.get("max_date"):
+        max_dates[interval] = str(report["max_date"])
+if not max_dates:
+    print("intraday summary freshness: manifest has no interval max_date entries")
+else:
+    oldest = min(max_dates.values())
+    try:
+        staleness_days = (date.today() - datetime.fromisoformat(oldest).date()).days
+    except ValueError:
+        staleness_days = None
+    staleness_note = f", stale for {staleness_days} day(s)" if staleness_days is not None else ""
+    print(f"intraday summary freshness: interval max_date={max_dates}, oldest={oldest}{staleness_note}")
+    if staleness_days is not None and staleness_days > 5:
+        print(
+            f"WARNING: intraday summary is {staleness_days} day(s) stale (oldest interval max_date={oldest}). "
+            "See docs/investigation_intraday_summary_stall_20260827.md; if this is unexpected, "
+            "confirm the upstream archive bridge before trusting week5 scan / feature freshness.",
+            file=sys.stderr,
+        )
+PY
 fi
 if [[ "${FORCE_REBUILD_INTRADAY_SUMMARY}" -eq 1 ]]; then
   echo "intraday summary rebuild explicitly requested"

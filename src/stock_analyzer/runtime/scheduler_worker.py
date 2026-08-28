@@ -19,8 +19,103 @@ from stock_analyzer.config import StockAnalyzerConfig, get_config
 from stock_analyzer.ops.file_lock import DistributedFileLock
 from stock_analyzer.runtime.service import StockAnalyzerService
 
+NOW_OVERRIDE_ENV = "SCHEDULER_NOW_OVERRIDE"
+
+
+def _parse_now_override(raw: str) -> datetime:
+    """Parse the override into a *naive* datetime (may raise ``ValueError``).
+
+    ``datetime.fromisoformat`` returns an aware datetime whenever the input
+    carries an offset (``2026-08-28T21:45:00+08:00``), while the default
+    branch of :func:`_resolve_now` returns naive ``datetime.now()``. Feeding
+    an aware value downstream would break comparisons against the naive
+    datetimes ``DailyScheduler`` / ``TimeGuard`` already work with
+    (``TypeError: can't compare offset-naive and offset-aware datetimes``),
+    so an offset-carrying override is converted to local wall clock and
+    stripped — the same normalization ``time_guard._now_in_market_timezone``
+    applies for the identical reason.
+    """
+    parsed = datetime.fromisoformat(raw)
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone().replace(tzinfo=None)
+    return parsed
+
+
+def validate_now_override() -> None:
+    """Fail fast on a malformed override, before entering any polling loop.
+
+    Must be called *outside* the long-running ``while True`` loops. Those
+    loops call :func:`_resolve_now` at the top of every iteration but
+    **outside** their ``try`` block, so letting a ``ValueError`` escape from
+    there would kill the process on every single poll: under the containers'
+    ``restart: unless-stopped`` policy that degrades into an endless restart
+    loop whose only symptom is a bare traceback repeating in the logs, with
+    nothing pointing at the real cause (a typo in one environment variable).
+    Validating once at startup turns that into a single actionable message.
+    """
+    raw = os.getenv(NOW_OVERRIDE_ENV, "").strip()
+    if not raw:
+        return
+    try:
+        parsed = _parse_now_override(raw)
+    except ValueError as exc:
+        raise SystemExit(
+            f"{NOW_OVERRIDE_ENV}={raw!r} is not a valid ISO 8601 datetime ({exc}). "
+            f"Unset it to use the real clock, or fix the format, "
+            f"e.g. {NOW_OVERRIDE_ENV}=2026-08-28T21:45:00"
+        ) from exc
+    # 时钟被钉死是极不寻常的运行状态，必须在日志里显著可见：否则运维看到
+    # "所有 job 都不触发" 或 "同一个 job 每轮重复执行" 时，很难联想到是这个
+    # 环境变量还留着没清掉（例如从测试配置复制粘贴过来的 compose 覆盖）。
+    print(
+        json.dumps(
+            {
+                "level": "WARNING",
+                "event": "scheduler_now_override_active",
+                "override": parsed.isoformat(),
+                "message": (
+                    f"{NOW_OVERRIDE_ENV} is set: the scheduler clock is pinned and will "
+                    "not advance. Intended for deterministic replay/tests only."
+                ),
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+
+
+def _resolve_now() -> datetime:
+    """Current wall clock, or a fixed override for deterministic replay/tests.
+
+    Long-running worker loops (this ``main()`` and
+    ``scheduler_supervisor.run_supervisor``) previously called
+    ``datetime.now()`` directly on every poll iteration with no way to pin
+    the clock from outside the process — unlike ``DailyScheduler.run_due``/
+    ``due_job_names`` and the ``/scheduler/run_due`` API/CLI, which already
+    accept an explicit ``now``. ``SCHEDULER_NOW_OVERRIDE`` (ISO 8601) closes
+    that gap for the long-lived loop entrypoints without touching production
+    behavior: unset (the default) keeps using the real clock.
+
+    Never raises: callers invoke this outside their ``try`` block, so a
+    malformed value must not be allowed to terminate the loop (see
+    :func:`validate_now_override`, which is what actually reports the typo at
+    startup). Reaching the fallback here means the value changed after that
+    startup check, which should not happen for a container's fixed env.
+    """
+    raw = os.getenv(NOW_OVERRIDE_ENV, "").strip()
+    if not raw:
+        return datetime.now()
+    try:
+        return _parse_now_override(raw)
+    except ValueError:
+        return datetime.now()
+
 
 def main() -> None:
+    # 在任何长驻循环之前校验一次：两条分支（本函数的 while 与 run_supervisor
+    # 的 while）都在 try 之外调用 _resolve_now()，把格式错误留到循环里会变成
+    # 无限重启循环。这里是生产的唯一入口，校验一次即覆盖两条路径。
+    validate_now_override()
     group = os.getenv("SCHEDULER_GROUP", "").strip().lower()
     if group in {"critical", "heavy"}:
         from stock_analyzer.runtime.scheduler_supervisor import run_supervisor
@@ -31,7 +126,7 @@ def main() -> None:
     service: StockAnalyzerService | None = None
     consecutive_failures = 0
     while True:
-        now = datetime.now()
+        now = _resolve_now()
         try:
             config = get_config()
             if service is None:

@@ -694,11 +694,15 @@ Invoke-RestMethod -Method Post -Uri 'http://localhost:8001/week6/run' -ContentTy
   自动创建一个**空目录**挂载进容器，这个空目录会覆盖镜像内原本构建好的前端产物，
   导致 `/ui` 返回 404，且不会有其它明显报错提示问题所在。首次启用该挂载卷之前，
   务必按“先跑脚本、再 recreate”的顺序操作。
-- `docker-compose.memlimit.yml` is an optional overlay that caps container memory
-  (`api` 4G / `scheduler-critical` 2G / `scheduler-heavy` 3G / `redis` 512M, all with
-  `memswap_limit` equal to `mem_limit` to avoid pushing swap pressure onto the host). It is
-  **not** part of the default compose combination and must be explicitly appended:
-  `docker compose -f docker-compose.yml -f docker-compose.runtime.yml -f docker-compose.advisory.yml
-  -f docker-compose.vendor-overlay.yml -f docker-compose.memlimit.yml up -d --force-recreate
-  api scheduler-critical scheduler-heavy redis`. Applying it recreates all four containers and
-  requires a maintenance window on hosts with tight available memory.
+- `docker-compose.memlimit.yml` caps container memory (`api` 4G / `scheduler-critical` 2G /
+  `scheduler-heavy` 3G / `redis` 512M, all with `memswap_limit` equal to `mem_limit` to avoid
+  pushing swap pressure onto the host). It is **part of the standard NAS compose baseline**
+  (`scripts/nas_compose_files.sh`) since 2026-08-28, when it was applied to all four
+  production containers and verified (actual usage sits far below the caps: `api` 394M/4G,
+  `scheduler-heavy` 446M/3G, `scheduler-critical` 411M/2G, `redis` 9M/512M, host swap at 0).
+  Do **not** hand-roll the `-f` list — source the baseline instead, otherwise a recreate
+  silently drops the caps back to unlimited:
+  `source scripts/nas_compose_files.sh && docker compose --env-file .env "${NAS_COMPOSE_ARGS[@]}"
+  up -d --force-recreate api scheduler-critical scheduler-heavy redis`. First applying (or
+  removing) the caps recreates all four containers, so it still needs a maintenance window on
+  hosts with tight available memory.

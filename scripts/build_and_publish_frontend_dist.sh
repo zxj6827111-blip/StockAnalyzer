@@ -72,8 +72,15 @@ trap 'rm -rf "${BUILD_STAGE}"' EXIT
 
 if [[ "${USE_DOCKER}" -eq 1 ]]; then
   echo "[1/3] building frontend inside a throwaway node:22-slim container"
+  # 源码目录保持 :ro（一次性构建不应污染宿主 frontend/ 源码树）；但 npm ci 需要
+  # 写 node_modules、vite build 需要写 dist，只读挂载下两者都会直接失败
+  # （返工第 3 项 bug）。用匿名卷分别覆盖这两个子目录：写入落在容器生命周期内的
+  # 匿名卷而非宿主机磁盘，构建产物通过 cp 显式拷到 /output，容器退出后
+  # node_modules/dist 的匿名卷随之销毁，不会残留或污染宿主环境。
   docker run --rm \
     -v "${ROOT}/frontend:/frontend:ro" \
+    -v "/frontend/node_modules" \
+    -v "/frontend/dist" \
     -v "${BUILD_STAGE}:/output" \
     -w /frontend \
     node:22-slim \

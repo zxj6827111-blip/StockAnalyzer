@@ -5,6 +5,34 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, time
 from enum import StrEnum
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+# 显式时区常量（返工 P2 项）：A 股交易时段判断必须锚定 Asia/Shanghai，不能靠
+# 运维在容器/宿主上把系统 TZ 设对来兜底——一旦 TZ 缺失或被设成别的时区，
+# 下面 evaluate() 的默认取值分支会用系统本地时间去匹配硬编码的沪深交易时段，
+# 静默判断出错误的窗口（例如把开盘集合竞价误判为盘中，导致本该硬停的任务
+# 继续跑）。只影响“调用方未显式传入 moment”的默认路径；显式传参（测试、
+# evolution/ops/recovery.py 的 now 参数）行为不变，因为那是调用方自己决定
+# 按字面时刻判断，不应被这里悄悄改写。
+_MARKET_TZ_NAME = "Asia/Shanghai"
+
+
+def _now_in_market_timezone() -> datetime:
+    """Current wall clock in Asia/Shanghai, returned as naive for comparison.
+
+    Falls back to bare ``datetime.now()`` only if the ``tzdata`` package is
+    unavailable (extremely unlikely on the project's supported runtimes, but
+    keeps this guard from crashing the caller if it ever happens).
+    """
+    try:
+        aware = datetime.now(ZoneInfo(_MARKET_TZ_NAME))
+    except (ZoneInfoNotFoundError, KeyError, ValueError):
+        return datetime.now()
+    # _match_window only compares .time()/.weekday(), which are tz-agnostic
+    # once the correct wall-clock instant has been resolved; dropping tzinfo
+    # here keeps evaluate()'s return type and comparisons consistent with the
+    # naive datetimes callers already pass in explicitly.
+    return aware.replace(tzinfo=None)
 
 
 class TimeGuardMode(StrEnum):
@@ -57,7 +85,7 @@ class TimeGuard:
 
     def evaluate(self, moment: datetime | None = None) -> TimeGuardDecision:
         """Return mode and recommended action for one timestamp."""
-        current = moment or datetime.now()
+        current = moment if moment is not None else _now_in_market_timezone()
         if current.weekday() >= 5:
             return TimeGuardDecision(
                 mode=TimeGuardMode.FULL_POWER,
