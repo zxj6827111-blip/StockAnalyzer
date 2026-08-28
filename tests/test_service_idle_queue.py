@@ -31,6 +31,17 @@ def _load_test_config(tmp_path: Path) -> StockAnalyzerConfig:
     config.evolution.auto_run = False
     config.cloud_backup.enabled = False
     config.acceptance.auto_run = False
+    # 测试隔离修复（与 as_of 功能无关，同类问题见 test_service_week5.py /
+    # test_service_evolution_scheduler.py）：本函数此前完全未处理
+    # market_warehouse，db_path/package_root/data_source.warehouse_db_path 均
+    # 指向仓库共享真实路径 artifacts/warehouse/market.duckdb。idle_queue 部分
+    # 任务（如 WE-LEARN-01 停滞报告检查）会经 _market_warehouse() 读取该文件，
+    # 与其它测试写入的共享文件产生跨用例状态泄露风险。
+    config.market_warehouse.enabled = False
+    config.market_warehouse.auto_run = False
+    config.market_warehouse.db_path = str(tmp_path / "market_warehouse.duckdb")
+    config.market_warehouse.package_root = str(tmp_path / "market_warehouse_package")
+    config.data_source.warehouse_db_path = str(tmp_path / "market_warehouse.duckdb")
     config.idle_queue.enabled = True
     config.idle_queue.auto_run = False
     config.idle_queue.dispatch_interval_minutes = 5

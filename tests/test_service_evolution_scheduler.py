@@ -37,6 +37,16 @@ def _load_test_config(tmp_path: Path) -> StockAnalyzerConfig:
     config.evolution.code_commit_id = "git:test"
     config.market_warehouse.enabled = False
     config.market_warehouse.auto_run = False
+    # 测试隔离修复（与 as_of 功能无关）：此前只关了 enabled/auto_run，未重定向
+    # db_path/package_root/data_source.warehouse_db_path，三者默认指向仓库共享
+    # 真实路径 artifacts/warehouse/market.duckdb。evolution_offhours 流程内部
+    # 经 _market_warehouse() 无条件读取该文件（不受 enabled=False 影响），若
+    # 该共享文件因同一 xdist worker 内其它测试写入而非空/状态异常，会让
+    # evolution_offhours/evolution_m3_maintenance 抛出被 scheduler 吞掉的异常
+    # （success=False，detail=str(exc)），即 PR #37 CI flaky 根因之一。
+    config.market_warehouse.db_path = str(tmp_path / "market_warehouse.duckdb")
+    config.market_warehouse.package_root = str(tmp_path / "market_warehouse_package")
+    config.data_source.warehouse_db_path = str(tmp_path / "market_warehouse.duckdb")
     config.evolution.suggestions_dir = str((tmp_path / "suggestions").relative_to(tmp_path))
     config.evolution.manifest_path = str(
         (tmp_path / "artifacts" / "evolution" / "run_manifest.json").relative_to(tmp_path)
@@ -98,7 +108,25 @@ def _reset_evolution_orchestrator(
     )
 
 
-def test_scheduler_runs_evolution_offhours_job(tmp_path: Path) -> None:
+def test_scheduler_runs_evolution_offhours_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 测试隔离修复（与 as_of 功能无关）：run_due_jobs 内部 _execute_job_callback
+    # 以零参数调用 job.callback()（见 scheduler.py），_job_evolution_offhours(now=None)
+    # 因此永远取 datetime.now() 真实墙钟时间，而非本测试传入的模拟 now
+    # (2026-03-02T20:40:00)。这条真实时间会经 EvolutionOrchestrator.run() 传入
+    # assert_recovery_time_window()，若测试恰好在真实的 08:30-09:35 或
+    # 14:55-15:05（open/close auction 硬停窗口）运行就会随机抛
+    # RuntimeError("recovery blocked during hard_stop window")，被 scheduler
+    # 吞掉变成 success=False —— 与本 PR 的 as_of/market_warehouse 改动均无关，
+    # 是该测试对真实墙钟时间的隐藏依赖（PR #37 CI flaky 的第二个独立根因）。
+    # TimeGuard/hard_stop 窗口本身的行为已在 test_evolution_time_guard.py /
+    # test_evolution_recovery.py 专门覆盖，此处只需让本测试不再被真实时间污染。
+    import stock_analyzer.evolution.orchestrator as orchestrator_module
+
+    monkeypatch.setattr(
+        orchestrator_module, "assert_recovery_time_window", lambda now=None, guard=None: None
+    )
     config = _load_test_config(tmp_path)
     service = _new_service(config=config, tmp_path=tmp_path)
     _reset_evolution_orchestrator(service=service, config=config, tmp_path=tmp_path)
@@ -284,7 +312,17 @@ def test_evolution_offhours_keeps_weekend_silent(tmp_path: Path) -> None:
     assert _as_int(events["records"]) >= 1
 
 
-def test_scheduler_runs_evolution_m3_maintenance_job(tmp_path: Path) -> None:
+def test_scheduler_runs_evolution_m3_maintenance_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 同 test_scheduler_runs_evolution_offhours_job 的隔离修复说明：
+    # run_due_jobs 触发 evolution_offhours 时同样会因零参数 callback() 落到真实
+    # 墙钟时间，需要屏蔽 assert_recovery_time_window 对真实时间的依赖。
+    import stock_analyzer.evolution.orchestrator as orchestrator_module
+
+    monkeypatch.setattr(
+        orchestrator_module, "assert_recovery_time_window", lambda now=None, guard=None: None
+    )
     config = _load_test_config(tmp_path)
     service = _new_service(config=config, tmp_path=tmp_path)
     _reset_evolution_orchestrator(service=service, config=config, tmp_path=tmp_path)
