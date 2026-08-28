@@ -146,19 +146,41 @@ if [[ "${ENABLE_LEARNING:-0}" = "1" ]]; then
   exit 1
 fi
 
-# frontend_dist 存在性检查（返工第 2 项）：docker-compose.yml 把宿主
-# ${SA_FRONTEND_DIST_HOST_ROOT:-./frontend_dist} 挂载进容器 /app/frontend_dist。
-# 如果该目录从未构建过（不存在或为空）就执行 --force-recreate，Docker 会
-# 自动创建一个空目录挂载进容器，覆盖镜像内已构建好的前端产物，导致 /ui 返回
-# 404 且没有任何显著报错（build_and_publish_frontend_dist.sh 头部注释记录的
-# 同一个部署顺序陷阱）。这里在 recreate 之前显式检查，不可复用则直接调用
-# 构建脚本兜底，而不是放任静默退化。
+# frontend_dist 存在性 + 新鲜度检查。docker-compose.yml 把宿主
+# ${SA_FRONTEND_DIST_HOST_ROOT:-./frontend_dist} 挂载进容器 /app/frontend_dist，
+# 这带来两个都会静默失败的陷阱：
+#
+# 1) 目录从未构建过（不存在或为空）就执行 --force-recreate，Docker 会自动创建一个
+#    空目录挂载进容器，覆盖镜像内已构建好的前端产物，导致 /ui 返回 404 且无报错。
+# 2) 目录存在但内容过期。Python 代码在镜像内、重建镜像即更新；前端产物却在镜像外
+#    的挂载卷里、只有跑构建脚本才更新。于是"git pull + 重建镜像"这套标准部署动作
+#    会产出"后端已是新版、前端还是旧版"的组合，而且两边单独看都正常。2026-08-28
+#    连续三次踩到，其中一次让前端鉴权修复看起来完全没生效（后端已注入 token，
+#    浏览器加载的旧 bundle 根本不读它，所有请求 401），排查成本极高。
+#
+# 所以这里既检查存在性，也比对产物记录的前端源码子树 hash 与当前 HEAD 是否一致，
+# 任一不满足就直接调构建脚本兜底，而不是放任静默退化。
 FRONTEND_DIST_HOST_ROOT="${SA_FRONTEND_DIST_HOST_ROOT:-${ROOT}/frontend_dist}"
 if [[ "${DO_RECREATE}" -eq 1 ]]; then
+  FRONTEND_REBUILD_REASON=""
   if [[ ! -f "${FRONTEND_DIST_HOST_ROOT}/index.html" ]]; then
-    echo "frontend_dist missing or empty at ${FRONTEND_DIST_HOST_ROOT}; building it now to avoid an empty-directory mount overriding the image's bundled frontend" >&2
+    FRONTEND_REBUILD_REASON="missing or empty at ${FRONTEND_DIST_HOST_ROOT}"
+  else
+    CURRENT_FRONTEND_TREE="$(git -C "${ROOT}" rev-parse "HEAD:frontend" 2>/dev/null || true)"
+    PUBLISHED_FRONTEND_TREE="$(cat "${FRONTEND_DIST_HOST_ROOT}.tree" 2>/dev/null || true)"
+    if [[ -z "${CURRENT_FRONTEND_TREE}" ]]; then
+      # 拿不到当前子树 hash 时选择保守重建：多花一次构建时间，换掉"可能漏更新前端"
+      # 的风险——后者的排查成本远高于一次构建。
+      FRONTEND_REBUILD_REASON="cannot resolve HEAD:frontend tree hash; rebuilding to be safe"
+    elif [[ "${CURRENT_FRONTEND_TREE}" != "${PUBLISHED_FRONTEND_TREE}" ]]; then
+      FRONTEND_REBUILD_REASON="stale (published=${PUBLISHED_FRONTEND_TREE:0:12}${PUBLISHED_FRONTEND_TREE:+ }current=${CURRENT_FRONTEND_TREE:0:12})"
+    fi
+  fi
+
+  if [[ -n "${FRONTEND_REBUILD_REASON}" ]]; then
+    echo "[1.5/6] rebuilding frontend_dist: ${FRONTEND_REBUILD_REASON}" >&2
     if ! bash "${ROOT}/scripts/build_and_publish_frontend_dist.sh" --output-dir "${FRONTEND_DIST_HOST_ROOT}" --docker; then
-      echo "ERROR: failed to build frontend_dist; refusing to recreate api with a missing/empty mount." >&2
+      echo "ERROR: failed to build frontend_dist; refusing to recreate api with a missing/stale mount." >&2
       exit 1
     fi
   fi
