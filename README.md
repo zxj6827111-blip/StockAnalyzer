@@ -685,8 +685,16 @@ Invoke-RestMethod -Method Post -Uri 'http://localhost:8001/week6/run' -ContentTy
   Node.js install), which builds `frontend/` and atomically publishes the output to
   `frontend_dist/` (keeping the previous build as `frontend_dist.previous/` for one cycle).
   Adding this volume mount for the first time still requires recreating the `api` container
-  once (`docker compose up -d --force-recreate api`) for the new mount to take effect;
-  follow-up publishes need no restart since `StaticFiles` reads from disk directly.
+  once (`source scripts/nas_compose_files.sh && docker compose --env-file .env
+  "${NAS_COMPOSE_ARGS[@]}" up -d --force-recreate api`) for the new mount to take effect.
+  Follow-up publishes need no restart, but **only because the script syncs the new build
+  in place instead of `mv`-ing the directory**: a bind mount binds the directory *inode*,
+  so replacing `frontend_dist/` wholesale leaves the running container attached to the old
+  inode — the host shows the new build while the container still serves the old one, with no
+  visible error. That exact split state broke the `/ui` auth fix on 2026-08-28 (backend
+  injected `window.SA_API_TOKEN`, browser loaded a stale JS bundle that never read it, so
+  every POST returned 401). The script now self-checks the container's entry bundle after
+  publishing and tells you to recreate if the inode binding is already broken.
   **部署顺序硬性要求（务必遵守，否则会导致 `/ui` 404）**：必须先运行
   `scripts/build_and_publish_frontend_dist.sh` 让宿主 `frontend_dist/` 目录里已经有
   构建产物，**之后**才能执行 `docker compose up -d --force-recreate api`。如果顺序反过来

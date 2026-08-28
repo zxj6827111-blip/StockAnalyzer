@@ -132,6 +132,90 @@ async function pollTask(taskId: string, onTick?: () => void): Promise<TaskStatus
   throw new Error('任务轮询超时，请稍后在“最近结果”中查看是否已完成。');
 }
 
+/** 提交前的前端校验，返回空串表示通过。
+ *
+ * 后端虽然也有 Query 约束，但让用户点完才收到一条英文 422 体验很差；更麻烦的是
+ * 原生 number 控件在填 0 时会静默变成 1、填负数时仍允许提交（UI 验证实测到），
+ * 用户根本不知道自己的输入被改写过。所以这里显式挡住并给出中文原因。
+ */
+function validateBacktestInputs(params: {
+  mode: 'single' | 'range';
+  singleDate: string;
+  startDate: string;
+  endDate: string;
+  topN: number;
+  horizonDays: number;
+}): string {
+  const { mode, singleDate, startDate, endDate, topN, horizonDays } = params;
+  if (mode === 'single') {
+    if (!singleDate) return '请选择回测日期。';
+  } else {
+    if (!startDate || !endDate) return '请选择完整的日期区间（开始与结束日期）。';
+    if (startDate > endDate) return '日期区间无效：开始日期不能晚于结束日期。';
+  }
+  if (!Number.isInteger(topN) || topN < 1) return 'Top N 必须是不小于 1 的整数。';
+  // 上限与后端 AsofBacktestRequest 的 Field(ge=1, le=500) 保持一致，避免前端放过去
+  // 再被后端 422 拒掉
+  if (topN > 500) return 'Top N 最大支持 500。';
+  if (!Number.isInteger(horizonDays) || horizonDays < 1) {
+    return '持有交易日数必须是不小于 1 的整数。';
+  }
+  if (horizonDays > 60) return '持有交易日数最大支持 60（与后端约束一致）。';
+  return '';
+}
+
+/** 把接口层的技术错误转成用户能理解的中文说明。
+ *
+ * 原先直接把 `GET /tasks/xxx failed: 401` 这类信息抛到界面上，用户既看不懂也不
+ * 知道该做什么（UI 验证反馈）。这里保留原文附在括号里，便于排查时对照日志。
+ */
+function toFriendlyError(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  if (raw.includes(' 401')) {
+    return `鉴权失败：当前页面没有取得有效的 API token。请硬刷新页面（Ctrl+Shift+R）重试；若仍失败，说明前端产物与后端不同步，需要联系运维重新发布前端。（${raw}）`;
+  }
+  if (raw.includes(' 403')) {
+    return `鉴权被拒绝：token 无效或已轮换。请硬刷新页面重新获取。（${raw}）`;
+  }
+  if (raw.includes(' 404')) {
+    return `请求的资源不存在，可能是任务记录已过期或服务刚重启过。（${raw}）`;
+  }
+  if (raw.includes(' 422')) {
+    return `参数校验未通过，请检查日期与数值输入。（${raw}）`;
+  }
+  if (raw.includes(' 5')) {
+    return `服务端处理失败，请稍后重试或查看服务日志。（${raw}）`;
+  }
+  return raw;
+}
+
+/** 提交前就展示的静态口径提示。
+ *
+ * CaveatsBanner 依赖接口返回的 caveats，所以只有拿到结果后才会出现；但"这个功能
+ * 的结果偏乐观、不能当真实历史表现看"这件事，用户在**提交之前**就该知道，否则等
+ * 看到结果时已经先形成了错误预期（UI 验证反馈）。这里给不依赖接口数据的通用版本，
+ * 具体日期与模型训练时间仍由结果区的 CaveatsBanner 给出精确值。
+ */
+function StaticCaveatsNotice() {
+  return (
+    <div className="glass-panel flex flex-col gap-2 border-warn p-4 text-sm text-warn">
+      <div className="flex items-center gap-2 font-bold">
+        <AlertTriangle className="h-5 w-5" /> 请先了解本功能的结果口径
+      </div>
+      <ul className="ml-5 list-disc space-y-1">
+        <li>
+          回测使用<strong>当前</strong>模型回溯更早的日期，模型已"见过"回测日之后的市场，
+          存在未来函数，<strong>结果系统性偏乐观</strong>，不等于当时真实能取得的表现。
+        </li>
+        <li>历史新闻无法追溯，新闻情绪一律按中性处理。</li>
+        <li>分钟级特征受数据覆盖限制会降级为缺失，判断依据弱于实盘。</li>
+        <li>候选池默认取当前关注池，并非当日全市场，存在选择偏差。</li>
+      </ul>
+      <div className="text-xs opacity-80">提交后结果区会给出精确的模型训练时间与数据覆盖截止日期。</div>
+    </div>
+  );
+}
+
 function CaveatsBanner(props: { caveats: CaveatsPayload | undefined }) {
   const { caveats } = props;
   if (!caveats) return null;
@@ -281,6 +365,18 @@ export default function HistoricalBacktestPage() {
   const activeEntry = activeDateKey ? result?.dates?.[activeDateKey] : undefined;
 
   const handleSubmit = async () => {
+    const validationError = validateBacktestInputs({
+      mode,
+      singleDate,
+      startDate,
+      endDate,
+      topN,
+      horizonDays,
+    });
+    if (validationError) {
+      setError(validationError);
+      return;
+    }
     setSubmitting(true);
     setError('');
     setResult(null);
@@ -306,7 +402,7 @@ export default function HistoricalBacktestPage() {
         if (firstDate) setSelectedDate(firstDate);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(toFriendlyError(err));
     } finally {
       setSubmitting(false);
       setPolling(false);
@@ -327,7 +423,7 @@ export default function HistoricalBacktestPage() {
         setError('尚无历史回测结果，请先提交一次回测。');
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(toFriendlyError(err));
     }
   };
 
@@ -416,8 +512,13 @@ export default function HistoricalBacktestPage() {
               type="number"
               min={1}
               max={500}
-              value={topN}
-              onChange={(event) => setTopN(Number(event.target.value) || 1)}
+              // 不再用 `Number(v) || 1` 兜底：那会把用户填的 0 静默改写成 1，界面上看不出
+              // 输入被改过（UI 验证实测到）。这里保留原值（空串记为 NaN），交给
+              // validateBacktestInputs 在提交时给出明确的中文错误。
+              value={Number.isNaN(topN) ? '' : topN}
+              onChange={(event) =>
+                setTopN(event.target.value === '' ? Number.NaN : Number(event.target.value))
+              }
               className="rounded-lg border border-panelBorder bg-[rgba(8,25,39,0.7)] px-3 py-2 text-ink"
             />
           </label>
@@ -427,8 +528,10 @@ export default function HistoricalBacktestPage() {
               type="number"
               min={1}
               max={60}
-              value={horizonDays}
-              onChange={(event) => setHorizonDays(Number(event.target.value) || 1)}
+              value={Number.isNaN(horizonDays) ? '' : horizonDays}
+              onChange={(event) =>
+                setHorizonDays(event.target.value === '' ? Number.NaN : Number(event.target.value))
+              }
               className="rounded-lg border border-panelBorder bg-[rgba(8,25,39,0.7)] px-3 py-2 text-ink"
             />
           </label>
@@ -441,6 +544,11 @@ export default function HistoricalBacktestPage() {
       </div>
 
       {error ? <div className="glass-panel border-bad p-4 text-bad">{error}</div> : null}
+
+      {/* 还没有结果时展示静态口径提示：让用户在**提交前**就知道结果偏乐观，
+          而不是等看到数字之后才被告知（UI 验证反馈）。拿到结果后由下面的
+          CaveatsBanner 接管，给出模型训练时间等精确值，避免两块重复。 */}
+      {result ? null : <StaticCaveatsNotice />}
 
       {result ? (
         <>
