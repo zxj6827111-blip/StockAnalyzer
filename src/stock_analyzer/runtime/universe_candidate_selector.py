@@ -37,6 +37,9 @@ class UniverseQualityBatchSource(Protocol):
     a full ``MarketWarehouse``, a ``VendorZipOverlayProvider`` (ZIP history +
     delta overlay), or a wrapper around either. The selector never reaches
     into provider internals; it only calls this one batch method.
+
+    ``end_date``（as-of 契约）：非 None 时批量源必须先截断到该日期再取最近
+    N 根；历史回测的 as-of 粗筛依赖这个参数，避免混入未来行。
     """
 
     def fetch_universe_quality_metrics(
@@ -44,6 +47,7 @@ class UniverseQualityBatchSource(Protocol):
         *,
         symbols: list[str],
         lookback_days: int,
+        end_date: date | None = None,
     ) -> pd.DataFrame: ...
 
 # Five-board classification mirroring runtime.service._BOARD_ORDER / map.
@@ -166,12 +170,17 @@ class UniverseCandidateSelector:
         ruleset_id: str,
         board_scope: list[str],
         reference_date: date | datetime | str | None = None,
+        end_date: date | None = None,
     ) -> dict[str, object]:
         """Select up to ``target_size`` symbols and return a full audit report.
 
         Returns ``{"selected": [...], "report": {...}}``. On batch failure the
         selector invokes ``fallback_sampler`` (when provided) and returns a
         ``degraded_fallback`` report with complete metadata.
+
+        ``end_date``（as-of 契约）：非 None 时批量取数锚定该日期（先截断再取
+        最近 N 根），且快照 fallback 一律禁用——生产 selection snapshot 写于
+        当前时点，对历史日期属于未来信息，历史回测绝不读取。
         """
         target = max(1, int(target_size))
         normalized_input = _dedupe_preserve_order(
@@ -188,7 +197,7 @@ class UniverseCandidateSelector:
             "missing_batch_symbols_sample": sorted(normalized_input)[:20],
         }
 
-        batch_frame, fetch_error = self._safe_batch_fetch(normalized_input)
+        batch_frame, fetch_error = self._safe_batch_fetch(normalized_input, end_date=end_date)
         if fetch_error or batch_frame.empty:
             return self._fallback_with_snapshot_or_quota(
                 symbols=normalized_input,
@@ -201,6 +210,7 @@ class UniverseCandidateSelector:
                 started_at=started_at,
                 reference_date=resolved_reference_date,
                 batch_stats=batch_stats,
+                end_date=end_date,
             )
 
         missing_columns = sorted(set(_REQUIRED_COLUMNS) - set(batch_frame.columns))
@@ -216,6 +226,7 @@ class UniverseCandidateSelector:
                 started_at=started_at,
                 reference_date=resolved_reference_date,
                 batch_stats=batch_stats,
+                end_date=end_date,
             )
 
         batch_frame = batch_frame.copy()
@@ -248,6 +259,7 @@ class UniverseCandidateSelector:
                 started_at=started_at,
                 reference_date=resolved_reference_date,
                 batch_stats=batch_stats,
+                end_date=end_date,
             )
 
         try:
@@ -264,6 +276,7 @@ class UniverseCandidateSelector:
                 started_at=started_at,
                 reference_date=resolved_reference_date,
                 batch_stats=batch_stats,
+                end_date=end_date,
             )
         try:
             eligible_rows, rejected_counts = self._hard_filter(
@@ -283,6 +296,7 @@ class UniverseCandidateSelector:
                 started_at=started_at,
                 reference_date=resolved_reference_date,
                 batch_stats=batch_stats,
+                end_date=end_date,
             )
         eligible_count = len(eligible_rows)
 
@@ -375,11 +389,14 @@ class UniverseCandidateSelector:
     # ------------------------------------------------------------------
     # Batch fetch + hard filter
     # ------------------------------------------------------------------
-    def _safe_batch_fetch(self, symbols: list[str]) -> tuple[pd.DataFrame, str]:
+    def _safe_batch_fetch(
+        self, symbols: list[str], *, end_date: date | None = None
+    ) -> tuple[pd.DataFrame, str]:
         try:
             frame = self._warehouse.fetch_universe_quality_metrics(
                 symbols=symbols,
                 lookback_days=self._lookback_days,
+                end_date=end_date,
             )
             if not isinstance(frame, pd.DataFrame):
                 return pd.DataFrame(), "batch_fetch_error:invalid_return_type"
@@ -727,13 +744,18 @@ class UniverseCandidateSelector:
         started_at: datetime,
         reference_date: date | None,
         batch_stats: Mapping[str, object],
+        end_date: date | None = None,
     ) -> dict[str, object]:
-        snapshot_result, snapshot_unavailable_reason = self._load_snapshot_fallback(
-            symbols=symbols,
-            target_size=target_size,
-            ruleset_id=ruleset_id,
-            board_scope=board_scope,
-            reference_date=reference_date,
+        snapshot_result, snapshot_unavailable_reason = (
+            (None, "snapshot_disabled_for_asof")
+            if end_date is not None
+            else self._load_snapshot_fallback(
+                symbols=symbols,
+                target_size=target_size,
+                ruleset_id=ruleset_id,
+                board_scope=board_scope,
+                reference_date=reference_date,
+            )
         )
         if snapshot_result is not None:
             snapshot_selected, snapshot_payload, snapshot_meta = snapshot_result

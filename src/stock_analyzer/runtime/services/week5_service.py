@@ -11,7 +11,6 @@ from datetime import UTC, datetime
 from functools import lru_cache
 from importlib import import_module
 from pathlib import Path
-from time import perf_counter
 from typing import TYPE_CHECKING, Any, cast
 
 import pandas as pd
@@ -24,10 +23,6 @@ from stock_analyzer.evolution.execution_aware_scoring import (
     is_high_execution_risk,
     normalize_execution_model_outputs,
     normalize_execution_risk_payload,
-)
-from stock_analyzer.feature.snapshot import (
-    load_feature_snapshot,
-    snapshot_is_current,
 )
 from stock_analyzer.learning.execution_risk_labels import build_execution_risk_feature_vector
 from stock_analyzer.models.execution_risk_predictor import ExecutionRiskPredictor
@@ -1094,20 +1089,24 @@ class RuntimeWeek5Service:
     def _build_gate_blocked_report(
         self,
         *,
-        service: object,
         now: datetime,
         reasons: list[str],
         data_snapshot_id: str,
         snapshot_current: bool,
         scan_profile: str = "",
+        watchlist_size: int | None = None,
     ) -> dict[str, object]:
         """Fail-closed week5 scan report when the data gate is blocked."""
-        watchlist_size = len(service._state.watchlist)
+        resolved_size = (
+            len(self._service._state.watchlist)
+            if watchlist_size is None
+            else watchlist_size
+        )
         return {
             "timestamp": now.isoformat(),
             "trace_id": "",
             "status": "blocked_data_gate",
-            "watchlist_size": watchlist_size,
+            "watchlist_size": resolved_size,
             "symbol_source": "blocked",
             "scan_profile": scan_profile.strip() or "default",
             "first_board": {"candidate_count": 0, "candidates": [], "leaders": []},
@@ -1161,6 +1160,23 @@ class RuntimeWeek5Service:
         scan_profile: str = "",
         recovery_mode: bool = False,
     ) -> dict[str, object]:
+        """执行一次 Week5 扫描（live context → 共享选股引擎）。
+
+        漏斗编排全部在 :class:`Week5SelectionEngine.run()` 中；本方法只负责
+        live 上下文装配（真实账户状态/调度覆盖参数/通知开关）与进度文件
+        生命周期。historical 回测通过同一引擎 + historical context 复用同一
+        套阶段实现（见 ``week5_historical_runner.py``）。
+        """
+        from stock_analyzer.runtime.services.week5_selection_engine import (
+            Week5AccountState,
+            Week5RunContext,
+            Week5RunPolicy,
+            Week5SelectionEngine,
+        )
+        from stock_analyzer.runtime.services.week5_selection_engine import (
+            Week5EngineBackend as _Week5EngineBackend,
+        )
+
         service = self._service
         if service._bootstrap_runtime_blocked():
             blocked = {
@@ -1213,24 +1229,42 @@ class RuntimeWeek5Service:
             scan_profile=scan_profile.strip() or "default",
         )
         progress.update(status="running", phase="quality")
+        now = timestamp or datetime.now()
+        context = Week5RunContext(
+            mode="live",
+            now=now,
+            symbols=symbols,
+            pinned_symbols=list(pinned_symbols or []),
+            account=Week5AccountState(
+                current_equity=float(service._state.current_equity),
+                watchlist=list(service._state.watchlist),
+                pause_new_buy=bool(getattr(service._state, "pause_new_buy", False)),
+                no_buy_streak=self._run_summaries_no_buy_streak(),
+                monster_positions=self._monster_positions(),
+            ),
+            progress=progress.update,
+            sync_reason=sync_reason,
+            scan_profile=scan_profile,
+            force_universe_scan=bool(force_universe_scan),
+            recovery_mode=bool(recovery_mode),
+            sync_watchlist=sync_watchlist,
+            sync_top_k_override=sync_top_k_override,
+            prefilter_enabled_override=prefilter_enabled_override,
+            prefilter_top_k_override=prefilter_top_k_override,
+            universe_max_symbols_override=universe_max_symbols_override,
+            deep_candidate_target_override=deep_candidate_target_override,
+        )
+        policy = Week5RunPolicy.live()
+        policy.notify = (
+            bool(service._config.week5.auto_notify)
+            if notify_enabled is None
+            else bool(notify_enabled)
+        )
+        engine = Week5SelectionEngine(
+            backend=cast("_Week5EngineBackend", self), context=context, policy=policy
+        )
         try:
-            report = self._run_week5_scan_impl(
-                symbols=symbols,
-                timestamp=timestamp,
-                notify_enabled=notify_enabled,
-                sync_watchlist=sync_watchlist,
-                sync_reason=sync_reason,
-                sync_top_k_override=sync_top_k_override,
-                force_universe_scan=force_universe_scan,
-                prefilter_enabled_override=prefilter_enabled_override,
-                prefilter_top_k_override=prefilter_top_k_override,
-                universe_max_symbols_override=universe_max_symbols_override,
-                deep_candidate_target_override=deep_candidate_target_override,
-                pinned_symbols=pinned_symbols,
-                scan_profile=scan_profile,
-                recovery_mode=recovery_mode,
-                _progress=progress,
-            )
+            report = engine.run()
         except Exception as exc:
             progress.fail(error=exc)
             raise
@@ -1243,1713 +1277,301 @@ class RuntimeWeek5Service:
             progress.update(status="completed")
         return report
 
-    def _run_week5_scan_impl(
+    # ------------------------------------------------------------------
+    # Week5EngineBackend 实现：引擎的阶段实现钩子（live/historical 共用）
+    # ------------------------------------------------------------------
+    @property
+    def service(self) -> StockAnalyzerService:
+        return self._service
+
+    @property
+    def config(self) -> Any:
+        return self._service._config  # noqa: SLF001 - backend 契约
+
+    def build_data_gate(
         self,
-        symbols: list[str] | None = None,
-        timestamp: datetime | None = None,
-        notify_enabled: bool | None = None,
-        sync_watchlist: bool | None = None,
-        sync_reason: str = "",
-        sync_top_k_override: int | None = None,
-        force_universe_scan: bool = False,
-        prefilter_enabled_override: bool | None = None,
-        prefilter_top_k_override: int | None = None,
-        universe_max_symbols_override: int | None = None,
-        deep_candidate_target_override: int | None = None,
-        pinned_symbols: list[str] | None = None,
-        scan_profile: str = "",
-        recovery_mode: bool = False,
-        _progress: Week5ScanProgress | None = None,
+        *,
+        snapshot_manifest: object,
+        snapshot_current: bool,
+        latest_trade_date: str,
+        now: object,
     ) -> dict[str, object]:
-        service = self._service
-        now = timestamp or datetime.now()
-        # 阶段耗时计数器必须在任何阶段执行之前初始化，否则会覆盖
-        # quality_selection / light_stage 已记录的耗时。
-        quality_selection_ms = 0
-        light_stage_ms = 0
-        deep_stage_ms = 0
-        snapshot_manifest = None
-        snapshot_frame = None
-        snapshot_current = False
-        if bool(service._config.week5.feature_snapshot_enabled):
-            try:
-                snapshot_manifest, snapshot_frame = load_feature_snapshot(service._config)
-                if snapshot_manifest is not None and snapshot_frame is not None:
-                    snapshot_current = snapshot_is_current(snapshot_manifest, service._config, now)
-            except Exception:
-                snapshot_manifest = None
-                snapshot_frame = None
-                snapshot_current = False
-        snapshot_mode = bool(
-            snapshot_manifest is not None and snapshot_frame is not None and snapshot_current
-        )
-        data_gate = service._build_data_gate(
+        return self._service._build_data_gate(  # noqa: SLF001
             snapshot_manifest=snapshot_manifest,
             snapshot_current=snapshot_current,
-            latest_trade_date=str(snapshot_manifest.trade_date) if snapshot_manifest else "",
+            latest_trade_date=latest_trade_date,
             now=now,
         )
-        gate_status = str(data_gate.get("status", "ok"))
-        deep_candidate_target = max(
-            1,
-            _resolve_positive_int(
-                deep_candidate_target_override,
-                fallback=_as_int(service._config.week5.deep_candidate_target, default=20),
-            ),
+
+    def prefer_local_symbol_universe(self) -> bool:
+        return self._service._prefer_local_symbol_universe()  # noqa: SLF001
+
+    def resolve_symbol_universe(self, **kwargs: Any) -> dict[str, object]:
+        return self._service._resolve_symbol_universe(**kwargs)  # noqa: SLF001
+
+    def universe_seed_trade_date(self) -> str:
+        return self._service._resolve_universe_seed_trade_date()  # noqa: SLF001
+
+    def select_universe_quality_candidates(self, **kwargs: Any) -> dict[str, object]:
+        return self._service._select_universe_quality_candidates(**kwargs)  # noqa: SLF001
+
+    def ensure_feature_snapshot(self, *, symbols: list[str], scope: str) -> dict[str, object]:
+        return self._service.ensure_week5_feature_snapshot(symbols=symbols, scope=scope)  # noqa: SLF001
+
+    def light_stage_from_snapshot(
+        self, *, frame: Any, target: int, allowed_exchanges: set[str]
+    ) -> dict[str, object]:
+        return self._service._light_stage_from_snapshot(  # noqa: SLF001
+            frame=frame,
+            target=target,
+            allowed_exchanges=allowed_exchanges,
         )
-        intraday_scheduler_mode = self._is_intraday_scheduler_week5_scan(
+
+    def deep_stage_from_snapshot(
+        self, *, frame: Any, target: int, light_report: dict[str, object]
+    ) -> dict[str, object]:
+        return self._service._deep_stage_from_snapshot(  # noqa: SLF001
+            frame=frame,
+            target=target,
+            light_report=light_report,
+        )
+
+    def prefilter_universe_symbols(
+        self, *, symbols: list[str], top_k_override: int | None = None
+    ) -> dict[str, object]:
+        return self._service._prefilter_week5_universe_symbols(  # noqa: SLF001
+            symbols=symbols,
+            top_k_override=top_k_override,
+        )
+
+    def run_pipeline(self, **kwargs: Any) -> dict[str, object]:
+        return self._service.run_pipeline(**kwargs)  # noqa: SLF001
+
+    def select_live_runtime_provider(self) -> object:
+        return self._service._select_provider(use_live_runtime=True)  # noqa: SLF001
+
+    def score_signal_pool_candidate(
+        self,
+        *,
+        signal: Any,
+        prefilter_detail: Any,
+    ) -> dict[str, object]:
+        return self._service._score_week5_signal_pool_candidate(  # noqa: SLF001
+            signal=signal,
+            prefilter_detail=prefilter_detail,
+        )
+
+    def apply_execution_aware_rerank(
+        self, *, candidates: list[dict[str, object]]
+    ) -> dict[str, object]:
+        return self._apply_execution_aware_rerank(candidates=candidates)
+
+    def final_signal_selector(
+        self,
+        *,
+        signals: list[dict[str, object]],
+        data_gate_status: str,
+        min_threshold_lift: float = 0.0,
+        news_mode_override: str | None = None,
+    ) -> dict[str, object]:
+        return self._service._final_signal_selector(  # noqa: SLF001
+            signals=cast("list[object]", signals),
+            data_gate_status=data_gate_status,
+            min_threshold_lift=min_threshold_lift,
+            news_mode_override=news_mode_override,
+        )
+
+    def build_first_board_candidate(
+        self, *, symbol: str, bars: Any, signal: dict[str, object]
+    ) -> dict[str, object] | None:
+        return self._service._build_first_board_candidate(  # noqa: SLF001
+            symbol=symbol,
+            bars=bars,
+            signal=signal,
+        )
+
+    def detect_symbol_anomaly(
+        self, *, symbol: str, bars: Any
+    ) -> dict[str, object] | None:
+        return self._service._detect_symbol_anomaly(symbol=symbol, bars=bars)  # noqa: SLF001
+
+    def estimate_sentiment(self, *, monster_report: dict[str, object]) -> tuple[float, bool]:
+        return self._service._estimate_sentiment(monster_report=monster_report)  # noqa: SLF001
+
+    def market_breadth_gate(self, *, now: datetime) -> tuple[dict[str, object], float]:
+        return self._service._apply_market_breadth_gate(now=now)  # noqa: SLF001
+
+    def build_gate_blocked_report(
+        self,
+        *,
+        now: datetime,
+        reasons: list[str],
+        data_snapshot_id: str,
+        snapshot_current: bool,
+        scan_profile: str,
+        watchlist_size: int | None = None,
+    ) -> dict[str, object]:
+        resolved_size = (
+            len(self._service._state.watchlist)  # noqa: SLF001
+            if watchlist_size is None
+            else watchlist_size
+        )
+        return self._build_gate_blocked_report(
             now=now,
-            sync_reason=sync_reason,
-        )
-        prefilter_enabled = (
-            bool(prefilter_enabled_override)
-            if prefilter_enabled_override is not None
-            else bool(service._config.week5.universe_prefilter_enabled)
-        )
-        configured_prefilter_top_k = max(
-            1,
-            _resolve_positive_int(
-                prefilter_top_k_override,
-                fallback=_as_int(service._config.week5.universe_prefilter_top_k, default=500),
-            ),
-        )
-        symbol_source = "watchlist"
-        prefilter_report: dict[str, object] = {
-            "enabled": prefilter_enabled,
-            "applied": False,
-            "lookback_days": max(
-                120,
-                _as_int(service._config.week5.universe_prefilter_lookback_days, default=240),
-            ),
-            "top_k": configured_prefilter_top_k,
-            "shortlist_top_n": max(
-                1,
-                _as_int(service._config.week5.universe_prefilter_shortlist_top_n, default=50),
-            ),
-            "universe_count": 0,
-            "eligible_count": 0,
-            "shortlisted_count": 0,
-            "scoring_mode": "two_stage_funnel",
-            "symbols": [],
-            "shortlisted": [],
-            "preview": [],
-            "pinned_count": 0,
-            "pinned_symbols": [],
-            "reason": "not_requested",
-            "stages": {
-                "stage1": {
-                    "applied": False,
-                    "status": "not_run",
-                    "score_key": "baseline_score",
-                    "input_count": 0,
-                    "eligible_count": 0,
-                    "advanced_count": 0,
-                    "weights": {
-                        "trend": 0.40,
-                        "capital_flow": 0.25,
-                        "price_volume": 0.15,
-                        "liquidity": 0.10,
-                        "risk_penalty": 0.10,
-                    },
-                    "preview": [],
-                },
-                "stage2": {
-                    "applied": False,
-                    "status": "not_run",
-                    "score_key": "shortlist_score",
-                    "shortlist_top_n": max(
-                        1,
-                        _as_int(
-                            service._config.week5.universe_prefilter_shortlist_top_n,
-                            default=50,
-                        ),
-                    ),
-                    "input_count": 0,
-                    "advanced_count": 0,
-                    "weights": {
-                        "signal": 0.35,
-                        "capital_flow": 0.25,
-                        "trend": 0.15,
-                        "price_volume": 0.15,
-                        "execution_liquidity": 0.10,
-                        "risk_penalty": 0.10,
-                    },
-                    "preview": [],
-                },
-            },
-        }
-        prefilter_details_by_symbol: dict[str, dict[str, object]] = {}
-        prefer_local_universe = service._prefer_local_symbol_universe()
-        should_scan_universe = bool(force_universe_scan)
-        # Locals preserved across the prefilter_report reassignment below so the
-        # quality-selector audit report and universe errors are not lost when
-        # _prefilter_week5_universe_symbols returns a fresh dict.
-        quality_selection_report: dict[str, object] | None = None
-        universe_errors_list: list[str] | None = None
-
-        if symbols is not None and not force_universe_scan:
-            raw_symbols = symbols
-            symbol_source = "manual_input"
-            prefilter_report["reason"] = "manual_symbols"
-        else:
-            raw_symbols = list(service._state.watchlist)
-            if not raw_symbols and intraday_scheduler_mode and not force_universe_scan:
-                raw_symbols = self._state_service.latest_preserved_watchlist_symbols(
-                    top_k_override=sync_top_k_override,
-                )
-                if raw_symbols:
-                    symbol_source = "intraday_preserved_watchlist"
-                    prefilter_report["reason"] = "intraday_preserve_existing"
-            if force_universe_scan or (not raw_symbols and not intraday_scheduler_mode):
-                quality_selector_enabled = bool(
-                    service._config.week5.universe_quality_selector_enabled
-                )
-                if quality_selector_enabled:
-                    # Full universe first — never truncate via _quota_sample_universe
-                    # before the quality selector runs.
-                    universe = service._resolve_symbol_universe(
-                        max_symbols=0,
-                        allow_seed_fallback=True,
-                        allow_online_sources=not prefer_local_universe,
-                    )
-                    full_universe_symbols = _string_list(universe.get("symbols", []))
-                    quality_target = _resolve_positive_int(
-                        universe_max_symbols_override,
-                        fallback=_as_int(
-                            service._config.week5.universe_quality_target_size,
-                            default=300,
-                        ),
-                    )
-                    quality_trade_date = service._resolve_universe_seed_trade_date()
-                    quality_ruleset_id = str(
-                        service._config.evolution.universe_spec.universe_ruleset_id
-                    )
-                    quality_board_scope = list(service._config.evolution.universe_spec.board_scope)
-                    selection_started = perf_counter()
-                    selection = service._select_universe_quality_candidates(
-                        symbols=full_universe_symbols,
-                        target_size=quality_target,
-                        trade_date=quality_trade_date,
-                        reference_date=now.date().isoformat(),
-                        ruleset_id=quality_ruleset_id,
-                        board_scope=quality_board_scope,
-                    )
-                    # 已执行阶段取整后至少为 1ms：极快阶段向下取整会得到 0，
-                    # 与"未执行=0"的观测口径冲突，也会让测试出现 flaky。
-                    quality_selection_ms = max(1, int((perf_counter() - selection_started) * 1000))
-                    selection_report = selection.get("report", {})
-                    if not isinstance(selection_report, dict):
-                        selection_report = {}
-                    raw_symbols = _string_list(selection.get("selected", []))
-                    selector_mode = str(selection_report.get("selector_mode", "")).strip()
-                    symbol_source = str(universe.get("source", "universe")) + ":quality_selector"
-                    should_scan_universe = True
-                    prefilter_report["reason"] = "universe_scan"
-                    prefilter_report["universe_source"] = symbol_source
-                    prefilter_report["universe_quality_selection"] = selection_report
-                    prefilter_report["universe_quality_selector_mode"] = selector_mode
-                    quality_selection_report = selection_report
-                    board_quotas = selection_report.get("board_quotas")
-                    universe_board_quota = {
-                        "truncation_mode": "quality_ranked_board_floor",
-                        "cap": quality_target,
-                        "effective_cap": max(
-                            0,
-                            _as_int(
-                                selection_report.get("selected_count"),
-                                default=len(raw_symbols),
-                            ),
-                        ),
-                        "board_scope": quality_board_scope,
-                        "boards": board_quotas if isinstance(board_quotas, dict) else {},
-                        "seed_trade_date": quality_trade_date,
-                        "ruleset_id": quality_ruleset_id,
-                        "selector_mode": selector_mode,
-                    }
-                    prefilter_report["universe_board_quota"] = universe_board_quota
-                    raw_errors = universe.get("errors", [])
-                    if isinstance(raw_errors, list):
-                        universe_errors_list = [
-                            str(item).strip() for item in raw_errors if str(item).strip()
-                        ][:20]
-                        prefilter_report["universe_errors"] = universe_errors_list
-                else:
-                    universe_max_symbols = (
-                        max(0, _as_int(universe_max_symbols_override, default=0))
-                        if universe_max_symbols_override is not None
-                        else (0 if prefer_local_universe else 1200)
-                    )
-                    universe = service._resolve_symbol_universe(
-                        max_symbols=universe_max_symbols,
-                        allow_seed_fallback=True,
-                        allow_online_sources=not prefer_local_universe,
-                    )
-                    raw_symbols = _string_list(universe.get("symbols", []))
-                    symbol_source = str(universe.get("source", "universe"))
-                    should_scan_universe = True
-                    prefilter_report["reason"] = "universe_scan"
-                    prefilter_report["universe_source"] = symbol_source
-                    universe_board_quota = universe.get("board_quota")
-                    if isinstance(universe_board_quota, dict):
-                        prefilter_report["universe_board_quota"] = universe_board_quota
-                    raw_errors = universe.get("errors", [])
-                    if isinstance(raw_errors, list):
-                        universe_errors_list = [
-                            str(item).strip() for item in raw_errors if str(item).strip()
-                        ][:20]
-                        prefilter_report["universe_errors"] = universe_errors_list
-            else:
-                if prefilter_report.get("reason") == "not_requested":
-                    prefilter_report["reason"] = "existing_watchlist"
-
-        symbol_list = [str(item).strip() for item in raw_symbols if str(item).strip()]
-        # Feature snapshot is ensured AFTER the quality selection resolved the
-        # actual candidate set: the snapshot is built (or incrementally
-        # refreshed) for exactly those candidates, then the snapshot state and
-        # the data gate are re-evaluated so a fresh build is consumed by the
-        # light/deep stages.  On build failure the snapshot state is reset to
-        # missing and the gate keeps the scheduler path fail-closed.
-        feature_snapshot_report: dict[str, object] | None = None
-        snapshot_ensure_ms = 0
-        if _progress is not None:
-            _progress.update(phase="snapshot", total=len(symbol_list))
-        if (
-            should_scan_universe
-            and symbol_list
-            and bool(service._config.week5.feature_snapshot_enabled)
-        ):
-            snapshot_ensure_started = perf_counter()
-            feature_snapshot_report = service.ensure_week5_feature_snapshot(
-                symbols=symbol_list,
-                scope="universe_quality",
-            )
-            snapshot_ensure_ms = max(1, int((perf_counter() - snapshot_ensure_started) * 1000))
-            if not bool(feature_snapshot_report.get("ok", False)):
-                snapshot_manifest = None
-                snapshot_frame = None
-                snapshot_current = False
-            else:
-                try:
-                    snapshot_manifest, snapshot_frame = load_feature_snapshot(service._config)
-                    snapshot_current = bool(
-                        snapshot_manifest is not None
-                        and snapshot_frame is not None
-                        and snapshot_is_current(snapshot_manifest, service._config, now)
-                    )
-                except Exception:
-                    snapshot_manifest = None
-                    snapshot_frame = None
-                    snapshot_current = False
-            snapshot_mode = bool(
-                snapshot_manifest is not None and snapshot_frame is not None and snapshot_current
-            )
-            data_gate = service._build_data_gate(
-                snapshot_manifest=snapshot_manifest,
-                snapshot_current=snapshot_current,
-                latest_trade_date=str(snapshot_manifest.trade_date) if snapshot_manifest else "",
-                now=now,
-            )
-            gate_status = str(data_gate.get("status", "ok"))
-
-        # 三类选择策略（Week5 扫描漏斗整改）：
-        # - snapshot_funnel：全市场扫描（含 offhours_forced_full_deep），强制
-        #   执行 light/deep，deep 空结果 fail-closed；
-        # - intentional_full_deep：Friday/weekend 显式全量扫描，raw 候选 ->
-        #   monster_scan_max_symbols，有意绕过漏斗；
-        # - direct_non_universe：非全市场或不适用快照的既有直接扫描路径。
-        scan_profile_name = scan_profile.strip() or "default"
-        if scan_profile_name in ("offhours_friday_full_deep", "offhours_weekend_full_deep"):
-            funnel_policy = "intentional_full_deep"
-        elif should_scan_universe:
-            funnel_policy = "snapshot_funnel"
-        else:
-            funnel_policy = "direct_non_universe"
-        # PLAN Section 3: resolve required intraday date for the nightly deep.
-        # Daily snapshot is daily-only; intraday minute date = previous open
-        # trading date before snapshot latest day (T-1 contract, via calendar).
-        required_intraday_date: object | None = None
-        cal_source: object | None = None
-        if snapshot_manifest is not None and str(snapshot_manifest.trade_date).strip():
-            cal_source = _resolve_calendar_provider(service)
-            required_intraday_date = _resolve_required_intraday_date(
-                str(snapshot_manifest.trade_date).strip(), cal_source
-            )
-
-        if _progress is not None:
-            _progress.update(funnel_policy=funnel_policy)
-        if _progress is not None:
-            _progress.update(phase="light")
-
-        if should_scan_universe and symbol_list and prefilter_enabled:
-            if snapshot_mode:
-                light_started = perf_counter()
-                light_target = max(1, int(service._config.week5.light_candidate_target))
-                allowed_exchanges_for_light = {
-                    str(item).strip().upper()
-                    for item in service._config.evolution.universe_spec.board_scope
-                    if str(item).strip()
-                }
-                prefilter_report = service._light_stage_from_snapshot(
-                    frame=snapshot_frame,
-                    target=light_target,
-                    allowed_exchanges=allowed_exchanges_for_light,
-                )
-                light_stage_ms = max(1, int((perf_counter() - light_started) * 1000))
-            else:
-                # 自动调度触发：scheduler_* 前缀（intraday/nightly）或
-                # offhours_refresh 全市场漏斗（evolution 自动 offhours 链路）。
-                # 手动恢复（CLI/API 自定义 sync_reason）不在此列，保留绕过能力。
-                auto_scheduled_scan = bool(
-                    sync_reason.strip().lower().startswith("scheduler_")
-                    or (
-                        sync_reason.strip().lower() == "offhours_refresh"
-                        and funnel_policy == "snapshot_funnel"
-                    )
-                )
-                if gate_status == "blocked" and auto_scheduled_scan:
-                    # Fail-closed: the scheduled universe scan (including the
-                    # evolution offhours refresh) must NOT silently fall back to
-                    # the heavy direct-scan path (top_k=500 full market) when
-                    # the feature snapshot is missing/stale.  Manual recovery
-                    # runs override this by passing an explicit non-scheduler
-                    # sync reason.
-                    gate_reasons = [str(item) for item in (data_gate.get("reasons") or [])]
-                    blocked_payload = self._build_gate_blocked_report(
-                        service=service,
-                        now=now,
-                        reasons=gate_reasons,
-                        data_snapshot_id=str(snapshot_manifest.data_snapshot_id)
-                        if snapshot_manifest
-                        else "",
-                        snapshot_current=snapshot_current,
-                        scan_profile=scan_profile_name,
-                    )
-                    if feature_snapshot_report is not None:
-                        blocked_payload["feature_snapshot"] = feature_snapshot_report
-                    blocked_payload["funnel_policy"] = funnel_policy
-                    self._state_service.store_week5_scan_report(blocked_payload)
-                    service._record_audit_event(
-                        event_type="week5_scan_blocked_data_gate",
-                        level="warn",
-                        payload={"reasons": gate_reasons},
-                    )
-                    return blocked_payload
-                prefilter_report = service._prefilter_week5_universe_symbols(
-                    symbols=symbol_list,
-                    top_k_override=configured_prefilter_top_k,
-                )
-            prefilter_report["reason"] = "universe_scan"
-            prefilter_report["universe_source"] = symbol_source
-            if isinstance(universe_board_quota, dict):
-                prefilter_report["universe_board_quota"] = universe_board_quota
-            # Re-apply quality-selector audit report + universe errors that were
-            # captured before this reassignment (prefilter returns a fresh dict).
-            if quality_selection_report is not None:
-                prefilter_report["universe_quality_selection"] = quality_selection_report
-                prefilter_report["universe_quality_selector_mode"] = str(
-                    quality_selection_report.get("selector_mode", "")
-                ).strip()
-            if universe_errors_list is not None:
-                prefilter_report["universe_errors"] = universe_errors_list
-            raw_shortlisted = prefilter_report.get("shortlisted", [])
-            if isinstance(raw_shortlisted, list):
-                prefilter_details_by_symbol = {
-                    normalized: item
-                    for item in raw_shortlisted
-                    if isinstance(item, dict)
-                    for normalized in [_normalize_a_share_symbol(item.get("symbol"))]
-                    if normalized
-                }
-            prefilter_symbols = _string_list(prefilter_report.get("symbols", []))
-            if not prefilter_symbols:
-                prefilter_symbols = [
-                    str(item.get("symbol", "")).strip()
-                    for item in raw_shortlisted
-                    if isinstance(item, dict) and str(item.get("symbol", "")).strip()
-                ]
-            symbol_list = prefilter_symbols
-            symbol_source = f"{symbol_source}:prefilter"
-
-        deep_report: dict[str, object] = {}
-        deep_stage_ran = False
-        deep_symbols: list[str] = []
-        # 立即固化 deep 入选项数量：symbol_list 后续会追加 pinned / 被 cap
-        # 重建（引用别名），deep_selected_count 必须保持 deep 阶段原始口径。
-        deep_selected_count = 0
-        if _progress is not None:
-            _progress.update(phase="deep")
-        if snapshot_mode and funnel_policy != "intentional_full_deep":
-            deep_stage_ran = True
-            # PLAN Section 3: light -> deep now inserts minute sync + fresh deep frame.
-            # Light output is capped to 50 and BJ-excluded before sync.
-            light_symbols = [
-                str(item.get("symbol", "")).strip()
-                for item in (prefilter_report.get("shortlisted", []) or [])
-                if isinstance(item, dict) and str(item.get("symbol", "")).strip()
-            ]
-            # Also include symbol_list before deep when snapshot light produced it
-            if not light_symbols:
-                light_symbols = list(prefilter_report.get("symbols", []) or [])
-                light_symbols = [str(s).strip() for s in light_symbols if str(s).strip()]
-            (
-                eligible,
-                pinned_candidates,
-                unsupported_market,
-                sync_targets,
-            ) = _prepare_intraday_sync_symbols(
-                light_symbols=light_symbols,
-                pinned_symbols=pinned_symbols or [],
-            )
-
-            # Resolve warehouses for freshness + sync
-            _delta_warehouse: object | None = None
-            _vendor_overlay: object | None = None
-            try:
-                _delta_warehouse = (
-                    service._market_warehouse()
-                    if callable(getattr(service, "_market_warehouse", None))
-                    else None
-                )
-            except Exception:
-                _delta_warehouse = None
-            try:
-                _vendor_overlay = getattr(service, "_provider", None)
-                # Check if it looks like VendorZipOverlayProvider
-                if not hasattr(_vendor_overlay, "_intraday_warehouse"):
-                    # Try to find overlay in provider graph
-                    for p in (
-                        service._iter_market_data_provider_graph()
-                        if callable(getattr(service, "_iter_market_data_provider_graph", None))
-                        else []
-                    ):  # type: ignore[union-attr]
-                        if hasattr(p, "_intraday_warehouse"):
-                            _vendor_overlay = p
-                            break
-            except Exception:
-                pass
-            # Minute sync covers light candidates and off-light pinned symbols.
-            sync_report: dict[str, object] = {}
-            if (
-                sync_targets
-                and required_intraday_date is not None
-                and bool(getattr(service._config.week5, "intraday_sync_enabled", True))
-            ):
-                _sync_primary = str(
-                    getattr(service._config.week5, "intraday_sync_primary", "sina")
-                )
-                _sync_fallback = str(
-                    getattr(service._config.week5, "intraday_sync_fallback", "sina")
-                )
-                try:
-                    sync_report = _sync_intraday_symbols(
-                        warehouse=_delta_warehouse,
-                        vendor_overlay=_vendor_overlay,
-                        symbols=sync_targets,
-                        required_trade_date=required_intraday_date,
-                        primary=_sync_primary,
-                        fallback=_sync_fallback,
-                        concurrency=max(
-                            1, int(getattr(service._config.week5, "intraday_sync_concurrency", 4))
-                        ),
-                        timeout_sec=max(
-                            1, int(getattr(service._config.week5, "intraday_sync_timeout_sec", 5))
-                        ),
-                        deadline_sec=max(
-                            30,
-                            int(getattr(service._config.week5, "intraday_sync_deadline_sec", 180)),
-                        ),
-                        tushare_provider=(
-                            cal_source
-                            if callable(getattr(cal_source, "fetch_minute_bars", None))
-                            else None
-                        ),
-                    )
-                except Exception as exc:
-                    # 二道兜底：wrapper 内部已兜一层，此处仍需携带主备源与
-                    # ok/failed 计数，保证 all_failed 审计可判定。
-                    sync_report = {
-                        "error": f"{type(exc).__name__}:{exc}",
-                        "symbols_total": len(sync_targets),
-                        "ok": 0,
-                        "failed": len(sync_targets),
-                        "detail": {
-                            "primary": _sync_primary,
-                            "fallback": _sync_fallback,
-                        },
-                    }
-                # 分钟源健康度审计：capability_probe 目前无任何外部消费者，
-                # 主源降级/全军覆没必须在此显性留痕，否则只能等到 fresh_ratio
-                # 门禁拦截整轮 deep 才暴露（2026-08-22 复核结论）。
-                _record_intraday_sync_health_audits(service=service, sync_report=sync_report)
-                # Clear VendorZipOverlayProvider intraday cache after sync
-                for src in (_vendor_overlay, _delta_warehouse):
-                    try:
-                        fn = getattr(src, "clear_cache", None)
-                        if callable(fn):
-                            fn()
-                    except Exception:
-                        pass
-            elif sync_targets and required_intraday_date is None:
-                sync_report = {"skipped": True, "reason": "no_required_intraday_date"}
-
-            # Per-symbol freshness report (allowed_lag=0, session threshold 230)
-            freshness_report: dict[str, object] = {}
-            # PLAN §2 + NO-GO P1 fix: freshness gate must cover BOTH 1m and 5m
-            # intervals (model consumes both).  Check 5m via a second report
-            # and intersect the fresh sets.
-            freshness_obj = None
-            if eligible and required_intraday_date is not None:
-                try:
-                    from stock_analyzer.ops.intraday_freshness import (
-                        build_intraday_freshness_report,
-                    )
-
-                    report_1m = build_intraday_freshness_report(
-                        warehouse=_delta_warehouse,
-                        vendor_overlay=_vendor_overlay,
-                        symbols=eligible,
-                        required_trade_date=required_intraday_date,  # type: ignore[arg-type]
-                        interval="1m",
-                        deep_candidate_target=deep_candidate_target,
-                    )
-                    report_5m = build_intraday_freshness_report(
-                        warehouse=_delta_warehouse,
-                        vendor_overlay=_vendor_overlay,
-                        symbols=eligible,
-                        required_trade_date=required_intraday_date,  # type: ignore[arg-type]
-                        interval="5m",
-                        deep_candidate_target=deep_candidate_target,
-                    )
-                    fresh_1m = set(report_1m.fresh_symbols)
-                    fresh_5m = set(report_5m.fresh_symbols)
-                    fresh_both = sorted(fresh_1m & fresh_5m)
-                    # Merge: worst-case stale/incomplete sets, fresh = intersection
-                    freshness_obj = report_1m
-                    freshness_obj.fresh_symbols = fresh_both
-                    freshness_obj.fresh_count = len(fresh_both)
-                    freshness_obj.delta_missing = sorted(
-                        set(report_1m.delta_missing) | set(report_5m.delta_missing)
-                    )
-                    freshness_obj.summary_missing = sorted(
-                        set(report_1m.summary_missing) | set(report_5m.summary_missing)
-                    )
-                    freshness_obj.effective_stale = sorted(
-                        set(report_1m.effective_stale) | set(report_5m.effective_stale)
-                    )
-                    freshness_obj.session_incomplete = sorted(
-                        set(report_1m.session_incomplete) | set(report_5m.session_incomplete)
-                    )
-                    eligible_for_ratio = max(
-                        1, len([s for s in eligible if s not in set(report_1m.unsupported_market)])
-                    )
-                    freshness_obj.fresh_ratio = (
-                        round(len(fresh_both) / eligible_for_ratio, 4) if eligible else 0.0
-                    )
-                    freshness_obj.source_breakdown = {
-                        k: max(
-                            report_1m.source_breakdown.get(k, 0),
-                            report_5m.source_breakdown.get(k, 0),
-                        )
-                        for k in set(report_1m.source_breakdown) | set(report_5m.source_breakdown)
-                    }
-                    freshness_report = freshness_obj.to_dict()
-                    freshness_report["interval"] = "1m+5m"
-                    freshness_report["fresh_1m_count"] = len(fresh_1m)
-                    freshness_report["fresh_5m_count"] = len(fresh_5m)
-                except Exception as exc:
-                    freshness_report = {"error": f"{type(exc).__name__}:{exc}"}
-            elif not eligible:
-                from stock_analyzer.ops.intraday_freshness import IntradayFreshnessReport
-
-                freshness_obj = IntradayFreshnessReport(required_trade_date=None)
-                freshness_report = freshness_obj.to_dict()
-                freshness_report["required_trade_date"] = (
-                    str(required_intraday_date) if required_intraday_date else ""
-                )
-
-            # Fresh ratio gate: fail-closed for whole scan if insufficient.
-            # Skip the gate when provider is synthetic (tests/local dev): synthetic
-            # warehouses have no real intraday data and should not block funnel tests.
-            fresh_ratio_min = float(
-                getattr(service._config.week5, "intraday_fresh_ratio_min", 0.95)
-            )
-            fresh_count = int(freshness_report.get("fresh_count", 0)) if freshness_report else 0
-            fresh_ratio = (
-                float(freshness_report.get("fresh_ratio", 0.0)) if freshness_report else 0.0
-            )
-            eligible_count = (
-                int(freshness_report.get("eligible_count", len(eligible)))
-                if freshness_report
-                else len(eligible)
-            )
-            # Detect synthetic provider (tests use RecordingSyntheticProvider)
-            _is_synthetic = False
-            try:
-                _prov = getattr(service, "_provider", None)
-                _key = ""
-                if hasattr(_prov, "status") and callable(_prov.status):
-                    _key = str(
-                        _prov.status().get("provider_key", _prov.status().get("provider_mode", ""))
-                    ).lower()  # type: ignore[union-attr]
-                _prov_name = type(_prov).__name__.lower() if _prov is not None else ""
-                if "synthetic" in _key or "synthetic" in _prov_name or "recording" in _prov_name:
-                    _is_synthetic = True
-            except Exception:
-                pass
-            # Only gate when snapshot_funnel and snapshot_mode (deep is relevant)
-            should_gate = bool(
-                snapshot_mode
-                and funnel_policy == "snapshot_funnel"
-                and eligible
-                and not _is_synthetic
-            )
-            freshness_gate_blocked = False
-            if should_gate:
-                if fresh_ratio < fresh_ratio_min or fresh_count < deep_candidate_target:
-                    freshness_gate_blocked = True
-                    blocked = _build_intraday_freshness_blocked_report(
-                        now=now,
-                        scan_profile=scan_profile_name,
-                        freshness_report=freshness_report,
-                        funnel_policy=funnel_policy,
-                    )
-                    blocked["prefilter"] = prefilter_report
-                    blocked["intraday_sync"] = sync_report
-                    blocked["unsupported_market"] = unsupported_market
-                    blocked["required_intraday_date"] = (
-                        str(required_intraday_date) if required_intraday_date else ""
-                    )
-                    # Ensure audit
-                    service._record_audit_event(
-                        event_type="week5_scan_blocked_intraday_freshness",
-                        level="warn",
-                        payload={
-                            "fresh_count": fresh_count,
-                            "fresh_ratio": fresh_ratio,
-                            "eligible_count": eligible_count,
-                            "deep_candidate_target": deep_candidate_target,
-                        },
-                    )
-                    self._state_service.store_week5_scan_report(blocked)
-                    return blocked
-            # Attach freshness + sync + unsupported to prefilter for observability
-            prefilter_report["intraday_sync"] = sync_report
-            prefilter_report["intraday_freshness"] = freshness_report
-            prefilter_report["unsupported_market"] = unsupported_market
-            prefilter_report["unsupported_market_count"] = len(unsupported_market)
-            prefilter_report["required_intraday_date"] = (
-                str(required_intraday_date) if required_intraday_date else ""
-            )
-
-            # Build fresh deep frame for eligible fresh symbols (daily+intraday)
-            # Filter pinned through same freshness gate
-            pinned_fresh: list[str] = []
-            if pinned_candidates:
-                for ps in pinned_candidates:
-                    # pinned must pass the same freshness gate as eligible:
-                    # stale pinned is dropped.  For symbols not in the eligible
-                    # list, run an on-demand freshness check instead of blindly
-                    # allowing them through.
-                    if freshness_obj is not None:
-                        # Build set of all symbols that were evaluated for freshness
-                        evaled = (
-                            set(getattr(freshness_obj, "fresh_symbols", []))
-                            | set(getattr(freshness_obj, "effective_stale", []))
-                            | set(getattr(freshness_obj, "session_incomplete", []))
-                            | set(getattr(freshness_obj, "unsupported_market", []))
-                            | set(getattr(freshness_obj, "summary_missing", []))
-                            | set(getattr(freshness_obj, "delta_missing", []))
-                        )
-                        if ps in evaled:
-                            # Evaluated: only include if fresh
-                            if ps in getattr(freshness_obj, "fresh_symbols", []):
-                                pinned_fresh.append(ps)
-                        else:
-                            # Not evaluated: on-demand freshness check for this pinned symbol.
-                            # In synthetic/test mode there is no real intraday warehouse,
-                            # so the check would always fail — allow through (existing
-                            # pinned_only tests rely on this).
-                            if _is_synthetic:
-                                pinned_fresh.append(ps)
-                            else:
-                                try:
-                                    from stock_analyzer.ops.intraday_freshness import (
-                                        build_intraday_freshness_report,
-                                    )
-
-                                    pinned_report = build_intraday_freshness_report(
-                                        warehouse=_delta_warehouse,
-                                        vendor_overlay=_vendor_overlay,
-                                        symbols=[ps],
-                                        required_trade_date=required_intraday_date,  # type: ignore[arg-type]
-                                        interval="1m",
-                                        deep_candidate_target=1,
-                                    )
-                                    pinned_report_5m = build_intraday_freshness_report(
-                                        warehouse=_delta_warehouse,
-                                        vendor_overlay=_vendor_overlay,
-                                        symbols=[ps],
-                                        required_trade_date=required_intraday_date,  # type: ignore[arg-type]
-                                        interval="5m",
-                                        deep_candidate_target=1,
-                                    )
-                                    if (
-                                        ps in pinned_report.fresh_symbols
-                                        and ps in pinned_report_5m.fresh_symbols
-                                    ):
-                                        pinned_fresh.append(ps)
-                                except Exception:
-                                    # On check failure, do not include — fail-closed
-                                    pass
-                    elif _is_synthetic:
-                        # Synthetic tests have no real intraday warehouse.
-                        pinned_fresh.append(ps)
-            # Determine deep input symbols: only fresh eligible (not stale/BJ)
-            fresh_symbols = (
-                list(freshness_report.get("fresh_symbols", [])) if freshness_report else eligible
-            )
-            # Fallback: if freshness not computed, use eligible
-            if not fresh_symbols and not freshness_gate_blocked:
-                fresh_symbols = eligible
-
-            deep_started = perf_counter()
-            # Deep must consume fresh_deep_frame, not snapshot_frame directly
-            # Try to build fresh frame; if it yields rows, use fresh frame for ranking
-            fresh_deep_frame: object | None = None
-            fresh_failed: list[str] = []
-            if fresh_symbols and required_intraday_date is not None:
-                try:
-                    # Use main provider for daily bars
-                    main_provider = getattr(service, "_provider", None)
-                    result = _build_fresh_deep_frame(
-                        provider=main_provider,
-                        warehouse=_delta_warehouse,
-                        vendor_overlay=_vendor_overlay,
-                        symbols=fresh_symbols,
-                        required_date=required_intraday_date,
-                        lookback_days=max(
-                            60, int(service._config.week5.feature_snapshot_lookback_days)
-                        ),
-                    )
-                    fresh_deep_frame = result.get("frame")
-                    fresh_failed = list(result.get("failed", []))
-                except Exception as exc:
-                    logger.warning("fresh deep frame build failed: %s", exc)
-                    fresh_deep_frame = None
-            # Use fresh frame when it has rows; otherwise fail-closed (P1-6 fix:
-            # must NOT fall back to daily-only snapshot_frame which lacks minute
-            # features, producing silently wrong rankings).
-            # Only block when intraday sync actually produced fresh candidates;
-            # when there is no intraday data (fresh_count=0) the fallback to
-            # snapshot_frame is allowed (tests without intraday warehouse).
-            if isinstance(fresh_deep_frame, pd.DataFrame) and not fresh_deep_frame.empty:
-                # Build a light report limited to fresh symbols for deep
-                fresh_light_report = dict(prefilter_report)
-                fresh_light_report["shortlisted"] = (
-                    [
-                        s
-                        for s in (prefilter_report.get("shortlisted", []) or [])
-                        if str(s.get("symbol", "")).strip() in set(fresh_symbols)
-                    ]
-                    if isinstance(prefilter_report.get("shortlisted"), list)
-                    else []
-                )
-                deep_report = service._deep_stage_from_snapshot(
-                    frame=fresh_deep_frame,  # type: ignore[arg-type]
-                    target=deep_candidate_target,
-                    light_report=fresh_light_report,
-                )
-                # Tag that deep used fresh frame
-                deep_report["fresh_frame_used"] = True
-                deep_report["fresh_frame_failed"] = fresh_failed
-            elif (
-                not _is_synthetic
-                and snapshot_mode
-                and funnel_policy == "snapshot_funnel"
-                and int(freshness_report.get("fresh_count", 0)) > 0
-            ):
-                # Fresh frame build failed despite intraday sync producing fresh
-                # candidates.  Block the deep stage — falling back to the
-                # daily-only snapshot would silently produce rankings without
-                # minute features.
-                deep_report = _build_intraday_freshness_blocked_report(
-                    now=now,
-                    scan_profile=scan_profile_name,
-                    freshness_report=freshness_report,
-                    funnel_policy=funnel_policy,
-                )
-                deep_report["fresh_frame_used"] = False
-                deep_report["fresh_frame_failed"] = fresh_failed
-                deep_report["fresh_blocked_reason"] = "fresh_deep_frame_empty_or_none"
-                deep_report["prefilter"] = prefilter_report
-                deep_report["intraday_sync"] = sync_report
-                deep_report["unsupported_market"] = unsupported_market
-                deep_report["required_intraday_date"] = (
-                    str(required_intraday_date) if required_intraday_date else ""
-                )
-                self._state_service.store_week5_scan_report(deep_report)
-                return deep_report
-            else:
-                # Fallback: either synthetic (tests), or no intraday sync produced
-                # fresh candidates, or snapshot_mode/funnel_policy do not require
-                # fresh frame.  Use the daily-only snapshot frame but still
-                # restrict deep input to fresh symbols.
-                deep_report = service._deep_stage_from_snapshot(
-                    frame=snapshot_frame,
-                    target=deep_candidate_target,
-                    light_report=prefilter_report,
-                )
-                deep_report["fresh_frame_used"] = False
-                deep_report["fresh_frame_failed"] = (
-                    fresh_failed if "fresh_failed" in locals() else []
-                )
-            deep_stage_ms = max(1, int((perf_counter() - deep_started) * 1000))
-            deep_symbols = [
-                str(item.get("symbol", "")).strip()
-                for item in deep_report.get("selected", [])
-                if isinstance(item, dict) and str(item.get("symbol", "")).strip()
-            ]
-            # Stale and BJ must not enter deep/final in production:
-            # filter deep output only when not synthetic (tests have no real
-            # intraday warehouse, so filtering would empty deep).
-            if not _is_synthetic:
-                deep_symbols = [s for s in deep_symbols if s in set(fresh_symbols)]
-            deep_selected_count = len(deep_symbols)
-            if deep_symbols:
-                symbol_list = deep_symbols
-                symbol_source = f"{symbol_source}:snapshot_deep"
-            elif funnel_policy == "snapshot_funnel":
-                # fail-closed：deep 无入选项时清空 raw 候选，仅允许随后追加
-                # pinned；绝不回退至质量选择原始候选或 cap 后的截断列表。
-                symbol_list = []
-                symbol_source = f"{symbol_source}:snapshot_deep_empty_fail_closed"
-            prefilter_report["deep_stage"] = deep_report
-            # Preserve fresh pinned for later merge
-            prefilter_report["_fresh_pinned_symbols"] = pinned_fresh
-
-        # deep 空结果归因：light 为空 / 快照无匹配行 / deep 筛选为空 三态区分，
-        # 与"deep 未执行"（intentional_full_deep）不可混淆。
-        deep_empty_reason = ""
-        if deep_stage_ran and not deep_symbols:
-            if _as_int(deep_report.get("light_shortlist_count"), default=0) <= 0:
-                deep_empty_reason = "light_shortlist_empty"
-            elif _as_int(deep_report.get("snapshot_match_rows"), default=0) <= 0:
-                deep_empty_reason = "no_snapshot_matching_rows"
-            else:
-                deep_empty_reason = "deep_selected_empty"
-
-        quality_selector_mode = (
-            str(quality_selection_report.get("selector_mode", "")).strip()
-            if isinstance(quality_selection_report, dict)
-            else ""
-        )
-        degraded_fail_closed = bool(
-            should_scan_universe
-            and not bool(prefilter_report.get("applied", False))
-            and quality_selector_mode == "degraded_fallback"
-        )
-        if degraded_fail_closed:
-            symbol_list = []
-            prefilter_report["degraded_fail_closed"] = True
-            prefilter_report["degraded_fail_closed_reason"] = "quality_unavailable_without_snapshot"
-
-        # Pinned must pass the same freshness gate; an explicit empty
-        # _fresh_pinned_symbols list is authoritative and must not fall back.
-        normalized_pinned_symbols = _resolve_pinned_symbols_after_freshness(
-            prefilter_report=prefilter_report,
-            pinned_symbols=pinned_symbols or [],
-        )
-        pinned_added_symbols: list[str] = []
-        if normalized_pinned_symbols:
-            existing_symbols = {
-                symbol
-                for symbol in (_normalize_a_share_symbol(item) for item in symbol_list)
-                if symbol
-            }
-            pinned_added_symbols = [
-                symbol for symbol in normalized_pinned_symbols if symbol not in existing_symbols
-            ]
-            if pinned_added_symbols:
-                symbol_list.extend(pinned_added_symbols)
-                symbol_source = f"{symbol_source}:pinned"
-        prefilter_report["pinned_symbols"] = list(normalized_pinned_symbols)
-        prefilter_report["pinned_count"] = len(pinned_added_symbols)
-        prefilter_report["selected_count"] = len(symbol_list)
-        original_monster_scan_count = len(symbol_list)
-        monster_scan_cap = (
-            max(
-                1,
-                _as_int(
-                    service._config.week5.monster_scan_intraday_max_symbols,
-                    default=_as_int(service._config.week5.live_runtime_max_symbols, default=15),
-                ),
-            )
-            if intraday_scheduler_mode
-            else max(0, _as_int(service._config.week5.monster_scan_max_symbols, default=120))
-        )
-        monster_scan_cap_applied = bool(
-            monster_scan_cap > 0 and len(symbol_list) > monster_scan_cap
-        )
-        if degraded_fail_closed:
-            ranking_mode = "degraded_fail_closed_pinned_only"
-        else:
-            ranking_mode = (
-                "prefilter_order" if bool(prefilter_report.get("applied", False)) else "input_order"
-            )
-        if monster_scan_cap_applied:
-            pinned_set = set(normalized_pinned_symbols)
-            pinned_first = [
-                symbol
-                for symbol in symbol_list
-                if (_normalize_a_share_symbol(symbol) or symbol) in pinned_set
-            ]
-            non_pinned = [
-                symbol
-                for symbol in symbol_list
-                if (_normalize_a_share_symbol(symbol) or symbol) not in pinned_set
-            ]
-            if not bool(prefilter_report.get("applied", False)) and isinstance(
-                quality_selection_report, dict
-            ):
-                selected_payload = quality_selection_report.get("selected", [])
-                quality_score_by_symbol = (
-                    {
-                        normalized: _as_float(item.get("score"), default=0.0)
-                        for item in selected_payload
-                        if isinstance(item, dict)
-                        for normalized in [_normalize_a_share_symbol(item.get("symbol"))]
-                        if normalized
-                    }
-                    if isinstance(selected_payload, list)
-                    else {}
-                )
-                selector_mode = str(quality_selection_report.get("selector_mode", "")).strip()
-                if quality_score_by_symbol and selector_mode in {
-                    "quality",
-                    "quality_all_eligible",
-                    "snapshot_fallback",
-                }:
-                    non_pinned.sort(
-                        key=lambda symbol: (
-                            -quality_score_by_symbol.get(
-                                _normalize_a_share_symbol(symbol) or symbol,
-                                0.0,
-                            ),
-                            _normalize_a_share_symbol(symbol) or symbol,
-                        )
-                    )
-                    ranking_mode = "universe_quality_score"
-            symbol_list = _dedupe_preserve_order([*pinned_first, *non_pinned])[:monster_scan_cap]
-            symbol_source = f"{symbol_source}:monster_cap"
-            prefilter_report["selected_count"] = len(symbol_list)
-        # funnel 汇总计数：政策、deep 是否执行/空结果归因、deep/pinned/实际
-        # pipeline 输入数。deep_symbols_empty 仅在 deep 真正执行且无入选项时为
-        # True——intentional_full_deep 的"deep 未运行"不会被误判为 fail-closed。
-        funnel_report: dict[str, object] = {
-            "mode": "snapshot" if snapshot_mode else "direct",
-            "policy": funnel_policy,
-            "deep_stage_ran": deep_stage_ran,
-            "deep_symbols_empty": bool(deep_stage_ran and deep_selected_count == 0),
-            "deep_empty_reason": deep_empty_reason,
-            "deep_selected_count": deep_selected_count,
-            "pinned_added_count": len(pinned_added_symbols),
-            "pipeline_input_count": len(symbol_list),
-        }
-        if funnel_policy == "intentional_full_deep":
-            selection_source = "intentional_full_deep"
-        elif deep_stage_ran and deep_selected_count:
-            # deep 有入选项（含既有直接路径在快照可用时的 deep 收窄）。
-            selection_source = "snapshot_deep"
-        elif funnel_policy == "snapshot_funnel" and deep_stage_ran:
-            # deep 执行且无入选项：fail-closed，仅 pinned。
-            selection_source = "deep_empty_pinned_only"
-        else:
-            # deep 未执行（快照不可用等）：既有直接路径来源，不标为 deep 空回退。
-            selection_source = "direct_scan"
-        # snapshot_funnel 的最终 pipeline 输入上限：min(monster 上限, deep+pinned)。
-        # deep 未执行时上限就是 monster_scan_cap（直接路径既有语义）。
-        if funnel_policy == "snapshot_funnel" and deep_stage_ran:
-            deep_plus_pinned = deep_selected_count + len(pinned_added_symbols)
-            effective_input_cap = (
-                min(monster_scan_cap, deep_plus_pinned)
-                if monster_scan_cap > 0
-                else deep_plus_pinned
-            )
-        else:
-            effective_input_cap = monster_scan_cap
-        monster_scan_controls: dict[str, object] = {
-            "cap": monster_scan_cap,
-            "cap_applied": monster_scan_cap_applied,
-            "intraday_scheduler_mode": intraday_scheduler_mode,
-            "input_count": original_monster_scan_count,
-            "selected_count": len(symbol_list),
-            "dropped_count": max(0, original_monster_scan_count - len(symbol_list)),
-            "ranking_mode": ranking_mode,
-            "selection_source": selection_source,
-            "effective_input_cap": effective_input_cap,
-        }
-        prefilter_report["monster_scan_controls"] = monster_scan_controls
-
-        if not symbol_list:
-            # snapshot_funnel 的 deep 空回退 fail-closed 是有意的修复行为，
-            # 与普通空 watchlist 区分记录，便于现场归因。
-            empty_fail_closed = bool(
-                funnel_policy == "snapshot_funnel" and deep_stage_ran and deep_selected_count == 0
-            )
-            empty_reason = (
-                "snapshot_deep_empty_fail_closed" if empty_fail_closed else "empty_watchlist"
-            )
-            empty_report = {
-                "timestamp": now.isoformat(),
-                "trace_id": "",
-                "watchlist_size": 0,
-                "symbol_source": symbol_source,
-                "scan_profile": scan_profile.strip() or "default",
-                "funnel_policy": funnel_policy,
-                "prefilter": prefilter_report,
-                "funnel": dict(funnel_report),
-                "monster_scan_controls": dict(monster_scan_controls),
-                "first_board": {"candidate_count": 0, "candidates": [], "leaders": []},
-                "signal_pool": {"candidate_count": 0, "candidates": []},
-                "anomalies": {"event_count": 0, "events": []},
-                "empty_signal": {
-                    "triggered": True,
-                    "reasons": [empty_reason],
-                    "no_buy_streak": 0,
-                    "buy_signals": 0,
-                    "drawdown_pct": 0.0,
-                    "risk_action": "unknown",
-                },
-                "monster_isolation": {
-                    "can_open_new_position": False,
-                    "reasons": ["empty_watchlist"],
-                    "total_monster_position": 0.0,
-                    "max_monster_position": 0.0,
-                    "sentiment_score": 0.0,
-                },
-                "summary": {
-                    "first_board_candidates": 0,
-                    "leaders": 0,
-                    "anomalies": 0,
-                    "empty_signal_triggered": True,
-                    "can_open_monster": False,
-                    "watchlist_synced": False,
-                },
-            }
-            self._state_service.store_week5_scan_report(empty_report)
-            service._record_audit_event(
-                event_type="week5_scan",
-                level="warn",
-                payload={"watchlist_size": 0, "reason": empty_reason},
-            )
-            return empty_report
-
-        if _progress is not None:
-            _progress.update(
-                phase="final_pipeline",
-                total=len(symbol_list),
-                current_symbol="",
-            )
-
-        def _pipeline_heartbeat(symbol: str, index: int, total: int, started: bool) -> None:
-            # final pipeline 单股开始/完成各更新一次（事件驱动，非周期心跳）：
-            # 单只耗时数分钟时通过 current_symbol 指示当前处理股票；若某只
-            # 股票长时间卡住，updated_at 不会继续刷新，这是已知语义边界。
-            if _progress is not None:
-                _progress.update(
-                    phase="final_pipeline",
-                    completed=index if started else index + 1,
-                    total=total,
-                    current_symbol=symbol,
-                )
-
-        live_provider = service._select_provider(use_live_runtime=True)
-        output_mode = str(service._config.week5.week5_output_mode).strip().lower() or "legacy"
-        dual_track = output_mode == "dual_track"
-        transform_workers = max(
-            1,
-            int(service._config.week5.final_pipeline_transform_max_workers),
-        )
-        # P1 双轨：基础扫描仍以 monster 观察池为主（保留现有评分链路），
-        # dual_track 时额外跑一次 trend 轨作为稳健候选。特征计算为渐进式双跑，
-        # 输出契约（trend_candidates/monster_watchlist/executable）先行落地。
-        monster_report = service.run_pipeline(
-            symbols=symbol_list,
-            strategy="monster",
-            current_equity=service._state.current_equity,
-            use_live_runtime=True,
-            dry_run_execution=True,
-            job_name="week5_scan_monster",
-            on_symbol_progress=_pipeline_heartbeat,
-            transform_max_workers=transform_workers,
-            # 捕获每只股票的 bars 尾部快照，first-board/anomaly/overextension
-            # 直接复用，不再对每只 symbol 二次 fetch_daily_bars。
-            capture_post_scan_enrichment=True,
-        )
-        trend_report: dict[str, object] | None = None
-        trend_pipeline_duration_ms = 0
-        if dual_track:
-            # 兼容期双跑成本：Shadow 对比期以 trend_pipeline_duration_ms 量化
-            # 双 pipeline 开销；满足"基础特征只计算一次"后此字段归零。
-            trend_started = perf_counter()
-            trend_report = service.run_pipeline(
-                symbols=symbol_list,
-                strategy="trend",
-                current_equity=service._state.current_equity,
-                use_live_runtime=True,
-                dry_run_execution=True,
-                job_name="week5_scan_trend",
-                on_symbol_progress=_pipeline_heartbeat,
-                transform_max_workers=transform_workers,
-                capture_post_scan_enrichment=True,
-            )
-            trend_pipeline_duration_ms = max(1, int((perf_counter() - trend_started) * 1000))
-        trace_id = str(monster_report.get("trace_id", ""))
-        if _progress is not None:
-            _progress.update(trace_id=trace_id)
-        monster_runtime_payload: dict[str, object] = {}
-        monster_runtime = monster_report.get("runtime")
-        if isinstance(monster_runtime, dict):
-            monster_runtime_payload = dict(monster_runtime)
-        raw_signals = monster_report.get("signals")
-        signal_map: dict[str, dict[str, object]] = {}
-        min_history_days = max(1, int(service._config.evolution.universe_spec.min_list_days))
-        first_board_scan_lookback_days = max(
-            40,
-            min_history_days,
-            int(service._config.evolution.universe_spec.first_board_scan_lookback_days),
-        )
-        if isinstance(raw_signals, list):
-            for item in raw_signals:
-                if not isinstance(item, dict):
-                    continue
-                symbol = str(item.get("symbol", "")).strip()
-                if symbol:
-                    signal_map[symbol] = item
-        # dual_track 时 trend 轨 signals 单独成图：最终信号只从 trend 轨产生。
-        trend_signal_map: dict[str, dict[str, object]] = {}
-        if dual_track and isinstance(trend_report, dict):
-            trend_raw = trend_report.get("signals")
-            if isinstance(trend_raw, list):
-                for item in trend_raw:
-                    if not isinstance(item, dict):
-                        continue
-                    symbol = str(item.get("symbol", "")).strip()
-                    if symbol:
-                        trend_signal_map[symbol] = item
-
-        signal_pool_candidates: list[dict[str, object]] = []
-        # dual_track 时最终信号只从 trend 轨产生；monster 轨作为观察池。
-        candidate_signal_map = trend_signal_map if dual_track else signal_map
-        for symbol, item in candidate_signal_map.items():
-            reason_values = _string_list(item.get("reasons", []))
-            if any(
-                str(reason).strip().startswith("insufficient_history_days:")
-                for reason in reason_values
-            ):
-                continue
-            normalized_symbol = _normalize_a_share_symbol(symbol) or symbol
-            candidate = service._score_week5_signal_pool_candidate(
-                signal=item,
-                prefilter_detail=prefilter_details_by_symbol.get(normalized_symbol),
-            )
-            # P1 过热风险（overextension）+ 板块连板（board_risk）在 final
-            # selector 之前计算并注入 signal；final selector 依据
-            # reject_new_buy 拒绝 trend 轨新买入（monster 观察池不受影响）。
-            bars = _bars_from_post_scan_enrichment(
-                str(item.get("post_scan_enrichment", "")).strip()
-            )
-            overextension_decision: dict[str, object] = {
-                "level": "none",
-                "penalty": 0.0,
-                "reject_new_buy": False,
-                "reasons": [],
-                "metrics": {},
-            }
-            board_decision: dict[str, object] = {
-                "consecutive_limit_up": 0,
-                "current_limit_state": "none",
-                "board": "",
-                "reject_new_buy": False,
-                "reasons": [],
-            }
-            if bars is not None and not bars.empty:
-                overextension_decision = _overextension_decision_dict(
-                    row=_latest_bar_dict(bars),
-                    config=service._config.overextension,
-                )
-                board_decision = _board_decision_dict(
-                    bars=bars,
-                    symbol=symbol,
-                    config=service._config.board_risk,
-                    limit_rule=service._config.limit_rule,
-                )
-            candidate["overextension"] = overextension_decision
-            candidate["board_risk"] = board_decision
-            # trend 轨执行质量门：overextension reject 或三连板 reject 时拒绝新买入
-            candidate["reject_new_buy"] = bool(
-                overextension_decision.get("reject_new_buy", False)
-                or board_decision.get("reject_new_buy", False)
-            )
-            signal_pool_candidates.append(candidate)
-        execution_rerank = self._apply_execution_aware_rerank(
-            candidates=signal_pool_candidates,
-        )
-        ranking_score_key = str(execution_rerank.get("score_key", "shortlist_score")).strip()
-        if not ranking_score_key:
-            ranking_score_key = "shortlist_score"
-        signal_pool_candidates = sorted(
-            signal_pool_candidates,
-            key=lambda item: (
-                -_as_float(
-                    item.get(ranking_score_key),
-                    default=_as_float(item.get("shortlist_score"), default=0.0),
-                ),
-                -_as_float(item.get("shortlist_score"), default=0.0),
-                -_as_float(item.get("score"), default=0.0),
-                str(item.get("symbol", "")),
-            ),
-        )
-        shortlist_top_n = max(
-            1,
-            _as_int(service._config.week5.universe_prefilter_shortlist_top_n, default=50),
-        )
-        for index, item in enumerate(signal_pool_candidates):
-            item["shortlist_rank"] = index + 1
-            item["shortlist_selected"] = index < shortlist_top_n
-
-        # The funnel's final selector rejects signals on data-trust problems
-        # (degraded/synthetic provider, low data-quality score).  A blocked
-        # gate caused solely by a missing/stale snapshot is a
-        # performance-contract issue: the scheduler path fail-closes at the
-        # universe-scan entry.  Only an EXPLICIT recovery run may proceed
-        # against direct bars, and even then it is advisory only — its output
-        # never feeds final_signals or the watchlist.
-        gate_reasons = [str(item) for item in (data_gate.get("reasons") or [])]
-        snapshot_only_blocked = bool(gate_reasons) and all(
-            reason.startswith("feature_snapshot") for reason in gate_reasons
-        )
-        recovery_direct_scan = bool(recovery_mode) and snapshot_only_blocked
-        final_selector_gate_status = (
-            "ok" if recovery_direct_scan else str(data_gate.get("status", "ok"))
-        )
-        # 市场广度门（PLAN P2-1 接线）：读取预写 market_breadth.json（缺失时
-        # 从 provider 现算兜底）。广度 block → 拒绝全部候选；轻度过期 →
-        # trend 最低分 +lift；数据不可用 → fail-open（不锁死扫描）。
-        breadth_meta: dict[str, object] = {"enabled": False}
-        breadth_lift = 0.0
-        if bool(service._config.week5.market_breadth_enabled):
-            breadth_meta, breadth_lift = service._apply_market_breadth_gate(now=now)
-            if bool(breadth_meta.get("block_new_buy", False)):
-                final_selector_gate_status = "market_breadth_blocked"
-        final_selector = service._final_signal_selector(
-            signals=signal_pool_candidates,
-            data_gate_status=final_selector_gate_status,
-            min_threshold_lift=breadth_lift,
-        )
-        if recovery_direct_scan:
-            # Advisory only: the output is inspected, never treated as a
-            # production signal source.
-            advisory_signals = list(final_selector.get("final_signals", []))
-            for item in advisory_signals:
-                if isinstance(item, dict):
-                    item["advisory"] = True
-            final_selector["advisory_only"] = True
-            final_selector["advisory_signals"] = advisory_signals
-            final_selector["final_signals"] = []
-            final_selector["selected_count"] = 0
-
-        shortlist_preview = [
-            {
-                "symbol": str(item.get("symbol", "")).strip(),
-                "shortlist_score": _as_float(item.get("shortlist_score"), default=0.0),
-                "score": _as_float(item.get("score"), default=0.0),
-                "shortlist_reasons": _string_list(item.get("shortlist_reasons", []))[:6],
-                **(
-                    {
-                        "execution_reranked_score": _as_float(
-                            item.get("execution_reranked_score"),
-                            default=_as_float(item.get("shortlist_score"), default=0.0),
-                        ),
-                        "execution_aware_score": _as_float(
-                            item.get("execution_aware_score"),
-                            default=0.0,
-                        ),
-                        "execution_high_risk": bool(item.get("execution_high_risk", False)),
-                    }
-                    if ranking_score_key == "execution_reranked_score"
-                    else {}
-                ),
-            }
-            for item in signal_pool_candidates[: min(shortlist_top_n, 10)]
-        ]
-        raw_stages = prefilter_report.get("stages")
-        if isinstance(raw_stages, dict):
-            raw_stage2 = raw_stages.get("stage2")
-            if isinstance(raw_stage2, dict):
-                raw_stage2.update(
-                    {
-                        "applied": True,
-                        "status": "completed" if signal_pool_candidates else "no_candidates",
-                        "score_key": ranking_score_key,
-                        "shortlist_top_n": shortlist_top_n,
-                        "input_count": len(signal_pool_candidates),
-                        "advanced_count": min(shortlist_top_n, len(signal_pool_candidates)),
-                        "preview": shortlist_preview,
-                        "execution_rerank": dict(execution_rerank),
-                    }
-                )
-
-        if _progress is not None:
-            _progress.update(phase="first_board_anomaly")
-
-        first_board_anomaly_started = perf_counter()
-        first_board_candidates: list[dict[str, object]] = []
-        anomalies: list[dict[str, object]] = []
-        for symbol in symbol_list:
-            signal = signal_map.get(symbol, {})
-            # 优先复用 pipeline 已捕获的 post_scan_enrichment（bars 尾部快照），
-            # 避免对每只 symbol 二次 fetch_daily_bars；字段为空/不可解析时
-            # 回退 live_provider 拉取（向后兼容）。
-            bars = _bars_from_post_scan_enrichment(
-                str(signal.get("post_scan_enrichment", "")).strip()
-                if isinstance(signal, dict)
-                else ""
-            )
-            if bars is None:
-                try:
-                    bars = live_provider.fetch_daily_bars(
-                        symbol=symbol,
-                        lookback_days=first_board_scan_lookback_days,
-                    )
-                except Exception as exc:
-                    anomalies.append(
-                        {
-                            "symbol": symbol,
-                            "types": ["data_source_error"],
-                            "detail": str(exc),
-                        }
-                    )
-                    continue
-            if len(bars) < min_history_days:
-                anomalies.append(
-                    {
-                        "symbol": symbol,
-                        "types": ["insufficient_history"],
-                        "history_days": len(bars),
-                        "required_history_days": min_history_days,
-                    }
-                )
-                continue
-            if len(bars) < 2:
-                continue
-            candidate = service._build_first_board_candidate(
-                symbol=symbol,
-                bars=bars,
-                signal=signal,
-            )
-            if candidate is not None:
-                first_board_candidates.append(candidate)
-
-            anomaly = service._detect_symbol_anomaly(
-                symbol=symbol,
-                bars=bars,
-            )
-            if anomaly is not None:
-                anomalies.append(anomaly)
-        first_board_anomaly_ms = max(1, int((perf_counter() - first_board_anomaly_started) * 1000))
-
-        empty_signal = service._evaluate_empty_signal(monster_report=monster_report)
-        isolation = service._monster_isolation_gate(
-            monster_report=monster_report,
-            empty_signal=empty_signal,
+            reasons=reasons,
+            data_snapshot_id=data_snapshot_id,
+            snapshot_current=snapshot_current,
+            scan_profile=scan_profile,
+            watchlist_size=resolved_size,
         )
 
-        max_stock_position = service._config.monster_risk.max_stock_position
-        block_all = not isolation["can_open_new_position"]
-        for item in first_board_candidates:
-            suggested = _as_float(item.get("suggested_position"), default=0.0)
-            isolated = block_all or suggested > max_stock_position
-            item["isolated"] = isolated
-            if suggested > max_stock_position:
-                item["isolation_reason"] = f"suggested_position_exceeds_{max_stock_position:.4f}"
-            elif block_all:
-                isolation_reason_values = isolation.get("reasons", [])
-                if isinstance(isolation_reason_values, list):
-                    reason_text = ",".join(str(x) for x in isolation_reason_values)
-                else:
-                    reason_text = ""
-                item["isolation_reason"] = reason_text
-            else:
-                item["isolation_reason"] = ""
+    def build_dual_track_output(self, **kwargs: Any) -> dict[str, object]:
+        return self._build_dual_track_output(**kwargs)
 
-        leaders = sorted(
-            first_board_candidates,
-            key=lambda item: (
-                -_as_float(item.get("leader_score"), default=0.0),
-                -_as_float(item.get("score"), default=0.0),
-                str(item.get("symbol", "")),
-            ),
-        )[:3]
-
-        report: dict[str, object] = {
-            "timestamp": now.isoformat(),
-            "trace_id": trace_id,
-            "watchlist_size": len(symbol_list),
-            "symbol_source": symbol_source,
-            "scan_profile": scan_profile.strip() or "default",
-            "emergency_direct_scan": recovery_direct_scan,
-            "recovery_mode": bool(recovery_mode),
-            "prefilter": prefilter_report,
-            "data_snapshot_id": str(snapshot_manifest.data_snapshot_id)
-            if snapshot_manifest is not None
-            else "",
-            "data_gate": dict(data_gate),
-            "market_breadth": dict(breadth_meta),
-            "feature_snapshot": feature_snapshot_report,
-            "scan_stages": {
-                "quality_selection": {
-                    "duration_ms": quality_selection_ms,
-                    "selected_count": _as_int(
-                        quality_selection_report.get("selected_count", 0),
-                        default=0,
-                    )
-                    if isinstance(quality_selection_report, dict)
-                    else 0,
-                },
-                "snapshot_ensure": {
-                    "duration_ms": snapshot_ensure_ms,
-                    "enabled": bool(service._config.week5.feature_snapshot_enabled),
-                    "requested_count": (
-                        _as_int(
-                            feature_snapshot_report.get("requested_symbol_count", 0),
-                            default=0,
-                        )
-                        if isinstance(feature_snapshot_report, dict)
-                        else 0
-                    ),
-                    "published_count": (
-                        _as_int(
-                            feature_snapshot_report.get("published_symbol_count", 0),
-                            default=0,
-                        )
-                        if isinstance(feature_snapshot_report, dict)
-                        else 0
-                    ),
-                    "ok": bool(feature_snapshot_report.get("ok", False))
-                    if isinstance(feature_snapshot_report, dict)
-                    else False,
-                },
-                "light_stage": {
-                    "duration_ms": light_stage_ms,
-                    "mode": str(prefilter_report.get("mode", "")),
-                    "shortlisted_count": _as_int(
-                        prefilter_report.get("shortlisted_count", 0), default=0
-                    ),
-                },
-                "deep_stage": {
-                    "duration_ms": deep_stage_ms,
-                    "mode": str(deep_report.get("mode", "")),
-                    "selected_count": _as_int(deep_report.get("selected_count", 0), default=0),
-                },
-                "final_pipeline": {
-                    "duration_ms": _as_int(monster_runtime_payload.get("duration_ms"), default=0),
-                    "symbols": len(symbol_list),
-                    **self._final_pipeline_timing_report(monster_runtime_payload),
-                },
-                "first_board_anomaly": {
-                    "duration_ms": first_board_anomaly_ms,
-                },
-            },
-            "funnel": {
-                **funnel_report,
-                "light_candidate_target": max(1, int(service._config.week5.light_candidate_target)),
-                "deep_candidate_target": deep_candidate_target,
-                "final_signal_cap": max(0, int(service._config.week5.final_signal_cap)),
-                "allow_zero_signal": bool(service._config.week5.allow_zero_signal),
-                "light_count": _as_int(prefilter_report.get("shortlisted_count", 0), default=0),
-                "deep_count": len(symbol_list),
-                "final_count": _as_int(final_selector.get("selected_count", 0), default=0),
-                "final_selection": dict(final_selector),
-            },
-            "runtime_source": {
-                "mode": (
-                    "realtime_overlay" if service._realtime_pipeline is not None else "offline_only"
-                ),
-                "provider": str(service._config.data_source.runtime_live_provider).strip()
-                or "offline",
-            },
-            "runtime": {
-                "monster_pipeline": monster_runtime_payload,
-            },
-            "monster_scan_controls": dict(monster_scan_controls),
-            "first_board": {
-                "interval_minutes": max(1, service._config.week5.first_board_interval_min),
-                "window_intervals": list(service._config.week5.first_board_window_intervals),
-                "windows": list(service._config.week5.first_board_windows),
-                "candidate_count": len(first_board_candidates),
-                "candidates": first_board_candidates,
-                "leaders": leaders,
-            },
-            "signal_pool": {
-                "candidate_count": len(signal_pool_candidates),
-                "candidates": signal_pool_candidates[:100],
-                "execution_rerank": dict(execution_rerank),
-                "ranking": {
-                    "mode": "two_stage_funnel",
-                    "score_key": ranking_score_key,
-                    "shortlist_top_n": shortlist_top_n,
-                    "selected_count": min(shortlist_top_n, len(signal_pool_candidates)),
-                    "selected_symbols": [
-                        str(item.get("symbol", "")).strip()
-                        for item in signal_pool_candidates[:shortlist_top_n]
-                        if str(item.get("symbol", "")).strip()
-                    ],
-                    "preview": shortlist_preview,
-                    "execution_rerank": dict(execution_rerank),
-                },
-            },
-            "dual_track": self._build_dual_track_output(
-                final_selector=final_selector,
-                signal_map=signal_map,
-                trend_signal_map=trend_signal_map,
-                dual_track=dual_track,
-                trend_pipeline_duration_ms=trend_pipeline_duration_ms,
-            ),
-            "anomalies": {
-                "event_count": len(anomalies),
-                "events": anomalies,
-            },
-            "empty_signal": empty_signal,
-            "monster_isolation": isolation,
-            "summary": {
-                "first_board_candidates": len(first_board_candidates),
-                "leaders": len(leaders),
-                "anomalies": len(anomalies),
-                "empty_signal_triggered": bool(empty_signal.get("triggered", False)),
-                "can_open_monster": bool(isolation.get("can_open_new_position", False)),
-                "prefilter_applied": bool(prefilter_report.get("applied", False)),
-                "prefilter_shortlisted": _as_int(
-                    prefilter_report.get("shortlisted_count"),
-                    default=len(symbol_list),
-                ),
-                "monster_scan_cap_applied": monster_scan_cap_applied,
-                "monster_scan_dropped_count": max(
-                    0,
-                    original_monster_scan_count - len(symbol_list),
-                ),
-                "execution_rerank_applied": bool(execution_rerank.get("applied", False)),
-            },
-        }
-
-        requested_watchlist_sync = (
-            bool(sync_watchlist)
-            if sync_watchlist is not None
-            else (symbols is None and bool(service._config.week5.auto_sync_watchlist))
-        )
-        should_sync_watchlist = requested_watchlist_sync and not intraday_scheduler_mode
-        # An explicit recovery run is advisory only: it must not mutate the
-        # watchlist or feed production signal channels.
-        if recovery_mode:
-            should_sync_watchlist = False
-        watchlist_sync: dict[str, object] = {
-            "enabled": requested_watchlist_sync,
-            "updated": False,
-            "reason": (
-                "intraday_preserve_existing"
-                if requested_watchlist_sync and intraday_scheduler_mode
-                else "disabled"
-            ),
-            "watchlist_before": len(service._state.watchlist),
-            "watchlist_after": len(service._state.watchlist),
-            "symbols": list(service._state.watchlist),
-        }
-        if should_sync_watchlist:
-            # Watchlist must only be synced from the final selection.  When
-            # the funnel yields zero final signals, the old watchlist is
-            # preserved (keep_if_empty) instead of topping up from the signal
-            # pool with stocks that never passed the final gates.
-            watchlist_sync = self._state_service.auto_sync_watchlist_from_week5_report(
-                report=report,
-                reason=sync_reason or f"week5_scan:{symbol_source}",
-                top_k_override=sync_top_k_override,
-                allow_signal_pool_fallback=False,
-            )
-        else:
-            watchlist_sync["diagnostics"] = self._state_service.build_watchlist_sync_diagnostics(
-                report=report,
-                top_k_override=sync_top_k_override,
-                selected=[],
-                fallback_applied=False,
-                allow_signal_pool_fallback=False,
-            )
-        report["watchlist_sync"] = watchlist_sync
-        summary = report.get("summary")
-        if isinstance(summary, dict):
-            summary["watchlist_synced"] = bool(watchlist_sync.get("updated", False))
-
+    def store_report(self, report: dict[str, object]) -> None:
         self._state_service.store_week5_scan_report(report)
-        has_warning = bool(empty_signal.get("triggered", False)) or len(anomalies) > 0
-        service._record_audit_event(
-            event_type="week5_scan",
+
+    def record_audit(
+        self,
+        *,
+        event_type: str,
+        level: str = "info",
+        trace_id: str = "",
+        payload: dict[str, object] | None = None,
+    ) -> None:
+        self._service._record_audit_event(  # noqa: SLF001
+            event_type=event_type,
+            level=level,
             trace_id=trace_id,
-            level="warn" if has_warning else "info",
-            payload={
-                "watchlist_size": len(symbol_list),
-                "first_board_candidates": len(first_board_candidates),
-                "anomalies": len(anomalies),
-                "empty_signal_triggered": bool(empty_signal.get("triggered", False)),
-                "can_open_monster": bool(isolation.get("can_open_new_position", False)),
-                "watchlist_sync": watchlist_sync,
-            },
+            payload=payload if payload is not None else {},
         )
 
-        use_notify = service._config.week5.auto_notify
-        if notify_enabled is not None:
-            use_notify = notify_enabled
-        if use_notify:
-            week5_content = self._notification_service.build_scan_notification_content(
-                symbol_list=symbol_list,
+    def sync_watchlist_from_report(
+        self,
+        *,
+        report: dict[str, object],
+        reason: str,
+        top_k_override: int | None = None,
+    ) -> dict[str, object]:
+        return self._state_service.auto_sync_watchlist_from_week5_report(
+            report=report,
+            reason=reason,
+            top_k_override=top_k_override,
+            allow_signal_pool_fallback=False,
+        )
+
+    def watchlist_sync_diagnostics(
+        self, *, report: dict[str, object], top_k_override: int | None = None
+    ) -> dict[str, object]:
+        return self._state_service.build_watchlist_sync_diagnostics(
+            report=report,
+            top_k_override=top_k_override,
+            selected=[],
+            fallback_applied=False,
+            allow_signal_pool_fallback=False,
+        )
+
+    def notify_scan(
+        self,
+        *,
+        symbol_list: list[str],
+        first_board_candidates: list[dict[str, object]],
+        leaders: list[dict[str, object]],
+        anomalies: list[dict[str, object]],
+        empty_signal: dict[str, object],
+        watchlist_sync: dict[str, object],
+        runtime_mode: str,
+        has_warning: bool,
+        trace_id: str,
+        now: datetime,
+    ) -> None:
+        content = self._notification_service.build_scan_notification_content(
+            symbol_list=symbol_list,
+            first_board_candidates=first_board_candidates,
+            leaders=leaders,
+            anomalies=anomalies,
+            empty_signal=empty_signal,
+            watchlist_sync=watchlist_sync,
+            runtime_mode=runtime_mode,
+        )
+        self._service._notify_if_changed(  # noqa: SLF001
+            dedup_key=f"notify:week5-scan:{now.strftime('%Y%m%d')}",
+            title=_push_title(
+                priority="P1" if has_warning else "P2",
+                category="week5",
+                summary="intraday scan",
+            ),
+            content=content,
+            dedup_value=self._notification_service.week5_scan_notification_signature(
                 first_board_candidates=first_board_candidates,
                 leaders=leaders,
                 anomalies=anomalies,
                 empty_signal=empty_signal,
-                watchlist_sync=watchlist_sync,
-                runtime_mode=(
-                    "realtime_overlay" if service._realtime_pipeline is not None else "offline_only"
-                ),
-            )
-            service._notify_if_changed(
-                dedup_key=f"notify:week5-scan:{now.strftime('%Y%m%d')}",
-                title=_push_title(
-                    priority="P1" if has_warning else "P2",
-                    category="week5",
-                    summary="intraday scan",
-                ),
-                content=week5_content,
-                dedup_value=self._notification_service.week5_scan_notification_signature(
-                    first_board_candidates=first_board_candidates,
-                    leaders=leaders,
-                    anomalies=anomalies,
-                    empty_signal=empty_signal,
-                ),
-                level="warn" if has_warning else "info",
-                trace_id=trace_id,
-                ttl_sec=20 * 3600,
-            )
-            # 全市场自动化模式下 actionable 信号唯一出口是 actionable_data_gate
-            # （auction / market_radar / live_runtime），旧扫描链只保留观察类
-            # 摘要通知，不再直接发送可执行信号。
-            if not bool(
-                getattr(service._config.week5, "full_market_automation_enabled", False)
-            ):
-                service._notify_actionable_signals(
-                    monster_report,
-                    trace_id=trace_id,
-                    title_prefix="week5 scan",
-                )
+            ),
+            level="warn" if has_warning else "info",
+            trace_id=trace_id,
+            ttl_sec=20 * 3600,
+        )
 
-        return report
+    def notify_actionable_signals(
+        self, report: dict[str, object], *, trace_id: str, title_prefix: str
+    ) -> None:
+        self._service._notify_actionable_signals(  # noqa: SLF001
+            report,
+            trace_id=trace_id,
+            title_prefix=title_prefix,
+        )
+
+    def is_intraday_scheduler_scan(self, *, now: datetime, sync_reason: str) -> bool:
+        return self._is_intraday_scheduler_week5_scan(now=now, sync_reason=sync_reason)
+
+    def latest_preserved_watchlist_symbols(
+        self, *, top_k_override: int | None = None
+    ) -> list[str]:
+        return self._state_service.latest_preserved_watchlist_symbols(
+            top_k_override=top_k_override,
+        )
+
+    def market_warehouse(self) -> object:
+        return self._service._market_warehouse()  # noqa: SLF001
+
+    def provider(self) -> object:
+        return self._service._provider  # noqa: SLF001
+
+    def provider_graph(self) -> list[object]:
+        return self._service._iter_market_data_provider_graph()  # noqa: SLF001
+
+    def runtime_source_mode(self) -> str:
+        return (
+            "realtime_overlay"
+            if self._service._realtime_pipeline is not None  # noqa: SLF001
+            else "offline_only"
+        )
+
+    def _run_summaries_no_buy_streak(self) -> int:
+        """从 run summaries 计算"连续无 actionable 信号"次数（empty_signal 用）。"""
+        service = self._service
+        no_buy_streak = 0
+        for item in reversed(service._run_summaries):  # noqa: SLF001
+            actionable = _as_int(item.get("actionable"), default=0)
+            if actionable <= 0:
+                no_buy_streak += 1
+            else:
+                break
+        return no_buy_streak
+
+    def _monster_positions(self) -> list[float]:
+        """当前 monster 策略持仓的目标仓位列表（monster_isolation 门输入）。"""
+        try:
+            positions = self._service._portfolio.positions()  # noqa: SLF001
+        except Exception:
+            return []
+        return [
+            _as_float(item.get("target_position"), default=0.0)
+            for item in positions
+            if isinstance(item, dict)
+            and str(item.get("strategy", "")).strip().lower() == "monster"
+        ]
 
     @staticmethod
     def _final_pipeline_timing_report(
@@ -3558,7 +2180,7 @@ class RuntimeWeek5Service:
                     warehouse = None
                     vendor_overlay = None
                     try:
-                        warehouse = service._market_warehouse()  # type: ignore[attr-defined]
+                        warehouse = service._market_warehouse()
                     except Exception:
                         pass
                     try:

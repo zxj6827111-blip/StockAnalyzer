@@ -5327,7 +5327,22 @@ class StockAnalyzerService:
         end_date: date,
         top_n: int | None = None,
         horizon_days: int | None = None,
+        algorithm: str = "",
+        holding_top_n: int | None = None,
+        explicit_symbols: list[str] | None = None,
+        progress: Any = None,
+        release_week5_lock: bool = False,
     ) -> dict[str, object]:
+        if algorithm == "week5_daily":
+            return self._asof_backtest_service.run_week5_daily(
+                start_date=start_date,
+                end_date=end_date,
+                horizon_days=horizon_days,
+                holding_top_n=holding_top_n,
+                explicit_symbols=explicit_symbols,
+                progress=progress,
+                release_lock=release_week5_lock,
+            )
         return self._asof_backtest_service.run(
             symbols=symbols,
             start_date=start_date,
@@ -5335,6 +5350,13 @@ class StockAnalyzerService:
             top_n=top_n,
             horizon_days=horizon_days,
         )
+
+    def try_acquire_week5_backtest(self) -> bool:
+        """尝试占位 Week5 历史任务的进程内互斥锁（NAS 同时只允许一个）。"""
+        return self._asof_backtest_service.try_acquire_week5_lock()
+
+    def release_week5_backtest(self) -> None:
+        self._asof_backtest_service.release_week5_lock()
 
     def latest_asof_backtest_report(self) -> dict[str, object] | None:
         return self._asof_backtest_service.latest()
@@ -5922,6 +5944,8 @@ class StockAnalyzerService:
         ruleset_id: str,
         board_scope: list[str],
         reference_date: date | datetime | str | None = None,
+        end_date: date | None = None,
+        selection_snapshot_path: str | None = None,
     ) -> dict[str, object]:
         """Run :class:`UniverseCandidateSelector` to pick ``target_size`` candidates.
 
@@ -5935,6 +5959,10 @@ class StockAnalyzerService:
         Degraded fallback to :func:`_quota_sample_universe` is wired through
         ``fallback_sampler`` so this method never silently switches to
         per-symbol reads.
+
+        ``end_date``（as-of 契约）：非 None 时批量取数锚定该历史日期（Week5
+        历史回测专用）；``selection_snapshot_path`` 覆盖审计快照的读写路径
+        （历史任务必须写入任务独立目录，绝不读写生产 selection snapshot）。
         """
         from stock_analyzer.runtime.universe_candidate_selector import (
             UniverseCandidateSelector,
@@ -5969,7 +5997,11 @@ class StockAnalyzerService:
                 60,
                 _as_int(cfg.universe_prefilter_lookback_days, default=240),
             ),
-            snapshot_path=str(cfg.universe_quality_snapshot_path),
+            snapshot_path=(
+                str(selection_snapshot_path)
+                if selection_snapshot_path is not None
+                else str(cfg.universe_quality_snapshot_path)
+            ),
             snapshot_max_age_days=_as_int(
                 cfg.universe_quality_snapshot_max_age_days, default=7
             ),
@@ -5982,10 +6014,15 @@ class StockAnalyzerService:
             ruleset_id=ruleset_id,
             board_scope=board_scope,
             reference_date=reference_date,
+            end_date=end_date,
         )
         report = result.get("report", {})
         if isinstance(report, dict):
-            report["snapshot_path"] = str(cfg.universe_quality_snapshot_path)
+            report["snapshot_path"] = (
+                str(selection_snapshot_path)
+                if selection_snapshot_path is not None
+                else str(cfg.universe_quality_snapshot_path)
+            )
             report["snapshot_persisted"] = False
             selector_mode = str(report.get("selector_mode", "")).strip()
             if selector_mode in {"quality", "quality_all_eligible"}:
@@ -6006,7 +6043,11 @@ class StockAnalyzerService:
                     try:
                         persist_selection_snapshot(
                             report,
-                            str(cfg.universe_quality_snapshot_path),
+                            (
+                                str(selection_snapshot_path)
+                                if selection_snapshot_path is not None
+                                else str(cfg.universe_quality_snapshot_path)
+                            ),
                         )
                     except Exception as exc:
                         report["snapshot_persist_error"] = f"{type(exc).__name__}:{exc}"
@@ -6679,15 +6720,25 @@ class StockAnalyzerService:
         signals: list[object],
         data_gate_status: str,
         min_threshold_lift: float = 0.0,
+        news_mode_override: str | None = None,
     ) -> dict[str, object]:
-        """Funnel final stage: gates + threshold -> at most ``final_signal_cap``."""
+        """Funnel final stage: gates + threshold -> at most ``final_signal_cap``.
+
+        ``news_mode_override``：历史回测（as-of）上下文强制 ``"off"``——当前
+        新闻对历史时点是未来信息，final selector 绝不允许读取实时新闻产生
+        veto/penalty。None 时保持生产语义（按 config.evolution.news_risk_mode）。
+        """
         cap = max(0, int(self._config.week5.final_signal_cap))
         allow_zero = bool(self._config.week5.allow_zero_signal)
         min_threshold = _as_float(self._config.week5.final_signal_min_threshold, default=70.0)
         min_threshold += max(0.0, float(min_threshold_lift))
-        news_risk_mode = str(
-            getattr(self._config.evolution, "news_risk_mode", "shadow")
-        ).strip().lower()
+        news_risk_mode = (
+            str(news_mode_override).strip().lower()
+            if news_mode_override is not None
+            else str(
+                getattr(self._config.evolution, "news_risk_mode", "shadow")
+            ).strip().lower()
+        )
         selected: list[dict[str, object]] = []
         rejected: list[dict[str, object]] = []
         news_gate_summary: dict[str, object] = {

@@ -1115,6 +1115,12 @@ class AsofBacktestConfig(_StrictModel):
     max_date_range_days: int = 30
     take_profit_pct: float = 0.08
     stop_loss_pct: float = 0.05
+    # Week5 完整链路历史回测（week5_daily 算法）功能开关：关闭后 API 与页面
+    # 立即回退 legacy_trend，不需要任何数据迁移。
+    week5_daily_enabled: bool = True
+    # Week5 历史任务按日期顺序执行（禁止日期并发），单次请求最多回测的
+    # 交易日数（PLAN 性能与安全约束）。
+    week5_max_dates_per_run: int = 5
 
 
 class ReconcileConfig(_StrictModel):

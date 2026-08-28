@@ -727,4 +727,11 @@ class AsofBacktestRunRequest(BaseModel):
     symbols: list[str] = Field(default_factory=list)
     top_n: int | None = Field(default=None, ge=1, le=500)
     horizon_days: int | None = Field(default=None, ge=1, le=60)
+    # 算法选择：``week5_daily``（Week5 完整每日主选股链路）或
+    # ``legacy_trend``（旧版单票 trend 快速扫描）。空串保持旧版兼容（等价
+    # legacy_trend）；历史回测页面显式发送 week5_daily。
+    algorithm: str = ""
+    # Week5 模式下持有期走势分析只统计最终入选股票的数量上限；旧 top_n 在
+    # week5 模式不参与漏斗（漏斗上限走 week5 自身配置）。
+    holding_top_n: int | None = Field(default=None, ge=1, le=100)
 

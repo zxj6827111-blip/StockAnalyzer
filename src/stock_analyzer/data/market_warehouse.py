@@ -2091,6 +2091,7 @@ class MarketWarehouse:
         *,
         symbols: list[str],
         lookback_days: int,
+        end_date: date | None = None,
     ) -> pd.DataFrame:
         """Batch-fetch per-symbol daily bars (last ``lookback_days`` rows each).
 
@@ -2098,6 +2099,11 @@ class MarketWarehouse:
         quality scoring across the whole universe. Deliberately avoids
         per-symbol ``fetch_daily_bars`` calls so 5000+ symbols can be scored in
         one pass without opening thousands of connections or DataFrames.
+
+        ``end_date``（as-of 契约）：非 None 时先在 SQL 里把行截断到
+        ``date <= end_date``，**再**按 symbol 取最近 ``lookback_days`` 根。
+        截断必须发生在窗口编号之前——"先取最近 N 根再过滤"会把历史日期的
+        as-of 批量质量数据悄悄混入未来行（历史回测泄露点之一）。
 
         Returns an empty frame when the daily table is missing or no requested
         symbol has data. Callers must treat empty as "batch unavailable" and
@@ -2113,6 +2119,12 @@ class MarketWarehouse:
             return pd.DataFrame()
         symbols_df = pd.DataFrame({"symbol": normalized_symbols})
         limit = max(1, int(lookback_days))
+        end_clause = ""
+        params: list[object] = []
+        if end_date is not None:
+            end_clause = "AND t.date <= ?"
+            params.append(end_date.isoformat())
+        params.append(limit)
         with self._connect_readonly() as connection:
             connection.register("_uqs_symbols", symbols_df)
             try:
@@ -2128,11 +2140,12 @@ class MarketWarehouse:
                                 ) AS _rn
                             FROM {_DAILY_TABLE} t
                             WHERE t.symbol IN (SELECT symbol FROM _uqs_symbols)
+                            {end_clause}
                         )
                         SELECT * FROM ranked WHERE _rn <= ?
                         ORDER BY symbol, date
                         """,
-                        [limit],
+                        params,
                     ).fetch_df(),
                 )
             finally:

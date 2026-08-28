@@ -94,6 +94,7 @@ class _FrameWarehouse:
         *,
         symbols: list[str],
         lookback_days: int,
+        end_date: object = None,
     ) -> pd.DataFrame:
         self.fetch_calls += 1
         requested = set(symbols)
@@ -553,7 +554,7 @@ def test_batch_failure_fallback_metadata(tmp_path: Path) -> None:
     selector = _make_selector(warehouse, fallback_sampler=fake_fallback)
 
     # Force batch failure by monkeypatching the warehouse batch method.
-    def _failing_fetch(*, symbols, lookback_days):
+    def _failing_fetch(*, symbols, lookback_days, end_date=None):
         raise RuntimeError("simulated duckdb failure")
 
     warehouse.fetch_universe_quality_metrics = _failing_fetch  # type: ignore[method-assign]
