@@ -338,6 +338,7 @@ class VendorZipOverlayProvider:
         *,
         symbols: list[str],
         lookback_days: int,
+        end_date: date | None = None,
     ) -> pd.DataFrame:
         """Batch-fetch per-symbol daily history (delta-first, ZIP for the rest).
 
@@ -365,6 +366,10 @@ class VendorZipOverlayProvider:
           named volumes are modified;
         - per-symbol rows never enter the small per-symbol LRU cache.
 
+        ``end_date``（as-of 契约）：非 None 时 delta 查询与 ZIP 合并结果都先
+        截断到 ``date <= end_date``，**再**取每 symbol 最近 ``lookback_days``
+        根——禁止"取满窗口之后再过滤"，否则 as-of 批量质量数据会混入未来行。
+
         Merge rules: ZIP provides the historical baseline, delta provides the
         recent increment, and on duplicate symbol/date the delta row wins.
         The final frame keeps at most the last ``lookback_days`` rows per
@@ -383,6 +388,7 @@ class VendorZipOverlayProvider:
             delta = delta_warehouse.fetch_universe_quality_metrics(
                 symbols=normalized,
                 lookback_days=limit,
+                end_date=end_date,
             )
             if not delta.empty:
                 delta = delta[delta["symbol"].isin(normalized)]
@@ -392,6 +398,7 @@ class VendorZipOverlayProvider:
             delta=delta,
             symbols=normalized,
             limit=limit,
+            end_date=end_date,
         )
         zip_frames = self._load_vendor_daily_batch(symbols=zip_symbols, limit=limit)
         pieces = [frame for frame in zip_frames if not frame.empty]
@@ -408,6 +415,9 @@ class VendorZipOverlayProvider:
         # drop_duplicates(keep="last") lets the delta row win.
         combined = combined.sort_values(["symbol", "date"], kind="stable")
         combined = combined.drop_duplicates(subset=["symbol", "date"], keep="last")
+        if end_date is not None:
+            # 先截断到 as_of，再取每 symbol 最近 limit 根（as-of 契约）。
+            combined = combined[combined["date"] <= pd.Timestamp(end_date)]
         combined = combined.groupby("symbol", sort=False).tail(limit)
         combined = combined.sort_values(["symbol", "date"]).reset_index(drop=True)
         combined = self._apply_financial_snapshots_batch(combined, symbols=normalized)
@@ -420,6 +430,7 @@ class VendorZipOverlayProvider:
         delta: pd.DataFrame,
         symbols: list[str],
         limit: int,
+        end_date: date | None = None,
     ) -> list[str]:
         """Symbols the delta cannot fully serve for this batch call.
 
@@ -431,15 +442,24 @@ class VendorZipOverlayProvider:
         ``delta_max_staleness_days`` behind the ZIP index, every symbol is
         read from the ZIPs (correctness fallback; the selector's own
         staleness gate would otherwise reject the entire batch).
+
+        ``end_date`` 非 None 时，delta 行数与"新鲜度兜底"判断都以截断后的
+        as-of 视角进行：delta 最新日期不会超过 end_date，避免用今天的新鲜度
+        误判历史窗口内 delta 已经足够。
         """
         if delta_warehouse is None or delta.empty:
             return list(symbols)
-        delta_symbols = delta["symbol"].astype(str)
+        delta_for_counting = delta
+        if end_date is not None:
+            delta_for_counting = delta[delta["date"] <= pd.Timestamp(end_date)]
+            if delta_for_counting.empty:
+                return list(symbols)
+        delta_symbols = delta_for_counting["symbol"].astype(str)
         delta_row_counts = delta_symbols.value_counts()
         shallow = set(delta_row_counts[delta_row_counts < limit].index)
         needed = (set(symbols) - set(delta_symbols.unique())) | shallow
-        index_latest = self._zip_index_latest_date(symbols)
-        delta_latest = delta["date"].max()
+        index_latest = self._zip_index_latest_date(symbols, end_date=end_date)
+        delta_latest = delta_for_counting["date"].max()
         if (
             index_latest is not None
             and (index_latest - delta_latest.date()).days > self.delta_max_staleness_days
@@ -447,7 +467,9 @@ class VendorZipOverlayProvider:
             return list(symbols)
         return sorted(needed)
 
-    def _zip_index_latest_date(self, symbols: list[str]) -> date | None:
+    def _zip_index_latest_date(
+        self, symbols: list[str], *, end_date: date | None = None
+    ) -> date | None:
         latest: date | None = None
         for symbol in symbols:
             raw_symbol = self._symbols_mapping().get(symbol)
@@ -455,6 +477,9 @@ class VendorZipOverlayProvider:
                 continue
             parsed = _coerce_date(raw_symbol.get("latest_date"))
             if parsed is not None and (latest is None or parsed > latest):
+                if end_date is not None and parsed > end_date:
+                    # as-of 视角：索引里晚于 end_date 的最新日期不可见。
+                    continue
                 latest = parsed
         return latest
 

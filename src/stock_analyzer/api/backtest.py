@@ -19,7 +19,10 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 
 from stock_analyzer.api.deps import get_config, get_service, get_verify_api_auth
 from stock_analyzer.api.models import AsofBacktestRunRequest
-from stock_analyzer.ops.background_tasks import submit_background_task
+from stock_analyzer.ops.background_tasks import (
+    submit_background_task,
+    submit_background_task_with_progress,
+)
 
 router = APIRouter()
 
@@ -74,8 +77,41 @@ def asof_scan_run(
     background_tasks: BackgroundTasks,
     _auth: None = Depends(get_verify_api_auth()),
 ) -> dict[str, object]:
+    algorithm = request.algorithm.strip().lower()
+    if algorithm not in {"", "week5_daily", "legacy_trend"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid_algorithm:{algorithm}:expected week5_daily|legacy_trend",
+        )
     start_date, end_date = _resolve_date_range(request)
     service = get_service()
+    if algorithm == "week5_daily":
+        config = get_config()
+        if not bool(config.asof_backtest.week5_daily_enabled):
+            raise HTTPException(
+                status_code=409,
+                detail="week5_backtest_disabled:feature switch is off",
+            )
+        # NAS 同时只允许一个 Week5 历史任务：提交时即占位，后台任务结束释放。
+        if not service.try_acquire_week5_backtest():
+            raise HTTPException(status_code=409, detail="week5_backtest_busy")
+        explicit_symbols: list[str] = list(request.symbols or [])
+        return submit_background_task_with_progress(
+            background_tasks,
+            name="asof_backtest_week5_scan",
+            fn=lambda progress: service.run_asof_backtest(
+                symbols=None,
+                start_date=start_date,
+                end_date=end_date,
+                top_n=None,
+                horizon_days=request.horizon_days,
+                algorithm=algorithm,
+                holding_top_n=request.holding_top_n,
+                explicit_symbols=explicit_symbols,
+                progress=progress,
+                release_week5_lock=True,
+            ),
+        )
     return submit_background_task(
         background_tasks,
         name="asof_backtest_scan",

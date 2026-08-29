@@ -1033,7 +1033,9 @@ def test_batch_quality_metrics_does_not_call_per_symbol_fetch_daily_bars(
     )
     delta_calls: list[int] = []
 
-    def _counting_delta_fetch(*, symbols: list[str], lookback_days: int) -> pd.DataFrame:
+    def _counting_delta_fetch(
+        *, symbols: list[str], lookback_days: int, end_date: object = None
+    ) -> pd.DataFrame:
         delta_calls.append(len(symbols))
         return pd.DataFrame()
 

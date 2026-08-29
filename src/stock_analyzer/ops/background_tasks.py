@@ -86,6 +86,21 @@ class BackgroundTaskRegistry:
             self._evict_locked()
         return True
 
+    def update_progress(self, task_id: str, progress: dict[str, Any]) -> bool:
+        """Attach/refresh the stage progress payload of a running task.
+
+        ``GET /tasks/{task_id}`` 返回的 entry 是本 dict 的浅拷贝，进度字段
+        因此对轮询方可见。进度只承载可观测性信息，写入失败不影响任务语义。
+        """
+        if not isinstance(progress, dict):
+            return False
+        with self._lock:
+            entry = self._entries.get(task_id)
+            if entry is None:
+                return False
+            entry["progress"] = dict(progress)
+        return True
+
     def get(self, task_id: str) -> dict[str, Any] | None:
         """Return a copy of the entry, or ``None`` for an unknown task id."""
         with self._lock:
@@ -156,6 +171,39 @@ def submit_background_task(
     reg = registry_obj if registry_obj is not None else registry
     task_id = reg.submit(name=name)
     background_tasks.add_task(run_registered_task, task_id, fn, reg)
+    entry = reg.get(task_id) or {}
+    return {
+        "task_id": task_id,
+        "name": name,
+        "status": STATUS_QUEUED,
+        "submitted_at": entry.get("submitted_at", ""),
+    }
+
+
+def submit_background_task_with_progress(
+    background_tasks: BackgroundTasks,
+    *,
+    name: str,
+    fn: Callable[[Callable[[dict[str, Any]], bool]], Any],
+    registry_obj: BackgroundTaskRegistry | None = None,
+) -> dict[str, object]:
+    """Register ``fn(progress)`` for post-response execution (staged progress).
+
+    与 :func:`submit_background_task` 相同的生命周期，区别在于 ``fn`` 接收一个
+    进度写入函数（``progress(payload: dict)``），长耗时任务（例如 Week5 历史
+    回测）可以在阶段推进时更新 ``GET /tasks/{task_id}`` 可见的 ``progress``
+    字段：``universe -> quality -> snapshot -> light -> deep -> final -> holding``。
+    """
+    reg = registry_obj if registry_obj is not None else registry
+    task_id = reg.submit(name=name)
+
+    def _progress_writer(payload: dict[str, Any]) -> bool:
+        return reg.update_progress(task_id, payload)
+
+    def _run() -> Any:
+        return fn(_progress_writer)
+
+    background_tasks.add_task(run_registered_task, task_id, _run, reg)
     entry = reg.get(task_id) or {}
     return {
         "task_id": task_id,
