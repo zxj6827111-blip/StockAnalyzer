@@ -109,7 +109,11 @@ class AsofBacktestService:
         self._service = service
         config = cast(StockAnalyzerConfig, service._config)
         self._config = config
-        root = project_root or Path(__file__).resolve().parents[3]
+        # parents[4] = 仓库根（本文件位于 <root>/src/stock_analyzer/runtime/services/）。
+        # 曾经错写成 parents[3]（src/）：容器里落盘进了 /app/src/artifacts 容器层
+        # 而非 /app/artifacts 数据卷，容器重建即丢结果——与同目录
+        # acceptance_service/week7_sim_broker_service 的取法保持一致。
+        root = project_root or Path(__file__).resolve().parents[4]
         self._output_dir = (root / config.asof_backtest.output_dir).resolve()
         self._lock = threading.Lock()
         # Week5 历史任务互斥：进程内同时只允许一个 week5_daily 任务运行
