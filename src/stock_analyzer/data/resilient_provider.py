@@ -148,6 +148,37 @@ class ResilientProvider:
         self.last_error = ""
         return frames
 
+    def list_symbols(self) -> list[str]:
+        """透传 primary 的全索引符号清单（Week5 历史回测股票池解析依赖）。
+
+        只走 primary：``list_symbols`` 是本地索引/warehouse 的批量元数据接口，
+        在线 backup（efinance/akshare）不提供该能力，fallback 无意义；primary
+        缺失或执行失败都应显式冒泡（fail-closed），而不是静默降级成空池。
+        """
+        method = getattr(self.primary, "list_symbols", None)
+        if not callable(method):
+            raise DataSourceError("primary provider does not expose list_symbols()")
+        symbols = method()
+        return list(symbols) if symbols is not None else []
+
+    def fetch_universe_quality_metrics(self, *args: object, **kwargs: object) -> pd.DataFrame:
+        """透传批量质量指标查询（``end_date`` 等关键字参数原样传递）。
+
+        Week5 历史回测的 as-of 质量选池依赖该接口；透传层不做任何截断或
+        改写，as-of 语义由 primary 实现与 AsOfMarketDataProvider 负责。签名
+        用 ``*args/**kwargs`` 以跟随下游演进（避免每加一个筛选参数就要改
+        这一层）。与 ``list_symbols`` 同理只走 primary、fail-closed。
+        """
+        method = getattr(self.primary, "fetch_universe_quality_metrics", None)
+        if not callable(method):
+            raise DataSourceError(
+                "primary provider does not expose fetch_universe_quality_metrics()"
+            )
+        result = method(*args, **kwargs)
+        if not isinstance(result, pd.DataFrame):
+            raise DataSourceError("fetch_universe_quality_metrics must return a DataFrame")
+        return result
+
     def status(self) -> dict[str, object]:
         return {
             "consecutive_failures": self.consecutive_failures,
