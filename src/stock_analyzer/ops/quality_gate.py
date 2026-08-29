@@ -312,6 +312,15 @@ def build_stage_specs(stage: str) -> list[QualityCommandSpec]:
                     _FULL_PARALLEL_WORKERS,
                     "--dist",
                     _FULL_XDIST_DIST,
+                    # 顺序/时序敏感的既有测试（快照集成、intraday deadline、
+                    # learning governance ticket 等）在 cov+xdist 下偶发踩雷
+                    # （同 commit 两次红/两次绿的实锤记录见 PR #43）。失败
+                    # 自动重跑两次作为兜底，配合 loadfile 分发把随机失败
+                    # 概率压到可合并水平；真回归（确定性失败）重跑也救不了。
+                    "--reruns",
+                    "2",
+                    "--reruns-delay",
+                    "3",
                     "--cov=stock_analyzer",
                     "--cov-report=term",
                     "--cov-report=xml:artifacts/coverage/coverage.xml",
