@@ -137,6 +137,7 @@ class UniverseCandidateSelector:
         exploration_ratio: float = 0.05,
         min_quota_per_in_scope_board: int = 10,
         lookback_days: int = 240,
+        batch_chunk_size: int = 500,
         snapshot_path: str | Path | None = None,
         snapshot_max_age_days: int = 7,
         fallback_sampler: Callable[..., tuple[list[str], dict[str, object]]] | None = None,
@@ -154,6 +155,10 @@ class UniverseCandidateSelector:
         self._exploration_ratio = max(0.0, min(1.0, float(exploration_ratio)))
         self._min_quota_per_in_scope_board = max(0, int(min_quota_per_in_scope_board))
         self._lookback_days = max(60, int(lookback_days))
+        # 批量取数分批大小：全市场（~5800 只）× lookback 宽表一次性进内存会
+        # 击穿容器内存上限（NAS 实测 OOM，PR #41 历史回测首跑即触发）。分批
+        # 取数后逐批 concat，覆盖率/评分等全局语义都基于合并帧，不受分批影响。
+        self._batch_chunk_size = max(1, int(batch_chunk_size))
         self._snapshot_path = Path(snapshot_path).expanduser() if snapshot_path else None
         self._snapshot_max_age_days = max(0, int(snapshot_max_age_days))
         self._fallback_sampler = fallback_sampler
@@ -392,15 +397,41 @@ class UniverseCandidateSelector:
     def _safe_batch_fetch(
         self, symbols: list[str], *, end_date: date | None = None
     ) -> tuple[pd.DataFrame, str]:
+        """分批拉取批量质量指标并合并。
+
+        全市场一次拉取的内存足迹随 ``len(symbols) × lookback_days`` 线性放大
+        （NAS 上 5800 只 × 240 根 × 47 列的宽表经 vendor overlay 的多次拷贝
+        会击穿 4G 容器上限）。这里按 ``batch_chunk_size`` 分批调用底层批量
+        接口再 concat：每批内存恒定，评分/覆盖率统计都发生在合并帧上，
+        与整批一次拉取语义一致。任一批失败按 fail-closed 整体报错（与原
+        整批语义一致，不做部分降级）。
+        """
+        chunk_size = self._batch_chunk_size
         try:
-            frame = self._warehouse.fetch_universe_quality_metrics(
-                symbols=symbols,
-                lookback_days=self._lookback_days,
-                end_date=end_date,
-            )
-            if not isinstance(frame, pd.DataFrame):
-                return pd.DataFrame(), "batch_fetch_error:invalid_return_type"
-            return frame, ""
+            if len(symbols) <= chunk_size:
+                frame = self._warehouse.fetch_universe_quality_metrics(
+                    symbols=symbols,
+                    lookback_days=self._lookback_days,
+                    end_date=end_date,
+                )
+                if not isinstance(frame, pd.DataFrame):
+                    return pd.DataFrame(), "batch_fetch_error:invalid_return_type"
+                return frame, ""
+            frames: list[pd.DataFrame] = []
+            for start in range(0, len(symbols), chunk_size):
+                chunk = symbols[start : start + chunk_size]
+                part = self._warehouse.fetch_universe_quality_metrics(
+                    symbols=chunk,
+                    lookback_days=self._lookback_days,
+                    end_date=end_date,
+                )
+                if not isinstance(part, pd.DataFrame):
+                    return (
+                        pd.DataFrame(),
+                        f"batch_fetch_error:invalid_return_type@chunk_{start}",
+                    )
+                frames.append(part)
+            return pd.concat(frames, axis=0, ignore_index=True, sort=False), ""
         except Exception as exc:
             return pd.DataFrame(), f"batch_fetch_error:{type(exc).__name__}"
 
