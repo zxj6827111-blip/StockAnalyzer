@@ -27,4 +27,7 @@ jobs:
           python -m pytest tests/test_week5_snapshot_integration.py -n 4 -q 2>&1 | tail -6
       - name: Full suite -n 4 (no cov, tail)
         run: |
-          python -m pytest tests -n 4 -q 2>&1 | tail -20
+          python -m pytest tests -n 4 -q 2>&1 | tail -8
+      - name: Full suite -n 4 with cov (repro attempt)
+        run: |
+          python -m pytest tests -n 4 --cov=stock_analyzer --cov-report= -q 2>&1 | tail -14
