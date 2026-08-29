@@ -3,12 +3,33 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
+import pytest
 
 from stock_analyzer.data.intraday_sync import sync_intraday_symbols
+
+_SYNC_LOCK = Path("artifacts/runtime/intraday_sync.lock")
+
+
+@pytest.fixture(autouse=True)
+def _clean_intraday_sync_lock() -> Iterator[None]:
+    """每个测试都在干净锁状态下运行。
+
+    sync 的锁文件是相对路径（所有测试共享）；前序测试在 release 与心跳
+    线程的竞态下可能留下"心跳仍持有、30s 内不过期"的孤儿锁，后续测试
+    lock busy 早退、返回初始 capability_probe（error=''）——CI 全量套件
+    实测偶发。renew() 只 os.utime 不重建文件，unlink 后孤儿心跳失效。
+    """
+    _SYNC_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    if _SYNC_LOCK.exists():
+        _SYNC_LOCK.unlink()
+    yield
+    if _SYNC_LOCK.exists():
+        _SYNC_LOCK.unlink()
 
 
 def _slow_fetch_provider(probe_sleep: float = 0.05, fetch_sleep: float = 2.0) -> object:
