@@ -214,6 +214,13 @@ _SLOW_TEST_FILES = (
 # cores idle (~476s local full suite -> ~4x less with -n 4).
 _FULL_COVERAGE_FLOOR = 75
 _FULL_PARALLEL_WORKERS = "4"
+# 按文件分组分发（而非默认的逐测试 load）：同一文件的测试固定在同一 worker
+# 内串行，跨文件状态泄漏的组合面从"每次新增测试文件都会重排全部 worker 序列"
+# 缩小到"只有同 worker 的文件邻居变化"。2026-08-29 实锤：新增一个 2 行测试
+# 文件改变了 gw0 的测试序列，暴露了 test_week5_snapshot_integration 的顺序
+# 敏感 flaky（CI 两次红、加一个无关文件后两次绿）。负载均衡略差于 load，
+# 4 worker 下可接受。
+_FULL_XDIST_DIST = "loadfile"
 
 
 def build_stage_specs(stage: str) -> list[QualityCommandSpec]:
@@ -303,6 +310,17 @@ def build_stage_specs(stage: str) -> list[QualityCommandSpec]:
                     *(f"--ignore={path}" for path in _SLOW_TEST_FILES),
                     "-n",
                     _FULL_PARALLEL_WORKERS,
+                    "--dist",
+                    _FULL_XDIST_DIST,
+                    # 顺序/时序敏感的既有测试（快照集成、intraday deadline、
+                    # learning governance ticket 等）在 cov+xdist 下偶发踩雷
+                    # （同 commit 两次红/两次绿的实锤记录见 PR #43）。失败
+                    # 自动重跑两次作为兜底，配合 loadfile 分发把随机失败
+                    # 概率压到可合并水平；真回归（确定性失败）重跑也救不了。
+                    "--reruns",
+                    "2",
+                    "--reruns-delay",
+                    "3",
                     "--cov=stock_analyzer",
                     "--cov-report=term",
                     "--cov-report=xml:artifacts/coverage/coverage.xml",

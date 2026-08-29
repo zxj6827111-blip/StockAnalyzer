@@ -1128,7 +1128,10 @@ def test_performance_5000_scale_under_30s() -> None:
         }
     )
     warehouse = _FrameWarehouse(frame)
-    selector = _make_selector(warehouse, exploration_ratio=0.05)
+    # 性能测量聚焦评分链路：显式用大 chunk（3 批）。默认 500 在 coverage
+    # 追踪下会让 fake warehouse 的逐批全帧 isin 扫描放大到 60s+（真实
+    # warehouse 是 SQL 查询，无此开销），不是被测对象。
+    selector = _make_selector(warehouse, exploration_ratio=0.05, batch_chunk_size=2000)
 
     start = time.perf_counter()
     result = selector.select(
@@ -1142,5 +1145,85 @@ def test_performance_5000_scale_under_30s() -> None:
     elapsed = time.perf_counter() - start
     assert result["report"]["batch_calls"] == 1
     assert result["report"]["selected_count"] == 300
-    assert warehouse.fetch_calls == 1
+    # 4995 只 / chunk 2000 = 3 批，分批真实发生。
+    assert warehouse.fetch_calls == -(-len(symbols) // 2000)
     assert elapsed < 30.0, f"selector too slow: {elapsed:.2f}s"
+
+
+# ---------------------------------------------------------------------------
+# 11. Batch fetch chunking（全市场分批取数，防 OOM）
+# ---------------------------------------------------------------------------
+
+
+def test_batch_fetch_chunking_matches_single_batch_selection(tmp_path: Path) -> None:
+    """超过 batch_chunk_size 时分批取数：调用次数正确、结果与整批等价。
+
+    回归背景：NAS 全市场（~5800 只 × 240 根 × 47 列）整批拉取击穿 4G 容器
+    内存上限，week5 历史回测首跑 OOM。分批后评分/覆盖率统计都基于合并帧，
+    选中结果必须与整批一次拉取完全一致。
+    """
+    spec = _default_symbols_spec(count_per_board=80)  # ~400 只
+    frame = _build_batch_frame(spec)
+    symbols = sorted(spec.keys())
+
+    chunked_warehouse = _FrameWarehouse(frame)
+    chunked = _make_selector(chunked_warehouse, batch_chunk_size=50)
+    out_chunked = chunked.select(
+        symbols=symbols,
+        target_size=300,
+        trade_date="2026-07-31",
+        reference_date="2026-07-31",
+        ruleset_id="a_share_default_v1",
+        board_scope=["SSE", "SZSE", "BSE"],
+    )
+
+    single_warehouse = _FrameWarehouse(frame)
+    single = _make_selector(single_warehouse, batch_chunk_size=100_000)
+    out_single = single.select(
+        symbols=symbols,
+        target_size=300,
+        trade_date="2026-07-31",
+        reference_date="2026-07-31",
+        ruleset_id="a_share_default_v1",
+        board_scope=["SSE", "SZSE", "BSE"],
+    )
+
+    # 400 只 / 50 = 8 批，分批真实发生。
+    assert chunked_warehouse.fetch_calls == 8
+    assert single_warehouse.fetch_calls == 1
+    # 等价性：分批与整批的选中集合与审计统计一致。
+    assert out_chunked["selected"] == out_single["selected"]
+    report_chunked = out_chunked["report"]
+    assert report_chunked["batch_symbol_count"] == len(spec)
+    assert report_chunked["batch_coverage_ratio"] == out_single["report"]["batch_coverage_ratio"]
+    assert report_chunked["selector_mode"] == out_single["report"]["selector_mode"]
+
+
+def test_batch_fetch_chunk_failure_fails_closed(tmp_path: Path) -> None:
+    """分批中任一批失败：整体按 batch_fetch_error 走降级（不做部分降级）。"""
+    spec = _default_symbols_spec(count_per_board=80)
+    frame = _build_batch_frame(spec)
+    warehouse = _FrameWarehouse(frame)
+    original_fetch = warehouse.fetch_universe_quality_metrics
+    state = {"calls": 0}
+
+    def _fail_third_chunk(*, symbols: list[str], lookback_days: int, end_date: object = None):
+        state["calls"] += 1
+        if state["calls"] == 3:
+            raise RuntimeError("chunk 3 exploded")
+        return original_fetch(symbols=symbols, lookback_days=lookback_days, end_date=end_date)
+
+    warehouse.fetch_universe_quality_metrics = _fail_third_chunk  # type: ignore[method-assign]
+
+    selector = _make_selector(warehouse, batch_chunk_size=50)
+    result = selector.select(
+        symbols=sorted(spec.keys()),
+        target_size=50,
+        trade_date="2026-07-31",
+        ruleset_id="a_share_default_v1",
+        board_scope=["SSE", "SZSE", "BSE"],
+    )
+    report = result["report"]
+    assert report["selector_mode"] == "degraded_fallback"
+    assert report["fallback_reason"] == "batch_fetch_error:RuntimeError"
+    assert state["calls"] == 3
