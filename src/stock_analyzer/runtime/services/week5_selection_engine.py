@@ -409,7 +409,11 @@ class Week5SelectionEngine:
             ),
         )
         symbol_source = "watchlist"
-        prefilter_report = _empty_prefilter_report(config)
+        prefilter_report = _empty_prefilter_report(
+            config,
+            enabled=prefilter_enabled,
+            top_k=configured_prefilter_top_k,
+        )
         historical_universe_report: dict[str, object] | None = None
         prefilter_details_by_symbol: dict[str, dict[str, object]] = {}
         prefer_local_universe = (
@@ -755,17 +759,11 @@ class Week5SelectionEngine:
                     deep_started=deep_started,
                 )
                 if blocked_live:
+                    # 两条 blocked 路径（新鲜度门 / fresh frame 构建失败）已在
+                    # _run_live_deep_stage 内部完成 store_report + audit（payload
+                    # 更精确），这里只补 historical 标注后短路返回，绝不重复落盘。
                     if self._historical:
                         deep_report["historical_context"] = self._historical_context_payload()
-                    self._finalize_report_writes(
-                        deep_report,
-                        audit_event="week5_scan_blocked_intraday_freshness",
-                        audit_payload={
-                            "fresh_count": _as_int(
-                                deep_report.get("watchlist_size"), default=0
-                            ),
-                        },
-                    )
                     return deep_report
                 deep_symbols = [
                     str(item.get("symbol", "")).strip()
@@ -1461,6 +1459,9 @@ class Week5SelectionEngine:
             },
             "signal_pool": {
                 "candidate_count": len(signal_pool_candidates),
+                # 全量口径的 action 计数（candidates 列表本身截断到前 100，
+                # 全市场扫描时按截断列表统计会低估，这里独立提供全量计数）。
+                "action_counts": _signal_pool_action_counts(signal_pool_candidates),
                 "candidates": signal_pool_candidates[:100],
                 "execution_rerank": dict(execution_rerank),
                 "ranking": {
@@ -1540,7 +1541,9 @@ class Week5SelectionEngine:
             trace_id=trace_id,
             has_warning=has_warning,
         )
-        if self._policy.notify and not ctx.recovery_mode:
+        # 与原实现一致：recovery 运行只禁关注池同步与 final 生效（advisory），
+        # 通知照发——不在这里做 recovery 短路。
+        if self._policy.notify:
             backend.notify_scan(
                 symbol_list=symbol_list,
                 first_board_candidates=first_board_candidates,
@@ -2350,6 +2353,17 @@ def _breadth_unavailable_meta() -> dict[str, object]:
     }
 
 
+def _signal_pool_action_counts(
+    candidates: list[dict[str, object]],
+) -> dict[str, int]:
+    """全量 signal pool 的 action 计数（不受 candidates 截断影响）。"""
+    counts: dict[str, int] = {}
+    for item in candidates:
+        action = str(item.get("action", "")).strip().lower() or "unknown"
+        counts[action] = counts.get(action, 0) + 1
+    return counts
+
+
 def _detect_synthetic_provider(backend: Week5EngineBackend) -> bool:
     try:
         provider = backend.provider()
@@ -2521,17 +2535,28 @@ def load_feature_snapshot_from_root(
     return manifest, frame
 
 
-def _empty_prefilter_report(config: StockAnalyzerConfig) -> dict[str, Any]:
+def _empty_prefilter_report(
+    config: StockAnalyzerConfig,
+    *,
+    enabled: bool,
+    top_k: int,
+) -> dict[str, Any]:
+    """prefilter 报告骨架。
+
+    ``enabled``/``top_k`` 必须传入解析 override 之后的值：offhours 等调用方
+    通过 ``prefilter_enabled_override``/``prefilter_top_k_override`` 覆盖调度
+    行为，报告里的初始字段必须如实反映本轮实际生效的口径（与原实现一致）。
+    """
     shortlist_top_n = max(
         1, _as_int(config.week5.universe_prefilter_shortlist_top_n, default=50)
     )
     return {
-        "enabled": bool(config.week5.universe_prefilter_enabled),
+        "enabled": bool(enabled),
         "applied": False,
         "lookback_days": max(
             120, _as_int(config.week5.universe_prefilter_lookback_days, default=240)
         ),
-        "top_k": max(1, _as_int(config.week5.universe_prefilter_top_k, default=500)),
+        "top_k": int(top_k),
         "shortlist_top_n": shortlist_top_n,
         "universe_count": 0,
         "eligible_count": 0,

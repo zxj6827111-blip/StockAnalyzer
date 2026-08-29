@@ -352,8 +352,9 @@ class AsofBacktestService:
                 "market_breadth_recomputed": True,
             },
         }
-        self._persist_week5(result)
-        return result
+        serializable = cast(dict[str, object], _to_jsonable(result))
+        self._persist_week5(serializable)
+        return serializable
 
     def _build_week5_date_entry(
         self,
@@ -375,12 +376,20 @@ class AsofBacktestService:
         final_selector = _dict_of(funnel.get("final_selection"))
         final_signals = _list_of_dicts(final_selector.get("final_signals", []))
         rejected = _list_of_dicts(final_selector.get("rejected", []))
-        # 原始 buy/watch/hold 全部保留在 signal_pool，不静默过滤。
-        action_counts: dict[str, int] = {}
+        # 原始 buy/watch/hold 全部保留在 signal_pool，不静默过滤。action
+        # 计数优先取引擎提供的全量口径（candidates 列表本身截断到前 100）。
         raw_candidates = _list_of_dicts(signal_pool.get("candidates", []))
-        for item in raw_candidates:
-            action = str(item.get("action", "")).strip().lower() or "unknown"
-            action_counts[action] = action_counts.get(action, 0) + 1
+        action_counts_raw = signal_pool.get("action_counts")
+        if isinstance(action_counts_raw, dict) and action_counts_raw:
+            action_counts = {
+                str(key): _as_int_field(value)
+                for key, value in action_counts_raw.items()
+            }
+        else:
+            action_counts = {}
+            for item in raw_candidates:
+                action = str(item.get("action", "")).strip().lower() or "unknown"
+                action_counts[action] = action_counts.get(action, 0) + 1
         rejection_reasons: dict[str, int] = {}
         for item in rejected:
             reasons = item.get("reject_reasons", [])
@@ -496,12 +505,18 @@ class AsofBacktestService:
         }
 
     def _persist_week5(self, result: dict[str, object]) -> None:
-        """week5_daily 结果落盘（latest 指针复用 + history 摘要标注算法）。"""
+        """week5_daily 结果落盘（latest 指针复用 + history 摘要标注算法）。
+
+        入参必须是已经过 :func:`_to_jsonable` 的结构（调用方负责转换）：
+        引擎报告含 dataclass/datetime 等非 JSON 原生类型，直接 json.dumps
+        会在多小时扫描完成之后才 TypeError，代价不可接受。
+        """
         with self._lock:
             self._output_dir.mkdir(parents=True, exist_ok=True)
             latest_path = self._output_dir / _LATEST_FILENAME
             latest_path.write_text(
-                json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+                json.dumps(result, ensure_ascii=False, indent=2),
+                encoding="utf-8",
             )
             dates_payload = result.get("dates", {})
             dates_map: dict[str, object] = dates_payload if isinstance(dates_payload, dict) else {}

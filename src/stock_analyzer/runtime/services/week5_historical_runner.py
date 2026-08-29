@@ -173,8 +173,9 @@ def run_week5_historical_day(
     if base_provider is None:
         base_provider = build_runtime_provider(hist_config.data_source, synthetic_seed=2026)
     provider = AsOfMarketDataProvider(base_provider, as_of)
-    # 历史决策时点：收盘后 15:00（与 pipeline as-of 决策时点一致）。
-    decision_time = datetime.combine(as_of, datetime.min.time()).replace(hour=15)
+    # 历史决策时点：与 pipeline as-of 模式的 _AS_OF_DECISION_TIME(15:30)
+    # 严格一致，保证同一轮回测内报告时间戳与信号决策时点同源。
+    decision_time = datetime.combine(as_of, datetime.min.time()).replace(hour=15, minute=30)
     pipeline = AnalyzerPipeline(config=hist_config, provider=provider)
 
     def run_pipeline_fn(

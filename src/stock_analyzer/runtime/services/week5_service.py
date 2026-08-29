@@ -1573,54 +1573,6 @@ class RuntimeWeek5Service:
             and str(item.get("strategy", "")).strip().lower() == "monster"
         ]
 
-    @staticmethod
-    def _final_pipeline_timing_report(
-        runtime_payload: dict[str, object],
-    ) -> dict[str, object]:
-        """final pipeline 聚合子阶段耗时 + 最慢 5 只股票（Phase 1 可观测性）。"""
-        timing: dict[str, object] = {}
-        stage_ms = runtime_payload.get("pipeline_stage_ms")
-        if isinstance(stage_ms, dict):
-            for key in (
-                "fetch_bars_ms",
-                "feature_engine_ms",
-                "inference_ms",
-                # 子阶段细分：intraday/market-context 已含在 feature_engine_ms
-                # 桶内，此处并列展示供耗时下钻。
-                "intraday_ms",
-                "market_context_ms",
-                "cross_review_ms",
-                "score_risk_ms",
-                "learning_persist_ms",
-                "completed_count",
-            ):
-                timing[key] = _as_int(stage_ms.get(key), default=0)
-        parallel_transform = runtime_payload.get("pipeline_parallel_transform")
-        if isinstance(parallel_transform, dict):
-            timing["parallel_transform"] = dict(parallel_transform)
-        raw_symbol_ms = runtime_payload.get("pipeline_symbol_ms")
-        symbol_ms: list[dict[str, object]] = []
-        if isinstance(raw_symbol_ms, list):
-            for item in raw_symbol_ms:
-                if not isinstance(item, dict):
-                    continue
-                symbol = str(item.get("symbol", "")).strip()
-                if symbol:
-                    symbol_ms.append(
-                        {
-                            "symbol": symbol,
-                            "duration_ms": _as_int(item.get("duration_ms"), default=0),
-                        }
-                    )
-        symbol_ms.sort(
-            key=lambda item: (
-                -_as_int(item.get("duration_ms"), default=0),
-                str(item.get("symbol", "")),
-            )
-        )
-        timing["slowest_symbols"] = symbol_ms[:5]
-        return timing
-
     def _apply_execution_aware_rerank(
         self,
         *,
