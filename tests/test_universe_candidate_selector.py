@@ -1128,7 +1128,10 @@ def test_performance_5000_scale_under_30s() -> None:
         }
     )
     warehouse = _FrameWarehouse(frame)
-    selector = _make_selector(warehouse, exploration_ratio=0.05)
+    # 性能测量聚焦评分链路：显式用大 chunk（3 批）。默认 500 在 coverage
+    # 追踪下会让 fake warehouse 的逐批全帧 isin 扫描放大到 60s+（真实
+    # warehouse 是 SQL 查询，无此开销），不是被测对象。
+    selector = _make_selector(warehouse, exploration_ratio=0.05, batch_chunk_size=2000)
 
     start = time.perf_counter()
     result = selector.select(
@@ -1142,8 +1145,8 @@ def test_performance_5000_scale_under_30s() -> None:
     elapsed = time.perf_counter() - start
     assert result["report"]["batch_calls"] == 1
     assert result["report"]["selected_count"] == 300
-    # 4995 只 > 默认 batch_chunk_size(500) → 分批取数（每批内存恒定）。
-    assert warehouse.fetch_calls == -(-len(symbols) // 500)
+    # 4995 只 / chunk 2000 = 3 批，分批真实发生。
+    assert warehouse.fetch_calls == -(-len(symbols) // 2000)
     assert elapsed < 30.0, f"selector too slow: {elapsed:.2f}s"
 
 
