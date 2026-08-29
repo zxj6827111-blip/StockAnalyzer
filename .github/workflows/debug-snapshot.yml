@@ -1,0 +1,30 @@
+# 临时调试 workflow：定位只在 CI 全量套件出现的快照集成测试失败。
+# 结论落地后删除本文件。
+name: debug-snapshot
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["fix/asof-backtest-output-dir", "debug/ci-snapshot"]
+
+jobs:
+  snapshot-only:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONHASHSEED: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev]
+      - name: Single file with xdist
+        run: |
+          python -m pytest tests/test_week5_snapshot_integration.py -n 4 -q 2>&1 | tail -6
+      - name: Full suite -n 4 (no cov, tail)
+        run: |
+          python -m pytest tests -n 4 -q 2>&1 | tail -20
