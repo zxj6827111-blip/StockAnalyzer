@@ -72,7 +72,11 @@ def test_deadline_includes_slow_capability_probes() -> None:
             end_date: object,
             freq: str = "1min",
         ) -> pd.DataFrame:
-            time.sleep(2.0)
+            # 6s 远超 deadline(1s) 的任何调度/coverage 追踪抖动：probe 在
+            # deadline 预算内必然完不成，wait 超时与 remaining<=0 两条路径
+            # 都确定性地汇聚到 deadline_exceeded（sleep 2s 时 cov 慢速下的
+            # 分支竞态曾让 CI 偶发拿到空 error，PR #43 验证链实测）。
+            time.sleep(6.0)
             return pd.DataFrame()
 
     with patch(
