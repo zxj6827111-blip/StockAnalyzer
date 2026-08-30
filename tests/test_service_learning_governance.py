@@ -7,6 +7,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
+import pytest
+
 import stock_analyzer.runtime.services.learning_governance_service as learning_governance_module
 from stock_analyzer.config import StockAnalyzerConfig, load_config
 from stock_analyzer.data.provider import SyntheticProvider
@@ -186,6 +188,16 @@ def _prepare_learning_governance_service(
         service.build_learning_trainable_manifest(symbols=["600000", "000001"])
     )
     return service, manifest, champion_model_id, notifications
+
+
+def _require_ticket(ticket_payload: Mapping[str, object]) -> Mapping[str, object]:
+    """issue 失败（无 ticket 键）时把返回 payload 原样抛进断言，供 CI 诊断。"""
+    if "ticket" not in ticket_payload:
+        pytest.fail(
+            "ticket issue failed: "
+            + json.dumps(dict(ticket_payload), ensure_ascii=False, default=str)[:600]
+        )
+    return _as_mapping(ticket_payload["ticket"])
 
 
 def _prepare_learning_model_proposal(
@@ -439,7 +451,11 @@ def test_service_shadow_proposal_auto_promotion_binds_generated_proposal_and_tic
     assert captured["approval_proposal_id"] == str(proposal["proposal_id"])
     assert captured["ticket_proposal_id"] == str(proposal["proposal_id"])
     assert captured["execute_ticket_id"] == str(auto_promotion["ticket_id"])
-    assert auto_promotion["auto_approve"] is True
+    if auto_promotion.get("auto_approve") is not True:
+        pytest.fail(
+            "auto promotion did not fire: "
+            + json.dumps(dict(auto_promotion), ensure_ascii=False, default=str)[:600]
+        )
     assert auto_promotion["auto_release"] is True
 
 
@@ -551,7 +567,7 @@ def test_service_learning_model_release_flow_updates_registry_timeline_and_statu
             note="manual release",
         )
     )
-    ticket = _as_mapping(ticket_payload["ticket"])
+    ticket = _as_mapping(_require_ticket(ticket_payload))
     execute = _as_mapping(
         service.execute_learning_model_release_ticket(
             "release_manager",
@@ -730,7 +746,7 @@ def test_service_learning_release_watchdog_auto_rolls_back_overdue_ticket(
     execute = _as_mapping(
         service.execute_learning_model_release_ticket(
             "release_manager",
-            ticket_id=str(_as_mapping(ticket_payload["ticket"])["ticket_id"]),
+            ticket_id=str(_require_ticket(ticket_payload)["ticket_id"]),
             note="release done",
             timestamp=datetime(2026, 4, 1, 9, 15, tzinfo=UTC),
         )
