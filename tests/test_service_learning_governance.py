@@ -64,6 +64,12 @@ def _load_test_config(base_dir: Path | None = None) -> StockAnalyzerConfig:
     config.labels.horizon_days = 2
     config.command_channel.state_persist_enabled = False
     config.command_channel.history_archive_enabled = False
+    # 隔离 runtime_state 读取路径：persist 关闭只挡写，service 启动仍会从
+    # state_persist_path 恢复 proposal/approval/ticket history——不隔离的话
+    # 全量套件里其它测试（或 CI runner 上的残留文件）写入的记录会跨测试
+    # 污染 proposal/approval 状态机，CI 上偶发 KeyError: 'ticket'（PR #44
+    # 验证链实锤：同 commit 一次绿一次红、同 job 100% 复现）。
+    config.command_channel.state_persist_path = str(temp_root / "command_state.json")
     config.evolution.auto_run = False
     config.evolution.report_dir = str(temp_root / "evolution_history")
     config.evolution.suggestions_dir = str(temp_root / "suggestions")
