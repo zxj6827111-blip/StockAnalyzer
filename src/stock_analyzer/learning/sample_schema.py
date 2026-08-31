@@ -162,6 +162,9 @@ class OutcomeRecord(_StrictModel):
     realized_return: float | None = None
     max_favorable_excursion: float | None = None
     max_adverse_excursion: float | None = None
+    # TP/SL 同期冲突事件标记（Phase 0 §3.2）：None=旧数据未计算；True/False=回填时判定。
+    # 训练标签由 policy.conflict_policy 决定软值，本字段仅作事件级追溯。
+    conflict_flag: bool | None = None
     execution_fill_ratio: float | None = None
     realized_slippage_bp: float | None = None
     reconcile_status: str = ""

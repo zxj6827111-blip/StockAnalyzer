@@ -87,6 +87,7 @@ from stock_analyzer.market_calendar import is_a_share_trading_day
 from stock_analyzer.models.adapters import inspect_model_backend_dependencies
 from stock_analyzer.models.artifact import ModelArtifact
 from stock_analyzer.models.bundle import (
+    compute_artifact_identity_hash,
     prune_model_bundle_archive,
     publish_model_bundle,
     verify_artifact_integrity,
@@ -744,6 +745,12 @@ class StockAnalyzerService:
         try:
             resolved_path = str(Path(normalized_path).expanduser().resolve())
             artifact = ModelArtifact.load(resolved_path)
+            # Phase 0 §3.3：APPROVED/CHAMPION 强制非空 content hash——bundle 发布
+            # 路径显式传目录内容 hash；未传时按工件形态自适应 hash 兜底
+            # （legacy alias 为文件 sha256），空 hash 记录无法进入 champion 生命周期。
+            resolved_content_hash = str(artifact_content_hash).strip()
+            if not resolved_content_hash:
+                resolved_content_hash = compute_artifact_identity_hash(resolved_path)
         except Exception as exc:
             return {
                 "registered": False,
@@ -778,7 +785,7 @@ class StockAnalyzerService:
                 role=role,
                 lifecycle_state=lifecycle_state,
                 parent_model_id=resolved_parent,
-                artifact_content_hash=str(artifact_content_hash).strip(),
+                artifact_content_hash=resolved_content_hash,
                 model_id=model_id,
             )
         except Exception as exc:
@@ -806,6 +813,71 @@ class StockAnalyzerService:
             payload=payload,
         )
         return payload
+
+    def _validated_predictor_reload(self, artifact_path: str, *, source: str) -> bool:
+        """predictor 热载前的 registry/完整性前置校验（Phase 0 §3.3，废 auto_load 直载）。
+
+        fail-closed 语义：
+        - bundle/sidecar 完整性校验失败 → 拒绝；
+        - registry 内容 hash 能匹配该工件（任意 role 的记录）→ 放行；
+        - 无匹配且当前无 active champion（bootstrap 阶段）→ 放行并留审计事件；
+        - 无匹配且已存在 active champion → 拒绝（含 champion 记录本身空 hash 的
+          历史脏数据，倒逼重新走受控引导）。
+        """
+
+        normalized = str(artifact_path or "").strip()
+        if not normalized:
+            return False
+        try:
+            verify_artifact_integrity(normalized)
+        except Exception as exc:
+            self._record_audit_event(
+                event_type="predictor_reload_integrity_blocked",
+                level="warning",
+                message="predictor reload blocked by artifact integrity check",
+                payload={
+                    "artifact_path": normalized,
+                    "source": source,
+                    "error": f"{exc.__class__.__name__}: {exc}",
+                },
+            )
+            return False
+
+        resolved = Path(normalized).expanduser().resolve()
+        candidates = {compute_artifact_identity_hash(resolved)}
+        matched = False
+        try:
+            for record in self._model_registry.list_records(
+                limit=200,
+                suppress_read_errors=True,
+            ):
+                if str(record.artifact_content_hash).strip().lower() in candidates:
+                    matched = True
+                    break
+        except Exception:
+            matched = False
+
+        if not matched:
+            champion = self._model_registry.active_champion(suppress_read_errors=True)
+            if champion is not None:
+                self._record_audit_event(
+                    event_type="predictor_reload_unregistered_blocked",
+                    level="warning",
+                    message="predictor reload blocked: artifact has no matching registry record",
+                    payload={
+                        "artifact_path": normalized,
+                        "source": source,
+                        "active_champion_id": champion.model_id,
+                    },
+                )
+                return False
+            self._record_audit_event(
+                event_type="predictor_reload_unregistered_pre_champion",
+                level="info",
+                message="predictor reload allowed in pre-champion bootstrap window",
+                payload={"artifact_path": normalized, "source": source},
+            )
+        return self._pipeline.reload_predictor(artifact_path=normalized)
 
     def bootstrap_baseline_champion(
         self,
@@ -1341,6 +1413,9 @@ class StockAnalyzerService:
             role=ModelRole.CHAMPION,
             lifecycle_state=ModelLifecycleState.APPROVED,
             artifact_uri=artifact_uri,
+            # Phase 0 §3.3：legacy 修复路径同样物化内容 hash——champion 记录
+            # 必须可校验（文件已成功加载，hash 计算失败属异常，向上抛出）。
+            artifact_content_hash=compute_artifact_identity_hash(artifact_uri),
             artifact_created_at=_parse_iso_datetime(artifact.created_at),
             dataset_manifest_id=dataset_manifest_id,
             feature_schema_id=feature_schema_id,
@@ -9201,7 +9276,9 @@ class StockAnalyzerService:
                 source="train_models_single_symbol",
             )
             output_path = str(bundle_payload["artifact_path"])
-            loaded = self._pipeline.reload_predictor(artifact_path=output_path)
+            loaded = self._validated_predictor_reload(
+                output_path, source="train_models_single_symbol"
+            )
             model_registry_payload = bundle_payload["model_registry"]
             return {
                 "mode": "single_symbol",
@@ -9250,8 +9327,9 @@ class StockAnalyzerService:
             lookback_days=lookback_days,
             artifact_path=artifact_path,
         )
-        loaded = self._pipeline.reload_predictor(
-            artifact_path=str(training_payload.get("artifact_path", ""))
+        loaded = self._validated_predictor_reload(
+            str(training_payload.get("artifact_path", "")),
+            source="train_models_full_market_bootstrap",
         )
 
         self._training_bootstrap_state.update(
@@ -11672,7 +11750,9 @@ class StockAnalyzerService:
             )
             resolved_output_path = Path(str(bundle_payload["artifact_path"]))
             predictor_loaded = (
-                self._pipeline.reload_predictor(artifact_path=str(resolved_output_path))
+                self._validated_predictor_reload(
+                    str(resolved_output_path), source="train_learning_manifest"
+                )
                 if load_predictor
                 else False
             )

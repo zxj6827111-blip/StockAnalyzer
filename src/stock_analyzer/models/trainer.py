@@ -1153,6 +1153,107 @@ def _non_conflict_label(
     return 0.0
 
 
+def build_label_policy_diff_report(
+    *,
+    outcomes: Sequence[OutcomeRecord],
+    old_policy: LabelPolicyRecord,
+    new_policy: LabelPolicyRecord,
+) -> dict[str, object]:
+    """新旧标签策略差异报告（Phase 0 §3.2 backfill 验收产物）。
+
+    输入为同一批 outcome 快照（回填前后各算一遍标签），输出变更行数、
+    正负样本比例、冲突比例、成熟时间分布与旧新策略混用检查。
+    纯函数：不读库、不写库，供 NAS backfill 窗口脚本直接调用。
+    """
+
+    def _label(outcome: OutcomeRecord, policy: LabelPolicyRecord) -> float | None:
+        if policy.schema_version.strip() == "1":
+            return _label_from_outcome_schema_v1(outcome=outcome, policy=policy)
+        if policy.schema_version.strip() == "2":
+            return _label_from_outcome_schema_v2(outcome=outcome, policy=policy)
+        raise ValueError(
+            f"unsupported label policy schema_version: {policy.schema_version!r}"
+        )
+
+    def _ratio(numerator: int, denominator: int) -> float:
+        return round(numerator / denominator, 6) if denominator else 0.0
+
+    total = len(outcomes)
+    changed = 0
+    old_positive = 0
+    new_positive = 0
+    labeled_old = 0
+    labeled_new = 0
+    conflict_old = 0
+    conflict_new = 0
+    mature_time_distribution: dict[str, int] = {}
+    missing_mature_time = 0
+
+    for outcome in outcomes:
+        old_value = _label(outcome, old_policy)
+        new_value = _label(outcome, new_policy)
+        if old_value is not None:
+            labeled_old += 1
+            if old_value >= 0.5:
+                old_positive += 1
+        if new_value is not None:
+            labeled_new += 1
+            if new_value >= 0.5:
+                new_positive += 1
+        if old_value != new_value:
+            changed += 1
+        old_conflict = (
+            outcome.max_favorable_excursion is not None
+            and outcome.max_adverse_excursion is not None
+            and float(outcome.max_favorable_excursion) >= float(old_policy.take_profit_pct)
+            and float(outcome.max_adverse_excursion) <= -float(old_policy.stop_loss_pct)
+        )
+        new_conflict = bool(outcome.conflict_flag) if outcome.conflict_flag is not None else (
+            outcome.max_favorable_excursion is not None
+            and outcome.max_adverse_excursion is not None
+            and float(outcome.max_favorable_excursion) >= float(new_policy.take_profit_pct)
+            and float(outcome.max_adverse_excursion) <= -float(new_policy.stop_loss_pct)
+        )
+        if old_conflict:
+            conflict_old += 1
+        if new_conflict:
+            conflict_new += 1
+        if outcome.label_mature_time is None:
+            missing_mature_time += 1
+        else:
+            month_bucket = outcome.label_mature_time.strftime("%Y-%m")
+            mature_time_distribution[month_bucket] = (
+                mature_time_distribution.get(month_bucket, 0) + 1
+            )
+
+    return {
+        "total_outcomes": total,
+        "changed_label_rows": changed,
+        "changed_ratio": _ratio(changed, total),
+        "old_positive_ratio": _ratio(old_positive, labeled_old),
+        "new_positive_ratio": _ratio(new_positive, labeled_new),
+        "old_conflict_count": conflict_old,
+        "new_conflict_count": conflict_new,
+        "old_conflict_ratio": _ratio(conflict_old, labeled_old),
+        "new_conflict_ratio": _ratio(conflict_new, labeled_new),
+        "labeled_old_rows": labeled_old,
+        "labeled_new_rows": labeled_new,
+        "mature_time_distribution": dict(sorted(mature_time_distribution.items())),
+        "missing_mature_time_rows": missing_mature_time,
+        "old_policy_id": old_policy.label_policy_id,
+        "new_policy_id": new_policy.label_policy_id,
+        "old_policy_hash": old_policy.label_policy_hash,
+        "new_policy_hash": new_policy.label_policy_hash,
+        # 旧新策略混用检查说明：同一批 backfill 的快照必须共享单一
+        # label_policy_id（由 snapshot.label_policy_id / manifest 候选分组保证），
+        # 调用方在落盘报告时附带本批快照的 policy id 集合即可断言未混用。
+        "mixed_policy_note": (
+            "single new_policy_id per backfill batch enforced by snapshot "
+            "label_policy_id grouping; assert externally"
+        ),
+    }
+
+
 def _as_float(value: object, default: float = 0.0) -> float:
     if not isinstance(value, (int, float, str, bytes, bytearray)):
         return default

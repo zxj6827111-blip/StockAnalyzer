@@ -141,3 +141,20 @@
 
 - **本地代码窗口（本分支后续 commit）**：B1/B2/B3（标签语义 + conflict_flag 持久化 + schema 迁移）、B5/B6（model_id v3 + APPROVAL 强制 hash + bootstrap 传 hash）、B7（reload 前置校验）、配套测试。
 - **NAS 运行窗口（独立排期，不保证与本审计同周末）**：B4（受影响 outcome backfill + 新旧标签差异报告实跑）、B8（registry 脏数据隔离标记）、B12/B13（数据覆盖报告、updater 状态、champion 三层核验）、单 fold benchmark。
+
+## 10. 本地代码窗口修复落地状态（2026-08-31 同日更新）
+
+| 阻塞项 | 状态 | 落地内容 |
+|---|---|---|
+| B1 入场价语义 | ✅ 已修复（代码） | 新增 `next_tradable_open` basis（`labels/soup.py` + `learning/backfill.py` `_resolve_entry_position`：T+1 开盘入场、停牌顺延、入场日算第 1 天）；`LabelsConfig` 与 `config/default.yaml` 默认值同步切换 |
+| B2 conflict_policy 非显式 | ✅ 已修复（代码） | `LabelsConfig.conflict_policy` 默认 `soft_label`（yaml 同步）；v1/v2 历史契约经 registry 版本化共存，旧快照不受影响 |
+| B3 conflict 标记未持久化 | ✅ 已修复（代码） | `OutcomeRecord.conflict_flag`（None=未计算）；outcome 表 DDL + 幂等迁移（`_migrate_outcome_records_columns`）；backfill 以 MFE/MAE 判定写入；`_OUTCOME_COLUMNS`/序列化同步 |
+| B5 model_id 路径依赖 | ✅ 已修复（代码） | `_build_model_id` v3：payload 剔除 `artifact_uri`，改为 {内容 hash（按形态自适应），created_at, manifest, schema, policy}；策略决策见 §7.2 |
+| B6 champion 空 hash | ✅ 已修复（代码） | `_validate_lifecycle_requirements` 新增 champion 内容身份强制（`_CHAMPION_REQUIRED_FIELDS`）；hash 物化下沉 `register()` 入口 + `update_role`/CAS 晋升路径；legacy 修复路径与服务注册 fallback 均物化 hash |
+| B7 auto_load 直载无校验 | ✅ 已修复（代码） | 新增 `service._validated_predictor_reload`（完整性 fail-closed + registry 内容 hash 匹配 + pre-champion 兼容窗口审计），替换 3 处直调 |
+| B4 差异报告（代码侧） | ✅ 机制就绪 | `trainer.build_label_policy_diff_report`（纯函数：变更行数/正负比例/冲突比例/成熟时间分布/hash 对）；实跑属 NAS 窗口 |
+| B4/B8/B12/B13 | ⏳ NAS 窗口 | 见 §9 |
+
+配套验证：新增 `tests/test_week5_phase0_remediation.py`（9 项）；`test_model_bundle_release.py` 夹具升级为真实文件 uri（champion 契约）。回归：registry/bundle/labels/backfill/store/governance/evolution 报告共 111 项通过；全量套件另行回归；ruff check 全过；mypy 与 main 基线对比无新增错误（41=41）。
+
+**hash 口径统一决策（实现备注）**：registry 内容 hash 按"工件形态自适应"——裸文件（旧 alias）= 单文件 sha256；bundle 工件（`model_v2_*/`）= 目录内容哈希。`verify_artifact_integrity` 与注册物化使用同一 `compute_artifact_identity_hash`，消除"注册算文件、校验算目录"的漂移。

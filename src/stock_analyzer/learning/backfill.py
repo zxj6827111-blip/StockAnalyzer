@@ -44,6 +44,8 @@ class _OutcomeMetrics:
     realized_return: float
     max_favorable_excursion: float
     max_adverse_excursion: float
+    # TP/SL 同期冲突事件标记（Phase 0 §3.2）：持仓窗口内 TP 与 SL 同时命中。
+    conflict: bool = False
 
 
 @dataclass(slots=True)
@@ -1545,6 +1547,7 @@ class LearningBackfillEngine:
                 "realized_return": metrics.realized_return,
                 "max_favorable_excursion": metrics.max_favorable_excursion,
                 "max_adverse_excursion": metrics.max_adverse_excursion,
+                "conflict_flag": metrics.conflict,
                 "outcome_updated_at": as_of,
                 "last_backfill_at": as_of,
                 "backfill_fidelity_tier": (
@@ -1778,13 +1781,27 @@ def _compute_outcome_metrics_for_row(
     realized_return = float(close_window.iloc[-1] / entry_price - 1.0)
     max_favorable_excursion = float(high_window.max() / entry_price - 1.0)
     max_adverse_excursion = float(low_window.min() / entry_price - 1.0)
+    conflict = bool(
+        max_favorable_excursion >= float(label_policy.take_profit_pct)
+        and max_adverse_excursion <= -float(label_policy.stop_loss_pct)
+    )
     mature_time = _decision_time_from_index(ordered.index[last_position])
     return _OutcomeMetrics(
         label_mature_time=mature_time,
         realized_return=round(realized_return, 6),
         max_favorable_excursion=round(max_favorable_excursion, 6),
         max_adverse_excursion=round(max_adverse_excursion, 6),
+        conflict=conflict,
     )
+
+
+def _positive_float(value: object) -> float | None:
+    """解析正数价格；缺失/非数值/非正数一律返回 None（供 fallback 链使用）。"""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    parsed = float(value)
+    return parsed if parsed > 0 else None
 
 
 def _resolve_entry_position(
@@ -1794,6 +1811,24 @@ def _resolve_entry_position(
     label_policy: LabelPolicyRecord,
 ) -> tuple[int | None, float]:
     basis = label_policy.price_basis.strip().lower()
+    if basis == "next_tradable_open":
+        # Phase 0 计划口径：T+1 开盘入场，入场日算持仓第 1 天；停牌日跳过。
+        max_search = min(len(bars), row_position + label_policy.horizon_days + 1)
+        for candidate_position in range(row_position + 1, max_search):
+            row = bars.iloc[candidate_position]
+            if bool(row.get("suspended", False)):
+                continue
+            open_value = _positive_float(row.get("open"))
+            if open_value is not None:
+                return candidate_position, open_value
+            close_value = _positive_float(row.get("close", 0.0))
+            if close_value is not None:
+                return candidate_position, close_value
+        if label_policy.exclude_untradable:
+            return None, 0.0
+        close_value = float(bars["close"].iloc[row_position])
+        return row_position, close_value if close_value > 0 else 0.0
+
     if basis != "next_tradable_vwap":
         close_value = float(bars["close"].iloc[row_position])
         return row_position, close_value if close_value > 0 else 0.0

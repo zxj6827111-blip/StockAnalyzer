@@ -984,8 +984,12 @@ class LabelsConfig(_StrictModel):
     stop_loss_pct: float = 0.05
     horizon_days: int = 10
     exclude_untradable: bool = True
-    pnl_price_basis: str = "close"
-    conflict_policy: str = "bar_shape_heuristic"
+    # Phase 0 §3.2 标签语义：入场=决策日 T 的下一个交易日开盘价（原 close 会以
+    # T 日收盘入场，与"入场日算持仓第 1 天"的收益口径不一致）。
+    pnl_price_basis: str = "next_tradable_open"
+    # TP/SL 同期冲突统一显式 soft label（v2 分发下 bar_shape_heuristic 亦按软值
+    # 处理，但 registry 契约要求记录显式策略名）。
+    conflict_policy: str = "soft_label"
     conflict_soft_label_value: float = 0.5
 
 

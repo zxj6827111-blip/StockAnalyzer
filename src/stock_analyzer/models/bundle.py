@@ -76,6 +76,37 @@ def bundle_id_from_content_hash(content_hash: str) -> str:
     return f"model_v2_{normalized[:20]}"
 
 
+def compute_artifact_file_hash(artifact_path: str | Path) -> str:
+    """单文件 sha256：非 bundle 的裸工件（旧 alias model_v1.json 等）身份输入。
+
+    Phase 0 §3.3：APPROVED 强制非空 content hash 后，legacy 路径在注册时兜底
+    计算文件级 hash，保证身份链闭合。
+    """
+
+    resolved = Path(artifact_path).expanduser().resolve()
+    digest = hashlib.sha256()
+    with resolved.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def compute_artifact_identity_hash(artifact_path: str | Path) -> str:
+    """按工件形态自适应的 registry 内容 hash（Phase 0 §3.3 统一口径）。
+
+    - 裸文件（无 model_v2_* bundle 目录包裹）：单文件 sha256；
+    - bundle 工件：整目录内容哈希（与 bundle_id 同源）。
+
+    registry 物化与 verify_artifact_integrity 均以此为准，消除"注册算文件
+    hash、校验算目录 hash"的口径漂移。
+    """
+
+    resolved = Path(artifact_path).expanduser().resolve()
+    if resolved.parent.name.startswith("model_v2_"):
+        return compute_bundle_content_hash(resolved.parent)
+    return compute_artifact_file_hash(resolved)
+
+
 def verify_artifact_integrity(
     artifact_path: str | Path,
     *,
@@ -99,7 +130,7 @@ def verify_artifact_integrity(
 
     content_hash = ""
     if expected_content_hash.strip():
-        content_hash = compute_bundle_content_hash(resolved.parent)
+        content_hash = compute_artifact_identity_hash(resolved)
         if content_hash != expected_content_hash.strip().lower():
             raise BundleIntegrityError(
                 "bundle content hash mismatch: "
