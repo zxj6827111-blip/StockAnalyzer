@@ -406,3 +406,86 @@ def test_label_policy_diff_report_counts() -> None:
     assert report["mature_time_distribution"] == {"2026-04": 1, "2026-05": 2}
     assert report["old_policy_id"] != report["new_policy_id"]
     assert report["new_policy_hash"] == new_policy.label_policy_hash
+
+
+# ---------------------------------------------------------------------------
+# 符合性检查响应：label_anchor_time / source_data_cutoff 持久化
+# ---------------------------------------------------------------------------
+
+
+def test_outcome_anchor_and_cutoff_roundtrip_and_legacy_migration(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy_store2.duckdb"
+    conn = duckdb.connect(str(db_path))
+    conn.execute(_LEGACY_OUTCOME_DDL)
+    conn.execute(
+        "INSERT INTO outcome_records VALUES "
+        "('snap-legacy2', 'label_matured', '2026-03-31T15:00:00+00:00', 0.07, 0.09, "
+        "-0.03, NULL, NULL, '', NULL, '2026-03-31T15:00:00+00:00', NULL, 'gold', "
+        "'runtime_observed', '')"
+    )
+    conn.close()
+
+    store = SampleStore(db_path=db_path)
+    legacy = store.get_outcome("snap-legacy2")
+    assert legacy is not None
+    # 旧数据无锚点/截止 → None，不冒充已计算。
+    assert legacy.label_anchor_time is None
+    assert legacy.source_data_cutoff is None
+
+    anchor = datetime(2026, 4, 1, 14, 50, tzinfo=UTC)
+    cutoff = datetime(2026, 4, 15, 15, 0, tzinfo=UTC)
+    outcome = OutcomeRecord(
+        snapshot_id="snap-new2",
+        maturity_status=MaturityStatus.LABEL_MATURED,
+        label_mature_time=datetime(2026, 4, 11, 15, 0, tzinfo=UTC),
+        realized_return=0.03,
+        label_anchor_time=anchor,
+        source_data_cutoff=cutoff,
+        conflict_flag=False,
+        backfill_source="phase0_backfill",
+    )
+    store.upsert_outcome(outcome)
+    loaded = store.get_outcome("snap-new2")
+    assert loaded is not None
+    assert loaded.label_anchor_time == anchor
+    assert loaded.source_data_cutoff == cutoff
+
+
+def test_reload_gate_schema_ring_blocks_mismatched_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """schema 第三环：artifact 声明的 schema 与 registry 记录不一致 → 拒绝。"""
+
+    from stock_analyzer.models.registry import (
+        ModelLifecycleState,
+        ModelRole,
+        build_model_registry_record_from_artifact,
+    )
+    from stock_analyzer.runtime.service import StockAnalyzerService
+    from tests.test_service_model_registry import _load_test_config
+
+    service = StockAnalyzerService(config=_load_test_config(tmp_path))
+    monkeypatch.setattr(service._pipeline, "reload_predictor", lambda artifact_path=None: True)
+
+    # 现实链路：artifact 落盘（schema 绑定随文件走）→ 从同一文件构建注册记录。
+    artifact_file = tmp_path / "bundle" / "model.json"
+    artifact_file.parent.mkdir(parents=True, exist_ok=True)
+    artifact = _artifact()
+    artifact.save(artifact_file)
+    record = build_model_registry_record_from_artifact(
+        artifact=artifact,
+        artifact_uri=str(artifact_file),
+        role=ModelRole.CHAMPION,
+        lifecycle_state=ModelLifecycleState.APPROVED,
+        model_id="gate_schema_champ",
+    )
+    service._model_registry.register(record)
+
+    # 同一 artifact（schema 绑定一致）→ 放行。
+    assert service._validated_predictor_reload(str(artifact_file), source="t_ok") is True
+
+    # 篡改 artifact 的 schema hash → 与 registry 记录不一致 → 拒绝。
+    payload = json.loads(artifact_file.read_text(encoding="utf-8"))
+    payload["feature_schema_hash"] = "tampered_hash"
+    artifact_file.write_text(json.dumps(payload), encoding="utf-8")
+    assert service._validated_predictor_reload(str(artifact_file), source="t_bad") is False

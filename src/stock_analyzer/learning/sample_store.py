@@ -217,10 +217,11 @@ class SampleStore:
                     "INSERT INTO outcome_records ("
                     "snapshot_id, maturity_status, label_mature_time, realized_return, "
                     "max_favorable_excursion, max_adverse_excursion, conflict_flag, "
-                    "execution_fill_ratio, realized_slippage_bp, reconcile_status, "
-                    "sim_vs_broker_diff, outcome_updated_at, last_backfill_at, "
-                    "backfill_fidelity_tier, backfill_source, recomputed_feature_schema_id"
-                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    "label_anchor_time, source_data_cutoff, execution_fill_ratio, "
+                    "realized_slippage_bp, reconcile_status, sim_vs_broker_diff, "
+                    "outcome_updated_at, last_backfill_at, backfill_fidelity_tier, "
+                    "backfill_source, recomputed_feature_schema_id"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 ),
                 _outcome_parameters(outcome),
             )
@@ -568,6 +569,8 @@ class SampleStore:
             "max_favorable_excursion DOUBLE, "
             "max_adverse_excursion DOUBLE, "
             "conflict_flag BOOLEAN, "
+            "label_anchor_time VARCHAR, "
+            "source_data_cutoff VARCHAR, "
             "execution_fill_ratio DOUBLE, "
             "realized_slippage_bp DOUBLE, "
             "reconcile_status VARCHAR NOT NULL, "
@@ -634,6 +637,14 @@ class SampleStore:
             return
         if "conflict_flag" not in existing:
             conn.execute("ALTER TABLE outcome_records ADD COLUMN conflict_flag BOOLEAN")
+        if "label_anchor_time" not in existing:
+            conn.execute(
+                "ALTER TABLE outcome_records ADD COLUMN label_anchor_time VARCHAR"
+            )
+        if "source_data_cutoff" not in existing:
+            conn.execute(
+                "ALTER TABLE outcome_records ADD COLUMN source_data_cutoff VARCHAR"
+            )
 
     def _migrate_dataset_manifests_columns(self, conn: _DuckConnection) -> None:
         """旧库逐列补 v2 去重字段（幂等；DuckDB 不支持带约束 ADD COLUMN）。"""
@@ -731,6 +742,8 @@ _OUTCOME_COLUMNS = (
     "max_favorable_excursion",
     "max_adverse_excursion",
     "conflict_flag",
+    "label_anchor_time",
+    "source_data_cutoff",
     "execution_fill_ratio",
     "realized_slippage_bp",
     "reconcile_status",
@@ -846,6 +859,8 @@ def _outcome_parameters(outcome: OutcomeRecord) -> list[object]:
         outcome.max_favorable_excursion,
         outcome.max_adverse_excursion,
         outcome.conflict_flag,
+        _dump_optional_datetime(outcome.label_anchor_time),
+        _dump_optional_datetime(outcome.source_data_cutoff),
         outcome.execution_fill_ratio,
         outcome.realized_slippage_bp,
         outcome.reconcile_status,
@@ -928,7 +943,7 @@ def _row_to_snapshot(row: Sequence[object]) -> SignalSnapshot:
 
 
 def _row_to_outcome(row: Sequence[object]) -> OutcomeRecord:
-    fidelity_raw = row[13]
+    fidelity_raw = row[15]
     conflict_raw = row[6]
     return OutcomeRecord(
         snapshot_id=str(row[0]),
@@ -938,17 +953,19 @@ def _row_to_outcome(row: Sequence[object]) -> OutcomeRecord:
         max_favorable_excursion=_optional_float(row[4]),
         max_adverse_excursion=_optional_float(row[5]),
         conflict_flag=None if conflict_raw is None else bool(conflict_raw),
-        execution_fill_ratio=_optional_float(row[7]),
-        realized_slippage_bp=_optional_float(row[8]),
-        reconcile_status=str(row[9]),
-        sim_vs_broker_diff=_optional_float(row[10]),
-        outcome_updated_at=_parse_datetime(row[11]),
-        last_backfill_at=_parse_optional_datetime(row[12]),
+        label_anchor_time=_parse_optional_datetime(row[7]),
+        source_data_cutoff=_parse_optional_datetime(row[8]),
+        execution_fill_ratio=_optional_float(row[9]),
+        realized_slippage_bp=_optional_float(row[10]),
+        reconcile_status=str(row[11]),
+        sim_vs_broker_diff=_optional_float(row[12]),
+        outcome_updated_at=_parse_datetime(row[13]),
+        last_backfill_at=_parse_optional_datetime(row[14]),
         backfill_fidelity_tier=(
             BackfillFidelityTier(str(fidelity_raw)) if fidelity_raw is not None else None
         ),
-        backfill_source=str(row[14]),
-        recomputed_feature_schema_id=str(row[15]),
+        backfill_source=str(row[16]),
+        recomputed_feature_schema_id=str(row[17]),
     )
 
 

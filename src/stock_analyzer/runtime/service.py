@@ -846,6 +846,7 @@ class StockAnalyzerService:
         resolved = Path(normalized).expanduser().resolve()
         candidates = {compute_artifact_identity_hash(resolved)}
         matched = False
+        matched_record: ModelRegistryRecord | None = None
         try:
             # 不做 limit 截断：记录量级为几十，匹配记录若在列表尾部会误拒。
             for record in self._model_registry.list_records(
@@ -854,9 +855,38 @@ class StockAnalyzerService:
             ):
                 if str(record.artifact_content_hash).strip().lower() in candidates:
                     matched = True
+                    matched_record = record
                     break
         except Exception:
             matched = False
+
+        if matched and matched_record is not None:
+            # Phase 0 §3.3 第三环：feature schema 校验（legacy 无绑定 artifact
+            # 仅在 legacy 合成身份记录下兼容放行，见共享 helper）。
+            artifact = None
+            try:
+                artifact = ModelArtifact.load(resolved)
+            except Exception as exc:
+                self._record_audit_event(
+                    event_type="predictor_reload_schema_blocked",
+                    level="warning",
+                    message="predictor reload blocked: artifact unloadable during "
+                    "schema check",
+                    payload={
+                        "artifact_path": normalized,
+                        "source": source,
+                        "error": f"{exc.__class__.__name__}: {exc}",
+                    },
+                )
+                return False
+            if not self._feature_schema_ring_pass(
+                record=matched_record,
+                artifact=artifact,
+                artifact_path=normalized,
+                source=source,
+                event_prefix="predictor_reload_schema",
+            ):
+                return False
 
         if not matched:
             champion = self._model_registry.active_champion(suppress_read_errors=True)
@@ -880,6 +910,77 @@ class StockAnalyzerService:
             )
         return self._pipeline.reload_predictor(artifact_path=normalized)
 
+    def _feature_schema_ring_pass(
+        self,
+        *,
+        record: ModelRegistryRecord,
+        artifact: ModelArtifact,
+        artifact_path: str,
+        source: str,
+        event_prefix: str,
+    ) -> bool:
+        """Phase 0 §3.3 第三环：feature schema 一致性校验（两个加载门共享）。
+
+        - registry 记录缺 schema 绑定 → 视为脏数据，拒绝；
+        - artifact 声明了 schema → 必须与记录一致，不一致拒绝；
+        - artifact 无 schema 绑定（legacy 修复路径产物）：仅当记录身份本身是
+          ``legacy_production_*`` 合成（该合成即出自同一 artifact）时兼容放行
+          并留审计，否则拒绝。
+        """
+
+        record_schema_hash = str(record.feature_schema_hash).strip()
+        record_schema_id = str(record.feature_schema_id).strip()
+        artifact_schema_hash = str(artifact.feature_schema_hash).strip()
+        artifact_schema_id = str(artifact.feature_schema_id).strip()
+        mismatch_payload: dict[str, object] = {
+            "artifact_path": artifact_path,
+            "source": source,
+            "artifact_schema_id": artifact_schema_id,
+            "artifact_schema_hash": artifact_schema_hash,
+            "registry_schema_id": record_schema_id,
+            "registry_schema_hash": record_schema_hash,
+        }
+        if not record_schema_hash:
+            self._record_audit_event(
+                event_type=f"{event_prefix}_blocked",
+                level="warning",
+                message="load blocked: matching registry record has empty "
+                "feature schema hash",
+                payload=mismatch_payload,
+            )
+            return False
+        if not artifact_schema_hash:
+            if record_schema_id.startswith("legacy_production_"):
+                self._record_audit_event(
+                    event_type=f"{event_prefix}_legacy_compat",
+                    level="info",
+                    message="schema ring not applicable for legacy artifact "
+                    "under synthesized legacy record",
+                    payload=mismatch_payload,
+                )
+                return True
+            self._record_audit_event(
+                event_type=f"{event_prefix}_blocked",
+                level="warning",
+                message="load blocked: artifact has no feature schema binding "
+                "while registry record requires one",
+                payload=mismatch_payload,
+            )
+            return False
+        if (
+            artifact_schema_hash != record_schema_hash
+            or artifact_schema_id != record_schema_id
+        ):
+            self._record_audit_event(
+                event_type=f"{event_prefix}_blocked",
+                level="warning",
+                message="load blocked: feature schema mismatch between artifact "
+                "and registry record",
+                payload=mismatch_payload,
+            )
+            return False
+        return True
+
     def _reload_alias_predictor_validated(self, artifact_path: str, *, source: str) -> bool:
         """旧 alias（model_v1.json 等衍生 payload）的兼容加载入口（Phase 0 §3.3）。
 
@@ -888,7 +989,7 @@ class StockAnalyzerService:
         - sidecar 完整性 fail-closed；
         - alias 自描述 metadata（registry_model_id/bundle_content_hash，见
           ``build_release_alias_payload``）能与 registry 记录对应 → 放行，
-          对应不上 → 拒绝；
+          对应不上 → 拒绝；对应记录还需通过 feature schema 一致性（第三环）；
         - metadata 缺失（历史 alias）：champion 记录 hash 齐全时拒绝；champion
           不存在或本身为历史空 hash 脏数据时兼容放行并留审计（不炸既有部署）。
         """
@@ -896,6 +997,7 @@ class StockAnalyzerService:
         normalized = str(artifact_path or "").strip()
         if not normalized:
             return False
+        resolved = Path(normalized).expanduser().resolve()
         try:
             verify_artifact_integrity(normalized)
         except Exception as exc:
@@ -914,9 +1016,7 @@ class StockAnalyzerService:
         registry_model_id = ""
         bundle_content_hash = ""
         try:
-            payload = json.loads(
-                Path(normalized).expanduser().resolve().read_text(encoding="utf-8")
-            )
+            payload = json.loads(resolved.read_text(encoding="utf-8"))
             metadata = payload.get("metadata") if isinstance(payload, dict) else None
             if isinstance(metadata, dict):
                 registry_model_id = str(metadata.get("registry_model_id", "")).strip()
@@ -926,6 +1026,7 @@ class StockAnalyzerService:
 
         if registry_model_id or bundle_content_hash:
             validated = False
+            matched_record = None
             try:
                 for record in self._model_registry.list_records(
                     limit=None,
@@ -938,10 +1039,11 @@ class StockAnalyzerService:
                     )
                     if id_match or hash_match:
                         validated = True
+                        matched_record = record
                         break
             except Exception:
                 validated = False
-            if not validated:
+            if not validated or matched_record is None:
                 self._record_audit_event(
                     event_type="alias_reload_untraceable_blocked",
                     level="warning",
@@ -954,6 +1056,33 @@ class StockAnalyzerService:
                         "bundle_content_hash": bundle_content_hash,
                     },
                 )
+                return False
+            # Phase 0 §3.3 第三环：feature schema 校验（与 _validated_predictor_
+            # reload 共用 _feature_schema_ring_pass；legacy 合成记录的兼容规则
+            # 亦在 helper 内统一）。
+            artifact = None
+            try:
+                artifact = ModelArtifact.load(resolved)
+            except Exception as exc:
+                self._record_audit_event(
+                    event_type="alias_reload_schema_blocked",
+                    level="warning",
+                    message="alias predictor reload blocked: artifact unloadable "
+                    "during schema check",
+                    payload={
+                        "artifact_path": normalized,
+                        "source": source,
+                        "error": f"{exc.__class__.__name__}: {exc}",
+                    },
+                )
+                return False
+            if not self._feature_schema_ring_pass(
+                record=matched_record,
+                artifact=artifact,
+                artifact_path=normalized,
+                source=source,
+                event_prefix="alias_reload_schema",
+            ):
                 return False
             return self._pipeline.reload_predictor(artifact_path=normalized)
 

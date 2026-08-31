@@ -123,19 +123,21 @@
 
 理由：随机 UUID/ULID 会破坏 `register()` 幂等重放（同 artifact 重注册产生重复记录）与兜底补注册（`service.py:9285`）的去重语义；内容绑定派生 id 同时满足"独立、不可变、不循环依赖（model_id 仅依赖叶子值 content hash，与 bundle_id 为同源兄弟依赖而非循环）"。唯一性由 sha256 全长保证，12 位截断与现有惯例一致且可后续扩展。
 
-## 8. Phase 0 硬门对照（方案 §3.6）
+## 8. Phase 0 硬门对照（方案 §3.6）——2026-08-31 再审计（第二轮，修复落地后）
 
-| 硬门 | 状态 | 对应阻塞项 |
+| 硬门 | 状态 | 依据 / 对应阻塞项 |
 |---|---|---|
-| 标签时间不变量违规 = 0 | 机制在位，实库核验待 NAS | B12 |
-| 受影响标签已重建或明确排除 | 未通过 | B1–B4 |
-| active champion/registry/artifact/hash 完全一致 | 未通过（代码根因 B6/B7 在） | B5–B8 |
-| 新评估产物 model_id 非空 | 待 Phase 1 字段标准化 | Phase 1 |
-| 未处理 artifact_overwritten = 0 | 待 NAS 核验 | B8 |
-| Universe 口径已确定 | **本报告 §7.1 已决策** | B10 关闭 |
-| 数据缺口已修复/排除/标记 | 规则已定稿，落地待 harness | B11 |
-| NAS runtime 读取并实际使用有效 champion | 待 NAS 核验 | B13 |
-| 单 fold benchmark 已完成 | 未开始（Phase 2 前置） | — |
+| 标签时间不变量违规 = 0 | ✅ 机制达标（本地）/ ⏳ 实库核验待 NAS | time_semantics 四不变量 + manifest embargo 在位；实库扫描属 B12 |
+| 受影响标签已重建或明确排除 | 🔶 代码侧就绪，实跑待 NAS | B1–B3 已修；conflict_flag/anchor/cutoff 回填与差异报告由 `scripts/week5_phase0_backfill_runner.py` 在 NAS 窗口执行 |
+| active champion/registry/artifact/hash 完全一致 | 🔶 代码强制已生效，实态待 NAS | B5/B6/B7 已修（model_id v3、champion hash 强制、identity hash 统一、三层核验待做） |
+| 新评估产物 model_id 非空 | ⏳ Phase 1 字段标准化时落地 | — |
+| 未处理 artifact_overwritten = 0 | ⏳ 待 NAS 核验 | B8 |
+| Universe 口径已确定 | ✅ **已决策**（§7.1 扩训练样本） | B10 关闭 |
+| 数据缺口已修复/排除/标记 | 🔶 规则已定稿，落地待 harness | B11（degraded_reasons 随 Phase 1/2） |
+| NAS runtime 读取并实际使用有效 champion | ⏳ 待 NAS 核验 | B13 |
+| 单 fold benchmark 已完成 | ⏳ 未开始（Phase 2 前置） | — |
+
+**再审计结论（本地部分）：B1/B2/B3/B5/B6/B7/B10 七项阻塞的代码侧修复全部落地并通过测试；Phase 0 硬门整体仍未通过**——通过与否取决于 NAS 窗口的实库核验（B4 实跑、B8 隔离、B12/B13、单 fold benchmark）。重训与 walk-forward 禁令维持。
 
 ## 9. 修复执行窗口划分
 
@@ -158,3 +160,21 @@
 配套验证：新增 `tests/test_week5_phase0_remediation.py`（9 项）；`test_model_bundle_release.py` 夹具升级为真实文件 uri（champion 契约）。回归：registry/bundle/labels/backfill/store/governance/evolution 报告共 111 项通过；全量套件另行回归；ruff check 全过；mypy 与 main 基线对比无新增错误（41=41）。
 
 **hash 口径统一决策（实现备注）**：registry 内容 hash 按"工件形态自适应"——裸文件（旧 alias）= 单文件 sha256；bundle 工件（`model_v2_*/`）= 目录内容哈希。`verify_artifact_integrity` 与注册物化使用同一 `compute_artifact_identity_hash`，消除"注册算文件、校验算目录"的漂移。
+
+### 10.1 第二轮增补（符合性检查响应，2026-08-31）
+
+| 项 | 状态 | 内容 |
+|---|---|---|
+| B2 补充：label_anchor_time / source_data_cutoff 持久化 | ✅ | `OutcomeRecord` 新增两字段（None=旧数据未回填）+ outcome 表幂等迁移；backfill 写入（anchor=快照 decision_time、cutoff=回填 as_of）；消除"以 decision_time 隐式承担锚点"偏差——Phase 1 maturity 推算 fallback 可直接消费 |
+| B7 补充：schema 第三环 | ✅ | `_feature_schema_ring_pass` 共享 helper：registry 记录缺 schema → 拒；artifact 声明 schema 且与记录不一致 → 拒；artifact 无绑定（legacy）仅当记录为 `legacy_production_*` 合成身份时兼容放行。接入 `_validated_predictor_reload` 与 alias 门 |
+| 残余风险：release 回滚恢复路径直载 | ✅ | `learning_governance_service` 回滚重载改走 `_reload_alias_predictor_validated`（恢复旧 alias 亦过门），`predictor_restored` 以校验结果为准 |
+| B4 前置：backfill runner | ✅ | 新增 `scripts/week5_phase0_backfill_runner.py`（repair_backfill 重建 + 新旧标签差异报告 + 输入快照三件套落盘，时间戳命名不覆盖），NAS 窗口直接执行 |
+| alias 门第三环测试 | ✅ | `test_reload_gate_schema_ring_blocks_mismatched_binding`（篡改 artifact schema hash → 拒） |
+
+## 11. 偏差签认（对 plan 文本的正式偏离记录）
+
+| plan 条文 | 实现 | 决策 | 状态 |
+|---|---|---|---|
+| §3.3 "model_id 使用独立、不可变的 UUID/ULID" | model_id v3 内容绑定派生（`model_v3_<sha256[:12]>`，payload=内容 hash+created_at+manifest+schema+policy） | 随机 UUID/ULID 会破坏 `register()` 幂等重放与兜底补注册去重语义；内容派生 id 同样满足"独立、不可变、三者不循环依赖"（详见 §7.2）。**符合性检查（2026-08-31）评审意见为可接受** | 签认通过（如需改回随机 id 须重开设计评审） |
+| §3.2 "固定记录 label_anchor_time / source_data_cutoff" | 第一轮仅隐式（decision_time 承担） | 第二轮已补齐显式持久化（见 §10.1） | 偏差已消除 |
+| §3.3 "alias 加载前完成 registry、hash、schema 校验" | 第一轮缺 schema 环 | 第二轮已补齐（见 §10.1） | 偏差已消除 |

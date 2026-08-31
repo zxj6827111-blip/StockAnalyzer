@@ -85,6 +85,9 @@ def test_runtime_history_archive_keeps_only_execution_counts_and_sidecar_pointer
 ) -> None:
     config = _load_test_config(tmp_path)
     service = StockAnalyzerService(config=config)
+    # 清空构造期审计（bootstrap 自愈的 alias 兼容窗口等启动事件），
+    # 本测试只关注"手动记录的执行事件进入归档"的聚合语义。
+    service._audit_events.clear()  # noqa: SLF001
     service._record_audit_event(  # noqa: SLF001
         event_type="pipeline_run",
         trace_id="trace-runtime-execution",

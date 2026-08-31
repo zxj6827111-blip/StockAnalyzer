@@ -165,6 +165,11 @@ class OutcomeRecord(_StrictModel):
     # TP/SL 同期冲突事件标记（Phase 0 §3.2）：None=旧数据未计算；True/False=回填时判定。
     # 训练标签由 policy.conflict_policy 决定软值，本字段仅作事件级追溯。
     conflict_flag: bool | None = None
+    # 标签锚点（= 快照 decision_time，Phase 0 §3.2 显式持久化，供 maturity
+    # 推算 fallback 使用）；None=旧数据未回填。
+    label_anchor_time: datetime | None = None
+    # 回填所用行情数据的截止时点（bars 上限），Phase 0 §3.2 source_data_cutoff。
+    source_data_cutoff: datetime | None = None
     execution_fill_ratio: float | None = None
     realized_slippage_bp: float | None = None
     reconcile_status: str = ""

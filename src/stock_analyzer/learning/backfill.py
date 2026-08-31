@@ -1548,6 +1548,18 @@ class LearningBackfillEngine:
                 "max_favorable_excursion": metrics.max_favorable_excursion,
                 "max_adverse_excursion": metrics.max_adverse_excursion,
                 "conflict_flag": metrics.conflict,
+                # Phase 0 §3.2：显式持久化锚点与数据截止（anchor=决策日 T，
+                # cutoff=回填所用行情的 as_of 上限）；旧记录已有值不覆盖。
+                "label_anchor_time": (
+                    current.label_anchor_time
+                    if current is not None and current.label_anchor_time is not None
+                    else snapshot.decision_time
+                ),
+                "source_data_cutoff": (
+                    current.source_data_cutoff
+                    if current is not None and current.source_data_cutoff is not None
+                    else as_of
+                ),
                 "outcome_updated_at": as_of,
                 "last_backfill_at": as_of,
                 "backfill_fidelity_tier": (
