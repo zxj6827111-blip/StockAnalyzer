@@ -847,8 +847,9 @@ class StockAnalyzerService:
         candidates = {compute_artifact_identity_hash(resolved)}
         matched = False
         try:
+            # 不做 limit 截断：记录量级为几十，匹配记录若在列表尾部会误拒。
             for record in self._model_registry.list_records(
-                limit=200,
+                limit=None,
                 suppress_read_errors=True,
             ):
                 if str(record.artifact_content_hash).strip().lower() in candidates:
@@ -877,6 +878,105 @@ class StockAnalyzerService:
                 message="predictor reload allowed in pre-champion bootstrap window",
                 payload={"artifact_path": normalized, "source": source},
             )
+        return self._pipeline.reload_predictor(artifact_path=normalized)
+
+    def _reload_alias_predictor_validated(self, artifact_path: str, *, source: str) -> bool:
+        """旧 alias（model_v1.json 等衍生 payload）的兼容加载入口（Phase 0 §3.3）。
+
+        alias 与 registry 记录的 artifact_uri 不是同一文件（sidecar 路径改写 +
+        自描述 metadata），文件 hash 不能直接匹配 registry 记录，因此校验策略：
+        - sidecar 完整性 fail-closed；
+        - alias 自描述 metadata（registry_model_id/bundle_content_hash，见
+          ``build_release_alias_payload``）能与 registry 记录对应 → 放行，
+          对应不上 → 拒绝；
+        - metadata 缺失（历史 alias）：champion 记录 hash 齐全时拒绝；champion
+          不存在或本身为历史空 hash 脏数据时兼容放行并留审计（不炸既有部署）。
+        """
+
+        normalized = str(artifact_path or "").strip()
+        if not normalized:
+            return False
+        try:
+            verify_artifact_integrity(normalized)
+        except Exception as exc:
+            self._record_audit_event(
+                event_type="alias_reload_integrity_blocked",
+                level="warning",
+                message="alias predictor reload blocked by artifact integrity check",
+                payload={
+                    "artifact_path": normalized,
+                    "source": source,
+                    "error": f"{exc.__class__.__name__}: {exc}",
+                },
+            )
+            return False
+
+        registry_model_id = ""
+        bundle_content_hash = ""
+        try:
+            payload = json.loads(
+                Path(normalized).expanduser().resolve().read_text(encoding="utf-8")
+            )
+            metadata = payload.get("metadata") if isinstance(payload, dict) else None
+            if isinstance(metadata, dict):
+                registry_model_id = str(metadata.get("registry_model_id", "")).strip()
+                bundle_content_hash = str(metadata.get("bundle_content_hash", "")).strip()
+        except Exception:
+            pass
+
+        if registry_model_id or bundle_content_hash:
+            validated = False
+            try:
+                for record in self._model_registry.list_records(
+                    limit=None,
+                    suppress_read_errors=True,
+                ):
+                    id_match = bool(registry_model_id) and record.model_id == registry_model_id
+                    hash_match = bool(bundle_content_hash) and (
+                        record.artifact_content_hash.strip().lower()
+                        == bundle_content_hash.lower()
+                    )
+                    if id_match or hash_match:
+                        validated = True
+                        break
+            except Exception:
+                validated = False
+            if not validated:
+                self._record_audit_event(
+                    event_type="alias_reload_untraceable_blocked",
+                    level="warning",
+                    message="alias predictor reload blocked: self-described identity "
+                    "does not match any registry record",
+                    payload={
+                        "artifact_path": normalized,
+                        "source": source,
+                        "registry_model_id": registry_model_id,
+                        "bundle_content_hash": bundle_content_hash,
+                    },
+                )
+                return False
+            return self._pipeline.reload_predictor(artifact_path=normalized)
+
+        champion = self._model_registry.active_champion(suppress_read_errors=True)
+        if champion is not None and bool(str(champion.artifact_content_hash).strip()):
+            self._record_audit_event(
+                event_type="alias_reload_unverified_blocked",
+                level="warning",
+                message="alias predictor reload blocked: no self-described identity "
+                "while a hash-verified champion exists",
+                payload={
+                    "artifact_path": normalized,
+                    "source": source,
+                    "active_champion_id": champion.model_id,
+                },
+            )
+            return False
+        self._record_audit_event(
+            event_type="alias_reload_legacy_compat",
+            level="warning",
+            message="legacy alias predictor reload allowed in pre-identity window",
+            payload={"artifact_path": normalized, "source": source},
+        )
         return self._pipeline.reload_predictor(artifact_path=normalized)
 
     def bootstrap_baseline_champion(

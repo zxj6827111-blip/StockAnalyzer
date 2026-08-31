@@ -242,9 +242,12 @@ class RuntimeLearningGovernanceService:
                             ).strip()
                             shadow_entry = self._service._model_registry.get_by_id(shadow_model_id)
                             if shadow_entry is not None and str(shadow_entry.artifact_uri).strip():
+                                # Phase 0 §3.3：发布后热载同样走 registry 前置校验，
+                                # 不直载未经身份校验的文件。
                                 auto_promotion["predictor_loaded"] = bool(
-                                    self._service._pipeline.reload_predictor(
-                                        artifact_path=str(shadow_entry.artifact_uri)
+                                    self._service._validated_predictor_reload(
+                                        str(shadow_entry.artifact_uri),
+                                        source="learning_governance_auto_release",
                                     )
                                 )
                     else:
