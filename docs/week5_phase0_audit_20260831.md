@@ -168,8 +168,9 @@
 | B2 补充：label_anchor_time / source_data_cutoff 持久化 | ✅ | `OutcomeRecord` 新增两字段（None=旧数据未回填）+ outcome 表幂等迁移；backfill 写入（anchor=快照 decision_time、cutoff=回填 as_of）；消除"以 decision_time 隐式承担锚点"偏差——Phase 1 maturity 推算 fallback 可直接消费 |
 | B7 补充：schema 第三环 | ✅ | `_feature_schema_ring_pass` 共享 helper：registry 记录缺 schema → 拒；artifact 声明 schema 且与记录不一致 → 拒；artifact 无绑定（legacy）仅当记录为 `legacy_production_*` 合成身份时兼容放行。接入 `_validated_predictor_reload` 与 alias 门 |
 | 残余风险：release 回滚恢复路径直载 | ✅ | `learning_governance_service` 回滚重载改走 `_reload_alias_predictor_validated`（恢复旧 alias 亦过门），`predictor_restored` 以校验结果为准 |
-| B4 前置：backfill runner | ✅ | 新增 `scripts/week5_phase0_backfill_runner.py`（repair_backfill 重建 + 新旧标签差异报告 + 输入快照三件套落盘，时间戳命名不覆盖），NAS 窗口直接执行 |
-| alias 门第三环测试 | ✅ | `test_reload_gate_schema_ring_blocks_mismatched_binding`（篡改 artifact schema hash → 拒） |
+| B4 前置：backfill runner | ✅ | 新增 `scripts/week5_phase0_backfill_runner.py`（repair_backfill 重建 + 差异报告双口径 + 输入快照落盘，时间戳命名不覆盖），NAS 窗口直接执行 |
+| schema 第三环测试（第三轮修正，KIMIK3 复核） | ✅ | 首版测试篡改 artifact 文件导致 hash 环先拦、schema 环未触发（测试打偏）。已修正：`test_reload_gate_schema_ring_blocks_mismatched_binding` 改为"registry 记录 schema 字段与 artifact 不一致"构造（文件不动 → hash 环过），并断言审计事件 `predictor_reload_schema_blocked`；另补 alias 门触发用例 `test_alias_gate_schema_ring_blocks_mismatched_binding`（断言 `alias_reload_schema_blocked`）。两个门各有独立的 schema 环生效证明 |
+| B4 差异报告口径（第三轮修正，KIMIK3 复核） | ✅ | 首版仅同批 outcome × 双 policy（只捕捉 conflict 策略/schema 版本差，偏保守）。已补主口径 `build_label_policy_migration_report`：重建前 outcome（旧 basis 真实 MFE/MAE）× 旧 policy vs 重建后 × 新 policy——真实迁移差。runner 报告含 `label_policy_diff_migration`（主口径）与 `label_policy_diff_same_batch`（参考）双键；解读影响面以 migration 键为准 |
 
 ## 11. 偏差签认（对 plan 文本的正式偏离记录）
 

@@ -454,7 +454,12 @@ def test_outcome_anchor_and_cutoff_roundtrip_and_legacy_migration(tmp_path: Path
 def test_reload_gate_schema_ring_blocks_mismatched_binding(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """schema 第三环：artifact 声明的 schema 与 registry 记录不一致 → 拒绝。"""
+    """schema 第三环：artifact 声明的 schema 与 registry 记录不一致 → 拒绝。
+
+    构造要点：文件内容不动（identity/hash 环通过），不一致只存在于 registry
+    记录的 schema 绑定上——否则文件被篡改会先被 hash 匹配环拦下，schema 环
+    永远不会触发（KIMIK3 复核指出的测试打偏）。断言到审计事件类型。
+    """
 
     from stock_analyzer.models.registry import (
         ModelLifecycleState,
@@ -481,11 +486,151 @@ def test_reload_gate_schema_ring_blocks_mismatched_binding(
     )
     service._model_registry.register(record)
 
-    # 同一 artifact（schema 绑定一致）→ 放行。
+    # 正例：文件内容与 registry 记录完全一致 → hash 环 + schema 环双过 → 放行。
     assert service._validated_predictor_reload(str(artifact_file), source="t_ok") is True
 
-    # 篡改 artifact 的 schema hash → 与 registry 记录不一致 → 拒绝。
-    payload = json.loads(artifact_file.read_text(encoding="utf-8"))
-    payload["feature_schema_hash"] = "tampered_hash"
-    artifact_file.write_text(json.dumps(payload), encoding="utf-8")
+    # schema 环触发构造：registry 记录的 schema hash 与 artifact 声明不一致
+    # （文件本身未动 → hash 环通过，阻断必须来自 schema 环）。从库里取已物化
+    # content hash 的记录再改写 schema 字段，绕开 champion 身份校验。
+    stored = service._model_registry.get_by_id("gate_schema_champ")
+    assert stored is not None and stored.artifact_content_hash.strip()
+    mismatched = stored.model_copy(update={"feature_schema_hash": "mismatched_hash"})
+    service._model_registry.upsert_repair_record(mismatched)
     assert service._validated_predictor_reload(str(artifact_file), source="t_bad") is False
+    last_event = service._audit_events[-1]
+    assert last_event["event_type"] == "predictor_reload_schema_blocked", last_event
+
+
+def test_alias_gate_schema_ring_blocks_mismatched_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """alias 门 schema 第三环：metadata 指向的记录 schema 与 alias 内容不一致 → 拒。"""
+
+    import json as _json
+
+    from stock_analyzer.models.registry import (
+        ModelLifecycleState,
+        ModelRole,
+        build_model_registry_record_from_artifact,
+    )
+    from stock_analyzer.runtime.service import StockAnalyzerService
+    from tests.test_service_model_registry import _load_test_config
+
+    service = StockAnalyzerService(config=_load_test_config(tmp_path))
+    monkeypatch.setattr(service._pipeline, "reload_predictor", lambda artifact_path=None: True)
+
+    artifact_file = tmp_path / "bundle" / "model.json"
+    artifact_file.parent.mkdir(parents=True, exist_ok=True)
+    artifact = _artifact()
+    artifact.save(artifact_file)
+    record = build_model_registry_record_from_artifact(
+        artifact=artifact,
+        artifact_uri=str(artifact_file),
+        role=ModelRole.CHAMPION,
+        lifecycle_state=ModelLifecycleState.APPROVED,
+        model_id="alias_schema_champ",
+    )
+    service._model_registry.register(record)
+
+    # alias：champion payload + 自描述 metadata（identity 环通过），
+    # 但 alias 内声明的 schema hash 与 registry 记录不一致 → schema 环拒。
+    alias_path = tmp_path / "alias_described.json"
+    payload = _json.loads(artifact_file.read_text(encoding="utf-8"))
+    payload.setdefault("metadata", {})["registry_model_id"] = record.model_id
+    payload["feature_schema_hash"] = "alias_tampered_hash"
+    alias_path.write_text(_json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    assert service._reload_alias_predictor_validated(str(alias_path), source="t_alias") is False
+    last_event = service._audit_events[-1]
+    assert last_event["event_type"] == "alias_reload_schema_blocked", last_event
+
+
+# ---------------------------------------------------------------------------
+# KIMIK3 复核响应：迁移口径差异报告（before×旧 vs after×新）
+# ---------------------------------------------------------------------------
+
+
+def test_label_policy_migration_report_true_delta() -> None:
+    from stock_analyzer.models.trainer import build_label_policy_migration_report
+
+    old_policy = build_label_policy_record(
+        label_name="soup_10d_tp8_before_sl5",
+        take_profit_pct=0.08,
+        stop_loss_pct=0.05,
+        horizon_days=10,
+        price_basis="close",
+        exclude_untradable=True,
+        conflict_policy="bar_shape_heuristic",
+        conflict_soft_label_value=0.5,
+        schema_version="1",
+    )
+    new_policy = build_label_policy_record(
+        label_name="soup_10d_tp8_before_sl5",
+        take_profit_pct=0.08,
+        stop_loss_pct=0.05,
+        horizon_days=10,
+        price_basis="next_tradable_open",
+        exclude_untradable=True,
+        conflict_policy="soft_label",
+        conflict_soft_label_value=0.5,
+        schema_version="2",
+    )
+    # before：旧 basis 时代的 outcome（MFE=0.05 未达 TP 8%→旧标签 0）。
+    # after：重建后新 basis 下同一票 MFE 提升到 0.10 → 新标签 1 → 真实迁移变更。
+    before_changed = OutcomeRecord(
+        snapshot_id="m1",
+        maturity_status=MaturityStatus.LABEL_MATURED,
+        label_mature_time=datetime(2026, 4, 1, 15, 0, tzinfo=UTC),
+        realized_return=0.01,
+        max_favorable_excursion=0.05,
+        max_adverse_excursion=-0.02,
+        backfill_source="legacy",
+    )
+    after_changed = OutcomeRecord(
+        snapshot_id="m1",
+        maturity_status=MaturityStatus.LABEL_MATURED,
+        label_mature_time=datetime(2026, 4, 1, 15, 0, tzinfo=UTC),
+        realized_return=0.03,
+        max_favorable_excursion=0.10,
+        max_adverse_excursion=-0.02,
+        conflict_flag=False,
+        backfill_source="phase0_backfill",
+    )
+    # 不变样本：两侧都纯 SL。
+    unchanged_pair = (
+        OutcomeRecord(
+            snapshot_id="m2",
+            maturity_status=MaturityStatus.LABEL_MATURED,
+            label_mature_time=datetime(2026, 4, 2, 15, 0, tzinfo=UTC),
+            realized_return=-0.07,
+            max_favorable_excursion=0.02,
+            max_adverse_excursion=-0.09,
+            backfill_source="legacy",
+        ),
+        OutcomeRecord(
+            snapshot_id="m2",
+            maturity_status=MaturityStatus.LABEL_MATURED,
+            label_mature_time=datetime(2026, 4, 2, 15, 0, tzinfo=UTC),
+            realized_return=-0.09,
+            max_favorable_excursion=0.03,
+            max_adverse_excursion=-0.11,
+            conflict_flag=False,
+            backfill_source="phase0_backfill",
+        ),
+    )
+
+    report = build_label_policy_migration_report(
+        before_outcomes=[before_changed, unchanged_pair[0]],
+        after_outcomes=[after_changed, unchanged_pair[1]],
+        old_policy=old_policy,
+        new_policy=new_policy,
+    )
+    assert report["caliber"] == "before_x_old_policy_vs_after_x_new_policy"
+    assert report["total_before_outcomes"] == 2
+    assert report["comparable_rows"] == 2
+    # m1：旧 0 → 新 1（入场 basis 迁移引起的真实变化，同批口径看不到）。
+    assert report["changed_label_rows"] == 1
+    assert report["changed_ratio"] == 0.5
+    assert report["old_positive_ratio"] == 0.0
+    assert report["new_positive_ratio"] == 0.5
+    assert report["mature_time_distribution"] == {"2026-04": 2}
+    assert "true migration delta" in str(report["note"])

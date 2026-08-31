@@ -229,9 +229,7 @@ class ModelTrainer:
                 "dataset manifest blocked by quality flags "
                 f"{sorted(blocking_flags)}: {manifest.dataset_manifest_id}"
             )
-        manifest_quality_flags = list(
-            getattr(manifest, "manifest_quality_flags", []) or []
-        )
+        manifest_quality_flags = list(getattr(manifest, "manifest_quality_flags", []) or [])
         if manifest_quality_flags:
             # Reject low-coverage test splits before any model fitting occurs.
             raise ValueError(
@@ -304,21 +302,16 @@ class ModelTrainer:
             feedback_rows.append(feedback_weight)
             sample_weights.append(float(feedback_weight.final_weight))
             outcome_return = outcome.realized_return
-            realized_returns.append(
-                float(outcome_return) if outcome_return is not None else 0.0
-            )
+            realized_returns.append(float(outcome_return) if outcome_return is not None else 0.0)
             # 数据集级统计（P1-b 硬门）：上海决策日与逻辑样本键去重计数。
-            decision_date_sh = (
-                snapshot.decision_time + timedelta(hours=8)
-            ).date().isoformat()
+            decision_date_sh = (snapshot.decision_time + timedelta(hours=8)).date().isoformat()
             dataset_trade_dates.add(decision_date_sh)
             logical_key = f"{snapshot.symbol}|{snapshot.strategy}|{decision_date_sh}"
             if logical_key in dataset_logical_keys:
                 duplicate_logical_rows += 1
                 if str(getattr(manifest, "schema_version", "1")) == "2":
                     raise ValueError(
-                        "v2 manifest contains duplicate logical sample: "
-                        f"{logical_key}"
+                        f"v2 manifest contains duplicate logical sample: {logical_key}"
                     )
             dataset_logical_keys.add(logical_key)
 
@@ -358,28 +351,16 @@ class ModelTrainer:
             "dedup_key": str(getattr(manifest, "dedup_key", "") or ""),
             "dedup_rule": str(getattr(manifest, "dedup_rule", "") or ""),
             "rows_before_dedup": int(getattr(manifest, "rows_before_dedup", 0) or 0),
-            "rows_dropped_by_dedup": int(
-                getattr(manifest, "rows_dropped_by_dedup", 0) or 0
-            ),
-            "blocking_quality_flags": list(
-                getattr(manifest, "blocking_quality_flags", []) or []
-            ),
-            "warning_quality_flags": list(
-                getattr(manifest, "warning_quality_flags", []) or []
-            ),
-            "manifest_quality_flags": list(
-                getattr(manifest, "manifest_quality_flags", []) or []
-            ),
-            "test_split_window_days": int(
-                getattr(manifest, "test_split_window_days", 0) or 0
-            ),
+            "rows_dropped_by_dedup": int(getattr(manifest, "rows_dropped_by_dedup", 0) or 0),
+            "blocking_quality_flags": list(getattr(manifest, "blocking_quality_flags", []) or []),
+            "warning_quality_flags": list(getattr(manifest, "warning_quality_flags", []) or []),
+            "manifest_quality_flags": list(getattr(manifest, "manifest_quality_flags", []) or []),
+            "test_split_window_days": int(getattr(manifest, "test_split_window_days", 0) or 0),
             "test_split_unique_symbol_dates": int(
                 getattr(manifest, "test_split_unique_symbol_dates", 0) or 0
             ),
         }
-        result.metrics["rows_before_dedup"] = float(
-            str(dedup_metadata["rows_before_dedup"])
-        )
+        result.metrics["rows_before_dedup"] = float(str(dedup_metadata["rows_before_dedup"]))
         result.metrics["rows_dropped_by_dedup"] = float(
             str(dedup_metadata["rows_dropped_by_dedup"])
         )
@@ -401,13 +382,9 @@ class ModelTrainer:
             1.0 if nav_report.compounding_explosion else 0.0
         )
         result.metrics["dataset_unique_trade_dates"] = float(len(dataset_trade_dates))
-        result.metrics["dataset_unique_logical_samples"] = float(
-            len(dataset_logical_keys)
-        )
+        result.metrics["dataset_unique_logical_samples"] = float(len(dataset_logical_keys))
         result.metrics["dataset_duplicate_logical_rows"] = float(duplicate_logical_rows)
-        label_values = [
-            float(payload.get(label_column, 0.0)) for payload in row_payloads
-        ]
+        label_values = [float(payload.get(label_column, 0.0)) for payload in row_payloads]
         result.metrics["dataset_hard_positive_count"] = float(
             sum(1 for value in label_values if value == 1.0)
         )
@@ -421,9 +398,7 @@ class ModelTrainer:
 
     def train_on_feature_label(self, features: pd.DataFrame, labels: pd.Series) -> TrainResult:
         aligned = features.join(labels, how="inner")
-        label_column = (
-            str(labels.name) if labels.name is not None else "label_soup_tp_before_sl"
-        )
+        label_column = str(labels.name) if labels.name is not None else "label_soup_tp_before_sl"
         aligned = aligned.dropna(subset=[label_column])
         aligned, time_gate = apply_time_invariants_to_frame(
             aligned,
@@ -1153,6 +1128,132 @@ def _non_conflict_label(
     return 0.0
 
 
+def build_label_policy_migration_report(
+    *,
+    before_outcomes: Sequence[OutcomeRecord],
+    after_outcomes: Sequence[OutcomeRecord],
+    old_policy: LabelPolicyRecord,
+    new_policy: LabelPolicyRecord,
+) -> dict[str, object]:
+    """完整迁移口径差异报告（Phase 0 §3.2，KIMIK3 复核指出的口径补全）。
+
+    与 :func:`build_label_policy_diff_report` 的区别：
+    - 该函数在**同一批**（重建后）outcome 上同时套新旧 policy，只捕捉
+      conflict 策略 + schema 版本差，不捕捉入场 basis 变化引起的 MFE/MAE 差
+      （旧 basis 作用于新 MFE/MAE 是错配，结果偏保守）；
+    - 本函数用**重建前**outcome（旧 basis 时代的真实 MFE/MAE）套旧 policy、
+      **重建后**outcome 套新 policy——这才是"旧标签 → 新标签"的真实迁移差，
+      changed_label_rows 才是 backfill 的真实影响面。
+
+    对齐方式：按 snapshot_id JOIN；两侧都无标签的行不计入变更；仅一侧可标
+    签（数据边界变化）单独计数。纯函数，供 NAS backfill 窗口脚本调用。
+    """
+
+    def _label(outcome: OutcomeRecord, policy: LabelPolicyRecord) -> float | None:
+        if policy.schema_version.strip() == "1":
+            return _label_from_outcome_schema_v1(outcome=outcome, policy=policy)
+        if policy.schema_version.strip() == "2":
+            return _label_from_outcome_schema_v2(outcome=outcome, policy=policy)
+        raise ValueError(f"unsupported label policy schema_version: {policy.schema_version!r}")
+
+    def _ratio(numerator: int, denominator: int) -> float:
+        return round(numerator / denominator, 6) if denominator else 0.0
+
+    before_map = {outcome.snapshot_id: outcome for outcome in before_outcomes}
+    after_map = {outcome.snapshot_id: outcome for outcome in after_outcomes}
+    total = len(before_map)
+    changed = 0
+    old_positive = 0
+    new_positive = 0
+    labeled_old = 0
+    labeled_new = 0
+    comparable = 0
+    only_before_labeled = 0
+    only_after_labeled = 0
+    conflict_old = 0
+    conflict_new = 0
+    mature_time_distribution: dict[str, int] = {}
+    missing_mature_time = 0
+
+    for snapshot_id, before in before_map.items():
+        after = after_map.get(snapshot_id)
+        old_value = _label(before, old_policy)
+        new_value = _label(after, new_policy) if after is not None else None
+        if old_value is not None:
+            labeled_old += 1
+            if old_value >= 0.5:
+                old_positive += 1
+        if new_value is not None:
+            labeled_new += 1
+            if new_value >= 0.5:
+                new_positive += 1
+        if old_value is not None and new_value is not None:
+            comparable += 1
+            if old_value != new_value:
+                changed += 1
+        elif old_value is not None:
+            only_before_labeled += 1
+        elif new_value is not None:
+            only_after_labeled += 1
+        if before.max_favorable_excursion is not None and (
+            before.max_adverse_excursion is not None
+            and float(before.max_favorable_excursion) >= float(old_policy.take_profit_pct)
+            and float(before.max_adverse_excursion) <= -float(old_policy.stop_loss_pct)
+        ):
+            conflict_old += 1
+        if after is not None:
+            after_conflict = (
+                bool(after.conflict_flag)
+                if after.conflict_flag is not None
+                else (
+                    after.max_favorable_excursion is not None
+                    and after.max_adverse_excursion is not None
+                    and float(after.max_favorable_excursion) >= float(new_policy.take_profit_pct)
+                    and float(after.max_adverse_excursion) <= -float(new_policy.stop_loss_pct)
+                )
+            )
+            if after_conflict:
+                conflict_new += 1
+        mature_source = after if after is not None else before
+        if mature_source.label_mature_time is None:
+            missing_mature_time += 1
+        else:
+            month_bucket = mature_source.label_mature_time.strftime("%Y-%m")
+            mature_time_distribution[month_bucket] = (
+                mature_time_distribution.get(month_bucket, 0) + 1
+            )
+
+    return {
+        "caliber": "before_x_old_policy_vs_after_x_new_policy",
+        "total_before_outcomes": total,
+        "comparable_rows": comparable,
+        "changed_label_rows": changed,
+        "changed_ratio": _ratio(changed, comparable),
+        "only_before_labeled_rows": only_before_labeled,
+        "only_after_labeled_rows": only_after_labeled,
+        "old_positive_ratio": _ratio(old_positive, labeled_old),
+        "new_positive_ratio": _ratio(new_positive, labeled_new),
+        "old_conflict_count": conflict_old,
+        "new_conflict_count": conflict_new,
+        "old_conflict_ratio": _ratio(conflict_old, labeled_old),
+        "new_conflict_ratio": _ratio(conflict_new, labeled_new),
+        "labeled_old_rows": labeled_old,
+        "labeled_new_rows": labeled_new,
+        "mature_time_distribution": dict(sorted(mature_time_distribution.items())),
+        "missing_mature_time_rows": missing_mature_time,
+        "old_policy_id": old_policy.label_policy_id,
+        "new_policy_id": new_policy.label_policy_id,
+        "old_policy_hash": old_policy.label_policy_hash,
+        "new_policy_hash": new_policy.label_policy_hash,
+        "note": (
+            "true migration delta: before outcomes (pre-rebuild MFE/MAE under old "
+            "basis) vs after outcomes (post-rebuild under new basis); do not "
+            "interpret changed_label_rows from the same-batch report as the "
+            "migration impact surface"
+        ),
+    }
+
+
 def build_label_policy_diff_report(
     *,
     outcomes: Sequence[OutcomeRecord],
@@ -1171,9 +1272,7 @@ def build_label_policy_diff_report(
             return _label_from_outcome_schema_v1(outcome=outcome, policy=policy)
         if policy.schema_version.strip() == "2":
             return _label_from_outcome_schema_v2(outcome=outcome, policy=policy)
-        raise ValueError(
-            f"unsupported label policy schema_version: {policy.schema_version!r}"
-        )
+        raise ValueError(f"unsupported label policy schema_version: {policy.schema_version!r}")
 
     def _ratio(numerator: int, denominator: int) -> float:
         return round(numerator / denominator, 6) if denominator else 0.0
@@ -1208,11 +1307,15 @@ def build_label_policy_diff_report(
             and float(outcome.max_favorable_excursion) >= float(old_policy.take_profit_pct)
             and float(outcome.max_adverse_excursion) <= -float(old_policy.stop_loss_pct)
         )
-        new_conflict = bool(outcome.conflict_flag) if outcome.conflict_flag is not None else (
-            outcome.max_favorable_excursion is not None
-            and outcome.max_adverse_excursion is not None
-            and float(outcome.max_favorable_excursion) >= float(new_policy.take_profit_pct)
-            and float(outcome.max_adverse_excursion) <= -float(new_policy.stop_loss_pct)
+        new_conflict = (
+            bool(outcome.conflict_flag)
+            if outcome.conflict_flag is not None
+            else (
+                outcome.max_favorable_excursion is not None
+                and outcome.max_adverse_excursion is not None
+                and float(outcome.max_favorable_excursion) >= float(new_policy.take_profit_pct)
+                and float(outcome.max_adverse_excursion) <= -float(new_policy.stop_loss_pct)
+            )
         )
         if old_conflict:
             conflict_old += 1

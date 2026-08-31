@@ -7,9 +7,12 @@
 1. 从 sample store 取候选 outcome（默认 PENDING + 成熟态都重建，或 --only-matured）；
 2. 用 ``LearningBackfillEngine.repair_backfill`` 以当前 label policy（soft_label /
    next_tradable_open）重建受影响 outcome；
-3. 重建前后各算一遍标签（v1 历史 policy vs 新 policy），生成
-   ``build_label_policy_diff_report`` 差异报告；
-4. 全部产物（backfill payload + diff report + 输入快照）落盘 JSON，不覆盖
+3. 差异报告双口径：
+   - ``label_policy_diff_migration``（主口径）：重建前 outcome × 旧 policy vs
+     重建后 outcome × 新 policy——真实迁移差，changed_label_rows 为影响面；
+   - ``label_policy_diff_same_batch``（参考）：同批 outcome × 双 policy——只捕捉
+     conflict 策略/schema 版本差，不捕捉入场 basis 引起的 MFE/MAE 差（偏保守）；
+4. 全部产物（backfill payload + 双差异报告 + 输入快照）落盘 JSON，不覆盖
    已有报告文件（时间戳命名）。
 
 用法（NAS 容器内）：
@@ -35,7 +38,10 @@ from stock_analyzer.learning.label_policy_registry import (  # noqa: E402
     build_label_policy_record,
 )
 from stock_analyzer.learning.sample_schema import MaturityStatus  # noqa: E402
-from stock_analyzer.models.trainer import build_label_policy_diff_report  # noqa: E402
+from stock_analyzer.models.trainer import (  # noqa: E402
+    build_label_policy_diff_report,
+    build_label_policy_migration_report,
+)
 from stock_analyzer.runtime.service import StockAnalyzerService  # noqa: E402
 
 
@@ -147,12 +153,24 @@ def main() -> int:
         service._sample_store.get_outcome(snapshot_id) for snapshot_id in snapshot_ids
     ]
     comparable = [outcome for outcome in after_outcomes if outcome is not None]
+    # 口径一（参考）：同批 outcome × 双 policy——只捕捉 conflict 策略/schema
+    # 版本差，不捕捉入场 basis 变化引起的 MFE/MAE 差（结果偏保守）。
     diff_report = build_label_policy_diff_report(
         outcomes=comparable,
         old_policy=legacy_policy,
         new_policy=active_policy,
     )
-    result["label_policy_diff"] = diff_report
+    result["label_policy_diff_same_batch"] = diff_report
+    # 口径二（主口径，plan §3.2"新旧标签差异"）：重建前 outcome（旧 basis 时代
+    # 的真实 MFE/MAE）× 旧 policy vs 重建后 outcome × 新 policy——真实迁移差。
+    before_outcomes_typed = [outcome for outcome in before_outcomes if outcome is not None]
+    migration_report = build_label_policy_migration_report(
+        before_outcomes=before_outcomes_typed,
+        after_outcomes=comparable,
+        old_policy=legacy_policy,
+        new_policy=active_policy,
+    )
+    result["label_policy_diff_migration"] = migration_report
     result["new_label_policy_id"] = active_policy.label_policy_id
     result["legacy_label_policy_id"] = legacy_policy.label_policy_id
     result["finished_at"] = _now_iso()
@@ -169,7 +187,8 @@ def main() -> int:
     )
     print(
         f"[phase0-backfill] ok={result['ok']} "
-        f"changed={diff_report.get('changed_label_rows')} "
+        f"migration_changed={migration_report.get('changed_label_rows')} "
+        f"same_batch_changed={diff_report.get('changed_label_rows')} "
         f"report={report_path}",
         flush=True,
     )
