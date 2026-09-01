@@ -153,6 +153,12 @@ def main() -> int:
         default=0,
         help="跳过排序后的前 N 条（与 --limit 配合分块续跑）",
     )
+    parser.add_argument(
+        "--fetch-workers",
+        type=int,
+        default=1,
+        help="日线并行预取线程数（i7-7700 8 核建议 6；写库仍顺序，规避 DuckDB 单写者）",
+    )
     args = parser.parse_args()
 
     started_at = _now_iso()
@@ -205,6 +211,7 @@ def main() -> int:
             lambda: engine.repair_backfill(
                 snapshot_ids=snapshot_ids,
                 source="week5_phase0_backfill_runner",
+                fetch_workers=args.fetch_workers,
             ),
             label="repair_backfill",
         )

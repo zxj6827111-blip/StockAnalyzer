@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
 from pathlib import Path
@@ -363,10 +364,9 @@ class LearningBackfillEngine:
         snapshot_ids: Sequence[str],
         as_of: datetime | None = None,
         source: str = "repair_backfill",
+        fetch_workers: int = 1,
     ) -> dict[str, object]:
-        normalized_snapshot_ids = [
-            str(item).strip() for item in snapshot_ids if str(item).strip()
-        ]
+        normalized_snapshot_ids = [str(item).strip() for item in snapshot_ids if str(item).strip()]
         if not normalized_snapshot_ids:
             return {
                 "ok": False,
@@ -403,6 +403,30 @@ class LearningBackfillEngine:
             for outcome in self._sample_store.list_outcomes(snapshot_ids=normalized_snapshot_ids)
         }
         grouped = _group_snapshots_by_symbol(snapshots)
+
+        # 并行预取日线：逐 symbol 顺序拉 bars 是重训/修复的主要耗时（每 symbol
+        # 一次 provider 读取），fetch_workers>1 时用线程池把只读 I/O 并行化；
+        # 写库（outcome upsert）仍保持顺序，规避 DuckDB 单写者锁竞争。
+        bars_cache: dict[str, pd.DataFrame] = {}
+        if fetch_workers > 1 and len(grouped) > 1:
+            with ThreadPoolExecutor(max_workers=fetch_workers) as executor:
+                future_to_symbol = {
+                    executor.submit(
+                        self._fetch_symbol_bars,
+                        symbol,
+                        symbol_snapshots,
+                        effective_as_of,
+                    ): symbol
+                    for symbol, symbol_snapshots in grouped.items()
+                }
+                for future in as_completed(future_to_symbol):
+                    symbol = future_to_symbol[future]
+                    try:
+                        bars_cache[symbol] = future.result()
+                    except Exception:
+                        # 并行取数失败的 symbol 由主循环顺序重试兜底。
+                        bars_cache[symbol] = pd.DataFrame()
+
         updated = 0
         promoted_label_matured = 0
         promoted_fully_matured = 0
@@ -410,16 +434,9 @@ class LearningBackfillEngine:
 
         for symbol, symbol_snapshots in grouped.items():
             try:
-                lookback_days = _required_lookback_days(
-                    snapshots=symbol_snapshots,
-                    as_of=effective_as_of,
-                    label_policy_resolver=self._label_policy_for_snapshot,
-                )
-                bars = self._fetch_daily_bars(
-                    symbol=symbol,
-                    lookback_days=lookback_days,
-                    end_date=effective_as_of.date(),
-                )
+                bars = bars_cache.get(symbol)
+                if bars is None or bars.empty:
+                    bars = self._fetch_symbol_bars(symbol, symbol_snapshots, effective_as_of)
                 for snapshot in symbol_snapshots:
                     repaired = self._repair_snapshot_with_bars(
                         snapshot=snapshot,
@@ -633,9 +650,7 @@ class LearningBackfillEngine:
                 int(self._config.training.min_test_split_unique_symbol_dates),
             ),
         )
-        split_counts = {
-            item.split_name: int(item.row_count) for item in manifest.split_plan
-        }
+        split_counts = {item.split_name: int(item.row_count) for item in manifest.split_plan}
         return {
             "ok": True,
             "mode": "build_trainable_manifest",
@@ -658,9 +673,7 @@ class LearningBackfillEngine:
                 else ""
             ),
             "time_window_end": (
-                manifest.time_window_end.isoformat()
-                if manifest.time_window_end is not None
-                else ""
+                manifest.time_window_end.isoformat() if manifest.time_window_end is not None else ""
             ),
             "errors": [],
         }
@@ -975,9 +988,7 @@ class LearningBackfillEngine:
             contexts_enriched += int(result.get("contexts_enriched", 0))
             execution_updates += int(result.get("execution_updates", 0))
             command_events_linked += int(result.get("command_events_linked", 0))
-            portfolio_trade_events_linked += int(
-                result.get("portfolio_trade_events_linked", 0)
-            )
+            portfolio_trade_events_linked += int(result.get("portfolio_trade_events_linked", 0))
             reconcile_updates += int(result.get("reconcile_updates", 0))
             reconcile_promoted += int(result.get("reconcile_promoted", 0))
             for item in result.get("symbols", []):
@@ -1085,9 +1096,9 @@ class LearningBackfillEngine:
         recommendation_reference = _coerce_mapping(command_update.get("recommendation_reference"))
         snapshot_id = _extract_archive_snapshot_id(recommendation_reference)
         if not snapshot_id:
-            recommendation_id = str(
-                recommendation_reference.get("recommendation_id", "")
-            ).strip().upper()
+            recommendation_id = (
+                str(recommendation_reference.get("recommendation_id", "")).strip().upper()
+            )
             snapshot_id = str(recommendation_snapshot_ids.get(recommendation_id, "")).strip()
         if not snapshot_id:
             return {
@@ -1571,9 +1582,7 @@ class LearningBackfillEngine:
                 )
                 or source,
                 "recomputed_feature_schema_id": (
-                    str(current.recomputed_feature_schema_id).strip()
-                    if current is not None
-                    else ""
+                    str(current.recomputed_feature_schema_id).strip() if current is not None else ""
                 )
                 or (
                     snapshot.feature_schema_id
@@ -1743,6 +1752,25 @@ class LearningBackfillEngine:
                 ):
                     best = candidate
         return best
+
+    def _fetch_symbol_bars(
+        self,
+        symbol: str,
+        symbol_snapshots: Sequence[SignalSnapshot],
+        as_of: datetime,
+    ) -> pd.DataFrame:
+        """单 symbol 的日线拉取（repair 预取并行单元，与顺序路径同一实现）。"""
+
+        lookback_days = _required_lookback_days(
+            snapshots=symbol_snapshots,
+            as_of=as_of,
+            label_policy_resolver=self._label_policy_for_snapshot,
+        )
+        return self._fetch_daily_bars(
+            symbol=symbol,
+            lookback_days=lookback_days,
+            end_date=as_of.date(),
+        )
 
     def _fetch_daily_bars(
         self,
