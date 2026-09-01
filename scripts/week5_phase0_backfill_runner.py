@@ -25,6 +25,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -37,7 +39,8 @@ from stock_analyzer.learning.backfill import LearningBackfillEngine  # noqa: E40
 from stock_analyzer.learning.label_policy_registry import (  # noqa: E402
     build_label_policy_record,
 )
-from stock_analyzer.learning.sample_schema import MaturityStatus  # noqa: E402
+from stock_analyzer.learning.sample_schema import MaturityStatus, OutcomeRecord  # noqa: E402
+from stock_analyzer.learning.sample_store import SampleStore  # noqa: E402
 from stock_analyzer.models.trainer import (  # noqa: E402
     build_label_policy_diff_report,
     build_label_policy_migration_report,
@@ -47,6 +50,56 @@ from stock_analyzer.runtime.service import StockAnalyzerService  # noqa: E402
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _is_lock_conflict(exc: BaseException) -> bool:
+    text = f"{exc.__class__.__name__}: {exc}".lower()
+    return "conflicting lock" in text or "could not set lock" in text
+
+
+def _run_with_lock_retry(
+    fn: Callable[[], Any],
+    *,
+    label: str,
+    attempts: int = 12,
+    base_sleep: float = 20.0,
+) -> Any:
+    """DuckDB 单写者冲突重试：API 服务进程与调度器会周期性持写锁，
+    runner 侧必须 backoff 重试而不是整体崩溃（2026-08-31 首跑即栽在此）。"""
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            if not _is_lock_conflict(exc):
+                raise
+            if attempt >= attempts:
+                raise
+            sleep_for = min(base_sleep * attempt, 180.0)
+            print(
+                f"[phase0-backfill] {label}: lock conflict "
+                f"(attempt {attempt}/{attempts}); retry in {sleep_for:.0f}s",
+                flush=True,
+            )
+            time.sleep(sleep_for)
+    raise RuntimeError("unreachable")
+
+
+def _list_outcomes_by_ids(
+    store: SampleStore,
+    snapshot_ids: list[str],
+    *,
+    batch_size: int = 2000,
+) -> dict[str, OutcomeRecord]:
+    """分批 list_outcomes：84,900 条逐条 get_outcome 会开 8 万次读写连接并放大
+    锁冲突窗口；这里收敛为每批一次查询，只读用途下锁暴露最小化。"""
+
+    rows: dict[str, OutcomeRecord] = {}
+    for start in range(0, len(snapshot_ids), batch_size):
+        chunk = snapshot_ids[start : start + batch_size]
+        for outcome in store.list_outcomes(snapshot_ids=chunk):
+            rows[outcome.snapshot_id] = outcome
+    return rows
 
 
 def _select_outcome_snapshot_ids(
@@ -100,17 +153,24 @@ def main() -> int:
         label_policy_registry=service._label_policy_registry,
     )
 
-    snapshot_ids = _select_outcome_snapshot_ids(
-        service, only_matured=args.only_matured, limit=args.limit
+    snapshot_ids = _run_with_lock_retry(
+        lambda: _select_outcome_snapshot_ids(
+            service, only_matured=args.only_matured, limit=args.limit
+        ),
+        label="select_candidates",
     )
     print(f"[phase0-backfill] candidate outcomes: {len(snapshot_ids)}", flush=True)
 
     # 输入快照：重建前的 outcome 原样留存（供差异报告与审计追溯）。
-    before_outcomes = [
-        service._sample_store.get_outcome(snapshot_id) for snapshot_id in snapshot_ids
-    ]
+    # 批量分批查询 + 锁冲突重试，避免逐条 get_outcome 放大锁窗口。
+    before_map = _run_with_lock_retry(
+        lambda: _list_outcomes_by_ids(service._sample_store, snapshot_ids),
+        label="before_snapshot",
+    )
     before_payload = [
-        outcome.model_dump(mode="json") for outcome in before_outcomes if outcome is not None
+        before_map[snapshot_id].model_dump(mode="json")
+        for snapshot_id in snapshot_ids
+        if snapshot_id in before_map
     ]
 
     result: dict[str, Any] = {
@@ -122,9 +182,12 @@ def main() -> int:
         "limit": args.limit,
     }
     if snapshot_ids:
-        repair_payload = engine.repair_backfill(
-            snapshot_ids=snapshot_ids,
-            source="week5_phase0_backfill_runner",
+        repair_payload = _run_with_lock_retry(
+            lambda: engine.repair_backfill(
+                snapshot_ids=snapshot_ids,
+                source="week5_phase0_backfill_runner",
+            ),
+            label="repair_backfill",
         )
         result["repair"] = repair_payload
         result["ok"] = bool(repair_payload.get("ok", False))
@@ -149,10 +212,13 @@ def main() -> int:
         conflict_soft_label_value=config.labels.conflict_soft_label_value,
         schema_version="1",
     )
-    after_outcomes = [
-        service._sample_store.get_outcome(snapshot_id) for snapshot_id in snapshot_ids
+    after_map = _run_with_lock_retry(
+        lambda: _list_outcomes_by_ids(service._sample_store, snapshot_ids),
+        label="after_snapshot",
+    )
+    comparable = [
+        after_map[snapshot_id] for snapshot_id in snapshot_ids if snapshot_id in after_map
     ]
-    comparable = [outcome for outcome in after_outcomes if outcome is not None]
     # 口径一（参考）：同批 outcome × 双 policy——只捕捉 conflict 策略/schema
     # 版本差，不捕捉入场 basis 变化引起的 MFE/MAE 差（结果偏保守）。
     diff_report = build_label_policy_diff_report(
@@ -163,7 +229,9 @@ def main() -> int:
     result["label_policy_diff_same_batch"] = diff_report
     # 口径二（主口径，plan §3.2"新旧标签差异"）：重建前 outcome（旧 basis 时代
     # 的真实 MFE/MAE）× 旧 policy vs 重建后 outcome × 新 policy——真实迁移差。
-    before_outcomes_typed = [outcome for outcome in before_outcomes if outcome is not None]
+    before_outcomes_typed = [
+        before_map[snapshot_id] for snapshot_id in snapshot_ids if snapshot_id in before_map
+    ]
     migration_report = build_label_policy_migration_report(
         before_outcomes=before_outcomes_typed,
         after_outcomes=comparable,
