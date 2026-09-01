@@ -224,8 +224,12 @@ def main() -> int:
         result["errors"] = []
 
     # 差异报告：v1 历史 policy（close/bar_shape_heuristic 时代）vs 当前 policy。
-    active_policy = service._label_policy_registry.register_from_config(
-        config.labels, schema_version="2"
+    # 注册会写 label_policy_registry 表，同样纳入锁冲突重试（14:37 首块曾栽在此）。
+    active_policy = _run_with_lock_retry(
+        lambda: service._label_policy_registry.register_from_config(
+            config.labels, schema_version="2"
+        ),
+        label="register_policy",
     )
     legacy_policy = build_label_policy_record(
         label_name=config.labels.primary,
