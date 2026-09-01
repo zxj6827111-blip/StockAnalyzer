@@ -107,8 +107,14 @@ def _select_outcome_snapshot_ids(
     *,
     only_matured: bool,
     limit: int,
+    offset: int,
 ) -> list[str]:
-    """选择需重建的 outcome：默认全量（PENDING 会自然跳过不成熟样本）。"""
+    """选择需重建的 outcome：默认全量（PENDING 会自然跳过不成熟样本）。
+
+    大库下全量 list_outcomes 一次装载 8 万+ 记录会撑爆容器内存
+    （2026-09-01 实测 84,900 条直接 OOMKilled），故支持 offset+limit 分块；
+    分块顺序稳定（outcome_updated_at, snapshot_id），断点续跑幂等。
+    """
 
     outcomes = [
         outcome
@@ -116,6 +122,8 @@ def _select_outcome_snapshot_ids(
         if outcome.maturity_status != MaturityStatus.PENDING or not only_matured
     ]
     outcomes.sort(key=lambda item: (item.outcome_updated_at, item.snapshot_id))
+    if offset > 0:
+        outcomes = outcomes[offset:]
     if limit > 0:
         outcomes = outcomes[:limit]
     return [outcome.snapshot_id for outcome in outcomes]
@@ -139,6 +147,12 @@ def main() -> int:
         default=0,
         help="最多重建 N 条（0=不限制）；分批执行时按 outcome_updated_at 升序截取",
     )
+    parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="跳过排序后的前 N 条（与 --limit 配合分块续跑）",
+    )
     args = parser.parse_args()
 
     started_at = _now_iso()
@@ -155,11 +169,15 @@ def main() -> int:
 
     snapshot_ids = _run_with_lock_retry(
         lambda: _select_outcome_snapshot_ids(
-            service, only_matured=args.only_matured, limit=args.limit
+            service, only_matured=args.only_matured, limit=args.limit, offset=args.offset
         ),
         label="select_candidates",
     )
-    print(f"[phase0-backfill] candidate outcomes: {len(snapshot_ids)}", flush=True)
+    print(
+        f"[phase0-backfill] candidate outcomes: {len(snapshot_ids)} "
+        f"(offset={args.offset}, limit={args.limit})",
+        flush=True,
+    )
 
     # 输入快照：重建前的 outcome 原样留存（供差异报告与审计追溯）。
     # 批量分批查询 + 锁冲突重试，避免逐条 get_outcome 放大锁窗口。
@@ -180,6 +198,7 @@ def main() -> int:
         "candidate_count": len(snapshot_ids),
         "only_matured": args.only_matured,
         "limit": args.limit,
+        "offset": args.offset,
     }
     if snapshot_ids:
         repair_payload = _run_with_lock_retry(
