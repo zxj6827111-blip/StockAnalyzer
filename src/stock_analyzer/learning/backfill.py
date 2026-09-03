@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time as _time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -37,6 +38,17 @@ from stock_analyzer.learning.sample_store import SampleStore
 
 _BUSINESS_CLOSE_UTC = time(15, 0, tzinfo=UTC)
 _LabelPolicyResolver = Callable[[SignalSnapshot], LabelPolicyRecord]
+
+_LOCK_RETRY_ATTEMPTS = 20
+_LOCK_RETRY_BASE_SLEEP = 5.0
+_LOCK_RETRY_MAX_SLEEP = 60.0
+
+
+def _is_lock_conflict(exc: BaseException) -> bool:
+    """DuckDB 单写者锁冲突识别：生产调度器/API 周期性持写锁，
+    逐 symbol 写入撞锁时应退避重试而不是把整块判失败。"""
+    text = f"{exc.__class__.__name__}: {exc}".lower()
+    return "conflicting lock" in text or "could not set lock" in text
 
 
 @dataclass(slots=True)
@@ -433,26 +445,36 @@ class LearningBackfillEngine:
         errors: list[str] = []
 
         for symbol, symbol_snapshots in grouped.items():
-            try:
-                bars = bars_cache.get(symbol)
-                if bars is None or bars.empty:
-                    bars = self._fetch_symbol_bars(symbol, symbol_snapshots, effective_as_of)
-                for snapshot in symbol_snapshots:
-                    repaired = self._repair_snapshot_with_bars(
-                        snapshot=snapshot,
-                        outcome=outcome_map.get(snapshot.snapshot_id),
-                        bars=bars,
-                        as_of=effective_as_of,
-                        source=normalized_source,
-                    )
-                    if bool(repaired["updated"]):
-                        updated += 1
-                    if bool(repaired["promoted_label_matured"]):
-                        promoted_label_matured += 1
-                    if bool(repaired["promoted_fully_matured"]):
-                        promoted_fully_matured += 1
-            except Exception as exc:
-                errors.append(f"{symbol}:{exc}")
+            symbol_error: BaseException | None = None
+            for attempt in range(_LOCK_RETRY_ATTEMPTS):
+                try:
+                    bars = bars_cache.get(symbol)
+                    if bars is None or bars.empty:
+                        bars = self._fetch_symbol_bars(symbol, symbol_snapshots, effective_as_of)
+                    for snapshot in symbol_snapshots:
+                        repaired = self._repair_snapshot_with_bars(
+                            snapshot=snapshot,
+                            outcome=outcome_map.get(snapshot.snapshot_id),
+                            bars=bars,
+                            as_of=effective_as_of,
+                            source=normalized_source,
+                        )
+                        if bool(repaired["updated"]):
+                            updated += 1
+                        if bool(repaired["promoted_label_matured"]):
+                            promoted_label_matured += 1
+                        if bool(repaired["promoted_fully_matured"]):
+                            promoted_fully_matured += 1
+                    symbol_error = None
+                    break
+                except Exception as exc:
+                    symbol_error = exc
+                    if not _is_lock_conflict(exc) or attempt >= _LOCK_RETRY_ATTEMPTS - 1:
+                        break
+                    sleep_for = min(_LOCK_RETRY_BASE_SLEEP * (2 ** attempt), _LOCK_RETRY_MAX_SLEEP)
+                    _time.sleep(sleep_for)
+            if symbol_error is not None:
+                errors.append(f"{symbol}:{symbol_error}")
 
         return {
             "ok": not errors and not missing_snapshot_ids,
