@@ -32,6 +32,7 @@ import pandas as pd
 
 from stock_analyzer.config import get_config
 from stock_analyzer.learning.feature_schema_registry import FeatureSchemaRegistry
+from stock_analyzer.learning.gate_metrics import gate_metrics_batch
 from stock_analyzer.learning.label_policy_registry import LabelPolicyRegistry
 from stock_analyzer.learning.sample_store import SampleStore
 from stock_analyzer.learning.scoring_eval import ManifestEligibility, resolve_manifest_eligibility
@@ -83,63 +84,6 @@ def _manifest_items(conn, manifest_id: str) -> tuple[int, list[str], list[str | 
     matures = [None if r[1] is None else str(r[1]) for r in rows]
     missing = sum(1 for row in rows if row[1] is None)
     return missing, decisions, matures
-
-
-def _gate_metrics_for_symbols(
-    market_db: str, symbols: list[str], day: date
-) -> dict[str, dict[str, float]]:
-    """从 market.duckdb 现算每 symbol 的 bias_ma5 / atr_distance（as-of day）。
-
-    窗口：day 及之前 30 个自然日内取最近 20 根日线；ma5=最近 5 收盘均值、
-    atr14=最近 14 日 TR 均值（首日 TR 用 high-low）——与特征工程的近端口径一致。
-    """
-
-    conn = _connect_read_only(market_db)
-    try:
-        rows = conn.execute(
-            """
-            WITH picked AS (
-                SELECT symbol, date, close, high, low
-                FROM (
-                    SELECT symbol, date, close, high, low,
-                           ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY date DESC) AS rn
-                    FROM daily_bars
-                    WHERE symbol IN (SELECT UNNEST(?))
-                      AND date <= CAST(? AS DATE)
-                      AND date >= CAST(? AS DATE) - INTERVAL 30 DAY
-                ) t
-                WHERE rn <= 20
-            )
-            SELECT symbol, date, close, high, low FROM picked ORDER BY symbol, date
-            """,
-            [list(symbols), day.isoformat(), day.isoformat()],
-        ).fetchall()
-    finally:
-        conn.close()
-    by_symbol: dict[str, list[tuple[float, float, float]]] = {}
-    dates: dict[str, date] = {}
-    for symbol, _d, close, high, low in rows:
-        by_symbol.setdefault(str(symbol), []).append((float(high), float(low), float(close)))
-        dates[str(symbol)] = _d if isinstance(_d, date) else date.fromisoformat(str(_d))
-    metrics: dict[str, dict[str, float]] = {}
-    for symbol, series in by_symbol.items():
-        closes = [item[2] for item in series]
-        if len(closes) < 5 or closes[-1] <= 0:
-            continue
-        ma5 = sum(closes[-5:]) / 5.0
-        trs: list[float] = []
-        for i in range(1, len(series)):
-            prev_close = series[i - 1][2]
-            high_i, low_i, _ = series[i]
-            trs.append(max(high_i - low_i, abs(high_i - prev_close), abs(low_i - prev_close)))
-        if not trs:
-            continue
-        atr14 = sum(trs[-14:]) / len(trs[-14:])
-        close = closes[-1]
-        bias = abs(close / ma5 - 1.0) if ma5 > 0 else 0.0
-        atr_distance = abs(close - ma5) / atr14 if atr14 > 0 else 0.0
-        metrics[symbol] = {"bias_ma5": bias, "atr_distance": atr_distance}
-    return metrics
 
 
 def main() -> int:
@@ -249,6 +193,28 @@ def main() -> int:
     daily_records: list[dict[str, object]] = []
     score_distribution: list[dict[str, float]] = []
 
+    # 批量预取全部 (symbol, as_of) 的过热指标（一次 SQL，本地现算）。
+    print("[1.5] batch-fetching gate metrics...", flush=True)
+    universe_symbols = sorted(
+        {
+            str(item)
+            for item in store.list_snapshot_ids()
+            if str(item)
+        }
+    )
+    universe_symbols = sorted(
+        {
+            str(r[0])
+            for r in _connect_read_only(args.protocol_db)
+            .execute("SELECT DISTINCT symbol FROM signal_snapshots")
+            .fetchall()
+        }
+    )
+    gate_metrics_by_day_symbol = gate_metrics_batch(
+        args.market_db, universe_symbols, eval_dates
+    )
+    print(f"[1.5] gate metrics: {len(gate_metrics_by_day_symbol)} entries", flush=True)
+
     for day in eval_dates:
         candidates_list = [
             e for e in eligible
@@ -287,7 +253,10 @@ def main() -> int:
         scores = predictor.predict_rows(pd.DataFrame(rows))["meta"]
         symbols = [s.symbol for s in snapshots]
         prob_scores = [round(float(s) * 100.0, 2) for s in scores]
-        gate_metrics = _gate_metrics_for_symbols(args.market_db, symbols, day)
+        gate_metrics = {
+            symbol: gate_metrics_by_day_symbol.get(f"{symbol}|{day.isoformat()}", {})
+            for symbol in symbols
+        }
 
         day_scores = [p for p in prob_scores if p >= 40.0]
         if day_scores:
