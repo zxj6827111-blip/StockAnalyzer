@@ -27,7 +27,7 @@ import argparse
 import json
 import sys
 import time
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 
 import duckdb
@@ -42,10 +42,12 @@ from stock_analyzer.data.tushare_provider import (  # noqa: E402
     _HttpTushareProApi,
     _resolve_tushare_token,
 )
+from stock_analyzer.data.warehouse_enrichment import (  # noqa: E402
+    BACKGROUND_SOURCE_BULK,
+    enrich_background_for_dates,
+)
 
 MARKET_DB = "/app/artifacts/warehouse/market.duckdb"
-BG_SOURCE = "tushare_pro_bulk_backfill"
-BG_MISSING = "optional:holder_count"
 
 
 def _trading_dates(con, start: date, end: date) -> list[date]:
@@ -54,117 +56,6 @@ def _trading_dates(con, start: date, end: date) -> list[date]:
         [start, end],
     ).fetchall()
     return [r[0] if isinstance(r[0], date) else date.fromisoformat(str(r[0])) for r in rows]
-
-
-def _call(http, api_name: str, **params: object):
-    return http._call(api_name, **params)  # noqa: SLF001 - 复用内置 host 容错客户端
-
-
-def _bulk_maps(http, day: date) -> dict[str, object]:
-    yyyymmdd = day.strftime("%Y%m%d")
-
-    block_amount: dict[str, float] = {}
-    block_volume: dict[str, float] = {}
-    frame = _call(http, "block_trade", trade_date=yyyymmdd)
-    if frame is not None and not frame.empty:
-        for row in frame.to_dict("records"):
-            code = str(row.get("ts_code", "")).split(".")[0]
-            if not code:
-                continue
-            amount = float(row.get("amount") or 0.0) * 1e4  # 万元→元
-            volume = float(row.get("vol") or 0.0) * 1e4  # 万股→股
-            block_amount[code] = block_amount.get(code, 0.0) + amount
-            block_volume[code] = block_volume.get(code, 0.0) + volume
-
-    financing: dict[str, float] = {}
-    frame = _call(http, "margin_detail", trade_date=yyyymmdd)
-    if frame is not None and not frame.empty:
-        for row in frame.to_dict("records"):
-            code = str(row.get("ts_code", "")).split(".")[0]
-            if not code:
-                continue
-            financing[code] = float(row.get("rzye") or 0.0)  # 元
-
-    dragon: dict[str, float] = {}
-    frame = _call(http, "top_list", trade_date=yyyymmdd)
-    if frame is not None and not frame.empty:
-        for row in frame.to_dict("records"):
-            code = str(row.get("ts_code", "")).split(".")[0]
-            if code:
-                dragon[code] = 1.0
-
-    return {
-        "block_amount": block_amount,
-        "block_volume": block_volume,
-        "financing": financing,
-        "dragon": dragon,
-    }
-
-
-def _update_date(con, day: date, maps: dict[str, object], as_of: str) -> int:
-    block_amount: dict[str, float] = maps["block_amount"]  # type: ignore[assignment]
-    block_volume: dict[str, float] = maps["block_volume"]  # type: ignore[assignment]
-    financing: dict[str, float] = maps["financing"]  # type: ignore[assignment]
-    dragon: dict[str, float] = maps["dragon"]  # type: ignore[assignment]
-
-    con.execute("BEGIN TRANSACTION")
-    try:
-        con.execute(
-            "UPDATE daily_bars SET block_trade_net=0.0, block_trade_amount=0.0, "
-            "block_trade_volume=0.0, financing_balance=0.0, "
-            "margin_financing_balance=0.0, dragon_tiger_flag=0.0, northbound_net=0.0 "
-            "WHERE date = ?",
-            [day],
-        )
-        if block_amount:
-            con.register("bg_stage_block", _stage_frame(block_amount, block_volume))
-            con.execute(
-                "UPDATE daily_bars SET "
-                "block_trade_net=stage.amount, block_trade_amount=stage.amount, "
-                "block_trade_volume=stage.volume "
-                "FROM bg_stage_block stage "
-                "WHERE daily_bars.date = ? AND daily_bars.symbol = stage.symbol",
-                [day],
-            )
-        if financing:
-            con.register("bg_stage_fin", _stage_frame(financing, {}))
-            con.execute(
-                "UPDATE daily_bars SET "
-                "financing_balance=stage.amount, margin_financing_balance=stage.amount "
-                "FROM bg_stage_fin stage "
-                "WHERE daily_bars.date = ? AND daily_bars.symbol = stage.symbol",
-                [day],
-            )
-        if dragon:
-            con.register("bg_stage_dt", _stage_frame(dragon, {}))
-            con.execute(
-                "UPDATE daily_bars SET dragon_tiger_flag=stage.amount "
-                "FROM bg_stage_dt stage "
-                "WHERE daily_bars.date = ? AND daily_bars.symbol = stage.symbol",
-                [day],
-            )
-        con.execute(
-            "UPDATE daily_bars SET background_data_source=?, background_data_complete=TRUE, "
-            "background_missing_fields=?, background_as_of=? WHERE date = ?",
-            [BG_SOURCE, BG_MISSING, as_of, day],
-        )
-        con.execute("COMMIT")
-    except Exception:
-        con.execute("ROLLBACK")
-        raise
-    return 1
-
-
-def _stage_frame(amount: dict[str, float], volume: dict[str, float]):
-    import pandas as pd
-
-    return pd.DataFrame(
-        {
-            "symbol": list(amount.keys()),
-            "amount": [float(v) for v in amount.values()],
-            "volume": [float(volume.get(k, 0.0)) for k in amount],
-        }
-    )
 
 
 def main() -> int:
@@ -210,23 +101,28 @@ def main() -> int:
 
     updated = 0
     started = time.time()
-    for index, day in enumerate(days):
-        maps = _bulk_maps(http, day)
-        time.sleep(interval)
-        _update_date(con, day, maps, datetime.now().isoformat())
-        updated += 1
+
+    def _progress(index: int, total: int, day: date, maps: dict[str, dict[str, float]]) -> None:
         print(
             f"[2] {day} block={len(maps['block_amount'])} fin={len(maps['financing'])} "
-            f"dragon={len(maps['dragon'])} ({index + 1}/{len(days)})",  # type: ignore[arg-type]
+            f"dragon={len(maps['dragon'])} ({index}/{total})",
             flush=True,
         )
+
+    updated = enrich_background_for_dates(
+        con,
+        days,
+        http,
+        request_interval_sec=interval,
+        progress=_progress,
+    )
     con.close()
     print(
         json.dumps(
             {
                 "updated_dates": updated,
                 "total_seconds": round(time.time() - started, 1),
-                "bg_source": BG_SOURCE,
+                "bg_source": BACKGROUND_SOURCE_BULK,
             },
             ensure_ascii=False,
         ),

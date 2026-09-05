@@ -638,6 +638,41 @@ class Week5SelectionEngine:
             ctx.progress(phase="light")
 
         if should_scan_universe and symbol_list and prefilter_enabled:
+            # 自动调度触发：scheduler_* 前缀（intraday/nightly）或 offhours_refresh
+            # 全市场漏斗；手动恢复保留绕过能力；历史全市场任务与调度路径同等
+            # fail-closed。（2026-09-05 修复：原 blocked 中止只挂在非 snapshot
+            # 预过滤分支，snapshot_funnel 主路径被绕过——data_gate=blocked 形同
+            # 虚设。提升到分支顶部后两条路径同等 fail-closed。）
+            auto_scheduled_scan = bool(
+                ctx.sync_reason.strip().lower().startswith("scheduler_")
+                or (
+                    ctx.sync_reason.strip().lower() == "offhours_refresh"
+                    and funnel_policy == "snapshot_funnel"
+                )
+            )
+            if gate_status == "blocked" and (auto_scheduled_scan or self._historical):
+                gate_reasons = [str(item) for item in (data_gate.get("reasons") or [])]
+                blocked_payload = backend.build_gate_blocked_report(
+                    now=now,
+                    reasons=gate_reasons,
+                    data_snapshot_id=str(snapshot_manifest.data_snapshot_id)
+                    if snapshot_manifest
+                    else "",
+                    snapshot_current=snapshot_current,
+                    scan_profile=scan_profile_name,
+                    watchlist_size=len(ctx.account.watchlist),
+                )
+                if feature_snapshot_report is not None:
+                    blocked_payload["feature_snapshot"] = feature_snapshot_report
+                blocked_payload["funnel_policy"] = funnel_policy
+                if self._historical:
+                    blocked_payload["historical_context"] = self._historical_context_payload()
+                self._finalize_report_writes(
+                    blocked_payload,
+                    audit_event="week5_scan_blocked_data_gate",
+                    audit_payload={"reasons": gate_reasons},
+                )
+                return blocked_payload
             if snapshot_mode:
                 light_started = perf_counter()
                 light_target = max(1, int(config.week5.light_candidate_target))
@@ -653,39 +688,6 @@ class Week5SelectionEngine:
                 )
                 light_stage_ms = max(1, int((perf_counter() - light_started) * 1000))
             else:
-                # 自动调度触发：scheduler_* 前缀（intraday/nightly）或
-                # offhours_refresh 全市场漏斗；手动恢复保留绕过能力；
-                # 历史全市场任务与调度路径同等 fail-closed。
-                auto_scheduled_scan = bool(
-                    ctx.sync_reason.strip().lower().startswith("scheduler_")
-                    or (
-                        ctx.sync_reason.strip().lower() == "offhours_refresh"
-                        and funnel_policy == "snapshot_funnel"
-                    )
-                )
-                if gate_status == "blocked" and (auto_scheduled_scan or self._historical):
-                    gate_reasons = [str(item) for item in (data_gate.get("reasons") or [])]
-                    blocked_payload = backend.build_gate_blocked_report(
-                        now=now,
-                        reasons=gate_reasons,
-                        data_snapshot_id=str(snapshot_manifest.data_snapshot_id)
-                        if snapshot_manifest
-                        else "",
-                        snapshot_current=snapshot_current,
-                        scan_profile=scan_profile_name,
-                        watchlist_size=len(ctx.account.watchlist),
-                    )
-                    if feature_snapshot_report is not None:
-                        blocked_payload["feature_snapshot"] = feature_snapshot_report
-                    blocked_payload["funnel_policy"] = funnel_policy
-                    if self._historical:
-                        blocked_payload["historical_context"] = self._historical_context_payload()
-                    self._finalize_report_writes(
-                        blocked_payload,
-                        audit_event="week5_scan_blocked_data_gate",
-                        audit_payload={"reasons": gate_reasons},
-                    )
-                    return blocked_payload
                 prefilter_report = backend.prefilter_universe_symbols(
                     symbols=symbol_list,
                     top_k_override=configured_prefilter_top_k,
