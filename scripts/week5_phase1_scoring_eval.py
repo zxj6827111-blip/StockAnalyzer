@@ -237,7 +237,7 @@ def main() -> int:
         try:
             result = trainer.train_on_dataset_manifest(
                 store=store,
-                dataset_manifest_id=manifest_id,
+                dataset_manifest=manifest_id,
                 feature_schema_registry=feature_registry,
                 label_policy_registry=label_registry,
             )
