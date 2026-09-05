@@ -28,6 +28,38 @@ from stock_analyzer.data.tdx_offline_provider import (
 )
 from stock_analyzer.data.tushare_provider import _to_ts_code
 
+# market.duckdb 富集列：overlay（ZIP 价格 ⋈ delta 元数据）不含财务/背景字段，
+# 逐 symbol 从消费库 market.duckdb join 补齐（2026-09-05 修复，见
+# docs/week5_datagate_root_cause_20260905.md 第四层）。
+_MARKET_ENRICHMENT_COLUMNS = (
+    "roe",
+    "debt_ratio",
+    "financial_data_complete",
+    "financial_missing_fields",
+    "financial_source",
+    "financial_report_date",
+    "financial_as_of",
+    "financial_trust_level",
+    "financial_completeness",
+    "holder_count",
+    "block_trade_net",
+    "financing_balance",
+    "margin_financing_balance",
+    "northbound_net",
+    "dragon_tiger_flag",
+    "moneyflow_net_amount",
+    "hk_hold_ratio",
+    "hk_hold_change",
+    "inst_net_amount",
+    "block_trade_amount",
+    "block_trade_volume",
+    "block_trade_premium_discount",
+    "background_data_source",
+    "background_data_complete",
+    "background_missing_fields",
+    "background_as_of",
+)
+
 VENDOR_ZIP_INDEX_VERSION = 1
 logger = logging.getLogger(__name__)
 _YEAR_ARCHIVE_RE = re.compile(r"^(?P<year>\d{4})(?:\((?P<copy>\d+)\))?\.zip$", re.I)
@@ -194,6 +226,8 @@ class VendorZipOverlayProvider:
     _index: dict[str, object] = field(init=False)
     _warehouse: MarketWarehouse | None = field(init=False)
     _intraday_warehouse: MarketWarehouse | None = field(init=False)
+    _market_enrichment_warehouse: MarketWarehouse | None = field(init=False, default=None)
+    _market_enrichment_resolved: bool = field(init=False, default=False)
     _intraday_manifest: dict[str, object] = field(default_factory=dict, init=False)
     _daily_cache: OrderedDict[str, pd.DataFrame] = field(default_factory=OrderedDict, init=False)
     _intraday_cache: OrderedDict[str, pd.DataFrame] = field(default_factory=OrderedDict, init=False)
@@ -301,6 +335,79 @@ class VendorZipOverlayProvider:
                     latest[symbol] = value
         return latest
 
+    def _market_enrichment(self) -> MarketWarehouse | None:
+        """惰性解析 market.duckdb 消费库（财务/背景富集来源）。
+
+        overlay 运行时把 ``warehouse_db_path`` 指向 delta 库，market.duckdb 按
+        约定位于其同级 ``warehouse/`` 目录（同一 named volume）。文件不存在或
+        打开失败时返回 None——富集是尽力而为，绝不阻塞取价主路径。
+        """
+
+        if self._market_enrichment_resolved:
+            return self._market_enrichment_warehouse
+        self._market_enrichment_resolved = True
+        candidate = (
+            Path(self.delta_db_path).expanduser().parent.parent
+            / "warehouse"
+            / "market.duckdb"
+        )
+        if not candidate.exists():
+            return None
+        try:
+            self._market_enrichment_warehouse = MarketWarehouse(
+                db_path=candidate,
+                package_root=candidate.parent / "package",
+                package_writes_enabled=False,
+                read_only=True,
+            )
+        except Exception:  # noqa: BLE001 - 富集失败降级为不富集
+            self._market_enrichment_warehouse = None
+        return self._market_enrichment_warehouse
+
+    def _overlay_financial_background(self, symbol: str, frame: pd.DataFrame) -> pd.DataFrame:
+        """用 market.duckdb 的财务/背景列覆盖 overlay 帧的同名列。
+
+        overlay 行（ZIP 价格 ⋈ delta 元数据）在这约 26 列上恒为空——week6
+        prewarm 覆盖率 0.0、scan 候选 background_completion_score=0.0 的直接
+        原因。market.duckdb 同 (symbol,date) 行在原生富集期（≤7/30）与回填
+        修复期（7/31 起）都带 PIT 语义值，直接按日期索引覆盖。market 库缺失
+        时静默跳过（保持原行为）。
+        """
+
+        if frame.empty:
+            return frame
+        market = self._market_enrichment()
+        if market is None or not market._table_exists("daily_bars"):  # noqa: SLF001
+            return frame
+        try:
+            start = frame.index.min()
+            end = frame.index.max()
+            if not isinstance(start, pd.Timestamp) or not isinstance(end, pd.Timestamp):
+                return frame
+            import duckdb
+
+            columns = ", ".join(_MARKET_ENRICHMENT_COLUMNS)
+            connection = duckdb.connect(str(market._db_path), read_only=True)  # noqa: SLF001
+            try:
+                enriched = connection.execute(
+                    f"SELECT date, {columns} FROM daily_bars "
+                    "WHERE symbol = ? AND date BETWEEN ? AND ? ORDER BY date",
+                    [symbol, start.date().isoformat(), end.date().isoformat()],
+                ).fetch_df()
+            finally:
+                connection.close()
+        except Exception:  # noqa: BLE001 - 富集失败降级为不富集
+            return frame
+        if enriched.empty:
+            return frame
+        enriched["date"] = pd.to_datetime(enriched["date"], errors="coerce")
+        enriched = enriched.dropna(subset=["date"]).set_index("date").sort_index()
+        aligned = enriched.reindex(frame.index)
+        for column in _MARKET_ENRICHMENT_COLUMNS:
+            if column in frame.columns and column in aligned.columns:
+                frame[column] = aligned[column]
+        return frame
+
     def fetch_daily_bars(
         self,
         symbol: str,
@@ -328,6 +435,7 @@ class VendorZipOverlayProvider:
         if merged.empty:
             raise DataSourceError(f"vendor ZIP and delta warehouse are empty for {normalized}")
         result = merged.tail(max(1, int(lookback_days))).copy()
+        result = self._overlay_financial_background(normalized, result)
         result.attrs["source"] = "vendor_zip_overlay"
         result.attrs["historical_root"] = str(self._root)
         result.attrs["delta_db_path"] = str(Path(self.delta_db_path).expanduser())
