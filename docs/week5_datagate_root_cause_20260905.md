@@ -47,4 +47,21 @@ market.duckdb daily_bars 字段填充时间线（实库）：
 ## 4. 附注
 
 - 9/3-9/4 产生的 buy 信号是在残缺数据下给出的，复核其依据时应打折。
-- 今晚（9/5）21:45 night_scan 将在新容器（dab3813）上首跑，预期 gate 仍 blocked（数据未修复），行为与 9/4 一致。
+- 9/5 21:45 night_scan（修复完成前）gate 仍 blocked（advisory），行为与 9/4 一致。
+
+## 5. 修复执行记录（2026-09-05 深夜完成，commit ca69979 部署）
+
+第四层根因（执行中追加发现）：gate 的 prewarm 走 **runtime provider**（`SA__DATA_SOURCE__PRIMARY=vendor_zip_overlay`），overlay 帧（ZIP 价格 ⋈ delta 元数据）结构上不含财务/背景列——即使 market.duckdb 修好，provider 路径覆盖率仍为 0。
+
+实际修复（全部已部署验证）：
+
+| 层 | 修复 | 验证 |
+|---|---|---|
+| 数据回填 | `backfill_financial_snapshots.py` 全市场 PIT 重跑（数据落在 delta 库，已合并进 market.duckdb：56→163,188 行/5,818 只）+ `backfill_background_fields.py` 按 tushare bulk 回填 26 个交易日背景字段 + `enrich_daily_financial_pit` 批量 PIT 物化（143,990 行/2 秒） | daily_bars 7/31-9/4：fin 99.4%、bg 100% |
+| sync 钩子 | `sync_market_duckdb.py` 日更 upsert 后自动执行 PIT 财务物化 + 背景 bulk（防复发） | 代码+lint（周一 21:30 首个自然运行） |
+| gate 语义 | snapshot_funnel 主路径补上 blocked 中止（原检查只在非 snapshot 分支）| 新增集成测试；snapshot 正常+data_quality blocked → fail-closed 空报告 |
+| provider 层 | `VendorZipOverlayProvider.fetch_daily_bars` 从 market.duckdb join 26 列财务/背景（按 delta 同级 warehouse/ 目录约定惰性解析，缺失即降级） | 新增集成测试；prewarm 覆盖率 **0.0 → 0.8889**（8/9 字段，仅可选 holder_count 待回填）≥ pass 0.88 → **gate=ok** |
+
+运维事故记录：23:24 的首次重建在回滚备份编排阶段失败（`rollback: backup container missing` → FATAL），三个 runtime 容器被移除后未重建，系统短暂下线；重跑 deploy（镜像已构建完成）后全部恢复并健康。教训：deploy 脚本 rollback 编排在「容器 rename 后 compose 再编排」之间存在窗口，重建前应确认镜像构建已缓存完成。
+
+周日（9/6）21:00 财务 cron 已换用 universe 文件方案 + 回填后自动物化；周日 21:45 night_scan 预期 gate=ok/watch_only、候选财务/背景分量恢复。
