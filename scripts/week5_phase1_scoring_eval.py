@@ -309,6 +309,16 @@ def main() -> int:
         snapshots = store.list_snapshots(time_window_start=window_start, time_window_end=window_end)
         n_universe = _market_symbols_on_date(args.market_db, day)
 
+        # 横截面去重：快照日内按 symbol 重复捕获（实测 ~7.5 次/只），横截面
+        # 排名必须每 symbol 一票，否则 IC/分位被捕获频次加权。
+        # 口径：每 symbol 取当日最后一次快照（decision_time 最大）。
+        latest_by_symbol: dict[str, object] = {}
+        for snapshot in snapshots:
+            current = latest_by_symbol.get(snapshot.symbol)
+            if current is None or str(snapshot.decision_time) >= str(current.decision_time):
+                latest_by_symbol[snapshot.symbol] = snapshot
+        snapshots = list(latest_by_symbol.values())
+
         if not snapshots:
             daily_records.append({
                 "eval_date": day.isoformat(),
