@@ -105,8 +105,8 @@ def _gate_metrics_for_symbols(
                            ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY date DESC) AS rn
                     FROM daily_bars
                     WHERE symbol IN (SELECT UNNEST(?))
-                      AND date <= ?
-                      AND date >= ? - INTERVAL 30 DAY
+                      AND date <= CAST(? AS DATE)
+                      AND date >= CAST(? AS DATE) - INTERVAL 30 DAY
                 ) t
                 WHERE rn <= 20
             )
