@@ -169,9 +169,21 @@ class PitDatasetStore:
         return sorted(dates_seen)
 
     def fetch_train_rows(
-        self, *, start: date, end: date, require_label: bool = True
+        self,
+        *,
+        start: date,
+        end: date,
+        require_label: bool = True,
+        max_rows_per_day: int = 0,
+        seed: int = 0,
     ) -> pd.DataFrame:
-        """训练行：trade_date ∈ [start, end] 且 label_mature < end（maturity purge）。"""
+        """训练行：trade_date ∈ [start, end] 且 label_mature < end（maturity purge）。
+
+        ``max_rows_per_day > 0`` 时在 SQL 内按交易日下采样（ORDER BY hash
+        组内排序取前 N）——下采样必须发生在 fetch 之前：120 交易日全量
+        （~50 万行 × 208 列）fetch 后的 pandas 副本 ~1.9GB 是容器 OOM 的
+        实测根因（2026-09-06）。
+        """
 
         self._ensure_materialized()
         columns = ", ".join(
@@ -181,13 +193,22 @@ class PitDatasetStore:
         # trade_date 在 parquet 中为 ISO 字符串（'YYYY-MM-DD'）——字符串字典序
         # 与日期序一致，直接比较可下推到 parquet 统计信息；CAST 会退化为全表
         # 扫描（2026-09-06 实测 4GiB OOM 根因）。
-        query = (
-            f"SELECT {columns} FROM pit_dedup "
-            "WHERE trade_date >= ? AND trade_date <= ? "
-            "AND label_mature_trade_date < ?"
-        )
+        predicate = "trade_date >= ? AND trade_date <= ? AND label_mature_trade_date < ?"
         if require_label:
-            query += " AND label IS NOT NULL"
+            predicate += " AND label IS NOT NULL"
+        if max_rows_per_day > 0:
+            # hash(symbol || seed) 组内伪随机且可复现（同 seed 同样本）。
+            query = (
+                f"SELECT {columns} FROM ("
+                f"  SELECT *, ROW_NUMBER() OVER ("
+                f"    PARTITION BY trade_date"
+                f"    ORDER BY hash(symbol || '{int(seed)}')"
+                f"  ) AS __rn"
+                f"  FROM pit_dedup WHERE {predicate}"
+                f") WHERE __rn <= {int(max_rows_per_day)}"
+            )
+        else:
+            query = f"SELECT {columns} FROM pit_dedup WHERE {predicate}"
         return self._con.execute(
             query, [start.isoformat(), end.isoformat(), end.isoformat()]
         ).fetch_df()
@@ -307,7 +328,15 @@ def run_fold(
     )
 
     print(f"    [fold {fold_id}] fetching train rows... rss={_rss_mib():.0f}MiB", flush=True)
-    train = store.fetch_train_rows(start=train_start, end=train_end)
+    # 内存约束下采样（4GiB 容器，2026-09-06 实测）：120 交易日 × ~5000 只
+    # 全量 fetch 的 pandas 副本 ~1.9GB 顶爆容器——下采样下沉到 SQL（每日
+    # hash 前 1,500 只，seed=fold_id 可复现），fetch 后 ≈ 18 万行 × 208 列。
+    train = store.fetch_train_rows(
+        start=train_start,
+        end=train_end,
+        max_rows_per_day=1500,
+        seed=fold_id,
+    )
     print(
         f"    [fold {fold_id}] train fetched rows={len(train):,} "
         f"rss={_rss_mib():.0f}MiB",
@@ -317,23 +346,7 @@ def run_fold(
         result.status = "skipped"
         result.invalid_reason = "empty_train_after_maturity_purge"
         return result
-    # 内存约束下采样（4GiB 容器）：训练行按交易日分层抽样，每日至多
-    # ``max_rows_per_day``（保持横截面结构，随机种子=fold_id 可复现）。
-    # 120 日 × 5000 只 ≈ 60 万行会令 trainer 内部副本顶爆容器；1,500/日
-    # ≈ 18 万行经实测可承载，样本量仍远超旧 manifest 时代（≤1.6 万）。
-    max_rows_per_day = 1500
-    if len(train) > max_rows_per_day * 120:
-        rng = np.random.default_rng(fold_id)
-        train = (
-            train.groupby("trade_date", group_keys=False)
-            .apply(
-                lambda g: g.sample(
-                    n=min(len(g), max_rows_per_day), random_state=rng.integers(1 << 31)
-                )
-            )
-            .reset_index(drop=True)
-        )
-        result.universe_stats["train_rows_sampled"] = float(len(train))
+    result.universe_stats["train_rows_sampled"] = float(len(train))
 
     result.training_cutoff = train_end.isoformat()
     result.label_mature_cutoff = str(
