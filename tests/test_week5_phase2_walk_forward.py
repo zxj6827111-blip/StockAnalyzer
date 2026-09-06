@@ -16,8 +16,8 @@ import pytest
 
 from stock_analyzer.backtest.pit_dataset import _universe_mask
 from stock_analyzer.backtest.walk_forward_xsec import (
+    PitDatasetStore,
     aggregate_report,
-    load_pit_dataset,
     plan_folds,
 )
 
@@ -116,7 +116,6 @@ class TestAggregateReport:
         auc: float = 0.6,
         status: str = "completed",
     ) -> object:
-        import numpy as np
 
         from stock_analyzer.backtest.walk_forward_xsec import FoldResult
 
@@ -238,8 +237,8 @@ class TestUniverseMask:
         assert list(mask.to_numpy()) == [True, False]
 
 
-class TestLoadPitDataset:
-    def test_dedupes_logical_key_and_sorts(self, tmp_path: Path) -> None:
+class TestPitDatasetStore:
+    def test_dedupes_logical_key_and_fetch(self, tmp_path: Path) -> None:
         frame = pd.DataFrame(
             {
                 "symbol": ["600000", "600000", "000001"],
@@ -251,15 +250,34 @@ class TestLoadPitDataset:
             }
         )
         frame.to_parquet(tmp_path / "pit_2026-03.parquet", index=False)
-        data = load_pit_dataset(str(tmp_path))
-        # (symbol, trade_date) 唯一键：重复行保留最后一条。
-        assert len(data) == 2
-        assert (
-            data[(data["symbol"] == "600000") & (data["label"] == 0.0)].shape[0] == 1
+        store = PitDatasetStore(str(tmp_path))
+        # (symbol, trade_date) 唯一键：重复行保留一条（窗口函数 rn=1）。
+        assert store.row_count() == 2
+        eval_rows = store.fetch_eval_rows(on=date(2026, 3, 2))
+        assert len(eval_rows) == 2
+        assert set(eval_rows["symbol"]) == {"600000", "000001"}
+        assert store.trading_dates() == [date(2026, 3, 2)]
+        store.close()
+
+    def test_train_fetch_applies_maturity_purge(self, tmp_path: Path) -> None:
+        frame = pd.DataFrame(
+            {
+                "symbol": ["600000", "600000"],
+                "trade_date": ["2026-03-02", "2026-03-03"],
+                "label": [1.0, 1.0],
+                # 3/2 的行成熟日 3/09 < train_end(3/31) → 保留；
+                # 3/3 行成熟日 4/02 >= train_end → 被 purge。
+                "label_mature_trade_date": ["2026-03-09", "2026-04-02"],
+                "fwd_return": [0.01, 0.02],
+                "feat_a": [1.0, 2.0],
+            }
         )
-        # 排序：trade_date 升序、同日内 symbol 升序。
-        assert data.iloc[0]["symbol"] == "000001"
+        frame.to_parquet(tmp_path / "pit_2026-03.parquet", index=False)
+        store = PitDatasetStore(str(tmp_path))
+        train = store.fetch_train_rows(start=date(2026, 3, 1), end=date(2026, 3, 31))
+        assert list(train["trade_date"]) == ["2026-03-02"]
+        store.close()
 
     def test_missing_dataset_raises(self, tmp_path: Path) -> None:
         with pytest.raises(FileNotFoundError):
-            load_pit_dataset(str(tmp_path / "empty"))
+            PitDatasetStore(str(tmp_path / "empty"))

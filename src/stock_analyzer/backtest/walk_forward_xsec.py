@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 
+import duckdb
 import numpy as np
 import pandas as pd
 
@@ -67,31 +68,127 @@ class FoldResult:
     eval_returns: np.ndarray | None = None
 
 
-def load_pit_dataset(dataset_dir: str) -> pd.DataFrame:
-    """载入月度 parquet 块；特征列统一降 float32（240 万行 × 222 列
-    float64 ≈ 4.2GB 会顶爆 4GiB 容器，float32 + 分批 concat 峰值 ≈ 2.2GB）。"""
+class PitDatasetStore:
+    """按需查询的 PIT 数据集存储（DuckDB 临时表，替代全帧驻留）。
 
-    root = Path(dataset_dir)
-    chunks = sorted(root.glob("pit_*.parquet"))
-    if not chunks:
-        raise FileNotFoundError(f"no pit parquet chunks under {dataset_dir}")
-    meta_columns = ["symbol", "trade_date", "label", "label_mature_trade_date", "fwd_return"]
-    frames: list[pd.DataFrame] = []
-    for chunk in chunks:
-        frame = pd.read_parquet(chunk)
-        feature_columns = [c for c in frame.columns if c not in meta_columns]
-        for column in feature_columns:
-            if pd.api.types.is_numeric_dtype(frame[column]):
-                frame[column] = frame[column].astype("float32")
-        frames.append(frame)
-    data = pd.concat(frames, ignore_index=True)
-    del frames
-    data["trade_date"] = pd.to_datetime(data["trade_date"])
-    data["label_mature_trade_date"] = pd.to_datetime(
-        data["label_mature_trade_date"], errors="coerce"
-    )
-    data = data.drop_duplicates(subset=["symbol", "trade_date"], keep="last")
-    return data.sort_values(["trade_date", "symbol"]).reset_index(drop=True)
+    240 万行 × 222 特征在 4GiB 容器内无法整帧驻留（float32 也要 ~2.1GB
+    驻留 + 训练/评估副本）。改为：月度 parquet 分块逐个 ATTACH 进 DuckDB
+    内存表（分批注册，峰值=单块 ~100MB），fold 训练/评估时按日期过滤查询，
+    只把当前 fold 需要的行拉成 DataFrame。
+    """
+
+    def __init__(self, dataset_dir: str) -> None:
+        self.root = Path(dataset_dir)
+        self.chunks = sorted(self.root.glob("pit_*.parquet"))
+        if not self.chunks:
+            raise FileNotFoundError(f"no pit parquet chunks under {dataset_dir}")
+        self._con = duckdb.connect(database=":memory:")
+        self._materialized = False
+        self._feature_columns: list[str] = []
+
+    def _ensure_materialized(self) -> None:
+        if self._materialized:
+            return
+        print("[store] materializing parquet chunks into duckdb...", flush=True)
+        started = time.time()
+        for index, chunk in enumerate(self.chunks):
+            table = f"chunk_{index}"
+            self._con.execute(
+                f"CREATE TABLE {table} AS SELECT * FROM read_parquet('{chunk}')"
+            )
+        union = " UNION ALL ".join(
+            f"SELECT * FROM chunk_{i}" for i in range(len(self.chunks))
+        )
+        self._con.execute(f"CREATE TABLE pit AS {union}")
+        for index in range(len(self.chunks)):
+            self._con.execute(f"DROP TABLE chunk_{index}")
+        self._con.execute(
+            "CREATE TABLE pit_dedup AS SELECT * FROM ("
+            "  SELECT *, ROW_NUMBER() OVER ("
+            "    PARTITION BY symbol, trade_date ORDER BY trade_date DESC"
+            "  ) AS rn FROM pit"
+            ") WHERE rn = 1"
+        )
+        self._con.execute("DROP TABLE pit")
+        self._materialized = True
+        columns = [
+            str(r[0]) for r in self._con.execute("DESCRIBE pit_dedup").fetchall()
+        ]
+        meta_columns = {
+            "symbol",
+            "trade_date",
+            "label",
+            "label_mature_trade_date",
+            "fwd_return",
+        }
+        self._feature_columns = [c for c in columns if c not in meta_columns]
+        print(
+            f"[store] materialized in {time.time() - started:.0f}s "
+            f"features={len(self._feature_columns)}",
+            flush=True,
+        )
+
+    @property
+    def feature_columns(self) -> list[str]:
+        self._ensure_materialized()
+        return list(self._feature_columns)
+
+    def row_count(self) -> int:
+        self._ensure_materialized()
+        return int(self._con.execute("SELECT COUNT(*) FROM pit_dedup").fetchone()[0])
+
+    def trading_dates(self) -> list[date]:
+        self._ensure_materialized()
+        rows = self._con.execute(
+            "SELECT DISTINCT CAST(trade_date AS DATE) FROM pit_dedup ORDER BY 1"
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def fetch_train_rows(
+        self, *, start: date, end: date, require_label: bool = True
+    ) -> pd.DataFrame:
+        """训练行：trade_date ∈ [start, end] 且 label_mature < end（maturity purge）。"""
+
+        self._ensure_materialized()
+        columns = ", ".join(
+            ["symbol", "trade_date", "label", "label_mature_trade_date"]
+            + self._feature_columns
+        )
+        query = (
+            f"SELECT {columns} FROM pit_dedup "
+            "WHERE CAST(trade_date AS DATE) >= ? AND CAST(trade_date AS DATE) <= ? "
+            "AND CAST(label_mature_trade_date AS DATE) < ?"
+        )
+        if require_label:
+            query += " AND label IS NOT NULL"
+        return self._con.execute(
+            query, [start.isoformat(), end.isoformat(), end.isoformat()]
+        ).fetch_df()
+
+    def fetch_eval_rows(self, *, on: date) -> pd.DataFrame:
+        """评估行：单个交易日的横截面（含 fwd_return 与 label_mature）。"""
+
+        self._ensure_materialized()
+        columns = ", ".join(
+            [
+                "symbol",
+                "trade_date",
+                "label",
+                "label_mature_trade_date",
+                "fwd_return",
+            ]
+            + self._feature_columns
+        )
+        return self._con.execute(
+            f"SELECT {columns} FROM pit_dedup WHERE CAST(trade_date AS DATE) = ?",
+            [on.isoformat()],
+        ).fetch_df()
+
+    def close(self) -> None:
+        try:
+            self._con.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def plan_folds(
@@ -163,7 +260,7 @@ def _feature_columns(data: pd.DataFrame) -> list[str]:
 def run_fold(
     *,
     fold: dict[str, object],
-    data: pd.DataFrame,
+    store: PitDatasetStore,
     trading_dates: list[date],
     trainer: ModelTrainer,
     feature_columns: list[str],
@@ -182,13 +279,7 @@ def run_fold(
         embargo_days=embargo_days,
     )
 
-    train_mask = (
-        (data["trade_date"] >= pd.Timestamp(train_start))
-        & (data["trade_date"] <= pd.Timestamp(train_end))
-        & (data["label_mature_trade_date"] < pd.Timestamp(train_end))
-        & data["label"].notna()
-    )
-    train = data[train_mask]
+    train = store.fetch_train_rows(start=train_start, end=train_end)
     if train.empty:
         result.status = "skipped"
         result.invalid_reason = "empty_train_after_maturity_purge"
@@ -196,13 +287,13 @@ def run_fold(
 
     result.training_cutoff = train_end.isoformat()
     result.label_mature_cutoff = str(
-        train["label_mature_trade_date"].max().date()
+        pd.to_datetime(train["label_mature_trade_date"]).max().date()
     )
     # lookahead 检查：成熟日不得越过训练窗结束（purge 后必然满足），
     # 决策日不得越过 train_end。
     violations = int(
         (
-            train["label_mature_trade_date"]
+            pd.to_datetime(train["label_mature_trade_date"])
             >= pd.Timestamp(train_end) + pd.Timedelta(days=1)
         ).sum()
     )
@@ -226,8 +317,7 @@ def run_fold(
 
     eval_parts: list[pd.DataFrame] = []
     for day in test_dates:
-        day_mask = data["trade_date"] == pd.Timestamp(day)
-        day_frame = data[day_mask].copy()
+        day_frame = store.fetch_eval_rows(on=day)
         if day_frame.empty:
             continue
         scores = predictor.predict_rows(day_frame[feature_columns])["meta"]
@@ -419,13 +509,13 @@ def main() -> int:
     embargo_days = int(cfg.labels.horizon_days) + int(cfg.evolution.execution_spec.settlement_lag)
 
     t0 = time.time()
-    data = load_pit_dataset(args.dataset_dir)
+    store = PitDatasetStore(args.dataset_dir)
     meta_path = Path(args.dataset_dir) / "pit_meta.json"
     dataset_meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
-    trading_dates = sorted({d.date() for d in data["trade_date"]})
-    feature_columns = _feature_columns(data)
+    trading_dates = store.trading_dates()
+    feature_columns = store.feature_columns
     print(
-        f"[1] dataset rows={len(data):,} symbols={data['symbol'].nunique():,} "
+        f"[1] dataset rows={store.row_count():,} "
         f"dates={len(trading_dates)} features={len(feature_columns)}",
         flush=True,
     )
@@ -459,7 +549,7 @@ def main() -> int:
         started = time.time()
         result = run_fold(
             fold=plan,
-            data=data,
+            store=store,
             trading_dates=trading_dates,
             trainer=trainer,
             feature_columns=feature_columns,
@@ -476,7 +566,7 @@ def main() -> int:
 
     report = aggregate_report(
         folds=folds,
-        dataset_meta_rows=int(dataset_meta.get("rows", len(data))),
+        dataset_meta_rows=int(dataset_meta.get("rows", store.row_count())),
         train_window=args.train_window,
         test_window=args.test_window,
         step=args.step,
