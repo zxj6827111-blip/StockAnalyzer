@@ -479,7 +479,7 @@ def run_fold(
     result.status = "completed"
     # fold 间释放：trainer 内部 LightGBM/XGBoost 模型、isotonic 校准器与
     # fold 级中间帧在跨 fold 累积（RSS 实测 1.2GB → 3.0GB 后 OOM）。
-    del aligned, features_frame, labels_series, labeled, evaluation, train, predictor, trained
+    del features_frame, labels_series, labeled, evaluation, train, predictor, trained
     gc.collect()
     return result
 
