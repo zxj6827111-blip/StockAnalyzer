@@ -28,6 +28,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import duckdb
+import numpy as np
 import pandas as pd
 
 from stock_analyzer.feature.engineer import FeatureEngineer
@@ -217,7 +218,11 @@ def generate_pit_dataset(
                     "fwd_return": fwd_return,
                 }
                 row.update(
-                    {str(k): float(v) for k, v in features.loc[ts].items()}
+                    {
+                        str(k): np.float32(v)
+                        for k, v in features.loc[ts].items()
+                        if pd.notna(v)
+                    }
                 )
                 symbol_rows.append(row)
             if symbol_rows:
@@ -265,25 +270,71 @@ def _finalize_pit_dataset(
 ) -> PitDatasetMeta:
     out_path = Path(out_dir)
     shards = sorted((out_path / "shards").glob("shard_*.parquet"))
-    frames = [pd.read_parquet(shard) for shard in shards]
-    data = (
-        pd.concat(frames, ignore_index=True)
-        if frames
-        else pd.DataFrame(columns=["symbol", "trade_date", "label"])
-    )
-    if data.empty:
+    if not shards:
         raise RuntimeError("pit dataset is empty after merging shards")
-    data["trade_date"] = pd.to_datetime(data["trade_date"])
-    data = data.drop_duplicates(subset=["symbol", "trade_date"], keep="last")
-    data = data.sort_values(["trade_date", "symbol"]).reset_index(drop=True)
-    for month, group in data.groupby(data["trade_date"].dt.to_period("M")):
-        group.to_parquet(out_path / f"pit_{month}.parquet", index=False)
-    labeled = data.dropna(subset=["label"])
+
+    # 流式合并（2026-09-06 防 OOM 修复）：一次全量 concat 5,570 分片
+    # （~240 万行 × 222 列 float64 ≈ 4GB）曾把容器顶爆。改为按批
+    # （500 分片）读入 → 按月桶拆分 → 满批即写盘；统计走增量计数器。
+    month_buckets: dict[str, pd.DataFrame | None] = {}
+    batch_size = 500
+    total_rows = 0
+    labeled_rows = 0
+    labeled_positive = 0
+    symbols_seen: set[str] = set()
+    trade_dates_seen: set[str] = set()
+
+    def _flush_months() -> None:
+        for month_key, frame in month_buckets.items():
+            if frame is None:
+                continue
+            frame = frame.drop_duplicates(subset=["symbol", "trade_date"], keep="last")
+            frame = frame.sort_values(["trade_date", "symbol"])
+            target = out_path / f"pit_{month_key}.parquet"
+            if target.exists():
+                previous = pd.read_parquet(target)
+                frame = pd.concat([previous, frame], ignore_index=True)
+                frame = frame.drop_duplicates(
+                    subset=["symbol", "trade_date"], keep="last"
+                ).sort_values(["trade_date", "symbol"])
+            frame.to_parquet(target, index=False)
+        month_buckets.clear()
+
+    for offset in range(0, len(shards), batch_size):
+        batch = shards[offset : offset + batch_size]
+        frames = [pd.read_parquet(shard) for shard in batch]
+        batch_frame = pd.concat(frames, ignore_index=True)
+        del frames
+        total_rows += len(batch_frame)
+        if "label" in batch_frame.columns:
+            labeled_mask = batch_frame["label"].notna()
+            labeled_rows += int(labeled_mask.sum())
+            labeled_positive += int(
+                (batch_frame.loc[labeled_mask, "label"] == 1.0).sum()
+            )
+        symbols_seen.update(str(s) for s in batch_frame["symbol"].unique())
+        trade_dates_seen.update(str(d)[:10] for d in batch_frame["trade_date"].unique())
+        batch_frame["trade_date"] = pd.to_datetime(batch_frame["trade_date"])
+        batch_frame["__month"] = batch_frame["trade_date"].dt.strftime("%Y-%m")
+        for month_key, group in batch_frame.groupby("__month"):
+            group = group.drop(columns=["__month"])
+            current = month_buckets.get(month_key)
+            month_buckets[month_key] = (
+                pd.concat([current, group], ignore_index=True)
+                if current is not None
+                else group
+            )
+        _flush_months()
+        del batch_frame
+
+    if total_rows == 0:
+        raise RuntimeError("pit dataset is empty after merging shards")
+    positive_rate = round(labeled_positive / labeled_rows, 6) if labeled_rows else 0.0
     meta = PitDatasetMeta(
         dataset_hash=hashlib.sha256(
             json.dumps(
                 {
-                    "rows": len(data),
+                    "rows": total_rows,
                     "window": [window_start.isoformat(), window_end.isoformat()],
                     "horizon": horizon,
                     "tp": tp,
@@ -296,11 +347,11 @@ def _finalize_pit_dataset(
         ).hexdigest()[:16],
         window_start=window_start.isoformat(),
         window_end=window_end.isoformat(),
-        rows=int(len(data)),
-        symbols=int(data["symbol"].nunique()),
-        trade_dates=int(data["trade_date"].nunique()),
-        positive_rate=round(float((labeled["label"] == 1.0).mean()), 6) if len(labeled) else 0.0,
-        matured_rows=int(len(labeled)),
+        rows=int(total_rows),
+        symbols=len(symbols_seen),
+        trade_dates=len(trade_dates_seen),
+        positive_rate=positive_rate,
+        matured_rows=int(labeled_rows),
         generated_at=pd.Timestamp.now(tz="UTC").isoformat(),
         label_policy_note=(
             f"soup T+1 open basis horizon={horizon} tp={tp} sl={sl} "
@@ -311,7 +362,7 @@ def _finalize_pit_dataset(
         json.dumps(meta.__dict__, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     print(
-        f"[pit] done rows={len(data):,} symbols={meta.symbols} dates={meta.trade_dates} "
+        f"[pit] done rows={total_rows:,} symbols={meta.symbols} dates={meta.trade_dates} "
         f"positive_rate={meta.positive_rate} shards={len(shards)} "
         f"(processed={done} skipped={skipped}) in {time.time() - started:.0f}s",
         flush=True,
