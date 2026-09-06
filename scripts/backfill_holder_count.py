@@ -63,12 +63,11 @@ def main() -> int:
     started = time.time()
     for index, symbol in enumerate(symbols):
         try:
-            # start_date 传披露区间起点：必须拉到窗口首日之前的最近一期，
-            # 否则 ffill 在窗口前段无值（smoke 实测 000002 仅 6/25 天）。
-            fetch_kwargs = {"start_date": "20240401"}
-            frame = http._call("stk_holdernumber", ts_code=f"{symbol}.SZ", **fetch_kwargs)  # noqa: SLF001
+            # 不传 start_date：API 默认返回全部披露历史（实测传 start_date
+            # 反而截短到 30 行）；需要窗口首日之前的最近一期做 ffill 起点。
+            frame = http._call("stk_holdernumber", ts_code=f"{symbol}.SZ")  # noqa: SLF001
             if frame is None or frame.empty:
-                frame = http._call("stk_holdernumber", ts_code=f"{symbol}.SH", **fetch_kwargs)  # noqa: SLF001
+                frame = http._call("stk_holdernumber", ts_code=f"{symbol}.SH")  # noqa: SLF001
             if frame is None or frame.empty:
                 failed += 1
                 time.sleep(max(0.0, args.request_interval_sec))
