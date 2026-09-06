@@ -68,6 +68,17 @@ class FoldResult:
     eval_returns: np.ndarray | None = None
 
 
+def _rss_mib() -> float:
+    try:
+        with open("/proc/self/status", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return float(line.split()[1]) / 1024.0
+    except OSError:
+        return -1.0
+    return -1.0
+
+
 class PitDatasetStore:
     """按需查询的 PIT 数据集存储（DuckDB 临时表，替代全帧驻留）。
 
@@ -135,9 +146,12 @@ class PitDatasetStore:
     def trading_dates(self) -> list[date]:
         self._ensure_materialized()
         rows = self._con.execute(
-            "SELECT DISTINCT CAST(trade_date AS DATE) FROM pit_dedup ORDER BY 1"
+            "SELECT DISTINCT trade_date FROM pit_dedup ORDER BY 1"
         ).fetchall()
-        return [r[0] for r in rows]
+        return [
+            r[0] if isinstance(r[0], date) else date.fromisoformat(str(r[0]))
+            for r in rows
+        ]
 
     def fetch_train_rows(
         self, *, start: date, end: date, require_label: bool = True
@@ -149,10 +163,13 @@ class PitDatasetStore:
             ["symbol", "trade_date", "label", "label_mature_trade_date"]
             + self._feature_columns
         )
+        # trade_date 在 parquet 中为 ISO 字符串（'YYYY-MM-DD'）——字符串字典序
+        # 与日期序一致，直接比较可下推到 parquet 统计信息；CAST 会退化为全表
+        # 扫描（2026-09-06 实测 4GiB OOM 根因）。
         query = (
             f"SELECT {columns} FROM pit_dedup "
-            "WHERE CAST(trade_date AS DATE) >= ? AND CAST(trade_date AS DATE) <= ? "
-            "AND CAST(label_mature_trade_date AS DATE) < ?"
+            "WHERE trade_date >= ? AND trade_date <= ? "
+            "AND label_mature_trade_date < ?"
         )
         if require_label:
             query += " AND label IS NOT NULL"
@@ -175,7 +192,7 @@ class PitDatasetStore:
             + self._feature_columns
         )
         return self._con.execute(
-            f"SELECT {columns} FROM pit_dedup WHERE CAST(trade_date AS DATE) = ?",
+            f"SELECT {columns} FROM pit_dedup WHERE trade_date = ?",
             [on.isoformat()],
         ).fetch_df()
 
@@ -274,7 +291,13 @@ def run_fold(
         embargo_days=embargo_days,
     )
 
+    print(f"    [fold {fold_id}] fetching train rows... rss={_rss_mib():.0f}MiB", flush=True)
     train = store.fetch_train_rows(start=train_start, end=train_end)
+    print(
+        f"    [fold {fold_id}] train fetched rows={len(train):,} "
+        f"rss={_rss_mib():.0f}MiB",
+        flush=True,
+    )
     if train.empty:
         result.status = "skipped"
         result.invalid_reason = "empty_train_after_maturity_purge"
@@ -315,8 +338,17 @@ def run_fold(
     aligned.index = pd.to_datetime(train["trade_date"])
     aligned["label"] = aligned["label"].astype(float)
     try:
+        print(
+            f"    [fold {fold_id}] training aligned={len(aligned):,} "
+            f"rss={_rss_mib():.0f}MiB",
+            flush=True,
+        )
         trained = trainer.train_on_feature_label(
             features=aligned[feature_columns], labels=aligned["label"]
+        )
+        print(
+            f"    [fold {fold_id}] trained rss={_rss_mib():.0f}MiB",
+            flush=True,
         )
     except Exception as exc:  # noqa: BLE001 - fold 级失败可重跑
         result.status = "failed"
