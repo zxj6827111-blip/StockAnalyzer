@@ -330,11 +330,12 @@ def run_fold(
     print(f"    [fold {fold_id}] fetching train rows... rss={_rss_mib():.0f}MiB", flush=True)
     # 内存约束下采样（4GiB 容器，2026-09-06 实测）：120 交易日 × ~5000 只
     # 全量 fetch 的 pandas 副本 ~1.9GB 顶爆容器——下采样下沉到 SQL（每日
-    # hash 前 1,500 只，seed=fold_id 可复现），fetch 后 ≈ 18 万行 × 208 列。
+    # hash 前 800 只，seed=fold_id 可复现），fetch 后 ≈ 9.6 万行 × 208 列；
+    # trainer 内部还有 aligned.copy + 三 split 副本，1,500/日实测仍超。
     train = store.fetch_train_rows(
         start=train_start,
         end=train_end,
-        max_rows_per_day=1500,
+        max_rows_per_day=800,
         seed=fold_id,
     )
     print(
