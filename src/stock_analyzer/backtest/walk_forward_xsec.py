@@ -336,7 +336,7 @@ def run_fold(
     train = store.fetch_train_rows(
         start=train_start,
         end=train_end,
-        max_rows_per_day=800,
+        max_rows_per_day=500,
         seed=fold_id,
     )
     print(
@@ -642,8 +642,67 @@ def main() -> int:
         market_relative_feature=cfg.market_relative_feature,
     )
 
+    # fold checkpoint（方案 §5）：每 fold 完成即落盘，重跑跳过已完成
+    # fold（含 OOM/中断后续跑）。目录 {out_dir}/checkpoints/。
+    ckpt_dir = Path(args.out_dir) / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    def _fold_to_payload(f: FoldResult) -> dict[str, object]:
+        return {
+            "fold_id": f.fold_id,
+            "train_window": [f.train_start, f.train_end],
+            "eval_dates": f.eval_dates,
+            "status": f.status,
+            "invalid_reason": f.invalid_reason,
+            "training_cutoff": f.training_cutoff,
+            "label_mature_cutoff": f.label_mature_cutoff,
+            "embargo_days": f.embargo_days,
+            "lookahead_violations": f.lookahead_violations,
+            "daily_ic": [[d, v] for d, v in f.daily_ic],
+            "daily_top_bottom": [[d, v] for d, v in f.daily_top_bottom],
+            "pooled_auc": f.pooled_auc,
+            "pooled_brier": f.pooled_brier,
+            "pooled_n": f.pooled_n,
+            "quantile_means": f.quantile_means,
+            "top_minus_bottom": f.top_minus_bottom,
+            "universe_stats": f.universe_stats,
+        }
+
+    loaded: dict[int, FoldResult] = {}
+    for ckpt_file in sorted(ckpt_dir.glob("fold_*.json")):
+        try:
+            raw = json.loads(ckpt_file.read_text(encoding="utf-8"))
+            fid = int(raw["fold_id"])
+        except Exception:  # noqa: BLE001 - 损坏 checkpoint 忽略重跑
+            continue
+        loaded[fid] = FoldResult(
+            fold_id=fid,
+            train_start=str(raw["train_window"][0]),
+            train_end=str(raw["train_window"][1]),
+            eval_dates=[str(d) for d in raw.get("eval_dates", [])],
+            status=str(raw.get("status", "")),
+            invalid_reason=str(raw.get("invalid_reason", "")),
+            training_cutoff=str(raw.get("training_cutoff", "")),
+            label_mature_cutoff=str(raw.get("label_mature_cutoff", "")),
+            embargo_days=int(raw.get("embargo_days", 0)),
+            lookahead_violations=int(raw.get("lookahead_violations", 0)),
+            daily_ic=[(str(d), float(v)) for d, v in raw.get("daily_ic", [])],
+            daily_top_bottom=[(str(d), float(v)) for d, v in raw.get("daily_top_bottom", [])],
+            pooled_auc=float(raw.get("pooled_auc", "nan") or "nan"),
+            pooled_brier=float(raw.get("pooled_brier", "nan") or "nan"),
+            pooled_n=int(raw.get("pooled_n", 0)),
+            quantile_means=[float(q) for q in raw.get("quantile_means", [])],
+            top_minus_bottom=float(raw.get("top_minus_bottom", "nan") or "nan"),
+            universe_stats=dict(raw.get("universe_stats", {})),
+        )
+
     folds: list[FoldResult] = []
     for plan in folds_plan:
+        fid = int(plan["fold_id"])
+        if fid in loaded and loaded[fid].status in {"completed", "completed_unlabeled"}:
+            folds.append(loaded[fid])
+            print(f"[3] fold {fid} resumed from checkpoint", flush=True)
+            continue
         started = time.time()
         result = run_fold(
             fold=plan,
@@ -655,6 +714,10 @@ def main() -> int:
             k_precision=k_list,
         )
         folds.append(result)
+        (ckpt_dir / f"fold_{fid:02d}.json").write_text(
+            json.dumps(_fold_to_payload(result), ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
         print(
             f"[3] fold {result.fold_id} {result.status} "
             f"train={result.train_start}..{result.train_end} "
@@ -672,6 +735,7 @@ def main() -> int:
         step=args.step,
         embargo_days=embargo_days,
     )
+
     payload = {
         "generated_at": datetime.utcnow().isoformat() + "Z",
         "folds": [
