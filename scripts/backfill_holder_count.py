@@ -74,12 +74,15 @@ def main() -> int:
                 continue
             records = frame.to_dict("records")
             # ann_date 升序；写「ann_date <= as_of 的最新披露」。
+            # 过滤脏行：非 8 位 ann_date（如 '2025-05-12 15:09:08'）与
+            # holder_num 为 None/NaN 的披露（实测 tushare 缺值给 nan——
+            # NaN 若入 payload 会作为"最近披露"把 ffill 写成 NULL）。
             events = []
             for row in records:
                 ann = str(row.get("ann_date") or "").strip()
                 end = str(row.get("end_date") or "").strip()
                 holders = row.get("holder_num")
-                if len(ann) != 8 or holders is None:
+                if len(ann) != 8 or holders is None or pd.isna(holders):
                     continue
                 ann_iso = f"{ann[:4]}-{ann[4:6]}-{ann[6:8]}"
                 events.append((ann_iso, float(holders), end))
