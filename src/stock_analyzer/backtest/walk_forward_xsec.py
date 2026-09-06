@@ -20,6 +20,7 @@ IC>0、top≥bottom、CI 是否跨 0。产出 JSON+MD 报告（时间戳命名�
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import time
@@ -476,6 +477,10 @@ def run_fold(
     result.quantile_means = [float(q) for q in quantiles["quantile_means"]]
     result.top_minus_bottom = float(quantiles["top_minus_bottom"])
     result.status = "completed"
+    # fold 间释放：trainer 内部 LightGBM/XGBoost 模型、isotonic 校准器与
+    # fold 级中间帧在跨 fold 累积（RSS 实测 1.2GB → 3.0GB 后 OOM）。
+    del aligned, features_frame, labels_series, labeled, evaluation, train, predictor, trained
+    gc.collect()
     return result
 
 
@@ -653,9 +658,11 @@ def main() -> int:
         print(
             f"[3] fold {result.fold_id} {result.status} "
             f"train={result.train_start}..{result.train_end} "
-            f"({time.time() - started:.0f}s) {result.invalid_reason}",
+            f"({time.time() - started:.0f}s) {result.invalid_reason} "
+            f"rss={_rss_mib():.0f}MiB",
             flush=True,
         )
+        gc.collect()
 
     report = aggregate_report(
         folds=folds,
