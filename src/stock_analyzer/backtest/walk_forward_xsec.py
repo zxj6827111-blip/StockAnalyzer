@@ -127,10 +127,10 @@ class PitDatasetStore:
             "fwd_return",
         }
         self._feature_columns = [c for c in columns if c not in meta_columns]
-        total = self._con.execute("SELECT COUNT(*) FROM pit_dedup").fetchone()[0]
+        # 注意：注册后不再立即 COUNT(*)（全扫）——行数从 pit_meta.json 读取。
         print(
             f"[store] view registered over {len(files)} chunks "
-            f"(rows={total:,} features={len(self._feature_columns)})",
+            f"(features={len(self._feature_columns)})",
             flush=True,
         )
 
@@ -140,6 +140,15 @@ class PitDatasetStore:
         return list(self._feature_columns)
 
     def row_count(self) -> int:
+        """行数直读 pit_meta.json——避免 COUNT(*) 触发 24 块全扫（注册期
+        内存峰值的实测来源之一）。"""
+
+        meta_path = self.root / "pit_meta.json"
+        if meta_path.exists():
+            try:
+                return int(json.loads(meta_path.read_text(encoding="utf-8"))["rows"])
+            except Exception:  # noqa: BLE001 - meta 损坏时退回查询
+                pass
         self._ensure_materialized()
         return int(self._con.execute("SELECT COUNT(*) FROM pit_dedup").fetchone()[0])
 
