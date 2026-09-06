@@ -285,6 +285,23 @@ def run_fold(
         result.status = "skipped"
         result.invalid_reason = "empty_train_after_maturity_purge"
         return result
+    # 内存约束下采样（4GiB 容器）：训练行按交易日分层抽样，每日至多
+    # ``max_rows_per_day``（保持横截面结构，随机种子=fold_id 可复现）。
+    # 120 日 × 5000 只 ≈ 60 万行会令 trainer 内部副本顶爆容器；1,500/日
+    # ≈ 18 万行经实测可承载，样本量仍远超旧 manifest 时代（≤1.6 万）。
+    max_rows_per_day = 1500
+    if len(train) > max_rows_per_day * 120:
+        rng = np.random.default_rng(fold_id)
+        train = (
+            train.groupby("trade_date", group_keys=False)
+            .apply(
+                lambda g: g.sample(
+                    n=min(len(g), max_rows_per_day), random_state=rng.integers(1 << 31)
+                )
+            )
+            .reset_index(drop=True)
+        )
+        result.universe_stats["train_rows_sampled"] = float(len(train))
 
     result.training_cutoff = train_end.isoformat()
     result.label_mature_cutoff = str(
