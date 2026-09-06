@@ -153,14 +153,20 @@ class PitDatasetStore:
         return int(self._con.execute("SELECT COUNT(*) FROM pit_dedup").fetchone()[0])
 
     def trading_dates(self) -> list[date]:
-        self._ensure_materialized()
-        rows = self._con.execute(
-            "SELECT DISTINCT trade_date FROM pit_dedup ORDER BY 1"
-        ).fetchall()
-        return [
-            r[0] if isinstance(r[0], date) else date.fromisoformat(str(r[0]))
-            for r in rows
-        ]
+        """逐块读取单列 DISTINCT（避免 24 块合并视图的全表 DISTINCT——
+        实测该全扫是 harness OOM 爆点；单块单列峰值 < 50MB）。"""
+
+        dates_seen: set[date] = set()
+        for chunk in self.chunks:
+            rows = self._con.execute(
+                f"SELECT DISTINCT trade_date FROM read_parquet('{chunk}')"
+            ).fetchall()
+            for r in rows:
+                value = r[0]
+                dates_seen.add(
+                    value if isinstance(value, date) else date.fromisoformat(str(value))
+                )
+        return sorted(dates_seen)
 
     def fetch_train_rows(
         self, *, start: date, end: date, require_label: bool = True
