@@ -370,9 +370,22 @@ def run_fold(
     # 修复：保持 RangeIndex（行唯一），决策日语义由 trainer 的
     # apply_time_invariants（date 索引缺失时按行拒绝）与我们的 maturity purge
     # 共同保障；对齐用同一 RangeIndex 的两帧 join 即逐行内积。
-    features_frame = train[feature_columns].reset_index(drop=True)
-    labels_series = train["label"].astype(float).reset_index(drop=True)
-    labels_series.name = "label_soup_tp_before_sl"
+    # trainer 的 temporal split 要求索引携带交易日语义且行唯一：用
+    # MultiIndex (decision_time=trade_date, row=行号)——decision_time level
+    # 供 _extract_trading_dates 解析交易日，row level 保证 join 逐行对齐
+    # （不产生日期组笛卡尔积）。
+    row_index = pd.MultiIndex.from_arrays(
+        [
+            pd.to_datetime(train["trade_date"]).to_numpy(),
+            np.arange(len(train)),
+        ],
+        names=["decision_time", "row"],
+    )
+    features_frame = train[feature_columns].copy()
+    features_frame.index = row_index
+    labels_series = pd.Series(
+        train["label"].astype(float).to_numpy(), index=row_index, name="label_soup_tp_before_sl"
+    )
     try:
         print(
             f"    [fold {fold_id}] training aligned={len(features_frame):,} "
