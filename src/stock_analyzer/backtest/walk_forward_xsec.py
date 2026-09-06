@@ -83,33 +83,33 @@ class PitDatasetStore:
         if not self.chunks:
             raise FileNotFoundError(f"no pit parquet chunks under {dataset_dir}")
         self._con = duckdb.connect(database=":memory:")
+        # 4GiB 容器内的 DuckDB 内存上限（留出训练/评估的空间）。
+        self._con.execute("SET memory_limit='1.5GB'")
+        self._con.execute("SET threads=2")
         self._materialized = False
         self._feature_columns: list[str] = []
 
     def _ensure_materialized(self) -> None:
+        """注册 parquet 视图（不物化：DuckDB 谓词下推按需扫盘，内存只驻留
+        查询结果）。物化表方案在 240 万行时同样顶爆 4GiB（2026-09-06 实测）。"""
+
         if self._materialized:
             return
-        print("[store] materializing parquet chunks into duckdb...", flush=True)
-        started = time.time()
-        for index, chunk in enumerate(self.chunks):
-            table = f"chunk_{index}"
-            self._con.execute(
-                f"CREATE TABLE {table} AS SELECT * FROM read_parquet('{chunk}')"
-            )
-        union = " UNION ALL ".join(
-            f"SELECT * FROM chunk_{i}" for i in range(len(self.chunks))
-        )
-        self._con.execute(f"CREATE TABLE pit AS {union}")
-        for index in range(len(self.chunks)):
-            self._con.execute(f"DROP TABLE chunk_{index}")
+        files = [str(chunk) for chunk in self.chunks]
+        file_list = ", ".join(f"'{f}'" for f in files)
+        # 视图 + 去重窗口：scan 时按 (symbol, trade_date) 保留一条。
         self._con.execute(
-            "CREATE TABLE pit_dedup AS SELECT * FROM ("
-            "  SELECT *, ROW_NUMBER() OVER ("
-            "    PARTITION BY symbol, trade_date ORDER BY trade_date DESC"
-            "  ) AS rn FROM pit"
-            ") WHERE rn = 1"
+            f"""
+            CREATE OR REPLACE VIEW pit_dedup AS
+            SELECT * EXCLUDE (rn) FROM (
+              SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY symbol, trade_date
+                ORDER BY label_mature_trade_date DESC NULLS LAST
+              ) AS rn
+              FROM read_parquet([{file_list}])
+            ) WHERE rn = 1
+            """
         )
-        self._con.execute("DROP TABLE pit")
         self._materialized = True
         columns = [
             str(r[0]) for r in self._con.execute("DESCRIBE pit_dedup").fetchall()
@@ -122,9 +122,10 @@ class PitDatasetStore:
             "fwd_return",
         }
         self._feature_columns = [c for c in columns if c not in meta_columns]
+        total = self._con.execute("SELECT COUNT(*) FROM pit_dedup").fetchone()[0]
         print(
-            f"[store] materialized in {time.time() - started:.0f}s "
-            f"features={len(self._feature_columns)}",
+            f"[store] view registered over {len(files)} chunks "
+            f"(rows={total:,} features={len(self._feature_columns)})",
             flush=True,
         )
 
