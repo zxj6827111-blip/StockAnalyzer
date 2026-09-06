@@ -221,3 +221,67 @@ class TestCheckLookahead:
         )
         assert result["lookahead_bias"] is True
         assert any(r.startswith("snapshot_after_eval") for r in result["lookahead_reasons"])
+
+
+class TestCoverageDegradation:
+    """week6 覆盖率退化检测（尾巴③：根治 7/31-9/5 静默断链 35 天）。"""
+
+    def test_three_consecutive_drops_triggers(self) -> None:
+        from stock_analyzer.runtime.services.week6_service import _detect_coverage_degradation
+
+        result = _detect_coverage_degradation(
+            history=[
+                {"overall_coverage_ratio": 0.95},
+                {"overall_coverage_ratio": 0.82},
+            ],
+            current_ratio=0.60,
+            watch_threshold=0.72,
+        )
+        assert result is not None
+        assert result["trigger"] == "below_watch_threshold"
+        assert result["recent_ratios"] == [0.95, 0.82, 0.6]
+
+    def test_drop_without_threshold_breach_triggers_on_trend(self) -> None:
+        from stock_analyzer.runtime.services.week6_service import _detect_coverage_degradation
+
+        result = _detect_coverage_degradation(
+            history=[
+                {"overall_coverage_ratio": 0.95},
+                {"overall_coverage_ratio": 0.85},
+            ],
+            current_ratio=0.75,
+            watch_threshold=0.72,
+        )
+        # 全部高于 watch 阈值，但 0.95→0.85→0.75 每步跌 ≥0.05 → 趋势命中。
+        assert result is not None
+        assert result["trigger"] == "consecutive_drops"
+
+    def test_stable_history_no_trigger(self) -> None:
+        from stock_analyzer.runtime.services.week6_service import _detect_coverage_degradation
+
+        result = _detect_coverage_degradation(
+            history=[
+                {"overall_coverage_ratio": 0.95},
+                {"overall_coverage_ratio": 0.94},
+            ],
+            current_ratio=0.90,
+            watch_threshold=0.72,
+        )
+        assert result is None
+
+    def test_short_history_falls_back_to_threshold_only(self) -> None:
+        from stock_analyzer.runtime.services.week6_service import _detect_coverage_degradation
+
+        result = _detect_coverage_degradation(
+            history=[],
+            current_ratio=0.90,
+            watch_threshold=0.72,
+        )
+        assert result is None
+        result2 = _detect_coverage_degradation(
+            history=[],
+            current_ratio=0.60,
+            watch_threshold=0.72,
+        )
+        assert result2 is not None
+        assert result2["trigger"] == "below_watch_threshold"

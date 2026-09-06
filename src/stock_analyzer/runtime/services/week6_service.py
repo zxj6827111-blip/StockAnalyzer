@@ -206,6 +206,34 @@ class RuntimeWeek6Service:
                 "critical_fields": critical_fields,
             },
         )
+        # 覆盖率退化告警（2026-09-06 尾巴③，根治 7/31-9/5 静默断链 35 天）：
+        # 单次报告只看当天，历史趋势才是断链早期信号。条件（任一）：
+        # ① 覆盖率连续 3 次下降（含跌幅阈值）；② 跌破 watch 阈值。
+        degradation = _detect_coverage_degradation(
+            history=service._week6_data_quality_history,
+            current_ratio=float(report["overall_coverage_ratio"]),
+            watch_threshold=float(service._config.week6.data_quality_warn_threshold),
+        )
+        if degradation:
+            service._record_audit_event(
+                event_type="week6_coverage_degradation",
+                trace_id=source_trace_id,
+                level="warning",
+                payload=degradation,
+            )
+            if bool(service._config.week6.data_quality_notify):
+                service.notify(
+                    title=_push_title(
+                        priority="P1", category="quality", summary="week6 覆盖率退化"
+                    ),
+                    content=(
+                        f"整体覆盖率连续下降：{degradation['recent_ratios']}；"
+                        f"当前={degradation['current_ratio']:.2%}；"
+                        f"watch 阈值={degradation['watch_threshold']:.2%}"
+                    ),
+                    level="warn",
+                    trace_id=source_trace_id,
+                )
         use_notify = service._config.week6.data_quality_notify
         if notify_enabled is not None:
             use_notify = notify_enabled
@@ -595,3 +623,49 @@ def _is_week6_quality_field_valid(*, field: str, value: object) -> bool:
         bool,
         _runtime_service_module()._is_week6_quality_field_valid(field=field, value=value),
     )
+
+
+def _detect_coverage_degradation(
+    *,
+    history: list[dict[str, object]],
+    current_ratio: float,
+    watch_threshold: float,
+    consecutive_drops: int = 3,
+    min_drop_step: float = 0.05,
+) -> dict[str, object] | None:
+    """覆盖率退化检测（断链早期信号）。
+
+    - 历史尾部取最近 ``consecutive_drops-1`` 份报告 + 当前值，构成序列；
+    - 严格递减且每步跌幅 ≥ ``min_drop_step`` → 命中"连续下降"；
+    - 当前值 < watch 阈值 → 命中"跌破阈值"（含在下降检测内，独立可触发）。
+    历史不足时只做阈值判断（宁可早报不漏报）。
+    """
+
+    recent_ratios: list[float] = []
+    for record in reversed(history):
+        value = record.get("overall_coverage_ratio") if isinstance(record, dict) else None
+        if value is None:
+            continue
+        recent_ratios.append(float(value))
+        if len(recent_ratios) >= consecutive_drops - 1:
+            break
+    sequence = recent_ratios[::-1] + [current_ratio]
+
+    below_threshold = current_ratio < watch_threshold
+    dropping = (
+        len(sequence) >= consecutive_drops
+        and all(
+            sequence[i + 1] < sequence[i] - min_drop_step
+            for i in range(len(sequence) - 1)
+        )
+    )
+    if not (below_threshold or dropping):
+        return None
+    return {
+        "trigger": "below_watch_threshold" if below_threshold else "consecutive_drops",
+        "current_ratio": round(current_ratio, 4),
+        "recent_ratios": [round(v, 4) for v in sequence],
+        "watch_threshold": round(watch_threshold, 4),
+        "consecutive_drops_required": consecutive_drops,
+        "min_drop_step": min_drop_step,
+    }
