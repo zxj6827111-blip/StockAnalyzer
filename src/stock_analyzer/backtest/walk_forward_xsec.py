@@ -633,14 +633,18 @@ def main() -> int:
         flush=True,
     )
 
-    trainer = ModelTrainer(
-        training=cfg.training,
-        labels=cfg.labels,
-        models=cfg.models,
-        settlement_lag_days=int(cfg.evolution.execution_spec.settlement_lag),
-        provider=None,
-        market_relative_feature=cfg.market_relative_feature,
-    )
+    def _build_trainer() -> ModelTrainer:
+        # 每 fold 新建 trainer：LightGBM/XGBoost 的 C 层分配器缓存不归 Python
+        # gc 管，跨 fold 复用实例会累积 ~1.6GB（2026-09-06 实测）。
+        return ModelTrainer(
+            training=cfg.training,
+            labels=cfg.labels,
+            models=cfg.models,
+            settlement_lag_days=int(cfg.evolution.execution_spec.settlement_lag),
+            provider=None,
+            market_relative_feature=cfg.market_relative_feature,
+        )
+
 
     # fold checkpoint（方案 §5）：每 fold 完成即落盘，重跑跳过已完成
     # fold（含 OOM/中断后续跑）。目录 {out_dir}/checkpoints/。
@@ -708,7 +712,7 @@ def main() -> int:
             fold=plan,
             store=store,
             trading_dates=trading_dates,
-            trainer=trainer,
+            trainer=_build_trainer(),
             feature_columns=feature_columns,
             embargo_days=embargo_days,
             k_precision=k_list,
