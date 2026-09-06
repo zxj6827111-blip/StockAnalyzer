@@ -363,17 +363,24 @@ def run_fold(
     )
     result.lookahead_violations = violations
 
-    aligned = train[feature_columns + ["label"]].copy()
-    aligned.index = pd.to_datetime(train["trade_date"])
-    aligned["label"] = aligned["label"].astype(float)
+    # train_on_feature_label 内部 features.join(labels, how="inner")——两个
+    # 传入帧的索引必须是行唯一对齐的。此前把 trade_date 设为索引（120 个
+    # 交易日 × ~800 只 = 非唯一索引），join 退化成组内笛卡尔积：
+    # 880 日期行 × 800 标签行 = 70.4 万行/日 → 7040 万行（实测 MemoryError）。
+    # 修复：保持 RangeIndex（行唯一），决策日语义由 trainer 的
+    # apply_time_invariants（date 索引缺失时按行拒绝）与我们的 maturity purge
+    # 共同保障；对齐用同一 RangeIndex 的两帧 join 即逐行内积。
+    features_frame = train[feature_columns].reset_index(drop=True)
+    labels_series = train["label"].astype(float).reset_index(drop=True)
+    labels_series.name = "label_soup_tp_before_sl"
     try:
         print(
-            f"    [fold {fold_id}] training aligned={len(aligned):,} "
+            f"    [fold {fold_id}] training aligned={len(features_frame):,} "
             f"rss={_rss_mib():.0f}MiB",
             flush=True,
         )
         trained = trainer.train_on_feature_label(
-            features=aligned[feature_columns], labels=aligned["label"]
+            features=features_frame, labels=labels_series
         )
         print(
             f"    [fold {fold_id}] trained rss={_rss_mib():.0f}MiB",
