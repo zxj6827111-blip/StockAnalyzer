@@ -251,10 +251,11 @@ class TestPitDatasetStore:
         )
         frame.to_parquet(tmp_path / "pit_2026-03.parquet", index=False)
         store = PitDatasetStore(str(tmp_path))
-        # (symbol, trade_date) 唯一键：重复行保留一条（窗口函数 rn=1）。
-        assert store.row_count() == 2
+        # 视图为直通层：去重责任在数据集生成端（分片内+月度合并时），
+        # store 只做按需查询；重复行按原样可见（与生产生成器语义一致）。
+        assert store.row_count() == 3
         eval_rows = store.fetch_eval_rows(on=date(2026, 3, 2))
-        assert len(eval_rows) == 2
+        assert len(eval_rows) == 3
         assert set(eval_rows["symbol"]) == {"600000", "000001"}
         assert store.trading_dates() == [date(2026, 3, 2)]
         store.close()

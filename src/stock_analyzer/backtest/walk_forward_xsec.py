@@ -97,18 +97,12 @@ class PitDatasetStore:
             return
         files = [str(chunk) for chunk in self.chunks]
         file_list = ", ".join(f"'{f}'" for f in files)
-        # 视图 + 去重窗口：scan 时按 (symbol, trade_date) 保留一条。
+        # 直接视图（不叠窗口函数）：分片生成阶段已保证 (symbol, trade_date)
+        # 唯一（shard 内 drop_duplicates + 月度合并再去重），视图层去重
+        # 的 ROW_NUMBER 全表排序曾把 4GiB 容器顶爆（2026-09-06 实测）。
         self._con.execute(
-            f"""
-            CREATE OR REPLACE VIEW pit_dedup AS
-            SELECT * EXCLUDE (rn) FROM (
-              SELECT *, ROW_NUMBER() OVER (
-                PARTITION BY symbol, trade_date
-                ORDER BY label_mature_trade_date DESC NULLS LAST
-              ) AS rn
-              FROM read_parquet([{file_list}])
-            ) WHERE rn = 1
-            """
+            f"CREATE OR REPLACE VIEW pit_dedup AS "
+            f"SELECT * FROM read_parquet([{file_list}])"
         )
         self._materialized = True
         columns = [
