@@ -62,16 +62,30 @@ class FoldResult:
     quantile_means: list[float] = field(default_factory=list)
     top_minus_bottom: float = float("nan")
     universe_stats: dict[str, float] = field(default_factory=dict)
-    eval_rows: pd.DataFrame | None = None
+    # fold 评估行不整帧驻留：只保留池化统计所需的紧凑数组。
+    eval_scores: np.ndarray | None = None
+    eval_returns: np.ndarray | None = None
 
 
 def load_pit_dataset(dataset_dir: str) -> pd.DataFrame:
+    """载入月度 parquet 块；特征列统一降 float32（240 万行 × 222 列
+    float64 ≈ 4.2GB 会顶爆 4GiB 容器，float32 + 分批 concat 峰值 ≈ 2.2GB）。"""
+
     root = Path(dataset_dir)
     chunks = sorted(root.glob("pit_*.parquet"))
     if not chunks:
         raise FileNotFoundError(f"no pit parquet chunks under {dataset_dir}")
-    frames = [pd.read_parquet(chunk) for chunk in chunks]
+    meta_columns = ["symbol", "trade_date", "label", "label_mature_trade_date", "fwd_return"]
+    frames: list[pd.DataFrame] = []
+    for chunk in chunks:
+        frame = pd.read_parquet(chunk)
+        feature_columns = [c for c in frame.columns if c not in meta_columns]
+        for column in feature_columns:
+            if pd.api.types.is_numeric_dtype(frame[column]):
+                frame[column] = frame[column].astype("float32")
+        frames.append(frame)
     data = pd.concat(frames, ignore_index=True)
+    del frames
     data["trade_date"] = pd.to_datetime(data["trade_date"])
     data["label_mature_trade_date"] = pd.to_datetime(
         data["label_mature_trade_date"], errors="coerce"
@@ -225,7 +239,12 @@ def run_fold(
         return result
     evaluation = pd.concat(eval_parts, ignore_index=True)
     labeled = evaluation[evaluation["fwd_return"].notna()].copy()
-    result.eval_rows = labeled
+    # fold 级即取即算（不整帧驻留：24 fold 的评估行合计=全数据集）。
+    pooled_scores = labeled["score"].to_numpy(dtype=float)
+    pooled_returns = labeled["fwd_return"].to_numpy(dtype=float)
+    pooled_labels_binary = (pooled_returns > 0.0).astype(float)
+    result.eval_scores = pooled_scores
+    result.eval_returns = pooled_returns
     result.pooled_n = int(len(labeled))
     result.universe_stats = {
         "training_universe_size": int(train["symbol"].nunique()),
@@ -244,10 +263,9 @@ def run_fold(
         return result
 
     quantiles = compute_quantile_returns(
-        labeled["score"].to_numpy(), labeled["fwd_return"].to_numpy(), n_quantiles=5
+        pooled_scores, pooled_returns, n_quantiles=5
     )
-    labels_binary = (labeled["fwd_return"] > 0.0).astype(float).to_numpy()
-    auc = compute_auc_brier(labeled["score"].to_numpy(), labels_binary)
+    auc = compute_auc_brier(pooled_scores, pooled_labels_binary)
     result.daily_ic = [
         (d.isoformat(), float(v))
         for d, v in labeled.groupby("trade_date")
@@ -296,15 +314,6 @@ def aggregate_report(
     completed = [f for f in folds if f.status in {"completed", "completed_unlabeled"}]
     daily_ic_all = [item for f in completed for item in f.daily_ic]
     daily_tb_all = [item for f in completed for item in f.daily_top_bottom]
-    pooled_scores: list[float] = []
-    pooled_returns: list[float] = []
-    pooled_labels: list[float] = []
-    for f in completed:
-        if f.eval_rows is None or f.eval_rows.empty:
-            continue
-        pooled_scores.extend(f.eval_rows["score"].astype(float).tolist())
-        pooled_returns.extend(f.eval_rows["fwd_return"].astype(float).tolist())
-        pooled_labels.extend((f.eval_rows["fwd_return"] > 0).astype(float).tolist())
     ci = date_block_bootstrap_ci(daily_ic_all)
     ic_mean = (
         float(np.mean([v for _, v in daily_ic_all])) if daily_ic_all else float("nan")
@@ -312,12 +321,31 @@ def aggregate_report(
     tb_mean = (
         float(np.mean([v for _, v in daily_tb_all])) if daily_tb_all else float("nan")
     )
+    # 池化指标：fold 级即取即算（eval 行不跨 fold 驻留）——逐 fold 增量累积
+    # score/return/label 数组后一次性计算。
+    pooled_scores: list[np.ndarray] = []
+    pooled_returns: list[np.ndarray] = []
+    pooled_labels: list[np.ndarray] = []
+    for f in completed:
+        if f.eval_scores is None:
+            continue
+        pooled_scores.append(f.eval_scores)
+        pooled_returns.append(f.eval_returns)
+        pooled_labels.append((f.eval_returns > 0.0).astype(float))
     quantile_means: list[float] = []
+    pooled_auc = float("nan")
+    pooled_brier = float("nan")
+    pooled_n = 0
     if pooled_scores:
-        quantiles = compute_quantile_returns(
-            np.asarray(pooled_scores), np.asarray(pooled_returns), n_quantiles=5
-        )
+        scores = np.concatenate(pooled_scores)
+        returns = np.concatenate(pooled_returns)
+        labels_binary = np.concatenate(pooled_labels)
+        pooled_n = int(len(scores))
+        quantiles = compute_quantile_returns(scores, returns, n_quantiles=5)
         quantile_means = [float(q) for q in quantiles["quantile_means"]]
+        auc = compute_auc_brier(scores, labels_binary)
+        pooled_auc = auc["auc"]
+        pooled_brier = auc["brier"]
     # 月度单调性：逐月 top-bottom 均值方向。
     monthly: dict[str, list[float]] = {}
     for d, v in daily_tb_all:
@@ -325,7 +353,6 @@ def aggregate_report(
     monthly_means = {m: float(np.mean(vals)) for m, vals in sorted(monthly.items())}
     months_positive = sum(1 for v in monthly_means.values() if v >= 0)
     total_months = len(monthly_means)
-    auc = compute_auc_brier(np.asarray(pooled_scores), np.asarray(pooled_labels))
 
     monotonic_ok = (
         months_positive >= max(1, math.ceil(4 / 6 * total_months)) if total_months else False
@@ -347,9 +374,9 @@ def aggregate_report(
         "aggregate_ic_ci95": [ci["ci_low"], ci["ci_high"]],
         "ci_valid_days": ci["valid_days"],
         "aggregate_top_minus_bottom": tb_mean,
-        "pooled_auc": auc["auc"],
-        "pooled_brier": auc["brier"],
-        "pooled_n": len(pooled_scores),
+        "pooled_auc": pooled_auc,
+        "pooled_brier": pooled_brier,
+        "pooled_n": pooled_n,
         "quantile_means": quantile_means,
         "monthly_top_bottom_mean": monthly_means,
         "months_top_bottom_positive": months_positive,

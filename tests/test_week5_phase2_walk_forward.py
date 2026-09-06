@@ -116,8 +116,15 @@ class TestAggregateReport:
         auc: float = 0.6,
         status: str = "completed",
     ) -> object:
+        import numpy as np
+
         from stock_analyzer.backtest.walk_forward_xsec import FoldResult
 
+        n = max(1, len(daily_ic) * 10)
+        # 排序能力正交于收益方向：分数高的行收益高（IC>0 语义）。
+        rng = np.random.default_rng(fold_id)
+        scores = rng.random(n)
+        returns = scores * 0.05 - 0.01
         return FoldResult(
             fold_id=fold_id,
             train_start="2026-01-05",
@@ -128,10 +135,12 @@ class TestAggregateReport:
             daily_top_bottom=[(f"2026-07-{i+1:02d}", v) for i, v in enumerate(daily_tb)],
             pooled_auc=auc,
             pooled_brier=0.25,
-            pooled_n=len(daily_ic) * 10,
+            pooled_n=n,
             quantile_means=[-0.05, -0.02, 0.0, 0.02, 0.05],
             top_minus_bottom=0.10,
             lookahead_violations=0,
+            eval_scores=scores,
+            eval_returns=returns,
         )
 
     def test_verdict_go_candidate_with_positive_signal(self) -> None:
