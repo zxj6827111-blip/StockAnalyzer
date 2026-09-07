@@ -26,12 +26,25 @@
 # 应该通过 --force-recreate 走正规流程），首次应用或撤销限制会重建全部四个
 # 容器，在可用内存紧张的宿主上仍应安排维护窗口。
 #
-# 内存预算（合计 9.5G，可用 10.7G，留 ~1.2G 冗余给宿主其他容器与内核）：
+# 2026-09-07 修订：scheduler-critical 2G → 3G。原 2G 上限被 dmesg 证伪：
+# live_runtime worker（09:25 冷启动首轮，8 符号全 pipeline）anon-rss 峰值
+# 1.2-1.6G，叠加 supervisor 常驻 ~0.4-0.5G 与 ~0.13G file-rss，反复触发
+# CONSTRAINT_MEMCG OOM kill（9/7 四杀：09:26/09:31/10:30/14:01；lr1 自 8/28
+# 限额应用后连败 6 个交易日，last_success 恰为限额应用当天上午）。原
+# "实测占用 411M" 测的是空闲 supervisor，未覆盖 worker 冷启动峰值。
+# lr1 窗口仅 09:25-09:26 一分钟、无重试机会，失败即当日信号链路缺失。
+# 预算同步：四容器上限合计 9.5G → 10.5G（caps 非预留，宿主 15.5G 内存，
+# 当前实际占用 api 0.6G + heavy 0.5G + critical 0.5G + redis 10M，
+# 上限调高不增加常态占用）。
+#
+# 内存预算（合计 10.5G，宿主 15.5G / 常态可用 ~6.7G）：
 #   redis            0.5G  —— 现有工作负载体量小，纯缓存
 #   api              4.0G  —— 常规请求服务 + 本次新增 as-of 回测后台任务
 #                              （Top N 默认 50、标的维度 <= 8 worker，
 #                              远小于曾导致 12G 峰值的全市场 5500 只扫描）
-#   scheduler-critical 2.0G —— 按设计跑轻量/高频任务
+#   scheduler-critical 3.0G —— 跑 live_runtime（8 符号全 pipeline，worker
+#                              冷启动峰值 ~2.2G 含 supervisor 常驻；2G 实测
+#                              反复 OOM，见上方 2026-09-07 修订）
 #   scheduler-heavy    3.0G —— 跑全市场扫描/evolution 等重任务，预留更大余量
 #
 # memswap_limit 与 mem_limit 相等 = 禁止该容器额外使用 swap（超出 mem_limit
@@ -47,8 +60,8 @@ services:
     memswap_limit: 4g
 
   scheduler-critical:
-    mem_limit: 2g
-    memswap_limit: 2g
+    mem_limit: 3g
+    memswap_limit: 3g
 
   scheduler-heavy:
     mem_limit: 3g
