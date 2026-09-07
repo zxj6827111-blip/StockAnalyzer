@@ -472,3 +472,64 @@ def test_week5_scan_incremental_refresh_updates_candidate_set(tmp_path: Path) ->
     assert "000001" not in manifest.per_symbol
     assert "002415" in manifest.per_symbol
     assert manifest.requested_symbol_count == len(second_set)
+
+
+def test_week5_scan_snapshot_mode_data_gate_blocked_fail_closed(
+    tmp_path: Path,
+) -> None:
+    """snapshot_funnel 主路径（snapshot 构建成功且 current）在 data_gate=blocked
+    时同样必须 fail-closed（2026-09-05 修复：原 blocked 中止只挂在非 snapshot
+    预过滤分支，生产主路径被绕过——scan 带 blocked 照常产出 buy）。"""
+    config = _load_test_config()
+    _enable_universe_quality_selector(config)
+    config.week5.feature_snapshot_require_current = True
+    config.week5.feature_snapshot_root = str(tmp_path / "features_light")
+    config.week5.data_quality_watch_threshold = 0.72
+    service = _new_service(config)
+    service.state.watchlist = []
+    universe_symbols = ["600519", "000001", "601318"]
+    _patch_attr(
+        service,
+        "_resolve_symbol_universe",
+        lambda **_: {"source": "test_universe", "symbols": universe_symbols, "errors": []},
+    )
+    _patch_attr(service, "_resolve_universe_seed_trade_date", lambda: "2026-03-16")
+    selected = ["600519", "000001", "601318"]
+    _patch_attr(
+        service,
+        "_select_universe_quality_candidates",
+        _quality_selection_fake(selected, len(universe_symbols)),
+    )
+    _patch_scan_surroundings(service, {})
+    pipeline_symbols: list[list[str]] = []
+    _capture_pipeline(service, pipeline_symbols)
+    # week6 prewarm 覆盖率 0（7/31 起裸行的生产实态）→ data_quality_blocked。
+    _patch_attr(
+        service,
+        "latest_week6_data_quality_report",
+        lambda: {"overall_coverage_ratio": 0.0, "status": "critical"},
+    )
+
+    report = _as_mapping(
+        service.run_week5_scan(
+            timestamp=datetime(2026, 3, 16, 20, 30),
+            sync_reason="scheduler_week5_nightly",
+            notify_enabled=False,
+            force_universe_scan=True,
+            prefilter_enabled_override=True,
+        )
+    )
+
+    assert str(report.get("status", "")) == "blocked_data_gate"
+    gate = _as_mapping(report["data_gate"])
+    assert gate["status"] == "blocked"
+    assert any(
+        "data_quality_blocked" in str(reason) for reason in _as_text_list(gate["reasons"])
+    )
+    # snapshot 本身构建成功（证明失败点不是 snapshot，而是 gate 被 snapshot
+    # 模式绕过——修复后 gate 在主路径同样生效）。
+    fs = report.get("feature_snapshot")
+    assert isinstance(fs, Mapping)
+    assert fs["ok"] is True
+    # fail-closed：重型 pipeline 从未执行。
+    assert pipeline_symbols == []

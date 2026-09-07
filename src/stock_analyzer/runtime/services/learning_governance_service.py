@@ -242,9 +242,12 @@ class RuntimeLearningGovernanceService:
                             ).strip()
                             shadow_entry = self._service._model_registry.get_by_id(shadow_model_id)
                             if shadow_entry is not None and str(shadow_entry.artifact_uri).strip():
+                                # Phase 0 §3.3：发布后热载同样走 registry 前置校验，
+                                # 不直载未经身份校验的文件。
                                 auto_promotion["predictor_loaded"] = bool(
-                                    self._service._pipeline.reload_predictor(
-                                        artifact_path=str(shadow_entry.artifact_uri)
+                                    self._service._validated_predictor_reload(
+                                        str(shadow_entry.artifact_uri),
+                                        source="learning_governance_auto_release",
                                     )
                                 )
                     else:
@@ -2419,9 +2422,14 @@ class _TwoPhaseReleaseExecutor:
             except OSError as exc:
                 logger.error("release rollback failed to restore alias: %s", exc)
             # 旧实例不存在（发布前本无 predictor）时从恢复后的磁盘别名重载。
+            # Phase 0 §3.3：恢复加载同样走 alias 校验门（恢复的旧 alias 可能是
+            # 带自描述 metadata 的新式 alias 或历史 legacy alias）。
             if pipeline is not None and self._previous_predictor is None:
-                pipeline.reload_predictor()
-                recovery["predictor_restored"] = True
+                recovery["predictor_restored"] = bool(
+                    self._service._reload_alias_predictor_validated(
+                        str(self._alias_path), source="release_rollback_recovery"
+                    )
+                )
         if self._registry_committed:
             # 补偿事务：旧 champion 升回、目标降级（CAS 期望值对调）。
             if self._previous_champion is None:

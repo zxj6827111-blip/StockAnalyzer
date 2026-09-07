@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import cast
 
 import pandas as pd
+import pytest
 
 from stock_analyzer.config import StockAnalyzerConfig, load_config
 from stock_analyzer.data.provider import SyntheticProvider
@@ -348,9 +349,7 @@ def test_service_bootstrap_active_champion_repairs_legacy_production_artifact(
     assert payload["lifecycle_state"] == "approved"
     assert str(payload["dataset_manifest_id"]).startswith("legacy_production_dataset_manifest_")
     assert str(payload["feature_schema_id"]).startswith("legacy_production_feature_schema_")
-    assert str(payload["feature_schema_hash"]).startswith(
-        "legacy_production_feature_schema_hash_"
-    )
+    assert str(payload["feature_schema_hash"]).startswith("legacy_production_feature_schema_hash_")
     assert str(payload["label_policy_id"]).startswith("legacy_production_label_policy_")
     assert str(payload["label_policy_hash"]).startswith("legacy_production_label_policy_hash_")
     assert active["model_id"] == "model_v1_prod_bootstrap_existing"
@@ -478,9 +477,7 @@ def test_service_build_shadow_dataset_uses_registered_model_manifest(tmp_path: P
             preview_limit=3,
         )
     )
-    audit_payload = _as_mapping(
-        service.audit_events(limit=20, event_type="shadow_dataset_built")
-    )
+    audit_payload = _as_mapping(service.audit_events(limit=20, event_type="shadow_dataset_built"))
 
     assert shadow_payload["model_id"] == registry_payload["model_id"]
     assert shadow_payload["dataset_manifest_id"] == training_payload["dataset_manifest_id"]
@@ -627,9 +624,7 @@ def test_service_build_shadow_online_v2_report_emits_detailed_payload(tmp_path: 
     assert "legacy_shadow_v2_cum_return" in _as_mapping(report_payload["return_summary"])
     assert "shadow_v2_slot_return" in _as_mapping(report_payload["return_summary"])
     assert "shadow_v2" in _as_mapping(report_payload["calibration_summary"])
-    assert "shadow_v2_signal_divergence_ratio" in _as_mapping(
-        report_payload["execution_summary"]
-    )
+    assert "shadow_v2_signal_divergence_ratio" in _as_mapping(report_payload["execution_summary"])
     assert int(audit_payload["records"]) >= 1
 
 
@@ -732,9 +727,9 @@ def test_service_train_execution_risk_model_returns_preflight_when_targets_not_t
     preflight = _as_mapping(payload["preflight"])
     outcome_coverage = _as_mapping(preflight["outcome_coverage"])
     assert _as_mapping(outcome_coverage["requested_field_coverage"])["reconcile_status"] == 30
-    assert _as_mapping(outcome_coverage["requested_target_coverage"])[
-        "reconcile_mismatch_risk"
-    ] == 30
+    assert (
+        _as_mapping(outcome_coverage["requested_target_coverage"])["reconcile_mismatch_risk"] == 30
+    )
     assert preflight["requested_maturity_statuses"] == [
         "pending",
         "label_matured",
@@ -1267,3 +1262,63 @@ def test_service_run_learning_manifest_shadow_promotion_gate_skips_gate_when_sha
     assert promotion_gate["ok"] is False
     assert promotion_gate["reason_codes"] == ["shadow_validation_failed"]
     assert "shadow_validation_failed" in cast(list[object], payload["errors"])
+
+
+# ---------------------------------------------------------------------------
+# Phase 0 §3.3：alias 兼容加载门（_reload_alias_predictor_validated）
+# ---------------------------------------------------------------------------
+
+
+def _gate_artifact() -> ModelArtifact:
+    return ModelArtifact.create(
+        feature_columns=["feature_a", "feature_b"],
+        lgbm_model={},
+        xgb_model={},
+        lgbm_calibrator={},
+        xgb_calibrator={},
+        training_metrics={"auc": 0.51},
+    )
+
+
+def test_alias_reload_gate_branches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import json as _json
+
+    config = _load_test_config(tmp_path)
+    service = _new_service(config, provider=FailingBarsProvider())
+    # 门语义与底层加载解耦：toy artifact 会被真实 predictor 拒载，
+    # 这里把 _pipeline.reload_predictor 替换为恒真，只验证门分支。
+    monkeypatch.setattr(service._pipeline, "reload_predictor", lambda artifact_path=None: True)
+
+    legacy_alias = tmp_path / "model_v1.json"
+    _gate_artifact().save(legacy_alias)
+
+    # ① pre-champion 窗口 + 无自描述 metadata → 兼容放行。
+    assert service._reload_alias_predictor_validated(str(legacy_alias), source="gate_t1") is True
+
+    # ② champion（hash 已物化）存在后，无自描述 alias → 拒绝。
+    champ_path = tmp_path / "champion.json"
+    _gate_artifact().save(champ_path)
+    boot = _as_mapping(
+        service.bootstrap_active_champion_from_artifact(
+            artifact_path=str(champ_path),
+            source="gate_t2_bootstrap",
+            allow_legacy_production_artifact=True,
+            model_id="model_v1_gate_champ",
+        )
+    )
+    assert boot["accepted"] is True
+    champion = service._model_registry.active_champion()
+    assert champion is not None and champion.artifact_content_hash.strip()
+    assert service._reload_alias_predictor_validated(str(legacy_alias), source="gate_t2") is False
+
+    # ③ 自描述 metadata 指向 champion 记录 → 放行。
+    described = tmp_path / "alias_described.json"
+    payload = _json.loads(champ_path.read_text(encoding="utf-8"))
+    payload.setdefault("metadata", {})["registry_model_id"] = champion.model_id
+    described.write_text(_json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    assert service._reload_alias_predictor_validated(str(described), source="gate_t3") is True
+
+    # ④ 自描述 identity 无法对应任何 registry 记录 → 拒绝。
+    payload["metadata"]["registry_model_id"] = "model_v3_nonexistent"
+    described.write_text(_json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    assert service._reload_alias_predictor_validated(str(described), source="gate_t4") is False

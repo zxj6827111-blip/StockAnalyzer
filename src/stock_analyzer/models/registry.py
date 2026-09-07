@@ -14,6 +14,7 @@ from typing import Protocol, cast
 
 from stock_analyzer._pydantic_compat import BaseModel, ConfigDict, Field, field_validator
 from stock_analyzer.models.artifact import ModelArtifact
+from stock_analyzer.models.bundle import compute_artifact_identity_hash
 
 
 class ModelRole(StrEnum):
@@ -139,6 +140,7 @@ def build_model_registry_record_from_artifact(
     resolved_model_id = model_id or _build_model_id(
         artifact=artifact,
         artifact_uri=normalized_artifact_uri,
+        artifact_content_hash=str(artifact_content_hash).strip(),
     )
     return ModelRegistryRecord(
         model_id=resolved_model_id,
@@ -199,6 +201,9 @@ class ModelRegistry:
     def register(self, record: ModelRegistryRecord) -> ModelRegistryRecord:
         """Insert one registry record, returning the existing copy on idempotent replays."""
 
+        # Phase 0 §3.3：入库前物化内容 hash（缺失时从 artifact 文件回填）——
+        # registry 级不变量，任何调用方（发布/引导/测试）统一覆盖。
+        record = _materialize_artifact_content_hash(record)
         _validate_lifecycle_requirements(record)
         existing = self.get_by_id(record.model_id, suppress_read_errors=True)
         if existing is not None:
@@ -401,11 +406,12 @@ class ModelRegistry:
             },
             deep=True,
         )
-        if (
-            role == ModelRole.CHAMPION
-            and next_record.lifecycle_state != ModelLifecycleState.APPROVED
-        ):
-            raise ValueError("champion role requires approved lifecycle state")
+        if role == ModelRole.CHAMPION:
+            # Phase 0 §3.3：晋升 champion 时物化内容 hash（缺失则从 artifact
+            # 文件回填），使 active champion 恒指向 hash 可校验的模型。
+            next_record = _materialize_artifact_content_hash(next_record)
+            if next_record.lifecycle_state != ModelLifecycleState.APPROVED:
+                raise ValueError("champion role requires approved lifecycle state")
         return self._replace_record(next_record)
 
     def active_champion(
@@ -483,6 +489,23 @@ class ModelRegistry:
                         "champion role requires approved lifecycle state: "
                         f"{normalized_target}"
                     )
+                # Phase 0 §3.3：晋升目标必须满足 champion 内容身份要求（hash
+                # 缺失时从 artifact 文件物化，文件不可读即拒绝，fail-closed）。
+                materialized = _materialize_artifact_content_hash(target_record)
+                if str(materialized.artifact_content_hash).strip() != str(
+                    target_record.artifact_content_hash
+                ).strip():
+                    conn.execute(
+                        f"UPDATE {self._table_name} SET artifact_content_hash = ? "
+                        "WHERE model_id = ?",
+                        [materialized.artifact_content_hash, normalized_target],
+                    )
+                    target_record = materialized
+                _validate_lifecycle_requirements(
+                    target_record.model_copy(
+                        update={"role": ModelRole.CHAMPION}, deep=True
+                    )
+                )
                 conn.execute(
                     f"UPDATE {self._table_name} SET role = ?, updated_at = ?, "
                     "promoted_at = COALESCE(promoted_at, ?) WHERE model_id = ?",
@@ -731,6 +754,16 @@ _APPROVAL_REQUIRED_FIELDS = (
     "label_policy_id",
     "label_policy_hash",
 )
+# Phase 0 §3.3：champion 级强制的字段（高于 APPROVED 协议绑定要求）——
+# active_champion_id 只允许指向存在且 hash 校验通过的模型。
+_CHAMPION_REQUIRED_FIELDS = (
+    "artifact_content_hash",
+    "dataset_manifest_id",
+    "feature_schema_id",
+    "feature_schema_hash",
+    "label_policy_id",
+    "label_policy_hash",
+)
 
 _ALLOWED_LIFECYCLE_TRANSITIONS: dict[ModelLifecycleState, set[ModelLifecycleState]] = {
     ModelLifecycleState.REGISTERED: {
@@ -863,6 +896,20 @@ def _validate_lifecycle_requirements(record: ModelRegistryRecord) -> None:
         and record.lifecycle_state != ModelLifecycleState.APPROVED
     ):
         raise ValueError("champion role requires approved lifecycle state")
+    if record.role == ModelRole.CHAMPION:
+        # Phase 0 §3.3：champion 必须携带内容 hash 且协议绑定完整——空 hash 属
+        # 历史脏数据，禁止再次进入 champion；缺失 hash 在晋升路径上由
+        # _materialize_artifact_content_hash 自动回填，不可回填即拒绝。
+        missing_champion = [
+            field_name
+            for field_name in _CHAMPION_REQUIRED_FIELDS
+            if not str(getattr(record, field_name)).strip()
+        ]
+        if missing_champion:
+            raise ValueError(
+                "champion record requires content identity: "
+                + ", ".join(missing_champion)
+            )
     if record.lifecycle_state == ModelLifecycleState.APPROVED:
         missing = [
             field_name
@@ -875,9 +922,49 @@ def _validate_lifecycle_requirements(record: ModelRegistryRecord) -> None:
             )
 
 
-def _build_model_id(*, artifact: ModelArtifact, artifact_uri: str) -> str:
+def _materialize_artifact_content_hash(
+    record: ModelRegistryRecord,
+) -> ModelRegistryRecord:
+    """champion 晋升前的内容 hash 物化：缺失时从 artifact 文件回填。
+
+    文件不可读时保持空 hash，由 _validate_lifecycle_requirements 拒绝晋升
+    （fail-closed）；文件可读则落 sha256，后续 hash 校验以此为准。
+    """
+
+    if str(record.artifact_content_hash).strip():
+        return record
+    artifact_uri = str(record.artifact_uri).strip()
+    if not artifact_uri:
+        return record
+    try:
+        content_hash = compute_artifact_identity_hash(artifact_uri)
+    except OSError:
+        return record
+    return record.model_copy(
+        update={"artifact_content_hash": content_hash, "updated_at": record.updated_at},
+        deep=True,
+    )
+
+
+def _build_model_id(
+    *,
+    artifact: ModelArtifact,
+    artifact_uri: str,
+    artifact_content_hash: str = "",
+) -> str:
+    """内容绑定派生 id（v3）。
+
+    Phase 0 §3.3 决策（audit §7.2）：identity 只依赖内容叶子值（content hash）
+    与协议绑定字段，不再包含 artifact_uri 文件路径——同内容换路径身份不变，
+    文件被覆盖（同路径不同内容）也不会与旧身份冲突。缺失 content hash 时
+    退回单文件 sha256（旧 alias 兼容路径），保证 APPROVED 记录恒有非空身份输入。
+    """
+
+    resolved_hash = str(artifact_content_hash).strip()
+    if not resolved_hash:
+        resolved_hash = compute_artifact_identity_hash(artifact_uri)
     payload = {
-        "artifact_uri": artifact_uri,
+        "artifact_content_hash": resolved_hash,
         "artifact_created_at": str(artifact.created_at).strip(),
         "dataset_manifest_id": artifact.dataset_manifest_id,
         "feature_schema_id": artifact.feature_schema_id,
@@ -887,7 +974,7 @@ def _build_model_id(*, artifact: ModelArtifact, artifact_uri: str) -> str:
     }
     serialized = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
-    return f"model_v1_{digest[:12]}"
+    return f"model_v3_{digest[:12]}"
 
 
 def _load_json_dict_float(value: object) -> dict[str, float]:

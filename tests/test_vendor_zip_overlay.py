@@ -1468,3 +1468,73 @@ def test_required_intraday_backend_errors_fail_closed(
     provider._intraday_warehouse = None
     with pytest.raises(RequiredIntradayDataError, match="database is unavailable"):
         provider.fetch_intraday_summary("600000", "1m", lookback_days=5)
+
+
+def test_daily_overlay_enriches_financial_background_from_market_warehouse(
+    tmp_path: Path,
+) -> None:
+    """overlay 取价后从 market.duckdb join 财务/背景列（2026-09-05 修复）。
+
+    overlay 帧（ZIP 价格 ⋈ delta 元数据）在财务/背景列上恒为空——week6
+    prewarm 覆盖率 0.0 的直接原因。market.duckdb（delta 同级 warehouse/
+    目录约定）里同 (symbol,date) 行的 PIT 值必须被带上。
+    """
+    index_path = _build_daily_fixture(tmp_path)
+    delta_db = tmp_path / "delta" / "market_delta.duckdb"
+    delta_package = tmp_path / "delta" / "package"
+    delta_warehouse = MarketWarehouse(db_path=delta_db, package_root=delta_package)
+    delta = pd.DataFrame(
+        {
+            "open": [12.0],
+            "high": [13.0],
+            "low": [11.5],
+            "close": [12.5],
+            "volume": [7777.0],
+            "turnover": [777_700.0],
+            "float_market_cap": [2_250_000_000.0],
+            "price_series_mode": ["raw"],
+            "adjustment_source": ["tushare_raw"],
+        },
+        index=pd.to_datetime(["2026-01-02"]),
+    )
+    delta_warehouse.replace_daily_bars(symbol="600000", frame=delta)
+
+    # market.duckdb 按 delta 同级 warehouse/ 目录约定放置，含富集行。
+    market_db = tmp_path / "warehouse" / "market.duckdb"
+    market = MarketWarehouse(db_path=market_db, package_root=str(market_db.parent / "package"))
+    enriched = pd.DataFrame(
+        {
+            "open": [12.0],
+            "high": [13.0],
+            "low": [11.5],
+            "close": [12.5],
+            "volume": [7777.0],
+            "turnover": [777_700.0],
+            "float_market_cap": [2_250_000_000.0],
+            "roe": [0.113],
+            "debt_ratio": [0.42],
+            "financial_data_complete": [True],
+            "financial_trust_level": ["reported"],
+            "financial_source": ["tushare_fina_indicator"],
+            "background_data_complete": [True],
+            "background_data_source": ["tushare_pro_bulk_backfill"],
+            "dragon_tiger_flag": [1.0],
+        },
+        index=pd.to_datetime(["2026-01-02"]),
+    )
+    market.replace_daily_bars(symbol="600000", frame=enriched)
+
+    provider = VendorZipOverlayProvider(
+        data_root=str(tmp_path),
+        index_path=str(index_path),
+        delta_db_path=str(delta_db),
+        delta_package_root=str(delta_package),
+    )
+    bars = provider.fetch_daily_bars("600000", lookback_days=10)
+
+    assert float(bars.loc["2026-01-02", "roe"]) == pytest.approx(0.113)
+    assert bool(bars.loc["2026-01-02", "financial_data_complete"]) is True
+    assert bool(bars.loc["2026-01-02", "background_data_complete"]) is True
+    assert float(bars.loc["2026-01-02", "dragon_tiger_flag"]) == 1.0
+    # 价格列不被富集覆盖（ZIP/delta 仍是价格权威）。
+    assert float(bars.loc["2026-01-02", "close"]) == 12.5

@@ -262,8 +262,14 @@ _LEGACY_CREATE = (
 
 
 def _approved_challenger_record(model_id: str, uri: str):
+    """构建 APPROVED challenger 记录；uri 指向真实文件——champion 晋升会从该
+    文件物化 content hash（Phase 0 §3.3 契约：champion 必须可校验）。"""
+
     from stock_analyzer.models.registry import build_model_registry_record_from_artifact
 
+    artifact_path = Path(uri)
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text("{}", encoding="utf-8")
     artifact = ModelArtifact.create(
         feature_columns=["f"],
         lgbm_model={},
@@ -345,7 +351,9 @@ def test_registry_read_path_works_on_unmigrated_legacy_table(tmp_path: Path) -> 
 
 def test_registry_round_trips_artifact_content_hash(tmp_path: Path) -> None:
     registry = ModelRegistry(db_path=tmp_path / "registry.duckdb")
-    record = _approved_challenger_record("model_v2_abc", "/tmp/bundle/model.json")
+    record = _approved_challenger_record(
+        "model_v2_abc", str(tmp_path / "bundle" / "model.json")
+    )
     record = record.model_copy(update={"artifact_content_hash": "c" * 64})
     registry.register(record)
     loaded = registry.get_by_id("model_v2_abc")
@@ -355,10 +363,14 @@ def test_registry_round_trips_artifact_content_hash(tmp_path: Path) -> None:
 
 def test_promote_model_with_cas_success_and_conflict(tmp_path: Path) -> None:
     registry = ModelRegistry(db_path=tmp_path / "registry.duckdb")
-    champion = _approved_challenger_record("champ_old", "/tmp/champ/model.json")
+    champion = _approved_challenger_record(
+        "champ_old", str(tmp_path / "champ" / "model.json")
+    )
     registry.register(champion)
     registry.update_role(model_id="champ_old", role=ModelRole.CHAMPION)
-    challenger = _approved_challenger_record("chall_new", "/tmp/chall/model.json")
+    challenger = _approved_challenger_record(
+        "chall_new", str(tmp_path / "chall" / "model.json")
+    )
     registry.register(challenger)
 
     promoted, demoted = registry.promote_model_with_cas(
@@ -373,7 +385,9 @@ def test_promote_model_with_cas_success_and_conflict(tmp_path: Path) -> None:
     assert [item.model_id for item in champions] == ["chall_new"]
 
     # CAS 期望值不符 → 冲突，状态不变。
-    other = _approved_challenger_record("chall_other", "/tmp/other/model.json")
+    other = _approved_challenger_record(
+        "chall_other", str(tmp_path / "other" / "model.json")
+    )
     registry.register(other)
     with pytest.raises(ModelRegistryCASConflictError):
         registry.promote_model_with_cas(

@@ -86,7 +86,7 @@ def _sync_daily(
     missing_dates = _missing_daily_dates(since)
     if not missing_dates:
         print("[daily] no missing rows", flush=True)
-        return 0
+        return 0, []
     print(f"[daily] missing dates: {[d.isoformat() for d in missing_dates]}", flush=True)
 
     delta_con = duckdb.connect(DELTA_DB, read_only=True)
@@ -142,12 +142,12 @@ def _sync_daily(
     price_frame = pd.DataFrame(price_rows)
     if price_frame.empty:
         print("[daily] ZIP has no rows for missing dates", flush=True)
-        return 0
+        return 0, []
 
     merged = price_frame.merge(delta_frame, on=["symbol", "date"], how="inner")
     if merged.empty:
         print("[daily] no overlapping rows (zip ⋈ delta)", flush=True)
-        return 0
+        return 0, []
 
     warehouse = MarketWarehouse(
         db_path=MARKET_DB,
@@ -188,7 +188,8 @@ def _sync_daily(
         con.unregister("daily_sync_stage")
         con.close()
     print(f"[daily] upserted rows: {len(payload)}", flush=True)
-    return len(payload)
+    synced_dates = sorted({row for row in payload["date"].tolist() if row is not None})
+    return len(payload), synced_dates
 
 
 def _missing_minute_dates(zip_root: Path, since: date_type) -> list[date_type]:
@@ -301,6 +302,47 @@ def _sync_minute(zip_root: Path, since: date_type) -> int:
     return total
 
 
+def _enrich_synced_dates(dates: list[date_type]) -> None:
+    """日更富集钩子（2026-09-05 修复，见 docs/week5_datagate_root_cause_20260905.md）。
+
+    sync 裸行 upsert 后立刻补：① PIT 财务物化（本地 as-of join，无外部 API）；
+    ② 背景 bulk（tushare 按日接口）。否则每日新行会持续产出财务/背景全空的
+    行——week6 prewarm 覆盖率归零、data_gate 长期 blocked 的根因即此。
+    每步独立容错：富集失败不阻塞同步主流程（缺口由次日重跑或手工回填补齐）。
+    """
+
+    from stock_analyzer.data.tushare_provider import (
+        _HttpTushareProApi,
+        _resolve_tushare_token,
+    )
+    from stock_analyzer.data.warehouse_enrichment import (
+        enrich_background_for_dates,
+        enrich_daily_financial_pit,
+    )
+
+    con = duckdb.connect(MARKET_DB)
+    try:
+        try:
+            rows = enrich_daily_financial_pit(con, dates)
+            print(f"[daily][enrich] financial PIT rows: {rows}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[daily][enrich] financial failed: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+        token = _resolve_tushare_token()
+        if not token:
+            print("[daily][enrich] no tushare token; background skipped", flush=True)
+            return
+        http = _HttpTushareProApi(token=token, timeout_sec=30.0)
+        updated = enrich_background_for_dates(
+            con, dates, http, request_interval_sec=0.35
+        )
+        print(f"[daily][enrich] background dates updated: {updated}", flush=True)
+    finally:
+        con.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--daily", action="store_true", help="同步 tushare 日线缺口")
@@ -326,7 +368,9 @@ def main() -> None:
     since = date_type.fromisoformat(args.since)
 
     if args.daily:
-        _sync_daily(zip_dir=Path(args.daily_zip_dir), since=since)
+        _, synced_dates = _sync_daily(zip_dir=Path(args.daily_zip_dir), since=since)
+        if synced_dates:
+            _enrich_synced_dates(synced_dates)
     if args.minute:
         _sync_minute(zip_root=Path(args.qq_zip_root), since=since)
 

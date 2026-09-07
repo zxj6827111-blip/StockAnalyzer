@@ -691,8 +691,8 @@ labels:
   stop_loss_pct: 0.05
   horizon_days: 10
   exclude_untradable: true
-  pnl_price_basis: next_tradable_vwap
-  conflict_policy: bar_shape_heuristic
+  pnl_price_basis: next_tradable_open
+  conflict_policy: soft_label
   conflict_soft_label_value: 0.5
 
 market_relative_feature:

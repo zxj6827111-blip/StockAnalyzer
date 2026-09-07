@@ -142,6 +142,27 @@ def _resolve_entry_price(
     basis: str,
     exclude_untradable: bool,
 ) -> tuple[int, float]:
+    if basis == "next_tradable_open":
+        # 计划口径（Phase 0 §3.2）：入场日为决策日 T 的下一个交易日，入场价取
+        # 该日开盘价；停牌日跳过（exclude_untradable 时无可用入场则整条作废）。
+        max_search = min(close.shape[0], start_idx + horizon_days + 1)
+        for idx in range(start_idx + 1, max_search):
+            row = bars.iloc[idx]
+            if bool(row.get("suspended", False)):
+                continue
+            open_price = _safe_price(row.get("open"), default=0.0)
+            if open_price > 0:
+                return idx, open_price
+            close_value = float(close[idx]) if idx < close.shape[0] else 0.0
+            if close_value > 0:
+                return idx, close_value
+        if exclude_untradable:
+            return -1, 0.0
+        fallback = start_idx if start_idx < close.shape[0] else -1
+        if fallback < 0:
+            return -1, 0.0
+        return fallback, float(close[fallback])
+
     if basis != "next_tradable_vwap":
         if start_idx >= close.shape[0]:
             return -1, 0.0

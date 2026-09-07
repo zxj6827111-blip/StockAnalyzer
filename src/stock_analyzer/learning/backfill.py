@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time as _time
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
 from pathlib import Path
@@ -37,6 +39,17 @@ from stock_analyzer.learning.sample_store import SampleStore
 _BUSINESS_CLOSE_UTC = time(15, 0, tzinfo=UTC)
 _LabelPolicyResolver = Callable[[SignalSnapshot], LabelPolicyRecord]
 
+_LOCK_RETRY_ATTEMPTS = 20
+_LOCK_RETRY_BASE_SLEEP = 5.0
+_LOCK_RETRY_MAX_SLEEP = 60.0
+
+
+def _is_lock_conflict(exc: BaseException) -> bool:
+    """DuckDB 单写者锁冲突识别：生产调度器/API 周期性持写锁，
+    逐 symbol 写入撞锁时应退避重试而不是把整块判失败。"""
+    text = f"{exc.__class__.__name__}: {exc}".lower()
+    return "conflicting lock" in text or "could not set lock" in text
+
 
 @dataclass(slots=True)
 class _OutcomeMetrics:
@@ -44,6 +57,8 @@ class _OutcomeMetrics:
     realized_return: float
     max_favorable_excursion: float
     max_adverse_excursion: float
+    # TP/SL 同期冲突事件标记（Phase 0 §3.2）：持仓窗口内 TP 与 SL 同时命中。
+    conflict: bool = False
 
 
 @dataclass(slots=True)
@@ -361,10 +376,9 @@ class LearningBackfillEngine:
         snapshot_ids: Sequence[str],
         as_of: datetime | None = None,
         source: str = "repair_backfill",
+        fetch_workers: int = 1,
     ) -> dict[str, object]:
-        normalized_snapshot_ids = [
-            str(item).strip() for item in snapshot_ids if str(item).strip()
-        ]
+        normalized_snapshot_ids = [str(item).strip() for item in snapshot_ids if str(item).strip()]
         if not normalized_snapshot_ids:
             return {
                 "ok": False,
@@ -401,39 +415,66 @@ class LearningBackfillEngine:
             for outcome in self._sample_store.list_outcomes(snapshot_ids=normalized_snapshot_ids)
         }
         grouped = _group_snapshots_by_symbol(snapshots)
+
+        # 并行预取日线：逐 symbol 顺序拉 bars 是重训/修复的主要耗时（每 symbol
+        # 一次 provider 读取），fetch_workers>1 时用线程池把只读 I/O 并行化；
+        # 写库（outcome upsert）仍保持顺序，规避 DuckDB 单写者锁竞争。
+        bars_cache: dict[str, pd.DataFrame] = {}
+        if fetch_workers > 1 and len(grouped) > 1:
+            with ThreadPoolExecutor(max_workers=fetch_workers) as executor:
+                future_to_symbol = {
+                    executor.submit(
+                        self._fetch_symbol_bars,
+                        symbol,
+                        symbol_snapshots,
+                        effective_as_of,
+                    ): symbol
+                    for symbol, symbol_snapshots in grouped.items()
+                }
+                for future in as_completed(future_to_symbol):
+                    symbol = future_to_symbol[future]
+                    try:
+                        bars_cache[symbol] = future.result()
+                    except Exception:
+                        # 并行取数失败的 symbol 由主循环顺序重试兜底。
+                        bars_cache[symbol] = pd.DataFrame()
+
         updated = 0
         promoted_label_matured = 0
         promoted_fully_matured = 0
         errors: list[str] = []
 
         for symbol, symbol_snapshots in grouped.items():
-            try:
-                lookback_days = _required_lookback_days(
-                    snapshots=symbol_snapshots,
-                    as_of=effective_as_of,
-                    label_policy_resolver=self._label_policy_for_snapshot,
-                )
-                bars = self._fetch_daily_bars(
-                    symbol=symbol,
-                    lookback_days=lookback_days,
-                    end_date=effective_as_of.date(),
-                )
-                for snapshot in symbol_snapshots:
-                    repaired = self._repair_snapshot_with_bars(
-                        snapshot=snapshot,
-                        outcome=outcome_map.get(snapshot.snapshot_id),
-                        bars=bars,
-                        as_of=effective_as_of,
-                        source=normalized_source,
-                    )
-                    if bool(repaired["updated"]):
-                        updated += 1
-                    if bool(repaired["promoted_label_matured"]):
-                        promoted_label_matured += 1
-                    if bool(repaired["promoted_fully_matured"]):
-                        promoted_fully_matured += 1
-            except Exception as exc:
-                errors.append(f"{symbol}:{exc}")
+            symbol_error: BaseException | None = None
+            for attempt in range(_LOCK_RETRY_ATTEMPTS):
+                try:
+                    bars = bars_cache.get(symbol)
+                    if bars is None or bars.empty:
+                        bars = self._fetch_symbol_bars(symbol, symbol_snapshots, effective_as_of)
+                    for snapshot in symbol_snapshots:
+                        repaired = self._repair_snapshot_with_bars(
+                            snapshot=snapshot,
+                            outcome=outcome_map.get(snapshot.snapshot_id),
+                            bars=bars,
+                            as_of=effective_as_of,
+                            source=normalized_source,
+                        )
+                        if bool(repaired["updated"]):
+                            updated += 1
+                        if bool(repaired["promoted_label_matured"]):
+                            promoted_label_matured += 1
+                        if bool(repaired["promoted_fully_matured"]):
+                            promoted_fully_matured += 1
+                    symbol_error = None
+                    break
+                except Exception as exc:
+                    symbol_error = exc
+                    if not _is_lock_conflict(exc) or attempt >= _LOCK_RETRY_ATTEMPTS - 1:
+                        break
+                    sleep_for = min(_LOCK_RETRY_BASE_SLEEP * (2 ** attempt), _LOCK_RETRY_MAX_SLEEP)
+                    _time.sleep(sleep_for)
+            if symbol_error is not None:
+                errors.append(f"{symbol}:{symbol_error}")
 
         return {
             "ok": not errors and not missing_snapshot_ids,
@@ -631,9 +672,7 @@ class LearningBackfillEngine:
                 int(self._config.training.min_test_split_unique_symbol_dates),
             ),
         )
-        split_counts = {
-            item.split_name: int(item.row_count) for item in manifest.split_plan
-        }
+        split_counts = {item.split_name: int(item.row_count) for item in manifest.split_plan}
         return {
             "ok": True,
             "mode": "build_trainable_manifest",
@@ -656,9 +695,7 @@ class LearningBackfillEngine:
                 else ""
             ),
             "time_window_end": (
-                manifest.time_window_end.isoformat()
-                if manifest.time_window_end is not None
-                else ""
+                manifest.time_window_end.isoformat() if manifest.time_window_end is not None else ""
             ),
             "errors": [],
         }
@@ -973,9 +1010,7 @@ class LearningBackfillEngine:
             contexts_enriched += int(result.get("contexts_enriched", 0))
             execution_updates += int(result.get("execution_updates", 0))
             command_events_linked += int(result.get("command_events_linked", 0))
-            portfolio_trade_events_linked += int(
-                result.get("portfolio_trade_events_linked", 0)
-            )
+            portfolio_trade_events_linked += int(result.get("portfolio_trade_events_linked", 0))
             reconcile_updates += int(result.get("reconcile_updates", 0))
             reconcile_promoted += int(result.get("reconcile_promoted", 0))
             for item in result.get("symbols", []):
@@ -1083,9 +1118,9 @@ class LearningBackfillEngine:
         recommendation_reference = _coerce_mapping(command_update.get("recommendation_reference"))
         snapshot_id = _extract_archive_snapshot_id(recommendation_reference)
         if not snapshot_id:
-            recommendation_id = str(
-                recommendation_reference.get("recommendation_id", "")
-            ).strip().upper()
+            recommendation_id = (
+                str(recommendation_reference.get("recommendation_id", "")).strip().upper()
+            )
             snapshot_id = str(recommendation_snapshot_ids.get(recommendation_id, "")).strip()
         if not snapshot_id:
             return {
@@ -1545,6 +1580,19 @@ class LearningBackfillEngine:
                 "realized_return": metrics.realized_return,
                 "max_favorable_excursion": metrics.max_favorable_excursion,
                 "max_adverse_excursion": metrics.max_adverse_excursion,
+                "conflict_flag": metrics.conflict,
+                # Phase 0 §3.2：显式持久化锚点与数据截止（anchor=决策日 T，
+                # cutoff=回填所用行情的 as_of 上限）；旧记录已有值不覆盖。
+                "label_anchor_time": (
+                    current.label_anchor_time
+                    if current is not None and current.label_anchor_time is not None
+                    else snapshot.decision_time
+                ),
+                "source_data_cutoff": (
+                    current.source_data_cutoff
+                    if current is not None and current.source_data_cutoff is not None
+                    else as_of
+                ),
                 "outcome_updated_at": as_of,
                 "last_backfill_at": as_of,
                 "backfill_fidelity_tier": (
@@ -1556,9 +1604,7 @@ class LearningBackfillEngine:
                 )
                 or source,
                 "recomputed_feature_schema_id": (
-                    str(current.recomputed_feature_schema_id).strip()
-                    if current is not None
-                    else ""
+                    str(current.recomputed_feature_schema_id).strip() if current is not None else ""
                 )
                 or (
                     snapshot.feature_schema_id
@@ -1729,6 +1775,25 @@ class LearningBackfillEngine:
                     best = candidate
         return best
 
+    def _fetch_symbol_bars(
+        self,
+        symbol: str,
+        symbol_snapshots: Sequence[SignalSnapshot],
+        as_of: datetime,
+    ) -> pd.DataFrame:
+        """单 symbol 的日线拉取（repair 预取并行单元，与顺序路径同一实现）。"""
+
+        lookback_days = _required_lookback_days(
+            snapshots=symbol_snapshots,
+            as_of=as_of,
+            label_policy_resolver=self._label_policy_for_snapshot,
+        )
+        return self._fetch_daily_bars(
+            symbol=symbol,
+            lookback_days=lookback_days,
+            end_date=as_of.date(),
+        )
+
     def _fetch_daily_bars(
         self,
         *,
@@ -1778,13 +1843,27 @@ def _compute_outcome_metrics_for_row(
     realized_return = float(close_window.iloc[-1] / entry_price - 1.0)
     max_favorable_excursion = float(high_window.max() / entry_price - 1.0)
     max_adverse_excursion = float(low_window.min() / entry_price - 1.0)
+    conflict = bool(
+        max_favorable_excursion >= float(label_policy.take_profit_pct)
+        and max_adverse_excursion <= -float(label_policy.stop_loss_pct)
+    )
     mature_time = _decision_time_from_index(ordered.index[last_position])
     return _OutcomeMetrics(
         label_mature_time=mature_time,
         realized_return=round(realized_return, 6),
         max_favorable_excursion=round(max_favorable_excursion, 6),
         max_adverse_excursion=round(max_adverse_excursion, 6),
+        conflict=conflict,
     )
+
+
+def _positive_float(value: object) -> float | None:
+    """解析正数价格；缺失/非数值/非正数一律返回 None（供 fallback 链使用）。"""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    parsed = float(value)
+    return parsed if parsed > 0 else None
 
 
 def _resolve_entry_position(
@@ -1794,6 +1873,24 @@ def _resolve_entry_position(
     label_policy: LabelPolicyRecord,
 ) -> tuple[int | None, float]:
     basis = label_policy.price_basis.strip().lower()
+    if basis == "next_tradable_open":
+        # Phase 0 计划口径：T+1 开盘入场，入场日算持仓第 1 天；停牌日跳过。
+        max_search = min(len(bars), row_position + label_policy.horizon_days + 1)
+        for candidate_position in range(row_position + 1, max_search):
+            row = bars.iloc[candidate_position]
+            if bool(row.get("suspended", False)):
+                continue
+            open_value = _positive_float(row.get("open"))
+            if open_value is not None:
+                return candidate_position, open_value
+            close_value = _positive_float(row.get("close", 0.0))
+            if close_value is not None:
+                return candidate_position, close_value
+        if label_policy.exclude_untradable:
+            return None, 0.0
+        close_value = float(bars["close"].iloc[row_position])
+        return row_position, close_value if close_value > 0 else 0.0
+
     if basis != "next_tradable_vwap":
         close_value = float(bars["close"].iloc[row_position])
         return row_position, close_value if close_value > 0 else 0.0

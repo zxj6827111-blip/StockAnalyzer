@@ -109,9 +109,14 @@ class RuntimeTrainingService:
         for candidate in candidate_paths:
             if not candidate.exists():
                 continue
-            if not service._pipeline.reload_predictor(artifact_path=str(candidate)):
+            # Phase 0 §3.3：alias 兼容入口走感知校验（完整性 + 自描述身份/兼容窗口）。
+            if not service._reload_alias_predictor_validated(
+                str(candidate), source="training_bootstrap_reconcile"
+            ):
                 self._repair_training_artifact_sidecars(candidate)
-            if service._pipeline.reload_predictor(artifact_path=str(candidate)):
+            if service._reload_alias_predictor_validated(
+                str(candidate), source="training_bootstrap_reconcile"
+            ):
                 loaded_artifact = candidate
                 break
 
