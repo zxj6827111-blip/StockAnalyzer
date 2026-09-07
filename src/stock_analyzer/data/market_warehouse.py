@@ -52,7 +52,19 @@ _INTRADAY_COLUMNS = [
     "last30_volume_share",
     "positive_bar_ratio",
     "close_position",
+    # 2026-09-07（方向一'任务 2）：补齐 summarize_minute_bars 产出的后 8 列，
+    # 此前写入端从未落这些列（PIT 特征 i1m/i5m above_vwap_ratio 等 8 项恒 0）。
+    "tail30_volume_share",
+    "morning30_volume_share",
+    "above_vwap_ratio",
+    "price_efficiency",
+    "am_pm_reversal_strength",
+    "tail_volatility_ratio",
+    "close_vwap_stability",
+    "intraday_pullback_ratio",
 ]
+# 与 _INTRADAY_COLUMNS 的后 8 列一致（ensure_schema 幂等迁移用）。
+_INTRADAY_EXTENDED_COLUMNS = _INTRADAY_COLUMNS[12:]
 _DAILY_NUMERIC_COLUMNS = {
     "open",
     "high",
@@ -275,6 +287,18 @@ class MarketWarehouse:
                 )
                 """
             )
+            # 2026-09-07（方向一'任务 2）：summarize_minute_bars 产出 20 列，
+            # 历史写入端只落 12 列——above_vwap_ratio 等 8 列从未进表，PIT
+            # 数据集里 i1m/i5m 族 8 个特征恒为常量 0（归因扫描全 NaN 的
+            # 直接原因之一）。ADD COLUMN IF NOT EXISTS 幂等迁移；旧行新列
+            # 为 NULL，由 sync_market_duckdb --minute 的 symbol+date
+            # DELETE+INSERT 幂等重跑自然补齐。
+            for interval_table in ("intraday_summary_1m", "intraday_summary_5m"):
+                for column_name in _INTRADAY_EXTENDED_COLUMNS:
+                    connection.execute(
+                        f"ALTER TABLE {interval_table} "
+                        f"ADD COLUMN IF NOT EXISTS {column_name} DOUBLE"
+                    )
 
             connection.execute(
                 """

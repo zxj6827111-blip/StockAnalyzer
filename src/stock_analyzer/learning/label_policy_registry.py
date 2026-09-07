@@ -34,6 +34,63 @@ class LabelPolicyRecord(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
+def build_return_rank_policy_record(
+    *,
+    horizon_days: int,
+    price_basis: str = "next_tradable_open",
+    schema_version: str = "3",
+    label_policy_id: str | None = None,
+    created_at: datetime | None = None,
+) -> LabelPolicyRecord:
+    """Build the cross-sectional return-rank label contract (schema v3).
+
+    v3 与 v1/v2（soup TP/SL 路径标签）共享全部时间不变量（T+1 开盘锚点、
+    horizon 交易日成熟、embargo=horizon+settlement_lag），只换 label 公式：
+    以同日横截面 fwd_return 分位（top 30% → 1 / bottom 30% → 0，中间
+    剔除）替代 TP/SL 触发顺序。TP/SL 语义下沉到执行层，不再进入训练目标。
+
+    TP/SL 字段按 registry 表结构以占位值登记（v3 不消费路径信息，但列是
+    NOT NULL）：tp/sl=0 表示"路径不适用"。
+    """
+
+    if int(horizon_days) <= 0:
+        raise ValueError("horizon_days must be positive")
+    payload = {
+        "label_name": "label_return_rank",
+        "schema_version": str(schema_version),
+        "take_profit_pct": 0.0,
+        "stop_loss_pct": 0.0,
+        "horizon_days": int(horizon_days),
+        "price_basis": price_basis.strip(),
+        "exclude_untradable": True,
+        "conflict_policy": "rank_quantile",
+        "conflict_soft_label_value": 0.5,
+        "maturity_rule": "label_mature_time_v1",
+        "top_quantile": 0.3,
+        "bottom_quantile": 0.3,
+    }
+    label_policy_hash = _stable_hash(payload)
+    resolved_policy_id = label_policy_id or _default_label_policy_id(
+        schema_version=str(schema_version),
+        label_policy_hash=label_policy_hash,
+    )
+    return LabelPolicyRecord(
+        label_policy_id=resolved_policy_id,
+        label_name="label_return_rank",
+        schema_version=str(schema_version),
+        take_profit_pct=0.0,
+        stop_loss_pct=0.0,
+        horizon_days=int(horizon_days),
+        price_basis=price_basis.strip(),
+        exclude_untradable=True,
+        conflict_policy="rank_quantile",
+        conflict_soft_label_value=0.5,
+        maturity_rule="label_mature_time_v1",
+        label_policy_hash=label_policy_hash,
+        created_at=created_at or datetime.now(UTC),
+    )
+
+
 class _DuckCursor(Protocol):
     def fetchone(self) -> Sequence[object] | None: ...
 
@@ -217,6 +274,23 @@ class LabelPolicyRegistry:
             )
         finally:
             conn.close()
+
+    def register_return_rank(
+        self,
+        *,
+        horizon_days: int,
+        price_basis: str = "next_tradable_open",
+        schema_version: str = "3",
+    ) -> LabelPolicyRecord:
+        """Register the cross-sectional return-rank contract (schema v3)."""
+
+        return self.register(
+            build_return_rank_policy_record(
+                horizon_days=horizon_days,
+                price_basis=price_basis,
+                schema_version=schema_version,
+            )
+        )
 
     def get_by_hash(self, label_policy_hash: str) -> LabelPolicyRecord | None:
         """Load one label policy by deterministic hash."""
