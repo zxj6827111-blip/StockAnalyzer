@@ -88,10 +88,8 @@ def _daily_ic_matrix(
     """
 
     n_features = len(feature_columns)
-    rows_per_date: dict[str, np.ndarray] = {}
     valid_dates: list[str] = []
     ic_rows: list[np.ndarray] = []
-    fwd_rows: list[np.ndarray] = []
     # 逐日拉取：谓词下推（ISO 字符串直比），单日峰值 ~10MB。
     for i, day in enumerate(eval_dates):
         cols = ", ".join(["fwd_return"] + feature_columns)
@@ -124,8 +122,6 @@ def _daily_ic_matrix(
                     continue
                 ic_row[j] = float((xc * yc[mask]).sum() / (x_denom * y_denom))
         ic_rows.append(ic_row)
-        fwd_rows.append(fwd)
-        rows_per_date[day] = fwd
         valid_dates.append(day)
         if (i + 1) % 20 == 0:
             print(
