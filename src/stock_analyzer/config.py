@@ -991,6 +991,15 @@ class LabelsConfig(_StrictModel):
     # 处理，但 registry 契约要求记录显式策略名）。
     conflict_policy: str = "soft_label"
     conflict_soft_label_value: float = 0.5
+    # 标签族选择（方向一'，2026-09-07）：默认 "soup"（TP/SL 路径标签），
+    # 生产 night_scan/asof 回测行为不变；PIT 数据集与实验链路可显式切
+    # "return_rank"（横截面收益排序语义，schema v3 registry 契约）。
+    basis: str = "soup"
+    # return_rank 专用参数（basis != "return_rank" 时不消费）。
+    return_rank_top_quantile: float = 0.3
+    return_rank_bottom_quantile: float = 0.3
+    return_rank_drop_middle: bool = True
+    return_rank_min_cross_section: int = 30
 
 
 class MarketRelativeFeatureConfig(_StrictModel):

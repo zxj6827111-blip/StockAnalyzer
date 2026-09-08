@@ -598,6 +598,14 @@ def main() -> int:
     parser.add_argument("--test-window", type=int, default=20)
     parser.add_argument("--step", type=int, default=20)
     parser.add_argument("--k-list", default="5,10")
+    # 对照基线（方向一'验收要求）：旧 soup label 的 Phase 2 数字，写进
+    # 报告作对照行。默认取 2026-09-06 NO-GO 结论；传 "none" 可省略。
+    parser.add_argument(
+        "--baseline-soup-ic",
+        type=str,
+        default="-0.024",
+        help="旧 soup label 的 aggregate IC 对照值（含 CI 用 'ic:lo:hi' 三段）",
+    )
     args = parser.parse_args()
     k_list = [int(k) for k in args.k_list.split(",") if k.strip()]
 
@@ -610,11 +618,13 @@ def main() -> int:
     store = PitDatasetStore(args.dataset_dir)
     meta_path = Path(args.dataset_dir) / "pit_meta.json"
     dataset_meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+    label_basis = str(dataset_meta.get("label_policy_note", "")).split(" ", 1)[0]
     trading_dates = store.trading_dates()
     feature_columns = store.feature_columns
     print(
         f"[1] dataset rows={store.row_count():,} "
-        f"dates={len(trading_dates)} features={len(feature_columns)}",
+        f"dates={len(trading_dates)} features={len(feature_columns)} "
+        f"label_basis={label_basis}",
         flush=True,
     )
 
@@ -702,7 +712,7 @@ def main() -> int:
 
     folds: list[FoldResult] = []
     for plan in folds_plan:
-        fid = int(plan["fold_id"])
+        fid = int(plan["fold_id"])  # type: ignore[call-overload]
         if fid in loaded and loaded[fid].status in {"completed", "completed_unlabeled"}:
             folds.append(loaded[fid])
             print(f"[3] fold {fid} resumed from checkpoint", flush=True)
@@ -739,9 +749,34 @@ def main() -> int:
         step=args.step,
         embargo_days=embargo_days,
     )
+    # 验收硬门（方向一'任务书）：新 label 下模型分数 IC 的 date-block
+    # bootstrap 95% CI 下界 > 0。此判定行独立于 verdict（GO_CANDIDATE 的
+    # 判据是 IC>0，硬门更严：要求 CI 不跨 0）。
+    ci_values = list(report["aggregate_ic_ci95"])  # type: ignore[call-overload]
+    ci_low = float(ci_values[0])
+    ci_high = float(ci_values[1])
+    report["hard_gate"] = {
+        "rule": "aggregate_ic_ci95_low > 0 (date-block bootstrap 95%)",
+        "ic_ci95_low": ci_low,
+        "ic_ci95_high": ci_high,
+        "pass": bool(ci_low > 0),
+    }
 
     payload = {
         "generated_at": datetime.utcnow().isoformat() + "Z",
+        "dataset": {
+            "dir": args.dataset_dir,
+            "label_basis": label_basis,
+            "meta": dataset_meta,
+        },
+        # 对照基线行（验收硬门要求）：同一 harness 配置下旧 soup label 的
+        # Phase 2 结论（2026-09-06，18/18 fold，IC=-0.024 CI=[-0.043,-0.005]）。
+        "baseline_soup_label": {
+            "aggregate_ic_mean": -0.024,
+            "aggregate_ic_ci95": [-0.043, -0.005],
+            "source": "Phase 2 NO-GO report 2026-09-06 (18/18 folds, pit_dataset_ext v1)",
+            "note": "同一 harness 配置（train=120/test=20/step=20/embargo=11）",
+        },
         "folds": [
             {
                 "fold_id": f.fold_id,

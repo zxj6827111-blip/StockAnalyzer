@@ -694,6 +694,13 @@ labels:
   pnl_price_basis: next_tradable_open
   conflict_policy: soft_label
   conflict_soft_label_value: 0.5
+  # 标签族（方向一'）：默认 soup（TP/SL 路径标签，生产链路不变）；
+  # "return_rank" = 横截面收益排序语义（schema v3），仅实验/PIT 链路显式开启。
+  basis: soup
+  return_rank_top_quantile: 0.3
+  return_rank_bottom_quantile: 0.3
+  return_rank_drop_middle: true
+  return_rank_min_cross_section: 30
 
 market_relative_feature:
   enabled: false

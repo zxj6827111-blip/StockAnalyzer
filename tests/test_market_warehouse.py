@@ -660,3 +660,61 @@ def test_fetch_universe_quality_metrics_filters_to_requested_symbols(
     frame = warehouse.fetch_universe_quality_metrics(symbols=["600000", "600002"], lookback_days=20)
     assert set(frame["symbol"].unique()) == {"600000", "600002"}
     assert "600001" not in set(frame["symbol"].unique())
+
+
+def _build_vendor_schema_warehouse(tmp_path: Path) -> tuple[MarketWarehouse, str]:
+    """构造 vendor 只读旧 schema 场景：intraday 表只有 12 个数据列（无
+    2026-09-07 扩展的后 8 列），以 read-only 模式打开——完整复现 2026-09-08
+    生产事故的查询环境（vendor_intraday_summary.duckdb 14 列）。"""
+
+    import duckdb
+
+    from stock_analyzer.data.market_warehouse import _INTRADAY_COLUMNS
+
+    db_path = tmp_path / "vendor" / "intraday_summary.duckdb"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_columns = _INTRADAY_COLUMNS[:12]
+    con = duckdb.connect(str(db_path))
+    con.execute("SET threads=1")
+    con.execute(
+        f"CREATE TABLE intraday_summary_1m (symbol VARCHAR, date DATE, "
+        f"{', '.join(f'{c} DOUBLE' for c in legacy_columns)})"
+    )
+    con.execute(
+        f"INSERT INTO intraday_summary_1m VALUES ('600000', '2026-03-05', "
+        f"{', '.join(str(0.5) for _ in legacy_columns)})"
+    )
+    con.close()
+    warehouse = MarketWarehouse(
+        db_path=db_path,
+        package_root=tmp_path / "package",
+        read_only=True,
+    )
+    return warehouse, "600000"
+
+
+def test_fetch_intraday_summaries_survives_vendor_legacy_schema(tmp_path: Path) -> None:
+    """vendor 只读库缺后 8 列时批量查询不炸 Binder Error（9/8 事故回归），
+    缺失列以 0.0 呈现（NULL AS col → normalize fillna），基础 12 列数值原样。"""
+
+    warehouse, symbol = _build_vendor_schema_warehouse(tmp_path)
+    frames = warehouse.fetch_intraday_summaries([symbol], "1m", lookback_days=5)
+    assert symbol in frames
+    frame = frames[symbol]
+    assert len(frame) == 1
+    assert float(frame["session_return"].iloc[0]) == pytest.approx(0.5)
+    assert float(frame["above_vwap_ratio"].iloc[0]) == 0.0
+
+
+def test_fetch_intraday_summary_single_symbol_survives_vendor_legacy_schema(
+    tmp_path: Path,
+) -> None:
+    """单标的查询路径（fetch_intraday_summary/fetch_all）同样兼容旧 schema。"""
+
+    warehouse, symbol = _build_vendor_schema_warehouse(tmp_path)
+    frame = warehouse.fetch_intraday_summary(symbol, "1m", lookback_days=5)
+    assert len(frame) == 1
+    assert "tail_volatility_ratio" in frame.columns
+    assert float(frame["tail_volatility_ratio"].iloc[0]) == 0.0
+    full = warehouse.fetch_all_intraday_summary(symbol=symbol, interval="1m")
+    assert len(full) == 1
