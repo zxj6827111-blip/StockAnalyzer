@@ -65,6 +65,28 @@ _INTRADAY_COLUMNS = [
 ]
 # 与 _INTRADAY_COLUMNS 的后 8 列一致（ensure_schema 幂等迁移用）。
 _INTRADAY_EXTENDED_COLUMNS = _INTRADAY_COLUMNS[12:]
+
+
+def _intraday_select_columns(available_columns: set[str]) -> list[str]:
+    """按表实际列渲染 SELECT 列表；缺失列以 NULL AS <col> 占位。
+
+    背景（2026-09-08 生产事故）：_INTRADAY_COLUMNS 扩到 20 列后，查询打到
+    **只读挂载的 vendor_intraday_summary.duckdb（旧 12 数据列）**直接
+    Binder Error，lr1/lr2 连败。本库（market.duckdb）经 ensure_schema 迁移
+    后有 20 列，但 vendor 只读库永远不可能被迁移——同一份 SELECT 代码必须
+    同时适配两种 schema：缺失列置 NULL（等价"该数据源无此指标"语义，
+    FeatureEngineer 对 NaN 列既有容错），绝不因 schema 差异炸掉查询。
+    """
+
+    rendered: list[str] = []
+    for column in _INTRADAY_COLUMNS:
+        if column in available_columns:
+            rendered.append(column)
+        else:
+            rendered.append(f"NULL AS {column}")
+    return rendered
+
+
 _DAILY_NUMERIC_COLUMNS = {
     "open",
     "high",
@@ -2725,14 +2747,19 @@ class MarketWarehouse:
         )
         if table_name is None or not normalized_symbols or not self._table_exists(table_name):
             return {}
+        # schema 探测：SELECT 列按表实际列渲染（vendor 只读库 14 列 vs
+        # 本库迁移后 22 列，缺失列 NULL 占位——见 _intraday_select_columns）。
+        available_columns = self._table_columns(table_name)
+        select_columns = _intraday_select_columns(available_columns)
+        columns_csv = ", ".join(select_columns)
         placeholders = ", ".join("?" for _ in normalized_symbols)
         query = f"""
-            SELECT symbol, date, {", ".join(_INTRADAY_COLUMNS)}
+            SELECT symbol, date, {columns_csv}
             FROM (
                 SELECT
                     symbol,
                     date,
-                    {", ".join(_INTRADAY_COLUMNS)},
+                    {columns_csv},
                     ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY date DESC) AS row_num
                 FROM {table_name}
                 WHERE symbol IN ({placeholders})
@@ -2761,13 +2788,15 @@ class MarketWarehouse:
         lookback_days: int = 120,
     ) -> pd.DataFrame:
         table_name = _INTRADAY_TABLES.get(interval)
-        if table_name is None:
+        if table_name is None or not self._table_exists(table_name):
             return pd.DataFrame()
         normalized_symbol = _normalize_symbol(symbol)
+        # schema 探测渲染（vendor 只读库兼容，同 fetch_intraday_summaries）。
+        columns_csv = ", ".join(_intraday_select_columns(self._table_columns(table_name)))
         query = f"""
-            SELECT date, {", ".join(_INTRADAY_COLUMNS)}
+            SELECT date, {columns_csv}
             FROM (
-                SELECT date, {", ".join(_INTRADAY_COLUMNS)}
+                SELECT date, {columns_csv}
                 FROM {table_name}
                 WHERE symbol = ?
                 ORDER BY date DESC
@@ -2775,8 +2804,6 @@ class MarketWarehouse:
             ) AS recent
             ORDER BY date ASC
         """
-        if not self._table_exists(table_name):
-            return pd.DataFrame()
         with self._connect_readonly() as connection:
             frame = cast(
                 pd.DataFrame,
@@ -2809,17 +2836,17 @@ class MarketWarehouse:
 
     def fetch_all_intraday_summary(self, *, symbol: str, interval: str) -> pd.DataFrame:
         table_name = _INTRADAY_TABLES.get(interval)
-        if table_name is None:
+        if table_name is None or not self._table_exists(table_name):
             return pd.DataFrame()
         normalized_symbol = _normalize_symbol(symbol)
+        # schema 探测渲染（vendor 只读库兼容，同 fetch_intraday_summaries）。
+        columns_csv = ", ".join(_intraday_select_columns(self._table_columns(table_name)))
         query = f"""
-            SELECT date, {", ".join(_INTRADAY_COLUMNS)}
+            SELECT date, {columns_csv}
             FROM {table_name}
             WHERE symbol = ?
             ORDER BY date ASC
         """
-        if not self._table_exists(table_name):
-            return pd.DataFrame()
         with self._connect_readonly() as connection:
             frame = cast(
                 pd.DataFrame,
@@ -3193,6 +3220,18 @@ class MarketWarehouse:
             ).fetchone()
         return bool(row and int(row[0]) > 0)
 
+    def _table_columns(self, table_name: str) -> set[str]:
+        """表的列名集合（DESCRIBE 单表元数据查询，无数据扫描）。
+
+        供 SELECT 列渲染做 schema 探测——vendor 只读库与本库列集不同
+        （2026-09-08 生产事故根因：列集差异直接炸 Binder Error）。
+        表不存在返回空集（调用方先行 _table_exists 短路）。
+        """
+
+        with self._connect_readonly() as connection:
+            rows = connection.execute(f"DESCRIBE {table_name}").fetchall()
+        return {str(row[0]) for row in rows}
+
     def _connect_write(self) -> _DUCK_CONNECTION:
         if self._read_only:
             raise DataSourceError(f"market warehouse is read-only; refusing write: {self._db_path}")
@@ -3431,6 +3470,8 @@ def _normalize_intraday_frame(*, frame: pd.DataFrame, symbol: str) -> pd.DataFra
     normalized.index.name = "date"
     normalized = normalized.sort_index()
     normalized = normalized[~normalized.index.duplicated(keep="last")]
+    # NULL AS <col>（vendor 只读库缺列）→ NaN → 0.0：与"该数据源无此指标"
+    # 的既有语义一致（写入端 summarize 产出的列本就是 0 填充口径）。
     for column in _INTRADAY_COLUMNS:
         if column not in normalized.columns:
             normalized[column] = 0.0
