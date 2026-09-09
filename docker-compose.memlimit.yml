@@ -45,7 +45,15 @@
 #   scheduler-critical 3.0G —— 跑 live_runtime（8 符号全 pipeline，worker
 #                              冷启动峰值 ~2.2G 含 supervisor 常驻；2G 实测
 #                              反复 OOM，见上方 2026-09-07 修订）
-#   scheduler-heavy    3.0G —— 跑全市场扫描/evolution 等重任务，预留更大余量
+#   scheduler-heavy    4.0G —— 跑全市场扫描/evolution offhours（3 小时长任务
+#                              含重训，worker 峰值 2.65G）+ night_scan。
+#                              2026-09-09 修订 3G→4G：dmesg 定案 offhours 连续
+#                              6 次 MEMCG OOM（9/8 23:25/23:56、9/9 22:14，
+#                              anon-rss 2.65G 撞 3G），cf=19；与 9/7 critical
+#                              2G→3G 同型问题——"空闲实测远低于上限"口径再次
+#                              证伪，必须按任务 worker 峰值定额。四容器上限
+#                              合计 10.5G→11.5G（caps 非预留，宿主 15.5G，
+#                              常态实际占用 critical 0.47G + heavy 0.7G）。
 #
 # memswap_limit 与 mem_limit 相等 = 禁止该容器额外使用 swap（超出 mem_limit
 # 直接 OOM kill 而非拖累宿主 swap 到影响其他容器的地步）——现在 swap 已有
@@ -64,5 +72,5 @@ services:
     memswap_limit: 3g
 
   scheduler-heavy:
-    mem_limit: 3g
-    memswap_limit: 3g
+    mem_limit: 4g
+    memswap_limit: 4g

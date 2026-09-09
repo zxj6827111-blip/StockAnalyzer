@@ -23,7 +23,9 @@
 # docker-compose.memlimit.yml 也纳入本基线。它最初被设计成"可选叠加层"，但
 # 2026-08-28 修复上述事故时已经对 NAS 的 api / scheduler-critical /
 # scheduler-heavy / redis 四个容器全部应用并验证通过（实测占用远低于上限：
-# api 394M/4G、scheduler-heavy 446M/3G、scheduler-critical 411M/3G（2026-09-07
+# api 394M/4G、scheduler-heavy 446M/4G（2026-09-09 由 3G 上调：evolution
+# offhours 长任务 worker 峰值 2.65G 撞 3G 连续 MEMCG OOM，见
+# docker-compose.memlimit.yml 修订说明）、scheduler-critical 411M/3G（2026-09-07
 # 由 2G 上调：live_runtime worker 冷启动峰值 ~2.2G 撞 2G 限额反复 OOM，见
 # docker-compose.memlimit.yml 修订说明）、
 # redis 9M/512M，宿主 swap 用量为 0）。既然生产实际已运行在内存限制之下，
