@@ -9,11 +9,17 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Lock, Thread, current_thread
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+
+# 全市场快照的 akshare 备源顺序：东财（主）→ 腾讯 → 新浪（兜底）。
+# 腾讯 ``stock_zh_a_spot_tx`` 是独立于东财/新浪的第三方源，NAS 实测 6.2s /
+# 5561 行（新浪同口径 16.6~29.2s），单列出来使东财被断时仍有一条数秒级通路。
+_AK_SPOT_SOURCES = ("stock_zh_a_spot_em", "stock_zh_a_spot_tx", "stock_zh_a_spot")
+_TX_SPOT_FUNC = "stock_zh_a_spot_tx"
 
 
 class Week5MarketSnapshotService:
@@ -149,14 +155,30 @@ class Week5MarketSnapshotService:
                 errors.append("efinance_empty")
         except Exception as exc:
             errors.append(f"efinance:{exc.__class__.__name__}")
+        ak: object | None
         try:
-            import akshare as ak  # type: ignore[import-untyped]
+            import akshare as _ak  # type: ignore[import-untyped]
 
-            for name in ("stock_zh_a_spot_em", "stock_zh_a_spot"):
+            ak = cast(object, _ak)
+        except Exception as exc:
+            errors.append(f"akshare_import:{exc.__class__.__name__}")
+            ak = None
+        if ak is not None:
+            # 逐源独立 try/except：单源异常必须只记错并继续下一个备源。早期实现
+            # 把整个循环包在同一个 try 里，stock_zh_a_spot_em 的 ConnectionError
+            # 会直接跳到 except，后面的备源从未被执行——"多源兜底"形同虚设，
+            # 东财 push2 一被断即整体 unavailable（2026-09-10 radar 实测）。
+            for name in _AK_SPOT_SOURCES:
                 func = getattr(ak, name, None)
                 if not callable(func):
                     continue
-                frame = func()
+                try:
+                    frame = func()
+                except Exception as exc:
+                    errors.append(f"{name}:{exc.__class__.__name__}")
+                    continue
+                if name == _TX_SPOT_FUNC:
+                    frame = _prepare_tx_spot_frame(frame)
                 if isinstance(frame, pd.DataFrame) and not frame.empty:
                     if primary is None:
                         covered = _coverage_count(frame)
@@ -193,8 +215,6 @@ class Week5MarketSnapshotService:
                     errors.append(f"{name}_merge_partial_coverage:{covered}")
                     continue
                 errors.append(f"{name}_empty")
-        except Exception as exc:
-            errors.append(f"akshare:{exc.__class__.__name__}")
         return pd.DataFrame(), "unavailable", errors
 
     def _fetch_batch_frame_with_timeout(self) -> tuple[pd.DataFrame, str, list[str]]:
@@ -539,8 +559,61 @@ def _normalize_snapshot_time(value: object, fallback: datetime) -> str:
                 microsecond=0,
             )
             return local.isoformat()
-    parsed = pd.to_datetime(text, errors="coerce", utc=True)
-    return parsed.isoformat() if pd.notna(parsed) else ""
+    # 完整日期时间：行情源给的是市场本地墙钟时间，通常不带时区偏移
+    # （efinance "更新时间" = "2026-09-10 14:32:00"）。必须按市场时区解释——
+    # 早期实现用 utc=True 解析，会把天真的北京时间直接贴上 +00:00，使快照
+    # 时间戳比真实时钟超前 8 小时：新鲜度 age 恒为大幅负值，撞 fail-closed
+    # 判成 stale（2026-09-10 实测 radar 五个 slot 中三次因此失败，同时掩盖了
+    # 真实的源可用性问题）。带偏移的字符串按自身偏移解析后换算到市场时区，
+    # 保证同一快照内所有行时间戳口径一致。
+    parsed = pd.to_datetime(text, errors="coerce", utc=False)
+    if pd.isna(parsed):
+        return ""
+    stamp = parsed.to_pydatetime()
+    market_tz = fallback.tzinfo or UTC
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=market_tz)
+    else:
+        stamp = stamp.astimezone(market_tz)
+    return stamp.isoformat()
+
+
+def _prepare_tx_spot_frame(frame: object) -> object:
+    """腾讯 ``stock_zh_a_spot_tx`` 列名与量纲适配。
+
+    该接口用拼音缩写列名（zxj 最新价 / zdf 涨跌幅 / zd 涨跌额 / volume 手 /
+    turnover 万元 / hsl 换手率），与 ``normalize_market_snapshot_frame`` 的识别
+    词表不重合，因此这里显式映射为规范列名，并把量纲对齐到新浪口径
+    （成交量→股、成交额→元），避免同一快照内多源合并时量纲混用；昨收由
+    最新价 − 涨跌额 推导（腾讯不直接给昨收，缺失会让涨跌幅与涨停距离归零）。
+    识别不出关键列时原样返回，由调用方按 empty 处理。
+    """
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return frame
+    if "zxj" not in frame.columns or "code" not in frame.columns:
+        return frame
+
+    def _column(name: str, factor: float = 1.0) -> Any:
+        # 缺列返回标量 0.0（由 pandas 广播），已存在的列顺带做量纲换算。
+        if name not in frame.columns:
+            return 0.0
+        return pd.to_numeric(frame[name], errors="coerce") * factor
+
+    price = _column("zxj")
+    return pd.DataFrame(
+        {
+            "代码": frame["code"],
+            "名称": frame["name"] if "name" in frame.columns else "",
+            "最新价": price,
+            "涨跌幅": _column("zdf"),
+            # 腾讯不直接给昨收：缺失会让涨跌幅与涨停距离双双归零，故由
+            # 最新价 − 涨跌额 推导。
+            "昨收": price - _column("zd") if "zd" in frame.columns else 0.0,
+            "成交量": _column("volume", 100.0),  # 手 → 股
+            "成交额": _column("turnover", 10000.0),  # 万元 → 元
+            "换手率": _column("hsl"),
+        }
+    )
 
 
 def _limit_up_distance(*, symbol: str, name: str, price: float, prev_close: float) -> float:

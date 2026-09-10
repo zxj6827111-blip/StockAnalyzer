@@ -414,6 +414,129 @@ def test_board_resolver_falls_back_to_stale_cache(tmp_path: Path) -> None:
     assert result.symbols == ["600011", "600027", "600886"]
 
 
+class _TushareFake:
+    """伪造 tushare 客户端：只实现被复用的 ``_call`` 入口。"""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    def _call(self, api_name: str, **kwargs: object) -> pd.DataFrame:
+        self.calls.append((api_name, kwargs))
+        if api_name == "ths_index":
+            if kwargs.get("type") == "N":
+                return pd.DataFrame(
+                    [
+                        {"ts_code": "885372.TI", "name": "页岩气"},
+                        # 与行业同名但粒度更粗：概念版应为别名指向的目标。
+                        {"ts_code": "885398.TI", "name": "煤化工概念"},
+                    ]
+                )
+            return pd.DataFrame(
+                [
+                    {"ts_code": "884146.TI", "name": "火电"},
+                    {"ts_code": "884281.TI", "name": "煤化工"},
+                ]
+            )
+        if api_name == "index_classify":
+            return pd.DataFrame([{"index_code": "801010.SI", "industry_name": "农林牧渔"}])
+        if api_name == "ths_member":
+            code = str(kwargs.get("ts_code"))
+            if code == "884281.TI":  # 同名的行业版：只有 1 只
+                return pd.DataFrame({"ts_code": [code], "con_code": ["000830.SZ"]})
+            if code == "885398.TI":  # 概念版：3 只
+                return pd.DataFrame(
+                    {
+                        "ts_code": [code] * 3,
+                        "con_code": ["000830.SZ", "000990.SZ", "002274.SZ"],
+                    }
+                )
+            return pd.DataFrame(
+                {
+                    "ts_code": [code] * 2,
+                    "con_code": ["000407.SZ", "600028.SH"],
+                    "con_name": ["胜利股份", "中国石化"],
+                }
+            )
+        if api_name == "index_member":
+            return pd.DataFrame(
+                {
+                    "index_code": ["801010.SI"] * 3,
+                    "con_code": ["000019.SZ", "000998.SZ", "600598.SH"],
+                    "in_date": ["20211213"] * 3,
+                    "out_date": [None, None, None],
+                    "is_new": ["Y", "N", "Y"],
+                }
+            )
+        raise AssertionError(f"unexpected api: {api_name}")
+
+
+def test_board_resolver_uses_tushare_ths_member(tmp_path: Path) -> None:
+    """tushare 同花顺路径：取 con_code 而非 ts_code（后者是指数自身代码）。"""
+    client = _TushareFake()
+    resolver = BoardResolver(cache_dir=tmp_path, tushare_client=client)
+
+    result = resolver.resolve("页岩气")
+
+    assert result.source == "ths_concept"
+    assert result.symbols == ["000407", "600028"]
+
+
+def test_board_resolver_alias_resolves_sw_industry_and_filters_out_members(
+    tmp_path: Path,
+) -> None:
+    """别名落到申万名录；index_member 的历史成分（is_new=N）必须剔除。"""
+    resolver = BoardResolver(cache_dir=tmp_path, tushare_client=_TushareFake())
+
+    result = resolver.resolve("农牧饲渔", aliases=["农林牧渔"])
+
+    assert result.source == "sw_industry"
+    assert result.symbols == ["000019", "600598"]
+
+
+def test_board_resolver_alias_wins_over_narrower_same_name_industry(
+    tmp_path: Path,
+) -> None:
+    """别名优先于同名但粒度更细的行业实体（煤化工 8 只 vs 煤化工概念 112 只）。
+
+    同花顺存在同名不同粒度实体：``煤化工`` 既是行业（少量成分）也是概念
+    （目标板块）。按 [规范名, *别名] 顺序匹配会让行业版胜出，把主题缩成几只
+    股票；声明的别名才是策展人指定的目标名。
+    """
+    resolver = BoardResolver(cache_dir=tmp_path, tushare_client=_TushareFake())
+
+    result = resolver.resolve("煤化工", aliases=["煤化工概念"])
+
+    assert result.source == "ths_concept"
+    assert result.symbols == ["000830", "000990", "002274"]
+
+
+def test_board_resolver_catalogue_miss_falls_through_to_akshare(tmp_path: Path) -> None:
+    """名录查无此名时必须继续尝试 akshare 源，不得直接判 unresolved。"""
+    resolver = BoardResolver(
+        cache_dir=tmp_path,
+        ak_module=_BoardFake(),
+        tushare_client=_TushareFake(),
+    )
+
+    result = resolver.resolve("虚拟电厂")
+
+    assert result.source == "concept"
+    assert result.symbols == ["600011", "600027", "600886"]
+
+
+def test_board_resolver_catalogue_loaded_once_per_day(tmp_path: Path) -> None:
+    """名录一天内只拉一次：第二个板块不得重复请求 ths_index。"""
+    client = _TushareFake()
+    resolver = BoardResolver(cache_dir=tmp_path, tushare_client=client)
+
+    resolver.resolve("页岩气")
+    resolver.resolve("火电")
+    resolver.resolve("农牧饲渔", aliases=["农林牧渔"])
+
+    index_calls = [name for name, _ in client.calls if name == "ths_index"]
+    assert len(index_calls) == 2  # type=N + type=I，仅名录首次加载时各一次
+
+
 # ---------------------------------------------------------------------------
 # ledger（tmp_path + 真 duckdb）
 # ---------------------------------------------------------------------------

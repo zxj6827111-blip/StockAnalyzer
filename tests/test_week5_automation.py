@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -1399,6 +1400,106 @@ def test_market_wall_time_interpreted_in_market_timezone(tmp_path: Path) -> None
 
     parsed = datetime.fromisoformat(str(normalized.iloc[0]["snapshot_time"]))
     assert parsed.utcoffset() == timedelta(hours=8)
+
+
+def test_snapshot_naive_full_datetime_uses_market_timezone() -> None:
+    """完整日期时间同样按市场时区解释：不得把北京时间原样贴上 +00:00。
+
+    回归 2026-09-10 radar 连败：efinance "更新时间" = "2026-09-10 14:32:00"
+    被 ``pd.to_datetime(..., utc=True)`` 解析成 14:32Z，而真实时钟是 14:32+08:00，
+    快照时间戳整体超前 8 小时 → age 恒为 -28800s → 超过
+    ``_SNAPSHOT_FUTURE_TOLERANCE_SEC``(60s) 被 fail-closed 判 stale（age=None）。
+    """
+    timestamp = datetime(2026, 9, 10, 14, 31, 45, tzinfo=ZoneInfo("Asia/Shanghai"))
+    normalized = normalize_market_snapshot_frame(
+        pd.DataFrame(
+            [
+                {
+                    "代码": "600000",
+                    "最新价": 10.5,
+                    "昨日收盘": 10.0,
+                    "更新时间": "2026-09-10 14:31:00",
+                }
+            ]
+        ),
+        timestamp=timestamp,
+        source="efinance",
+    )
+
+    parsed = datetime.fromisoformat(str(normalized.iloc[0]["snapshot_time"]))
+    assert parsed.utcoffset() == timedelta(hours=8)
+    assert parsed.replace(tzinfo=None) == datetime(2026, 9, 10, 14, 31)
+
+    rows = [
+        {
+            "symbol": "600000",
+            "price": 10.5,
+            "change_pct": 5.0,
+            "snapshot_time": normalized.iloc[0]["snapshot_time"],
+        }
+    ]
+    age = automation_module._snapshot_age_sec(rows, timestamp)
+
+    assert age is not None
+    assert abs(age - 45.0) < 1e-6
+
+
+def test_backup_source_failure_does_not_abort_fallback_chain(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """东财源抛异常不得中断后续备源（腾讯/新浪）——多源兜底的核心契约。
+
+    回归 2026-09-10：akshare 循环整体包在同一个 try 内，``stock_zh_a_spot_em``
+    的 ConnectionError 会直接跳到 except，排在后面的备源从未被执行，"多源兜底"
+    形同虚设，东财 push2 一被断即整体 unavailable。
+    """
+
+    def _blocked() -> pd.DataFrame:
+        raise ConnectionError("push2.eastmoney.com blocked")
+
+    service = FakeService(tmp_path)
+    service._config.week5.market_snapshot_min_rows = 1
+    snapshot_service = Week5MarketSnapshotService(service)
+    fake_ef = types.SimpleNamespace(stock=types.SimpleNamespace(get_realtime_quotes=_blocked))
+    fake_ak = types.SimpleNamespace(
+        stock_zh_a_spot_em=_blocked,
+        stock_zh_a_spot_tx=lambda: pd.DataFrame(
+            [
+                {
+                    "code": "sh600000",
+                    "name": "浦发银行",
+                    "zxj": "10.50",
+                    "zdf": "5.00",
+                    "zd": "0.50",
+                    "volume": "1000",
+                    "turnover": "10500",
+                    "hsl": "1.2",
+                }
+            ]
+        ),
+        stock_zh_a_spot=_blocked,
+    )
+    monkeypatch.setitem(sys.modules, "efinance", fake_ef)
+    monkeypatch.setitem(sys.modules, "akshare", fake_ak)
+
+    frame, source, errors = snapshot_service._fetch_batch_frame()
+
+    assert source == "akshare"
+    assert any(str(item).startswith("stock_zh_a_spot_em:") for item in errors)
+    normalized = normalize_market_snapshot_frame(
+        frame,
+        timestamp=datetime(2026, 8, 25, 9, 25, tzinfo=UTC),
+        source=source,
+    )
+    row = normalized.iloc[0].to_dict()
+    assert row["symbol"] == "600000"
+    assert row["price"] == 10.5
+    # 昨收由 最新价 − 涨跌额 推导（腾讯不直接给昨收，缺失会让涨停距离归零）；
+    # 成交量 手→股、成交额 万元→元，对齐新浪口径后再与其他源合并。
+    assert row["prev_close"] == 10.0
+    assert row["volume"] == 100000.0
+    assert row["turnover"] == 105000000.0
+    assert row["turnover_rate"] == 1.2
 
 
 def test_candidate_gate_blocks_when_fresh_ratio_missing(tmp_path: Path) -> None:

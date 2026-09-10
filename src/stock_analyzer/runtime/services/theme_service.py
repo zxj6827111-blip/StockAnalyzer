@@ -167,7 +167,9 @@ class RuntimeThemeService:
                 symbols: list[str] = []
                 board_summaries: list[dict[str, object]] = []
                 for board in theme.boards:
-                    constituents = board_resolver.resolve(board)
+                    constituents = board_resolver.resolve(
+                        board, aliases=theme.board_aliases.get(board, [])
+                    )
                     board_summaries.append(constituents.to_dict())
                     symbols.extend(constituents.symbols)
                 symbols.extend(theme.symbols)
@@ -371,7 +373,31 @@ class RuntimeThemeService:
                 "artifacts/evolution/theme_board_cache"
             ),
             ak_module=getattr(service, "_theme_ak_module", None),
+            tushare_client=self._tushare_client(),
         )
+
+    def _tushare_client(self) -> object | None:
+        """板块成分解析所需的 tushare 客户端（东财板块接口不可用时的主源）。
+
+        未配置 token 或缺少依赖时返回 None，解析器自动退回 akshare 源。测试可
+        注入 ``service._theme_tushare_client`` 覆盖。
+        """
+        service = self._service
+        injected: object | None = getattr(service, "_theme_tushare_client", None)
+        if injected is not None:
+            return injected
+        warehouse = getattr(getattr(service, "_config", None), "market_warehouse", None)
+        token = str(getattr(warehouse, "tushare_token", "") or "").strip()
+        if not token:
+            return None
+        try:
+            from stock_analyzer.data.tushare_provider import _HttpTushareProApi
+        except Exception:
+            return None
+        # 名录/成分是只读低频查询，用独立超时（30s）：沿用 market_warehouse 的
+        # online_socket_timeout_sec(6s) 会在网络抖动时直接放弃整个板块解析。
+        client: object = _HttpTushareProApi(token=token, timeout_sec=30.0)
+        return client
 
     def _theme_state_path(self) -> Path:
         service = self._service

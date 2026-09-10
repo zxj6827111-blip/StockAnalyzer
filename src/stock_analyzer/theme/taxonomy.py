@@ -26,8 +26,11 @@ class ThemeDefinition(_StrictModel):
     ``event_type`` 为主题族事件分类（geopolitics/climate/policy/supply_chain），
     ``direction`` 为事件对商品的预期传导方向（+1 看多 / -1 看空），
     ``commodities`` 为价格确认对象（经 :mod:`price_confirmation` 内置注册表
-    解析为期货主力连续合约），``boards`` 为 akshare 概念/行业板块名列表，
-    ``symbols`` 为可选静态成分股覆盖（板块接口不可用时的兜底，通常为空）。
+    解析为期货主力连续合约），``boards`` 为板块名列表（种子期按东财命名），
+    ``board_aliases`` 为板块名的跨源别名（同花顺/申万名录里的等价名）——各源
+    命名体系不同，别名让同一规范名在多个源上都能**精确**命中，从而不必引入
+    模糊匹配（模糊匹配会把"国产芯片"猜成数百只规模的泛概念板块），
+    ``symbols`` 为可选静态成分股覆盖（板块接口不可用时的兜底）。
     """
 
     theme_id: str
@@ -36,6 +39,7 @@ class ThemeDefinition(_StrictModel):
     direction: int = 1
     commodities: list[str] = Field(default_factory=list)
     boards: list[str] = Field(default_factory=list)
+    board_aliases: dict[str, list[str]] = Field(default_factory=dict)
     symbols: list[str] = Field(default_factory=list)
     description: str = ""
 
