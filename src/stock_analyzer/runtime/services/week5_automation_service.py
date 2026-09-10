@@ -2046,6 +2046,14 @@ def _snapshot_age_sec(
             continue
         if symbol:
             seen.add(symbol)
+        # 无行情行（北交所/退市票：price 显式 null，新浪源给开盘前 08:00
+        # 占位时间戳）不参与新鲜度判定——2026-09-10 实测 357 行僵尸时间戳把
+        # 最旧口径的整体 age 拖到 2.5h，5,555 行有行情的真实实时数据被判
+        # stale。这些行 price/change_pct 全 null，本就不进任何行情判定。
+        # 仅对"显式存在 price 键"的行生效：无 price 键的行（旧夹具/旧快照）
+        # 保持原有判定路径不变。
+        if "price" in row and row.get("price") is None and row.get("change_pct") is None:
+            continue
         parsed = _parse_datetime(row.get("snapshot_time"))
         if parsed is not None:
             values.append(parsed)
