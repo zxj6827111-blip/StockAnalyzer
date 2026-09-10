@@ -52,6 +52,7 @@ from stock_analyzer.risk.controls import RiskController
 from stock_analyzer.signal.cross_review import evaluate_cross_review
 from stock_analyzer.signal.scoring import ScoreEngine
 from stock_analyzer.strategy.soup import SoupStrategy
+from stock_analyzer.theme.scorer import NeutralThemeBoostProvider
 from stock_analyzer.time_semantics import apply_time_invariants_to_frame
 from stock_analyzer.types import PipelineReport, PipelineSignal, ScoredSignal
 from stock_analyzer.week6.engines import MainForceTracker
@@ -151,6 +152,23 @@ class NeutralNewsSignalProvider:
         return 0.50
 
 
+class ThemeBoostProviderProtocol(Protocol):
+    """M12 主题加分 provider 契约（ThemeBoostProvider / NeutralThemeBoostProvider）。"""
+
+    def score(
+        self,
+        *,
+        symbol: str,
+        bars: pd.DataFrame,
+        features: pd.DataFrame,
+        strategy: str,
+    ) -> float:
+        """Return normalized theme boost component score in [0, 1]."""
+
+    def available(self, symbol: str = "") -> bool:
+        """Whether a valid theme boost exists for the symbol."""
+
+
 # 历史回测决策时点固定为该日收盘之后（PLAN Task 3）：真实决策发生在当天收盘，
 # 用一个晚于常规收盘（15:00）又早于次日开盘的时刻，使 apply_time_invariants_to_frame
 # 的 decision_time > available_time 判定语义清晰、不依赖 datetime.now() 的墙钟时间。
@@ -241,6 +259,7 @@ class AnalyzerPipeline:
         sample_store: SampleStore | None = None,
         feature_schema_registry: FeatureSchemaRegistry | None = None,
         label_policy_registry: LabelPolicyRegistry | None = None,
+        theme_boost_provider: ThemeBoostProviderProtocol | None = None,
     ) -> None:
         self._config = config
         self._provider = (
@@ -262,6 +281,13 @@ class AnalyzerPipeline:
         self._predictor, self._predictor_status = _load_predictor(config.training.artifact_path)
         self._news_provider = (
             news_provider if news_provider is not None else NeutralNewsSignalProvider()
+        )
+        # M12 主题加分 provider：None 时用 Neutral（恒 0 分量，available 恒 False），
+        # 保证 theme_boost 永不进入 components——零行为变化（照 news 先例）。
+        self._theme_boost_provider: ThemeBoostProviderProtocol = (
+            theme_boost_provider
+            if theme_boost_provider is not None
+            else NeutralThemeBoostProvider()
         )
         self._sample_store = sample_store
         self._feature_schema_registry = feature_schema_registry
@@ -376,9 +402,14 @@ class AnalyzerPipeline:
         # 用 save/restore 而非直接丢弃原 provider：as_of=None 时这段 no-op，
         # 保证生产路径（例如注入了自定义 news_provider 的调用方）零行为变化；
         # try/finally 保证即使 _run_once_prefetched 抛异常也一定恢复原状态。
+        # M12 同理：theme_state.json 是当前时点的主题状态，as_of 回测时主题
+        # 分量必须中性化（照 news 先例）——即使 theme_boost 权重被误配 > 0，
+        # 历史回测也不会被当前主题状态污染（双保险）。
         original_news_provider = self._news_provider
+        original_theme_boost_provider = self._theme_boost_provider
         if as_of is not None:
             self._news_provider = NeutralNewsSignalProvider()
+            self._theme_boost_provider = NeutralThemeBoostProvider()
         try:
             return self._run_once_prefetched(
                 symbols=symbols,
@@ -392,6 +423,7 @@ class AnalyzerPipeline:
         finally:
             _PIPELINE_INTRADAY_PREFETCH.reset(token)
             self._news_provider = original_news_provider
+            self._theme_boost_provider = original_theme_boost_provider
 
     def _run_once_prefetched(
         self,
@@ -1553,6 +1585,18 @@ class AnalyzerPipeline:
         }
         if news_available:
             components["news"] = news_value
+        # M12 主题分量：仅在 provider 声明该 symbol 有有效主题证据时条件加入
+        # （照 news 先例）。权重来自 weights["theme_boost"]（默认 0.0，shadow
+        # 期零影响）；available=False 时不加键，ScoreEngine 权重表∩components
+        # 归一化自动跳过——未激活主题的 symbol 总分与改动前逐字节一致。
+        theme_value, theme_available = self._score_theme_boost_component(
+            symbol=symbol,
+            bars=analysis_bars,
+            features=features,
+            strategy=strategy,
+        )
+        if theme_available:
+            components["theme_boost"] = theme_value
         bar_t1 = bars.iloc[-2] if len(bars) >= 2 else bars.iloc[-1]
         scored = self._score_engine.score(components=components, strategy=strategy)
         raw_score = scored.total_score
@@ -2076,6 +2120,38 @@ class AnalyzerPipeline:
             return 0.50, False
         if not math.isfinite(value):
             return 0.50, False
+        return max(0.0, min(1.0, value)), True
+
+    def _score_theme_boost_component(
+        self,
+        *,
+        symbol: str,
+        bars: pd.DataFrame,
+        features: pd.DataFrame,
+        strategy: str,
+    ) -> tuple[float, bool]:
+        """M12 主题分量（照 _score_news_component 的异常兜底契约）。
+
+        任何异常（state 文件损坏、provider 缺方法等）都退化为
+        ``(0.0, False)``——不加键、不影响总分，主题层故障绝不阻断扫描。
+        """
+        try:
+            availability_check = getattr(
+                self._theme_boost_provider, "available", lambda symbol="": False
+            )
+            if not bool(availability_check(symbol=symbol)):
+                return 0.0, False
+            raw_value = self._theme_boost_provider.score(
+                symbol=symbol,
+                bars=bars,
+                features=features,
+                strategy=strategy,
+            )
+            value = float(raw_value)
+        except Exception:
+            return 0.0, False
+        if not math.isfinite(value):
+            return 0.0, False
         return max(0.0, min(1.0, value)), True
 
 

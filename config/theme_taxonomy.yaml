@@ -1,0 +1,57 @@
+# M12 宏观事件主题层种子知识库（核心资产）
+# ---------------------------------------------------------------
+# 原则：先小而准（种子 ≤6 族）；价格确认对象必须是真实期货主力连续合约
+# （经 price_confirmation 内置注册表解析，未注册的商品会被记录为 unresolved）；
+# 板块名为 akshare 东财概念/行业板块名（stock_board_*_name_em），接口拉不到时
+# 静默降级为空成分并保留当日缓存，靠 shadow 期 ledger 有效性数据迭代。
+# 阈值冻结于 shadow 数据收集前（参照 Phase 1.5 多重比较教训），不可因信号少调低。
+themes:
+  - theme_id: geo_oil
+    event_type: geopolitics
+    description: 地缘冲突→原油
+    event_keywords: [战争, 冲突, 制裁, 封锁, 袭击, 霍尔木兹, 减产]
+    direction: 1
+    commodities: [SC原油, BRENT]
+    boards: [石油行业, 油气设服, 页岩气, 航运概念, 煤化工]
+    symbols: []
+
+  - theme_id: enso_agri
+    event_type: climate
+    description: 厄尔尼诺/气候→农产品
+    event_keywords: [厄尔尼诺, 拉尼娜, 干旱, 洪涝, 寒潮]
+    direction: 1
+    commodities: [白糖, 棕榈油, 橡胶, 豆粕]
+    boards: [农业种植, 农牧饲渔, 天然橡胶, 水产养殖, 种业]
+    symbols: []
+
+  - theme_id: heat_power
+    event_type: climate
+    description: 极端高温→电力
+    event_keywords: [高温, 用电负荷, 电力缺口]
+    direction: 1
+    commodities: [动力煤]
+    boards: [电力行业, 火电, 水电, 虚拟电厂]
+    symbols: []
+
+  - theme_id: policy_infra
+    event_type: policy
+    description: 政策→基建/建材
+    event_keywords: [基建投资, 专项债, 重大项目, 新基建, 城中村改造]
+    direction: 1
+    commodities: [螺纹钢]
+    boards: [工程建设, 水泥建材, 基建工程, 一带一路]
+    symbols: []
+
+  - theme_id: supply_chip
+    event_type: supply_chain
+    description: 供应链→半导体/芯片
+    event_keywords: [出口管制, 断供, 禁令, 光刻机, 先进制程]
+    direction: 1
+    commodities: [沪铜]
+    boards: [半导体, 国产芯片, 中芯概念, 光刻机]
+    symbols: []
+
+confirmation:
+  price_move_1d_min: 0.015
+  price_move_3d_min: 0.03
+  lookback_days: 3

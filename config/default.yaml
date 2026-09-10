@@ -197,6 +197,9 @@ score:
     news: 0.10
     board: 0.10
     completion: 0.10
+    # M12 主题层分量：默认 0.0（零影响）。shadow 期不消费；Phase 3 开 boost
+    # 时起步 0.05（单股加分封顶 +5：0.05 × 满分量 1.0 × 100）。
+    theme_boost: 0.0
   thresholds:
     s: 78
     a: 65
@@ -215,6 +218,8 @@ strategy_scores:
       news: 0.05
       board: 0.05
       completion: 0.05
+      # M12 主题层分量（默认 0.0，Phase 3 boost 起步 0.05）。
+      theme_boost: 0.0
   monster:
     thresholds:
       s: 76
@@ -227,6 +232,8 @@ strategy_scores:
       news: 0.10
       board: 0.10
       completion: 0.10
+      # M12 主题层分量（默认 0.0，Phase 3 boost 起步 0.05）。
+      theme_boost: 0.0
 
 soup_strategy:
   entry_mode: tail_confirm
@@ -291,6 +298,34 @@ overextension:
 board_risk:
   limit_up_tolerance: 0.001
   consecutive_limit_up_reject: 3
+
+# M12 宏观事件主题层（Macro Theme Layer）：正向主题线。
+# 宏观事件（地缘/气候/政策/供应链）→ 商品/产业链传导 → 板块 → 个股，
+# 以「评分加分 + 候选池注入」双通道接入选股漏斗。渐进启用：
+# off=不启用 | shadow=只记账不改结果（默认，4-8 周前瞻验证）| boost=加分+注入。
+# enabled=false 时不注册调度、手动 sync 也 skipped（照 m7_live_news_enabled
+# 先例）；NAS Phase 2 观察时显式置 true（SA__THEME__ENABLED=true）。
+theme:
+  mode: shadow
+  enabled: false
+  taxonomy_path: "config/theme_taxonomy.yaml"
+  confirmation:
+    # 价格确认阈值（命门）：冻结于 shadow 数据收集前，不可因信号少调低。
+    price_move_1d_min: 0.015
+    price_move_3d_min: 0.03
+    lookback_days: 3
+  # Phase 3 候选池注入上限（只/日）与单股加分封顶（+5 分语义）。
+  pinned_max_per_day: 10
+  boost_max_lift: 0.5
+  boost_half_life_days: 3.0
+  news_latest_path: "artifacts/evolution/inputs/theme_news_latest.jsonl"
+  news_daily_dir: "artifacts/evolution/inputs/theme_news_daily"
+  news_daily_retention_days: 90
+  ledger_db_path: "artifacts/evolution/m12_theme_ledger.duckdb"
+  ledger_archive_dir: "artifacts/evolution/m12_theme_ledger_archive"
+  ledger_ttl_days: 14
+  state_path: "artifacts/evolution/theme_state.json"
+  review_path: "artifacts/evolution/theme_review.jsonl"
 
 week5:
   enabled: true
@@ -665,6 +700,8 @@ scheduler:
   auction_report_time: "09:26"
   week5_auction_time: "09:25"
   close_reconcile_time: "15:10"
+  # M12 主题层每日同步时间：错开 16:30 daily_news_sync（默认 16:45）。
+  theme_daily_sync_time: "16:45"
   week4_acceptance_time: "20:35"
   week6_daily_time: "15:25"
   week5_night_scan_time: "21:45"

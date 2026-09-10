@@ -149,6 +149,7 @@ from stock_analyzer.runtime.services.news_service import RuntimeNewsService
 from stock_analyzer.runtime.services.reconcile_service import RuntimeReconcileService
 from stock_analyzer.runtime.services.runtime_ops_service import RuntimeOpsService
 from stock_analyzer.runtime.services.runtime_state_service import RuntimeStateService
+from stock_analyzer.runtime.services.theme_service import RuntimeThemeService
 from stock_analyzer.runtime.services.training_service import RuntimeTrainingService
 from stock_analyzer.runtime.services.week5_automation_service import (
     RuntimeWeek5AutomationService,
@@ -245,6 +246,7 @@ class StockAnalyzerService:
         self._reconcile_service = RuntimeReconcileService(self)
         self._runtime_ops_service = RuntimeOpsService(self)
         self._runtime_state_service = RuntimeStateService(self)
+        self._theme_service = RuntimeThemeService(self)
         self._training_service = RuntimeTrainingService(self)
         self._week5_service = RuntimeWeek5Service(self)
         self._week6_service = RuntimeWeek6Service(self)
@@ -290,10 +292,14 @@ class StockAnalyzerService:
         self._market_depth_provider: MarketDepthProvider | None = None
         if config.market_depth.enabled:
             self._market_depth_provider = build_market_depth_provider(config.market_depth)
+        # M12 主题加分 provider：theme_mode=off/shadow 时 state 里 boost 表为空
+        # （available 恒 False），分量永不进入 components；boost 模式才生效。
+        theme_boost_provider = self._theme_service.theme_boost_provider()
         self._pipeline = AnalyzerPipeline(
             config=config,
             provider=provider,
             news_provider=news_provider,
+            theme_boost_provider=theme_boost_provider,
         )
         # final selector 复用同一 news provider（mtime 缓存）做政策面新闻门。
         self._news_provider = news_provider
@@ -302,6 +308,7 @@ class StockAnalyzerService:
                 config=config,
                 provider=realtime_provider,
                 news_provider=news_provider,
+                theme_boost_provider=theme_boost_provider,
             )
             if realtime_provider is not None
             else None
@@ -3765,6 +3772,39 @@ class StockAnalyzerService:
             force_refresh=force_refresh,
             enable_ai_review=enable_ai_review,
         )
+
+    # ------------------------------------------------------------------
+    # M12 主题层（Macro Theme Layer）
+    # ------------------------------------------------------------------
+    def run_theme_daily_sync(
+        self,
+        *,
+        timestamp: datetime | None = None,
+        force_refresh: bool = False,
+    ) -> dict[str, object]:
+        """手动触发主题层每日同步（抓取→抽取→确认→账本→theme_state）。"""
+        return self._theme_service.run_theme_daily_sync(
+            timestamp=timestamp,
+            force_refresh=force_refresh,
+        )
+
+    def theme_state(self) -> dict[str, object]:
+        """当前主题状态（/theme/state 预览数据源）。"""
+        return self._theme_service.theme_state()
+
+    def theme_events(
+        self,
+        *,
+        status: str = "",
+        limit: int = 100,
+    ) -> dict[str, object]:
+        """主题账本事件预览（/theme/events 数据源）。"""
+        return self._theme_service.theme_events(status=status, limit=limit)
+
+    def theme_shadow_readiness(self) -> dict[str, object]:
+        """Phase 2 shadow→boost 升级门槛判定。"""
+        return self._theme_service.theme_shadow_readiness()
+
 
     def build_live_news_briefing(
         self,
@@ -17900,6 +17940,20 @@ class StockAnalyzerService:
                 weekdays=trading_weekdays,
                 date_predicate=trading_day_filter,
             )
+        # M12 主题层每日同步：交易日过滤内置在 run_theme_daily_sync（非交易日
+        # 直接 skipped），调度层再做一层保险。theme.enabled=false 时不注册
+        # （照 m7_live_news_enabled 先例——测试/离线环境绝不打真实网络）。
+        if bool(getattr(self._config.theme, "enabled", False)) and str(
+            getattr(self._config.scheduler, "theme_daily_sync_time", "")
+        ).strip():
+            self._scheduler.register(
+                name="theme_daily_sync",
+                trigger_hhmm=self._config.scheduler.theme_daily_sync_time,
+                callback=self._job_theme_daily_sync,
+                latest_hhmm="23:59",
+                weekdays=trading_weekdays,
+                date_predicate=trading_day_filter,
+            )
 
     def _job_premarket_scan(self) -> dict[str, object]:
         global_snapshot_report = self._collect_global_market_snapshot(source_trace_id="premarket")
@@ -17997,6 +18051,26 @@ class StockAnalyzerService:
             },
         )
         return report
+
+    def _job_theme_daily_sync(self) -> dict[str, object]:
+        """M12 主题层每日同步调度回调（照 _job_daily_news_sync 模式）。
+
+        成功路径的审计由 run_theme_daily_sync 内部记录（theme_daily_sync，
+        覆盖手动 API 触发与调度两条入口），此处只兜失败审计，避免同
+        event_type 重复记录。
+        """
+        try:
+            return self._theme_service.run_theme_daily_sync()
+        except Exception as exc:
+            self._record_audit_event(
+                event_type="theme_daily_sync_failed",
+                level="warn",
+                payload={
+                    "error_type": exc.__class__.__name__,
+                    "error": str(exc)[:300],
+                },
+            )
+            return {"status": "error", "error_type": exc.__class__.__name__}
 
     def _job_midday_news_brief(self) -> dict[str, object]:
         news_briefing = self.build_live_news_briefing(

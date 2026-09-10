@@ -298,14 +298,29 @@ class ScoreThresholdConfig(_StrictModel):
     b: float = 50.0
 
 
+def _ensure_theme_boost_weight(value: dict[str, float]) -> dict[str, float]:
+    """保证权重表始终含 ``theme_boost`` 键（默认 0.0，M12 主题层）。
+
+    即使 YAML 未显式配置 theme_boost，ScoreEngine 也能在 components 出现
+    ``theme_boost`` 时按 0.0 权重归一化——主链 18-fold 硬门零回退的结构性保障。
+    """
+    if "theme_boost" not in value:
+        return {**value, "theme_boost": 0.0}
+    return value
+
+
 class ScoreConfig(_StrictModel):
     weights: dict[str, float]
     thresholds: ScoreThresholdConfig
+
+    _ensure_theme_boost = field_validator("weights")(_ensure_theme_boost_weight)
 
 
 class StrategyScoreConfig(_StrictModel):
     thresholds: ScoreThresholdConfig
     weights: dict[str, float]
+
+    _ensure_theme_boost = field_validator("weights")(_ensure_theme_boost_weight)
 
 
 class SoupStrategyConfig(_StrictModel):
@@ -380,6 +395,48 @@ class BoardRiskConfig(_StrictModel):
 
     limit_up_tolerance: float = 0.001
     consecutive_limit_up_reject: int = 3
+
+
+class ThemeConfirmationConfig(_StrictModel):
+    """M12 主题价格确认阈值（冻结于 shadow 期前，参照 Phase 1.5 多重比较教训）。
+
+    主题事件必须伴随对应商品/期货真实价格异动才激活，防"听消息追高"。
+    shadow 数据收集期间不可因"信号太少"调低阈值。
+    """
+
+    price_move_1d_min: float = 0.015
+    price_move_3d_min: float = 0.03
+    lookback_days: int = 3
+
+
+class MacroThemeConfig(_StrictModel):
+    """M12 宏观事件主题层（Macro Theme Layer）配置。
+
+    渐进启用：off=不启用 | shadow=只记账不改结果（默认）| boost=评分加分+候选池注入。
+    照抄 ``news_risk_mode`` 成熟框架：shadow 期 4-8 周前瞻验证（akshare 宏观接口
+    只有实时、无历史），达标后才开 boost。
+    """
+
+    mode: str = "shadow"
+    # 总开关（照 m7_live_news_enabled 先例）：false 时不注册调度任务、
+    # run_theme_daily_sync 直接 skipped——保证测试/离线环境不打真实网络。
+    # NAS 部署 Phase 2 观察时显式置 true。
+    enabled: bool = False
+    taxonomy_path: str = "config/theme_taxonomy.yaml"
+    confirmation: ThemeConfirmationConfig = Field(default_factory=ThemeConfirmationConfig)
+    # Phase 3 候选池注入上限（只/日）。
+    pinned_max_per_day: int = 10
+    # 单股主题加分封顶：theme_boost 权重 0.05 起步时，满分量贡献正好 +5 分。
+    boost_max_lift: float = 0.5
+    boost_half_life_days: float = 3.0
+    news_latest_path: str = "artifacts/evolution/inputs/theme_news_latest.jsonl"
+    news_daily_dir: str = "artifacts/evolution/inputs/theme_news_daily"
+    news_daily_retention_days: int = 90
+    ledger_db_path: str = "artifacts/evolution/m12_theme_ledger.duckdb"
+    ledger_archive_dir: str = "artifacts/evolution/m12_theme_ledger_archive"
+    ledger_ttl_days: int = 14
+    state_path: str = "artifacts/evolution/theme_state.json"
+    review_path: str = "artifacts/evolution/theme_review.jsonl"
 
 
 class Week5Config(_StrictModel):
@@ -946,6 +1003,8 @@ class SchedulerConfig(_StrictModel):
     # 与 week6_daily_time(15:25)、week4_acceptance_time(20:35) 等已有盘后任务，
     # 保证 run_m7_live_news_sync 有独立调度入口而不依赖 evolution 流程。
     daily_news_sync_time: str = "16:30"
+    # M12 主题层每日同步时间：错开 16:30 daily_news_sync（默认 16:45）。
+    theme_daily_sync_time: str = "16:45"
     week4_acceptance_time: str = "20:35"
     week6_daily_time: str = "15:25"
     week5_night_scan_time: str = "21:45"
@@ -1630,6 +1689,7 @@ class StockAnalyzerConfig(_StrictModel):
     monster_risk: MonsterRiskConfig = Field(default_factory=MonsterRiskConfig)
     overextension: OverextensionConfig = Field(default_factory=OverextensionConfig)
     board_risk: BoardRiskConfig = Field(default_factory=BoardRiskConfig)
+    theme: MacroThemeConfig = Field(default_factory=MacroThemeConfig)
     week5: Week5Config = Field(default_factory=Week5Config)
     holiday_risk: HolidayRiskConfig = Field(default_factory=HolidayRiskConfig)
     global_market: GlobalMarketConfig = Field(default_factory=GlobalMarketConfig)

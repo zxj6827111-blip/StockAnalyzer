@@ -1268,6 +1268,42 @@ class RuntimeWeek5Service:
         except Exception as exc:
             progress.fail(error=exc)
             raise
+        # M12 主题层摘要（shadow 期 dry-run 注入清单 / boost 分布 / 激活主题）：
+        # 旁路标注，任何失败都不影响扫描报告本身。
+        try:
+            theme_state = self._service.theme_state()
+            if str(theme_state.get("status", "")) == "ok":
+                boost_map = theme_state.get("boost_by_symbol", {})
+                boost_values = [
+                    float(v) for v in boost_map.values() if isinstance(v, (int, float))
+                ] if isinstance(boost_map, dict) else []
+                active_themes_raw = theme_state.get("active_themes", [])
+                active_themes = (
+                    [str(t) for t in active_themes_raw if str(t).strip()]
+                    if isinstance(active_themes_raw, list)
+                    else []
+                )
+                pinned_pool_raw = theme_state.get("pinned_pool", [])
+                pinned_pool = (
+                    [str(t) for t in pinned_pool_raw if str(t).strip()]
+                    if isinstance(pinned_pool_raw, list)
+                    else []
+                )
+                report["theme"] = {
+                    "mode": str(theme_state.get("mode", "off")),
+                    "dry_run": bool(theme_state.get("dry_run", True)),
+                    "active_themes": active_themes,
+                    "pinned_pool": pinned_pool,
+                    "boost_symbol_count": len(boost_values),
+                    "boost_max": round(max(boost_values), 4) if boost_values else 0.0,
+                    "boost_avg": round(
+                        sum(boost_values) / len(boost_values), 4
+                    ) if boost_values else 0.0,
+                    "generated_at": str(theme_state.get("generated_at", "")),
+                }
+        except Exception:
+            # 主题摘要缺失不阻断扫描报告（主题层是旁路增强线）。
+            pass
         # 终态区分：data gate blocked（fail-closed 设计内结果）记为 blocked，
         # 避免外部监控把被拦截的扫描误判为成功完成。
         report_status = str(report.get("status", "")).strip()

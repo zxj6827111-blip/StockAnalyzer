@@ -116,6 +116,24 @@ class RuntimeWeek5AutomationService:
                 allow_previous=True,
                 readiness=readiness,
             )
+        # M12 主题层候选池注入：theme_mode=boost 且 state 新鲜时把激活主题成分股
+        # 并入 pinned_symbols（经引擎 _resolve_pinned_symbols_after_freshness 过滤）；
+        # shadow 模式清单只入报告（dry-run），不进 pinned。
+        theme_injection = self._resolve_theme_injection()
+        theme_pinned_raw = theme_injection.get("pinned_symbols")
+        theme_pinned: list[str] | None = (
+            [str(item) for item in theme_pinned_raw if str(item).strip()]
+            if isinstance(theme_pinned_raw, list)
+            else None
+        )
+        theme_shadow_note: dict[str, object] = {}
+        if theme_injection.get("shadow_dry_run"):
+            theme_shadow_note = {
+                "mode": "shadow",
+                "dry_run": True,
+                "would_pin": theme_injection.get("would_pin", []),
+                "active_themes": theme_injection.get("active_themes", []),
+            }
         try:
             report = service.run_week5_scan(
                 symbols=None,
@@ -128,6 +146,7 @@ class RuntimeWeek5AutomationService:
                 prefilter_top_k_override=self._cfg_int("night_light_candidate_target", 100),
                 universe_max_symbols_override=self._cfg_int("night_quality_target", 300),
                 deep_candidate_target_override=self._cfg_int("night_deep_candidate_target", 50),
+                pinned_symbols=theme_pinned,
                 scan_profile="night_scan",
             )
         except Exception as exc:
@@ -136,7 +155,15 @@ class RuntimeWeek5AutomationService:
                 trace_id=trace_id,
                 reason=f"night_scan_failed:{exc.__class__.__name__}:{exc}",
             )
-
+        if theme_shadow_note:
+            report["theme_injection"] = theme_shadow_note
+        elif theme_pinned:
+            report["theme_injection"] = {
+                "mode": "boost",
+                "dry_run": False,
+                "pinned_symbols": list(theme_pinned),
+                "active_themes": theme_injection.get("active_themes", []),
+            }
         rows = self._night_candidate_rows(report)
         rows = self._select_night_pool(rows)
         candidate_gate = self._candidate_gate_from_report(report, rows)
@@ -230,6 +257,51 @@ class RuntimeWeek5AutomationService:
                 "reason": "overnight_advisory_only",
             }
         return result
+
+    def _resolve_theme_injection(self) -> dict[str, object]:
+        """解析 M12 主题注入意图（boost=真实注入 / shadow=dry-run 清单 / 其他=空）。
+
+        读取 theme_state.json 判定：mode=boost 且非 dry-run 时返回 pinned_symbols
+        （激活主题成分股，pinned_max_per_day 已在 state 生成时截断）；shadow
+        模式返回 would_pin 清单供报告展示（不实际注入）；state 缺失/过期
+        一律返回空注入（fail-closed，不阻断 night_scan）。过期口径与
+        ThemeBoostProvider._STATE_MAX_AGE_HOURS 同源（72h）——评分与注入
+        两条消费路径对同一 state 的新鲜度判定必须一致。
+        """
+        service = self._service
+        try:
+            state = service.theme_state()
+        except Exception:
+            return {"mode": "off", "pinned_symbols": None}
+        if str(state.get("status", "")) != "ok":
+            return {"mode": "off", "pinned_symbols": None}
+        mode = str(state.get("mode", "off"))
+        dry_run = bool(state.get("dry_run", True))
+        generated_at = str(state.get("generated_at", "")).strip()
+        stale = _theme_state_stale(generated_at=generated_at)
+        active_themes = state.get("active_themes", [])
+        themes_list = active_themes if isinstance(active_themes, list) else []
+        pool = state.get("pinned_pool", [])
+        pool_list = pool if isinstance(pool, list) else []
+        if stale:
+            # 过期 state fail-closed：boost 拒绝注入；shadow 也停止展示
+            # would_pin（陈旧清单有误导性），保留 mode 供报告溯源。
+            return {"mode": f"{mode}_stale", "pinned_symbols": None}
+        if mode == "boost" and not dry_run:
+            pinned = [str(item) for item in pool_list if str(item).strip()]
+            return {
+                "mode": "boost",
+                "pinned_symbols": pinned or None,
+                "active_themes": [str(t) for t in themes_list],
+            }
+        if mode == "shadow":
+            return {
+                "mode": "shadow",
+                "shadow_dry_run": True,
+                "would_pin": [str(item) for item in pool_list if str(item).strip()],
+                "active_themes": [str(t) for t in themes_list],
+            }
+        return {"mode": mode, "pinned_symbols": None}
 
     def latest_night_scan(self) -> dict[str, object]:
         state = self.candidate_state()
@@ -2032,6 +2104,29 @@ def _financial_trust_from_rows(rows: list[dict[str, object]]) -> str:
     return "missing"
 
 
+def _theme_state_stale(*, generated_at: str) -> bool:
+    """M12 主题 state 过期判定（与 ThemeBoostProvider._STATE_MAX_AGE_HOURS 同源）。
+
+    generated_at 缺失/不可解析视为过期（fail-closed）；超过 72h 视为过期
+    ——night_scan（21:45）消费的 state 必须是当天 16:45 sync 产物，跨周末
+    最多 72h（周五生成、周一消费）仍在窗口内。
+    """
+    text = str(generated_at).strip()
+    if not text:
+        return True
+    normalized = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return True
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    else:
+        parsed = parsed.astimezone(UTC)
+    age_hours = (datetime.now(tz=UTC) - parsed).total_seconds() / 3600.0
+    return age_hours > 72.0 or age_hours < -24.0
+
+
 def _snapshot_age_sec(
     rows: list[dict[str, object]],
     now: datetime,
@@ -2046,7 +2141,7 @@ def _snapshot_age_sec(
             continue
         if symbol:
             seen.add(symbol)
-        # 无行情行（北交所/退市票：price 显式 null，新浪源给开盘前 08:00
+        # 无行情行（北交所/退市票：price 显式为 null，新浪源给开盘前 08:00
         # 占位时间戳）不参与新鲜度判定——2026-09-10 实测 357 行僵尸时间戳把
         # 最旧口径的整体 age 拖到 2.5h，5,555 行有行情的真实实时数据被判
         # stale。这些行 price/change_pct 全 null，本就不进任何行情判定。

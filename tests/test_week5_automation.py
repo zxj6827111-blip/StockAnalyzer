@@ -1293,6 +1293,39 @@ def test_snapshot_age_sec_uses_oldest_timestamp_as_worst_case() -> None:
     assert abs(age - 300.0) < 1e-6
 
 
+def test_snapshot_age_sec_excludes_no_quote_rows() -> None:
+    """无行情行（price 显式 null：北交所/退市票，新浪源给 08:00 占位时间戳）
+    不参与最旧口径 age 计算——2026-09-10 实测 357 行僵尸时间戳把整体 age
+    拖到 2.5h，5,555 行有行情数据被判 stale（radar 连败 26 的第二层根因）。"""
+    now = datetime(2026, 8, 25, 10, 0, tzinfo=UTC)
+    rows = [
+        # 有行情行：最旧 5 分钟前（真实 age 来源）
+        {"symbol": "600000", "price": 10.0, "change_pct": 0.5,
+         "snapshot_time": (now - timedelta(minutes=5)).isoformat()},
+        {"symbol": "600001", "price": 8.0, "change_pct": -0.2,
+         "snapshot_time": now.isoformat()},
+        # 僵尸行：北交所退市票，price 显式 null + 08:00 占位时间戳
+        {"symbol": "920680", "price": None, "change_pct": None, "prev_close": 0.86,
+         "snapshot_time": "2026-08-25T08:00:00+00:00"},
+    ]
+
+    age = automation_module._snapshot_age_sec(rows, now)
+
+    assert age is not None
+    assert abs(age - 300.0) < 1e-6
+
+
+def test_snapshot_age_sec_keeps_legacy_rows_without_price_key() -> None:
+    """无 price 键的行（旧快照/测试夹具）保持原判定路径——不因本次修复改变行为。"""
+    now = datetime(2026, 8, 25, 10, 0, tzinfo=UTC)
+    rows = [{"symbol": "600000", "snapshot_time": now.isoformat()}]
+
+    age = automation_module._snapshot_age_sec(rows, now)
+
+    assert age is not None
+    assert abs(age - 0.0) < 1e-6
+
+
 def test_snapshot_age_sec_tolerates_small_future_skew() -> None:
     """小幅未来偏差（now 先于抓取采样导致的时延 + 时钟偏差）截断为 0，不得误判过期。"""
     now = datetime(2026, 8, 25, 10, 0, tzinfo=UTC)
@@ -1655,3 +1688,73 @@ def test_snapshot_age_sec_keeps_legacy_rows_without_price_key() -> None:
 
     assert age is not None
     assert abs(age - 0.0) < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# M12 主题注入（night_scan pinned 通道 + shadow dry-run + 过期 fail-closed）
+# ---------------------------------------------------------------------------
+
+
+def test_theme_injection_rejects_stale_state(tmp_path: Path) -> None:
+    """过期（>72h）theme_state 不得进入注入（与评分路径口径一致，fail-closed）。"""
+
+    automation = _automation(tmp_path)
+    stale_state = {
+        "status": "ok",
+        "mode": "boost",
+        "dry_run": False,
+        "generated_at": (
+            datetime.now(tz=UTC) - timedelta(days=7)
+        ).isoformat(),
+        "active_themes": ["geo_oil"],
+        "pinned_pool": ["600028", "601857"],
+    }
+    automation._service.theme_state = lambda: stale_state  # type: ignore[method-assign]
+    injection = automation._resolve_theme_injection()
+    assert injection["mode"] == "boost_stale"
+    assert injection["pinned_symbols"] is None
+
+
+def test_theme_injection_boost_mode_passes_pinned(tmp_path: Path) -> None:
+    automation = _automation(tmp_path)
+    fresh_state = {
+        "status": "ok",
+        "mode": "boost",
+        "dry_run": False,
+        "generated_at": datetime.now(tz=UTC).isoformat(),
+        "active_themes": ["geo_oil"],
+        "pinned_pool": ["600028", "601857"],
+    }
+    automation._service.theme_state = lambda: fresh_state  # type: ignore[method-assign]
+    injection = automation._resolve_theme_injection()
+    assert injection["mode"] == "boost"
+    assert injection["pinned_symbols"] == ["600028", "601857"]
+
+
+def test_theme_injection_shadow_mode_is_dry_run(tmp_path: Path) -> None:
+    automation = _automation(tmp_path)
+    shadow_state = {
+        "status": "ok",
+        "mode": "shadow",
+        "dry_run": True,
+        "generated_at": datetime.now(tz=UTC).isoformat(),
+        "active_themes": ["geo_oil"],
+        "pinned_pool": ["600028"],
+    }
+    automation._service.theme_state = lambda: shadow_state  # type: ignore[method-assign]
+    injection = automation._resolve_theme_injection()
+    assert injection["shadow_dry_run"] is True
+    assert injection.get("would_pin") == ["600028"]
+    assert "pinned_symbols" not in injection or injection["pinned_symbols"] is None
+
+
+def test_theme_injection_unavailable_state_is_noop(tmp_path: Path) -> None:
+    automation = _automation(tmp_path)
+    automation._service.theme_state = lambda: {  # type: ignore[method-assign]
+        "status": "unavailable",
+        "reason": "theme_state_not_found",
+    }
+    injection = automation._resolve_theme_injection()
+    assert injection["mode"] == "off"
+    assert injection["pinned_symbols"] is None
+
