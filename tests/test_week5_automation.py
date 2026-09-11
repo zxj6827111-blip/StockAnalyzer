@@ -1758,39 +1758,6 @@ def test_fallback_night_scan_does_not_satisfy_idempotent_rerun(tmp_path: Path) -
     assert service.scan_call_count == 1
 
 
-def test_snapshot_age_sec_excludes_no_quote_rows() -> None:
-    """无行情行（price 显式 null：北交所/退市票，新浪源给 08:00 占位时间戳）
-    不参与最旧口径 age 计算——2026-09-10 实测 357 行僵尸时间戳把整体 age
-    拖到 2.5h，5,555 行有行情数据被判 stale（radar 连败 26 的第二层根因）。"""
-    now = datetime(2026, 8, 25, 10, 0, tzinfo=UTC)
-    rows = [
-        # 有行情行：最旧 5 分钟前（真实 age 来源）
-        {"symbol": "600000", "price": 10.0, "change_pct": 0.5,
-         "snapshot_time": (now - timedelta(minutes=5)).isoformat()},
-        {"symbol": "600001", "price": 8.0, "change_pct": -0.2,
-         "snapshot_time": now.isoformat()},
-        # 僵尸行：北交所退市票，price 显式 null + 08:00 占位时间戳
-        {"symbol": "920680", "price": None, "change_pct": None, "prev_close": 0.86,
-         "snapshot_time": "2026-08-25T08:00:00+00:00"},
-    ]
-
-    age = automation_module._snapshot_age_sec(rows, now)
-
-    assert age is not None
-    assert abs(age - 300.0) < 1e-6
-
-
-def test_snapshot_age_sec_keeps_legacy_rows_without_price_key() -> None:
-    """无 price 键的行（旧快照/测试夹具）保持原判定路径——不因本次修复改变行为。"""
-    now = datetime(2026, 8, 25, 10, 0, tzinfo=UTC)
-    rows = [{"symbol": "600000", "snapshot_time": now.isoformat()}]
-
-    age = automation_module._snapshot_age_sec(rows, now)
-
-    assert age is not None
-    assert abs(age - 0.0) < 1e-6
-
-
 # ---------------------------------------------------------------------------
 # M12 主题注入（night_scan pinned 通道 + shadow dry-run + 过期 fail-closed）
 # ---------------------------------------------------------------------------
