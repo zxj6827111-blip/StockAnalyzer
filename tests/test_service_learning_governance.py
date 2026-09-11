@@ -200,6 +200,22 @@ def _require_ticket(ticket_payload: Mapping[str, object]) -> Mapping[str, object
     return _as_mapping(ticket_payload["ticket"])
 
 
+def _require_executed(execute_payload: Mapping[str, object]) -> Mapping[str, object]:
+    """execute 失败（无 ticket 键）时把返回 payload 原样抛进断言，供 CI 诊断。
+
+    execute 的全部拒绝分支（ticket_not_issued / champion_changed_... /
+    release_flow_failed 等）都返回 {"accepted": False, "code": ...}，直接
+    下标取 "ticket" 只会得到裸 KeyError；CI 上偶发的三连挂必须看到真实
+    code 才能定位根因（PR #44 同型案例先例）。
+    """
+    if "ticket" not in execute_payload:
+        pytest.fail(
+            "ticket execute failed: "
+            + json.dumps(dict(execute_payload), ensure_ascii=False, default=str)[:900]
+        )
+    return _as_mapping(execute_payload["ticket"])
+
+
 def _prepare_learning_model_proposal(
     tmp_path: Path,
 ) -> tuple[
@@ -456,6 +472,11 @@ def test_service_shadow_proposal_auto_promotion_binds_generated_proposal_and_tic
             "auto promotion did not fire: "
             + json.dumps(dict(auto_promotion), ensure_ascii=False, default=str)[:600]
         )
+    if auto_promotion.get("auto_release") is not True:
+        pytest.fail(
+            "auto release did not fire: "
+            + json.dumps(dict(auto_promotion), ensure_ascii=False, default=str)[:900]
+        )
     assert auto_promotion["auto_release"] is True
 
 
@@ -601,7 +622,7 @@ def test_service_learning_model_release_flow_updates_registry_timeline_and_statu
     current_shadow_entry = _as_mapping(service.model_registry_entry(model_id=shadow_model_id))
     current_champion_entry = _as_mapping(service.model_registry_entry(model_id=champion_model_id))
     approval_record = _as_mapping(approval["record"])
-    executed_ticket = _as_mapping(execute["ticket"])
+    executed_ticket = _require_executed(execute)
     confirmed_ticket = _as_mapping(confirm["ticket"])
     rolled_back_ticket = _as_mapping(rollback["ticket"])
     timeline_events_before = cast(
@@ -751,7 +772,7 @@ def test_service_learning_release_watchdog_auto_rolls_back_overdue_ticket(
             timestamp=datetime(2026, 4, 1, 9, 15, tzinfo=UTC),
         )
     )
-    pending_confirmation = _as_mapping(_as_mapping(execute["ticket"])["pending_confirmation"])
+    pending_confirmation = _as_mapping(_require_executed(execute)["pending_confirmation"])
     due_at = datetime.fromisoformat(str(pending_confirmation["due_at"]))
     watchdog = _as_mapping(
         service.run_learning_model_release_confirmation_watchdog(
