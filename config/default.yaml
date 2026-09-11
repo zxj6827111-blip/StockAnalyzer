@@ -355,9 +355,10 @@ week5:
   market_radar_min_baseline_score: 55.0
   # 2026-09-09 修订 10→30：东财 push2 接口被 NAS 出口连接重置（RemoteDisconnected，
   # efinance 主源与 akshare spot_em 同挂），唯一幸存源 akshare stock_zh_a_spot
-  # （新浪）实测全市场拉取 15s（70 页逐页），10s 超时下三源全断 → radar unavailable
-  # → circuit_open 连败 24。30s 覆盖新浪源 15s 峰值 + akshare import 5.7s 开销。
-  market_snapshot_timeout_sec: 30
+  # （新浪）实测全市场拉取 15~29s（70 页逐页），10s 超时下三源全断 → radar unavailable
+  # → circuit_open 连败 24。45s 为"东财失败 → 腾讯 6s → 新浪"整条备源链留余量：
+  # 单源峰值 29s + 前两源快速失败开销，30s 会紧贴峰值把整条链判超时。
+  market_snapshot_timeout_sec: 45
   market_snapshot_retention_hours: 72.0
   market_snapshot_max_files: 500
   # 全市场快照最低行数门禁：实时源低于该行数视为部分数据，触发备源补齐
@@ -369,7 +370,11 @@ week5:
   market_radar_circuit_breaker_slow_runs: 2
   market_radar_slow_run_sec: 120
   market_radar_circuit_breaker_cooldown_min: 10
-  market_radar_timeout_sec: 90
+  # radar 单次实测 76.8s（capture 5.7~11.9s，其余在主体逻辑），原 90s 余量不足 15%：
+  # 一旦超时，调用方放弃等待但 worker 是 daemon 线程不会真取消，它会一直持有
+  # _market_radar_active，使后续 slot 只能拿到 busy 报告直到该线程自然结束
+  # （2026-09-11 实测需重启 api 才恢复）。150s 给正常路径留足余量，避免误判超时。
+  market_radar_timeout_sec: 150
   market_radar_window_intervals:
     - "09:35-11:20@10"
     - "13:05-14:50@10"
