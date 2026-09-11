@@ -131,3 +131,42 @@ def test_financial_adapter_merges_multi_source_metrics() -> None:
     sources = _as_text_list(snapshot["sources"])
     assert "stock_financial_analysis_indicator" in sources
     assert "stock_financial_abstract" in sources
+
+
+class _FakeAkNameFallback:
+    """首个名录源不可用（NAS 上上交所接口被拒），备源代码带交易所前缀。"""
+
+    def __init__(self) -> None:
+        self.tx_calls = 0
+
+    def stock_info_a_code_name(self) -> pd.DataFrame:
+        raise ConnectionError("query.sse.com.cn blocked")
+
+    def stock_zh_a_spot_tx(self) -> pd.DataFrame:
+        self.tx_calls += 1
+        return pd.DataFrame(
+            [
+                {"code": "sh600000", "name": "ST浦发"},
+                {"code": "bj920000", "name": "安徽凤凰"},
+            ]
+        )
+
+
+def test_financial_adapter_name_lookup_falls_back_and_normalizes_prefixed_code() -> None:
+    """名录源逐源降级 + 带前缀代码归一化。
+
+    回归 2026-09-10：名称映射只试 `stock_info_a_code_name`（NAS 上被网络策略
+    拒绝），失败即得到空名称表 —— ST/退市识别随之失效。且腾讯/新浪源返回的是
+    ``sh600000`` 这类带前缀代码，必须归一化成 6 位数字键才能按 symbol 命中。
+    """
+    fake = _FakeAkNameFallback()
+    adapter = AkshareFinancialAdapter(cache_ttl_sec=3600, ak_module=fake)
+
+    snapshot = adapter.fetch_snapshot("600000")
+
+    assert fake.tx_calls == 1
+    assert _as_text(snapshot["name"]) == "ST浦发"
+    assert _as_bool(snapshot["is_st"]) is True
+    # 同一张表在 TTL 内复用，不重复拉取
+    _ = adapter.fetch_snapshot("920000")
+    assert fake.tx_calls == 1

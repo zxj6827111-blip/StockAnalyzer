@@ -480,7 +480,9 @@ class RuntimeNewsService:
             boundary_clock = _parse_hhmm_time(raw_boundary)
         except ValueError:
             return default_ttl_sec
-        boundary_dt = datetime.combine(now.date(), boundary_clock)
+        # combine 产出 naive datetime，now 可能是带时区的市场时钟；显式继承
+        # now.tzinfo 才能比较/相减（naive 输入下 tzinfo 为 None，行为不变）。
+        boundary_dt = datetime.combine(now.date(), boundary_clock, tzinfo=now.tzinfo)
         if boundary_dt <= now:
             return default_ttl_sec
         return max(10 * 60, int((boundary_dt - now).total_seconds()))

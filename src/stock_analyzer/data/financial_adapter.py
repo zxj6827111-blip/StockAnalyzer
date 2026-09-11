@@ -10,6 +10,14 @@ from typing import cast
 
 import pandas as pd
 
+# 代码→名称全市场名录的候选源（按代价从低到高）。上交所名录接口最省，但在 NAS
+# 上被网络策略拒绝；腾讯/新浪全市场快照是独立第三方源，实测可用且带名称列。
+_NAME_INDEX_FUNCS = (
+    "stock_info_a_code_name",
+    "stock_zh_a_spot_tx",
+    "stock_zh_a_spot",
+)
+
 
 @dataclass(slots=True)
 class FinancialSnapshot:
@@ -112,16 +120,23 @@ class AkshareFinancialAdapter:
         if mapping and now - ts <= self._cache_ttl_sec:
             return mapping.get(symbol, "")
 
+        # 逐源独立 try：任一源不可用（如上交所接口在 NAS 上被拒）都必须继续尝试
+        # 后续源，不能因为第一个源抛异常就放弃整张名称表——名称缺失会让 ST/退市
+        # 识别失效，属于风控输入缺失。首个产出非空映射的源即返回；整表按
+        # cache_ttl_sec 缓存，因此这里多花几秒是可接受的。
         index: dict[str, str] = {}
-        func = getattr(ak, "stock_info_a_code_name", None)
-        if callable(func):
+        for func_name in _NAME_INDEX_FUNCS:
+            func = getattr(ak, func_name, None)
+            if not callable(func):
+                continue
             try:
                 frame = func()
             except Exception:
-                frame = None
+                continue
             parsed = _parse_name_mapping(frame)
             if parsed:
-                index.update(parsed)
+                index = parsed
+                break
 
         self._name_index = (now, index)
         return index.get(symbol, "")
@@ -194,11 +209,20 @@ def _parse_name_mapping(frame: object) -> dict[str, str]:
         return {}
     index: dict[str, str] = {}
     for _, row in frame.iterrows():
-        code = str(row.get(code_col, "")).strip()
+        # 全市场快照源的代码带交易所前缀（sh600000 / bj920000），必须归一化成
+        # 6 位数字键，否则按 symbol 查表永远命中不了（此前只接交易所名录接口，
+        # 它给的本来就是纯数字，所以没暴露）。
+        code = _digits_only(row.get(code_col, ""))
         name = str(row.get(name_col, "")).strip()
         if code and name:
             index[code] = name
     return index
+
+
+def _digits_only(value: object) -> str:
+    """取 6 位纯数字代码；识别不出返回空串。"""
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    return digits if len(digits) == 6 else ""
 
 
 def _call_dataframe_function(ak: object, func_name: str, symbol: str) -> pd.DataFrame | None:

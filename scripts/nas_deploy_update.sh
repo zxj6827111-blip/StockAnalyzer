@@ -24,7 +24,10 @@ DO_RECREATE=1
 DO_PULL=1
 START_SCHEDULERS=1
 FORCE_REBUILD_INTRADAY_SUMMARY=0
-HEALTH_ATTEMPTS="${HEALTH_ATTEMPTS:-30}"
+# 健康检查窗口：api 容器实测启动需约 120s（entrypoint seed-bootstrap + 应用启动），
+# 原先 30×2s=60s 会在启动完成前判失败并触发回滚（2026-09-10 事故的直接触发点）。
+# 默认 90×2s=180s，留出约 50% 余量；可用 HEALTH_ATTEMPTS/HEALTH_SLEEP_SEC 覆盖。
+HEALTH_ATTEMPTS="${HEALTH_ATTEMPTS:-90}"
 HEALTH_SLEEP_SEC="${HEALTH_SLEEP_SEC:-2}"
 HOST_PYTHON="${HOST_PYTHON:-}"
 DEPLOY_ID="$(date -u +%Y%m%d%H%M%S)-$$"
@@ -306,11 +309,24 @@ backup_runtime_containers() {
 prepare_runtime_rollback() {
   local index
   local name
+  local backup
   local failed=0
   for index in "${!RUNTIME_CONTAINER_NAMES[@]}"; do
     name="${RUNTIME_CONTAINER_NAMES[index]}"
+    backup="${RUNTIME_CONTAINER_BACKUPS[index]:-}"
     if [[ "${RUNTIME_CONTAINER_BACKED_UP[index]:-0}" == "1" \
       || "${RUNTIME_CONTAINER_EXISTED[index]:-0}" == "0" ]]; then
+      # 删除替换容器前必须先确认回滚源真的可用。原实现直接 rm -f 替换容器，
+      # 若备份容器已不存在，restore_runtime_containers 随后会报
+      # "backup container missing" —— 替换容器已删、备份又回不来，三个容器
+      # 同时消失（2026-09-10 生产事故）。宁可保留正在运行的替换容器，
+      # 也不能把服务清空。
+      if [[ "${RUNTIME_CONTAINER_BACKED_UP[index]:-0}" == "1" ]] \
+        && ! docker inspect "${backup}" >/dev/null 2>&1; then
+        echo "rollback: backup container missing, keeping replacement ${name}" >&2
+        failed=1
+        continue
+      fi
       if docker inspect "${name}" >/dev/null 2>&1 \
         && ! docker rm -f "${name}" >/dev/null; then
         echo "rollback: failed to stop replacement container ${name}" >&2
@@ -341,7 +357,10 @@ restore_runtime_containers() {
     backup="${RUNTIME_CONTAINER_BACKUPS[index]:-}"
     if [[ "${RUNTIME_CONTAINER_BACKED_UP[index]:-0}" == "1" ]]; then
       if ! docker inspect "${backup}" >/dev/null 2>&1; then
-        echo "rollback: backup container missing: ${backup}" >&2
+        # prepare_runtime_rollback 已在这种情况下保留替换容器；此处不再当作
+        # 致命错误（否则脚本会以失败退出而服务其实还在运行），但仍标记 failed
+        # 让调用方知道回滚没完成、需要人工确认。
+        echo "rollback: backup container missing, replacement left in place: ${name}" >&2
         failed=1
         continue
       fi

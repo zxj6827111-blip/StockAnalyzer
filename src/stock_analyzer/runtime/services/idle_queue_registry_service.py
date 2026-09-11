@@ -128,12 +128,21 @@ class RuntimeIdleQueueRegistryService:
         )
 
     def idle_weekend_remaining_minutes(self, now_clock: datetime) -> int:
-        if now_clock.weekday() == 5:
-            weekend_end = datetime.combine(now_clock.date() + timedelta(days=2), dt_time(0, 0, 0))
-        elif now_clock.weekday() == 6:
-            weekend_end = datetime.combine(now_clock.date() + timedelta(days=1), dt_time(0, 0, 0))
-        else:
+        # datetime.combine 默认产出 naive datetime，而生产路径的 now_clock 带
+        # 市场时区，二者相减会抛 TypeError（"can't subtract offset-naive and
+        # offset-aware datetimes"）——这就是 2026-09-05 起 week5_weekend_learning
+        # 连败 51 次且从未成功的根因：周末分支只在周六(5)/周日(6) 触发，而该任务
+        # 本来就只在周末运行，于是必然次次在 1 毫秒内失败。combine 必须显式继承
+        # now_clock.tzinfo（naive 输入下 tzinfo 为 None，行为与原先一致）。
+        offset_days = {5: 2, 6: 1}.get(now_clock.weekday())
+        if offset_days is None:
             weekend_end = now_clock
+        else:
+            weekend_end = datetime.combine(
+                now_clock.date() + timedelta(days=offset_days),
+                dt_time(0, 0, 0),
+                tzinfo=now_clock.tzinfo,
+            )
         remaining_seconds = max((weekend_end - now_clock).total_seconds(), 0.0)
         return int(remaining_seconds // 60)
 

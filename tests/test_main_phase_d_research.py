@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
+import pytest
 from fastapi.testclient import TestClient
 
 import stock_analyzer.main as main_module
@@ -331,3 +332,51 @@ def test_phase_d_report_endpoint_routes_conserved() -> None:
         "/research/tft/report",
     ]
     assert len(report_paths) == 9
+
+
+def test_phase_d_model_resolution_fails_closed_on_revoked_and_legacy(
+    tmp_path: Path,
+) -> None:
+    """无活跃 champion 时不得退回"任意记录"。
+
+    回归 2026-09-10：NAS registry 的 17 条记录全被 Phase 0 隔离为 ``revoked``，
+    原先的 ``list_records(limit=1)`` 兜底抓到 legacy 合成身份记录
+    （``dataset_manifest_id=legacy_production_*``，身份由 artifact URI 摘要合成），
+    再配对当前 artifact 就必然触发 protocol binding mismatch ——
+    ``factor_ic_decay_report`` 连败 9 次、``next_due`` 停在 8/31 的直接原因。
+    兜底必须挑"可用身份"，一个都没有时 fail-closed 报明确原因。
+    """
+    from stock_analyzer.models.registry import (
+        ModelLifecycleState,
+        ModelRegistryRecord,
+        ModelRole,
+    )
+
+    service = StockAnalyzerService(config=_load_test_config(tmp_path))
+    legacy = ModelRegistryRecord(
+        model_id="model_v1_prod_bootstrap_existing",
+        role=ModelRole.CHALLENGER,
+        lifecycle_state=ModelLifecycleState.REVOKED,
+        artifact_uri=str(tmp_path / "model_v1.json"),
+        dataset_manifest_id="legacy_production_dataset_manifest_f25b6f781ebe",
+        feature_schema_id="legacy_production_feature_schema_f25b6f781ebe",
+        label_policy_id="legacy_production_label_policy_f25b6f781ebe",
+    )
+    service._model_registry.register(legacy)
+
+    with pytest.raises(ValueError, match="no usable model identity"):
+        service._resolve_phase_d_research_model_id()
+
+    # 出现一条身份真实的 trained 记录后，兜底恢复可用（无需 champion）。
+    real = legacy.model_copy(
+        update={
+            "model_id": "model_v1_real_identity",
+            "lifecycle_state": ModelLifecycleState.TRAINED,
+            "dataset_manifest_id": "dataset_manifest_v1_50ec7236be71",
+            "feature_schema_id": "feature_schema_v1_285626b6fdd6",
+            "label_policy_id": "label_policy_v1_e2afc1135a3f",
+        }
+    )
+    service._model_registry.register(real)
+
+    assert service._resolve_phase_d_research_model_id() == "model_v1_real_identity"

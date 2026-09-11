@@ -20,13 +20,43 @@ def _script() -> str:
 def test_nas_deploy_update_uses_bounded_health_readiness_polling() -> None:
     script = _script()
 
-    assert 'HEALTH_ATTEMPTS="${HEALTH_ATTEMPTS:-30}"' in script
-    assert 'HEALTH_SLEEP_SEC="${HEALTH_SLEEP_SEC:-2}"' in script
+    # 窗口必须覆盖 api 容器实测约 120s 的启动时间（entrypoint seed-bootstrap +
+    # 应用启动）：30×2s=60s 会在启动完成前判失败并触发回滚，是 2026-09-10
+    # 部署事故的直接触发点。断言"窗口 >= 120s"这一不变量，而不是固化的次数。
+    attempts = int(script.split('HEALTH_ATTEMPTS="${HEALTH_ATTEMPTS:-', 1)[1].split("}", 1)[0])
+    sleep_sec = int(script.split('HEALTH_SLEEP_SEC="${HEALTH_SLEEP_SEC:-', 1)[1].split("}", 1)[0])
+
+    assert attempts * sleep_sec >= 120
     assert 'while [[ "${attempt}" -le "${HEALTH_ATTEMPTS}" ]]' in script
     assert "--connect-timeout 3 --max-time 10" in script
     assert 'sleep "${HEALTH_SLEEP_SEC}"' in script
     assert "health not ready" in script
     assert "sleep 3" not in script
+
+
+def test_nas_deploy_update_rollback_keeps_replacement_when_backup_missing() -> None:
+    """回滚不得在备份不可用时先删掉替换容器。
+
+    回归 2026-09-10 事故：prepare_runtime_rollback 对 BACKED_UP==1 的容器直接
+    ``docker rm -f`` 替换容器，未先确认备份容器存在；随后
+    restore_runtime_containers 报 "backup container missing"，结果三个容器
+    同时消失、服务完全中断（只剩 redis）。删除前必须先校验备份可用性。
+    """
+    script = _script()
+
+    prepare_start = script.index("prepare_runtime_rollback()")
+    restore_start = script.index("restore_runtime_containers()")
+    prepare_body = script[prepare_start:restore_start]
+
+    guard = (
+        'if [[ "${RUNTIME_CONTAINER_BACKED_UP[index]:-0}" == "1" ]] \\\n'
+        '        && ! docker inspect "${backup}" >/dev/null 2>&1; then'
+    )
+    assert guard in prepare_body
+    assert "keeping replacement" in prepare_body
+    # 守卫必须出现在 rm -f 之前
+    assert prepare_body.index(guard) < prepare_body.index('docker rm -f "${name}"')
+    assert "replacement left in place" in script[restore_start:]
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Bash syntax is verified on Linux CI")

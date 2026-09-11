@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
@@ -327,6 +328,61 @@ def test_idle_queue_weekend_task_sequence_progresses(tmp_path: Path) -> None:
     assert (output_root / "WE-P1-05" / "multi_seed" / "seed_stability_report.json").exists()
     assert (output_root / "WE-P1-06" / "cost_sensitivity" / "cost_sensitivity_report.json").exists()
     assert (output_root / "WE-P1-07" / "disaster_recovery" / "dr_report.json").exists()
+
+
+def test_idle_weekend_remaining_minutes_accepts_timezone_aware_clock(tmp_path: Path) -> None:
+    """周末剩余时间必须接受带时区的市场时钟。
+
+    回归 2026-09-05：`datetime.combine` 产出 naive datetime，与带时区的
+    now_clock 相减抛 TypeError —— week5_weekend_learning 因此连败 51 次、
+    从未成功（该分支只在周六/周日触发，而任务本就只在周末运行）。
+    """
+    service = StockAnalyzerService(config=_load_test_config(tmp_path))
+    tz = ZoneInfo("Asia/Shanghai")
+
+    # 2026-09-05 周六 12:00 → 距周一 00:00 还有 36 小时
+    saturday = datetime(2026, 9, 5, 12, 0, tzinfo=tz)
+    assert service._idle_weekend_remaining_minutes(saturday) == 36 * 60
+
+    # 2026-09-06 周日 12:00 → 距周一 00:00 还有 12 小时
+    sunday = datetime(2026, 9, 6, 12, 0, tzinfo=tz)
+    assert service._idle_weekend_remaining_minutes(sunday) == 12 * 60
+
+    # 工作日：原有语义不变（剩余 0）
+    friday = datetime(2026, 9, 11, 12, 0, tzinfo=tz)
+    assert service._idle_weekend_remaining_minutes(friday) == 0
+
+    # naive 输入保持向后兼容
+    assert service._idle_weekend_remaining_minutes(datetime(2026, 9, 5, 12, 0)) == 36 * 60
+
+
+def test_idle_queue_weekend_round_with_aware_clock_runs_we_learn_01(tmp_path: Path) -> None:
+    """带时区的周末时钟下，WE-LEARN-01 必须进入正常执行路径而不是报错。
+
+    与 test_idle_queue_weekend_task_sequence_progresses 的区别只在时钟是否
+    带时区——生产走的是带时区路径，此前测试全部用 naive 时钟，因此漏掉了这个
+    必然失败的场景。
+    """
+    config = _load_test_config(tmp_path)
+    service = StockAnalyzerService(config=config)
+    service._evolution_project_root = tmp_path
+    service._idle_task_manifests["WE-P2-08"]["force_run_on_disk_usage_pct"] = 100.0
+    service.state.watchlist = ["600000.SH"]
+    _patch_attr(service, "_provider", _MockProvider())
+
+    mock_root = tmp_path / "staging" / "mock_history"
+    mock_root.mkdir(parents=True, exist_ok=True)
+    (mock_root / "day_01.csv").write_text("x", encoding="utf-8")
+
+    reports = [
+        service.run_idle_queue_cycle(
+            now=datetime(2026, 3, 7, 13, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+            + timedelta(minutes=step * 5)
+        )
+        for step in range(8)
+    ]
+
+    assert "WE-LEARN-01" in [str(item.get("task_id", "")) for item in reports]
 
 
 def test_idle_queue_weekend_rotation_prioritizes_unfinished_p1_tasks(tmp_path: Path) -> None:

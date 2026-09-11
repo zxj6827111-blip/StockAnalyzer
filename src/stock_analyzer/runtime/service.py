@@ -3856,7 +3856,9 @@ class StockAnalyzerService:
             boundary_clock = _parse_hhmm_time(raw_boundary)
         except ValueError:
             return default_ttl_sec
-        boundary_dt = datetime.combine(now.date(), boundary_clock)
+        # combine 产出 naive datetime，now 可能是带时区的市场时钟；显式继承
+        # now.tzinfo 才能比较/相减（naive 输入下 tzinfo 为 None，行为不变）。
+        boundary_dt = datetime.combine(now.date(), boundary_clock, tzinfo=now.tzinfo)
         if boundary_dt <= now:
             return default_ttl_sec
         return max(10 * 60, int((boundary_dt - now).total_seconds()))
@@ -10173,10 +10175,27 @@ class StockAnalyzerService:
         champion = self._model_registry.active_champion()
         if champion is not None:
             return champion.model_id
-        records = self._model_registry.list_records(limit=1)
-        if records:
-            return records[0].model_id
-        raise ValueError("no registered model available for phase D research")
+        # 无活跃 champion 时的兜底必须挑"可用身份"，不能拿任意一条记录：
+        # registry 可能整表都是被隔离的 revoked 记录，或 legacy 合成身份
+        # （dataset_manifest_id 形如 legacy_production_*，身份由 artifact URI
+        # 摘要合成而非真实训练产物）。拿这类记录去配对当前 artifact，必然触发
+        # "protocol binding mismatch"，而且会把研究报告挂到错误/已撤销的模型
+        # 身份上——2026-09-10 起 factor_ic_decay_report 连败 9 次的直接原因。
+        # 没有可用身份时 fail-closed 报明确原因，而不是退回任意记录。
+        usable = [
+            record
+            for record in self._model_registry.list_records(limit=50)
+            if record.lifecycle_state
+            in {ModelLifecycleState.TRAINED, ModelLifecycleState.SHADOW_VALIDATED}
+            and not str(record.dataset_manifest_id).strip().startswith("legacy_production_")
+        ]
+        if usable:
+            return usable[0].model_id
+        raise ValueError(
+            "no usable model identity for phase D research: registry has no approved "
+            "champion and no trained/shadow_validated record with a real protocol "
+            "identity (all records revoked or legacy-synthesized)"
+        )
 
     def _default_phase_d_report_path(self, research_id: str) -> str:
         normalized = str(research_id).strip().lower() or "phase_d_research"
