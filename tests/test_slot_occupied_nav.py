@@ -168,7 +168,9 @@ def test_gate_blocks_nav_explosion_from_stored_metrics_or_returns() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_release_refuses_when_validity_gate_fails(tmp_path: Path) -> None:
+def test_release_refuses_when_validity_gate_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import stock_analyzer.runtime.services.learning_governance_service as gov_module
     from stock_analyzer.learning.slot_occupied_nav import PromotionValidityReport
     from tests.test_model_bundle_release import _prepare_release_ready_service
@@ -188,17 +190,19 @@ def test_release_refuses_when_validity_gate_fails(tmp_path: Path) -> None:
         )
 
     # 在两阶段执行器类上注入无效判定（prepare 内部调用）。
-    executor_cls._evaluate_candidate_validity = _invalid_validity
-    try:
-        execute = cast(
-            dict[str, object],
-            service.execute_learning_model_release_ticket(
-                "release_manager",
-                ticket_id=str(ctx["ticket"]["ticket_id"]),
-            ),
-        )
-    finally:
-        delattr(executor_cls, "_evaluate_candidate_validity")
+    # 必须用 monkeypatch：类上的 _evaluate_candidate_validity 是真实方法，
+    # 裸赋值 + finally delattr 会把原方法从类上永久删掉，同进程内后续所有
+    # 走两阶段发布的测试都会撞 AttributeError → release_flow_failed。
+    # CI xdist 按文件动态分发、顺序不定，曾致 test_service_learning_governance
+    # 三个用例间歇性三连挂（2026-09-12 本地同进程复现实锤）。
+    monkeypatch.setattr(executor_cls, "_evaluate_candidate_validity", _invalid_validity)
+    execute = cast(
+        dict[str, object],
+        service.execute_learning_model_release_ticket(
+            "release_manager",
+            ticket_id=str(ctx["ticket"]["ticket_id"]),
+        ),
+    )
 
     assert execute["accepted"] is False
     assert execute["code"] == "promotion_validity_failed"
