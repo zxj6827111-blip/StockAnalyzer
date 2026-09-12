@@ -55,7 +55,7 @@ import numpy as np
 import pandas as pd
 
 from stock_analyzer.feature.engineer import FeatureEngineer
-from stock_analyzer.labels.return_rank import build_return_rank_labels
+from stock_analyzer.labels.return_rank import apply_return_rank_labels_by_day
 from stock_analyzer.labels.soup import build_soup_labels
 
 MARKET_DB = "/app/artifacts/warehouse/market.duckdb"
@@ -488,31 +488,22 @@ def _apply_return_rank_labels(
     横截面分位必须基于该 trade_date 的**完整截面**：月度块恰含整月全部
     symbol 分片（合并阶段保证），逐日 groupby 即完整截面，无前视、无
     截面截断。
+
+    实现已提炼为两入口公共函数 ``labels/return_rank.apply_return_rank_labels_by_day``
+    （生产训练链 trainer 同源调用），此处只做 PIT 合并阶段的帧级适配——
+    严禁在本文件内重写横截面分位逻辑。
     """
 
-    fwd = month_frame["fwd_return"]
-    valid = fwd.notna()
-    labels = pd.Series(float("nan"), index=month_frame.index, dtype=float)
-    if valid.any():
-        # 逐日切片调用（严禁对整列一次调用：单层 RangeIndex 下全部行会
-        # 落入同一组，跨日混截面）。day 掩码保证分位严格限于当日截面。
-        day_labels_parts: list[pd.Series] = []
-        for day in month_frame["trade_date"].unique():
-            day_mask = month_frame["trade_date"] == day
-            day_fwd = fwd[day_mask]
-            if not day_fwd.notna().any():
-                continue
-            part = build_return_rank_labels(
-                day_fwd,
-                top_quantile=top_q,
-                bottom_quantile=bottom_q,
-                drop_middle=drop_middle,
-                min_cross_section=min_cross,
-            )
-            day_labels_parts.append(part)
-        if day_labels_parts:
-            labels = pd.concat(day_labels_parts).reindex(month_frame.index)
     month_frame = month_frame.copy()
+    labels = apply_return_rank_labels_by_day(
+        month_frame,
+        fwd_return_col="fwd_return",
+        date_col="trade_date",
+        top_quantile=top_q,
+        bottom_quantile=bottom_q,
+        drop_middle=drop_middle,
+        min_cross_section=min_cross,
+    )
     # label 列回写：NaN 保持 None（parquet 缺失语义与 soup 模式一致，
     # drop_middle 剔除的行 label 为空）。
     month_frame["label"] = labels.where(labels.notna())
