@@ -9697,6 +9697,17 @@ class StockAnalyzerService:
         protocol_fallback_reason = str(protocol_payload.get("fallback_reason", "")).strip()
         if bool(protocol_payload.get("ok", False)):
             return protocol_payload
+        if str(self._config.labels.basis).strip().lower() == "return_rank":
+            # bars 兜底路径硬编码 soup 标签（label_name=label_soup_tp_before_sl），
+            # 与 return_rank 口径互斥：协议路径不可用时宁可训练失败（loud），
+            # 也不静默退回 soup 造成两套 label 语义混用（子线① fail-closed 原则）。
+            return {
+                **protocol_payload,
+                "errors": [
+                    *_string_list(protocol_payload.get("errors", [])),
+                    "return_rank_basis_requires_cross_section: bars fallback disabled",
+                ],
+            }
 
         for symbol in symbols:
             try:
