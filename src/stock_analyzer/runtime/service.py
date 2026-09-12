@@ -228,6 +228,36 @@ _RECOMMENDATION_SIGNAL_EXIT_REASONS = {
 
 _BASELINE_BOOTSTRAP_LOCK = threading.Lock()
 
+# duckdb 的锁冲突与文件损坏都抛 IOException——恢复流程会把整个 learning db
+# 改名重建，误触发即丢库（2026-09-12 生产实锤：backfill 持锁期间并发训练
+# 请求的 lock IOException 被误判为损坏，1.27GB 库被改名重建，靠改名备份文件
+# 才恢复）。判定 fail-safe：锁冲突文本一律否决；只有命中损坏特征文本才允许
+# 走恢复。版本不匹配（"version number"）不自动重建——那是升级问题，重建只会
+# 静默丢数据。
+_LEARNING_PROTOCOL_LOCK_MARKERS = (
+    "could not set lock",
+    "conflicting lock",
+    "lock on file",
+    "is locked",
+    "being used by another process",
+)
+_LEARNING_PROTOCOL_CORRUPTION_MARKERS = (
+    "corrupt",
+    "not a valid duckdb",
+    "invalid database",
+    "invalid header",
+    "checksum",
+    "magic bytes",
+)
+
+
+def _is_likely_learning_protocol_corruption(error_text: str) -> bool:
+    normalized = str(error_text).lower()
+    if any(marker in normalized for marker in _LEARNING_PROTOCOL_LOCK_MARKERS):
+        return False
+    return any(marker in normalized for marker in _LEARNING_PROTOCOL_CORRUPTION_MARKERS)
+
+
 class StockAnalyzerService:
     """Stateful runtime service used by FastAPI handlers and scheduled tasks."""
 
@@ -9500,7 +9530,7 @@ class StockAnalyzerService:
                 "IOException",
                 "CatalogException",
                 "InternalException",
-            }:
+            } and _is_likely_learning_protocol_corruption(str(exc)):
                 recovery = self._recover_corrupt_learning_protocol(error_text=str(exc))
             result: dict[str, object] = {
                 "attempted": True,
