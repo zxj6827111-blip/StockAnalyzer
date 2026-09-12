@@ -1,8 +1,17 @@
 # Week5 Phase 3 子线① 实施细节：return_rank 切生产训练
 
-日期：2026-09-10
-状态：**待用户过目后动手**（本文件为实施前方案，不含代码改动）
+日期：2026-09-10（2026-09-12 实施完成）
+状态：**已实施（feat/week5-subline1-return-rank-0912）**——§2 三个开发点 + §3 测试集全部落地；待 NAS 部署 + `SA__LABELS__BASIS=return_rank` 切换 + §4 周末重训 checklist
 前置：18-fold 硬门已过（IC +0.0658，方案 A 归因 → 双口径诊断 → 方向一' 复核）
+
+## 0. 实施记录（2026-09-12）
+
+- §2.1 公共函数：`labels/return_rank.py::apply_return_rank_labels_by_day`（按 DataFrame 日期列逐日横截面，内部走 `build_return_rank_labels(trade_dates=...)`）；pit_dataset `_apply_return_rank_labels` 改为薄适配调用它。
+- §2.1 生产链：`train_on_dataset_manifest` 组装阶段新增 v3 预计算（`_return_rank_labels_from_outcomes`：outcome.realized_return 作 fwd_return、label_anchor_time+8h 上海决策日作截面键）；`train_on_bars` 对 `basis=return_rank` fail-closed（`return_rank_basis_requires_cross_section`）。
+- §2.2 偏离文档的实现选择：basis 分支**放在 `register_from_config` 内部**（而非 backfill.py 调用点）——pipeline 快照写入 / backfill 回填 / 训练编排三个注册点自动同源，单实现防漂移。`build_return_rank_policy_record`/`register_return_rank` 扩展分位/剔除/最小截面参数并纳入契约 hash（默认值即 18-fold 验证过的 0.3/0.3/drop/30）。
+- §3 测试：`tests/test_label_basis_matrix.py` 8 用例全绿（截面语义+ties/跨日泄漏/thin/两入口一致性/soup 基线 spy 回归/fail-closed/registry 分支/端到端 v3 manifest 训练演练）。实施中发现并修掉一个真实缺陷：helper 曾把 labels 的 RangeIndex 当 snapshot_id 返回（测试抓住）。
+- 口径核实：生产 `realized_return`（回填链 `_compute_outcome_metrics_for_row`）与 PIT `fwd_return` 同公式（T+1 开盘入场 → 成熟日收盘）；数据集口径由 manifest 锁定，旧 soup manifest 在 basis=return_rank 下训练仍走 v2 逐行派生，config 漂移不影响历史数据集。
+- 验证：受影响路径回归 59 例 + 相邻 28 例 + 新增 8 例全绿；clean-scope 绿；本地全量质量门（CI 同旗标 -n 4 loadfile reruns cov）绿。
 
 ## 1. 事实核验（本地代码确认）
 

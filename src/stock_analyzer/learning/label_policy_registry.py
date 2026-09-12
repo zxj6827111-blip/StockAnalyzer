@@ -39,6 +39,10 @@ def build_return_rank_policy_record(
     horizon_days: int,
     price_basis: str = "next_tradable_open",
     schema_version: str = "3",
+    top_quantile: float = 0.3,
+    bottom_quantile: float = 0.3,
+    drop_middle: bool = True,
+    min_cross_section: int = 30,
     label_policy_id: str | None = None,
     created_at: datetime | None = None,
 ) -> LabelPolicyRecord:
@@ -51,10 +55,20 @@ def build_return_rank_policy_record(
 
     TP/SL 字段按 registry 表结构以占位值登记（v3 不消费路径信息，但列是
     NOT NULL）：tp/sl=0 表示"路径不适用"。
+
+    分位/剔除/最小截面参数进 hash payload：改参数即得新契约 id，防止
+    不同参数的样本混在同一 label_policy 下训练（默认值即 18-fold 硬门
+    验证过的 0.3/0.3/drop/30 口径）。
     """
 
     if int(horizon_days) <= 0:
         raise ValueError("horizon_days must be positive")
+    if not 0.0 < float(top_quantile) < 1.0 or not 0.0 < float(bottom_quantile) < 1.0:
+        raise ValueError("top/bottom quantiles must be in (0, 1)")
+    if float(top_quantile) + float(bottom_quantile) > 1.0:
+        raise ValueError("top_quantile + bottom_quantile must be <= 1.0")
+    if int(min_cross_section) < 2:
+        raise ValueError("min_cross_section must be >= 2")
     payload = {
         "label_name": "label_return_rank",
         "schema_version": str(schema_version),
@@ -66,8 +80,10 @@ def build_return_rank_policy_record(
         "conflict_policy": "rank_quantile",
         "conflict_soft_label_value": 0.5,
         "maturity_rule": "label_mature_time_v1",
-        "top_quantile": 0.3,
-        "bottom_quantile": 0.3,
+        "top_quantile": float(top_quantile),
+        "bottom_quantile": float(bottom_quantile),
+        "drop_middle": bool(drop_middle),
+        "min_cross_section": int(min_cross_section),
     }
     label_policy_hash = _stable_hash(payload)
     resolved_policy_id = label_policy_id or _default_label_policy_id(
@@ -242,8 +258,25 @@ class LabelPolicyRegistry:
         label_policy_id: str | None = None,
         created_at: datetime | None = None,
     ) -> LabelPolicyRecord:
-        """Register the active runtime label contract from LabelsConfig."""
+        """Register the active runtime label contract from LabelsConfig.
 
+        ``labels.basis="return_rank"`` 时登记横截面收益排序契约（schema v3，
+        分位/剔除参数取自 config）——分支放在本方法内部而非各调用点：
+        pipeline 快照写入、backfill 回填、训练编排三个注册点必须登记同一
+        契约，单实现防漂移（Phase 3 子线①实施文档 §2.2）。
+        """
+
+        if str(labels.basis).strip().lower() == "return_rank":
+            return self.register(
+                build_return_rank_policy_record(
+                    horizon_days=labels.horizon_days,
+                    price_basis=labels.pnl_price_basis,
+                    top_quantile=labels.return_rank_top_quantile,
+                    bottom_quantile=labels.return_rank_bottom_quantile,
+                    drop_middle=labels.return_rank_drop_middle,
+                    min_cross_section=labels.return_rank_min_cross_section,
+                )
+            )
         return self.register(
             build_label_policy_record(
                 label_name=labels.primary,
@@ -281,6 +314,10 @@ class LabelPolicyRegistry:
         horizon_days: int,
         price_basis: str = "next_tradable_open",
         schema_version: str = "3",
+        top_quantile: float = 0.3,
+        bottom_quantile: float = 0.3,
+        drop_middle: bool = True,
+        min_cross_section: int = 30,
     ) -> LabelPolicyRecord:
         """Register the cross-sectional return-rank contract (schema v3)."""
 
@@ -289,6 +326,10 @@ class LabelPolicyRegistry:
                 horizon_days=horizon_days,
                 price_basis=price_basis,
                 schema_version=schema_version,
+                top_quantile=top_quantile,
+                bottom_quantile=bottom_quantile,
+                drop_middle=drop_middle,
+                min_cross_section=min_cross_section,
             )
         )
 

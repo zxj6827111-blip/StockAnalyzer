@@ -95,6 +95,40 @@ def build_return_rank_labels(
     return labels.rename("label_return_rank")
 
 
+def apply_return_rank_labels_by_day(
+    frame: pd.DataFrame,
+    *,
+    fwd_return_col: str = "fwd_return",
+    date_col: str = "trade_date",
+    top_quantile: float = 0.3,
+    bottom_quantile: float = 0.3,
+    drop_middle: bool = True,
+    min_cross_section: int = 30,
+) -> pd.Series:
+    """DataFrame 逐日横截面 return_rank 标签——**两入口公共实现**。
+
+    PIT 回测链（backtest/pit_dataset 合并阶段）与生产训练链（models/trainer
+    manifest 组装阶段）都经由本函数计算横截面分位标签，禁止各自实现横截
+    面逻辑——两入口口径漂移是本子线最大的正确性风险（Phase 3 子线①实施
+    文档 §2.1）。
+
+    输入 frame 需含 ``fwd_return_col``（前向收益，IC 评估同口径）与
+    ``date_col``（截面分组键，上海决策日）；分组语义由
+    ``build_return_rank_labels(trade_dates=...)`` 保证：分位严格限于当日
+    截面，无跨日泄漏；当日有效样本 < ``min_cross_section`` → 整日 NaN。
+    返回 Series（name=``label_return_rank``），index 与输入对齐。
+    """
+
+    return build_return_rank_labels(
+        frame[fwd_return_col],
+        top_quantile=top_quantile,
+        bottom_quantile=bottom_quantile,
+        drop_middle=drop_middle,
+        min_cross_section=min_cross_section,
+        trade_dates=frame[date_col],
+    )
+
+
 def fwd_return_from_bars(
     bars: pd.DataFrame,
     *,

@@ -22,6 +22,7 @@ from stock_analyzer.config import (
 from stock_analyzer.data.provider import MarketDataProvider
 from stock_analyzer.feature.engineer import FeatureEngineer
 from stock_analyzer.feature.market_context import build_market_relative_frame
+from stock_analyzer.labels.return_rank import apply_return_rank_labels_by_day
 from stock_analyzer.labels.soup import build_soup_labels
 from stock_analyzer.learning.dataset_manifest import DatasetManifestBuilder
 from stock_analyzer.learning.feature_schema_registry import FeatureSchemaRegistry
@@ -38,6 +39,7 @@ from stock_analyzer.learning.sample_schema import (
     BackfillFidelityTier,
     DatasetManifest,
     OutcomeRecord,
+    SignalSnapshot,
 )
 from stock_analyzer.learning.sample_store import SampleStore
 from stock_analyzer.learning.slot_occupied_nav import simulate_slot_occupied_realized_nav
@@ -116,6 +118,10 @@ class ModelTrainer:
         intraday_5m: pd.DataFrame | None = None,
         market_index: pd.DataFrame | None = None,
     ) -> TrainResult:
+        if str(self._labels.basis).strip().lower() == "return_rank":
+            # 单标的路径没有同日横截面，return_rank 分位无从计算；显式
+            # fail-closed 而非静默退回 soup，防止两套口径混用（子线① §2.1）。
+            raise ValueError("return_rank_basis_requires_cross_section")
         filtered_bars, _bars_time_gate = apply_time_invariants_to_frame(
             bars,
             decision_time=datetime.now(),
@@ -262,6 +268,18 @@ class ModelTrainer:
         )
         label_column = label_policy.label_name
 
+        # schema v3（return_rank）的 label 是同日横截面分位，无法逐行从
+        # outcome 度量派生（v1/v2 的 TP/SL 路径标签才是逐行可算）：组装
+        # 阶段用 outcome.realized_return 按上海决策日整表现算，与 PIT 链
+        # 共用 apply_return_rank_labels_by_day，防止两入口口径漂移。
+        v3_labels: dict[str, float] | None = None
+        if str(label_policy.schema_version).strip() == "3":
+            v3_labels = _return_rank_labels_from_outcomes(
+                outcomes=outcomes,
+                snapshots=snapshots,
+                labels_config=self._labels,
+            )
+
         row_index: list[tuple[str, datetime, str]] = []
         row_payloads: list[dict[str, float]] = []
         split_labels: list[str] = []
@@ -278,7 +296,12 @@ class ModelTrainer:
             outcome = outcomes.get(item.snapshot_id)
             if outcome is None:
                 raise ValueError(f"outcome missing for manifest item: {item.snapshot_id}")
-            label_value = _label_from_outcome(outcome=outcome, policy=label_policy)
+            if v3_labels is not None:
+                # v3：整表现算的横截面标签；缺值（drop_middle 中间段 /
+                # 截面太薄 / realized_return 缺失）即剔除该行。
+                label_value = v3_labels.get(item.snapshot_id)
+            else:
+                label_value = _label_from_outcome(outcome=outcome, policy=label_policy)
             if label_value is None:
                 continue
             row_payload = {
@@ -1046,6 +1069,61 @@ def _label_from_outcome(
         f"unsupported label policy schema_version: {policy.schema_version!r} "
         f"(policy_id={policy.label_policy_id})"
     )
+
+
+def _return_rank_labels_from_outcomes(
+    *,
+    outcomes: dict[str, OutcomeRecord],
+    snapshots: dict[str, SignalSnapshot],
+    labels_config: LabelsConfig,
+) -> dict[str, float]:
+    """schema v3（return_rank）整表现算横截面标签（生产链入口）。
+
+    - fwd_return 取 ``outcome.realized_return``（T+1 开盘入场 → 成熟日
+      收盘，与 PIT 链 fwd_return 同公式，回填链 `_compute_outcome_metrics_for_row`
+      写入）；
+    - 截面分组键 = 上海决策日（``label_anchor_time`` 即快照 decision_time，
+      Phase 0 §3.2；旧数据缺 anchor 时回退 snapshot.decision_time；+8h
+      折算与 v1/v2 的 decision_date_sh 统计口径一致，也与 PIT 链
+      trade_date 同为上海决策日）；
+    - realized_return 缺失（未成熟）的行不进截面；
+    - 分位/剔除/最小截面参数来自 ``labels.return_rank_*`` config（与
+      registry v3 契约同源，hash 绑定）；
+    - 返回 snapshot_id → label（仅含 0.0/1.0 硬标签；NaN 行缺失即剔除）。
+    """
+
+    rows: list[tuple[str, str, float]] = []
+    for snapshot_id, outcome in outcomes.items():
+        realized_return = outcome.realized_return
+        if realized_return is None:
+            continue
+        anchor = outcome.label_anchor_time
+        if anchor is None:
+            snapshot = snapshots.get(snapshot_id)
+            anchor = snapshot.decision_time if snapshot is not None else None
+        if anchor is None:
+            continue
+        trade_date = (anchor + timedelta(hours=8)).date().isoformat()
+        rows.append((snapshot_id, trade_date, float(realized_return)))
+    if not rows:
+        return {}
+    frame = pd.DataFrame(rows, columns=["snapshot_id", "trade_date", "fwd_return"])
+    labels = apply_return_rank_labels_by_day(
+        frame,
+        fwd_return_col="fwd_return",
+        date_col="trade_date",
+        top_quantile=float(labels_config.return_rank_top_quantile),
+        bottom_quantile=float(labels_config.return_rank_bottom_quantile),
+        drop_middle=bool(labels_config.return_rank_drop_middle),
+        min_cross_section=int(labels_config.return_rank_min_cross_section),
+    )
+    # labels 的 index 是 frame 的 RangeIndex（行位置），snapshot_id 必须从
+    # 行数据里按位置对齐取回，不能拿 labels.items() 的键当 snapshot_id。
+    return {
+        str(snapshot_id): float(value)
+        for snapshot_id, value in zip(frame["snapshot_id"], labels, strict=True)
+        if pd.notna(value)
+    }
 
 
 def _conflict_label_for_policy(*, policy: LabelPolicyRecord, allow_soft: bool) -> float:
