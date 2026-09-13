@@ -84,12 +84,13 @@ def evaluate_output_health(
     )
     checks["evaluable"] = evaluable
     if not evaluable:
-        # 完全没有输出语义字段：无法判定（legacy / 其他产线工件）→ advisory。
-        warnings.append("output_health_not_evaluable_missing_output_semantics")
+        # 完全没有输出语义字段：无法判定（legacy / 其他产线工件）→ 放行，仅记
+        # ``checks['evaluable']=False``。这是**覆盖缺口**而非工件缺陷，故不写进
+        # warnings——否则每个旧工件都会带一条噪音告警、稀释真正可行动的 advisory。
         return OutputHealthReport(
             valid=True,
             blocking_reasons=[],
-            warnings=sorted(set(warnings)),
+            warnings=[],
             checks=checks,
         )
 
@@ -105,8 +106,8 @@ def evaluate_output_health(
 
         if scored is None or unique is None:
             # 契约不匹配：工件**声明了**输出语义（有部分字段）却缺该尺度的关键项，
-            # 自相矛盾 → fail-closed。完全没有输出语义字段的情形已在上面按
-            # advisory 放行（legacy，不能判定）。
+            # 自相矛盾 → fail-closed。完全没有输出语义字段的情形已在上面直接放行
+            # （legacy，无法判定）。
             blocking.append(f"output_health_metrics_missing:{scale}")
             continue
         if scored <= 0.0:

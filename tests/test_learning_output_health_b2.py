@@ -148,7 +148,8 @@ def test_legacy_metrics_without_output_semantics_is_advisory_only() -> None:
     assert report.valid is True
     assert report.blocking_reasons == []
     assert report.checks["evaluable"] is False
-    assert "output_health_not_evaluable_missing_output_semantics" in report.warnings
+    # 覆盖缺口不进 warnings（避免每个旧工件都带噪音告警），但留痕在 checks 里。
+    assert report.warnings == []
 
 
 def test_empirical_thresholds_are_advisory_not_blocking() -> None:
