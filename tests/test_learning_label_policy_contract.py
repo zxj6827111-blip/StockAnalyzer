@@ -301,5 +301,43 @@ def test_trainer_derives_v3_labels_from_manifest_contract(tmp_path: Path) -> Non
         label_policy_registry=registry,
     )
 
-    # 每个 10 行截面：0.3/0.3 → 3 top + 2 bottom = 5 标签；0.2/0.2 → 2 + 1 = 3。
-    assert result.samples_total == 24 * 5
+    # 独立复算：按训练产物反查 manifest 成员，分别用契约参数与漂移配置参数重算
+    # 应得标签数。断言实际样本数等于**契约**口径、且两者可区分；不写死行数，
+    # 避免与切分/purge 规模耦合。
+    manifest = store.get_manifest(str(result.artifact.dataset_manifest_id))
+    assert manifest is not None
+    item_ids = [
+        item.snapshot_id for item in store.list_manifest_items(manifest.dataset_manifest_id)
+    ]
+    manifest_outcomes = {
+        outcome.snapshot_id: outcome for outcome in store.list_outcomes(snapshot_ids=item_ids)
+    }
+    manifest_snapshots = {
+        snapshot.snapshot_id: snapshot for snapshot in store.list_snapshots(snapshot_ids=item_ids)
+    }
+    contract_expected = len(
+        _return_rank_labels_from_outcomes(
+            outcomes=manifest_outcomes,
+            snapshots=manifest_snapshots,
+            params=ReturnRankParams(
+                top_quantile=0.3,
+                bottom_quantile=0.3,
+                drop_middle=True,
+                min_cross_section=5,
+            ),
+        )
+    )
+    drifted_expected = len(
+        _return_rank_labels_from_outcomes(
+            outcomes=manifest_outcomes,
+            snapshots=manifest_snapshots,
+            params=ReturnRankParams(
+                top_quantile=0.2,
+                bottom_quantile=0.2,
+                drop_middle=True,
+                min_cross_section=5,
+            ),
+        )
+    )
+    assert contract_expected != drifted_expected
+    assert result.samples_total == contract_expected
