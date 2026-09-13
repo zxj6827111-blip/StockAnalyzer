@@ -364,6 +364,33 @@ def test_decision_day_purge_infeasible_flags_blocking(tmp_path: Path) -> None:
     assert manifest.purged_rows == 0
 
 
+def test_decision_day_purge_flags_when_isolation_cannot_be_verified(tmp_path: Path) -> None:
+    """决策日不足三段时无法证明隔离 → 报告 violations>0 且必须 fail-closed。"""
+
+    store = SampleStore(db_path=tmp_path / "sample_store.duckdb")
+    builder = DatasetManifestBuilder(store=store)
+    _write_daily_cross_sections(
+        store,
+        day_count=2,
+        symbols=("600000.SH",),
+        horizon_days=2,
+    )
+    manifest = builder.create_manifest(
+        feature_schema_id="feature_schema_v1_abc",
+        feature_schema_hash="feature_hash_1",
+        label_policy_id="label_policy_v1_abc",
+        label_policy_hash="label_hash_1",
+        fidelity_filter=[BackfillFidelityTier.GOLD],
+        calibration_ratio=0.25,
+        test_ratio=0.25,
+        embargo_days=2,
+    )
+
+    assert manifest.split_isolation_report["status"] == "insufficient_decision_days"
+    assert int(manifest.split_isolation_report["violations"]) > 0
+    assert "label_availability_purge_infeasible" in manifest.manifest_quality_flags
+
+
 def test_decision_day_purge_records_late_maturing_samples(tmp_path: Path) -> None:
     """异常延迟成熟样本必须计数留样，否则 purge 规模无法解释。"""
 

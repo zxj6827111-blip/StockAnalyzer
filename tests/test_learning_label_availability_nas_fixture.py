@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 
 from stock_analyzer.learning.dataset_manifest import _build_manifest_items_and_split_plan
@@ -93,7 +93,11 @@ def _pairs_from_day_profile(
     return pairs
 
 
-def _old_split_leak(days: list[dict[str, object]], previous: str, following: str) -> dict[str, object]:
+def _old_split_leak(
+    days: list[dict[str, object]],
+    previous: str,
+    following: str,
+) -> dict[str, object]:
     """旧切分下该边界的泄漏规模（决策日粒度）。
 
     口径：后段某决策日的**最早决策时间**早于前段截面标签可用时间（前段各决策日
@@ -181,10 +185,7 @@ def test_nas_fixture_new_split_satisfies_isolation_and_reports_purge() -> None:
     assert int(report["purged_rows"]) > 0
     assert int(report["purged_rows"]) == 40000 - len(items)
     assert report["purged_rows"] == int(report["purged_rows"])
-    assert (
-        sum(int(day["rows"]) for day in days)
-        == len(items) + int(report["purged_rows"])
-    )
+    assert sum(int(day["rows"]) for day in days) == len(items) + int(report["purged_rows"])
 
     # 三段非空，且 test 取最后 10% 决策日（口径不变）。
     counts = {entry.split_name: entry.row_count for entry in split_plan}
@@ -200,9 +201,7 @@ def test_nas_fixture_new_split_satisfies_isolation_and_reports_purge() -> None:
         int(splits[name]["effective_trading_days"])  # type: ignore[index]
         for name in ("train", "calibration", "test")
     )
-    assert assigned_days + int(report["purged_decision_days"]) == int(
-        report["decision_days_total"]
-    )
+    assert assigned_days + int(report["purged_decision_days"]) == int(report["decision_days_total"])
     assert sum(counts.values()) == len(items)
 
 

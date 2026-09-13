@@ -625,6 +625,10 @@ def _finalize_decision_day_split(
         "boundaries": boundaries,
         "violations": sum(1 for item in boundaries if not item["satisfied"]),
     }
+    if report["violations"] and _PURGE_INFEASIBLE_FLAG not in blocking_flags:
+        # 无法证明标签可用性隔离（判据不可满足、或决策日不足三段）→ fail-closed，
+        # 不允许只在报告里留痕却让训练继续。
+        blocking_flags = [*blocking_flags, _PURGE_INFEASIBLE_FLAG]
     return items, _build_split_plan(split_times), report, blocking_flags
 
 
