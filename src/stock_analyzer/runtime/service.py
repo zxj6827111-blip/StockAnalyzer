@@ -74,6 +74,7 @@ from stock_analyzer.learning.backfill import LearningBackfillEngine
 from stock_analyzer.learning.dataset_manifest import build_manifest_quality_report
 from stock_analyzer.learning.feature_schema_registry import FeatureSchemaRegistry
 from stock_analyzer.learning.label_policy_registry import LabelPolicyRegistry
+from stock_analyzer.learning.output_health import evaluate_output_health
 from stock_analyzer.learning.sample_schema import (
     BackfillFidelityTier,
     DatasetManifest,
@@ -852,14 +853,23 @@ class StockAnalyzerService:
         return payload
 
     def _validated_predictor_reload(self, artifact_path: str, *, source: str) -> bool:
-        """predictor 热载前的 registry/完整性前置校验（Phase 0 §3.3，废 auto_load 直载）。
+        """predictor 热载前的 registry/完整性/输出健康前置校验（Phase 0 §3.3 + B2）。
 
         fail-closed 语义：
         - bundle/sidecar 完整性校验失败 → 拒绝；
-        - registry 内容 hash 能匹配该工件（任意 role 的记录）→ 放行；
+        - registry 内容 hash 能匹配该工件：记录处于 ``blocked``/``revoked`` 状态
+          → 拒绝（**失败/撤销工件不得因"任一 role 的 hash 命中"而放行**）；
+          其余状态在通过 schema 环后放行（训练流自产工件是 challenger，必须可加载）；
+          工件带 B1 输出语义字段时并须通过输出健康门的确定性检查；
         - 无匹配且当前无 active champion（bootstrap 阶段）→ 放行并留审计事件；
+          范围限定为"尚无已批准 champion 的引导窗口"，且事件类型
+          ``predictor_reload_unregistered_pre_champion`` 可审计；
         - 无匹配且已存在 active champion → 拒绝（含 champion 记录本身空 hash 的
           历史脏数据，倒逼重新走受控引导）。
+
+        已知边界：**legacy 工件**（落盘指标不含 B1 的 ``*_raw_blend`` /
+        ``*_calibrated_blend`` 字段）无法做输出健康检查，只留审计放行——不能用
+        "新门"把在服旧模型直接挡在加载之外；其质量资格由 B3 身份链单独评估。
         """
 
         normalized = str(artifact_path or "").strip()
@@ -898,6 +908,22 @@ class StockAnalyzerService:
             matched = False
 
         if matched and matched_record is not None:
+            # B2：失败/撤销状态的记录不得构成放行凭证。
+            record_state = str(matched_record.lifecycle_state).strip().lower()
+            if record_state in {"blocked", "revoked"}:
+                self._record_audit_event(
+                    event_type="predictor_reload_failed_state_blocked",
+                    level="warning",
+                    message="predictor reload blocked: matching registry record is "
+                    "blocked/revoked",
+                    payload={
+                        "artifact_path": normalized,
+                        "source": source,
+                        "record_model_id": matched_record.model_id,
+                        "lifecycle_state": record_state,
+                    },
+                )
+                return False
             # Phase 0 §3.3 第三环：feature schema 校验（legacy 无绑定 artifact
             # 仅在 legacy 合成身份记录下兼容放行，见共享 helper）。
             artifact = None
@@ -924,6 +950,13 @@ class StockAnalyzerService:
                 event_prefix="predictor_reload_schema",
             ):
                 return False
+            if not self._output_health_ring_pass(
+                artifact=artifact,
+                artifact_path=normalized,
+                source=source,
+                event_prefix="predictor_reload_output_health",
+            ):
+                return False
 
         if not matched:
             champion = self._model_registry.active_champion(suppress_read_errors=True)
@@ -946,6 +979,61 @@ class StockAnalyzerService:
                 payload={"artifact_path": normalized, "source": source},
             )
         return self._pipeline.reload_predictor(artifact_path=normalized)
+
+    def _output_health_ring_pass(
+        self,
+        *,
+        artifact: ModelArtifact,
+        artifact_path: str,
+        source: str,
+        event_prefix: str,
+    ) -> bool:
+        """B2 第四环：热载前的输出健康检查（确定性失败拒绝，经验阈值只记录）。
+
+        - 工件落盘指标**不含** B1 输出语义字段 → legacy 工件，无法判定，留审计
+          放行（不能用新门把在服旧模型挡在加载之外）；
+        - 含字段且命中确定性失败（非有限值 / 常数输出 / 缺打分样本）→ 拒绝。
+        """
+
+        metrics = {key: float(value) for key, value in dict(artifact.training_metrics).items()}
+        has_output_semantics = any(
+            key.startswith(("unique_values_", "scored_samples_")) for key in metrics
+        )
+        if not has_output_semantics:
+            self._record_audit_event(
+                event_type=f"{event_prefix}_legacy_skipped",
+                level="info",
+                message="predictor reload allowed: artifact carries no output "
+                "semantics fields (legacy), output health not evaluable",
+                payload={"artifact_path": artifact_path, "source": source},
+            )
+            return True
+        report = evaluate_output_health(metrics)
+        if report.valid:
+            if report.warnings:
+                self._record_audit_event(
+                    event_type=f"{event_prefix}_advisory",
+                    level="info",
+                    message="predictor reload allowed with output health advisories",
+                    payload={
+                        "artifact_path": artifact_path,
+                        "source": source,
+                        "warnings": list(report.warnings),
+                    },
+                )
+            return True
+        self._record_audit_event(
+            event_type=f"{event_prefix}_blocked",
+            level="warning",
+            message="predictor reload blocked by output health gate",
+            payload={
+                "artifact_path": artifact_path,
+                "source": source,
+                "blocking_reasons": list(report.blocking_reasons),
+                "checks": report.checks,
+            },
+        )
+        return False
 
     def _feature_schema_ring_pass(
         self,
