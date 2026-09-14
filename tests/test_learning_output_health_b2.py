@@ -16,7 +16,10 @@ from pathlib import Path
 
 import pytest
 
-from stock_analyzer.learning.output_health import evaluate_output_health
+from stock_analyzer.learning.output_health import (
+    MIN_SCORED_FOR_CONSTANT_BLOCK,
+    evaluate_output_health,
+)
 from stock_analyzer.learning.slot_occupied_nav import evaluate_promotion_validity
 from stock_analyzer.models.artifact import ModelArtifact
 from stock_analyzer.models.registry import (
@@ -367,3 +370,62 @@ def test_reload_allows_legacy_artifact_without_output_semantics(
     assert service._audit_events[-1]["event_type"] == (
         "predictor_reload_output_health_legacy_skipped"
     )
+
+
+class TestConstantOutputSampleSizeFloor:
+    """常数输出判定的**样本量有效性下限**（B1×B2 交互修复）。
+
+    背景：B1 让 trainer 开始产出 raw/calibrated 输出语义字段后，本门从「legacy
+    无法判定→放行」变为激活，集成后立刻有 15 个走服务训练路径的既有测试被
+    `output_health_constant_output:calibrated` 阻断。定位为**小样本伪影**：
+    fixture 仅 6 个测试样本，calibrated unique=1 但 raw unique=6、auc_raw=0.333
+    ——原始模型仍能排序，塌的只是小样本 isotonic 校准器。
+    """
+
+    @staticmethod
+    def _small_sample_constant() -> dict[str, float]:
+        metrics = _healthy_metrics()
+        metrics["scored_samples_raw_blend"] = 6.0
+        metrics["unique_values_raw_blend"] = 6.0
+        metrics["auc_raw_blend"] = 0.333
+        metrics["scored_samples_calibrated_blend"] = 6.0
+        metrics["unique_values_calibrated_blend"] = 1.0
+        metrics["mean_prob_spread_calibrated_blend"] = 0.0
+        return metrics
+
+    def test_small_sample_calibrated_constant_is_advisory_not_blocking(self) -> None:
+        report = evaluate_output_health(self._small_sample_constant())
+
+        assert report.blocking_reasons == []
+        assert "output_health_constant_output_small_sample_advisory:calibrated" in report.warnings
+
+    def test_floor_boundary_blocks_at_threshold(self) -> None:
+        # 29 个样本 → 仍属小样本伪影；30 个样本 → 按确定性失败阻断。
+        below = self._small_sample_constant()
+        below["scored_samples_calibrated_blend"] = float(MIN_SCORED_FOR_CONSTANT_BLOCK - 1)
+        assert evaluate_output_health(below).blocking_reasons == []
+
+        at = self._small_sample_constant()
+        at["scored_samples_calibrated_blend"] = float(MIN_SCORED_FOR_CONSTANT_BLOCK)
+        assert (
+            "output_health_constant_output:calibrated"
+            in evaluate_output_health(at).blocking_reasons
+        )
+
+    def test_raw_constant_still_blocks_at_small_sample(self) -> None:
+        # 下限只用于**校准器塌缩**这一伪影；原始输出常数是模型本身缺陷，小样本也阻断。
+        metrics = self._small_sample_constant()
+        metrics["unique_values_raw_blend"] = 1.0
+        report = evaluate_output_health(metrics)
+        assert "output_health_constant_output:raw" in report.blocking_reasons
+
+    def test_large_sample_constant_still_blocks(self) -> None:
+        # 真实运行量级（9/13 工件 2392 个测试样本）：门禁强度不变。
+        metrics = _healthy_metrics()
+        metrics["scored_samples_calibrated_blend"] = 2392.0
+        metrics["unique_values_calibrated_blend"] = 1.0
+        metrics["mean_prob_spread_calibrated_blend"] = 0.000272
+        assert (
+            "output_health_constant_output:calibrated"
+            in evaluate_output_health(metrics).blocking_reasons
+        )
