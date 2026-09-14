@@ -1222,6 +1222,11 @@ class StockAnalyzerService:
                 min_test_trade_dates=max(
                     1, int(self._config.training.min_test_trade_dates)
                 ),
+                # 与常规晋升路径（evaluate_learning_model_promotion 分支）保持一致：
+                # 这里此前漏传该阈值，实际一直用函数默认值，配置项被静默忽略。
+                min_hard_class_samples=max(
+                    1, int(self._config.training.min_hard_class_samples)
+                ),
                 test_stats={
                     "unique_trade_dates": float(
                         candidate_artifact.training_metrics.get(

@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 from stock_analyzer.learning.feature_schema_registry import FeatureSchemaRegistry
 from stock_analyzer.learning.sample_schema import (
@@ -32,6 +32,12 @@ DEDUP_RULE = "keep_max_ordinal_latest_snapshot"
 # 去重丢弃占比超过该阈值视为 blocking（数据集以重复为主，训练无意义）。
 _DUPLICATE_DOMINANCE_RATIO = 0.5
 _MANIFEST_SCHEMA_VERSION = "2"
+# 真实时间隔离策略标识（A1）：决策日粒度的标签可用性 purge。
+_PURGE_POLICY = "decision_day_label_availability_purge_v1"
+# 判据不可满足时置入 manifest_quality_flags，trainer 据此 fail-closed。
+_PURGE_INFEASIBLE_FLAG = "label_availability_purge_infeasible"
+# 异常延迟成熟样本在报告中保留的样例上限（计数不受此限制）。
+_LATE_MATURING_EXAMPLE_LIMIT = 20
 
 
 class DatasetManifestBuilder:
@@ -117,11 +123,13 @@ class DatasetManifestBuilder:
             rows_before=dedup_stats["rows_before"],
             rows_dropped=dedup_stats["rows_dropped"],
         )
-        item_blueprints, split_plan = _build_manifest_items_and_split_plan(
-            included_pairs=deduped_pairs,
-            calibration_ratio=calibration_ratio,
-            test_ratio=test_ratio,
-            embargo_days=embargo_days,
+        item_blueprints, split_plan, isolation_report, isolation_flags = (
+            _build_manifest_items_and_split_plan(
+                included_pairs=deduped_pairs,
+                calibration_ratio=calibration_ratio,
+                test_ratio=test_ratio,
+                embargo_days=embargo_days,
+            )
         )
         manifest_quality = build_manifest_quality_report(
             item_blueprints=item_blueprints,
@@ -181,7 +189,9 @@ class DatasetManifestBuilder:
             time_window_end=time_window_end,
             fidelity_filter=list(normalized_fidelity),
             included_snapshot_count=len(manifest_items),
-            included_outcome_count=len(deduped_pairs),
+            # included_* 是 purge 之后的成员数；purge 前的配对数见
+            # split_isolation_report["rows_before_purge"]，两者相减即剔除规模。
+            included_outcome_count=len(manifest_items),
             fidelity_breakdown=fidelity_breakdown,
             dropped_reason_breakdown=dropped_reason_breakdown,
             split_plan=split_plan,
@@ -190,14 +200,27 @@ class DatasetManifestBuilder:
             rows_before_dedup=dedup_stats["rows_before"],
             rows_dropped_by_dedup=dedup_stats["rows_dropped"],
             blocking_quality_flags=blocking_flags,
-            warning_quality_flags=warning_flags,
-            manifest_quality_flags=_as_str_list(manifest_quality.get("flags")),
+            warning_quality_flags=[
+                *warning_flags,
+                *(
+                    ["label_availability_split_degraded"]
+                    if isolation_report.get("status") == "isolated_degraded"
+                    else []
+                ),
+            ],
+            manifest_quality_flags=[
+                *_as_str_list(manifest_quality.get("flags")),
+                *isolation_flags,
+            ],
             test_split_window_days=_as_int(
                 manifest_quality.get("test_split_window_days")
             ),
             test_split_unique_symbol_dates=_as_int(
                 manifest_quality.get("test_split_unique_symbol_dates")
             ),
+            purged_decision_days=_as_int(isolation_report.get("purged_decision_days")),
+            purged_rows=_as_int(isolation_report.get("purged_rows")),
+            split_isolation_report=dict(isolation_report),
         )
 
         existing = self._store.get_manifest(manifest.dataset_manifest_id)
@@ -286,7 +309,12 @@ def _build_manifest_items_and_split_plan(
     calibration_ratio: float,
     test_ratio: float,
     embargo_days: int = 0,
-) -> tuple[list[dict[str, object]], list[DatasetSplitPlanEntry]]:
+) -> tuple[
+    list[dict[str, object]],
+    list[DatasetSplitPlanEntry],
+    dict[str, object],
+    list[str],
+]:
     ordered_pairs = sorted(
         included_pairs,
         key=lambda pair: (pair[0].decision_time, pair[0].snapshot_id),
@@ -304,9 +332,9 @@ def _build_manifest_items_and_split_plan(
         ):
             items.append(_manifest_item(snapshot, split_name, ordinal))
             split_times.setdefault(split_name, []).append(snapshot.decision_time)
-        return items, _build_split_plan(split_times)
+        return items, _build_split_plan(split_times), {}, []
 
-    return _build_grouped_split_and_purge(
+    return _build_decision_day_split_and_purge(
         ordered_pairs=ordered_pairs,
         calibration_ratio=calibration_ratio,
         test_ratio=test_ratio,
@@ -314,57 +342,411 @@ def _build_manifest_items_and_split_plan(
     )
 
 
-def _build_grouped_split_and_purge(
+def _label_available_time(
+    snapshot: SignalSnapshot,
+    outcome: OutcomeRecord,
+    embargo_days: int,
+) -> datetime:
+    """单行标签可用时间：优先 outcome 的真实成熟时间，缺失时按 embargo_days 推算。
+
+    ``label_mature_time`` 缺失时只能退化到 ``decision_time + embargo_days``（与
+    ``create_manifest`` 的契约一致）；该退化本身就是审计对象，由调用方记账。
+    """
+    mature = outcome.label_mature_time
+    if mature is None:
+        mature = snapshot.decision_time + timedelta(days=max(1, embargo_days))
+    if mature.tzinfo is None:
+        return mature.replace(tzinfo=UTC)
+    return mature.astimezone(UTC)
+
+
+def _decision_day_profile(
+    ordered_pairs: Sequence[tuple[SignalSnapshot, OutcomeRecord]],
+    *,
+    embargo_days: int,
+) -> tuple[
+    list[date],
+    dict[date, list[tuple[SignalSnapshot, OutcomeRecord]]],
+    dict[date, datetime],
+    dict[date, datetime],
+]:
+    """按上海决策日聚合截面：最小决策时间与**截面最晚标签可用时间**。
+
+    return_rank 的标签依赖同日整个截面的收益，所以"标签可用时间"不是单行的成熟
+    时间，而是该决策日截面的最晚成熟时间——只有这一刻之后，这一天的标签才定稿。
+    """
+    day_order: list[date] = []
+    day_pairs: dict[date, list[tuple[SignalSnapshot, OutcomeRecord]]] = {}
+    day_decision: dict[date, datetime] = {}
+    day_available: dict[date, datetime] = {}
+    for snapshot, outcome in ordered_pairs:
+        key = _decision_date_shanghai(snapshot.decision_time)
+        available = _label_available_time(snapshot, outcome, embargo_days)
+        decision_time = snapshot.decision_time
+        if decision_time.tzinfo is None:
+            decision_time = decision_time.replace(tzinfo=UTC)
+        if key not in day_pairs:
+            day_order.append(key)
+            day_pairs[key] = []
+            day_decision[key] = decision_time
+            day_available[key] = available
+        day_pairs[key].append((snapshot, outcome))
+        day_decision[key] = min(day_decision[key], decision_time)
+        day_available[key] = max(day_available[key], available)
+    return day_order, day_pairs, day_decision, day_available
+
+
+def _build_decision_day_split_and_purge(
     *,
     ordered_pairs: list[tuple[SignalSnapshot, OutcomeRecord]],
     calibration_ratio: float,
     test_ratio: float,
     embargo_days: int,
-) -> tuple[list[dict[str, object]], list[DatasetSplitPlanEntry]]:
-    """Label-maturity-grouped split with a structural label-window embargo.
+) -> tuple[
+    list[dict[str, object]],
+    list[DatasetSplitPlanEntry],
+    dict[str, object],
+    list[str],
+]:
+    """按决策日切分 + 按标签可用性 purge 整日截面（A1，替代成熟日分组）。
 
-    Samples are grouped by their label maturity date (the outcome's real
-    ``label_mature_time``, falling back to ``decision_time + embargo_days``)
-    and whole maturity dates are assigned chronologically to
-    train/calibration/test.  A sample belongs to the split in which its label
-    matures, so a training/calibration sample's label window can never reach
-    into a later split — the embargo is structural instead of a post-hoc
-    purge, and the calibration set can never be emptied by its own label
-    windows.  All rows sharing one maturity date share one split (no
-    same-date label leakage across the boundary).
+    判据（两侧均取决策日粒度）：相邻两段之间
+
+        max(前段各决策日的截面标签可用时间) < min(后段决策日的决策时间)
+
+    成熟日分组只能保证 ``max(前段成熟日) < min(后段成熟日)``，**不能**保证拟合段
+    的标签在预测时已经可知——对 return_rank，标签依赖同日整个截面，所以泄漏单位
+    是决策日截面。这里整日剔除不满足判据的截面（不按单行删，避免截面残缺），并
+    把剔除行数、剔除决策日数、额外交易日间隔、异常延迟成熟样本全部记账。
+
+    比例（calibration_ratio/test_ratio）是**剔除后可用决策日**上的目标：先定 test，
+    再向前取满足判据的 calibration，最后把剩下的合格日给 train。构造保证三段非空；
+    若目标尺寸不可行则逐步缩小 test/cal 直到可行（记 ``isolated_degraded``），完全
+    不可行时整体拒绝并保留原比例切分供审计（记 ``infeasible``，trainer fail-closed）。
     """
-    maturity_order: list[date] = []
-    maturity_rows: dict[date, list[tuple[SignalSnapshot, OutcomeRecord]]] = {}
-    for snapshot, outcome in ordered_pairs:
-        label_mature = outcome.label_mature_time
-        maturity_date = (
-            label_mature.date()
-            if label_mature is not None
-            else snapshot.decision_time.date() + timedelta(days=max(1, embargo_days))
+    day_order, day_pairs, day_decision, day_available = _decision_day_profile(
+        ordered_pairs,
+        embargo_days=embargo_days,
+    )
+    total_days = len(day_order)
+    total_rows = len(ordered_pairs)
+    late_maturing_rows, late_maturing_examples = _collect_late_maturing_rows(
+        ordered_pairs,
+        embargo_days=embargo_days,
+    )
+    if total_days < 3:
+        # 少于 3 个决策日无法构造三段；沿用比例切分并显式说明未做隔离判定。
+        day_split = _assign_temporal_splits_by_date(
+            dates=day_order,
+            calibration_ratio=calibration_ratio,
+            test_ratio=test_ratio,
         )
-        if maturity_date not in maturity_rows:
-            maturity_rows[maturity_date] = []
-            maturity_order.append(maturity_date)
-        maturity_rows[maturity_date].append((snapshot, outcome))
-    maturity_order.sort()
+        return _finalize_decision_day_split(
+            day_order=day_order,
+            day_pairs=day_pairs,
+            day_split=day_split,
+            day_decision=day_decision,
+            day_available=day_available,
+            embargo_days=embargo_days,
+            total_rows=total_rows,
+            late_maturing_count=late_maturing_rows,
+            late_maturing_examples=late_maturing_examples,
+            status="insufficient_decision_days",
+            gap_days={},
+            blocking_flags=[],
+        )
 
-    maturity_split = _assign_temporal_splits_by_date(
-        dates=maturity_order,
-        calibration_ratio=calibration_ratio,
-        test_ratio=test_ratio,
+    n_test_target = max(1, int(round(total_days * max(0.0, test_ratio))))
+    n_cal_target = max(1, int(round(total_days * max(0.0, calibration_ratio))))
+    while n_test_target + n_cal_target > total_days - 1:
+        if n_cal_target > 1:
+            n_cal_target -= 1
+        elif n_test_target > 1:
+            n_test_target -= 1
+        else:
+            break
+
+    index_of = {day: position for position, day in enumerate(day_order)}
+    assignment: dict[date, str] | None = None
+    degraded = False
+    for test_count in range(n_test_target, 0, -1):
+        test_days = day_order[total_days - test_count :]
+        test_min_decision = min(day_decision[day] for day in test_days)
+        cal_pool = [
+            day
+            for day in day_order[: total_days - test_count]
+            if day_available[day] < test_min_decision
+        ]
+        for cal_count in range(min(n_cal_target, len(cal_pool)), 0, -1):
+            cal_days = cal_pool[len(cal_pool) - cal_count :]
+            cal_min_decision = min(day_decision[day] for day in cal_days)
+            train_days = [
+                day
+                for day in day_order[: index_of[cal_days[0]]]
+                if day_available[day] < cal_min_decision
+            ]
+            if not train_days:
+                continue
+            assignment = {day: "train" for day in train_days}
+            assignment.update({day: "calibration" for day in cal_days})
+            assignment.update({day: "test" for day in test_days})
+            degraded = test_count < n_test_target or cal_count < n_cal_target
+            break
+        if assignment is not None:
+            break
+
+    if assignment is None:
+        # 判据在当前数据上不可满足：保留比例切分供审计，并让 trainer fail-closed。
+        day_split = _assign_temporal_splits_by_date(
+            dates=day_order,
+            calibration_ratio=calibration_ratio,
+            test_ratio=test_ratio,
+        )
+        return _finalize_decision_day_split(
+            day_order=day_order,
+            day_pairs=day_pairs,
+            day_split=day_split,
+            day_decision=day_decision,
+            day_available=day_available,
+            embargo_days=embargo_days,
+            total_rows=total_rows,
+            late_maturing_count=late_maturing_rows,
+            late_maturing_examples=late_maturing_examples,
+            status="infeasible",
+            gap_days={},
+            blocking_flags=[_PURGE_INFEASIBLE_FLAG],
+        )
+
+    gap_days = _boundary_gap_days(
+        day_order=day_order,
+        assignment=assignment,
+        index_of=index_of,
+    )
+    return _finalize_decision_day_split(
+        day_order=day_order,
+        day_pairs=day_pairs,
+        day_split=assignment,
+        day_decision=day_decision,
+        day_available=day_available,
+        embargo_days=embargo_days,
+        total_rows=total_rows,
+        late_maturing_count=late_maturing_rows,
+        late_maturing_examples=late_maturing_examples,
+        status="isolated_degraded" if degraded else "isolated",
+        gap_days=gap_days,
+        blocking_flags=[],
     )
 
+
+def _boundary_gap_days(
+    *,
+    day_order: Sequence[date],
+    assignment: Mapping[date, str],
+    index_of: Mapping[date, int],
+) -> dict[str, int]:
+    """相邻两段之间被剔除的交易日数（额外交易日间隔，purge 的副产品）。"""
+    bounds = (("train", "calibration"), ("calibration", "test"))
+    gaps: dict[str, int] = {}
+    for previous, following in bounds:
+        previous_days = [day for day in day_order if assignment.get(day) == previous]
+        following_days = [day for day in day_order if assignment.get(day) == following]
+        if not previous_days or not following_days:
+            gaps[f"{previous}->{following}"] = 0
+            continue
+        last_previous = max(index_of[day] for day in previous_days)
+        first_following = min(index_of[day] for day in following_days)
+        gaps[f"{previous}->{following}"] = max(0, first_following - last_previous - 1)
+    return gaps
+
+
+def _finalize_decision_day_split(
+    *,
+    day_order: Sequence[date],
+    day_pairs: Mapping[date, list[tuple[SignalSnapshot, OutcomeRecord]]],
+    day_split: Mapping[date, str],
+    day_decision: Mapping[date, datetime],
+    day_available: Mapping[date, datetime],
+    embargo_days: int,
+    total_rows: int,
+    late_maturing_count: int,
+    late_maturing_examples: list[dict[str, object]],
+    status: str,
+    gap_days: Mapping[str, int],
+    blocking_flags: list[str],
+) -> tuple[
+    list[dict[str, object]],
+    list[DatasetSplitPlanEntry],
+    dict[str, object],
+    list[str],
+]:
     items: list[dict[str, object]] = []
     split_times: dict[str, list[datetime]] = {}
+    split_days: dict[str, list[date]] = {}
     ordinal = 0
-    for maturity_date in maturity_order:
-        split_name = maturity_split[maturity_date]
-        for snapshot, _outcome in maturity_rows[maturity_date]:
+    for day in day_order:
+        split_name = day_split.get(day)
+        if split_name is None:
+            continue
+        split_days.setdefault(split_name, []).append(day)
+        for snapshot, _outcome in day_pairs[day]:
             items.append(_manifest_item(snapshot, split_name, ordinal))
             ordinal += 1
             split_times.setdefault(split_name, []).append(snapshot.decision_time)
 
-    return items, _build_split_plan(split_times)
+    purged_days = [day for day in day_order if day not in day_split]
+    purged_rows = sum(len(day_pairs[day]) for day in purged_days)
+    boundaries = _boundary_isolation_checks(
+        day_order=day_order,
+        day_split=day_split,
+        day_decision=day_decision,
+        day_available=day_available,
+        day_pairs=day_pairs,
+        gap_days=gap_days,
+        index_of={day: position for position, day in enumerate(day_order)},
+    )
+    report: dict[str, object] = {
+        "policy": _PURGE_POLICY,
+        "status": status,
+        "embargo_days": int(embargo_days),
+        "decision_days_total": len(day_order),
+        "rows_before_purge": total_rows,
+        "purged_decision_days": len(purged_days),
+        "purged_rows": purged_rows,
+        "embargo_gap_trading_days": dict(gap_days),
+        "late_maturing_row_count": late_maturing_count,
+        "late_maturing_examples": late_maturing_examples,
+        "splits": _split_isolation_metrics(
+            day_order=day_order,
+            day_split=day_split,
+            day_decision=day_decision,
+            day_available=day_available,
+            split_days=split_days,
+        ),
+        "boundaries": boundaries,
+        "violations": sum(1 for item in boundaries if not item["satisfied"]),
+    }
+    if report["violations"] and _PURGE_INFEASIBLE_FLAG not in blocking_flags:
+        # 无法证明标签可用性隔离（判据不可满足、或决策日不足三段）→ fail-closed，
+        # 不允许只在报告里留痕却让训练继续。
+        blocking_flags = [*blocking_flags, _PURGE_INFEASIBLE_FLAG]
+    return items, _build_split_plan(split_times), report, blocking_flags
+
+
+def _split_isolation_metrics(
+    *,
+    day_order: Sequence[date],
+    day_split: Mapping[date, str],
+    day_decision: Mapping[date, datetime],
+    day_available: Mapping[date, datetime],
+    split_days: Mapping[str, list[date]],
+) -> dict[str, object]:
+    """四项目报告：决策日自然日跨度、有效交易日数、成熟日范围、标签可用性边界。"""
+    metrics: dict[str, object] = {}
+    for split_name in ("train", "calibration", "test"):
+        days = sorted(split_days.get(split_name, []))
+        if not days:
+            metrics[split_name] = {"effective_trading_days": 0}
+            continue
+        metrics[split_name] = {
+            "effective_trading_days": len(days),
+            "decision_span_calendar_days": (days[-1] - days[0]).days + 1,
+            "min_decision_time": min(day_decision[day] for day in days).isoformat(),
+            "max_decision_time": max(day_decision[day] for day in days).isoformat(),
+            "maturity_range": [
+                min(day_available[day] for day in days).date().isoformat(),
+                max(day_available[day] for day in days).date().isoformat(),
+            ],
+            "max_label_available_time": max(day_available[day] for day in days).isoformat(),
+        }
+    return metrics
+
+
+def _boundary_isolation_checks(
+    *,
+    day_order: Sequence[date],
+    day_split: Mapping[date, str],
+    day_decision: Mapping[date, datetime],
+    day_available: Mapping[date, datetime],
+    day_pairs: Mapping[date, list[tuple[SignalSnapshot, OutcomeRecord]]],
+    gap_days: Mapping[str, int],
+    index_of: Mapping[date, int],
+) -> list[dict[str, object]]:
+    """逐边界判据：max(前段截面标签可用时间) < min(后段决策时间)。"""
+    checks: list[dict[str, object]] = []
+    previous_days_by_split: dict[str, list[date]] = {"train": [], "calibration": []}
+    following_days_by_split: dict[str, list[date]] = {"calibration": [], "test": []}
+    for day in day_order:
+        split_name = day_split.get(day)
+        if split_name in previous_days_by_split:
+            previous_days_by_split[split_name].append(day)
+        if split_name in following_days_by_split:
+            following_days_by_split[split_name].append(day)
+    for previous, following in (("train", "calibration"), ("calibration", "test")):
+        previous_days = previous_days_by_split[previous]
+        following_days = following_days_by_split[following]
+        if not previous_days or not following_days:
+            checks.append(
+                {
+                    "name": f"{previous}->{following}",
+                    "satisfied": False,
+                    "reason": "empty_split",
+                    "purged_decision_days": 0,
+                    "purged_rows": 0,
+                    "gap_trading_days": int(gap_days.get(f"{previous}->{following}", 0)),
+                }
+            )
+            continue
+        previous_max_available = max(day_available[day] for day in previous_days)
+        following_min_decision = min(day_decision[day] for day in following_days)
+        # 该边界负责剔除的截面：两段之间被整体剔除的决策日。
+        last_previous = max(index_of[day] for day in previous_days)
+        first_following = min(index_of[day] for day in following_days)
+        gap_slice = day_order[last_previous + 1 : first_following]
+        boundary_purged = [day for day in gap_slice if day not in day_split]
+        checks.append(
+            {
+                "name": f"{previous}->{following}",
+                "prev_max_label_available": previous_max_available.isoformat(),
+                "next_min_decision": following_min_decision.isoformat(),
+                "satisfied": bool(previous_max_available < following_min_decision),
+                "purged_decision_days": len(boundary_purged),
+                "purged_rows": sum(len(day_pairs[day]) for day in boundary_purged),
+                "gap_trading_days": int(gap_days.get(f"{previous}->{following}", 0)),
+            }
+        )
+    return checks
+
+
+def _collect_late_maturing_rows(
+    ordered_pairs: Sequence[tuple[SignalSnapshot, OutcomeRecord]],
+    *,
+    embargo_days: int,
+) -> tuple[int, list[dict[str, object]]]:
+    """异常延迟成熟样本：标签可用时间晚于 ``decision_time + embargo_days`` 的行。
+
+    这类行会让"名义 horizon 决定间隔"的假设失效，必须计数并留样，否则 purge
+    规模无法解释。
+    """
+    count = 0
+    examples: list[dict[str, object]] = []
+    for snapshot, outcome in ordered_pairs:
+        available = _label_available_time(snapshot, outcome, embargo_days)
+        nominal = snapshot.decision_time + timedelta(days=max(1, embargo_days))
+        if nominal.tzinfo is None:
+            nominal = nominal.replace(tzinfo=UTC)
+        if available <= nominal:
+            continue
+        count += 1
+        if len(examples) < _LATE_MATURING_EXAMPLE_LIMIT:
+            examples.append(
+                {
+                    "snapshot_id": snapshot.snapshot_id,
+                    "decision_time": snapshot.decision_time.isoformat(),
+                    "label_available_time": available.isoformat(),
+                    "nominal_available_time": nominal.isoformat(),
+                }
+            )
+    return count, examples
 
 
 def _deduplicate_by_trading_day(

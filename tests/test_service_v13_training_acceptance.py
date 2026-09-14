@@ -291,10 +291,11 @@ def test_service_full_market_training_prefers_richer_projection_compatible_schem
     assert payload["input_mode"] == "sample_store"
     assert payload["protocol_attempted"] is True
     assert payload["protocol_fallback_reason"] == ""
-    # 结构性 embargo：样本按 label 成熟日归集切分，标签窗口不可能跨入
-    # 下一集合，因此无需事后 purge——24 条样本全部保留（旧 purge 逻辑会
-    # 剔除 train/calibration 末尾各 1 条 → 22）。
-    assert payload["dataset_rows"] == 24
+    # A1（决策日粒度标签可用性 purge）：24 个决策日里，train 末 2 日与
+    # calibration 末 2 日的截面标签在下段最早决策时尚未可知，按整日剔除
+    # → 24 - 4 = 20。旧断言写的是「成熟日分组无需 purge、24 条全保留」，
+    # 该不变量已被推翻：成熟日不重叠 ≠ 标签在预测时可知。
+    assert payload["dataset_rows"] == 20
     artifact_payload = _as_mapping(_as_mapping(payload["result"])["artifact"])
     assert artifact_payload["feature_schema_id"] == current_record.feature_schema_id
     assert "feature_c" in cast(list[object], artifact_payload["feature_columns"])
