@@ -13,8 +13,14 @@ parquet 分块（PIT universe 快照、(symbol, trade_date) 逻辑键唯一）�
 五分位收益与 top-bottom、月度单调性、AUC/Brier、Precision@K、
 universe 统计（B9 字段）。
 
-判定（§5 放行判据，INCONCLUSIVE 语义内置）：≥4 完整 fold、≥4/6 月、
-IC>0、top≥bottom、CI 是否跨 0。产出 JSON+MD 报告（时间戳命名不覆盖）。
+判定（§5 放行判据，C1 修正后**真正进入 verdict**）：
+``INSUFFICIENT_FOLDS``（完整 fold < 4）→ ``NO_GO``（fold 内 lookahead 违规 > 0，
+指标不可用）→ ``NO_GO``（CI 上界 < 0，或 IC ≤ 0 且 CI 不跨 0：有负向证据）→
+``INCONCLUSIVE``（CI 跨 0：证据不足，**不得**判 GO）→ ``GO_CANDIDATE``
+（IC > 0 且 top ≥ bottom 且月度 ≥ 4/6 **且 CI 下界 > 0**）。
+CI 为**连续交易日块** moving-block bootstrap（块长预设，见
+``DEFAULT_BLOCK_TRADING_DAYS``），不是逐日独立重采样。
+产出 JSON+MD 报告（时间戳命名不覆盖）。
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
+from typing import cast
 
 import duckdb
 import numpy as np
@@ -42,6 +49,53 @@ from stock_analyzer.models.trainer import ModelTrainer
 
 DEFAULT_DATASET_DIR = "/app/artifacts/phase2/pit_dataset"
 DEFAULT_OUT_DIR = "/app/artifacts/phase2"
+
+# 对照基线（2026-09-06 soup label Phase 2 NO-GO 报告）。fold 数由 plan_folds
+# 按数据覆盖与窗口参数**生成**，每次运行都可能不同；基线只在两者一致时才
+# 构成同口径对照，否则必须显式标"不可比"——禁止把覆盖率不同的两次运行并列
+# 成"改善/退化"（C1：fold 数不得写死当作期望值）。
+BASELINE_SOUP_LABEL: dict[str, object] = {
+    "aggregate_ic_mean": -0.024,
+    "aggregate_ic_ci95": [-0.043, -0.005],
+    "folds_total": 18,
+    "source": "Phase 2 NO-GO report 2026-09-06 (pit_dataset_ext v1)",
+    "note": "同一 harness 配置（train=120/test=20/step=20/embargo=11）",
+}
+
+
+# 验证范围声明（C1 §2）：本 harness 每折重新训练，评估的是**训练流程**；
+# 同一历史窗口被反复用于挑标签/特征/后，它已是"开发验证资产"，不得称最终
+# 测试集，也不构成"9/13 固定工件可晋升"的证据。工件级验证必须是冻结工件在
+# 未参与开发/训练/校准的**后续数据**上做 shadow 或真正前向验证（批次 D）。
+VALIDATION_SCOPE_PROCESS: dict[str, object] = {
+    "kind": "process",
+    "statement": (
+        "每折独立训练与拟合 → 评估对象是训练流程，不是固定工件回打历史；"
+        "该窗口已被反复用于标签/特征选择，属开发验证资产，不得称最终测试集。"
+    ),
+    "artifact_level_required": (
+        "冻结工件后在未参与开发/训练/校准的后续数据上做 shadow 或真正前向验证（批次 D）"
+    ),
+}
+
+
+def baseline_comparison(current_folds: int) -> dict[str, object]:
+    """基线对照写成**可判定**结果：fold 覆盖率不同即标不可比。"""
+
+    baseline_folds = int(cast(int, BASELINE_SOUP_LABEL["folds_total"]))
+    comparable = int(current_folds) == baseline_folds
+    payload: dict[str, object] = dict(BASELINE_SOUP_LABEL)
+    payload["comparable"] = comparable
+    payload["current_folds_total"] = int(current_folds)
+    payload["comparability_note"] = (
+        "同口径可对照"
+        if comparable
+        else (
+            f"fold 覆盖率不同（当前 {int(current_folds)} vs 基线 {baseline_folds}）："
+            "不得直接并列比较 IC/CI"
+        )
+    )
+    return payload
 
 
 @dataclass
@@ -548,19 +602,43 @@ def aggregate_report(
     ic_positive = not math.isnan(ic_mean) and ic_mean > 0
     tb_ok = not math.isnan(tb_mean) and tb_mean >= 0
     folds_ok = len(completed) >= 4
-    ci_supports = not (ci["ci_high"] < 0)  # CI 不支持"负向"即视为不反证
-    verdict = (
-        "GO_CANDIDATE"
-        if (folds_ok and ic_positive and tb_ok and monotonic_ok)
-        else "INCONCLUSIVE"
-    )
+    lookahead_total = sum(f.lookahead_violations for f in folds)
+    ci_low = float(ci["ci_low"])
+    ci_high = float(ci["ci_high"])
+    # C1：过程级判据必须真正进入 verdict。此前 ci_supports 只被"上报"不参与
+    # 判定（文档写了"CI 是否跨 0"却未实现），lookahead 违规同样只上报——
+    # 结果是「IC=+0.01 且 CI=[-0.032,+0.052] 且 lookahead=1」也能判 GO_CANDIDATE。
+    # 现在：时间安全违规 → 直接 NO_GO（指标不可用）；CI 下界 > 0 是 GO 的
+    # **必要条件**（不是"CI 不反对"）；CI 整体为负 → 有负向证据 → NO_GO。
+    lookahead_ok = lookahead_total == 0
+    ci_supports_positive = (not math.isnan(ci_low)) and ci_low > 0.0
+    ci_excludes_zero = ci_supports_positive or ((not math.isnan(ci_high)) and ci_high < 0.0)
+    ci_supports_negative = (not math.isnan(ci_high)) and ci_high < 0.0
+    ci_supports = not ci_supports_negative  # 兼容旧字段语义：CI 不反证"负向"
+    # 覆盖门（**结构性**判据，非人为阈值）：块数 < 2 时每轮重采样抽到同一个块，
+    # CI 退化成零宽（假显著）——此时不论 IC 多正都不得判 GO。
+    coverage_blocks = int(ci.get("n_blocks") or 0)
+    coverage_ok = coverage_blocks >= 2
     if not folds_ok:
         verdict = "INSUFFICIENT_FOLDS"
+    elif not lookahead_ok:
+        verdict = "NO_GO"
+    elif ci_supports_negative or (not ic_positive and ci_excludes_zero):
+        verdict = "NO_GO"
+    elif not coverage_ok or not ci_supports_positive:
+        verdict = "INCONCLUSIVE"
+    elif ic_positive and tb_ok and monotonic_ok:
+        verdict = "GO_CANDIDATE"
+    else:
+        verdict = "NO_GO"
 
     return {
         "aggregate_ic_mean": ic_mean,
-        "aggregate_ic_ci95": [ci["ci_low"], ci["ci_high"]],
+        "aggregate_ic_ci95": [ci_low, ci_high],
         "ci_valid_days": ci["valid_days"],
+        "ci_block_days": ci.get("block_days"),
+        "ci_method": ci.get("method"),
+        "ci_duplicate_days": ci.get("duplicate_days"),
         "aggregate_top_minus_bottom": tb_mean,
         "pooled_auc": pooled_auc,
         "pooled_brier": pooled_brier,
@@ -572,12 +650,30 @@ def aggregate_report(
         "folds_completed": len(completed),
         "folds_total": len(folds),
         "fold_gate": {"folds_ok": folds_ok, "min_required": 4},
+        "coverage_gate": {
+            "blocks": coverage_blocks,
+            "valid_days": ci["valid_days"],
+            "ok": coverage_ok,
+            "rule": "moving-block 块数 >= 2（块数=1 时 CI 退化为零宽，不构成证据）",
+        },
+        "validation_scope": "process",  # 流程级；工件级前向验证见批次 D
+        "verdict_rule": (
+            "INSUFFICIENT_FOLDS(folds<4) → NO_GO(lookahead>0) → "
+            "NO_GO(ci_high<0 或 ic<=0 且 CI 不跨 0) → "
+            "INCONCLUSIVE(块数<2 或 ci_low<=0) → "
+            "GO_CANDIDATE(ic>0 且 top>=bottom 且 月度>=4/6)"
+        ),
         "verdict_inputs": {
             "ic_positive": ic_positive,
             "top_ge_bottom": tb_ok,
             "monthly_monotonic_4_of_6": monotonic_ok,
+            "ci_supports_positive": ci_supports_positive,
+            "ci_excludes_zero": ci_excludes_zero,
+            "ci_supports_negative": ci_supports_negative,
             "ci_does_not_support_negative": ci_supports,
-            "lookahead_violations_total": sum(f.lookahead_violations for f in folds),
+            "lookahead_gate_pass": lookahead_ok,
+            "lookahead_violations_total": lookahead_total,
+            "coverage_gate_pass": coverage_ok,
         },
         "verdict": verdict,
         "params": {
@@ -749,9 +845,11 @@ def main() -> int:
         step=args.step,
         embargo_days=embargo_days,
     )
-    # 验收硬门（方向一'任务书）：新 label 下模型分数 IC 的 date-block
-    # bootstrap 95% CI 下界 > 0。此判定行独立于 verdict（GO_CANDIDATE 的
-    # 判据是 IC>0，硬门更严：要求 CI 不跨 0）。
+    # 验收硬门（方向一'任务书）：新 label 下模型分数 IC 的 moving-block
+    # bootstrap 95% CI 下界 > 0，且 fold 内不得有 lookahead 违规。
+    # 说明：verdict 现在同样把这两条当必要条件（C1 修正），本块是报告层的
+    # 显式留痕（含块长/方法/基线可比性），以便审计时不必反推。
+    baseline_payload = baseline_comparison(int(cast(int, report["folds_total"])))
     ci_values = list(report["aggregate_ic_ci95"])  # type: ignore[call-overload]
     ci_low = float(ci_values[0])
     ci_high = float(ci_values[1])
@@ -760,23 +858,26 @@ def main() -> int:
         "ic_ci95_low": ci_low,
         "ic_ci95_high": ci_high,
         "pass": bool(ci_low > 0),
+        "ci_method": report.get("ci_method"),
+        "ci_block_days": report.get("ci_block_days"),
+        "lookahead_violations_total": report["verdict_inputs"]["lookahead_violations_total"],  # type: ignore[index]
+        "lookahead_gate_pass": report["verdict_inputs"]["lookahead_gate_pass"],  # type: ignore[index]
+        "verdict": report["verdict"],
+        "baseline_comparable": bool(baseline_payload["comparable"]),
     }
 
     payload = {
         "generated_at": datetime.utcnow().isoformat() + "Z",
+        "validation_scope": VALIDATION_SCOPE_PROCESS,
         "dataset": {
             "dir": args.dataset_dir,
             "label_basis": label_basis,
             "meta": dataset_meta,
         },
         # 对照基线行（验收硬门要求）：同一 harness 配置下旧 soup label 的
-        # Phase 2 结论（2026-09-06，18/18 fold，IC=-0.024 CI=[-0.043,-0.005]）。
-        "baseline_soup_label": {
-            "aggregate_ic_mean": -0.024,
-            "aggregate_ic_ci95": [-0.043, -0.005],
-            "source": "Phase 2 NO-GO report 2026-09-06 (18/18 folds, pit_dataset_ext v1)",
-            "note": "同一 harness 配置（train=120/test=20/step=20/embargo=11）",
-        },
+        # Phase 2 结论。fold 数按本次运行**生成**并判定可比性，写死的只是
+        # 基线自身的历史值（见 BASELINE_SOUP_LABEL）。
+        "baseline_soup_label": baseline_payload,
         "folds": [
             {
                 "fold_id": f.fold_id,
