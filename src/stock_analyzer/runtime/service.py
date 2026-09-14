@@ -9609,6 +9609,13 @@ class StockAnalyzerService:
                 "symbols_used": len(unique_symbols),
                 "dataset_rows": int(result.samples_total),
                 "truncated": bool(best_candidate["truncated"]),
+                # F22：行数 cap 触发时历史起点会被推后（扩 lookback ≠ 历史变长），
+                # 显式回传覆盖口径，避免"窗口平移"被当成"历史加长"。
+                "history_coverage": _history_coverage(
+                    selected_refs,
+                    requested_start=time_window_start,
+                    truncated_by_row_cap=bool(best_candidate["truncated"]),
+                ),
                 "result": result.to_dict(),
                 "errors": [],
                 "fetch_failed": 0,
@@ -23824,6 +23831,35 @@ class _RowCapRow(Protocol):
     snapshot_id: str
     symbol: str
     decision_time: Any
+
+
+def _history_coverage(
+    rows: Sequence[_RowCapRow],
+    *,
+    requested_start: object,
+    truncated_by_row_cap: bool,
+) -> dict[str, object]:
+    """F22：行数 cap 是否把"扩 lookback"变成了"窗口平移"（可见化）。
+
+    cap 的截断策略是**从尾部保留**（keep last N）：一旦触发，历史起点就被推到比
+    请求窗口更晚的位置——lookback 加长并不会让历史变长，只是把同一长度的窗口向前
+    平移。这里把实际历史起点 / 请求起点 / 是否被 cap 截断显式回传，让调用方与报告
+    能看出来，而不是静默地以为历史变长了。
+
+    比较**只到日粒度**：请求侧时间戳与落库侧格式/时区可能不同，逐字符比较会得出
+    错误结论，而 F22 关心的正是"历史覆盖了几天"。
+    """
+
+    starts = [str(getattr(item, "decision_time", ""))[:10] for item in rows]
+    effective = min((value for value in starts if value), default="")
+    requested = str(requested_start)[:10] if requested_start is not None else ""
+    covered = (effective <= requested) if (effective and requested) else None
+    return {
+        "requested_window_start": requested,
+        "effective_history_start": effective,
+        "history_truncated_by_row_cap": bool(truncated_by_row_cap),
+        "requested_window_covered": covered,
+    }
 
 
 def _apply_learning_protocol_row_caps(
