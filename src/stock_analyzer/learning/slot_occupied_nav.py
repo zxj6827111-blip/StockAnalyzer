@@ -14,7 +14,9 @@
 2. :func:`simulate_slot_occupied_realized_nav`——旧"固定基数"版，保留为
    naive 参照指标（naive_compounded_nav/compounding_explosion 语义不变）。
 3. :func:`evaluate_promotion_validity`——晋级有效性门：发布/晋级前对评估
-   产物做口径、日期覆盖与类别充足性检查，任一 blocking 命中即拒绝晋级。
+   产物做口径、日期覆盖与类别充足性检查，任一 blocking 命中即拒绝晋级；
+   B2 起同时并入 :mod:`stock_analyzer.learning.output_health` 的输出语义检查
+   （确定性失败 hard-block、经验阈值 advisory）。
 """
 
 from __future__ import annotations
@@ -24,6 +26,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import cast
+
+from stock_analyzer.learning.output_health import evaluate_output_health
 
 # 复利参照超过该倍数视为口径爆炸（e44 案例 >1e44；正常策略难以越过 1e6）。
 DEFAULT_EXPLOSION_THRESHOLD = 1_000_000.0
@@ -391,6 +395,13 @@ def evaluate_promotion_validity(
 
     warnings：
     - ``insufficient_hard_labels``：硬标签少于 ``min_hard_labels_warn``。
+
+    blocking（B2 输出健康门，实现见 :mod:`stock_analyzer.learning.output_health`）：
+    - ``output_health_*``：非有限值、常数输出、契约不匹配（缺输出语义字段 /
+      无打分样本）等**确定性失败**；经验阈值（唯一取值数、raw→cal AUC 落差、
+      spread 塌缩）只进 warnings，不阻断。**不设** `positive_rate ∈ [0.30,0.70]`
+      通用硬门，也不跨分数尺度复用 spread 绝对阈值（审核反例：分数全在
+      0.51~0.59、预测正率 100% 的输出可能 AUC=1、Precision@K=1）。
     """
 
     blocking: list[str] = []
@@ -504,9 +515,16 @@ def evaluate_promotion_validity(
         if require_full_gates and (auc_valid is None or auc_valid < 1.0):
             blocking.append("auc_invalid")
 
+    # B2 输出健康门：与既有阻断项**并存**（不替换、不删除任何一条）。
+    output_health = evaluate_output_health(metrics_summary)
+    checks["output_health"] = output_health.to_dict()
+    for reason in output_health.blocking_reasons:
+        blocking.append(reason)
+    warnings.extend(output_health.warnings)
+
     return PromotionValidityReport(
         valid=not blocking,
         blocking_reasons=sorted(set(blocking)),
-        warnings=warnings,
+        warnings=sorted(set(warnings)),
         checks=checks,
     )
