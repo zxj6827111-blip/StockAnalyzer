@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -23,6 +24,36 @@ from stock_analyzer.learning.sample_schema import (
     OutcomeRecord,
     SignalSnapshot,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotRef:
+    """选池/去重/切分所需的最小快照引用（**不含特征载荷**）。
+
+    ``decision_time`` 保持数据库里的字符串形态（ISO），排序语义与
+    ``list_snapshots`` 的 ``decision_time`` 一致，避免为了一个轻量引用付
+    datetime 解析成本。
+    """
+
+    snapshot_id: str
+    symbol: str
+    decision_time: str
+    feature_schema_id: str
+    feature_schema_hash: str
+    label_policy_id: str
+
+
+def _normalize_ref_symbols(symbols: Sequence[str] | None) -> list[str]:
+    """符号过滤的 SQL 下推键（去空、去重、保持顺序）。"""
+
+    if not symbols:
+        return []
+    seen: dict[str, None] = {}
+    for item in symbols:
+        text = str(item).strip()
+        if text:
+            seen.setdefault(text, None)
+    return list(seen)
 
 
 class _DuckCursor(Protocol):
@@ -421,7 +452,7 @@ class SampleStore:
         finally:
             conn.close()
 
-    def list_snapshots(
+    def list_snapshot_refs(
         self,
         *,
         snapshot_ids: Sequence[str] | None = None,
@@ -429,15 +460,72 @@ class SampleStore:
         label_policy_id: str | None = None,
         time_window_start: datetime | None = None,
         time_window_end: datetime | None = None,
-    ) -> list[SignalSnapshot]:
-        """List snapshots with optional protocol/time filtering."""
+        symbols: Sequence[str] | None = None,
+    ) -> list[SnapshotRef]:
+        """只取选池/去重/切分需要的字段（**不含特征载荷**）。
+
+        B4：选池阶段此前用 ``list_snapshots`` 把窗口内**全部**快照连同 222 维特征
+        解析成 Pydantic 对象，并在整段调用栈里保持存活（manifest 构建与训练装配
+        期间不释放）→ 全池训练内存叠加超限。本方法只投影标量与契约标识列，
+        不读 ``feature_vector_json``，因此选池的内存与"快照条数"成正比而与
+        "特征维度"无关；特征载荷只在最终 ≤ cap 的样本上取一次。
+        """
+
+        conditions, parameters = self._snapshot_filters(
+            snapshot_ids=snapshot_ids,
+            feature_schema_id=feature_schema_id,
+            label_policy_id=label_policy_id,
+            time_window_start=time_window_start,
+            time_window_end=time_window_end,
+        )
+        normalized_symbols = _normalize_ref_symbols(symbols)
+        if normalized_symbols:
+            placeholders = ", ".join("?" for _ in normalized_symbols)
+            conditions.append(f"symbol IN ({placeholders})")
+            parameters.extend(normalized_symbols)
+        where_clause = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+
+        conn = self._connect()
+        try:
+            self._ensure_schema(conn)
+            rows = conn.execute(
+                "SELECT snapshot_id, symbol, decision_time, feature_schema_id, "
+                "feature_schema_hash, label_policy_id "
+                f"FROM signal_snapshots{where_clause} "
+                "ORDER BY decision_time, snapshot_id",
+                parameters,
+            ).fetchall()
+            return [
+                SnapshotRef(
+                    snapshot_id=str(row[0]),
+                    symbol=str(row[1]),
+                    decision_time=str(row[2]),
+                    feature_schema_id=str(row[3]),
+                    feature_schema_hash=str(row[4]),
+                    label_policy_id=str(row[5]),
+                )
+                for row in rows
+            ]
+        finally:
+            conn.close()
+
+    def _snapshot_filters(
+        self,
+        *,
+        snapshot_ids: Sequence[str] | None,
+        feature_schema_id: str | None,
+        label_policy_id: str | None,
+        time_window_start: datetime | None,
+        time_window_end: datetime | None,
+    ) -> tuple[list[str], list[object]]:
+        """``list_snapshots`` / ``list_snapshot_refs`` 共用的过滤条件构造（防两处漂移）。"""
 
         conditions: list[str] = []
         parameters: list[object] = []
         if snapshot_ids:
             normalized_ids = [str(item).strip() for item in snapshot_ids if str(item).strip()]
             if not normalized_ids:
-                return []
+                return ["1 = 0"], []
             placeholders = ", ".join("?" for _ in normalized_ids)
             conditions.append(f"snapshot_id IN ({placeholders})")
             parameters.extend(normalized_ids)
@@ -453,9 +541,29 @@ class SampleStore:
         if time_window_end is not None:
             conditions.append("decision_time <= ?")
             parameters.append(_dump_datetime(time_window_end))
-        where_clause = ""
-        if conditions:
-            where_clause = " WHERE " + " AND ".join(conditions)
+        return conditions, parameters
+
+    def list_snapshots(
+        self,
+        *,
+        snapshot_ids: Sequence[str] | None = None,
+        feature_schema_id: str | None = None,
+        label_policy_id: str | None = None,
+        time_window_start: datetime | None = None,
+        time_window_end: datetime | None = None,
+    ) -> list[SignalSnapshot]:
+        """List snapshots with optional protocol/time filtering."""
+
+        conditions, parameters = self._snapshot_filters(
+            snapshot_ids=snapshot_ids,
+            feature_schema_id=feature_schema_id,
+            label_policy_id=label_policy_id,
+            time_window_start=time_window_start,
+            time_window_end=time_window_end,
+        )
+        if conditions == ["1 = 0"]:
+            return []
+        where_clause = (" WHERE " + " AND ".join(conditions)) if conditions else ""
 
         conn = self._connect()
         try:

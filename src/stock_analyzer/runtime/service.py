@@ -20,7 +20,7 @@ from datetime import time as dt_time
 from pathlib import Path
 from threading import Lock, RLock, Thread, current_thread
 from time import perf_counter
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 import numpy as np
 import pandas as pd
@@ -80,9 +80,8 @@ from stock_analyzer.learning.sample_schema import (
     DatasetManifest,
     MaturityStatus,
     OutcomeRecord,
-    SignalSnapshot,
 )
-from stock_analyzer.learning.sample_store import SampleStore
+from stock_analyzer.learning.sample_store import SampleStore, SnapshotRef
 from stock_analyzer.learning.slot_occupied_nav import evaluate_promotion_validity
 from stock_analyzer.market_calendar import is_a_share_trading_day
 from stock_analyzer.models.adapters import inspect_model_backend_dependencies
@@ -9355,19 +9354,23 @@ class StockAnalyzerService:
 
         try:
             label_policy = self._label_policy_registry.register_from_config(self._config.labels)
-            snapshots = self._sample_store.list_snapshots(
+            # B4：选池阶段只读**引用级投影**（不含特征载荷），符号过滤下推到 SQL。
+            # 此前这里用 list_snapshots 把窗口内全部快照连同 222 维特征解析成
+            # Pydantic 对象，并在整段调用栈里存活到训练装配（内存叠加超限）。
+            refs = self._sample_store.list_snapshot_refs(
                 label_policy_id=label_policy.label_policy_id,
                 time_window_start=time_window_start,
                 time_window_end=time_window_end,
+                symbols=sorted(requested_symbols) if requested_symbols else None,
             )
             if requested_symbols:
-                snapshots = [
-                    snapshot
-                    for snapshot in snapshots
-                    if (_normalize_a_share_symbol(snapshot.symbol) or snapshot.symbol.strip())
+                refs = [
+                    ref
+                    for ref in refs
+                    if (_normalize_a_share_symbol(ref.symbol) or ref.symbol.strip())
                     in requested_symbols
                 ]
-            if not snapshots:
+            if not refs:
                 return {
                     "attempted": True,
                     "ok": False,
@@ -9379,7 +9382,7 @@ class StockAnalyzerService:
             outcome_map = {
                 outcome.snapshot_id: outcome
                 for outcome in self._sample_store.list_outcomes(
-                    snapshot_ids=[snapshot.snapshot_id for snapshot in snapshots]
+                    snapshot_ids=[ref.snapshot_id for ref in refs]
                 )
             }
             mature_statuses = {
@@ -9387,13 +9390,13 @@ class StockAnalyzerService:
                 MaturityStatus.RECONCILED,
                 MaturityStatus.FULLY_MATURED,
             }
-            exact_schema_groups: dict[tuple[str, str], list[SignalSnapshot]] = {}
-            for snapshot in snapshots:
-                outcome = outcome_map.get(snapshot.snapshot_id)
+            exact_schema_groups: dict[tuple[str, str], list[SnapshotRef]] = {}
+            for ref in refs:
+                outcome = outcome_map.get(ref.snapshot_id)
                 if outcome is None or outcome.maturity_status not in mature_statuses:
                     continue
-                key = (snapshot.feature_schema_id, snapshot.feature_schema_hash)
-                exact_schema_groups.setdefault(key, []).append(snapshot)
+                key = (ref.feature_schema_id, ref.feature_schema_hash)
+                exact_schema_groups.setdefault(key, []).append(ref)
             if not exact_schema_groups:
                 return {
                     "attempted": True,
@@ -9431,10 +9434,10 @@ class StockAnalyzerService:
                 if not allowed_contracts:
                     allowed_contracts = {(record.feature_schema_id, record.feature_schema_hash)}
                 candidate_snapshots = [
-                    snapshot
+                    ref
                     for contract_key, grouped_rows in exact_schema_groups.items()
                     if contract_key in allowed_contracts
-                    for snapshot in grouped_rows
+                    for ref in grouped_rows
                 ]
                 if not candidate_snapshots:
                     continue
@@ -9462,7 +9465,7 @@ class StockAnalyzerService:
                 )
 
             for blueprint in candidate_blueprints:
-                candidate_snapshots = cast(list[SignalSnapshot], blueprint["snapshots"])
+                candidate_snapshots = cast(list[SnapshotRef], blueprint["snapshots"])
                 capped_snapshots, truncated = _apply_learning_protocol_row_caps(
                     snapshots=candidate_snapshots,
                     max_rows=max_rows,
@@ -9478,13 +9481,13 @@ class StockAnalyzerService:
                     "snapshots": capped_snapshots,
                     "truncated": truncated,
                     "latest_decision_time": max(
-                        snapshot.decision_time for snapshot in capped_snapshots
+                        cast(SnapshotRef, ref).decision_time for ref in capped_snapshots
                     ),
                 }
                 if best_candidate is None:
                     best_candidate = candidate
                     continue
-                best_rows = len(cast(list[SignalSnapshot], best_candidate["snapshots"]))
+                best_rows = len(cast(list[SnapshotRef], best_candidate["snapshots"]))
                 candidate_rows = len(capped_snapshots)
                 if candidate_rows > best_rows or (
                     candidate_rows == best_rows
@@ -9528,8 +9531,8 @@ class StockAnalyzerService:
                     "protocol_candidate_rows": 0,
                 }
 
-            selected_snapshots = cast(list[SignalSnapshot], best_candidate["snapshots"])
-            candidate_rows = len(selected_snapshots)
+            selected_refs = cast(list[SnapshotRef], best_candidate["snapshots"])
+            candidate_rows = len(selected_refs)
             min_samples = max(1, int(self._config.training.min_samples))
             if candidate_rows < min_samples:
                 return {
@@ -9569,7 +9572,7 @@ class StockAnalyzerService:
                 feature_schema_hash=feature_schema_hash,
                 label_policy_id=label_policy.label_policy_id,
                 label_policy_hash=label_policy.label_policy_hash,
-                snapshot_ids=[snapshot.snapshot_id for snapshot in selected_snapshots],
+                snapshot_ids=[ref.snapshot_id for ref in selected_refs],
                 feature_schema_registry=self._feature_schema_registry,
                 label_policy_registry=self._label_policy_registry,
                 sample_selection_rule=(
@@ -9587,9 +9590,9 @@ class StockAnalyzerService:
             )
             output_path = str(bundle_payload["artifact_path"])
             unique_symbols = {
-                _normalize_a_share_symbol(snapshot.symbol) or snapshot.symbol.strip()
-                for snapshot in selected_snapshots
-                if (_normalize_a_share_symbol(snapshot.symbol) or snapshot.symbol.strip())
+                _normalize_a_share_symbol(ref.symbol) or ref.symbol.strip()
+                for ref in selected_refs
+                if (_normalize_a_share_symbol(ref.symbol) or ref.symbol.strip())
             }
             return {
                 "attempted": True,
@@ -23811,16 +23814,28 @@ def _dedupe_preserve_order(items: list[str]) -> list[str]:
     return deduped
 
 
+class _RowCapRow(Protocol):
+    """行上限裁剪所需的最小行接口（``SnapshotRef`` 与 ``SignalSnapshot`` 均满足）。
+
+    B4 后选池阶段传 ``SnapshotRef``（无特征载荷），历史/其它路径仍传
+    ``SignalSnapshot``——两者字段名一致，故以协议约束而不是具体类。
+    """
+
+    snapshot_id: str
+    symbol: str
+    decision_time: Any
+
+
 def _apply_learning_protocol_row_caps(
     *,
-    snapshots: list[SignalSnapshot],
+    snapshots: list[_RowCapRow],
     max_rows: int,
     per_symbol_rows_cap: int,
-) -> tuple[list[SignalSnapshot], bool]:
+) -> tuple[list[_RowCapRow], bool]:
     ordered = sorted(snapshots, key=lambda item: (item.decision_time, item.snapshot_id))
     if per_symbol_rows_cap > 0:
         snapshot_ids_to_keep: set[str] = set()
-        grouped: dict[str, list[SignalSnapshot]] = {}
+        grouped: dict[str, list[_RowCapRow]] = {}
         for snapshot in ordered:
             symbol_key = _normalize_a_share_symbol(snapshot.symbol) or snapshot.symbol.strip()
             grouped.setdefault(symbol_key, []).append(snapshot)
