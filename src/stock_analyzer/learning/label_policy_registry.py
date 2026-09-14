@@ -6,12 +6,27 @@ import hashlib
 import importlib
 import json
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, cast
 
 from stock_analyzer._pydantic_compat import BaseModel, ConfigDict, Field
 from stock_analyzer.config import LabelsConfig
+
+
+@dataclass(frozen=True, slots=True)
+class ReturnRankParams:
+    """v3（return_rank）横截面标签的分位契约参数。
+
+    这四个参数决定"哪些行有标签"，必须能随契约持久化；只进 hash 不进记录会让
+    未来改配置后重训旧 manifest 时标签静默漂移（A3 / F17）。
+    """
+
+    top_quantile: float
+    bottom_quantile: float
+    drop_middle: bool
+    min_cross_section: int
 
 
 class LabelPolicyRecord(BaseModel):
@@ -31,7 +46,110 @@ class LabelPolicyRecord(BaseModel):
     conflict_soft_label_value: float
     maturity_rule: str = "label_mature_time_v1"
     label_policy_hash: str
+    # v3 分位契约参数。None = 该契约不含这些参数（v1/v2 soup 路径）或旧记录未迁移；
+    # v3 记录缺参数时由 resolve_return_rank_params 显式拒绝，不静默按当前配置派生。
+    top_quantile: float | None = None
+    bottom_quantile: float | None = None
+    drop_middle: bool | None = None
+    min_cross_section: int | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    def return_rank_params(self) -> ReturnRankParams | None:
+        """返回已持久化的 v3 分位参数；任一缺失即视为未持久化。"""
+
+        top_quantile = self.top_quantile
+        bottom_quantile = self.bottom_quantile
+        drop_middle = self.drop_middle
+        min_cross_section = self.min_cross_section
+        if (
+            top_quantile is None
+            or bottom_quantile is None
+            or drop_middle is None
+            or min_cross_section is None
+        ):
+            return None
+        return ReturnRankParams(
+            top_quantile=float(top_quantile),
+            bottom_quantile=float(bottom_quantile),
+            drop_middle=bool(drop_middle),
+            min_cross_section=int(min_cross_section),
+        )
+
+    def hash_matches_return_rank_params(self, params: ReturnRankParams) -> bool:
+        """用候选参数重算 hash，验证它就是该契约绑定的那组参数。"""
+
+        return self.label_policy_hash == _stable_hash(
+            _return_rank_hash_payload(
+                horizon_days=self.horizon_days,
+                price_basis=self.price_basis,
+                schema_version=self.schema_version,
+                top_quantile=params.top_quantile,
+                bottom_quantile=params.bottom_quantile,
+                drop_middle=params.drop_middle,
+                min_cross_section=params.min_cross_section,
+            )
+        )
+
+
+def resolve_return_rank_params(
+    record: LabelPolicyRecord,
+    *,
+    config_labels: LabelsConfig | None = None,
+) -> ReturnRankParams:
+    """按契约取 v3 分位参数，禁止静默使用当前配置。
+
+    - 记录已持久化参数：直接用。
+    - 记录缺参数（旧 v3 记录）：仅当 ``config_labels`` 的参数能**重算出同一个
+      hash**（证明配置未漂移）时才受控采用；否则显式拒绝，要求重新登记契约。
+    """
+
+    params = record.return_rank_params()
+    if params is not None:
+        return params
+    if config_labels is not None:
+        candidate = ReturnRankParams(
+            top_quantile=float(config_labels.return_rank_top_quantile),
+            bottom_quantile=float(config_labels.return_rank_bottom_quantile),
+            drop_middle=bool(config_labels.return_rank_drop_middle),
+            min_cross_section=int(config_labels.return_rank_min_cross_section),
+        )
+        if record.hash_matches_return_rank_params(candidate):
+            return candidate
+    raise ValueError(
+        "label policy record is missing the v3 quantile contract and the current "
+        "config does not reproduce its hash: "
+        f"{record.label_policy_id}; re-register the contract before deriving labels"
+    )
+
+
+def _return_rank_hash_payload(
+    *,
+    horizon_days: int,
+    price_basis: str,
+    schema_version: str,
+    top_quantile: float,
+    bottom_quantile: float,
+    drop_middle: bool,
+    min_cross_section: int,
+) -> dict[str, object]:
+    """v3 契约的 hash payload（唯一构造点，登记与校验共用防漂移）。"""
+
+    return {
+        "label_name": "label_return_rank",
+        "schema_version": str(schema_version),
+        "take_profit_pct": 0.0,
+        "stop_loss_pct": 0.0,
+        "horizon_days": int(horizon_days),
+        "price_basis": price_basis.strip(),
+        "exclude_untradable": True,
+        "conflict_policy": "rank_quantile",
+        "conflict_soft_label_value": 0.5,
+        "maturity_rule": "label_mature_time_v1",
+        "top_quantile": float(top_quantile),
+        "bottom_quantile": float(bottom_quantile),
+        "drop_middle": bool(drop_middle),
+        "min_cross_section": int(min_cross_section),
+    }
 
 
 def build_return_rank_policy_record(
@@ -56,9 +174,11 @@ def build_return_rank_policy_record(
     TP/SL 字段按 registry 表结构以占位值登记（v3 不消费路径信息，但列是
     NOT NULL）：tp/sl=0 表示"路径不适用"。
 
-    分位/剔除/最小截面参数进 hash payload：改参数即得新契约 id，防止
+    分位/剔除/最小截面参数进 hash payload（改参数即得新契约 id），防止
     不同参数的样本混在同一 label_policy 下训练（默认值即 18-fold 硬门
-    验证过的 0.3/0.3/drop/30 口径）。
+    验证过的 0.3/0.3/drop/30 口径）。这些参数同时**持久化进记录与表**
+    （A3），派生标签时从契约取参而不是当前 config，避免配置漂移后重放
+    旧 manifest 得到不同标签。
     """
 
     if int(horizon_days) <= 0:
@@ -69,22 +189,15 @@ def build_return_rank_policy_record(
         raise ValueError("top_quantile + bottom_quantile must be <= 1.0")
     if int(min_cross_section) < 2:
         raise ValueError("min_cross_section must be >= 2")
-    payload = {
-        "label_name": "label_return_rank",
-        "schema_version": str(schema_version),
-        "take_profit_pct": 0.0,
-        "stop_loss_pct": 0.0,
-        "horizon_days": int(horizon_days),
-        "price_basis": price_basis.strip(),
-        "exclude_untradable": True,
-        "conflict_policy": "rank_quantile",
-        "conflict_soft_label_value": 0.5,
-        "maturity_rule": "label_mature_time_v1",
-        "top_quantile": float(top_quantile),
-        "bottom_quantile": float(bottom_quantile),
-        "drop_middle": bool(drop_middle),
-        "min_cross_section": int(min_cross_section),
-    }
+    payload = _return_rank_hash_payload(
+        horizon_days=int(horizon_days),
+        price_basis=price_basis,
+        schema_version=str(schema_version),
+        top_quantile=float(top_quantile),
+        bottom_quantile=float(bottom_quantile),
+        drop_middle=bool(drop_middle),
+        min_cross_section=int(min_cross_section),
+    )
     label_policy_hash = _stable_hash(payload)
     resolved_policy_id = label_policy_id or _default_label_policy_id(
         schema_version=str(schema_version),
@@ -103,6 +216,10 @@ def build_return_rank_policy_record(
         conflict_soft_label_value=0.5,
         maturity_rule="label_mature_time_v1",
         label_policy_hash=label_policy_hash,
+        top_quantile=float(top_quantile),
+        bottom_quantile=float(bottom_quantile),
+        drop_middle=bool(drop_middle),
+        min_cross_section=int(min_cross_section),
         created_at=created_at or datetime.now(UTC),
     )
 
@@ -224,8 +341,9 @@ class LabelPolicyRegistry:
                     "label_policy_id, label_name, schema_version, take_profit_pct, "
                     "stop_loss_pct, horizon_days, price_basis, exclude_untradable, "
                     "conflict_policy, conflict_soft_label_value, maturity_rule, "
-                    "label_policy_hash, created_at"
-                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    "label_policy_hash, created_at, top_quantile, bottom_quantile, "
+                    "drop_middle, min_cross_section"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 ),
                 [
                     record.label_policy_id,
@@ -241,6 +359,10 @@ class LabelPolicyRegistry:
                     record.maturity_rule,
                     record.label_policy_hash,
                     record.created_at.astimezone(UTC).isoformat(),
+                    record.top_quantile,
+                    record.bottom_quantile,
+                    record.drop_middle,
+                    record.min_cross_section,
                 ],
             )
             return record
@@ -376,9 +498,36 @@ class LabelPolicyRegistry:
             "conflict_soft_label_value DOUBLE NOT NULL, "
             "maturity_rule VARCHAR NOT NULL, "
             "label_policy_hash VARCHAR NOT NULL UNIQUE, "
-            "created_at VARCHAR NOT NULL"
+            "created_at VARCHAR NOT NULL, "
+            "top_quantile DOUBLE, "
+            "bottom_quantile DOUBLE, "
+            "drop_middle BOOLEAN, "
+            "min_cross_section INTEGER"
             ")"
         )
+        self._migrate_v3_columns(conn)
+
+    def _migrate_v3_columns(self, conn: _DuckConnection) -> None:
+        """旧库逐列补 v3 分位参数字段（幂等；NULL 表示旧记录/非 v3 契约）。"""
+
+        rows = conn.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
+            [self._table_name],
+        ).fetchall()
+        existing = {str(row[0]).strip().lower() for row in rows}
+        if not existing:
+            return
+        additions = {
+            "top_quantile": "DOUBLE",
+            "bottom_quantile": "DOUBLE",
+            "drop_middle": "BOOLEAN",
+            "min_cross_section": "INTEGER",
+        }
+        for column_name, column_type in additions.items():
+            if column_name not in existing:
+                conn.execute(
+                    f"ALTER TABLE {self._table_name} ADD COLUMN {column_name} {column_type}"
+                )
 
     def _select_one(
         self,
@@ -411,10 +560,16 @@ _SELECT_COLUMNS = (
     "maturity_rule",
     "label_policy_hash",
     "created_at",
+    "top_quantile",
+    "bottom_quantile",
+    "drop_middle",
+    "min_cross_section",
 )
 
 
 def _row_to_record(row: Sequence[object]) -> LabelPolicyRecord:
+    # 兼容两种行宽：17 列（含 v3 分位参数）/ 13 列（未迁移旧表降级查询）。
+    has_v3_columns = len(row) >= 17
     return LabelPolicyRecord(
         label_policy_id=str(row[0]),
         label_name=str(row[1]),
@@ -429,7 +584,29 @@ def _row_to_record(row: Sequence[object]) -> LabelPolicyRecord:
         maturity_rule=str(row[10]),
         label_policy_hash=str(row[11]),
         created_at=_parse_datetime(row[12]),
+        top_quantile=_optional_float(row[13]) if has_v3_columns else None,
+        bottom_quantile=_optional_float(row[14]) if has_v3_columns else None,
+        drop_middle=_optional_bool(row[15]) if has_v3_columns else None,
+        min_cross_section=(_optional_int(row[16]) if has_v3_columns else None),
     )
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    return float(str(value))
+
+
+def _optional_bool(value: object) -> bool | None:
+    if value is None:
+        return None
+    return bool(value)
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    return int(str(value))
 
 
 def _stable_hash(payload: Mapping[str, object]) -> str:
