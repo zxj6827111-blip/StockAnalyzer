@@ -33,7 +33,9 @@ from stock_analyzer.learning.feedback_weighting import (
 from stock_analyzer.learning.label_policy_registry import (
     LabelPolicyRecord,
     LabelPolicyRegistry,
+    ReturnRankParams,
     build_label_policy_record,
+    resolve_return_rank_params,
 )
 from stock_analyzer.learning.sample_schema import (
     BackfillFidelityTier,
@@ -272,12 +274,19 @@ class ModelTrainer:
         # outcome 度量派生（v1/v2 的 TP/SL 路径标签才是逐行可算）：组装
         # 阶段用 outcome.realized_return 按上海决策日整表现算，与 PIT 链
         # 共用 apply_return_rank_labels_by_day，防止两入口口径漂移。
+        # 分位参数从 **manifest 的 label policy 契约**取（A3），不读当前
+        # config——否则改配置后重放旧 manifest 会得到不同标签而 policy id
+        # 不变（静默漂移）。
         v3_labels: dict[str, float] | None = None
         if str(label_policy.schema_version).strip() == "3":
+            return_rank_params = resolve_return_rank_params(
+                label_policy,
+                config_labels=self._labels,
+            )
             v3_labels = _return_rank_labels_from_outcomes(
                 outcomes=outcomes,
                 snapshots=snapshots,
-                labels_config=self._labels,
+                params=return_rank_params,
             )
 
         row_index: list[tuple[str, datetime, str]] = []
@@ -1075,7 +1084,7 @@ def _return_rank_labels_from_outcomes(
     *,
     outcomes: dict[str, OutcomeRecord],
     snapshots: dict[str, SignalSnapshot],
-    labels_config: LabelsConfig,
+    params: ReturnRankParams,
 ) -> dict[str, float]:
     """schema v3（return_rank）整表现算横截面标签（生产链入口）。
 
@@ -1087,8 +1096,9 @@ def _return_rank_labels_from_outcomes(
       折算与 v1/v2 的 decision_date_sh 统计口径一致，也与 PIT 链
       trade_date 同为上海决策日）；
     - realized_return 缺失（未成熟）的行不进截面；
-    - 分位/剔除/最小截面参数来自 ``labels.return_rank_*`` config（与
-      registry v3 契约同源，hash 绑定）；
+    - 分位/剔除/最小截面参数来自 manifest 绑定的 label policy 契约
+      （``params``，由 :func:`resolve_return_rank_params` 校验），**不读
+      当前 config**；
     - 返回 snapshot_id → label（仅含 0.0/1.0 硬标签；NaN 行缺失即剔除）。
     """
 
@@ -1112,10 +1122,10 @@ def _return_rank_labels_from_outcomes(
         frame,
         fwd_return_col="fwd_return",
         date_col="trade_date",
-        top_quantile=float(labels_config.return_rank_top_quantile),
-        bottom_quantile=float(labels_config.return_rank_bottom_quantile),
-        drop_middle=bool(labels_config.return_rank_drop_middle),
-        min_cross_section=int(labels_config.return_rank_min_cross_section),
+        top_quantile=float(params.top_quantile),
+        bottom_quantile=float(params.bottom_quantile),
+        drop_middle=bool(params.drop_middle),
+        min_cross_section=int(params.min_cross_section),
     )
     # labels 的 index 是 frame 的 RangeIndex（行位置），snapshot_id 必须从
     # 行数据里按位置对齐取回，不能拿 labels.items() 的键当 snapshot_id。
