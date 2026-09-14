@@ -272,8 +272,9 @@ class SampleStore:
                     "dedup_key, dedup_rule, rows_before_dedup, rows_dropped_by_dedup, "
                     "blocking_quality_flags_json, warning_quality_flags_json, "
                     "manifest_quality_flags_json, test_split_window_days, "
-                    "test_split_unique_symbol_dates"
-                    ") VALUES (" + ", ".join(["?"] * 26) + ")"
+                    "test_split_unique_symbol_dates, purged_decision_days, "
+                    "purged_rows, split_isolation_report_json"
+                    ") VALUES (" + ", ".join(["?"] * 29) + ")"
                 ),
                 _manifest_parameters(manifest),
             )
@@ -609,6 +610,9 @@ class SampleStore:
             "manifest_quality_flags_json VARCHAR NOT NULL DEFAULT '[]', "
             "test_split_window_days INTEGER NOT NULL DEFAULT 0, "
             "test_split_unique_symbol_dates INTEGER NOT NULL DEFAULT 0, "
+            "purged_decision_days INTEGER NOT NULL DEFAULT 0, "
+            "purged_rows INTEGER NOT NULL DEFAULT 0, "
+            "split_isolation_report_json VARCHAR NOT NULL DEFAULT '{}', "
             "generated_at VARCHAR NOT NULL"
             ")"
         )
@@ -647,7 +651,7 @@ class SampleStore:
             )
 
     def _migrate_dataset_manifests_columns(self, conn: _DuckConnection) -> None:
-        """旧库逐列补 v2 去重字段（幂等；DuckDB 不支持带约束 ADD COLUMN）。"""
+        """旧库逐列补 v2 去重字段与时间隔离字段（幂等；DuckDB 不支持带约束 ADD COLUMN）。"""
 
         rows = conn.execute(
             "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
@@ -666,6 +670,9 @@ class SampleStore:
             "manifest_quality_flags_json": "VARCHAR",
             "test_split_window_days": "INTEGER",
             "test_split_unique_symbol_dates": "INTEGER",
+            "purged_decision_days": "INTEGER",
+            "purged_rows": "INTEGER",
+            "split_isolation_report_json": "VARCHAR",
         }
         for column_name, column_type in additions.items():
             if column_name not in existing:
@@ -705,6 +712,15 @@ class SampleStore:
         conn.execute(
             "UPDATE dataset_manifests SET test_split_unique_symbol_dates = 0 "
             "WHERE test_split_unique_symbol_dates IS NULL"
+        )
+        conn.execute(
+            "UPDATE dataset_manifests SET purged_decision_days = 0 "
+            "WHERE purged_decision_days IS NULL"
+        )
+        conn.execute("UPDATE dataset_manifests SET purged_rows = 0 WHERE purged_rows IS NULL")
+        conn.execute(
+            "UPDATE dataset_manifests SET split_isolation_report_json = '{}' "
+            "WHERE split_isolation_report_json IS NULL"
         )
 
 
@@ -782,6 +798,9 @@ _MANIFEST_COLUMNS = (
     "manifest_quality_flags_json",
     "test_split_window_days",
     "test_split_unique_symbol_dates",
+    "purged_decision_days",
+    "purged_rows",
+    "split_isolation_report_json",
 )
 
 # 未迁移旧表的降级列集（无 v2 去重字段，读取时映射默认值）。
@@ -806,11 +825,17 @@ _MANIFEST_LEGACY_COLUMNS = (
 )
 
 def _is_missing_dedup_column_error(exc: Exception) -> bool:
+    """旧表缺列判定：v2 去重字段或时间隔离开销字段缺失时降级旧列集。"""
+
     message = str(exc).strip().lower()
-    return (
-        ("not found" in message or "does not exist" in message)
-        and ("dedup_" in message or "quality_flags" in message)
+    missing_marker = "not found" in message or "does not exist" in message
+    column_marker = (
+        "dedup_" in message
+        or "quality_flags" in message
+        or "purged_" in message
+        or "split_isolation_report" in message
     )
+    return missing_marker and column_marker
 
 
 _MANIFEST_ITEM_COLUMNS = (
@@ -901,6 +926,9 @@ def _manifest_parameters(manifest: DatasetManifest) -> list[object]:
         _dump_json(list(manifest.manifest_quality_flags)),
         manifest.test_split_window_days,
         manifest.test_split_unique_symbol_dates,
+        manifest.purged_decision_days,
+        manifest.purged_rows,
+        _dump_json(manifest.split_isolation_report),
     ]
 
 
@@ -970,10 +998,11 @@ def _row_to_outcome(row: Sequence[object]) -> OutcomeRecord:
 
 
 def _row_to_manifest(row: Sequence[object]) -> DatasetManifest:
-    # 兼容三种行宽：26 列（含 manifest 质量字段）/ 23 列（v2 去重）/
-    # 17 列（未迁移旧表降级查询）。
+    # 兼容四种行宽：29 列（含时间隔离字段）/ 26 列（含 manifest 质量字段）/
+    # 23 列（v2 去重）/ 17 列（未迁移旧表降级查询）。
     has_v2_columns = len(row) >= 23
     has_manifest_quality_columns = len(row) >= 26
+    has_isolation_columns = len(row) >= 29
     if has_v2_columns:
         # v2 列序：... split_plan(15), generated_at(16), dedup_key(17),
         # dedup_rule(18), rows_before(19), rows_dropped(20), blocking(21), warning(22)
@@ -1003,6 +1032,14 @@ def _row_to_manifest(row: Sequence[object]) -> DatasetManifest:
             manifest_quality_flags = []
             test_split_window_days = 0
             test_split_unique_symbol_dates = 0
+        if has_isolation_columns:
+            purged_decision_days = int(row[26] or 0)
+            purged_rows = int(row[27] or 0)
+            split_isolation_report = _load_json_dict_any(row[28])
+        else:
+            purged_decision_days = 0
+            purged_rows = 0
+            split_isolation_report = {}
         generated_index = 16
     else:
         dedup_key = ""
@@ -1014,6 +1051,9 @@ def _row_to_manifest(row: Sequence[object]) -> DatasetManifest:
         manifest_quality_flags = []
         test_split_window_days = 0
         test_split_unique_symbol_dates = 0
+        purged_decision_days = 0
+        purged_rows = 0
+        split_isolation_report = {}
         generated_index = 16
     split_plan_raw = _load_json_list(row[15])
     split_plan = [DatasetSplitPlanEntry.model_validate(item) for item in split_plan_raw]
@@ -1047,6 +1087,9 @@ def _row_to_manifest(row: Sequence[object]) -> DatasetManifest:
         manifest_quality_flags=manifest_quality_flags,
         test_split_window_days=test_split_window_days,
         test_split_unique_symbol_dates=test_split_unique_symbol_dates,
+        purged_decision_days=purged_decision_days,
+        purged_rows=purged_rows,
+        split_isolation_report=split_isolation_report,
         generated_at=_parse_datetime(row[generated_index]),
     )
 
