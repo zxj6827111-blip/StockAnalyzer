@@ -98,7 +98,38 @@ A1 的 purge/split 与 cap 的分层必须共用这一处定义。`SnapshotRef.d
 `sample_store` 的同一解析器规范化后再取日——**这是 mypy 基线对比查出来的真实运行期
 TypeError（字符串 + timedelta），本地按 datetime 造样本时看不出来**。
 
-## 4. 改动清单
+### 3.2 结论（2026-09-15 00:34 实测）：cap **不是**这个门的杠杆
+
+最小裁剪版部署后（`53565a9`，`.env` 确认 `per_day`）再跑一次，manifest 结果为：
+
+| 量 | 值 |
+|---|---|
+| `included_snapshot_count` | **18,599**（budget 40,000 → 两版 cap 都没生效） |
+| `decision_days_total` | 130（purge 前 150；两处边界各 purge 10 天） |
+| split | train 107 天 / calibration 13 天 / test **13 天** |
+| test 内容 | 8/12~8/28，13 个决策日 × 189 行 = 2,457 |
+| `test_split_window_days` | **17**（仍 < 20） |
+
+即：**候选集只有 18,599 行，远低于 40,000 预算，`per_day` 与 `keep_last` 都不会裁剪**，
+所以 cap 策略对窗口没有任何影响。窗口的算式是纯比例的：
+
+```
+test 决策日数 = test_ratio × decision_days_total = 0.1 × 130 = 13
+test 日历窗    = 17 天（8/12 ~ 8/28）  <  20
+```
+
+**要过 20 天下限需要 test 决策日 ≥ 16 天，即 `test_ratio ≥ 0.123`；留余量取 0.2
+则 test 26 个决策日 ≈ 34 个自然日。**
+
+决策日池只有 130 天的原因另有一条：`bootstrap_per_symbol_rows_cap=120` 配上
+「每只每日多次捕获（实测约 7.5 次/只/日）」，等于把每只票的历史钉在约 16 个决策日
+（120 / 7.5），池子靠不同票的捕获日期错位才凑到 130 天。这正对应此前记录的
+「日内重复捕获必须按逻辑键去重」——**要去重之后 per_symbol cap 才不再兼作历史深度上限。**
+
+因此本改动的定位需要更正：它**不能**解开 `test_window_too_narrow`，价值在于
+(a) 取消 keep-last-N 的「延长 lookback 只滑动窗口」隐患，
+(b) 让 cap 一旦成为绑约束时把预算花在「天数」而非「同一天的重复行」上。
+真正要动的是 `test_ratio`（直接、算式确定）与捕获去重（根因）。
 
 | 文件 | 改动 |
 |---|---|
@@ -111,26 +142,35 @@ TypeError（字符串 + timedelta），本地按 datetime 造样本时看不出�
 **没有放宽任何门禁**：`min_test_split_window_days` 仍是 20，`intraday_fresh_ratio_min`
 与 cap 数值都没为了让某次运行通过而调整；本改动只是把同样 40,000 的预算**摊到更长的时间轴上**。
 
-## 5. NAS 落地与验收
+## 5. NAS 落地与验收（实测记录）
 
 ```bash
-# 1) .env 追加（不新增变量名：策略开关走 config 环境变量覆盖）
+# .env（已加）
 SA__TRAINING__BOOTSTRAP_ROW_CAP_STRATEGY=per_day
 #    MAX_ROWS 保持 40000、PER_SYMBOL 保持 120
-
-# 2) 部署本分支（部署脚本会重建容器，.env 生效）
-cd /vol1/docker/StockAnalyzer && bash scripts/nas_deploy_update.sh --branch feat/learning-chain-cap-stratify-0914
-
-# 3) 按**生产 lookback** 跑（训练服务路径用 training.bootstrap_lookback_days=2500）
+bash scripts/nas_deploy_update.sh --branch feat/learning-chain-accept-0914
 docker exec -d stock-analyzer-api sh -c 'stock-analyzer train-models --full-market --lookback-days 2500 > /tmp/cap_train.json 2>&1; echo $? > /tmp/cap_train.rc'
 ```
 
-验收点：
+实测结果（两次，均在 `fc6e019`/`53565a9` 上）：
 
-1. 训练结果 `ok=true` / `status=ok_learning_protocol*`，`dataset_manifest_id` 非空；
-2. manifest 质量报告里 `manifest_quality_flags_json=[]`、`test_split_window_days >= 20`；
-3. 结果 payload 的 `row_cap_strategy=per_day`、`rows_per_day_cap` = 自动值、`decision_days_used` 显著大于 120；
-4. cgroup `memory.peak` 仍 ≤ 4 GiB（4096 MiB）、`memory.events` 的 `oom_kill` 增量为 0。
+| | 均摊版 | 最小裁剪版 |
+|---|---|---|
+| 保留样本 | 17,423 | 18,599 |
+| test 每日条数 | 177 | 189 |
+| `test_split_window_days` | 17 | 17 |
+| 结论 | 仍 `test_window_too_narrow` | 仍 `test_window_too_narrow` |
+
+两次都没有触发 cap（候选集 < 40,000 预算），故**两版都未改变窗口**——
+见 §3.2，cap 不是这个门的杠杆。
+
+内存侧的有效观测：训练在容器内峰值约 **1.98 GiB / 4 GiB**（训练前容器 `memory.peak`
+522 MiB，`memory.events` 的 `oom_kill` 为 0）。但两次 run 都在协议门中止，
+**仍不含模型拟合段**，所以 B4 的「全池训练在 4 GiB 内完成」依旧只能算有条件成立。
+
+**尚未做的关键一次实测**：把 `SA__TRAINING__TEST_RATIO` 由 0.1 提到 0.2（test 26 个
+决策日 ≈ 34 自然日）后重跑，预期 `manifest_quality_flags_json=[]`。
+这一步会改变 train/test 配比，属**新的口径决策**，未擅自执行。
 
 ## 6. 已知残留
 
