@@ -178,28 +178,49 @@ def test_decision_day_uses_shanghai_boundary() -> None:
     assert len(kept) == 1
 
 
-def test_auto_spread_uses_whole_budget_across_all_days() -> None:
-    """自动档把整个 max_rows 预算平摊到全部决策日——决策日数拉满且不超预算。
-
-    这是取代「人工试出一个每日条数」的做法：480 个可用决策日、预算 40,000
-    → 每日 83 条 → 保留全部 480 天（39,840 ≤ 40,000）。若按旧 keep-last-N，
-    只剩 40,000/334 ≈ 119 天。
-    """
+def test_minimal_cut_keeps_every_day_within_budget() -> None:
+    """最小裁剪：均匀分布下取到 max_rows//天数，且一天都不丢。"""
     rows = _rows(days=480, per_day=334)
-    available_days = len({decision_date_shanghai(r.decision_time) for r in rows})
-    auto = _resolve_per_day_rows_cap(
-        strategy="per_day", configured=0, max_rows=40_000, available_days=available_days
+    counts = [334] * 480
+    cap = _resolve_per_day_rows_cap(
+        strategy="per_day", configured=0, max_rows=40_000, per_day_counts=counts
     )
-    assert auto == 83
+    assert cap == 83
     kept, _ = _apply_learning_protocol_row_caps(
-        snapshots=rows,
-        max_rows=40_000,
-        per_symbol_rows_cap=0,
-        per_day_rows_cap=auto,
+        snapshots=rows, max_rows=40_000, per_symbol_rows_cap=0, per_day_rows_cap=cap
     )
-    kept_days = {decision_date_shanghai(row.decision_time) for row in kept}
-    assert len(kept_days) == available_days  # 一天都没丢
-    assert len(kept) <= 40_000  # 预算没被突破
+    assert len({decision_date_shanghai(r.decision_time) for r in kept}) == 480
+    assert len(kept) <= 40_000
+
+
+def test_minimal_cut_survives_the_real_skewed_distribution() -> None:
+    """真实分布（NAS 2026-09-14 实测）：256 天 / 156,520 行，229 个稠密日均约 680。
+
+    均摊会算出 40_000//256 = 156 之外的错值吗？不会——但它真正的失效场景是
+    「按天数均摊」把 156 用成了上限却没意识到稀疏日几乎不占预算；这里直接断言
+    最小裁剪保住全部 256 天、总行数不超预算，且上限明显高于「平均每日行数」。
+    """
+    counts = [680] * 229 + [1] * 26 + [847]  # 合计 229*680 + 847 + 26 = 156,593
+    assert sum(counts) == 156_593
+    cap = _resolve_per_day_rows_cap(
+        strategy="per_day", configured=0, max_rows=40_000, per_day_counts=counts
+    )
+    total = sum(min(c, cap) for c in counts)
+    assert total <= 40_000
+    assert len(counts) == 256  # 全部决策日都保住
+    # 上限必须高于「均摊」的 156——均摊会低估稠密日的可用额度
+    assert cap >= 156
+    assert sum(min(c, cap + 1) for c in counts) > 40_000  # 已经取到最大可行值
+
+
+def test_no_capping_when_budget_covers_everything() -> None:
+    """预算本就装得下全部决策日时不做任何裁剪（返回 0 = 不启用）。"""
+    assert (
+        _resolve_per_day_rows_cap(
+            strategy="per_day", configured=0, max_rows=40_000, per_day_counts=[10] * 100
+        )
+        == 0
+    )
 
 
 def test_strategy_resolution_fails_closed_on_typo() -> None:
@@ -211,27 +232,28 @@ def test_strategy_resolution_fails_closed_on_typo() -> None:
 
 
 def test_per_day_cap_disabled_paths() -> None:
-    """策略为 keep_last / 无可算日数 / 无总预算时都不启用按日分层。"""
+    """策略为 keep_last / 无日分布 / 无总预算时都不启用按日分层；显式上限优先。"""
     assert (
         _resolve_per_day_rows_cap(
-            strategy="keep_last", configured=120, max_rows=40_000, available_days=480
+            strategy="keep_last", configured=120, max_rows=40_000, per_day_counts=[500] * 100
         )
         == 0
     )
     assert (
         _resolve_per_day_rows_cap(
-            strategy="per_day", configured=0, max_rows=40_000, available_days=0
+            strategy="per_day", configured=0, max_rows=40_000, per_day_counts=[]
         )
         == 0
     )
     assert (
-        _resolve_per_day_rows_cap(strategy="per_day", configured=0, max_rows=0, available_days=480)
+        _resolve_per_day_rows_cap(
+            strategy="per_day", configured=0, max_rows=0, per_day_counts=[500] * 100
+        )
         == 0
     )
-    # 显式给出每日上限时优先采用配置值
     assert (
         _resolve_per_day_rows_cap(
-            strategy="per_day", configured=120, max_rows=40_000, available_days=480
+            strategy="per_day", configured=120, max_rows=40_000, per_day_counts=[500] * 100
         )
         == 120
     )
