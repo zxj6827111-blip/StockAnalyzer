@@ -25,6 +25,13 @@ from collections.abc import Iterable
 
 import pandas as pd
 
+# 标签剔除原因（互斥，逐行至多一个）：B1 账本口径「进入阶段数 = 输出数 + 各互斥
+# 原因剔除数」。行级原因优先于日级原因——先看这行自己有没有可用的 fwd_return，
+# 再看它所在的截面够不够厚，最后才是中间的 30%~70% 段。
+LABEL_REASON_MISSING_RETURN = "missing_or_nonfinite_return"
+LABEL_REASON_THIN_CROSS_SECTION = "thin_cross_section"
+LABEL_REASON_MIDDLE_DROPPED = "middle_dropped"
+
 
 def build_return_rank_labels(
     fwd_return: pd.Series,
@@ -58,6 +65,35 @@ def build_return_rank_labels(
     返回 Series（name=``label_return_rank``），index 与输入对齐。
     """
 
+    labels, _reasons = build_return_rank_labels_with_reasons(
+        fwd_return,
+        top_quantile=top_quantile,
+        bottom_quantile=bottom_quantile,
+        drop_middle=drop_middle,
+        min_cross_section=min_cross_section,
+        trade_dates=trade_dates,
+    )
+    return labels
+
+
+def build_return_rank_labels_with_reasons(
+    fwd_return: pd.Series,
+    *,
+    top_quantile: float = 0.3,
+    bottom_quantile: float = 0.3,
+    drop_middle: bool = False,
+    min_cross_section: int = 30,
+    trade_dates: pd.Series | None = None,
+) -> tuple[pd.Series, pd.Series]:
+    """同 :func:`build_return_rank_labels`，额外返回逐行剔除原因。
+
+    返回 ``(labels, reasons)``：``reasons`` 对拿到标签的行是空字符串，对
+    被剔除的行是 :data:`LABEL_REASON_MISSING_RETURN` /
+    :data:`LABEL_REASON_THIN_CROSS_SECTION` /
+    :data:`LABEL_REASON_MIDDLE_DROPPED` 三者之一（互斥）。
+    生产训练链用它出账本（B1），标签本体仍由本函数唯一实现，防两处漂移。
+    """
+
     if not 0.0 < top_quantile < 1.0 or not 0.0 < bottom_quantile < 1.0:
         raise ValueError("top/bottom quantiles must be in (0, 1)")
     if top_quantile + bottom_quantile > 1.0:
@@ -66,7 +102,10 @@ def build_return_rank_labels(
         raise ValueError("min_cross_section must be >= 2")
 
     labels = pd.Series(float("nan"), index=fwd_return.index, dtype=float)
+    reasons = pd.Series("", index=fwd_return.index, dtype=object)
     values = pd.to_numeric(fwd_return, errors="coerce")
+    missing_mask = values.isna()
+    reasons[missing_mask] = LABEL_REASON_MISSING_RETURN
     if trade_dates is not None:
         groups: Iterable[tuple[object, pd.Series]] = values.groupby(
             pd.Series(trade_dates).to_numpy()
@@ -80,6 +119,9 @@ def build_return_rank_labels(
     for _, day_values in groups:
         day_valid = day_values.dropna()
         if len(day_valid) < min_cross_section:
+            # 整日不可用：有效收益的行归因 thin_cross_section；缺收益的行
+            # 保持行级原因 missing_or_nonfinite_return（互斥，不重复计）。
+            reasons.loc[day_valid.index] = LABEL_REASON_THIN_CROSS_SECTION
             continue
         ranks = day_valid.rank(method="average", pct=True)  # 平均秩，pct ∈ (0,1]
         top_cut = 1.0 - top_quantile
@@ -92,7 +134,10 @@ def build_return_rank_labels(
         if not drop_middle:
             day_labels[day_labels.isna()] = 0.5
         labels.loc[day_labels.index] = day_labels
-    return labels.rename("label_return_rank")
+        if drop_middle:
+            middle = day_labels[day_labels.isna()].index
+            reasons.loc[middle] = LABEL_REASON_MIDDLE_DROPPED
+    return labels.rename("label_return_rank"), reasons.rename("label_reason")
 
 
 def apply_return_rank_labels_by_day(
