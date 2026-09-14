@@ -71,7 +71,10 @@ from stock_analyzer.feature.snapshot import (
 from stock_analyzer.infra.cache import CacheStore, InMemoryCache, RedisCache
 from stock_analyzer.labels.soup import build_soup_labels
 from stock_analyzer.learning.backfill import LearningBackfillEngine
-from stock_analyzer.learning.dataset_manifest import build_manifest_quality_report
+from stock_analyzer.learning.dataset_manifest import (
+    build_manifest_quality_report,
+    decision_date_shanghai,
+)
 from stock_analyzer.learning.feature_schema_registry import FeatureSchemaRegistry
 from stock_analyzer.learning.label_policy_registry import LabelPolicyRegistry
 from stock_analyzer.learning.output_health import evaluate_output_health
@@ -82,6 +85,7 @@ from stock_analyzer.learning.sample_schema import (
     OutcomeRecord,
 )
 from stock_analyzer.learning.sample_store import SampleStore, SnapshotRef
+from stock_analyzer.learning.sample_store import _parse_datetime as _parse_stored_datetime
 from stock_analyzer.learning.slot_occupied_nav import evaluate_promotion_validity
 from stock_analyzer.market_calendar import is_a_share_trading_day
 from stock_analyzer.models.adapters import inspect_model_backend_dependencies
@@ -9414,6 +9418,13 @@ class StockAnalyzerService:
                 0,
                 _as_int(self._config.training.bootstrap_per_symbol_rows_cap, default=0),
             )
+            row_cap_strategy = _resolve_row_cap_strategy(
+                getattr(self._config.training, "bootstrap_row_cap_strategy", "keep_last")
+            )
+            per_day_rows_cap_config = max(
+                0,
+                _as_int(self._config.training.bootstrap_max_rows_per_day, default=0),
+            )
             best_candidate: dict[str, object] | None = None
             candidate_blueprints: list[dict[str, object]] = []
             registry_records = self._feature_schema_registry.list_records()
@@ -9466,10 +9477,19 @@ class StockAnalyzerService:
 
             for blueprint in candidate_blueprints:
                 candidate_snapshots = cast(list[SnapshotRef], blueprint["snapshots"])
+                per_day_rows_cap = _resolve_per_day_rows_cap(
+                    strategy=row_cap_strategy,
+                    configured=per_day_rows_cap_config,
+                    max_rows=max_rows,
+                    available_days=len(
+                        {_decision_day_of(ref.decision_time) for ref in candidate_snapshots}
+                    ),
+                )
                 capped_snapshots, truncated = _apply_learning_protocol_row_caps(
                     snapshots=candidate_snapshots,
                     max_rows=max_rows,
                     per_symbol_rows_cap=per_symbol_rows_cap,
+                    per_day_rows_cap=per_day_rows_cap,
                 )
                 if not capped_snapshots:
                     continue
@@ -9480,6 +9500,7 @@ class StockAnalyzerService:
                     "schema_created_at": cast(datetime, blueprint["schema_created_at"]),
                     "snapshots": capped_snapshots,
                     "truncated": truncated,
+                    "per_day_rows_cap": per_day_rows_cap,
                     "latest_decision_time": max(
                         cast(SnapshotRef, ref).decision_time for ref in capped_snapshots
                     ),
@@ -9617,6 +9638,16 @@ class StockAnalyzerService:
                 "protocol_candidate_rows": candidate_rows,
                 "dataset_manifest_id": result.artifact.dataset_manifest_id,
                 "protocol_fallback_reason": "",
+                # 样本窗口形态：按日分层启用与否直接决定测试段能跨多少决策日，
+                # 因此把它随训练结果一起落盘，便于事后判定 test_window_too_narrow
+                # 是数据不足还是 cap 口径所致。
+                "rows_per_day_cap": _as_int(best_candidate.get("per_day_rows_cap"), default=0),
+                "row_cap_strategy": row_cap_strategy,
+                "rows_per_symbol_cap": per_symbol_rows_cap,
+                "max_rows": max_rows,
+                "decision_days_used": len(
+                    {_decision_day_of(ref.decision_time) for ref in selected_refs}
+                ),
             }
         except Exception as exc:
             error_text = f"learning_protocol_failed:{exc.__class__.__name__}"
@@ -23826,12 +23857,136 @@ class _RowCapRow(Protocol):
     decision_time: Any
 
 
+ROW_CAP_STRATEGIES = ("keep_last", "per_day")
+
+
+def _resolve_row_cap_strategy(value: object) -> str:
+    """规范化行数 cap 策略名；未知取值 fail-closed 报错。
+
+    不做静默兜底：配置写错时若悄悄退回 keep_last，窗口问题会看起来「已经修了」
+    却依旧存在——这正是 2026-09-14 那次排障里最贵的一类假象。
+    """
+    strategy = str(value if value is not None else "keep_last").strip().lower()
+    if not strategy:
+        return "keep_last"
+    if strategy not in ROW_CAP_STRATEGIES:
+        raise ValueError(
+            "bootstrap_row_cap_strategy must be one of "
+            f"{ROW_CAP_STRATEGIES}, got {strategy!r}"
+        )
+    return strategy
+
+
+def _resolve_per_day_rows_cap(
+    *,
+    strategy: str,
+    configured: int,
+    max_rows: int,
+    available_days: int,
+) -> int:
+    """求实际生效的「单决策日条数上限」；0 表示不启用按日分层。
+
+    自动档（``configured <= 0``）把整个 ``max_rows`` 预算平摊到全部可用决策日，
+    避免引入一个必须人工试出来的每日条数魔数。
+    """
+    if strategy != "per_day" or available_days <= 0:
+        return 0
+    if configured > 0:
+        return configured
+    if max_rows <= 0:
+        return 0
+    return max(1, max_rows // max(1, available_days))
+
+
+def _decision_day_of(value: object) -> date:
+    """取样本决策时刻所属的「上海交易日」。
+
+    ``SnapshotRef.decision_time`` 是数据库里的 UTC ISO 字符串（B4 为省解析成本刻意
+    保留字符串形态），``SignalSnapshot.decision_time`` 是 datetime；按日分层必须与 A1
+    的 purge/split 落在同一个日界上，故这里统一解析后交给同一处日界定义。
+    解析器复用 ``sample_store`` 的同一实现（存侧按 UTC ISO 落库），避免第二套解析口径。
+    """
+    if isinstance(value, datetime):
+        return decision_date_shanghai(value)
+    if isinstance(value, date):
+        return decision_date_shanghai(datetime(value.year, value.month, value.day))
+    return decision_date_shanghai(_parse_stored_datetime(value))
+
+
+def _stratify_rows_by_decision_day(
+    ordered: list[_RowCapRow],
+    per_day_rows_cap: int,
+) -> tuple[list[_RowCapRow], int]:
+    """按「上海交易日」把每根日线的样本数压到 ``per_day_rows_cap``。
+
+    ``ordered`` 已按 (decision_time, snapshot_id) 升序。同一决策日内按 snapshot_id
+    取前 N 条——snapshot_id 是内容寻址哈希，等价于对该日截面做确定性随机抽样，
+    不会与标签产生系统相关；关键是让**每个决策日贡献相同的样本量**，从而在总样本
+    数不变的前提下把时间跨度拉长（keep-last-N 会让窗口随 lookback 增长而整体滑动，
+    决策日数反而被钉死在 总量/每日截面 上）。
+
+    返回 (裁剪后的行, 被丢弃的行数)。
+    """
+    if per_day_rows_cap <= 0:
+        return ordered, 0
+    per_day: dict[date, list[_RowCapRow]] = {}
+    for row in ordered:
+        key = _decision_day_of(row.decision_time)
+        per_day.setdefault(key, []).append(row)
+    kept: list[_RowCapRow] = []
+    dropped = 0
+    for key in sorted(per_day):
+        items = sorted(per_day[key], key=lambda item: item.snapshot_id)
+        kept.extend(items[:per_day_rows_cap])
+        dropped += max(0, len(items) - per_day_rows_cap)
+    kept.sort(key=lambda item: (item.decision_time, item.snapshot_id))
+    return kept, dropped
+
+
+def _slide_rows_by_whole_days(
+    ordered: list[_RowCapRow],
+    max_rows: int,
+) -> tuple[list[_RowCapRow], bool]:
+    """全局上限改为**整日滑窗**：从最新决策日往回累加，放不下的整日丢弃。
+
+    与 ``ordered[-max_rows:]`` 的差别在于不会把最新决策日拦腰截断——半截截面会让
+    该日的横截面标签（return_rank 分位）与训练样本口径不一致。仍保留一条兜底：
+    连最新一个整日都放不下时，回退成按行截断以保证有样本可用。
+    """
+    per_day: dict[date, list[_RowCapRow]] = {}
+    for row in ordered:
+        per_day.setdefault(_decision_day_of(row.decision_time), []).append(row)
+    if not per_day:
+        return ordered, False
+    kept: list[_RowCapRow] = []
+    total = 0
+    for key in sorted(per_day, reverse=True):
+        day_rows = per_day[key]
+        if total + len(day_rows) > max_rows:
+            break
+        kept.extend(day_rows)
+        total += len(day_rows)
+    if not kept:
+        return ordered[-max_rows:], True
+    kept.sort(key=lambda item: (item.decision_time, item.snapshot_id))
+    return kept, len(kept) < len(ordered)
+
+
 def _apply_learning_protocol_row_caps(
     *,
     snapshots: list[_RowCapRow],
     max_rows: int,
     per_symbol_rows_cap: int,
+    per_day_rows_cap: int = 0,
 ) -> tuple[list[_RowCapRow], bool]:
+    """学习协议样本行裁剪：单票上限 → 单日分层 → 全局上限。
+
+    ``per_day_rows_cap > 0`` 时启用**按日分层**：先让每个决策日只留 N 条，再用
+    全局 ``max_rows`` 以整日为粒度回退。这样总样本数与旧口径相当（内存前提不变），
+    但保留的决策日数从 ``max_rows / 每日截面`` 提升到 ``max_rows / per_day_rows_cap``，
+    测试段因而能跨过 ``min_test_split_window_days``。``= 0`` 保持历史
+    keep-last-N 逐行截断语义。
+    """
     ordered = sorted(snapshots, key=lambda item: (item.decision_time, item.snapshot_id))
     if per_symbol_rows_cap > 0:
         snapshot_ids_to_keep: set[str] = set()
@@ -23847,9 +24002,16 @@ def _apply_learning_protocol_row_caps(
         ]
 
     truncated = False
-    if max_rows > 0 and len(ordered) > max_rows:
-        ordered = ordered[-max_rows:]
+    ordered, dropped_by_day_cap = _stratify_rows_by_decision_day(ordered, per_day_rows_cap)
+    if dropped_by_day_cap > 0:
         truncated = True
+    if max_rows > 0 and len(ordered) > max_rows:
+        if per_day_rows_cap > 0:
+            ordered, slid = _slide_rows_by_whole_days(ordered, max_rows)
+            truncated = truncated or slid
+        else:
+            ordered = ordered[-max_rows:]
+            truncated = True
     return ordered, truncated
 
 
