@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import cast
 
 import pandas as pd
+import pytest
 
 from stock_analyzer.config import StockAnalyzerConfig, load_config
 from stock_analyzer.data.provider import SyntheticProvider
@@ -225,6 +226,10 @@ def test_service_full_market_training_prefers_learning_protocol_when_samples_exi
     )
 
     assert payload["ok"] is True
+    # B2 输出健康门：本 fixture 仅 6 个测试样本，isotonic 校准器会塌成单值
+    # （calibrated unique=1），但 raw 输出仍有 6 个取值且 auc_raw=0.333 —— 属
+    # **小样本伪影**而非工件退化，故按 MIN_SCORED_FOR_CONSTANT_BLOCK 降级为
+    # advisory，不阻断热载（真实运行 test_samples≈2400 时同样形态会被硬阻断）。
     assert payload["predictor_loaded"] is True
     assert payload["input_mode"] == "sample_store"
     assert payload["protocol_attempted"] is True
@@ -233,6 +238,58 @@ def test_service_full_market_training_prefers_learning_protocol_when_samples_exi
     artifact_payload = _as_mapping(_as_mapping(payload["result"])["artifact"])
     assert artifact_payload["dataset_manifest_id"] == payload["dataset_manifest_id"]
     assert artifact_payload["feature_schema_id"] != ""
+
+
+def test_learning_protocol_selection_reads_refs_not_full_snapshot_payloads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B4 行为护栏：选池阶段不得再做"窗口级全量特征载荷"读取。
+
+    做法：记录 ``list_snapshots`` 的每次调用参数——训练协议路径里它只应被
+    manifest 构建/装配按**显式 snapshot_ids**（已被行数上限裁剪）调用；
+    任何一次"只给时间窗、不给 ids"的调用都意味着选池又回到了全量物化。
+    同时断言引用级读取确实被调用过。
+    """
+
+    config = _load_test_config(tmp_path)
+    config.training.artifact_path = str(tmp_path / "protocol_model.json")
+    config.training.min_samples = 20
+    service = _new_service(config, provider=FailingBarsProvider())
+    _seed_learning_protocol_samples(service, symbols=["600000", "000001"], rows_per_symbol=30)
+
+    store = service._sample_store
+    full_reads: list[dict[str, object]] = []
+    ref_reads: list[int] = []
+    original_list_snapshots = store.list_snapshots
+    original_list_refs = store.list_snapshot_refs
+
+    def spy_snapshots(*args: object, **kwargs: object) -> object:
+        full_reads.append(dict(kwargs))
+        return original_list_snapshots(*args, **kwargs)  # type: ignore[arg-type]
+
+    def spy_refs(*args: object, **kwargs: object) -> object:
+        result = original_list_refs(*args, **kwargs)  # type: ignore[arg-type]
+        ref_reads.append(len(result))  # type: ignore[arg-type]
+        return result
+
+    monkeypatch.setattr(store, "list_snapshots", spy_snapshots)
+    monkeypatch.setattr(store, "list_snapshot_refs", spy_refs)
+
+    payload = service.train_models(
+        full_market=True,
+        lookback_days=240,
+        preferred_symbols=["600000", "000001"],
+        artifact_path=str(tmp_path / "protocol_model.json"),
+    )
+
+    assert payload["ok"] is True
+    assert payload["input_mode"] == "sample_store"
+    assert ref_reads, "选池阶段必须使用引用级读取"
+    assert full_reads, "manifest/装配阶段仍需按 id 读取特征载荷"
+    for call in full_reads:
+        ids = call.get("snapshot_ids")
+        assert ids, f"存在窗口级全量特征载荷读取（未按 id 裁剪）: {call}"
 
 
 def test_service_full_market_training_falls_back_to_bars_when_protocol_samples_are_insufficient(
@@ -287,6 +344,7 @@ def test_service_full_market_training_prefers_richer_projection_compatible_schem
     )
 
     assert payload["ok"] is True
+    # 同前：小样本校准器塌缩属伪影（raw 仍可排序）→ 不阻断热载。
     assert payload["predictor_loaded"] is True
     assert payload["input_mode"] == "sample_store"
     assert payload["protocol_attempted"] is True
