@@ -11,7 +11,9 @@ import pandas as pd
 
 from stock_analyzer.models.adapters import LightGBMAdapter, XGBoostAdapter
 from stock_analyzer.models.artifact import ModelArtifact
+from stock_analyzer.models.bundle import compute_artifact_identity_hash
 from stock_analyzer.models.calibration import IsotonicCalibrator
+from stock_analyzer.models.identity import content_hash_matches_stamp
 from stock_analyzer.models.output_semantics import (
     output_semantics_for_basis,
     semantics_supports_event_label_metrics,
@@ -131,9 +133,27 @@ class SignalPredictor:
 
     @classmethod
     def load(cls, path: str | Path) -> SignalPredictor:
+        """加载工件，并把**本次实际加载的文件**钉成内容哈希记进元数据。
+
+        2026-09-16 之前没有这一步：registry 有 ``artifact_content_hash`` 列、
+        ``compute_artifact_identity_hash`` 也能算，但加载路径从不参与，于是"生产到底
+        在跑哪个工件"只能靠文件 mtime 旁证（排查 raw A/B 自检失败时就只能猜是不是工件
+        被换过）。哈希在**加载时算一次**并缓存，``mode_details()`` 只是读取，不给
+        高频 health 端点增加每次请求的 IO。
+
+        哈希失败不阻断加载（只在元数据留空串）——身份缺失要能被观测到，但不该让服务起不来。
+        """
         artifact_path = Path(path)
         artifact = ModelArtifact.load(artifact_path)
-        return cls.from_artifact(artifact, artifact_root=artifact_path.parent)
+        predictor = cls.from_artifact(artifact, artifact_root=artifact_path.parent)
+        predictor.artifact_metadata["artifact_uri"] = str(artifact_path)
+        try:
+            predictor.artifact_metadata["artifact_content_hash"] = compute_artifact_identity_hash(
+                artifact_path
+            )
+        except Exception:  # noqa: BLE001 - 身份哈希失败不得阻断推理加载
+            predictor.artifact_metadata["artifact_content_hash"] = ""
+        return predictor
 
     def predict_row(self, features: pd.Series) -> dict[str, float]:
         batch = self.predict_rows(pd.DataFrame([features.to_dict()]))
@@ -244,6 +264,15 @@ class SignalPredictor:
             # 发布别名自描述字段：当前加载模型在 registry 中的身份与 bundle 内容哈希。
             "registry_model_id": str(self.artifact_metadata.get("registry_model_id", "")),
             "bundle_content_hash": str(self.artifact_metadata.get("bundle_content_hash", "")),
+            # 加载时按**实际文件内容**算出的哈希与来源路径（identity.py 的对账输入）。
+            # 上面两个字段是发布时**盖章**的"声称"，这里是加载时的"事实"：两者不等
+            # 即说明磁盘上的工件与发布时不是同一个（换件/篡改），**不读注册表也能发现**。
+            "artifact_uri": str(self.artifact_metadata.get("artifact_uri", "")),
+            "artifact_content_hash": str(self.artifact_metadata.get("artifact_content_hash", "")),
+            "content_hash_verified": content_hash_matches_stamp(
+                claimed=self.artifact_metadata.get("bundle_content_hash", ""),
+                actual=self.artifact_metadata.get("artifact_content_hash", ""),
+            ),
         }
 
     def inference_blocked_reason(self) -> str:

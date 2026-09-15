@@ -35,10 +35,14 @@ def health() -> dict[str, object]:
 def health_deep() -> dict[str, object]:
     config = get_config()
     build_manifest = get_build_manifest()
+    service = get_service()
     return {
         "status": "ok",
         "mode": config.app.mode,
         "build": {**build_manifest, "code_commit_id": config.evolution.code_commit_id},
-        "provider": get_service().provider_status(),
-        "runtime": get_service().runtime_status(include_learning_governance=False),
+        "provider": service.provider_status(),
+        # 在服工件 ↔ 注册表 champion 的身份对账：回答"生产实际在跑哪个工件"，
+        # 不再需要靠文件 mtime 旁证（2026-09-16 加；只观测不拦截）。
+        "model_identity": service.artifact_identity_report(),
+        "runtime": service.runtime_status(include_learning_governance=False),
     }
