@@ -41,6 +41,7 @@ import pandas as pd
 
 from stock_analyzer.backtest.variants import VARIANTS, variant_definitions
 from stock_analyzer.learning.scoring_eval import (
+    _rankdata,
     compute_auc_brier,
     compute_quantile_returns,
     compute_rank_ic,
@@ -122,6 +123,14 @@ class FoldResult:
     # fold 评估行不整帧驻留：只保留池化统计所需的紧凑数组。
     eval_scores: np.ndarray | None = None
     eval_returns: np.ndarray | None = None
+    # C3 追加：分数相对反转因子的横截面诊断（逐日）。
+    # 动机：C3 实测 blend 与固定反转基线 IC 难分（0.0564 vs 0.0578），
+    # 所以「模型有没有额外信息」必须看扣掉反转后还剩多少，而不是看水平值。
+    # daily_reversal_r2 是稳健读法（反转解释了分数排序方差的多少）；
+    # daily_residual_ic 是残差 IC，仅在残差方差不可忽略的日子才有意义。
+    daily_residual_ic: list[tuple[str, float]] = field(default_factory=list)
+    daily_reversal_r2: list[tuple[str, float]] = field(default_factory=list)
+    residual_ic_degenerate_days: int = 0
     # C5：逐决策日的组合级量（只有日级聚合在内存里，不驻留成分股明细）。
     # 口径说明：这里的收益是「当日前瞻收益的等权均值」，**不是**复利净值曲线，
     # 也不含持有重叠/涨跌停不可成交——只用于成本与换手对照。
@@ -538,6 +547,11 @@ def run_fold(
         )
         .items()
     ]
+    (
+        result.daily_residual_ic,
+        result.daily_reversal_r2,
+        result.residual_ic_degenerate_days,
+    ) = _daily_reversal_diagnostics(labeled)
     result.pooled_auc = auc["auc"]
     result.pooled_brier = auc["brier"]
     result.quantile_means = [float(q) for q in quantiles["quantile_means"]]
@@ -590,6 +604,68 @@ def _accumulate_portfolio_day(
     result.portfolio_turnover.append((day.isoformat(), float(turnover(previous_weights, weights))))
     previous_weights.clear()
     previous_weights.update(weights)
+
+
+# 残差方差占比低于此值时，残差的相关在数值上没有意义（分母≈0 → 会产出
+# ±1 之间的随机值）。这类日子必须跳过并计数，绝不能编造一个残差 IC。
+_MIN_RETAINED_RANK_VARIANCE = 1e-6
+
+
+def _daily_reversal_diagnostics(
+    labeled: pd.DataFrame,
+) -> tuple[list[tuple[str, float]], list[tuple[str, float]], int]:
+    """逐日的「分数 vs 反转因子」横截面诊断。
+
+    返回 ``(残差IC序列, 反转R²序列, 退化日数)``。每日在横截面内：
+
+    1. ``rank(score)`` 与 ``rank(ret_20d)`` 求含截距 OLS，得到 ``R²``；
+    2. ``R²`` 即「反转因子解释了分数排序方差的多少」——稳健读法，不受共线影响；
+    3. 残差 = ``rank(score) - 拟合值``；仅当残差保留了非可忽略方差时（占比
+       ``1-R² > 1e-6``）才计算残差与 ``rank(fwd_return)`` 的相关，否则当日计入
+       退化日数并跳过（零方差残差的相关是纯数值噪声）。
+    4. 横截面样本 < 5、或 score/因子秩退化的日子同样跳过。
+
+    自检：``reversal`` 变体的分数就是 ``-ret_20d``，其 ``R²`` 应≈1 且全是退化日。
+    """
+    from stock_analyzer.backtest.variants import REVERSAL_PAST_RETURN_COLUMN  # noqa: WPS433
+
+    column = REVERSAL_PAST_RETURN_COLUMN
+    if column not in labeled.columns:
+        return [], [], 0
+    residual_out: list[tuple[str, float]] = []
+    r2_out: list[tuple[str, float]] = []
+    degenerate = 0
+    for day, group in labeled.groupby("trade_date"):
+        score = pd.to_numeric(group["score"], errors="coerce").to_numpy(dtype=float)
+        base = pd.to_numeric(group[column], errors="coerce").to_numpy(dtype=float)
+        forward = pd.to_numeric(group["fwd_return"], errors="coerce").to_numpy(dtype=float)
+        mask = np.isfinite(score) & np.isfinite(base) & np.isfinite(forward)
+        if int(mask.sum()) < 5:
+            continue
+        score_r = _rankdata(score[mask])
+        base_r = _rankdata(base[mask])
+        forward_r = _rankdata(forward[mask])
+        score_var = float(np.nanvar(score_r))
+        base_var = float(np.nanvar(base_r))
+        if score_var == 0.0 or base_var == 0.0:
+            continue
+        design = np.column_stack([np.ones_like(base_r), base_r])
+        try:
+            coef, *_ = np.linalg.lstsq(design, score_r, rcond=None)
+        except np.linalg.LinAlgError:
+            continue
+        residual = score_r - design @ coef
+        residual_var = float(np.nanvar(residual))
+        r2 = max(0.0, min(1.0, 1.0 - residual_var / score_var))
+        r2_out.append((str(day), r2))
+        if residual_var <= _MIN_RETAINED_RANK_VARIANCE * score_var:
+            degenerate += 1
+            continue
+        with np.errstate(invalid="ignore"):
+            value = float(np.corrcoef(residual, forward_r)[0, 1])
+        if math.isfinite(value):
+            residual_out.append((str(day), value))
+    return residual_out, r2_out, degenerate
 
 
 def cast_date(value: object) -> date:
@@ -655,6 +731,16 @@ def aggregate_report(
     daily_ic_all = [item for f in completed for item in f.daily_ic]
     daily_tb_all = [item for f in completed for item in f.daily_top_bottom]
     ci = date_block_bootstrap_ci(daily_ic_all)
+    # C3 追加：残差 IC（对 ret_20d 横截面正交化后）——与水平 IC 同口径聚合，
+    # 用于回答「模型在反转因子之外还剩多少信息」。
+    residual_all = [item for f in completed for item in f.daily_residual_ic]
+    r2_all = [item for f in completed for item in f.daily_reversal_r2]
+    residual_ci = date_block_bootstrap_ci(residual_all)
+    residual_mean = (
+        float(np.mean([v for _, v in residual_all])) if residual_all else float("nan")
+    )
+    r2_mean = float(np.mean([v for _, v in r2_all])) if r2_all else float("nan")
+    degenerate_days = int(sum(f.residual_ic_degenerate_days for f in completed))
     ic_mean = (
         float(np.mean([v for _, v in daily_ic_all])) if daily_ic_all else float("nan")
     )
@@ -776,6 +862,16 @@ def aggregate_report(
         "verdict": verdict,
         "variant": variant,
         "cost_report": _cost_report(completed, cost_bps=cost_bps),
+        "aggregate_residual_ic_mean": residual_mean,
+        "aggregate_residual_ic_ci95": [residual_ci["ci_low"], residual_ci["ci_high"]],
+        "residual_ic_days": len(residual_all),
+        "residual_ic_degenerate_days": degenerate_days,
+        "reversal_r2_mean": r2_mean,
+        "reversal_r2_days": len(r2_all),
+        "residual_ic_method": (
+            "每日横截面：rank(score) 对 rank(ret_20d) 做含截距 OLS 取残差，"
+            "再与 rank(fwd_return) 求相关；只扣横截面线性部分"
+        ),
         "params": {
             "train_window": train_window,
             "test_window": test_window,
@@ -1012,6 +1108,9 @@ def main() -> int:
                 "embargo_days": f.embargo_days,
                 "lookahead_violations": f.lookahead_violations,
                 "daily_ic": [[d, v] for d, v in f.daily_ic],
+                "daily_residual_ic": [[d, v] for d, v in f.daily_residual_ic],
+                "daily_reversal_r2": [[d, v] for d, v in f.daily_reversal_r2],
+                "residual_ic_degenerate_days": f.residual_ic_degenerate_days,
                 "pooled_auc": f.pooled_auc,
                 "pooled_brier": f.pooled_brier,
                 "pooled_n": f.pooled_n,
