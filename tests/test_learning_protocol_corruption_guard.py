@@ -70,7 +70,10 @@ def test_lock_conflict_never_triggers_recovery(
     def _raise_lock(*args: object, **kwargs: object) -> list[object]:
         raise duckdb.IOException(_LOCK_TEXT)
 
-    monkeypatch.setattr(service._sample_store, "list_snapshots", _raise_lock)
+    # B4：选池阶段的第一处 DB 读取已是引用级投影（list_snapshot_refs），
+    # 因此注入点必须覆盖它，才能模拟"真实 DB 读取失败"（否则桩不会命中，
+    # 测试会退化成"空库无样本"而绕过被测逻辑）。
+    monkeypatch.setattr(service._sample_store, "list_snapshot_refs", _raise_lock)
     result = service._try_train_models_from_learning_protocol(
         trainer=service._build_model_trainer(),
         symbols=["600000"],
@@ -98,7 +101,8 @@ def test_real_corruption_still_triggers_recovery(
     def _raise_corrupt(*args: object, **kwargs: object) -> list[object]:
         raise duckdb.IOException(_CORRUPT_TEXT)
 
-    monkeypatch.setattr(service._sample_store, "list_snapshots", _raise_corrupt)
+    # 同 lock 用例：注入到选池阶段真实调用的读取口（B4 后为 list_snapshot_refs）。
+    monkeypatch.setattr(service._sample_store, "list_snapshot_refs", _raise_corrupt)
     result = service._try_train_models_from_learning_protocol(
         trainer=service._build_model_trainer(),
         symbols=["600000"],

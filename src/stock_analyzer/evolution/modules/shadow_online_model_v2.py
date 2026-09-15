@@ -7,6 +7,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime
 
+from stock_analyzer.models.output_semantics import (
+    output_semantics_for_basis,
+    semantics_supports_event_label_metrics,
+)
+
 _EFFECTIVE_MATURE_STATUSES = {"reconciled", "fully_matured"}
 
 
@@ -57,7 +62,18 @@ def run_shadow_online_model_v2(
 ) -> ShadowOnlineV2Result:
     mature_records = _resolve_mature_records(records=records, now=now)
     samples_considered = len(mature_records)
+    # C2：语义不符导致的排除在**成熟度过滤之前**就已发生（_resolve_mature_records
+    # 会先取标签），故计数从原始 records 统计，与丢弃位置解耦、不会漏计。
+    excluded_label_semantics_mismatch = sum(
+        1 for item in records if _label_excluded_by_semantics(item)
+    )
     reasons: list[str] = []
+    if excluded_label_semantics_mismatch > 0:
+        # 先写进 reasons：早退分支（样本不足/无成熟样本）共用同一 list，
+        # 否则"整批被语义排除"会表现为"没有成熟样本"而看不出真因。
+        reasons.append(
+            f"excluded_label_semantics_mismatch:{excluded_label_semantics_mismatch}"
+        )
     if samples_considered == 0:
         reasons.append("no_matured_samples")
         return ShadowOnlineV2Result(
@@ -392,6 +408,53 @@ def _score_mapping(value: object) -> dict[str, float]:
     return normalized
 
 
+def _label_semantics_mismatch(record: Mapping[str, object]) -> bool:
+    """记录声明的输出语义是否**不允许**用事件标签（含价格代理）评估（C2）。
+
+    ``rank_quantile``（return_rank v3，训练剔除中间 40%）的分数是同日横截面
+    分位归属：中间段样本在训练里没有标签定义，用 0/1 事件标签（尤其是
+    "收盘价 >= 开盘价"这种代理）去算 Brier/logloss/accuracy 属于**跨语义比较**，
+    必须排除并留痕，而不是默默产出一个看起来正常的损失值。
+    """
+
+    basis = record.get("label_basis")
+    if basis is None:
+        basis = record.get("output_semantics")
+    try:
+        semantics = output_semantics_for_basis(basis)
+    except ValueError:
+        # 未登记口径：不在这里抛（影子链路不应因新口径整体失败），
+        # 但也不允许事件标签代理——按"语义未知即不评估事件指标"处理。
+        return True
+    return not semantics_supports_event_label_metrics(semantics)
+
+
+def _has_explicit_label(record: Mapping[str, object]) -> bool:
+    """记录是否自带可用 ``label`` 字段（价格代理不算）。"""
+
+    raw = record.get("label")
+    if isinstance(raw, bool):
+        return True
+    if isinstance(raw, (int, float)):
+        return True
+    if isinstance(raw, str) and raw.strip():
+        try:
+            float(raw.strip())
+        except ValueError:
+            return False
+        return True
+    return False
+
+
+def _label_excluded_by_semantics(record: Mapping[str, object]) -> bool:
+    """因"分数语义 ≠ 事件标签语义"必须排除的记录（C2）。
+
+    只统计**没有显式 label** 的记录：带显式标签的记录仍可用于事件指标。
+    """
+
+    return _label_semantics_mismatch(record) and not _has_explicit_label(record)
+
+
 def _extract_label(record: Mapping[str, object]) -> int | None:
     raw = record.get("label")
     if isinstance(raw, bool):
@@ -405,6 +468,9 @@ def _extract_label(record: Mapping[str, object]) -> int | None:
                 return 1 if float(text) >= 0.5 else 0
             except ValueError:
                 return None
+    if _label_semantics_mismatch(record):
+        # 非事件语义（如 rank_quantile）不得用价格代理标签评事件指标。
+        return None
     open_px = _as_float(record.get("open"), default=0.0)
     close_px = _as_float(record.get("close"), default=0.0)
     if open_px > 0 and close_px > 0:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -23,6 +24,36 @@ from stock_analyzer.learning.sample_schema import (
     OutcomeRecord,
     SignalSnapshot,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotRef:
+    """选池/去重/切分所需的最小快照引用（**不含特征载荷**）。
+
+    ``decision_time`` 保持数据库里的字符串形态（ISO），排序语义与
+    ``list_snapshots`` 的 ``decision_time`` 一致，避免为了一个轻量引用付
+    datetime 解析成本。
+    """
+
+    snapshot_id: str
+    symbol: str
+    decision_time: str
+    feature_schema_id: str
+    feature_schema_hash: str
+    label_policy_id: str
+
+
+def _normalize_ref_symbols(symbols: Sequence[str] | None) -> list[str]:
+    """符号过滤的 SQL 下推键（去空、去重、保持顺序）。"""
+
+    if not symbols:
+        return []
+    seen: dict[str, None] = {}
+    for item in symbols:
+        text = str(item).strip()
+        if text:
+            seen.setdefault(text, None)
+    return list(seen)
 
 
 class _DuckCursor(Protocol):
@@ -272,8 +303,9 @@ class SampleStore:
                     "dedup_key, dedup_rule, rows_before_dedup, rows_dropped_by_dedup, "
                     "blocking_quality_flags_json, warning_quality_flags_json, "
                     "manifest_quality_flags_json, test_split_window_days, "
-                    "test_split_unique_symbol_dates"
-                    ") VALUES (" + ", ".join(["?"] * 26) + ")"
+                    "test_split_unique_symbol_dates, purged_decision_days, "
+                    "purged_rows, split_isolation_report_json"
+                    ") VALUES (" + ", ".join(["?"] * 29) + ")"
                 ),
                 _manifest_parameters(manifest),
             )
@@ -420,7 +452,7 @@ class SampleStore:
         finally:
             conn.close()
 
-    def list_snapshots(
+    def list_snapshot_refs(
         self,
         *,
         snapshot_ids: Sequence[str] | None = None,
@@ -428,15 +460,72 @@ class SampleStore:
         label_policy_id: str | None = None,
         time_window_start: datetime | None = None,
         time_window_end: datetime | None = None,
-    ) -> list[SignalSnapshot]:
-        """List snapshots with optional protocol/time filtering."""
+        symbols: Sequence[str] | None = None,
+    ) -> list[SnapshotRef]:
+        """只取选池/去重/切分需要的字段（**不含特征载荷**）。
+
+        B4：选池阶段此前用 ``list_snapshots`` 把窗口内**全部**快照连同 222 维特征
+        解析成 Pydantic 对象，并在整段调用栈里保持存活（manifest 构建与训练装配
+        期间不释放）→ 全池训练内存叠加超限。本方法只投影标量与契约标识列，
+        不读 ``feature_vector_json``，因此选池的内存与"快照条数"成正比而与
+        "特征维度"无关；特征载荷只在最终 ≤ cap 的样本上取一次。
+        """
+
+        conditions, parameters = self._snapshot_filters(
+            snapshot_ids=snapshot_ids,
+            feature_schema_id=feature_schema_id,
+            label_policy_id=label_policy_id,
+            time_window_start=time_window_start,
+            time_window_end=time_window_end,
+        )
+        normalized_symbols = _normalize_ref_symbols(symbols)
+        if normalized_symbols:
+            placeholders = ", ".join("?" for _ in normalized_symbols)
+            conditions.append(f"symbol IN ({placeholders})")
+            parameters.extend(normalized_symbols)
+        where_clause = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+
+        conn = self._connect()
+        try:
+            self._ensure_schema(conn)
+            rows = conn.execute(
+                "SELECT snapshot_id, symbol, decision_time, feature_schema_id, "
+                "feature_schema_hash, label_policy_id "
+                f"FROM signal_snapshots{where_clause} "
+                "ORDER BY decision_time, snapshot_id",
+                parameters,
+            ).fetchall()
+            return [
+                SnapshotRef(
+                    snapshot_id=str(row[0]),
+                    symbol=str(row[1]),
+                    decision_time=str(row[2]),
+                    feature_schema_id=str(row[3]),
+                    feature_schema_hash=str(row[4]),
+                    label_policy_id=str(row[5]),
+                )
+                for row in rows
+            ]
+        finally:
+            conn.close()
+
+    def _snapshot_filters(
+        self,
+        *,
+        snapshot_ids: Sequence[str] | None,
+        feature_schema_id: str | None,
+        label_policy_id: str | None,
+        time_window_start: datetime | None,
+        time_window_end: datetime | None,
+    ) -> tuple[list[str], list[object]]:
+        """``list_snapshots`` / ``list_snapshot_refs`` 共用的过滤条件构造（防两处漂移）。"""
 
         conditions: list[str] = []
         parameters: list[object] = []
         if snapshot_ids:
             normalized_ids = [str(item).strip() for item in snapshot_ids if str(item).strip()]
             if not normalized_ids:
-                return []
+                return ["1 = 0"], []
             placeholders = ", ".join("?" for _ in normalized_ids)
             conditions.append(f"snapshot_id IN ({placeholders})")
             parameters.extend(normalized_ids)
@@ -452,9 +541,29 @@ class SampleStore:
         if time_window_end is not None:
             conditions.append("decision_time <= ?")
             parameters.append(_dump_datetime(time_window_end))
-        where_clause = ""
-        if conditions:
-            where_clause = " WHERE " + " AND ".join(conditions)
+        return conditions, parameters
+
+    def list_snapshots(
+        self,
+        *,
+        snapshot_ids: Sequence[str] | None = None,
+        feature_schema_id: str | None = None,
+        label_policy_id: str | None = None,
+        time_window_start: datetime | None = None,
+        time_window_end: datetime | None = None,
+    ) -> list[SignalSnapshot]:
+        """List snapshots with optional protocol/time filtering."""
+
+        conditions, parameters = self._snapshot_filters(
+            snapshot_ids=snapshot_ids,
+            feature_schema_id=feature_schema_id,
+            label_policy_id=label_policy_id,
+            time_window_start=time_window_start,
+            time_window_end=time_window_end,
+        )
+        if conditions == ["1 = 0"]:
+            return []
+        where_clause = (" WHERE " + " AND ".join(conditions)) if conditions else ""
 
         conn = self._connect()
         try:
@@ -609,6 +718,9 @@ class SampleStore:
             "manifest_quality_flags_json VARCHAR NOT NULL DEFAULT '[]', "
             "test_split_window_days INTEGER NOT NULL DEFAULT 0, "
             "test_split_unique_symbol_dates INTEGER NOT NULL DEFAULT 0, "
+            "purged_decision_days INTEGER NOT NULL DEFAULT 0, "
+            "purged_rows INTEGER NOT NULL DEFAULT 0, "
+            "split_isolation_report_json VARCHAR NOT NULL DEFAULT '{}', "
             "generated_at VARCHAR NOT NULL"
             ")"
         )
@@ -647,7 +759,7 @@ class SampleStore:
             )
 
     def _migrate_dataset_manifests_columns(self, conn: _DuckConnection) -> None:
-        """旧库逐列补 v2 去重字段（幂等；DuckDB 不支持带约束 ADD COLUMN）。"""
+        """旧库逐列补 v2 去重字段与时间隔离字段（幂等；DuckDB 不支持带约束 ADD COLUMN）。"""
 
         rows = conn.execute(
             "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
@@ -666,6 +778,9 @@ class SampleStore:
             "manifest_quality_flags_json": "VARCHAR",
             "test_split_window_days": "INTEGER",
             "test_split_unique_symbol_dates": "INTEGER",
+            "purged_decision_days": "INTEGER",
+            "purged_rows": "INTEGER",
+            "split_isolation_report_json": "VARCHAR",
         }
         for column_name, column_type in additions.items():
             if column_name not in existing:
@@ -705,6 +820,15 @@ class SampleStore:
         conn.execute(
             "UPDATE dataset_manifests SET test_split_unique_symbol_dates = 0 "
             "WHERE test_split_unique_symbol_dates IS NULL"
+        )
+        conn.execute(
+            "UPDATE dataset_manifests SET purged_decision_days = 0 "
+            "WHERE purged_decision_days IS NULL"
+        )
+        conn.execute("UPDATE dataset_manifests SET purged_rows = 0 WHERE purged_rows IS NULL")
+        conn.execute(
+            "UPDATE dataset_manifests SET split_isolation_report_json = '{}' "
+            "WHERE split_isolation_report_json IS NULL"
         )
 
 
@@ -782,6 +906,9 @@ _MANIFEST_COLUMNS = (
     "manifest_quality_flags_json",
     "test_split_window_days",
     "test_split_unique_symbol_dates",
+    "purged_decision_days",
+    "purged_rows",
+    "split_isolation_report_json",
 )
 
 # 未迁移旧表的降级列集（无 v2 去重字段，读取时映射默认值）。
@@ -806,11 +933,17 @@ _MANIFEST_LEGACY_COLUMNS = (
 )
 
 def _is_missing_dedup_column_error(exc: Exception) -> bool:
+    """旧表缺列判定：v2 去重字段或时间隔离开销字段缺失时降级旧列集。"""
+
     message = str(exc).strip().lower()
-    return (
-        ("not found" in message or "does not exist" in message)
-        and ("dedup_" in message or "quality_flags" in message)
+    missing_marker = "not found" in message or "does not exist" in message
+    column_marker = (
+        "dedup_" in message
+        or "quality_flags" in message
+        or "purged_" in message
+        or "split_isolation_report" in message
     )
+    return missing_marker and column_marker
 
 
 _MANIFEST_ITEM_COLUMNS = (
@@ -901,6 +1034,9 @@ def _manifest_parameters(manifest: DatasetManifest) -> list[object]:
         _dump_json(list(manifest.manifest_quality_flags)),
         manifest.test_split_window_days,
         manifest.test_split_unique_symbol_dates,
+        manifest.purged_decision_days,
+        manifest.purged_rows,
+        _dump_json(manifest.split_isolation_report),
     ]
 
 
@@ -970,10 +1106,11 @@ def _row_to_outcome(row: Sequence[object]) -> OutcomeRecord:
 
 
 def _row_to_manifest(row: Sequence[object]) -> DatasetManifest:
-    # 兼容三种行宽：26 列（含 manifest 质量字段）/ 23 列（v2 去重）/
-    # 17 列（未迁移旧表降级查询）。
+    # 兼容四种行宽：29 列（含时间隔离字段）/ 26 列（含 manifest 质量字段）/
+    # 23 列（v2 去重）/ 17 列（未迁移旧表降级查询）。
     has_v2_columns = len(row) >= 23
     has_manifest_quality_columns = len(row) >= 26
+    has_isolation_columns = len(row) >= 29
     if has_v2_columns:
         # v2 列序：... split_plan(15), generated_at(16), dedup_key(17),
         # dedup_rule(18), rows_before(19), rows_dropped(20), blocking(21), warning(22)
@@ -1003,6 +1140,14 @@ def _row_to_manifest(row: Sequence[object]) -> DatasetManifest:
             manifest_quality_flags = []
             test_split_window_days = 0
             test_split_unique_symbol_dates = 0
+        if has_isolation_columns:
+            purged_decision_days = int(row[26] or 0)
+            purged_rows = int(row[27] or 0)
+            split_isolation_report = _load_json_dict_any(row[28])
+        else:
+            purged_decision_days = 0
+            purged_rows = 0
+            split_isolation_report = {}
         generated_index = 16
     else:
         dedup_key = ""
@@ -1014,6 +1159,9 @@ def _row_to_manifest(row: Sequence[object]) -> DatasetManifest:
         manifest_quality_flags = []
         test_split_window_days = 0
         test_split_unique_symbol_dates = 0
+        purged_decision_days = 0
+        purged_rows = 0
+        split_isolation_report = {}
         generated_index = 16
     split_plan_raw = _load_json_list(row[15])
     split_plan = [DatasetSplitPlanEntry.model_validate(item) for item in split_plan_raw]
@@ -1047,6 +1195,9 @@ def _row_to_manifest(row: Sequence[object]) -> DatasetManifest:
         manifest_quality_flags=manifest_quality_flags,
         test_split_window_days=test_split_window_days,
         test_split_unique_symbol_dates=test_split_unique_symbol_dates,
+        purged_decision_days=purged_decision_days,
+        purged_rows=purged_rows,
+        split_isolation_report=split_isolation_report,
         generated_at=_parse_datetime(row[generated_index]),
     )
 
