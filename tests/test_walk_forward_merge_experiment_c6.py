@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -209,3 +210,37 @@ def test_merge_grid_not_run_reports_reason() -> None:
     report = _merge_report([empty])
     assert report["verdict"] == "INVALID"
     assert report["invalid_reason"] == "merge_grid_not_computed"
+
+
+# --- 环境指纹与开关透传 --------------------------------------------------------
+
+
+def test_environment_fingerprint_records_thread_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """线程环境必须进指纹。
+
+    2026-09-15 实证：LightGBM 的 params 里没有 ``num_threads``，线程数只由
+    ``OMP_NUM_THREADS`` 决定；一次没带线程变量的抛壳运行把 aggregate IC 从
+    0.0612/0.0624/0.0634（三次）顶到 **0.0825**，比 0.0019 的复跑噪声地板大一个
+    量级。没有指纹，这类漂移完全静默。
+    """
+    from stock_analyzer.backtest.walk_forward_xsec import _environment_fingerprint
+
+    monkeypatch.setenv("OMP_NUM_THREADS", "8")
+    monkeypatch.delenv("OPENBLAS_NUM_THREADS", raising=False)
+    fingerprint = _environment_fingerprint()
+    assert fingerprint["OMP_NUM_THREADS"] == "8"
+    # 未设置的项要留空字符串（而不是缺键），否则"没设置"与"没记录"分不清
+    assert fingerprint["OPENBLAS_NUM_THREADS"] == ""
+    assert "lightgbm" in fingerprint and "xgboost" in fingerprint
+
+
+def test_merge_grid_flag_is_forwarded_to_aggregate_report() -> None:
+    """CLI 开关必须真的传到 aggregate_report。
+
+    第一版漏了这一跳：fold 级合并数据算对了、checkpoint 也落了盘，但汇总层因为
+    merge_grid 默认 False 报 NOT_RUN —— "跑了却没判定"比跑失败更坏（看起来像没做）。
+    """
+    from stock_analyzer.backtest import walk_forward_xsec as module
+
+    source = Path(module.__file__).read_text(encoding="utf-8")
+    assert "merge_grid=bool(args.merge_grid)" in source

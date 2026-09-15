@@ -944,6 +944,49 @@ def _ci_high(payload: object) -> float:
     return float("nan")
 
 
+def _environment_fingerprint(training: object = None) -> dict[str, object]:
+    """训练环境指纹——不记录它，跨运行的口径漂移会完全静默。
+
+    2026-09-15 实证：LightGBM 的 params 里**没有** ``num_threads``（见
+    ``models/adapters.py``），线程数完全由 ``OMP_NUM_THREADS`` 决定。一次没带
+    线程环境变量的抛壳运行（生产容器钉的是 8）训出了不同的模型：同一份数据、
+    同一组参数，aggregate IC 从 0.0612/0.0624/0.0634（三次）跳到 **0.0825**——
+    比 0.0019 的复跑噪声地板大一个量级。所以线程环境是与数据/参数同级的口径，
+    必须随报告落盘。
+    """
+    import os  # noqa: WPS433 - 仅在生成指纹时需要
+
+    fingerprint: dict[str, object] = {
+        key: os.environ.get(key, "")
+        for key in (
+            "OMP_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "NUMEXPR_NUM_THREADS",
+        )
+    }
+    fingerprint["cpu_count"] = os.cpu_count()
+    for name in ("lightgbm", "xgboost", "numpy", "pandas"):
+        try:
+            module = __import__(name)
+            fingerprint[name] = str(getattr(module, "__version__", ""))
+        except Exception:  # noqa: BLE001 - 指纹缺失不应让运行失败
+            fingerprint[name] = "unavailable"
+    if training is not None:
+        fingerprint["training_params"] = {
+            key: getattr(training, key, None)
+            for key in (
+                "test_ratio",
+                "validation_ratio",
+                "calibration_ratio",
+                "min_test_trade_dates",
+                "min_test_split_window_days",
+                "min_samples",
+            )
+        }
+    return fingerprint
+
+
 def cast_date(value: object) -> date:
     if isinstance(value, date):
         return value
@@ -1369,6 +1412,7 @@ def main() -> int:
         embargo_days=embargo_days,
         variant=variant,
         cost_bps=args.cost_bps,
+        merge_grid=bool(args.merge_grid),
     )
     # 验收硬门（方向一'任务书）：新 label 下模型分数 IC 的 moving-block
     # bootstrap 95% CI 下界 > 0，且 fold 内不得有 lookahead 违规。
@@ -1396,6 +1440,7 @@ def main() -> int:
     payload = {
         "generated_at": datetime.utcnow().isoformat() + "Z",
         "validation_scope": VALIDATION_SCOPE_PROCESS,
+        "environment": _environment_fingerprint(cfg.training),
         "dataset": {
             "dir": args.dataset_dir,
             "label_basis": label_basis,
@@ -1445,6 +1490,7 @@ def main() -> int:
         json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
     )
     print(f"[4] json={json_path}", flush=True)
+    print("ENVIRONMENT " + json.dumps(payload["environment"], ensure_ascii=False), flush=True)
     print("AGGREGATE " + json.dumps(report, ensure_ascii=False, default=str), flush=True)
     print(f"[done] {time.time() - t0:.0f}s", flush=True)
     return 0
