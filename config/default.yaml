@@ -770,10 +770,12 @@ training:
   #   test 窗口日历跨度 ≈ test_ratio × 决策日数 × 7/5（交易日→自然日）
   # 上式必须 >= min_test_split_window_days，否则 manifest 打
   # test_window_too_narrow，学习协议整链停摆。
-  # 0.2 是 NAS 实测跑通全市场协议训练的取值（2026-09-15，2.4M 行面板 /
-  # test 窗口 36 天），也与 cli.py 训练命令的既有默认一致；0.1 只在
-  # 小 max_rows（如 NAS 的 40000）下才跌破 20 天窗口。
-  test_ratio: 0.2
+  # NAS 把 max_rows 压到 40000（决策日数 ~120），故在 .env 里把它抬到 0.2
+  # （SA__TRAINING__TEST_RATIO=0.2）。受跟踪默认保持 0.1：它同时是训练器内部
+  # holdout 的比例，**改它会改所有环境训出来的模型**——同数据同参数实测
+  # test_ratio=0.2 → IC 0.0628、0.1 → 0.0802，且小数据集下会把训练集切空
+  # （CI 上 test_main_phase_d6_research 的 empty training set 即此）。
+  test_ratio: 0.1
   embargo_days: 0
   precision_at_k_ratio: 0.1
   artifact_path: "artifacts/model_v1.json"

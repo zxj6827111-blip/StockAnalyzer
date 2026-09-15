@@ -1095,9 +1095,11 @@ class TrainingConfig(_StrictModel):
     # test 段比例。与 ``bootstrap_dataset_max_rows`` 耦合：test 窗口日历跨度
     # 约等于 test_ratio × 决策日数（≈ max_rows/每日截面条数）× 7/5，必须
     # >= ``min_test_split_window_days``，否则 manifest 打
-    # test_window_too_narrow、学习协议整链停摆。0.2 与 ``cli.py`` 训练命令的
-    # 既有默认一致。
-    test_ratio: float = 0.2
+    # test_window_too_narrow、学习协议整链停摆。NAS 因 max_rows 压到 40000
+    # 而在 .env 里抬到 0.2；受跟踪默认保持 0.1——它同时是训练器内部 holdout
+    # 的比例，改它会改所有环境训出来的模型（实测 0.2→IC 0.0628 / 0.1→0.0802），
+    # 且小数据集下会把训练集切空。
+    test_ratio: float = 0.1
     embargo_days: int = 0
     precision_at_k_ratio: float = 0.1
     learning_feedback_weighting_enabled: bool = True
