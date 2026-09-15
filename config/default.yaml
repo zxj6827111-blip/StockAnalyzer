@@ -167,6 +167,13 @@ fall_then_rise:
 
 models:
   calibration: isotonic
+  # 打分/排序用哪一族推理分数：
+  #   raw（默认）= 校准前分数；calibrated = 校准后分数（修前基线，可回滚）。
+  # 依据：docs/learning_chain_c3_variant_results_20260915.md §6.1——raw_blend 相对
+  # 校准后 meta 的配对 ΔIC=+0.0098、CI [+0.0013,+0.0188] 不含 0，且校准后分数在
+  # 13/342 个交易日塌成常数。cross_review 门两种口径下都用校准后分数（其阈值是
+  # 绝对阈值，换输入会静默改变门禁松紧）。
+  inference_score_source: raw
   cross_review:
     p_lgbm_min: 0.60
     p_xgb_min: 0.55
@@ -758,6 +765,16 @@ training:
   min_samples: 200
   validation_ratio: 0.2
   calibration_ratio: 0.1
+  # test_ratio 与 bootstrap_dataset_max_rows 通过下式耦合，不得独立下调：
+  #   决策日数 ≈ max_rows / 每日截面条数
+  #   test 窗口日历跨度 ≈ test_ratio × 决策日数 × 7/5（交易日→自然日）
+  # 上式必须 >= min_test_split_window_days，否则 manifest 打
+  # test_window_too_narrow，学习协议整链停摆。
+  # NAS 把 max_rows 压到 40000（决策日数 ~120），故在 .env 里把它抬到 0.2
+  # （SA__TRAINING__TEST_RATIO=0.2）。受跟踪默认保持 0.1：它同时是训练器内部
+  # holdout 的比例，**改它会改所有环境训出来的模型**——同数据同参数实测
+  # test_ratio=0.2 → IC 0.0628、0.1 → 0.0802，且小数据集下会把训练集切空
+  # （CI 上 test_main_phase_d6_research 的 empty training set 即此）。
   test_ratio: 0.1
   embargo_days: 0
   precision_at_k_ratio: 0.1

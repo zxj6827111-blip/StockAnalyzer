@@ -96,6 +96,7 @@ from stock_analyzer.models.bundle import (
     publish_model_bundle,
     verify_artifact_integrity,
 )
+from stock_analyzer.models.predictor import resolve_score_source
 from stock_analyzer.models.registry import (
     ModelLifecycleState,
     ModelRegistry,
@@ -7093,12 +7094,32 @@ class StockAnalyzerService:
             }
         ]
         probabilities: dict[str, list[float]] | None = None
+        raw_probabilities: dict[str, list[float]] | None = None
         predictor = getattr(self._pipeline, "_predictor", None)
         if predictor is not None and callable(getattr(predictor, "predict_rows", None)):
             try:
-                probabilities = predictor.predict_rows(rows[feature_columns])
+                predict_with_raw = getattr(predictor, "predict_rows_with_raw", None)
+                if callable(predict_with_raw):
+                    raw_probabilities = predict_with_raw(rows[feature_columns])
+                    probabilities = {
+                        key: raw_probabilities[key] for key in ("lgbm", "xgb", "meta")
+                    }
+                else:
+                    # 旧接口 predictor：两族同值，effective_source 会退回 calibrated。
+                    probabilities = predictor.predict_rows(rows[feature_columns])
+                    raw_probabilities = probabilities
             except Exception:
                 probabilities = None
+                raw_probabilities = None
+        # 打分口径（models.inference_score_source）：raw 取校准前的 raw_blend，
+        # calibrated 保持修前语义 max(lgbm,xgb,meta)。raw 族不可用时显式退回
+        # calibrated 并记录 effective_source，不静默混口径。
+        score_source = resolve_score_source(self._config.models.inference_score_source)
+        effective_source = (
+            "raw"
+            if (score_source == "raw" and raw_probabilities is not None and "raw_blend" in raw_probabilities)
+            else "calibrated"
+        )
 
         champion_auc = None
         model_registry = getattr(self, "_model_registry", None)
@@ -7144,10 +7165,14 @@ class StockAnalyzerService:
             if cross_review.passed:
                 cross_review_passed += 1
             baseline = _as_float(light.get("baseline_score"), default=0.0)
+            if effective_source == "raw" and raw_probabilities is not None:
+                model_component = float(raw_probabilities["raw_blend"][position])
+            else:
+                model_component = max(lgbm, xgb, meta)
             funnel_score = round(
                 100.0
                 * _clip01(
-                    0.55 * max(lgbm, xgb, meta)
+                    0.55 * model_component
                     + 0.45 * _clip01(baseline / 100.0)
                 ),
                 4,
@@ -7157,6 +7182,10 @@ class StockAnalyzerService:
                     "symbol": symbol,
                     "baseline_score": baseline,
                     "funnel_score": funnel_score,
+                    "model_score": round(model_component, 4),
+                    "score_source": effective_source,
+                    # lgbm/xgb/meta 恒为校准后分数：cross_review 与事后诊断都读它，
+                    # 不随 inference_score_source 翻转（门禁阈值是绝对阈值）。
                     "lgbm": round(lgbm, 4),
                     "xgb": round(xgb, 4),
                     "meta": round(meta, 4),

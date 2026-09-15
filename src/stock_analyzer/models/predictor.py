@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +29,48 @@ def _resolve_artifact_semantics(basis: str) -> tuple[str | None, str]:
         return output_semantics_for_basis(basis), ""
     except ValueError as exc:
         return None, str(exc)
+
+
+SCORE_SOURCES = ("raw", "calibrated")
+
+# 打分分量的取键：分量名沿用 ScoreEngine 权重表的 ``lgbm/xgb/meta``，但 ``raw``
+# 口径下 ``meta`` 取 ``raw_blend``（校准前的加权混合），**不是**校准后的 meta。
+_SCORE_SOURCE_KEYS: dict[str, dict[str, str]] = {
+    "calibrated": {"lgbm": "lgbm", "xgb": "xgb", "meta": "meta"},
+    "raw": {"lgbm": "raw_lgbm", "xgb": "raw_xgb", "meta": "raw_blend"},
+}
+
+
+def resolve_score_source(value: object) -> str:
+    """规范化推理分数口径名；未知取值 fail-closed，不静默回退 ``calibrated``。
+
+    静默回退会让"已切 raw"看起来生效而实际没切——与 2026-09-14 排障里最贵的
+    那类假象同型（配置写错却被兜底掩盖）。
+    """
+    key = str(value if value is not None else "raw").strip().lower()
+    if key not in SCORE_SOURCES:
+        raise ValueError(
+            f"unknown inference score source: {value!r}; expected one of {SCORE_SOURCES}"
+        )
+    return key
+
+
+def score_source_keys(source: object) -> dict[str, str]:
+    """口径 → 分量名到原始分数键的映射（批量路径按位置索引时用）。"""
+    return dict(_SCORE_SOURCE_KEYS[resolve_score_source(source)])
+
+
+def scoring_components(predictions: Mapping[str, float], *, source: object) -> dict[str, float]:
+    """把一次推理的分数收敛成打分用的三个分量（键名固定 ``lgbm/xgb/meta``）。
+
+    缺目标族的键时 fail-closed：宁可显式失败，也不用校准分数冒充 raw——
+    那会让 A/B 结论建立在混口径的数字上。
+    """
+    keys = score_source_keys(source)
+    missing = [name for name in keys.values() if name not in predictions]
+    if missing:
+        raise ValueError(f"missing score keys for source={source!r}: {missing}")
+    return {component: float(predictions[key]) for component, key in keys.items()}
 
 
 @dataclass(slots=True)
@@ -94,6 +137,11 @@ class SignalPredictor:
 
     def predict_row(self, features: pd.Series) -> dict[str, float]:
         batch = self.predict_rows(pd.DataFrame([features.to_dict()]))
+        return {key: values[0] for key, values in batch.items()}
+
+    def predict_row_with_raw(self, features: pd.Series) -> dict[str, float]:
+        """同 ``predict_row``，但额外带校准前的 ``raw_*`` 分数（六键）。"""
+        batch = self.predict_rows_with_raw(pd.DataFrame([features.to_dict()]))
         return {key: values[0] for key, values in batch.items()}
 
     def _predict_matrix(self, features: pd.DataFrame) -> dict[str, list[float]]:

@@ -290,6 +290,26 @@ class ModelsConfig(_StrictModel):
     overfit_gap_threshold: float = 0.15
     include_random_feature_baseline: bool = True
     recent_data_weight_years: int = 3
+    # 推理分数的取值口径（打分/排序用哪一族分数）：
+    # - "raw"（默认）：校准前分数（raw_lgbm/raw_xgb/raw_blend）。C3 配对比较实测
+    #   raw_blend 相对校准后 meta 的 ΔIC=+0.0098、配对 CI [+0.0013,+0.0188] 不含 0，
+    #   且校准后分数在 13/342 个交易日塌成常数（raw 为 0 天）。
+    # - "calibrated"：修前基线（校准后 lgbm/xgb/meta），用于回滚与 A/B。
+    # 注意：cross_review 门在两种口径下都吃**校准后**分数——它的 p_*_min/max_diff 是
+    # 绝对阈值，换输入会静默改变门禁松紧（未测量方向），故不随本开关翻转。
+    inference_score_source: str = "raw"
+
+    @field_validator("inference_score_source")
+    @classmethod
+    def _validate_inference_score_source(cls, value: str) -> str:
+        normalized = str(value).strip().lower()
+        if normalized not in {"raw", "calibrated"}:
+            # fail-closed：写错口径时静默退回 calibrated 会让"已切 raw"看起来生效，
+            # 与 2026-09-14 排障里最贵的那类假象同型。
+            raise ValueError(
+                f"inference_score_source must be one of ('raw', 'calibrated'), got {value!r}"
+            )
+        return normalized
 
 
 class ScoreThresholdConfig(_StrictModel):
@@ -1072,6 +1092,13 @@ class TrainingConfig(_StrictModel):
     min_samples: int = 200
     validation_ratio: float = 0.2
     calibration_ratio: float = 0.1
+    # test 段比例。与 ``bootstrap_dataset_max_rows`` 耦合：test 窗口日历跨度
+    # 约等于 test_ratio × 决策日数（≈ max_rows/每日截面条数）× 7/5，必须
+    # >= ``min_test_split_window_days``，否则 manifest 打
+    # test_window_too_narrow、学习协议整链停摆。NAS 因 max_rows 压到 40000
+    # 而在 .env 里抬到 0.2；受跟踪默认保持 0.1——它同时是训练器内部 holdout
+    # 的比例，改它会改所有环境训出来的模型（实测 0.2→IC 0.0628 / 0.1→0.0802），
+    # 且小数据集下会把训练集切空。
     test_ratio: float = 0.1
     embargo_days: int = 0
     precision_at_k_ratio: float = 0.1
