@@ -131,6 +131,14 @@ class FoldResult:
     daily_residual_ic: list[tuple[str, float]] = field(default_factory=list)
     daily_reversal_r2: list[tuple[str, float]] = field(default_factory=list)
     residual_ic_degenerate_days: int = 0
+    # C6 合并实验：每日横截面内把模型分数与 −ret_20d 各自秩标准化后按权重合并。
+    # 键 = ``w0.25``/``w0.50``/``w0.75`` 与 ``anchor_model``/``anchor_reversal``。
+    # **五个口径共用同一个横截面 S**（见预注册 §3），故两两天然同日配对；端点也
+    # 在同一次运行内算，配对差里不含跨运行训练噪声（预注册 §4）。
+    merge_daily_ic: dict[str, list[tuple[str, float]]] = field(default_factory=dict)
+    merge_rows_used: int = 0
+    merge_rows_excluded: int = 0
+    merge_skipped_days: int = 0
     # C5：逐决策日的组合级量（只有日级聚合在内存里，不驻留成分股明细）。
     # 口径说明：这里的收益是「当日前瞻收益的等权均值」，**不是**复利净值曲线，
     # 也不含持有重叠/涨跌停不可成交——只用于成本与换手对照。
@@ -385,6 +393,7 @@ def run_fold(
     embargo_days: int,
     k_precision: list[int],
     variant: str = "blend",
+    merge_grid: bool = False,
 ) -> FoldResult:
     fold_id = int(fold["fold_id"])
     train_start = cast_date(fold["train_start"])
@@ -552,6 +561,13 @@ def run_fold(
         result.daily_reversal_r2,
         result.residual_ic_degenerate_days,
     ) = _daily_reversal_diagnostics(labeled)
+    if merge_grid:
+        (
+            result.merge_daily_ic,
+            result.merge_rows_used,
+            result.merge_rows_excluded,
+            result.merge_skipped_days,
+        ) = _daily_merge_diagnostics(labeled)
     result.pooled_auc = auc["auc"]
     result.pooled_brier = auc["brier"]
     result.quantile_means = [float(q) for q in quantiles["quantile_means"]]
@@ -668,11 +684,328 @@ def _daily_reversal_diagnostics(
     return residual_out, r2_out, degenerate
 
 
+def _rank_pct(values: np.ndarray) -> np.ndarray:
+    """横截面秩标准化：average 秩 → ``(r - 0.5) / n``，落在 (0,1)。
+
+    均匀秩分数**单调不变**（对任何严格单调变换结果相同），所以合并是纯秩空间的操作、
+    不受分数刻度影响；端点 ``w=1`` 的 IC 因此必须与原始分数的 IC 完全一致（测试钉死）。
+    用均匀秩而不是标准正态分数：后者要多选一个变换，属未注册的自由度。
+    """
+    ranks = _rankdata(values)
+    return (ranks - 0.5) / float(len(ranks))
+
+
+def _merge_labels() -> list[str]:
+    from stock_analyzer.backtest.variants import (  # noqa: WPS433
+        MERGE_WEIGHTS,
+        merge_anchor_labels,
+        merge_weight_label,
+    )
+
+    anchors = merge_anchor_labels()
+    return [merge_weight_label(w) for w in MERGE_WEIGHTS] + [anchors["model"], anchors["reversal"]]
+
+
+def _daily_merge_diagnostics(
+    labeled: pd.DataFrame,
+) -> tuple[dict[str, list[tuple[str, float]]], int, int, int]:
+    """C6：逐日的「模型分数 × 反转因子」秩空间合并诊断。
+
+    返回 ``(各口径逐日IC, 使用行数, 被额外剔除的行数, 跳过的日数)``。
+
+    五个口径（三个权重 + 两个端点）**共用同一个当段横截面 S** = score/ret_20d/fwd_return
+    三者都有限的行，``|S| < MERGE_MIN_CROSS_SECTION`` 的日子跳过。端点也在这段代码里
+    算（而不是复用别处的运行结果），配对差里就不含跨运行训练噪声——见预注册 §4。
+
+    ``rows_excluded`` 是 S 相对主 IC 口径（score/fwd_return 有限）额外剔除的行数：
+    它不为 0 时合并口径的横截面比主口径小，结论必须带着这个差异读。
+    """
+    from stock_analyzer.backtest.variants import (  # noqa: WPS433
+        MERGE_MIN_CROSS_SECTION,
+        MERGE_WEIGHTS,
+        REVERSAL_PAST_RETURN_COLUMN,
+        merge_anchor_labels,
+        merge_weight_label,
+    )
+
+    labels = _merge_labels()
+    out: dict[str, list[tuple[str, float]]] = {label: [] for label in labels}
+    column = REVERSAL_PAST_RETURN_COLUMN
+    if column not in labeled.columns:
+        return out, 0, 0, 0
+    anchors = merge_anchor_labels()
+    used = excluded = skipped = 0
+    for day, group in labeled.groupby("trade_date"):
+        score = pd.to_numeric(group["score"], errors="coerce").to_numpy(dtype=float)
+        base = pd.to_numeric(group[column], errors="coerce").to_numpy(dtype=float)
+        forward = pd.to_numeric(group["fwd_return"], errors="coerce").to_numpy(dtype=float)
+        main_mask = np.isfinite(score) & np.isfinite(forward)
+        mask = main_mask & np.isfinite(base)
+        excluded += int(main_mask.sum()) - int(mask.sum())
+        if int(mask.sum()) < MERGE_MIN_CROSS_SECTION:
+            skipped += 1
+            continue
+        kept_score = score[mask]
+        z_model = _rank_pct(kept_score)
+        z_rev = _rank_pct(-base[mask])
+        kept_forward = forward[mask]
+        used += int(mask.sum())
+        values: dict[str, np.ndarray] = {
+            anchors["model"]: kept_score,
+            anchors["reversal"]: -base[mask],
+        }
+        for weight in MERGE_WEIGHTS:
+            merged = float(weight) * z_model + (1.0 - float(weight)) * z_rev
+            values[merge_weight_label(weight)] = merged
+        for label, series in values.items():
+            ic = compute_rank_ic(series, kept_forward)["ic_spearman"]
+            if math.isfinite(ic):
+                out[label].append((str(day), float(ic)))
+    return out, used, excluded, skipped
+
+
+def _paired_delta_ci(
+    current: list[tuple[str, float]],
+    baseline: list[tuple[str, float]],
+    *,
+    block_days: int | None = None,
+) -> dict[str, object]:
+    """同交易日配对的差值序列 + moving-block bootstrap CI（预注册 §6）。
+
+    先按交易日取差（任一侧缺失就丢弃该日并计数），再对**差值序列**做同一个块 bootstrap
+    ——不得对两条序列各自求 CI 后看区间是否重叠，那不是配对检验。
+    """
+    from stock_analyzer.learning.scoring_eval import DEFAULT_BLOCK_TRADING_DAYS  # noqa: WPS433
+
+    base_map = {str(day): float(value) for day, value in baseline}
+    diffs: list[tuple[str, float]] = []
+    for day, value in current:
+        key = str(day)
+        if key not in base_map:
+            continue
+        numeric = float(value) - base_map[key]
+        if math.isfinite(numeric):
+            diffs.append((key, numeric))
+    resolved_block = (
+        int(DEFAULT_BLOCK_TRADING_DAYS) if block_days is None else max(1, int(block_days))
+    )
+    ci = date_block_bootstrap_ci(diffs, block_days=resolved_block)
+    mean = float(np.mean([v for _, v in diffs])) if diffs else float("nan")
+    return {
+        "mean": mean,
+        "ci95": [float(ci["ci_low"]), float(ci["ci_high"])],
+        "valid_days": int(ci["valid_days"]),
+        "block_days": ci.get("block_days"),
+        "n_blocks": ci.get("n_blocks"),
+        "duplicate_days": ci.get("duplicate_days"),
+        "unpaired_days": len(current) - len(diffs),
+    }
+
+
+def _merge_report(folds: list[FoldResult]) -> dict[str, object]:
+    """C6 合并实验的汇总与判定（判据冻死在预注册 §5）。"""
+    from stock_analyzer.backtest.variants import (  # noqa: WPS433
+        MERGE_NOISE_FLOOR,
+        MERGE_PRIMARY_WEIGHT,
+        MERGE_WEIGHTS,
+        merge_anchor_labels,
+        merge_experiment_definition,
+        merge_weight_label,
+    )
+
+    completed = [f for f in folds if f.status in {"completed", "completed_unlabeled"}]
+    primary_label = merge_weight_label(MERGE_PRIMARY_WEIGHT)
+    grid_labels = [merge_weight_label(w) for w in MERGE_WEIGHTS]
+    anchors = merge_anchor_labels()
+    series: dict[str, list[tuple[str, float]]] = {}
+    for label in [*grid_labels, anchors["model"], anchors["reversal"]]:
+        series[label] = [item for f in completed for item in f.merge_daily_ic.get(label, [])]
+    rows_used = int(sum(f.merge_rows_used for f in completed))
+    rows_excluded = int(sum(f.merge_rows_excluded for f in completed))
+    skipped_days = int(sum(f.merge_skipped_days for f in completed))
+
+    def _mean_ci(label: str) -> tuple[float, list[float]]:
+        values = series.get(label, [])
+        if not values:
+            return float("nan"), [float("nan"), float("nan")]
+        ci = date_block_bootstrap_ci(values)
+        return float(np.mean([v for _, v in values])), [float(ci["ci_low"]), float(ci["ci_high"])]
+
+    levels: dict[str, dict[str, object]] = {}
+    for label in series:
+        mean, ci = _mean_ci(label)
+        # 键名与 paired_deltas 统一用 ci95：不统一会让 _ci_low 读不到而静默给 NaN，
+        # 进而把一个本该 GO 的结果判成 INCONCLUSIVE（本函数第一版正是这么错的）。
+        levels[label] = {"ic_mean": mean, "ci95": ci, "days": len(series[label])}
+    deltas: dict[str, dict[str, object]] = {}
+    for label in grid_labels:
+        deltas[f"{label}-{anchors['model']}"] = _paired_delta_ci(
+            series[label], series[anchors["model"]]
+        )
+        deltas[f"{label}-{anchors['reversal']}"] = _paired_delta_ci(
+            series[label], series[anchors["reversal"]]
+        )
+    # 端点在**同一次运行内**的水平差（与 C3 的两次独立运行对照，差异应落在噪声地板内）
+    anchor_delta = _paired_delta_ci(series[anchors["model"]], series[anchors["reversal"]])
+
+    primary_vs_model = deltas.get(f"{primary_label}-{anchors['model']}", {})
+    primary_vs_rev = deltas.get(f"{primary_label}-{anchors['reversal']}", {})
+    primary_level = levels.get(primary_label, {})
+    d_model = _as_float(primary_vs_model.get("mean"))
+    d_model_low = _ci_low(primary_vs_model)
+    d_rev_low = _ci_low(primary_vs_rev)
+    primary_low = _ci_low(primary_level)
+    d_model_high = _ci_high(primary_vs_model)
+    grid_signs = {
+        label: _sign(_as_float(deltas.get(f"{label}-{anchors['model']}", {}).get("mean")))
+        for label in grid_labels
+    }
+    signs_consistent = len({s for s in grid_signs.values() if s != 0}) <= 1
+    # 结构性完整门：已完成的 fold 里有任何一个没带合并数据，说明该 fold 是从旧/别口径
+    # 的 checkpoint 恢复的（或漏算），此时日数会静默变少——必须 fail-closed，不能让
+    # "少了一半日子的 CI" 冒充证据。
+    folds_missing_merge = sum(1 for f in completed if not f.merge_daily_ic)
+    invalid_reason = ""
+    if not series.get(primary_label):
+        invalid_reason = "merge_grid_not_computed"
+    elif folds_missing_merge:
+        invalid_reason = f"merge_partial:folds_without_merge_data={folds_missing_merge}"
+    elif rows_excluded > 0:
+        invalid_reason = (
+            f"cross_section_shrunk:rows_excluded={rows_excluded}"
+            "（合并横截面比主口径小，结论须带此差异读）"
+        )
+    if invalid_reason:
+        verdict = "INVALID"
+    elif _is_finite(d_model_high) and d_model_high < 0.0:
+        verdict = "MERGE_NO_GO"
+    elif (
+        _is_finite(d_model)
+        and d_model >= MERGE_NOISE_FLOOR
+        and _is_finite(d_model_low)
+        and d_model_low > 0.0
+        and _is_finite(d_rev_low)
+        and d_rev_low > 0.0
+        and _is_finite(primary_low)
+        and primary_low > 0.0
+    ):
+        verdict = "MERGE_GO_CANDIDATE" if signs_consistent else "MERGE_INCONCLUSIVE"
+    else:
+        verdict = "MERGE_INCONCLUSIVE"
+    return {
+        "definition": merge_experiment_definition(),
+        "levels": levels,
+        "paired_deltas": deltas,
+        "anchor_delta_model_minus_reversal": anchor_delta,
+        "primary_label": primary_label,
+        "rows_used": rows_used,
+        "rows_excluded": rows_excluded,
+        "skipped_days": skipped_days,
+        "grid_delta_signs": grid_signs,
+        "grid_delta_signs_consistent": signs_consistent,
+        "folds_without_merge_data": folds_missing_merge,
+        "invalid_reason": invalid_reason,
+        "verdict": verdict,
+    }
+
+
+def _as_float(value: object) -> float:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _is_finite(value: float) -> bool:
+    return math.isfinite(value)
+
+
+def _sign(value: float) -> int:
+    if not math.isfinite(value) or value == 0.0:
+        return 0
+    return 1 if value > 0.0 else -1
+
+
+def _ci_low(payload: object) -> float:
+    if not isinstance(payload, dict):
+        return float("nan")
+    bounds = payload.get("ci95")
+    if isinstance(bounds, (list, tuple)) and len(bounds) == 2:
+        return _as_float(bounds[0])
+    return float("nan")
+
+
+def _ci_high(payload: object) -> float:
+    if not isinstance(payload, dict):
+        return float("nan")
+    bounds = payload.get("ci95")
+    if isinstance(bounds, (list, tuple)) and len(bounds) == 2:
+        return _as_float(bounds[1])
+    return float("nan")
+
+
+def _environment_fingerprint(training: object = None, labels: object = None) -> dict[str, object]:
+    """训练口径指纹——不记录它，跨运行的口径漂移会完全静默。
+
+    2026-09-15 实证（两次都踩到）：
+
+    1. LightGBM 的 params 里**没有** ``num_threads``（见 ``models/adapters.py``），
+       线程数完全由 ``OMP_NUM_THREADS`` 决定；
+    2. 报告里的 ``dataset.label_basis`` 是**数据集**属性（来自 pit_meta），不是训练
+       用的标签——训练标签来自 ``cfg.labels.basis``，会被 ``SA__LABELS__BASIS`` 覆盖。
+       一次没带该环境变量的抛壳运行训的是 soup 标签，aggregate IC 因此是 0.0802/0.0825,
+       而生产容器里（``SA__LABELS__BASIS=return_rank``）的历史三次是 0.0612/0.0624/0.0634。
+       同一份数据、同一 fold、同一 IC 实现（reversal 端点 IC 逐位相同 0.05779939947337951）
+       却差了 0.019——**属口径漂移而非噪声**。
+
+    所以训练/标签/线程三项都必须随报告落盘，否则"同一个 harness 跑出来的数"可能根本
+    不是同一个东西。
+    """
+    import os  # noqa: WPS433 - 仅在生成指纹时需要
+
+    fingerprint: dict[str, object] = {
+        key: os.environ.get(key, "")
+        for key in (
+            "OMP_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "NUMEXPR_NUM_THREADS",
+            "SA__LABELS__BASIS",
+            "SA__TRAINING__TEST_RATIO",
+        )
+    }
+    fingerprint["cpu_count"] = os.cpu_count()
+    for name in ("lightgbm", "xgboost", "numpy", "pandas"):
+        try:
+            module = __import__(name)
+            fingerprint[name] = str(getattr(module, "__version__", ""))
+        except Exception:  # noqa: BLE001 - 指纹缺失不应让运行失败
+            fingerprint[name] = "unavailable"
+    if training is not None:
+        fingerprint["training_params"] = {
+            key: getattr(training, key, None)
+            for key in (
+                "test_ratio",
+                "validation_ratio",
+                "calibration_ratio",
+                "min_test_trade_dates",
+                "min_test_split_window_days",
+                "min_samples",
+            )
+        }
+    if labels is not None:
+        # 真正决定模型学什么的字段；与上面 dataset.label_basis 不是一回事。
+        fingerprint["labels"] = {
+            key: getattr(labels, key, None)
+            for key in ("basis", "horizon_days", "positive_return_threshold")
+        }
+    return fingerprint
+
+
 def cast_date(value: object) -> date:
     if isinstance(value, date):
         return value
     return date.fromisoformat(str(value)[:10])
-
 
 def checkpoint_dir(out_dir: str | Path, variant: str) -> Path:
     """变体独立的 fold checkpoint 目录。
@@ -726,6 +1059,7 @@ def aggregate_report(
     embargo_days: int,
     variant: str = "blend",
     cost_bps: float | None = None,
+    merge_grid: bool = False,
 ) -> dict[str, object]:
     completed = [f for f in folds if f.status in {"completed", "completed_unlabeled"}]
     daily_ic_all = [item for f in completed for item in f.daily_ic]
@@ -872,6 +1206,12 @@ def aggregate_report(
             "每日横截面：rank(score) 对 rank(ret_20d) 做含截距 OLS 取残差，"
             "再与 rank(fwd_return) 求相关；只扣横截面线性部分"
         ),
+        # C6 合并实验：未开 --merge-grid 时该节为空并写明原因，不得当成"未通过"。
+        "merge_experiment": (
+            _merge_report(completed)
+            if merge_grid
+            else {"verdict": "NOT_RUN", "reason": "未开 --merge-grid（本次运行不算合并实验）"}
+        ),
         "params": {
             "train_window": train_window,
             "test_window": test_window,
@@ -902,6 +1242,13 @@ def main() -> int:
         type=float,
         default=None,
         help="单边成本（bps）；默认沿用 reversal_baseline 的 10bps，不另设口径",
+    )
+    # C6 合并实验（预注册见 docs/learning_chain_c6_merge_experiment_preregistration_20260915.md）：
+    # 单次运行内同时给出三个权重与两个端点，配对差里不含跨运行训练噪声。
+    parser.add_argument(
+        "--merge-grid",
+        action="store_true",
+        help="开启 C6 合并实验的每日秩标准化网格（默认关；关了就不算做过合并实验）",
     )
     # 对照基线（方向一'验收要求）：旧 soup label 的 Phase 2 数字，写进
     # 报告作对照行。默认取 2026-09-06 NO-GO 结论；传 "none" 可省略。
@@ -981,6 +1328,15 @@ def main() -> int:
             "lookahead_violations": f.lookahead_violations,
             "daily_ic": [[d, v] for d, v in f.daily_ic],
             "daily_top_bottom": [[d, v] for d, v in f.daily_top_bottom],
+            "daily_residual_ic": [[d, v] for d, v in f.daily_residual_ic],
+            "daily_reversal_r2": [[d, v] for d, v in f.daily_reversal_r2],
+            "residual_ic_degenerate_days": f.residual_ic_degenerate_days,
+            "merge_daily_ic": {
+                label: [[d, v] for d, v in values] for label, values in f.merge_daily_ic.items()
+            },
+            "merge_rows_used": f.merge_rows_used,
+            "merge_rows_excluded": f.merge_rows_excluded,
+            "merge_skipped_days": f.merge_skipped_days,
             "pooled_auc": f.pooled_auc,
             "pooled_brier": f.pooled_brier,
             "pooled_n": f.pooled_n,
@@ -1011,6 +1367,16 @@ def main() -> int:
             lookahead_violations=int(raw.get("lookahead_violations", 0)),
             daily_ic=[(str(d), float(v)) for d, v in raw.get("daily_ic", [])],
             daily_top_bottom=[(str(d), float(v)) for d, v in raw.get("daily_top_bottom", [])],
+            daily_residual_ic=[(str(d), float(v)) for d, v in raw.get("daily_residual_ic", [])],
+            daily_reversal_r2=[(str(d), float(v)) for d, v in raw.get("daily_reversal_r2", [])],
+            residual_ic_degenerate_days=int(raw.get("residual_ic_degenerate_days", 0)),
+            merge_daily_ic={
+                str(label): [(str(d), float(v)) for d, v in values]
+                for label, values in (raw.get("merge_daily_ic") or {}).items()
+            },
+            merge_rows_used=int(raw.get("merge_rows_used", 0)),
+            merge_rows_excluded=int(raw.get("merge_rows_excluded", 0)),
+            merge_skipped_days=int(raw.get("merge_skipped_days", 0)),
             pooled_auc=float(raw.get("pooled_auc", "nan") or "nan"),
             pooled_brier=float(raw.get("pooled_brier", "nan") or "nan"),
             pooled_n=int(raw.get("pooled_n", 0)),
@@ -1036,6 +1402,7 @@ def main() -> int:
             embargo_days=embargo_days,
             k_precision=k_list,
             variant=variant,
+            merge_grid=bool(args.merge_grid),
         )
         folds.append(result)
         (ckpt_dir / f"fold_{fid:02d}.json").write_text(
@@ -1060,6 +1427,7 @@ def main() -> int:
         embargo_days=embargo_days,
         variant=variant,
         cost_bps=args.cost_bps,
+        merge_grid=bool(args.merge_grid),
     )
     # 验收硬门（方向一'任务书）：新 label 下模型分数 IC 的 moving-block
     # bootstrap 95% CI 下界 > 0，且 fold 内不得有 lookahead 违规。
@@ -1087,6 +1455,7 @@ def main() -> int:
     payload = {
         "generated_at": datetime.utcnow().isoformat() + "Z",
         "validation_scope": VALIDATION_SCOPE_PROCESS,
+        "environment": _environment_fingerprint(cfg.training, cfg.labels),
         "dataset": {
             "dir": args.dataset_dir,
             "label_basis": label_basis,
@@ -1111,6 +1480,12 @@ def main() -> int:
                 "daily_residual_ic": [[d, v] for d, v in f.daily_residual_ic],
                 "daily_reversal_r2": [[d, v] for d, v in f.daily_reversal_r2],
                 "residual_ic_degenerate_days": f.residual_ic_degenerate_days,
+                "merge_daily_ic": {
+                    label: [[d, v] for d, v in values] for label, values in f.merge_daily_ic.items()
+                },
+                "merge_rows_used": f.merge_rows_used,
+                "merge_rows_excluded": f.merge_rows_excluded,
+                "merge_skipped_days": f.merge_skipped_days,
                 "pooled_auc": f.pooled_auc,
                 "pooled_brier": f.pooled_brier,
                 "pooled_n": f.pooled_n,
@@ -1130,6 +1505,7 @@ def main() -> int:
         json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
     )
     print(f"[4] json={json_path}", flush=True)
+    print("ENVIRONMENT " + json.dumps(payload["environment"], ensure_ascii=False), flush=True)
     print("AGGREGATE " + json.dumps(report, ensure_ascii=False, default=str), flush=True)
     print(f"[done] {time.time() - t0:.0f}s", flush=True)
     return 0

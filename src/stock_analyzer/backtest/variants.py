@@ -34,6 +34,48 @@ STUMP_MAX_DEPTH = 1
 STUMP_MIN_LEAF_FRACTION = 0.01
 STUMP_MIN_LEAF_FLOOR = 20
 
+# C6 合并实验（预注册见 docs/learning_chain_c6_merge_experiment_preregistration_20260915.md）。
+# 每日横截面内把模型分数与 −ret_20d 各自秩标准化后按 w 合并：
+#   z_model = (rank_avg(score) - 0.5)/n，z_rev = (rank_avg(-ret_20d) - 0.5)/n
+#   merged(w) = w·z_model + (1-w)·z_rev
+# 均匀秩分数是单调不变的（纯秩空间），不引入额外的变换选择。0.50 是无参数的
+# 唯一选择，故作主判据；0.25/0.75 只描述性报告，不得挑最好的那个下结论。
+MERGE_WEIGHTS = (0.25, 0.5, 0.75)
+MERGE_PRIMARY_WEIGHT = 0.5
+# 合并横截面的最小样本下限：与残差诊断一致，样本太少时秩相关不可信。
+MERGE_MIN_CROSS_SECTION = 5
+# 噪声地板（C3 §5.1 实测：同配置两个复跑目录的 |ΔIC| ≈ 0.0019）。配对增量小于
+# 它时不可解读为信号——这正是本实验要检出的效应量级，所以必须写成硬条件。
+MERGE_NOISE_FLOOR = 0.0019
+
+
+def merge_weight_label(weight: float) -> str:
+    """权重 → 报告键（``0.5`` → ``w0.50``）；两位小数，避免 0.5/0.50 两种写法。"""
+    return f"w{float(weight):.2f}"
+
+
+def merge_anchor_labels() -> dict[str, str]:
+    """两个端点在同一次运行内的键名（见预注册 §4：端点必须与网格同源）。"""
+    return {"model": "anchor_model", "reversal": "anchor_reversal"}
+
+
+def merge_experiment_definition() -> dict[str, object]:
+    """预注册定义的机器可读副本，随报告落盘便于事后核对有没有偷改口径。"""
+    return {
+        "weights": [float(w) for w in MERGE_WEIGHTS],
+        "primary_weight": float(MERGE_PRIMARY_WEIGHT),
+        "rank": "uniform_index = (average_rank - 0.5) / n",
+        "past_return_column": REVERSAL_PAST_RETURN_COLUMN,
+        "min_cross_section": MERGE_MIN_CROSS_SECTION,
+        "noise_floor": MERGE_NOISE_FLOOR,
+        "pairing": "同一次 fold 运行内计算端点与网格（配对差里不含跨运行训练噪声）",
+        "primary_rule": (
+            "Δ(merged−model) 配对 CI 下界>0 且均值>=noise_floor 且 "
+            "Δ(merged−reversal) 配对 CI 下界>0 且 merged 自身 CI 下界>0"
+        ),
+        "stability_gate": "0.25/0.75/0.50 三者相对模型的 ΔIC 符号必须一致，否则降级 INCONCLUSIVE",
+    }
+
 
 class FoldScorer(Protocol):
     """折内打分器：先 ``fit`` 折内训练段，再对评估日的横截面 ``score``。"""
