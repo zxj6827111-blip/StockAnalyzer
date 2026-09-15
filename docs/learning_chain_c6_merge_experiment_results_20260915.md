@@ -143,5 +143,6 @@ docker run --rm --memory 6g \
 # 3) 判据在报告 aggregate.merge_experiment.verdict；配对复算用 scripts/week5_c3_paired_compare.py
 ```
 
-本次运行产物：`/tmp/c6out3/phase2_walk_forward_20260915T130105Z.json`（NAS 临时目录，
-未进 artifacts 卷；如需长期留存按上面命令重跑写入 `artifacts/phase2_label_remediation/c6_merge`）。
+本次运行产物已归档：`artifacts/phase2_label_remediation/c6_merge/phase2_walk_forward_20260915T130105Z.json`
+（NAS 上对应 `/vol1/docker/volumes/stock_analyzer_runtime_artifacts/_data/phase2_label_remediation/c6_merge/`）。
+抛壳容器、worktree 与临时目录均已清理，部署检出仍在 `main`（28dede0）。
