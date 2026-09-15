@@ -19,7 +19,11 @@ import stock_analyzer.models.trainer as trainer_module
 from stock_analyzer.backtest.pit_dataset import _apply_return_rank_labels
 from stock_analyzer.config import LabelsConfig, StockAnalyzerConfig, load_config
 from stock_analyzer.learning.dataset_manifest import DatasetManifestBuilder
-from stock_analyzer.learning.label_policy_registry import LabelPolicyRegistry
+from stock_analyzer.learning.label_policy_registry import (
+    LabelPolicyRecord,
+    LabelPolicyRegistry,
+    ReturnRankParams,
+)
 from stock_analyzer.learning.sample_schema import (
     BackfillFidelityTier,
     MaturityStatus,
@@ -96,7 +100,7 @@ def _build_store(
     rows: list[tuple[str, str, float]],
     *,
     labels_config: LabelsConfig,
-) -> tuple[SampleStore, dict[str, str], LabelPolicyRegistry, object]:
+) -> tuple[SampleStore, dict[str, str], LabelPolicyRegistry, LabelPolicyRecord]:
     """按截面数据写 snapshot + outcome（realized_return=MFE 度量同源）。
 
     同时建 label policy registry 并按 labels_config 登记契约（soup 用例
@@ -238,7 +242,8 @@ def test_two_entry_label_consistency_production_vs_pit(tmp_path: Path) -> None:
     rows = _cross_section_rows()
     labels_config = _labels_config()
 
-    # 生产链入口：snapshot/outcome → trainer 的 v3 预计算 helper。
+    # 生产链入口：snapshot/outcome → trainer 的 v3 预计算 helper（A3 后按
+    # manifest 契约取分位参数，而不是当前 config）。
     store, snapshot_to_symbol, _registry, _policy = _build_store(
         tmp_path, rows, labels_config=labels_config
     )
@@ -253,7 +258,12 @@ def test_two_entry_label_consistency_production_vs_pit(tmp_path: Path) -> None:
     production = _return_rank_labels_from_outcomes(
         outcomes=outcomes,
         snapshots=snapshots,
-        labels_config=labels_config,
+        params=ReturnRankParams(
+            top_quantile=labels_config.return_rank_top_quantile,
+            bottom_quantile=labels_config.return_rank_bottom_quantile,
+            drop_middle=labels_config.return_rank_drop_middle,
+            min_cross_section=labels_config.return_rank_min_cross_section,
+        ),
     )
 
     # PIT 链入口：同一截面的合并阶段月度块。

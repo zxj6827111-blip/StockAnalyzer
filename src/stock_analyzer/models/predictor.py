@@ -11,11 +11,35 @@ import pandas as pd
 from stock_analyzer.models.adapters import LightGBMAdapter, XGBoostAdapter
 from stock_analyzer.models.artifact import ModelArtifact
 from stock_analyzer.models.calibration import IsotonicCalibrator
+from stock_analyzer.models.output_semantics import (
+    output_semantics_for_basis,
+    semantics_supports_event_label_metrics,
+)
+
+
+def _resolve_artifact_semantics(basis: str) -> tuple[str | None, str]:
+    """工件 label 契约 → 输出语义；未登记口径**不抛异常**而是回传错误串。
+
+    推理路径必须保持可用（未知/未登记契约退化为 ``semantics=None`` 并留痕），
+    而登记/审计路径用 ``output_semantics.describe_output_semantics`` 做 fail-closed。
+    """
+
+    try:
+        return output_semantics_for_basis(basis), ""
+    except ValueError as exc:
+        return None, str(exc)
 
 
 @dataclass(slots=True)
 class SignalPredictor:
-    """Predict lgbm/xgb/meta probabilities from engineered features."""
+    """从工程特征输出 lgbm/xgb/meta 分数。
+
+    **输出语义（C2）**：返回值是"分数"，其含义由工件的 label 契约决定，不是
+    天然的概率——``event_probability``（soup 的 TP/SL 路径事件）可与 0/1 事件
+    标签算 Brier/logloss；``rank_quantile``（return_rank v3）是同日横截面分位
+    归属，**中间 40% 被剔除**，`0.5` 是"上尾 vs 下尾"而非"涨 vs 跌"，不得当
+    全市场上涨概率用（见 ``models/output_semantics.py``）。
+    """
 
     feature_columns: list[str]
     lgbm: LightGBMAdapter
@@ -24,6 +48,24 @@ class SignalPredictor:
     xgb_calibrator: IsotonicCalibrator
     meta_weights: dict[str, float] = field(default_factory=lambda: {"lgbm": 0.5, "xgb": 0.5})
     artifact_metadata: dict[str, object] = field(default_factory=dict)
+    label_policy_id: str = ""
+
+    @property
+    def output_semantics(self) -> str | None:
+        """本工件输出语义（未登记契约返回 None，详情见 ``output_semantics_report``）。"""
+
+        return _resolve_artifact_semantics(self.label_policy_id)[0]
+
+    def output_semantics_report(self) -> dict[str, object]:
+        """语义 + 未登记原因，供概率健康/审计字段落痕（C2）。"""
+
+        semantics, error = _resolve_artifact_semantics(self.label_policy_id)
+        return {
+            "label_policy_id": self.label_policy_id,
+            "output_semantics": semantics,
+            "output_semantics_error": error,
+            "event_label_metrics_allowed": semantics_supports_event_label_metrics(semantics),
+        }
 
     @classmethod
     def from_artifact(
@@ -41,6 +83,7 @@ class SignalPredictor:
             xgb_calibrator=IsotonicCalibrator.from_dict(artifact.xgb_calibrator),
             meta_weights=meta_weights,
             artifact_metadata=dict(artifact.metadata),
+            label_policy_id=str(artifact.label_policy_id),
         )
 
     @classmethod

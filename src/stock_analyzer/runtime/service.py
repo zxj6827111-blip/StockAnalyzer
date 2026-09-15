@@ -20,7 +20,7 @@ from datetime import time as dt_time
 from pathlib import Path
 from threading import Lock, RLock, Thread, current_thread
 from time import perf_counter
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 import numpy as np
 import pandas as pd
@@ -71,7 +71,10 @@ from stock_analyzer.feature.snapshot import (
 from stock_analyzer.infra.cache import CacheStore, InMemoryCache, RedisCache
 from stock_analyzer.labels.soup import build_soup_labels
 from stock_analyzer.learning.backfill import LearningBackfillEngine
-from stock_analyzer.learning.dataset_manifest import build_manifest_quality_report
+from stock_analyzer.learning.dataset_manifest import (
+    build_manifest_quality_report,
+    decision_date_shanghai,
+)
 from stock_analyzer.learning.feature_schema_registry import FeatureSchemaRegistry
 from stock_analyzer.learning.label_policy_registry import LabelPolicyRegistry
 from stock_analyzer.learning.output_health import evaluate_output_health
@@ -80,9 +83,9 @@ from stock_analyzer.learning.sample_schema import (
     DatasetManifest,
     MaturityStatus,
     OutcomeRecord,
-    SignalSnapshot,
 )
-from stock_analyzer.learning.sample_store import SampleStore
+from stock_analyzer.learning.sample_store import SampleStore, SnapshotRef
+from stock_analyzer.learning.sample_store import _parse_datetime as _parse_stored_datetime
 from stock_analyzer.learning.slot_occupied_nav import evaluate_promotion_validity
 from stock_analyzer.market_calendar import is_a_share_trading_day
 from stock_analyzer.models.adapters import inspect_model_backend_dependencies
@@ -1309,6 +1312,11 @@ class StockAnalyzerService:
                 require_full_gates=True,
                 min_test_trade_dates=max(
                     1, int(self._config.training.min_test_trade_dates)
+                ),
+                # 与常规晋升路径（evaluate_learning_model_promotion 分支）保持一致：
+                # 这里此前漏传该阈值，实际一直用函数默认值，配置项被静默忽略。
+                min_hard_class_samples=max(
+                    1, int(self._config.training.min_hard_class_samples)
                 ),
                 test_stats={
                     "unique_trade_dates": float(
@@ -9350,19 +9358,23 @@ class StockAnalyzerService:
 
         try:
             label_policy = self._label_policy_registry.register_from_config(self._config.labels)
-            snapshots = self._sample_store.list_snapshots(
+            # B4：选池阶段只读**引用级投影**（不含特征载荷），符号过滤下推到 SQL。
+            # 此前这里用 list_snapshots 把窗口内全部快照连同 222 维特征解析成
+            # Pydantic 对象，并在整段调用栈里存活到训练装配（内存叠加超限）。
+            refs = self._sample_store.list_snapshot_refs(
                 label_policy_id=label_policy.label_policy_id,
                 time_window_start=time_window_start,
                 time_window_end=time_window_end,
+                symbols=sorted(requested_symbols) if requested_symbols else None,
             )
             if requested_symbols:
-                snapshots = [
-                    snapshot
-                    for snapshot in snapshots
-                    if (_normalize_a_share_symbol(snapshot.symbol) or snapshot.symbol.strip())
+                refs = [
+                    ref
+                    for ref in refs
+                    if (_normalize_a_share_symbol(ref.symbol) or ref.symbol.strip())
                     in requested_symbols
                 ]
-            if not snapshots:
+            if not refs:
                 return {
                     "attempted": True,
                     "ok": False,
@@ -9374,7 +9386,7 @@ class StockAnalyzerService:
             outcome_map = {
                 outcome.snapshot_id: outcome
                 for outcome in self._sample_store.list_outcomes(
-                    snapshot_ids=[snapshot.snapshot_id for snapshot in snapshots]
+                    snapshot_ids=[ref.snapshot_id for ref in refs]
                 )
             }
             mature_statuses = {
@@ -9382,13 +9394,13 @@ class StockAnalyzerService:
                 MaturityStatus.RECONCILED,
                 MaturityStatus.FULLY_MATURED,
             }
-            exact_schema_groups: dict[tuple[str, str], list[SignalSnapshot]] = {}
-            for snapshot in snapshots:
-                outcome = outcome_map.get(snapshot.snapshot_id)
+            exact_schema_groups: dict[tuple[str, str], list[SnapshotRef]] = {}
+            for ref in refs:
+                outcome = outcome_map.get(ref.snapshot_id)
                 if outcome is None or outcome.maturity_status not in mature_statuses:
                     continue
-                key = (snapshot.feature_schema_id, snapshot.feature_schema_hash)
-                exact_schema_groups.setdefault(key, []).append(snapshot)
+                key = (ref.feature_schema_id, ref.feature_schema_hash)
+                exact_schema_groups.setdefault(key, []).append(ref)
             if not exact_schema_groups:
                 return {
                     "attempted": True,
@@ -9405,6 +9417,13 @@ class StockAnalyzerService:
             per_symbol_rows_cap = max(
                 0,
                 _as_int(self._config.training.bootstrap_per_symbol_rows_cap, default=0),
+            )
+            row_cap_strategy = _resolve_row_cap_strategy(
+                getattr(self._config.training, "bootstrap_row_cap_strategy", "keep_last")
+            )
+            per_day_rows_cap_config = max(
+                0,
+                _as_int(self._config.training.bootstrap_max_rows_per_day, default=0),
             )
             best_candidate: dict[str, object] | None = None
             candidate_blueprints: list[dict[str, object]] = []
@@ -9426,10 +9445,10 @@ class StockAnalyzerService:
                 if not allowed_contracts:
                     allowed_contracts = {(record.feature_schema_id, record.feature_schema_hash)}
                 candidate_snapshots = [
-                    snapshot
+                    ref
                     for contract_key, grouped_rows in exact_schema_groups.items()
                     if contract_key in allowed_contracts
-                    for snapshot in grouped_rows
+                    for ref in grouped_rows
                 ]
                 if not candidate_snapshots:
                     continue
@@ -9457,11 +9476,22 @@ class StockAnalyzerService:
                 )
 
             for blueprint in candidate_blueprints:
-                candidate_snapshots = cast(list[SignalSnapshot], blueprint["snapshots"])
+                candidate_snapshots = cast(list[SnapshotRef], blueprint["snapshots"])
+                per_day_counts: dict[date, int] = {}
+                for ref in candidate_snapshots:
+                    day_key = _decision_day_of(ref.decision_time)
+                    per_day_counts[day_key] = per_day_counts.get(day_key, 0) + 1
+                per_day_rows_cap = _resolve_per_day_rows_cap(
+                    strategy=row_cap_strategy,
+                    configured=per_day_rows_cap_config,
+                    max_rows=max_rows,
+                    per_day_counts=list(per_day_counts.values()),
+                )
                 capped_snapshots, truncated = _apply_learning_protocol_row_caps(
                     snapshots=candidate_snapshots,
                     max_rows=max_rows,
                     per_symbol_rows_cap=per_symbol_rows_cap,
+                    per_day_rows_cap=per_day_rows_cap,
                 )
                 if not capped_snapshots:
                     continue
@@ -9472,14 +9502,15 @@ class StockAnalyzerService:
                     "schema_created_at": cast(datetime, blueprint["schema_created_at"]),
                     "snapshots": capped_snapshots,
                     "truncated": truncated,
+                    "per_day_rows_cap": per_day_rows_cap,
                     "latest_decision_time": max(
-                        snapshot.decision_time for snapshot in capped_snapshots
+                        cast(SnapshotRef, ref).decision_time for ref in capped_snapshots
                     ),
                 }
                 if best_candidate is None:
                     best_candidate = candidate
                     continue
-                best_rows = len(cast(list[SignalSnapshot], best_candidate["snapshots"]))
+                best_rows = len(cast(list[SnapshotRef], best_candidate["snapshots"]))
                 candidate_rows = len(capped_snapshots)
                 if candidate_rows > best_rows or (
                     candidate_rows == best_rows
@@ -9523,8 +9554,8 @@ class StockAnalyzerService:
                     "protocol_candidate_rows": 0,
                 }
 
-            selected_snapshots = cast(list[SignalSnapshot], best_candidate["snapshots"])
-            candidate_rows = len(selected_snapshots)
+            selected_refs = cast(list[SnapshotRef], best_candidate["snapshots"])
+            candidate_rows = len(selected_refs)
             min_samples = max(1, int(self._config.training.min_samples))
             if candidate_rows < min_samples:
                 return {
@@ -9564,7 +9595,7 @@ class StockAnalyzerService:
                 feature_schema_hash=feature_schema_hash,
                 label_policy_id=label_policy.label_policy_id,
                 label_policy_hash=label_policy.label_policy_hash,
-                snapshot_ids=[snapshot.snapshot_id for snapshot in selected_snapshots],
+                snapshot_ids=[ref.snapshot_id for ref in selected_refs],
                 feature_schema_registry=self._feature_schema_registry,
                 label_policy_registry=self._label_policy_registry,
                 sample_selection_rule=(
@@ -9582,9 +9613,9 @@ class StockAnalyzerService:
             )
             output_path = str(bundle_payload["artifact_path"])
             unique_symbols = {
-                _normalize_a_share_symbol(snapshot.symbol) or snapshot.symbol.strip()
-                for snapshot in selected_snapshots
-                if (_normalize_a_share_symbol(snapshot.symbol) or snapshot.symbol.strip())
+                _normalize_a_share_symbol(ref.symbol) or ref.symbol.strip()
+                for ref in selected_refs
+                if (_normalize_a_share_symbol(ref.symbol) or ref.symbol.strip())
             }
             return {
                 "attempted": True,
@@ -9609,6 +9640,16 @@ class StockAnalyzerService:
                 "protocol_candidate_rows": candidate_rows,
                 "dataset_manifest_id": result.artifact.dataset_manifest_id,
                 "protocol_fallback_reason": "",
+                # 样本窗口形态：按日分层启用与否直接决定测试段能跨多少决策日，
+                # 因此把它随训练结果一起落盘，便于事后判定 test_window_too_narrow
+                # 是数据不足还是 cap 口径所致。
+                "rows_per_day_cap": _as_int(best_candidate.get("per_day_rows_cap"), default=0),
+                "row_cap_strategy": row_cap_strategy,
+                "rows_per_symbol_cap": per_symbol_rows_cap,
+                "max_rows": max_rows,
+                "decision_days_used": len(
+                    {_decision_day_of(ref.decision_time) for ref in selected_refs}
+                ),
             }
         except Exception as exc:
             error_text = f"learning_protocol_failed:{exc.__class__.__name__}"
@@ -23806,16 +23847,169 @@ def _dedupe_preserve_order(items: list[str]) -> list[str]:
     return deduped
 
 
+class _RowCapRow(Protocol):
+    """行上限裁剪所需的最小行接口（``SnapshotRef`` 与 ``SignalSnapshot`` 均满足）。
+
+    B4 后选池阶段传 ``SnapshotRef``（无特征载荷），历史/其它路径仍传
+    ``SignalSnapshot``——两者字段名一致，故以协议约束而不是具体类。
+    """
+
+    snapshot_id: str
+    symbol: str
+    decision_time: Any
+
+
+ROW_CAP_STRATEGIES = ("keep_last", "per_day")
+
+
+def _resolve_row_cap_strategy(value: object) -> str:
+    """规范化行数 cap 策略名；未知取值 fail-closed 报错。
+
+    不做静默兜底：配置写错时若悄悄退回 keep_last，窗口问题会看起来「已经修了」
+    却依旧存在——这正是 2026-09-14 那次排障里最贵的一类假象。
+    """
+    strategy = str(value if value is not None else "keep_last").strip().lower()
+    if not strategy:
+        return "keep_last"
+    if strategy not in ROW_CAP_STRATEGIES:
+        raise ValueError(
+            "bootstrap_row_cap_strategy must be one of "
+            f"{ROW_CAP_STRATEGIES}, got {strategy!r}"
+        )
+    return strategy
+
+
+def _resolve_per_day_rows_cap(
+    *,
+    strategy: str,
+    configured: int,
+    max_rows: int,
+    per_day_counts: Sequence[int],
+) -> int:
+    """求实际生效的「单决策日条数上限」；0 表示不启用按日分层。
+
+    自动档（``configured <= 0``）用**最小裁剪**：取最大的每日上限，使
+    ``Σ min(n_d, cap) <= max_rows``（对上限做二分）。这样预算几乎全部花在
+    「保住多少天」上，只削掉超出部分。
+
+    曾经的实现是 ``max_rows // 天数`` 的**均摊**，它在真实的偏斜分布上会反向伤害：
+    2026-09-14 NAS 实测候选集为 256 个决策日 / 156,520 行，其中 229 个稠密日
+    （均约 680 行）与 27 个稀疏日（合计 873 行）。均摊得到的 177 把稠密日从 680
+    砍到 177（样本 40,000 → 17,423），却没能多保住几天，窗口只从 16 天挪到 17 天；
+    最小裁剪则给到约 156 并保住全部 256 天，测试段才可能跨过 20 天。
+    """
+    if strategy != "per_day" or not per_day_counts:
+        return 0
+    if configured > 0:
+        return configured
+    if max_rows <= 0:
+        return 0
+    if sum(per_day_counts) <= max_rows:
+        # 预算本就够装下全部决策日，无需按日裁剪。
+        return 0
+    low, high = 1, max(per_day_counts)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if sum(min(count, mid) for count in per_day_counts) <= max_rows:
+            low = mid
+        else:
+            high = mid - 1
+    return low
+
+
+def _decision_day_of(value: object) -> date:
+    """取样本决策时刻所属的「上海交易日」。
+
+    ``SnapshotRef.decision_time`` 是数据库里的 UTC ISO 字符串（B4 为省解析成本刻意
+    保留字符串形态），``SignalSnapshot.decision_time`` 是 datetime；按日分层必须与 A1
+    的 purge/split 落在同一个日界上，故这里统一解析后交给同一处日界定义。
+    解析器复用 ``sample_store`` 的同一实现（存侧按 UTC ISO 落库），避免第二套解析口径。
+    """
+    if isinstance(value, datetime):
+        return decision_date_shanghai(value)
+    if isinstance(value, date):
+        return decision_date_shanghai(datetime(value.year, value.month, value.day))
+    return decision_date_shanghai(_parse_stored_datetime(value))
+
+
+def _stratify_rows_by_decision_day(
+    ordered: list[_RowCapRow],
+    per_day_rows_cap: int,
+) -> tuple[list[_RowCapRow], int]:
+    """按「上海交易日」把每根日线的样本数压到 ``per_day_rows_cap``。
+
+    ``ordered`` 已按 (decision_time, snapshot_id) 升序。同一决策日内按 snapshot_id
+    取前 N 条——snapshot_id 是内容寻址哈希，等价于对该日截面做确定性随机抽样，
+    不会与标签产生系统相关；关键是让**每个决策日贡献相同的样本量**，从而在总样本
+    数不变的前提下把时间跨度拉长（keep-last-N 会让窗口随 lookback 增长而整体滑动，
+    决策日数反而被钉死在 总量/每日截面 上）。
+
+    返回 (裁剪后的行, 被丢弃的行数)。
+    """
+    if per_day_rows_cap <= 0:
+        return ordered, 0
+    per_day: dict[date, list[_RowCapRow]] = {}
+    for row in ordered:
+        key = _decision_day_of(row.decision_time)
+        per_day.setdefault(key, []).append(row)
+    kept: list[_RowCapRow] = []
+    dropped = 0
+    for key in sorted(per_day):
+        items = sorted(per_day[key], key=lambda item: item.snapshot_id)
+        kept.extend(items[:per_day_rows_cap])
+        dropped += max(0, len(items) - per_day_rows_cap)
+    kept.sort(key=lambda item: (item.decision_time, item.snapshot_id))
+    return kept, dropped
+
+
+def _slide_rows_by_whole_days(
+    ordered: list[_RowCapRow],
+    max_rows: int,
+) -> tuple[list[_RowCapRow], bool]:
+    """全局上限改为**整日滑窗**：从最新决策日往回累加，放不下的整日丢弃。
+
+    与 ``ordered[-max_rows:]`` 的差别在于不会把最新决策日拦腰截断——半截截面会让
+    该日的横截面标签（return_rank 分位）与训练样本口径不一致。仍保留一条兜底：
+    连最新一个整日都放不下时，回退成按行截断以保证有样本可用。
+    """
+    per_day: dict[date, list[_RowCapRow]] = {}
+    for row in ordered:
+        per_day.setdefault(_decision_day_of(row.decision_time), []).append(row)
+    if not per_day:
+        return ordered, False
+    kept: list[_RowCapRow] = []
+    total = 0
+    for key in sorted(per_day, reverse=True):
+        day_rows = per_day[key]
+        if total + len(day_rows) > max_rows:
+            break
+        kept.extend(day_rows)
+        total += len(day_rows)
+    if not kept:
+        return ordered[-max_rows:], True
+    kept.sort(key=lambda item: (item.decision_time, item.snapshot_id))
+    return kept, len(kept) < len(ordered)
+
+
 def _apply_learning_protocol_row_caps(
     *,
-    snapshots: list[SignalSnapshot],
+    snapshots: list[_RowCapRow],
     max_rows: int,
     per_symbol_rows_cap: int,
-) -> tuple[list[SignalSnapshot], bool]:
+    per_day_rows_cap: int = 0,
+) -> tuple[list[_RowCapRow], bool]:
+    """学习协议样本行裁剪：单票上限 → 单日分层 → 全局上限。
+
+    ``per_day_rows_cap > 0`` 时启用**按日分层**：先让每个决策日只留 N 条，再用
+    全局 ``max_rows`` 以整日为粒度回退。这样总样本数与旧口径相当（内存前提不变），
+    但保留的决策日数从 ``max_rows / 每日截面`` 提升到 ``max_rows / per_day_rows_cap``，
+    测试段因而能跨过 ``min_test_split_window_days``。``= 0`` 保持历史
+    keep-last-N 逐行截断语义。
+    """
     ordered = sorted(snapshots, key=lambda item: (item.decision_time, item.snapshot_id))
     if per_symbol_rows_cap > 0:
         snapshot_ids_to_keep: set[str] = set()
-        grouped: dict[str, list[SignalSnapshot]] = {}
+        grouped: dict[str, list[_RowCapRow]] = {}
         for snapshot in ordered:
             symbol_key = _normalize_a_share_symbol(snapshot.symbol) or snapshot.symbol.strip()
             grouped.setdefault(symbol_key, []).append(snapshot)
@@ -23827,9 +24021,16 @@ def _apply_learning_protocol_row_caps(
         ]
 
     truncated = False
-    if max_rows > 0 and len(ordered) > max_rows:
-        ordered = ordered[-max_rows:]
+    ordered, dropped_by_day_cap = _stratify_rows_by_decision_day(ordered, per_day_rows_cap)
+    if dropped_by_day_cap > 0:
         truncated = True
+    if max_rows > 0 and len(ordered) > max_rows:
+        if per_day_rows_cap > 0:
+            ordered, slid = _slide_rows_by_whole_days(ordered, max_rows)
+            truncated = truncated or slid
+        else:
+            ordered = ordered[-max_rows:]
+            truncated = True
     return ordered, truncated
 
 

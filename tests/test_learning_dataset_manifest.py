@@ -176,43 +176,23 @@ def test_dataset_manifest_builder_includes_projection_compatible_legacy_snapshot
     ]
 
 
-def test_dataset_manifest_builder_purges_label_windows_crossing_split_boundary(
-    tmp_path: Path,
-) -> None:
-    """embargo 分组切分按 label 成熟日归集，calibration 集合不会被清空。
+def test_decision_day_split_purges_label_availability_overlap(tmp_path: Path) -> None:
+    """A1：按决策日整日 purge，逐边界断言标签可用性隔离。
 
-    用「交易日」间隔的样本（每天一条），label_mature_time 各不相同，验证：
-    样本按其 label 成熟日落入对应集合（同日成熟同集合），train/calibration/
-    test 三个集合全部非空——回归旧 purge 逻辑把 calibration 清空导致训练失败
-    的缺陷。
+    24 个连续决策日 × 3 只票，label_mature = decision + 2 天。比例 0.25/0.25 的
+    目标尺寸（test=6/cal=6/train=12）可行，但必须剔除 train 尾部与 cal 尾部各两个
+    决策日，否则标签在预测时尚未可知。
     """
+
     store = SampleStore(db_path=tmp_path / "sample_store.duckdb")
     builder = DatasetManifestBuilder(store=store)
-
-    # 8 个交易日，比例 0.25/0.25 会得到 4 train / 2 calibration / 2 test。
-    for index in range(8):
-        decision_time = datetime(2026, 1, 1, 14, 30, tzinfo=UTC) + timedelta(days=index)
-        store.write_snapshot(
-            _build_snapshot(
-                f"snap-{index:03d}",
-                decision_time.isoformat(),
-            )
-        )
-        # 前 3 天标签成熟得早；其余样本 label 窗口较长，跨越多个集合边界。
-        if index <= 2:
-            mature = decision_time + timedelta(days=1)
-        else:
-            mature = decision_time + timedelta(days=10)
-        store.upsert_outcome(
-            OutcomeRecord(
-                snapshot_id=f"snap-{index:03d}",
-                maturity_status=MaturityStatus.RECONCILED,
-                label_mature_time=mature,
-                realized_return=0.05,
-                backfill_fidelity_tier=BackfillFidelityTier.GOLD,
-                backfill_source="runtime_observed",
-            )
-        )
+    rows = _write_daily_cross_sections(
+        store,
+        day_count=24,
+        symbols=("600000.SH", "600001.SH", "600002.SH"),
+        horizon_days=2,
+    )
+    assert rows == 72
 
     manifest = builder.create_manifest(
         feature_schema_id="feature_schema_v1_abc",
@@ -222,31 +202,334 @@ def test_dataset_manifest_builder_purges_label_windows_crossing_split_boundary(
         fidelity_filter=[BackfillFidelityTier.GOLD],
         calibration_ratio=0.25,
         test_ratio=0.25,
-        embargo_days=7,
+        embargo_days=2,
     )
 
-    items = store.list_manifest_items(manifest.dataset_manifest_id)
-    # 结构性 embargo：同一 label 成熟日的样本必须落在同一 split（无同日
-    # 标签跨集合泄漏），且没有样本被事后 purge 掉。
-    assert manifest.included_snapshot_count == 8
-    outcome_map = {outcome.snapshot_id: outcome for outcome in store.list_outcomes()}
-    by_mature_date: dict[str, set[str]] = {}
-    for item in items:
-        mature = outcome_map[item.snapshot_id].label_mature_time
-        assert mature is not None
-        by_mature_date.setdefault(str(mature.date()), set()).add(item.split_name)
-    assert all(len(splits) == 1 for splits in by_mature_date.values())
+    report = manifest.split_isolation_report
+    assert report["policy"] == "decision_day_label_availability_purge_v1"
+    assert report["status"] == "isolated"
+    # 逐边界判据：max(前段截面标签可用时间) < min(后段决策时间)，两侧决策日粒度。
+    boundaries = {item["name"]: item for item in report["boundaries"]}  # type: ignore[union-attr]
+    assert set(boundaries) == {"train->calibration", "calibration->test"}
+    for name in ("train->calibration", "calibration->test"):
+        boundary = boundaries[name]
+        assert boundary["satisfied"] is True
+        assert datetime.fromisoformat(
+            boundary["prev_max_label_available"]
+        ) < datetime.fromisoformat(boundary["next_min_decision"])
+    assert report["violations"] == 0
+    # 账本：purge 前 = 成员 + 剔除，且两者都在报告里。
+    assert report["rows_before_purge"] == 72
+    assert manifest.purged_decision_days == 4
+    assert manifest.purged_rows == 12
+    assert manifest.included_snapshot_count == 60
+    assert report["rows_before_purge"] == manifest.included_snapshot_count + manifest.purged_rows
+    assert report["embargo_gap_trading_days"] == {
+        "train->calibration": 2,
+        "calibration->test": 2,
+    }
+    # 四项目报告：决策日自然日跨度 / 有效交易日数 / 成熟日范围 / 标签可用性边界。
+    splits = report["splits"]
+    assert splits["train"]["effective_trading_days"] == 8  # type: ignore[index]
+    assert splits["calibration"]["effective_trading_days"] == 6  # type: ignore[index]
+    assert splits["test"]["effective_trading_days"] == 6  # type: ignore[index]
+    for split_name in ("train", "calibration", "test"):
+        metrics = splits[split_name]  # type: ignore[index]
+        assert metrics["decision_span_calendar_days"] >= metrics["effective_trading_days"]
+        assert len(metrics["maturity_range"]) == 2
+        assert metrics["max_label_available_time"]
 
-    # 回归：三集合全部非空——旧逻辑会因标签窗口跨入下一集合而清空
-    # calibration，导致训练端 "empty train/calibration/test set" 失败。
-    split_names = {item.split_name for item in items}
-    assert split_names == {"train", "calibration", "test"}
+
+def test_decision_day_purge_keeps_cross_sections_whole(tmp_path: Path) -> None:
+    """被剔除的是整日截面：某日要么 3 行全在，要么 3 行全不在。"""
+
+    store = SampleStore(db_path=tmp_path / "sample_store.duckdb")
+    builder = DatasetManifestBuilder(store=store)
+    _write_daily_cross_sections(
+        store,
+        day_count=24,
+        symbols=("600000.SH", "600001.SH", "600002.SH"),
+        horizon_days=2,
+    )
+    manifest = builder.create_manifest(
+        feature_schema_id="feature_schema_v1_abc",
+        feature_schema_hash="feature_hash_1",
+        label_policy_id="label_policy_v1_abc",
+        label_policy_hash="label_hash_1",
+        fidelity_filter=[BackfillFidelityTier.GOLD],
+        calibration_ratio=0.25,
+        test_ratio=0.25,
+        embargo_days=2,
+    )
+
+    rows_per_day: dict[str, int] = {}
+    for item in store.list_manifest_items(manifest.dataset_manifest_id):
+        day = (item.decision_time + timedelta(hours=8)).date().isoformat()
+        rows_per_day[day] = rows_per_day.get(day, 0) + 1
+    assert set(rows_per_day.values()) == {3}
+    assert len(rows_per_day) == 20
+    all_days = {
+        (snapshot.decision_time + timedelta(hours=8)).date().isoformat()
+        for snapshot in store.list_snapshots()
+    }
+    assert len(all_days - set(rows_per_day)) == manifest.purged_decision_days
+
+
+def test_decision_day_purge_keeps_calibration_and_train_non_empty(tmp_path: Path) -> None:
+    """回归 PR#20：隔离改造不得把 calibration / train 清空。"""
+
+    store = SampleStore(db_path=tmp_path / "sample_store.duckdb")
+    builder = DatasetManifestBuilder(store=store)
+    _write_daily_cross_sections(
+        store,
+        day_count=24,
+        symbols=("600000.SH",),
+        horizon_days=2,
+    )
+    manifest = builder.create_manifest(
+        feature_schema_id="feature_schema_v1_abc",
+        feature_schema_hash="feature_hash_1",
+        label_policy_id="label_policy_v1_abc",
+        label_policy_hash="label_hash_1",
+        fidelity_filter=[BackfillFidelityTier.GOLD],
+        calibration_ratio=0.1,
+        test_ratio=0.1,
+        embargo_days=2,
+    )
+
+    split_counts = {entry.split_name: entry.row_count for entry in manifest.split_plan}
+    assert set(split_counts) == {"train", "calibration", "test"}
+    assert all(count > 0 for count in split_counts.values())
+    assert manifest.manifest_quality_flags == []
+
+
+def test_decision_day_purge_degrades_split_sizes_before_failing(tmp_path: Path) -> None:
+    """目标尺寸不可行时缩小 test/cal 直到判据成立，并标记 degraded。"""
+
+    store = SampleStore(db_path=tmp_path / "sample_store.duckdb")
+    builder = DatasetManifestBuilder(store=store)
+    # 10 个连续决策日、label 窗口 3 天：0.4/0.4 的目标尺寸装不进隔离所需间隔。
+    _write_daily_cross_sections(
+        store,
+        day_count=10,
+        symbols=("600000.SH",),
+        horizon_days=3,
+    )
+    manifest = builder.create_manifest(
+        feature_schema_id="feature_schema_v1_abc",
+        feature_schema_hash="feature_hash_1",
+        label_policy_id="label_policy_v1_abc",
+        label_policy_hash="label_hash_1",
+        fidelity_filter=[BackfillFidelityTier.GOLD],
+        calibration_ratio=0.4,
+        test_ratio=0.4,
+        embargo_days=3,
+    )
+
+    report = manifest.split_isolation_report
+    assert report["status"] == "isolated_degraded"
+    assert "label_availability_split_degraded" in manifest.warning_quality_flags
+    assert report["violations"] == 0
+    boundaries = {item["name"]: item for item in report["boundaries"]}  # type: ignore[union-attr]
+    for name in ("train->calibration", "calibration->test"):
+        assert boundaries[name]["satisfied"] is True
+    assert manifest.manifest_quality_flags == []
+
+
+def test_decision_day_purge_infeasible_flags_blocking(tmp_path: Path) -> None:
+    """判据不可满足时标记 infeasible，trainer 据此 fail-closed。"""
+
+    store = SampleStore(db_path=tmp_path / "sample_store.duckdb")
+    builder = DatasetManifestBuilder(store=store)
+    # 12 个连续决策日、label 窗口 5 天：最小可行布局需要 15 天，隔离不可满足。
+    _write_daily_cross_sections(
+        store,
+        day_count=12,
+        symbols=("600000.SH",),
+        horizon_days=5,
+    )
+    manifest = builder.create_manifest(
+        feature_schema_id="feature_schema_v1_abc",
+        feature_schema_hash="feature_hash_1",
+        label_policy_id="label_policy_v1_abc",
+        label_policy_hash="label_hash_1",
+        fidelity_filter=[BackfillFidelityTier.GOLD],
+        calibration_ratio=0.25,
+        test_ratio=0.25,
+        embargo_days=5,
+    )
+
+    assert manifest.split_isolation_report["status"] == "infeasible"
+    assert "label_availability_purge_infeasible" in manifest.manifest_quality_flags
+    assert manifest.purged_rows == 0
+
+
+def test_decision_day_purge_flags_when_isolation_cannot_be_verified(tmp_path: Path) -> None:
+    """决策日不足三段时无法证明隔离 → 报告 violations>0 且必须 fail-closed。"""
+
+    store = SampleStore(db_path=tmp_path / "sample_store.duckdb")
+    builder = DatasetManifestBuilder(store=store)
+    _write_daily_cross_sections(
+        store,
+        day_count=2,
+        symbols=("600000.SH",),
+        horizon_days=2,
+    )
+    manifest = builder.create_manifest(
+        feature_schema_id="feature_schema_v1_abc",
+        feature_schema_hash="feature_hash_1",
+        label_policy_id="label_policy_v1_abc",
+        label_policy_hash="label_hash_1",
+        fidelity_filter=[BackfillFidelityTier.GOLD],
+        calibration_ratio=0.25,
+        test_ratio=0.25,
+        embargo_days=2,
+    )
+
+    assert manifest.split_isolation_report["status"] == "insufficient_decision_days"
+    assert int(manifest.split_isolation_report["violations"]) > 0
+    assert "label_availability_purge_infeasible" in manifest.manifest_quality_flags
+
+
+def test_decision_day_purge_records_late_maturing_samples(tmp_path: Path) -> None:
+    """异常延迟成熟样本必须计数留样，否则 purge 规模无法解释。"""
+
+    store = SampleStore(db_path=tmp_path / "sample_store.duckdb")
+    builder = DatasetManifestBuilder(store=store)
+    _write_daily_cross_sections(
+        store,
+        day_count=24,
+        symbols=("600000.SH", "600001.SH"),
+        horizon_days=2,
+    )
+    # 第 5 天的一行成熟时间远超名义窗口（decision + 30 天）。
+    store.upsert_outcome(
+        OutcomeRecord(
+            snapshot_id="snap-005-600001.SH",
+            maturity_status=MaturityStatus.RECONCILED,
+            label_mature_time=datetime(2026, 1, 1, 14, 30, tzinfo=UTC) + timedelta(days=5 + 30),
+            realized_return=0.05,
+            backfill_fidelity_tier=BackfillFidelityTier.GOLD,
+            backfill_source="runtime_observed",
+        )
+    )
+
+    manifest = builder.create_manifest(
+        feature_schema_id="feature_schema_v1_abc",
+        feature_schema_hash="feature_hash_1",
+        label_policy_id="label_policy_v1_abc",
+        label_policy_hash="label_hash_1",
+        fidelity_filter=[BackfillFidelityTier.GOLD],
+        calibration_ratio=0.25,
+        test_ratio=0.25,
+        embargo_days=2,
+    )
+
+    report = manifest.split_isolation_report
+    assert report["late_maturing_row_count"] == 1
+    examples = report["late_maturing_examples"]
+    assert len(examples) == 1
+    assert examples[0]["snapshot_id"] == "snap-005-600001.SH"  # type: ignore[index]
+    # 该异常截面被整日剔除，且整个截面（2 行）一起走。
+    assert manifest.purged_rows >= 2
+
+
+def test_manifest_isolation_report_round_trips_through_store(tmp_path: Path) -> None:
+    """报告必须持久化：重新读回的 manifest 与首次创建的一致。"""
+
+    store = SampleStore(db_path=tmp_path / "sample_store.duckdb")
+    builder = DatasetManifestBuilder(store=store)
+    _write_daily_cross_sections(
+        store,
+        day_count=24,
+        symbols=("600000.SH", "600001.SH"),
+        horizon_days=2,
+    )
+    created = builder.create_manifest(
+        feature_schema_id="feature_schema_v1_abc",
+        feature_schema_hash="feature_hash_1",
+        label_policy_id="label_policy_v1_abc",
+        label_policy_hash="label_hash_1",
+        fidelity_filter=[BackfillFidelityTier.GOLD],
+        calibration_ratio=0.25,
+        test_ratio=0.25,
+        embargo_days=2,
+    )
+
+    reloaded = store.get_manifest(created.dataset_manifest_id)
+    assert reloaded is not None
+    assert reloaded.purged_rows == created.purged_rows
+    assert reloaded.purged_decision_days == created.purged_decision_days
+    assert reloaded.split_isolation_report == created.split_isolation_report
+    assert reloaded.split_isolation_report["violations"] == 0
+
+
+def test_manifest_invariant_holds_when_embargo_disabled(tmp_path: Path) -> None:
+    """未启用 embargo（embargo_days=0）时不写隔离报告，保持旧口径。"""
+
+    store = SampleStore(db_path=tmp_path / "sample_store.duckdb")
+    builder = DatasetManifestBuilder(store=store)
+    _write_daily_cross_sections(
+        store,
+        day_count=24,
+        symbols=("600000.SH",),
+        horizon_days=2,
+    )
+    manifest = builder.create_manifest(
+        feature_schema_id="feature_schema_v1_abc",
+        feature_schema_hash="feature_hash_1",
+        label_policy_id="label_policy_v1_abc",
+        label_policy_hash="label_hash_1",
+        fidelity_filter=[BackfillFidelityTier.GOLD],
+    )
+
+    assert manifest.split_isolation_report == {}
+    assert manifest.purged_rows == 0
+    assert manifest.purged_decision_days == 0
+
+
+def _write_daily_cross_sections(
+    store: SampleStore,
+    *,
+    day_count: int,
+    symbols: tuple[str, ...],
+    horizon_days: int,
+    base_time: datetime | None = None,
+) -> int:
+    """写入 day_count 个连续决策日 × 每个 symbol 一行的截面，返回行数。"""
+
+    start = base_time or datetime(2026, 1, 1, 14, 30, tzinfo=UTC)
+    rows = 0
+    for index in range(day_count):
+        decision_time = start + timedelta(days=index)
+        for symbol in symbols:
+            snapshot_id = f"snap-{index:03d}-{symbol}"
+            store.write_snapshot(
+                _build_snapshot(
+                    snapshot_id,
+                    decision_time.isoformat(),
+                    symbol=symbol,
+                )
+            )
+            store.upsert_outcome(
+                OutcomeRecord(
+                    snapshot_id=snapshot_id,
+                    maturity_status=MaturityStatus.RECONCILED,
+                    label_mature_time=decision_time + timedelta(days=horizon_days),
+                    realized_return=0.05,
+                    backfill_fidelity_tier=BackfillFidelityTier.GOLD,
+                    backfill_source="runtime_observed",
+                )
+            )
+            rows += 1
+    return rows
 
 
 def _build_snapshot(
     snapshot_id: str,
     decision_time: str,
     *,
+    symbol: str = "600000.SH",
     feature_schema_id: str = "feature_schema_v1_abc",
     feature_schema_hash: str = "feature_hash_1",
     feature_vector: dict[str, float] | None = None,
@@ -254,7 +537,7 @@ def _build_snapshot(
     return SignalSnapshot(
         snapshot_id=snapshot_id,
         code_version="git:test",
-        symbol="600000.SH",
+        symbol=symbol,
         strategy="trend",
         decision_time=datetime.fromisoformat(decision_time).astimezone(UTC),
         feature_vector=feature_vector or {"ret_1d": 0.01, "atr14": 0.4},

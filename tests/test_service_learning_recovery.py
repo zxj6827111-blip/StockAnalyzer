@@ -158,8 +158,11 @@ def test_learning_protocol_exception_recovers_corrupt_db_in_except_block(
     db_path = _learning_protocol_db_path(service)
     db_path.write_text(_corrupt_text(), encoding="utf-8")
 
+    # 62a85d1 之后恢复路径先做文本级判定（_is_likely_learning_protocol_corruption）：
+    # 只有含真实损坏标记、且不含锁冲突标记的文本才走恢复。夹具必须提供这样的
+    # 文本，否则走不到恢复分支（此前只有 "Failed to deserialize"，不含任何标记）。
     fake_exception = type("SerializationException", (RuntimeError,), {})(
-        "Failed to deserialize the database"
+        "Failed to deserialize the database: database file is corrupted"
     )
     with mock.patch.object(
         service._label_policy_registry,
