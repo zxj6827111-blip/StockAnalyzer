@@ -944,15 +944,22 @@ def _ci_high(payload: object) -> float:
     return float("nan")
 
 
-def _environment_fingerprint(training: object = None) -> dict[str, object]:
-    """训练环境指纹——不记录它，跨运行的口径漂移会完全静默。
+def _environment_fingerprint(training: object = None, labels: object = None) -> dict[str, object]:
+    """训练口径指纹——不记录它，跨运行的口径漂移会完全静默。
 
-    2026-09-15 实证：LightGBM 的 params 里**没有** ``num_threads``（见
-    ``models/adapters.py``），线程数完全由 ``OMP_NUM_THREADS`` 决定。一次没带
-    线程环境变量的抛壳运行（生产容器钉的是 8）训出了不同的模型：同一份数据、
-    同一组参数，aggregate IC 从 0.0612/0.0624/0.0634（三次）跳到 **0.0825**——
-    比 0.0019 的复跑噪声地板大一个量级。所以线程环境是与数据/参数同级的口径，
-    必须随报告落盘。
+    2026-09-15 实证（两次都踩到）：
+
+    1. LightGBM 的 params 里**没有** ``num_threads``（见 ``models/adapters.py``），
+       线程数完全由 ``OMP_NUM_THREADS`` 决定；
+    2. 报告里的 ``dataset.label_basis`` 是**数据集**属性（来自 pit_meta），不是训练
+       用的标签——训练标签来自 ``cfg.labels.basis``，会被 ``SA__LABELS__BASIS`` 覆盖。
+       一次没带该环境变量的抛壳运行训的是 soup 标签，aggregate IC 因此是 0.0802/0.0825,
+       而生产容器里（``SA__LABELS__BASIS=return_rank``）的历史三次是 0.0612/0.0624/0.0634。
+       同一份数据、同一 fold、同一 IC 实现（reversal 端点 IC 逐位相同 0.05779939947337951）
+       却差了 0.019——**属口径漂移而非噪声**。
+
+    所以训练/标签/线程三项都必须随报告落盘，否则"同一个 harness 跑出来的数"可能根本
+    不是同一个东西。
     """
     import os  # noqa: WPS433 - 仅在生成指纹时需要
 
@@ -963,6 +970,8 @@ def _environment_fingerprint(training: object = None) -> dict[str, object]:
             "MKL_NUM_THREADS",
             "OPENBLAS_NUM_THREADS",
             "NUMEXPR_NUM_THREADS",
+            "SA__LABELS__BASIS",
+            "SA__TRAINING__TEST_RATIO",
         )
     }
     fingerprint["cpu_count"] = os.cpu_count()
@@ -983,6 +992,12 @@ def _environment_fingerprint(training: object = None) -> dict[str, object]:
                 "min_test_split_window_days",
                 "min_samples",
             )
+        }
+    if labels is not None:
+        # 真正决定模型学什么的字段；与上面 dataset.label_basis 不是一回事。
+        fingerprint["labels"] = {
+            key: getattr(labels, key, None)
+            for key in ("basis", "horizon_days", "positive_return_threshold")
         }
     return fingerprint
 
@@ -1440,7 +1455,7 @@ def main() -> int:
     payload = {
         "generated_at": datetime.utcnow().isoformat() + "Z",
         "validation_scope": VALIDATION_SCOPE_PROCESS,
-        "environment": _environment_fingerprint(cfg.training),
+        "environment": _environment_fingerprint(cfg.training, cfg.labels),
         "dataset": {
             "dir": args.dataset_dir,
             "label_basis": label_basis,
