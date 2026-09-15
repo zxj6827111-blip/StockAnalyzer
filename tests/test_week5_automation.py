@@ -1826,3 +1826,126 @@ def test_theme_injection_unavailable_state_is_noop(tmp_path: Path) -> None:
     assert injection["mode"] == "off"
     assert injection["pinned_symbols"] is None
 
+
+
+def test_night_pool_gates_on_final_deep_score_not_shortlist_copy(tmp_path: Path) -> None:
+    """门槛必须用最终深分，不得被 shortlist 副本判掉榜首。
+
+    2026-09-14 夜扫实测：002479 最终分 76.22（S 级 / buy）、shortlist_score 与
+    execution_reranked_score 都是 62.57（未跑 rerank 时后者只是前者副本），被旧
+    门槛（rerank → shortlist → score）判成 62.57 < 65 丢弃；600060（65.53 vs 61.30）
+    同样被丢；进池并成为唯一被盯的是更弱的 300592（67.33/A/watch）。
+    一份报告里系统自己的最强票进不了自己的观察池，属自相矛盾。
+    """
+    service = FakeService(tmp_path)
+    service.scan_report = {
+        "status": "ok",
+        "data_gate": {"status": "ok", "reasons": []},
+        "prefilter": {
+            "universe_count": 300,
+            "eligible_count": 300,
+            "batch_coverage_ratio": 1.0,
+            "intraday_freshness": {"fresh_ratio": 1.0},
+        },
+        "signal_pool": {
+            "ranking": {"mode": "two_stage_funnel", "score_key": "shortlist_score"},
+            "candidates": [
+                {
+                    "symbol": "002479",
+                    "action": "buy",
+                    "grade": "S",
+                    "score": 76.22,
+                    "shortlist_score": 62.57,
+                    "execution_reranked_score": 62.57,
+                },
+                {
+                    "symbol": "600060",
+                    "action": "watch",
+                    "grade": "A",
+                    "score": 65.53,
+                    "shortlist_score": 61.30,
+                    "execution_reranked_score": 61.30,
+                },
+                {
+                    "symbol": "300592",
+                    "action": "watch",
+                    "grade": "A",
+                    "score": 67.33,
+                    "shortlist_score": 67.02,
+                    "execution_reranked_score": 67.02,
+                },
+            ],
+        },
+    }
+
+    result = RuntimeWeek5AutomationService(service).run_night_scan(
+        timestamp=datetime(2026, 9, 14, 21, 45, tzinfo=UTC)
+    )
+
+    symbols = [item["symbol"] for item in result["night_pool"]]
+    # 三只都该在池里；榜首必须是最终分最高的 002479
+    assert symbols == ["002479", "300592", "600060"], symbols
+    assert result["night_pool"][0]["score"] == 76.22
+
+
+def test_night_pool_drops_below_threshold_on_every_score_field(tmp_path: Path) -> None:
+    """所有分数字段都低于门槛时仍必须丢弃（修正不得变成"谁来都放行"）。"""
+    service = FakeService(tmp_path)
+    service.scan_report = {
+        "status": "ok",
+        "data_gate": {"status": "ok", "reasons": []},
+        "prefilter": {
+            "universe_count": 300,
+            "eligible_count": 300,
+            "batch_coverage_ratio": 1.0,
+            "intraday_freshness": {"fresh_ratio": 1.0},
+        },
+        "signal_pool": {
+            "candidates": [
+                {
+                    "symbol": "600001",
+                    "action": "hold",
+                    "score": 64.99,
+                    "shortlist_score": 64.0,
+                    "execution_reranked_score": 63.0,
+                }
+            ]
+        },
+    }
+
+    result = RuntimeWeek5AutomationService(service).run_night_scan(
+        timestamp=datetime(2026, 9, 14, 21, 45, tzinfo=UTC)
+    )
+
+    assert result["night_pool"] == []
+
+
+def test_night_pool_falls_back_when_final_score_is_none(tmp_path: Path) -> None:
+    """``score`` 键在但为 None 时不得被当成 0 分丢掉，应回落到 shortlist_score。
+
+    ``dict.get(k, default)`` 只在键缺失时回落，键在值为 None 时会把 None 当分数
+    （_as_float(None) → 0.0）——这正是同处的第二个隐患。
+    """
+    service = FakeService(tmp_path)
+    service.scan_report = {
+        "status": "ok",
+        "data_gate": {"status": "ok", "reasons": []},
+        "prefilter": {
+            "universe_count": 300,
+            "eligible_count": 300,
+            "batch_coverage_ratio": 1.0,
+            "intraday_freshness": {"fresh_ratio": 1.0},
+        },
+        "signal_pool": {
+            "candidates": [
+                {"symbol": "600002", "score": None, "shortlist_score": 70.0},
+                {"symbol": "600003", "score": "", "shortlist_score": 71.0},
+            ]
+        },
+    }
+
+    result = RuntimeWeek5AutomationService(service).run_night_scan(
+        timestamp=datetime(2026, 9, 14, 21, 45, tzinfo=UTC)
+    )
+
+    assert sorted(item["symbol"] for item in result["night_pool"]) == ["600002", "600003"]

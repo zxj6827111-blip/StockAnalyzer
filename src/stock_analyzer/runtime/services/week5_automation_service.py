@@ -1396,8 +1396,20 @@ class RuntimeWeek5AutomationService:
         normalized: list[dict[str, object]] = []
         for rank, row in enumerate(rows, start=1):
             symbol = str(row.get("symbol", "")).strip()
-            score = _as_float(
-                row.get("execution_reranked_score", row.get("shortlist_score", row.get("score")))
+            # 门槛分取**最终深分优先**：score → shortlist_score → execution_reranked_score。
+            #
+            # 原实现是 execution_reranked_score → shortlist_score → score，实测后果
+            # （2026-09-14 夜扫）：没跑 rerank 时 execution_reranked_score 只是
+            # shortlist_score 的副本，于是门槛实际卡在**深分之前**的短名单分上——
+            # 002479 最终分 76.22（S 级 / buy）被判 62.57 丢掉，600060（65.53）也被
+            # 判 61.30 丢掉，而更弱的 300592（67.33/A/watch）进了池子。
+            # 一份报告里「系统自己的最强票」进不了自己的观察池，是自相矛盾。
+            #
+            # 注意 shortlist_score 是**漏斗自己声明的排序键**（signal_pool.ranking.
+            # score_key），所以这里只改「门槛用哪个分」，不改漏斗的排序口径；
+            # 同分的次序仍在下面按短名单分/最终分依次兜底。
+            score = _first_present_number(
+                row, "score", "shortlist_score", "execution_reranked_score"
             )
             if not symbol or score < self._cfg_float("auto_sync_watchlist_min_score", 65.0):
                 continue
@@ -1966,6 +1978,23 @@ def _record_auction_baseline(
         for symbol, values in list(by_symbol.items()):
             by_symbol[symbol] = values[-20:]
     return {"dates": dates, "by_symbol": by_symbol}
+
+
+def _first_present_number(row: Mapping[str, object], *keys: str) -> float:
+    """按给定顺序取**第一个非空**键的数值。
+
+    与 ``row.get(a, row.get(b))`` 的区别：``dict.get`` 的默认值只在**键缺失**时生效，
+    键存在但值为 ``None``/空串时会把 None 当成分数（``_as_float(None)`` → 0.0），
+    从而把一个分数字段尚未落盘的候选静默判成 0 分丢掉。这里显式跳过空值再回落。
+    """
+    for key in keys:
+        value = row.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return _as_float(value)
+    return 0.0
 
 
 def _mapping(value: object) -> dict[str, object]:
