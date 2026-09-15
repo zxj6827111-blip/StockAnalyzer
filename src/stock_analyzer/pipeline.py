@@ -41,7 +41,11 @@ from stock_analyzer.learning.sample_schema import (
     SignalSnapshot,
 )
 from stock_analyzer.learning.sample_store import SampleStore
-from stock_analyzer.models.predictor import SignalPredictor
+from stock_analyzer.models.predictor import (
+    SignalPredictor,
+    resolve_score_source,
+    scoring_components,
+)
 from stock_analyzer.models.probability_health import (
     ProbabilityHealthMonitor,
     sanitize_probabilities,
@@ -294,6 +298,10 @@ class AnalyzerPipeline:
         self._label_policy_registry = label_policy_registry
         self._model_registry: ModelRegistry | None = None
         self._probability_health = ProbabilityHealthMonitor()
+        # 打分口径：raw_blend（默认）或 calibrated。推理一次出两族分数，打分只用
+        # 其中一族；cross_review 门固定吃 calibrated（其阈值是绝对阈值，换输入会
+        # 静默改变门禁松紧，属未测量方向）。未知取值在配置校验期已 fail-closed。
+        self._score_source = resolve_score_source(config.models.inference_score_source)
         self._last_probability_health: dict[str, object] = {"status": "not_observed"}
         self._runtime_config_hash = _stable_config_hash(config)
         self._latest_report: PipelineReport | None = None
@@ -1506,8 +1514,19 @@ class AnalyzerPipeline:
                     raise ValueError(f"predictor_rejected:{blocked}")
             if feature_quality_degraded:
                 raw_probabilities = _controlled_heuristic_probabilities(latest_features)
+                # 启发式降级路径只有一族分数，打分必须按 calibrated 键取（启发式
+                # 分数没有校准前后之分，也没有 raw_* 键）。
+                score_probabilities = raw_probabilities
+                effective_score_source = "calibrated"
+                raw_unavailable = True
             else:
-                raw_probabilities = self._infer_probabilities(latest_features)
+                # raw 族只有在 predictor 真的给了 raw_* 键时才可用（旧的只有
+                # predict_row 的 predictor、模型降级模式都退化为"两族同值"）——
+                # 此时若仍按 raw 键取分会 KeyError，故显式回退 calibrated。
+                families, raw_unavailable = self._infer_probability_families(latest_features)
+                raw_probabilities = families["calibrated"]
+                effective_score_source = "calibrated" if raw_unavailable else self._score_source
+                score_probabilities = families[effective_score_source]
         except ValueError as exc:
             self._stage_ms_accum["inference_ms"] += (perf_counter() - infer_started) * 1000.0
             if not str(exc).startswith("predictor_rejected:"):
@@ -1535,6 +1554,12 @@ class AnalyzerPipeline:
                 pass
         self._last_probability_health["feature_quality_degraded"] = feature_quality_degraded
         self._last_probability_health["feature_quality_score"] = round(feature_quality_score, 4)
+        # 打分口径留痕：分数来自哪一族、以及 raw 族是否其实只是校准族的别名
+        # （旧接口 predictor / 降级模式）。没有这两个字段，事后无法分辨
+        # "切了 raw"与"没切"。
+        self._last_probability_health["inference_score_source"] = self._score_source
+        self._last_probability_health["score_source_effective"] = effective_score_source
+        self._last_probability_health["raw_score_unavailable"] = raw_unavailable
         mode_details_fn = getattr(self._predictor, "mode_details", None)
         if callable(mode_details_fn):
             try:
@@ -1588,10 +1613,16 @@ class AnalyzerPipeline:
             latest_features=latest_features,
         )
 
+        # 打分的模型三分量按 inference_score_source 取族（raw=校准前 / calibrated=
+        # 校准后）；键名仍是 ScoreEngine 权重表的 lgbm/xgb/meta。cross_review 用的是
+        # 上面的 `probabilities`（恒为校准后），不随本开关翻转。
+        model_components = scoring_components(
+            score_probabilities, source=effective_score_source
+        )
         components = {
-            "lgbm": probabilities["lgbm"],
-            "xgb": probabilities["xgb"],
-            "meta": probabilities["meta"],
+            "lgbm": model_components["lgbm"],
+            "xgb": model_components["xgb"],
+            "meta": model_components["meta"],
             "board": board_component,
             "completion": completion_component,
         }
@@ -1993,7 +2024,20 @@ class AnalyzerPipeline:
             return bars.copy()
         return bars.tail(self._signal_analysis_lookback_days).copy()
 
-    def _infer_probabilities(self, feature_row: pd.Series) -> dict[str, float]:
+    def _infer_probability_families(
+        self, feature_row: pd.Series
+    ) -> tuple[dict[str, dict[str, float]], bool]:
+        """推理一次，返回 ``({"calibrated": …, "raw": …}, raw_unavailable)``。
+
+        两族来自同一次 ``_predict_matrix``（校准不重跑模型），所以拿 raw 分数的
+        边际成本只是多带一份字典。退化/无 predictor 时两族同值（启发式分数没有
+        校准前后之分），调用方据此打分不会出现混口径。
+
+        ``raw_unavailable=True`` 表示 raw 族不是真的 raw：predictor 是旧接口（只有
+        ``predict_row``）或缺 predictor 或模型降级，此时两族同值（即维持修前行为）。
+        调用方据此回退 calibrated 键取值并写进 health 快照留痕，不静默把校准分数
+        当 raw 用（那会让 A/B 结论建立在混口径的数字上）。
+        """
         if self._predictor is not None:
             blocked = str(getattr(self._predictor, "inference_blocked_reason", lambda: "")())
             if blocked:
@@ -2009,10 +2053,28 @@ class AnalyzerPipeline:
                 except Exception:
                     predictor_degraded = False
             if predictor_degraded:
-                return _controlled_heuristic_probabilities(feature_row)
+                heuristic = _controlled_heuristic_probabilities(feature_row)
+                return {"calibrated": heuristic, "raw": dict(heuristic)}, True
+            predict_with_raw = getattr(self._predictor, "predict_row_with_raw", None)
+            if callable(predict_with_raw):
+                predicted = predict_with_raw(feature_row)
+                values = {str(key): float(value) for key, value in predicted.items()}
+                return {
+                    "calibrated": {key: values[key] for key in ("lgbm", "xgb", "meta")},
+                    "raw": {key: values[key] for key in ("raw_lgbm", "raw_xgb", "raw_blend")},
+                }, False
+            # 旧接口 predictor 只有校准后分数：两族同值（即维持修前行为），
+            # 并由 health 快照的 raw_score_unavailable 留痕，不静默冒充 raw。
             predicted = self._predictor.predict_row(feature_row)
-            return {str(key): float(value) for key, value in predicted.items()}
-        return _controlled_heuristic_probabilities(feature_row)
+            values = {str(key): float(value) for key, value in predicted.items()}
+            return {"calibrated": values, "raw": dict(values)}, True
+        heuristic = _controlled_heuristic_probabilities(feature_row)
+        return {"calibrated": heuristic, "raw": dict(heuristic)}, True
+
+    def _infer_probabilities(self, feature_row: pd.Series) -> dict[str, float]:
+        """校准后分数（兼容入口；打分侧改用 ``_infer_probability_families``）。"""
+        families, _ = self._infer_probability_families(feature_row)
+        return families["calibrated"]
 
     def _score_board_component(self, *, symbol: str, bars: pd.DataFrame) -> float:
         if bars.empty:
