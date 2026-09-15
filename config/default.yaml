@@ -780,6 +780,12 @@ training:
   bootstrap_max_symbols: 0
   bootstrap_dataset_max_rows: 500000
   bootstrap_per_symbol_rows_cap: 500
+  # 行数 cap 策略：keep_last（历史按行截断）| per_day（按决策日分层）。
+  # per_day 下 bootstrap_dataset_max_rows 变成整日滑窗，决策日数升到
+  # max_rows/每日条数；NAS 用 SA__TRAINING__BOOTSTRAP_ROW_CAP_STRATEGY=per_day 覆盖。
+  bootstrap_row_cap_strategy: keep_last
+  # 仅 per_day 使用：单决策日条数上限；0 = 自动摊平整个 max_rows 预算到全部决策日。
+  bootstrap_max_rows_per_day: 0
   bootstrap_auto_seed_watchlist: true
   bootstrap_seed_watchlist_size: 200
   bootstrap_retry_enabled: true

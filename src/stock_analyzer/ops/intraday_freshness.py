@@ -13,8 +13,10 @@ Builds a single freshness assessment for the nightly deep funnel:
   - summary_missing + delta_missing -> missing
   - effective_as_of is None or < required -> effective_stale
   - else check session completeness: fetch the summary row for the
-    required date and check ``minute_count >= 230`` (full A-share
-    session ~240 min; 230 is the completeness threshold). Missing row
+    required date and check ``minute_count`` against the shared
+    session-completeness threshold (see
+    ``stock_analyzer.data.intraday_sync.SESSION_COMPLETE_MINUTE_THRESHOLD``).
+    Missing row
     or insufficient minutes -> session_incomplete.
   - otherwise -> fresh
 
@@ -30,13 +32,24 @@ raising.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 import pandas as pd
 
-SESSION_COMPLETE_MINUTE_THRESHOLD = 230
-SESSION_COMPLETE_MINUTE_THRESHOLD_5M = 46
+from stock_analyzer.data.intraday_sync import (
+    SESSION_COMPLETE_MINUTE_THRESHOLD,
+    SESSION_COMPLETE_MINUTE_THRESHOLD_5M,
+)
+
+# 阈值不在此处定义——写侧 ``intraday_sync`` 是唯一来源，读侧引用同一常量。
+# 历史上两处各写一份 230，改一处漏一处会让「写进去的」和「读出来判的」不一致。
+__all__ = [
+    "SESSION_COMPLETE_MINUTE_THRESHOLD",
+    "SESSION_COMPLETE_MINUTE_THRESHOLD_5M",
+    "IntradayFreshnessReport",
+    "build_intraday_freshness_report",
+]
 
 
 def _coerce_date(value: object) -> date | None:
@@ -188,6 +201,77 @@ def _fetch_summary_minute_count(
     return None
 
 
+TRADED = "traded"
+NOT_TRADING = "not_trading"
+TRADE_STATE_UNKNOWN = "unknown"
+
+# 判定「必需交易日当天有没有会话」的日线探测窗：end 取必需日 +14 自然日、
+# 回溯 40 根，足以覆盖必需日前后各约 20 个交易日。
+_TRADE_STATE_PROBE_LOOKAHEAD_DAYS = 14
+_TRADE_STATE_PROBE_BARS = 40
+
+
+def _daily_frame_dates(frame: pd.DataFrame) -> set[date]:
+    """从日线帧取日期集合（索引为日期或含 ``date`` 列都能处理）。"""
+    if isinstance(frame.index, pd.DatetimeIndex):
+        raw: list[object] = list(frame.index)
+    elif "date" in frame.columns:
+        raw = list(frame["date"])
+    else:
+        return set()
+    dates: set[date] = set()
+    for value in raw:
+        coerced = _coerce_date(value)
+        if coerced is not None:
+            dates.add(coerced)
+    return dates
+
+
+def resolve_daily_trade_state(
+    warehouse: Any | None,
+    symbol: str,
+    required_trade_date: date | None,
+) -> str:
+    """判定 ``symbol`` 在 ``required_trade_date`` 当天是否交易。
+
+    只用日线**缺行模式**判定，不看日线的 ``suspended`` 列——NAS 实测该列恒为
+    False（全库无一行 true），依赖它会把停牌当成数据缺失。
+    判据是「必需日无 bar 且该日前后都有 bar」：这条能确证当日停牌
+    （如 600929 在 8/28→9/14、605577 在 9/8→9/14 之间的断档），而单纯的日线
+    断供通常会连带破坏邻近日，不会只精确缺掉单日，故不会把数据故障误判成停牌。
+
+    返回 ``"traded"`` / ``"not_trading"`` / ``"unknown"``；能力缺失或任何异常
+    一律回 ``"unknown"``，由调用方按原逻辑处理（与本模块既有的 fail-soft 取向一致）。
+    """
+    if warehouse is None or required_trade_date is None:
+        return TRADE_STATE_UNKNOWN
+    fetch = getattr(warehouse, "fetch_daily_bars", None)
+    if not callable(fetch):
+        return TRADE_STATE_UNKNOWN
+    try:
+        frame = fetch(
+            symbol,
+            lookback_days=_TRADE_STATE_PROBE_BARS,
+            end_date=required_trade_date + timedelta(days=_TRADE_STATE_PROBE_LOOKAHEAD_DAYS),
+        )
+    except Exception:
+        return TRADE_STATE_UNKNOWN
+    # 不看 ``frame.empty``：只有索引、没有列的帧 ``empty`` 也是 True，
+    # 日线日期才是唯一需要的载荷，故以解析出的日期集合为空与否判定。
+    if not isinstance(frame, pd.DataFrame):
+        return TRADE_STATE_UNKNOWN
+    dates = _daily_frame_dates(frame)
+    if not dates:
+        return TRADE_STATE_UNKNOWN
+    if required_trade_date in dates:
+        return TRADED
+    if any(day < required_trade_date for day in dates) and any(
+        day > required_trade_date for day in dates
+    ):
+        return NOT_TRADING
+    return TRADE_STATE_UNKNOWN
+
+
 @dataclass(slots=True)
 class IntradayFreshnessReport:
     required_trade_date: date | None
@@ -196,6 +280,9 @@ class IntradayFreshnessReport:
     effective_stale: list[str] = field(default_factory=list)
     session_incomplete: list[str] = field(default_factory=list)
     unsupported_market: list[str] = field(default_factory=list)
+    # 必需交易日当天**没有会话**（停牌/整日无成交）的票：不是数据故障，
+    # 不进新鲜度分母、不计入 effective_stale，但仍逐只上报便于对账。
+    not_trading: list[str] = field(default_factory=list)
     source_breakdown: dict[str, int] = field(default_factory=dict)
     fresh_symbols: list[str] = field(default_factory=list)
     fresh_count: int = 0
@@ -215,6 +302,7 @@ class IntradayFreshnessReport:
             "effective_stale": list(self.effective_stale),
             "session_incomplete": list(self.session_incomplete),
             "unsupported_market": list(self.unsupported_market),
+            "not_trading": list(self.not_trading),
             "source_breakdown": dict(self.source_breakdown),
             "fresh_symbols": list(self.fresh_symbols),
             "fresh_count": int(self.fresh_count),
@@ -289,6 +377,7 @@ def build_intraday_freshness_report(
             "delta_missing": 0,
             "effective_stale": len(normalized),
             "session_incomplete": 0,
+            "not_trading": 0,
             "fresh": 0,
         }
         return report
@@ -298,6 +387,7 @@ def build_intraday_freshness_report(
     delta_missing: list[str] = []
     effective_stale: list[str] = []
     session_incomplete: list[str] = []
+    not_trading: list[str] = []
     fresh: list[str] = []
 
     for symbol in normalized:
@@ -308,7 +398,14 @@ def build_intraday_freshness_report(
             unsupported.append(symbol)
             continue
 
-        # 2) Fetch latest dates from summary and delta
+        # 2) 必需交易日当天没有会话（停牌/整日无成交）→ 不是数据故障。
+        # 必须在 missing/stale 分类之前判：这类票 summary 与 delta 都必然缺当日行，
+        # 落到后面会被记成 summary_missing/delta_missing 而污染分母。
+        if resolve_daily_trade_state(delta_warehouse, symbol, req_date) == NOT_TRADING:
+            not_trading.append(symbol)
+            continue
+
+        # 3) Fetch latest dates from summary and delta
         summary_latest = _fetch_latest_intraday_date(summary_warehouse, symbol, interval=interval)
         delta_latest = _fetch_latest_intraday_date(delta_warehouse, symbol, interval=interval)
 
@@ -362,10 +459,13 @@ def build_intraday_freshness_report(
     report.delta_missing = sorted(delta_missing)
     report.effective_stale = sorted(effective_stale)
     report.session_incomplete = sorted(session_incomplete)
+    report.not_trading = sorted(not_trading)
     report.fresh_symbols = sorted(fresh)
     report.fresh_count = len(fresh)
-    # Fresh ratio is fresh / eligible (BJ excluded)
-    eligible_for_ratio = [s for s in normalized if s not in unsupported]
+    # Fresh ratio = fresh / 当日真正应该会话的票（剔除北交所与当日无会话的停牌票）。
+    # 分母若不剔除 not_trading，停牌就会被算成数据陈旧并挤占新鲜度预算。
+    non_trading = set(not_trading)
+    eligible_for_ratio = [s for s in normalized if s not in unsupported and s not in non_trading]
     if eligible_for_ratio:
         report.fresh_ratio = round(len(fresh) / len(eligible_for_ratio), 4)
     else:
@@ -377,6 +477,7 @@ def build_intraday_freshness_report(
         "delta_missing": len(delta_missing),
         "effective_stale": len(effective_stale),
         "session_incomplete": len(session_incomplete),
+        "not_trading": len(not_trading),
         "fresh": len(fresh),
     }
     return report

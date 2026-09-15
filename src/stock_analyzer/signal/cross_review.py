@@ -52,7 +52,18 @@ def evaluate_cross_review(
     config: CrossReviewConfig,
     champion_auc: float | None = None,
     dynamic_history: Sequence[Mapping[str, float]] | None = None,
+    output_semantics: str | None = None,
 ) -> CrossReviewResult:
+    """模型分数的一致性/阈值审查。
+
+    **阈值语义（C2）**：这里的 ``p_*_min`` 是对**模型分数**的阈值——
+    工件为 ``event_probability`` 时它读作"事件概率下限"；工件为
+    ``rank_quantile``（return_rank v3，中间 40% 剔除）时它读作"尾部归属
+    边界"，**不是**全市场上涨概率阈值。同一调用内三个分数必须同语义
+    （禁止事件语义与分位语义混比）。``output_semantics`` 传入后会原样回写
+    进结果，便于审计该次判定用的是哪种口径。
+    """
+
     lgbm = _clamp_probability(lgbm_prob)
     xgb = _clamp_probability(xgb_prob)
     meta = _clamp_probability(meta_prob)
@@ -81,7 +92,7 @@ def evaluate_cross_review(
     if degraded_consensus:
         reasons.append("degraded_consensus_lgbm_saturated")
     mode = "degraded_consensus" if degraded_consensus else "strict"
-    return CrossReviewResult(
+    result = CrossReviewResult(
         passed=(not reasons) or degraded_consensus,
         merged_probability=merged,
         reasons=reasons,
@@ -90,6 +101,10 @@ def evaluate_cross_review(
         thresholds={key: round(value, 4) for key, value in thresholds.items()},
         dynamic=dynamic is not None,
     )
+    if output_semantics:
+        # 语义留痕：不进 result 结构（避免改 schema），以 reason 形式可审计。
+        result.reasons.append(f"output_semantics:{output_semantics}")
+    return result
 
 
 def _passes_degraded_consensus(

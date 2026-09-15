@@ -1936,8 +1936,17 @@ class Week5SelectionEngine:
                 freshness_obj.session_incomplete = sorted(
                     set(report_1m.session_incomplete) | set(report_5m.session_incomplete)
                 )
+                freshness_obj.not_trading = sorted(
+                    set(getattr(report_1m, "not_trading", []))
+                    | set(getattr(report_5m, "not_trading", []))
+                )
+                # 分母 = 应当有会话的票：剔除北交所与当日无会话（停牌）的票。
+                # 不剔除停牌会把「当天没有交易」算成数据陈旧，挤占新鲜度预算。
+                excluded_from_ratio = set(report_1m.unsupported_market) | set(
+                    freshness_obj.not_trading
+                )
                 eligible_for_ratio = max(
-                    1, len([s for s in eligible if s not in set(report_1m.unsupported_market)])
+                    1, len([s for s in eligible if s not in excluded_from_ratio])
                 )
                 freshness_obj.fresh_ratio = (
                     round(len(fresh_both) / eligible_for_ratio, 4) if eligible else 0.0
@@ -2026,6 +2035,7 @@ class Week5SelectionEngine:
                         | set(getattr(freshness_obj, "effective_stale", []))
                         | set(getattr(freshness_obj, "session_incomplete", []))
                         | set(getattr(freshness_obj, "unsupported_market", []))
+                        | set(getattr(freshness_obj, "not_trading", []))
                         | set(getattr(freshness_obj, "summary_missing", []))
                         | set(getattr(freshness_obj, "delta_missing", []))
                     )

@@ -787,8 +787,19 @@ def _deduplicate_by_trading_day(
     return kept, {"rows_before": rows_before, "rows_dropped": rows_before - len(kept)}
 
 
-def _decision_date_shanghai(decision_time: datetime) -> date:
+def decision_date_shanghai(decision_time: datetime) -> date:
+    """决策时刻所属的「上海交易日」（全链路唯一定义）。
+
+    同时被 manifest 质量报告、A1 决策日粒度标签可用性 purge、以及行数 cap 的
+    按日分层使用。三处必须共用同一个「一天」，否则 cap 认定的「一日截面」会与
+    purge/split 认定的「一个决策日」错位——那正是 2026-09-14 测试窗恒窄问题的
+    温床（cap 按自然日切、purge 按上海日切）。
+    """
     return (decision_time + timedelta(hours=8)).date()
+
+
+# 历史私有名别名：既有调用方与测试按私有名导入，保留以免破坏。
+_decision_date_shanghai = decision_date_shanghai
 
 
 def _dedup_quality_flags(

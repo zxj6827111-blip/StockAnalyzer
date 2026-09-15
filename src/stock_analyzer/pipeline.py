@@ -1524,6 +1524,15 @@ class AnalyzerPipeline:
             )
         self._stage_ms_accum["inference_ms"] += (perf_counter() - infer_started) * 1000.0
         self._last_probability_health = self._probability_health.observe(raw_probabilities)
+        # C2：输出语义随健康快照留痕。rank_quantile（return_rank v3，训练剔除
+        # 中间 40%）下这些分数是同日横截面分位归属，`0.5` 是"上尾 vs 下尾"而非
+        # "涨 vs 跌"，下游不得当全市场上涨概率用（见 models/output_semantics.py）。
+        semantics_fn = getattr(self._predictor, "output_semantics_report", None)
+        if callable(semantics_fn):
+            try:
+                self._last_probability_health["output_semantics"] = semantics_fn()
+            except Exception:
+                pass
         self._last_probability_health["feature_quality_degraded"] = feature_quality_degraded
         self._last_probability_health["feature_quality_score"] = round(feature_quality_score, 4)
         mode_details_fn = getattr(self._predictor, "mode_details", None)
@@ -1561,6 +1570,9 @@ class AnalyzerPipeline:
             config=self._config.models.cross_review,
             champion_auc=champion_auc,
             dynamic_history=dynamic_history,
+            # C2：把工件输出语义带进共识判定，阈值含义（事件概率下限 /
+            # 尾部归属边界）在结果里可审计，而不是默认按概率解释。
+            output_semantics=getattr(self._predictor, "output_semantics", None),
         )
         self._stage_ms_accum["cross_review_ms"] += (perf_counter() - cross_review_started) * 1000.0
         score_risk_started = perf_counter()

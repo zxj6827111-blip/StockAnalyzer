@@ -174,9 +174,11 @@ class TestAggregateReport:
             embargo_days=11,
         )
         assert report["aggregate_ic_mean"] > 0
-        assert report["verdict"] in {"INCONCLUSIVE", "GO_CANDIDATE"}
-        # 单测锁定语义：均值>0 但 CI 跨 0 时必须不允许 GO_CANDIDATE 由 CI 背书，
-        # verdict_inputs 必须如实暴露 CI 状态。
+        # 单测锁定语义（C1 修正）：均值>0 但 CI 跨 0 时必须**不允许** GO_CANDIDATE
+        # ——CI 下界 > 0 是 GO 的必要条件，不是"CI 不反对"。此前断言写成
+        # `in {"INCONCLUSIVE","GO_CANDIDATE"}`，与注释自相矛盾且把缺陷固化。
+        assert report["verdict"] == "INCONCLUSIVE"
+        assert report["verdict_inputs"]["ci_supports_positive"] is False
         assert "ci_does_not_support_negative" in report["verdict_inputs"]
 
     def test_insufficient_folds(self) -> None:

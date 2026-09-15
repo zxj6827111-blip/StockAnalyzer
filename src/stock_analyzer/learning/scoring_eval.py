@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import math
 from bisect import bisect_right
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime
+from typing import TypedDict
 
 import numpy as np
 
@@ -236,33 +238,102 @@ def compute_precision_at_k(
     }
 
 
+# 连续块长度（交易日）——**预设常量**，不得依据观测到的显著性事后挑选。
+# 日 IC 存在日间自相关：逐日独立重采样会人为压窄 CI，使"均值>0 但 CI 跨 0"的
+# 序列看起来像有证据（C1 修正点）。5 交易日≈一周，覆盖常见的周内自相关。
+DEFAULT_BLOCK_TRADING_DAYS = 5
+
+
+def _day_sort_key(day: object) -> str:
+    """交易日排序键：``date/datetime`` 取 ISO 串，字符串按原样（ISO 字典序即时间序）。"""
+
+    if isinstance(day, datetime):
+        return day.date().isoformat()
+    if isinstance(day, date):
+        return day.isoformat()
+    return str(day).strip()[:10]
+
+
+class DateBlockBootstrapCI(TypedDict):
+    """moving-block bootstrap 结果（含可审计的口径元数据）。"""
+
+    ci_low: float
+    ci_high: float
+    valid_days: int
+    block_days: int
+    n_blocks: int
+    duplicate_days: int
+    distinct_days: int
+    method: str
+
+
 def date_block_bootstrap_ci(
-    daily_values: list[tuple[date, float]],
+    daily_values: Sequence[tuple[object, float]],
     *,
     n_boot: int = 1000,
     seed: int = 20260905,
     confidence: float = 0.95,
-) -> dict[str, float]:
-    """以交易日为 block 的 bootstrap 置信区间（方案 Phase 2 口径，Phase 1 先行输出）。
+    block_days: int = DEFAULT_BLOCK_TRADING_DAYS,
+) -> DateBlockBootstrapCI:
+    """以**连续交易日块**为单位的 moving-block bootstrap 置信区间。
 
-    输入为逐日指标（如日 IC）；按日重采样后取均值分布的分位数。
-    有效日 < 2 时返回全 NaN。
+    口径（C1 修正）：
+    - 按交易日排序后，以长度 ``block_days``（预设）的**连续块**循环重采样，
+      而不是逐日独立重采样——后者忽视日间自相关，会把 CI 压窄，使「IC>0、
+      CI 跨 0」的序列看起来像有证据；
+    - **保留全部观测**（同一交易日多值不合并，否则有效样本量被静默削掉，
+      极端情形 n < block 会让 CI 退化成零宽＝假显著），同日重复只做计数留痕
+      （``duplicate_days`` / ``distinct_days``）；排序键取 (交易日, 数值)，
+      保证与输入顺序无关的确定性；
+    - 块长与块数为**预设/派生**并在结果中回传，改块长必须显式传参（留痕），
+      不得在看过显著性后调整。
     """
 
-    values = [float(v) for _, v in daily_values if not math.isnan(float(v))]
-    if len(values) < 2:
-        return {"ci_low": float("nan"), "ci_high": float("nan"), "valid_days": len(values)}
+    keyed: list[tuple[str, float]] = []
+    for day, value in daily_values:
+        numeric = float(value)
+        if math.isnan(numeric):
+            continue
+        keyed.append((_day_sort_key(day), numeric))
+    per_day: dict[str, int] = {}
+    for key, _ in keyed:
+        per_day[key] = per_day.get(key, 0) + 1
+    duplicate_days = sum(1 for count in per_day.values() if count > 1)
+    distinct_days = len(per_day)
+    ordered = [value for _, value in sorted(keyed)]
+    n_valid = len(ordered)
+    resolved_block = max(1, int(block_days))
+    alpha = (1.0 - confidence) / 2.0
+    if n_valid < 2:
+        return {
+            "ci_low": float("nan"),
+            "ci_high": float("nan"),
+            "valid_days": n_valid,
+            "block_days": resolved_block,
+            "n_blocks": 0,
+            "duplicate_days": duplicate_days,
+            "distinct_days": distinct_days,
+            "method": "moving_block",
+        }
+    arr = np.asarray(ordered, dtype=float)
+    n_blocks = int(math.ceil(n_valid / resolved_block))
+    offsets = np.arange(resolved_block)
     rng = np.random.default_rng(seed)
-    arr = np.asarray(values, dtype=float)
     means = np.empty(int(n_boot), dtype=float)
     for i in range(int(n_boot)):
-        sample = arr[rng.integers(0, arr.shape[0], arr.shape[0])]
-        means[i] = sample.mean()
-    alpha = (1.0 - confidence) / 2.0
+        # 循环块：起点均匀取自 [0, n)，越界回卷，块内保持交易日连续。
+        starts = rng.integers(0, n_valid, n_blocks)
+        indices = (starts[:, None] + offsets[None, :]).ravel() % n_valid
+        means[i] = float(arr[indices[:n_valid]].mean())
     return {
         "ci_low": float(np.quantile(means, alpha)),
         "ci_high": float(np.quantile(means, 1.0 - alpha)),
-        "valid_days": len(values),
+        "valid_days": n_valid,
+        "block_days": resolved_block,
+        "n_blocks": n_blocks,
+        "duplicate_days": duplicate_days,
+        "distinct_days": distinct_days,
+        "method": "moving_block",
     }
 
 
