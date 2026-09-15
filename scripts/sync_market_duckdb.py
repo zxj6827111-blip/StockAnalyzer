@@ -248,10 +248,22 @@ def _load_symbol_frame(raw: bytes) -> pd.DataFrame | None:
 
 
 def _sync_minute(zip_root: Path, since: date_type) -> int:
-    """同步分钟缺口；返回写入行数。"""
+    """同步分钟缺口；返回写入行数。
+
+    源目录不存在时**拒绝空转**：2026-08-29~09-15 的故障形态正是容器里没有
+    ``/data/qq_minute_raw`` 挂载——``zip_dates`` 恒为空 → 缺口恒为空 → 每天
+    打印 ``no missing dates``，而 ``intraday_summary_1m/5m`` 停在 8/28 十八天。
+    "没有缺口"与"看不到源"必须能区分，否则同类静默故障会再来一次。
+    """
+    if not zip_root.is_dir():
+        raise SystemExit(
+            f"[minute] 源目录不存在: {zip_root} —— 拒绝空转（检查容器挂载 "
+            "/data/qq_minute_raw、或改用 --qq-zip-root；挂载由 "
+            "docker-compose.vendor-overlay.yml 的 SA_QQ_MINUTE_RAW_HOST_ROOT 提供）"
+        )
     missing = _missing_minute_dates(zip_root, since)
     if not missing:
-        print("[minute] no missing dates", flush=True)
+        print(f"[minute] no missing dates (source={zip_root})", flush=True)
         return 0
     print(f"[minute] missing dates: {[d.isoformat() for d in missing]}", flush=True)
 
