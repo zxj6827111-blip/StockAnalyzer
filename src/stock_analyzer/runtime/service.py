@@ -96,6 +96,7 @@ from stock_analyzer.models.bundle import (
     publish_model_bundle,
     verify_artifact_integrity,
 )
+from stock_analyzer.models.identity import describe_artifact_identity
 from stock_analyzer.models.predictor import resolve_score_source
 from stock_analyzer.models.registry import (
     ModelLifecycleState,
@@ -12075,6 +12076,49 @@ class StockAnalyzerService:
 
     def model_registry_status(self, limit: int = 20) -> dict[str, object]:
         return self._runtime_ops_service.model_registry_status(limit=limit)
+
+    def artifact_identity_report(self) -> dict[str, object]:
+        """在服工件 ↔ 注册表 champion 的身份对账（只读；**只观测、不拦截**）。
+
+        动机（2026-09-16）：加载路径从不参与 registry 身份——``AnalyzerPipeline`` 按
+        ``config.training.artifact_path`` 直接读文件，于是"生产到底在跑哪个工件"只能靠
+        文件 mtime 旁证（排查 raw A/B 自检失败时就只能猜是不是工件被换过）。这里把
+        加载期实算的内容哈希与 champion 登记的哈希摆到一起，状态取值见
+        ``models/identity.py``。
+
+        刻意不做门禁：当前生产本就是"裸 alias 文件 + 注册表无 champion"的状态，
+        直接 fail-closed 会把服务打死。先让身份可见，是否强制另议。
+        """
+        predictor = getattr(self._pipeline, "_predictor", None)
+        details: dict[str, object] = {}
+        mode_details = getattr(predictor, "mode_details", None)
+        if callable(mode_details):
+            try:
+                raw = mode_details()
+                details = dict(raw) if isinstance(raw, dict) else {}
+            except Exception:  # noqa: BLE001 - 身份查询不得影响健康端点
+                details = {}
+        registry = getattr(self, "_model_registry", None)
+        champion: dict[str, object] | None = None
+        registry_error = ""
+        if registry is not None:
+            try:
+                record = registry.active_champion(suppress_read_errors=True)
+                if record is not None:
+                    champion = {
+                        "model_id": getattr(record, "model_id", ""),
+                        "artifact_uri": getattr(record, "artifact_uri", ""),
+                        "artifact_content_hash": getattr(record, "artifact_content_hash", ""),
+                        "lifecycle_state": str(getattr(record, "lifecycle_state", "")),
+                    }
+            except Exception as exc:  # noqa: BLE001 - 读不到注册表要如实上报，不是 mismatch
+                registry_error = f"{type(exc).__name__}: {exc}"
+        return describe_artifact_identity(
+            loaded_uri=details.get("artifact_uri", ""),
+            loaded_hash=details.get("artifact_content_hash", ""),
+            champion=champion,
+            registry_error=registry_error,
+        )
 
     def shadow_v2_status(self, limit: int = 20) -> dict[str, object]:
         return self._runtime_ops_service.shadow_v2_status(limit=limit)
