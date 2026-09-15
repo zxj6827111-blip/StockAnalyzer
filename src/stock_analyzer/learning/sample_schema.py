@@ -228,6 +228,14 @@ class DatasetManifest(_StrictModel):
     manifest_quality_flags: list[str] = Field(default_factory=list)
     test_split_window_days: int = 0
     test_split_unique_symbol_dates: int = 0
+    # —— 真实时间隔离（label availability purge）记账 ——
+    # purged_decision_days/purged_rows：标签可用时间不早于下一段最早决策、被整体剔除的
+    # 决策日截面数与行数。split_isolation_report：逐边界判据（
+    # max(前段截面标签可用时间) < min(后段决策时间)）与四项目报告。
+    # 未启用 embargo 的旧记录保持默认值。
+    purged_decision_days: int = 0
+    purged_rows: int = 0
+    split_isolation_report: dict[str, Any] = Field(default_factory=dict)
     generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     @field_validator(
@@ -268,6 +276,14 @@ class DatasetManifest(_StrictModel):
         parsed = int(value)
         if parsed < 0:
             raise ValueError("test split quality counts must be >= 0")
+        return parsed
+
+    @field_validator("purged_decision_days", "purged_rows")
+    @classmethod
+    def _validate_non_negative_purge_counts(cls, value: int) -> int:
+        parsed = int(value)
+        if parsed < 0:
+            raise ValueError("purge count fields must be >= 0")
         return parsed
 
     @field_validator(

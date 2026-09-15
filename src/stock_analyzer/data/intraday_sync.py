@@ -20,7 +20,8 @@ with the guarantees required by the PLAN:
 * Sina fallback also pulls only 1m and locally derives 5m.
 * Concurrency 4, per-request timeout 5 s, total deadline 180 s.
 * Session completeness threshold: required date present, first bar
-  ≤ 09:35, last bar ≥ 14:55, valid 1-minute count ≥ 230.
+  ≤ 09:35, last bar ≥ 14:55, valid 1-minute count ≥
+  ``SESSION_COMPLETE_MINUTE_THRESHOLD``.
 * BJ stays in the light/audit reports but as ``unsupported_market`` and
   never enters dependence on minute features (deep/final).
 """
@@ -41,7 +42,21 @@ import pandas as pd
 from stock_analyzer.data.provider import DataSourceError
 
 _SYMBOL_RE = re.compile(r"(\d{6})")
-_SESSION_COMPLETE_MINUTE_THRESHOLD = 230
+
+# 会话完整性的**唯一来源**（写侧 intraday_sync 与读侧 ops.intraday_freshness 共用，
+# 避免两处常量各自漂移）。语义说明：
+# - A 股连续竞价 09:30-11:30 + 13:00-15:00；活跃票实测每个交易日 238 根 1 分钟线。
+# - 首/末根墙钟检查（≤09:35 / ≥14:55）才是**截断检测**：只取到上午、只取到下午
+#   都会在这两项上被拒（上午盘末根 11:30 < 14:55；下午盘首根 13:00 > 09:35）。
+# - 根数下限只表达「有多少根才够算当日的比值/波动特征」。原值 230 = 238 的 96.6%，
+#   等于要求全天几乎无断点，把「低流动性 → 无成交分钟被行情源省略」误判成数据不完整。
+#   2026-09-11 全 100 只自选实测分布：93 只在 230~238，5 只落在 216/224/226/226/228
+#   （成交额 0.8M~9.7M），228~230 之间没有任何样本——即失败侧是流动性伪影而非截断。
+#   取 200（≈全天 83%，低于实测低流动性尾部 16 根）仍能把半日会话（≈120 根）拒之门外。
+SESSION_COMPLETE_MINUTE_THRESHOLD = 200
+SESSION_COMPLETE_MINUTE_THRESHOLD_5M = 40
+# 向后兼容别名（历史私有名）。
+_SESSION_COMPLETE_MINUTE_THRESHOLD = SESSION_COMPLETE_MINUTE_THRESHOLD
 _PROBE_COUNT = 2
 
 
@@ -243,7 +258,7 @@ def sync_intraday_symbols(
       retried once.
     - Completeness gate per symbol:
       required date present, first bar ≤ 09:35, last bar ≥ 14:55,
-      valid 1-minute count ≥ 230.
+      valid 1-minute count ≥ ``SESSION_COMPLETE_MINUTE_THRESHOLD``.
     - Stale symbols and BJ (``unsupported_market``) never enter deep/final.
     - Shared cross-process lock ``intraday_sync.lock`` guards the DuckDB
       write.
