@@ -154,9 +154,10 @@ def test_scheduler_flags_stuck_and_failing() -> None:
         check_scheduler(
             jobs={
                 "wedged": {"running_since": "2026-09-15T22:00:00", "next_due_at": ""},
-                "broken": {
+                "broken_now": {
                     "consecutive_failures": 3,
                     "last_failure": "boom",
+                    "last_attempt_at": "2026-09-15T09:57:20",
                     "next_due_at": "2026-09-16T00:00:00",
                 },
                 "healthy": {"consecutive_failures": 0, "next_due_at": "2026-09-16T02:00:00"},
@@ -167,7 +168,36 @@ def test_scheduler_flags_stuck_and_failing() -> None:
     assert not results["scheduler_stuck_jobs"].ok
     assert "wedged" in results["scheduler_stuck_jobs"].detail
     assert not results["scheduler_failing_jobs"].ok
-    assert "broken" in results["scheduler_failing_jobs"].detail
+    assert "broken_now" in results["scheduler_failing_jobs"].detail
+
+
+def test_scheduler_old_failure_is_pending_not_defect() -> None:
+    """红灯必须意味着"正在坏"：月度任务的 16 天前旧失败只算待验证。
+
+    实测形态：`factor_ic_decay_report` 的 9 次失败全在 8/31（月度任务、修复已在其后
+    落地），若与"昨天还在失败"的任务同等报红，红灯就会被当背景噪音。
+    """
+    now = datetime(2026, 9, 16, 1, 0, tzinfo=CST)
+    results = _by_name(
+        check_scheduler(
+            jobs={
+                "factor_ic_decay_report": {
+                    "consecutive_failures": 9,
+                    "last_failure": "protocol binding mismatch",
+                    "last_attempt_at": "2026-08-31T23:22:50",
+                    "next_due_at": "2026-08-31T23:52:50",
+                }
+            },
+            now=now,
+        )
+    )
+    assert results["scheduler_failing_jobs"].ok
+    awaiting = results["scheduler_failures_awaiting_run"]
+    assert not awaiting.ok
+    assert awaiting.severity == SEVERITY_PENDING
+    assert "2026-08-31" in awaiting.evidence["awaiting"][0]
+    # 全部一起看：不产生 defect（陈旧条目另算 NOTE）
+    assert summarize(list(results.values()))["ok"] is True
 
 
 def test_scheduler_stale_entry_is_note_not_defect() -> None:

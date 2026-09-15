@@ -56,6 +56,9 @@ READINESS_UPDATE_WINDOW = ((19, 0), (21, 0))
 
 _STUCK_RUNNING_MINUTES = 60
 _STALE_DUE_DAYS = 3
+# 连败的新鲜度分界：末次尝试在此天数内才算「正在失败」，否则属「等下次窗口验证」。
+# 月度任务（如 factor_ic_decay_report）的旧失败不该常亮红灯，否则红灯成背景噪音。
+_RECENT_FAILURE_DAYS = 3
 
 
 @dataclass
@@ -220,16 +223,25 @@ def check_scheduler(
     now: datetime,
     stuck_running_minutes: int = _STUCK_RUNNING_MINUTES,
     stale_due_days: int = _STALE_DUE_DAYS,
+    recent_failure_days: int = _RECENT_FAILURE_DAYS,
 ) -> list[InvariantResult]:
-    """调度健康：卡住的任务 / 连败的任务 / 陈旧条目。
+    """调度健康：卡住的任务 / **正在**失败的 / 陈旧条目。
 
     刻意**不**按 cadence 判 next_due（月度任务会被误判成失败）：``next_due`` 只用来
-    识别"陈旧条目"（``info``，会误导排查但不产生错数）；真正的失败信号是
-    ``consecutive_failures > 0``。
+    识别"陈旧条目"（``info``，会误导排查但不产生错数）。
+
+    连败按**新鲜度**分两类（2026-09-16 首跑后补）：``factor_ic_decay_report`` 的 9 次
+    失败全在 8/31（月度任务、修复已在其后落地），若与"昨天还在失败"的
+    ``week5_automation_auction`` 同等报红，红灯就会被当背景噪音——**红灯必须意味着
+    "正在坏"**：
+
+    - 末次尝试在 ``recent_failure_days`` 内且 cf>0 → ``defect``（正在失败）；
+    - 末次尝试更早 → ``pending_decision``（等下次窗口验证，可能已修）。
     """
     results: list[InvariantResult] = []
     stuck: list[str] = []
     failing: list[str] = []
+    awaiting: list[str] = []
     stale: list[str] = []
     for name, entry in sorted(jobs.items()):
         running_since = str(entry.get("running_since") or "").strip()
@@ -239,7 +251,17 @@ def check_scheduler(
                 stuck.append(f"{name}({running_since[:19]})")
         failures = entry.get("consecutive_failures")
         if isinstance(failures, int) and failures > 0:
-            failing.append(f"{name}(cf={failures}, {str(entry.get('last_failure'))[:60]})")
+            reason = str(entry.get("last_failure") or "")[:60]
+            last_attempt = _parse_dt(
+                str(entry.get("last_attempt_at") or entry.get("last_attempt") or "")
+            )
+            if last_attempt is not None and (now - last_attempt) <= timedelta(
+                days=recent_failure_days
+            ):
+                failing.append(f"{name}(cf={failures}, {reason})")
+            else:
+                stamp = last_attempt.date().isoformat() if last_attempt else "unknown"
+                awaiting.append(f"{name}(cf={failures}, 末次尝试 {stamp}, {reason})")
         due = _parse_dt(str(entry.get("next_due_at") or ""))
         if due is not None and (now - due) > timedelta(days=stale_due_days):
             stale.append(f"{name}(next_due={str(entry.get('next_due_at'))[:19]})")
@@ -248,7 +270,17 @@ def check_scheduler(
         if not stuck
         else f"{len(stuck)} 个任务 running_since 超过 {stuck_running_minutes} 分钟未清：{stuck}"
     )
-    failing_detail = "无连败任务" if not failing else f"{len(failing)} 个任务存在连败：{failing}"
+    failing_detail = (
+        "无正在失败的任务" if not failing else f"{len(failing)} 个任务正在失败：{failing}"
+    )
+    awaiting_detail = (
+        "无待验证的旧失败"
+        if not awaiting
+        else (
+            f"{len(awaiting)} 个任务的历史失败早于 {recent_failure_days} 天，"
+            f"等下次窗口验证：{awaiting}"
+        )
+    )
     stale_detail = (
         "无陈旧条目"
         if not stale
@@ -270,6 +302,15 @@ def check_scheduler(
             severity=SEVERITY_DEFECT,
             detail=failing_detail,
             evidence={"failing": failing},
+        )
+    )
+    results.append(
+        InvariantResult(
+            name="scheduler_failures_awaiting_run",
+            ok=not awaiting,
+            severity=SEVERITY_PENDING,
+            detail=awaiting_detail,
+            evidence={"awaiting": awaiting},
         )
     )
     results.append(

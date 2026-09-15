@@ -7,6 +7,7 @@ state, snapshot replay, stage separation and signal-only safety.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from datetime import UTC, datetime, tzinfo
 from queue import Empty, Queue
@@ -41,10 +42,37 @@ class RuntimeWeek5AutomationService:
             getattr(config, "candidate_state_path", "artifacts/runtime/week5_candidate_state.json")
         ).strip()
         self._candidate_state = CandidateStateStore(service._resolve_evolution_path(state_path))
+        # 竞价 baseline 的**持久副本**：candidate_state 可被重置，而 baseline 需要
+        # 连续 ≥5 天才能生效——重置会静默清零预热（2026-09-16 实测只剩 2 天）。
+        self._auction_baseline_path = self._candidate_state.path.parent / ("auction_baseline.json")
         self._market_snapshots = Week5MarketSnapshotService(service)
         self._market_radar_lock = Lock()
         self._market_radar_active = False
         self._market_radar_worker: Thread | None = None
+
+    def _read_durable_auction_baseline(self) -> dict[str, object]:
+        try:
+            payload = json.loads(self._auction_baseline_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _persist_auction_baseline(self, baseline: Mapping[str, object]) -> dict[str, object]:
+        """把 baseline 落一份到 candidate_state 之外，并原样返回（便于内联进 patch）。
+
+        2026-09-16 实测：baseline 只剩 9/14、9/15 两天，而门槛要 5 天——预热本身没问题，
+        问题是它只活在可被重置的 candidate_state 里，任何重置都会静默清零 5 天。
+        落盘失败不影响竞价链本身（尽力而为，绝不抛）。
+        """
+        try:
+            path = self._auction_baseline_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps(dict(baseline), ensure_ascii=False), encoding="utf-8")
+            tmp.replace(path)
+        except OSError:
+            pass
+        return dict(baseline)
 
     def candidate_state(self) -> dict[str, object]:
         return self._candidate_state.load()
@@ -342,7 +370,10 @@ class RuntimeWeek5AutomationService:
         frame = _rows_to_frame(snapshot_rows)
         state = self.candidate_state()
         night_pool = _mapping_list(state.get("night_pool"))
-        baseline_state = _mapping(state.get("auction_baseline"))
+        baseline_state = _richer_baseline(
+            _mapping(state.get("auction_baseline")),
+            self._read_durable_auction_baseline(),
+        )
         auction = enrich_auction_metrics(
             frame,
             baseline=_baseline_values(baseline_state),
@@ -370,9 +401,9 @@ class RuntimeWeek5AutomationService:
             if snapshot_age_sec is not None and snapshot_age_sec <= self._cfg_int(
                 "auction_snapshot_max_age_sec", 120
             ):
-                baseline_patch["auction_baseline"] = _record_auction_baseline(
-                    baseline_state, snapshot_rows, snapshot, now
-                )
+                recorded = _record_auction_baseline(baseline_state, snapshot_rows, snapshot, now)
+                baseline_patch["auction_baseline"] = recorded
+                self._persist_auction_baseline(recorded)
             self._candidate_state.update(
                 {
                     "opening_focus": [],
@@ -512,8 +543,8 @@ class RuntimeWeek5AutomationService:
         self._candidate_state.update(
             {
                 "opening_focus": focus,
-                "auction_baseline": _record_auction_baseline(
-                    baseline_state, snapshot_rows, snapshot, now
+                "auction_baseline": self._persist_auction_baseline(
+                    _record_auction_baseline(baseline_state, snapshot_rows, snapshot, now)
                 ),
                 "actionable_data_gate": actionable_gate,
                 "latest_auction": report,
@@ -1978,6 +2009,29 @@ def _record_auction_baseline(
         for symbol, values in list(by_symbol.items()):
             by_symbol[symbol] = values[-20:]
     return {"dates": dates, "by_symbol": by_symbol}
+
+
+def _baseline_date_count(state: Mapping[str, object]) -> int:
+    dates = state.get("dates")
+    return len(dates) if isinstance(dates, list) else 0
+
+
+def _richer_baseline(*candidates: Mapping[str, object]) -> dict[str, object]:
+    """取 ``dates`` 最多的那份 baseline（并列取第一个）。
+
+    为什么是"取更丰富的"而不是"合并"：``by_symbol`` 的值列表与 ``dates`` **并非逐日对齐**
+    （某只票某天缺席时列表更短），两份合并无法还原对齐关系、会把中位数算歪；而两份都是
+    同一个 ``_record_auction_baseline`` 写出来的，取更丰富的那份即"保留更长的预热"。
+    """
+    best: Mapping[str, object] = {}
+    best_count = -1
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        count = _baseline_date_count(candidate)
+        if count > best_count:
+            best, best_count = candidate, count
+    return dict(best)
 
 
 def _first_present_number(row: Mapping[str, object], *keys: str) -> float:
