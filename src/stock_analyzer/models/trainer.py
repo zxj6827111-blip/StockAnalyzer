@@ -22,7 +22,12 @@ from stock_analyzer.config import (
 from stock_analyzer.data.provider import MarketDataProvider
 from stock_analyzer.feature.engineer import FeatureEngineer
 from stock_analyzer.feature.market_context import build_market_relative_frame
-from stock_analyzer.labels.return_rank import apply_return_rank_labels_by_day
+from stock_analyzer.labels.return_rank import (
+    LABEL_REASON_MIDDLE_DROPPED,
+    LABEL_REASON_MISSING_RETURN,
+    LABEL_REASON_THIN_CROSS_SECTION,
+    build_return_rank_labels_with_reasons,
+)
 from stock_analyzer.labels.soup import build_soup_labels
 from stock_analyzer.learning.dataset_manifest import DatasetManifestBuilder
 from stock_analyzer.learning.feature_schema_registry import FeatureSchemaRegistry
@@ -33,7 +38,9 @@ from stock_analyzer.learning.feedback_weighting import (
 from stock_analyzer.learning.label_policy_registry import (
     LabelPolicyRecord,
     LabelPolicyRegistry,
+    ReturnRankParams,
     build_label_policy_record,
+    resolve_return_rank_params,
 )
 from stock_analyzer.learning.sample_schema import (
     BackfillFidelityTier,
@@ -271,13 +278,22 @@ class ModelTrainer:
         # schema v3（return_rank）的 label 是同日横截面分位，无法逐行从
         # outcome 度量派生（v1/v2 的 TP/SL 路径标签才是逐行可算）：组装
         # 阶段用 outcome.realized_return 按上海决策日整表现算，与 PIT 链
-        # 共用 apply_return_rank_labels_by_day，防止两入口口径漂移。
+        # 共用 labels/return_rank 的同一实现（本处走带原因的变体，标签本体
+        # 仍是同一函数产出），防止两入口口径漂移。
+        # 分位参数从 **manifest 的 label policy 契约**取（A3），不读当前
+        # config——否则改配置后重放旧 manifest 会得到不同标签而 policy id
+        # 不变（静默漂移）。
         v3_labels: dict[str, float] | None = None
+        label_ledger: dict[str, float] = {}
         if str(label_policy.schema_version).strip() == "3":
-            v3_labels = _return_rank_labels_from_outcomes(
+            return_rank_params = resolve_return_rank_params(
+                label_policy,
+                config_labels=self._labels,
+            )
+            v3_labels, label_ledger = _return_rank_labels_with_ledger(
                 outcomes=outcomes,
                 snapshots=snapshots,
-                labels_config=self._labels,
+                params=return_rank_params,
             )
 
         row_index: list[tuple[str, datetime, str]] = []
@@ -303,6 +319,11 @@ class ModelTrainer:
             else:
                 label_value = _label_from_outcome(outcome=outcome, policy=label_policy)
             if label_value is None:
+                if v3_labels is None:
+                    # soup 路径（v1/v2）：标签逐行可算而返回 None = 该行标签不可用。
+                    label_ledger["dropped_soup_label_unavailable"] = (
+                        label_ledger.get("dropped_soup_label_unavailable", 0.0) + 1.0
+                    )
                 continue
             row_payload = {
                 column: float(snapshot.feature_vector.get(column, 0.0))
@@ -407,6 +428,24 @@ class ModelTrainer:
         result.metrics["dataset_unique_trade_dates"] = float(len(dataset_trade_dates))
         result.metrics["dataset_unique_logical_samples"] = float(len(dataset_logical_keys))
         result.metrics["dataset_duplicate_logical_rows"] = float(duplicate_logical_rows)
+        # 逐阶段账本（B1）：进入阶段数 = 输出数 + 各**互斥**原因剔除数。
+        # 不沿用 v1 的 `included_snapshot_count - dataset_rows` 当作唯一恒等式
+        # （存在 purge/缺失/其他过滤时不成立）。
+        if v3_labels is not None:
+            label_ledger.setdefault("entered", float(len(outcomes)))
+            label_ledger["labelled"] = float(len(row_payloads))
+        else:
+            label_ledger["entered"] = float(len(manifest_items))
+            label_ledger["labelled"] = float(len(row_payloads))
+        dropped_total = sum(
+            value for key, value in label_ledger.items() if key.startswith("dropped_")
+        )
+        label_ledger["dropped_total"] = dropped_total
+        label_ledger["unaccounted"] = (
+            label_ledger["entered"] - label_ledger["labelled"] - dropped_total
+        )
+        for ledger_key, ledger_value in label_ledger.items():
+            result.metrics[f"label_ledger_{ledger_key}"] = float(ledger_value)
         label_values = [float(payload.get(label_column, 0.0)) for payload in row_payloads]
         result.metrics["dataset_hard_positive_count"] = float(
             sum(1 for value in label_values if value == 1.0)
@@ -476,6 +515,7 @@ class ModelTrainer:
 
         x = aligned[feature_columns].to_numpy(dtype=float)
         y = aligned[label_column].to_numpy(dtype=float)
+        aligned_decision_dates = _aligned_decision_dates(aligned)
         sample_weight_array = (
             np.asarray(row_weights, dtype=float) if row_weights is not None else None
         )
@@ -495,6 +535,7 @@ class ModelTrainer:
             samples_embargo = int(np.count_nonzero(split.embargo_mask))
             embargo_trading_days = int(split.embargo_days)
             split_source = "temporal"
+            test_mask = np.asarray(split.test_mask, dtype=bool)
         else:
             x_train, y_train, x_calibration, y_calibration, x_test, y_test = (
                 _split_by_manifest_labels(x=x, y=y, split_labels=split_labels)
@@ -510,8 +551,18 @@ class ModelTrainer:
             samples_embargo = 0
             embargo_trading_days = 0
             split_source = "manifest"
+            test_mask = np.asarray(
+                [str(label).strip().lower() == "test" for label in split_labels],
+                dtype=bool,
+            )
         if len(x_train) == 0 or len(x_calibration) == 0 or len(x_test) == 0:
             raise ValueError("training split produced empty train/calibration/test set")
+        # 逐日分母（B1）：pooled 与逐日两套指标都要报，故需要 test 行的决策日。
+        test_trade_dates = (
+            aligned_decision_dates[test_mask]
+            if aligned_decision_dates is not None and len(test_mask) == len(y)
+            else None
+        )
 
         lgbm = LightGBMAdapter()
         xgb = XGBoostAdapter()
@@ -533,8 +584,11 @@ class ModelTrainer:
             xgb=xgb_calibration_prob,
         )
 
-        lgbm_test_prob = lgbm_calibrator.predict(lgbm.predict_proba(x_test))
-        xgb_test_prob = xgb_calibrator.predict(xgb.predict_proba(x_test))
+        lgbm_test_raw = lgbm.predict_proba(x_test)
+        xgb_test_raw = xgb.predict_proba(x_test)
+        lgbm_test_prob = lgbm_calibrator.predict(lgbm_test_raw)
+        xgb_test_prob = xgb_calibrator.predict(xgb_test_raw)
+        blend_raw = lgbm_test_raw * meta_weights["lgbm"] + xgb_test_raw * meta_weights["xgb"]
         meta_test_prob = lgbm_test_prob * meta_weights["lgbm"] + xgb_test_prob * meta_weights["xgb"]
 
         metrics = _evaluate_metrics(
@@ -543,6 +597,17 @@ class ModelTrainer:
             xgb=xgb_test_prob,
             meta=meta_test_prob,
             precision_at_k_ratio=max(0.01, float(self._training.precision_at_k_ratio)),
+            raw_scores={
+                "lgbm": lgbm_test_raw,
+                "xgb": xgb_test_raw,
+                "blend": blend_raw,
+            },
+            calibrated_scores={
+                "lgbm": lgbm_test_prob,
+                "xgb": xgb_test_prob,
+                "blend": meta_test_prob,
+            },
+            test_trade_dates=test_trade_dates,
         )
         resolved_time_gate = time_gate or {}
         metrics["time_gate_total_rows"] = _as_float(resolved_time_gate.get("total_rows"))
@@ -886,6 +951,97 @@ def _build_meta_weights(
     }
 
 
+def _aligned_decision_dates(aligned: pd.DataFrame) -> np.ndarray | None:
+    """取每行的决策时间（用于逐日指标）；索引结构不匹配时返回 None。"""
+
+    index = aligned.index
+    if isinstance(index, pd.MultiIndex):
+        for level_name in ("decision_time", "trade_date"):
+            if level_name in (index.names or []):
+                return np.asarray(index.get_level_values(level_name))
+    return None
+
+
+def _output_health(
+    *,
+    y_true: FloatArray,
+    scores: FloatArray,
+    precision_at_k_ratio: float,
+    trade_dates: np.ndarray | None = None,
+) -> dict[str, float]:
+    """单个打分输出的健康诊断（B1：pooled 与逐日、有效/无效日期分母）。
+
+    - ``auc``：仅在 {0,1} 硬标签子集上计算（与既有口径一致）；
+    - ``unique_values`` / ``tie_fraction``：在**该输出全部 test 分数**上统计，
+      并列占比 = 1 - 唯一值数/样本数（常数输出 → 1.0）；
+    - ``daily_*``：按决策日分别算 AUC，只有两类标签都出现的日才是**有效日**；
+      无效日单独计数，不静默并进分母。
+    """
+
+    y_hard_mask = (y_true == 0.0) | (y_true == 1.0)
+    y_hard = y_true[y_hard_mask].astype(float)
+    scores_hard = scores[y_hard_mask]
+    hard_positive_count = int(np.count_nonzero(y_hard >= 0.5))
+    hard_negative_count = int(np.count_nonzero(y_hard < 0.5))
+    auc_valid = 1.0 if (hard_positive_count > 0 and hard_negative_count > 0) else 0.0
+    auc = _binary_auc(y_hard, scores_hard) if len(y_hard) else 0.5
+
+    finite = scores[np.isfinite(scores)]
+    non_finite_count = int(scores.shape[0] - finite.shape[0])
+    unique_values = int(np.unique(finite).shape[0])
+    tie_fraction = 1.0 - float(unique_values) / float(finite.shape[0]) if finite.shape[0] else 1.0
+    positive_probs = scores_hard[y_hard >= 0.5]
+    negative_probs = scores_hard[y_hard < 0.5]
+    mean_prob_spread = (
+        float(positive_probs.mean() - negative_probs.mean())
+        if len(positive_probs) and len(negative_probs)
+        else 0.0
+    )
+    precision_at_k, recall_at_k = _precision_recall_at_k(
+        y_true=y_hard,
+        probabilities=scores_hard,
+        top_ratio=precision_at_k_ratio,
+    )
+    accuracy = float(np.mean((scores_hard >= 0.5).astype(float) == y_hard)) if len(y_hard) else 0.0
+
+    daily_auc_mean = 0.0
+    daily_valid_days = 0
+    daily_invalid_days = 0
+    if trade_dates is not None and len(trade_dates) == scores.shape[0]:
+        per_day: list[float] = []
+        for day in pd.unique(np.asarray(trade_dates)):
+            day_mask = np.asarray(trade_dates) == day
+            day_y = y_true[day_mask].astype(float)
+            day_scores = scores[day_mask]
+            day_pos = int(np.count_nonzero(day_y >= 0.5))
+            day_neg = int(np.count_nonzero(day_y < 0.5))
+            if day_pos > 0 and day_neg > 0:
+                per_day.append(_binary_auc(day_y, day_scores))
+                daily_valid_days += 1
+            else:
+                daily_invalid_days += 1
+        daily_auc_mean = float(np.mean(per_day)) if per_day else 0.0
+
+    return {
+        "auc": round(auc, 6),
+        "auc_valid": round(auc_valid, 6),
+        "accuracy": round(accuracy, 6),
+        "precision_at_k": round(precision_at_k, 6),
+        "recall_at_k": round(recall_at_k, 6),
+        "positive_rate": round(float(np.mean((scores >= 0.5).astype(float))), 6),
+        "mean_prob_spread": round(mean_prob_spread, 6),
+        "unique_values": float(unique_values),
+        "tie_fraction": round(tie_fraction, 6),
+        "non_finite_count": float(non_finite_count),
+        "scored_samples": float(scores.shape[0]),
+        "hard_positive_count": float(hard_positive_count),
+        "hard_negative_count": float(hard_negative_count),
+        "daily_auc_mean": round(daily_auc_mean, 6),
+        "daily_auc_valid_days": float(daily_valid_days),
+        "daily_auc_invalid_days": float(daily_invalid_days),
+    }
+
+
 def _evaluate_metrics(
     *,
     y_true: FloatArray,
@@ -893,6 +1049,9 @@ def _evaluate_metrics(
     xgb: FloatArray,
     meta: FloatArray,
     precision_at_k_ratio: float,
+    raw_scores: dict[str, FloatArray] | None = None,
+    calibrated_scores: dict[str, FloatArray] | None = None,
+    test_trade_dates: np.ndarray | None = None,
 ) -> dict[str, float]:
     # 口径分离：AUC/accuracy/precision/recall/spread 仅在 {0,1} 硬标签子集上
     # 计算；Brier 用全部样本的原始软标签目标。全硬标签数据（v1 契约）下两套
@@ -926,7 +1085,7 @@ def _evaluate_metrics(
         if len(positive_probs) and len(negative_probs)
         else 0.0
     )
-    return {
+    metrics: dict[str, float] = {
         "accuracy": round(accuracy, 6),
         "auc": round(auc, 6),
         "auc_valid": round(auc_valid, 6),
@@ -944,6 +1103,24 @@ def _evaluate_metrics(
         "lgbm_mean_prob": round(float(np.mean(lgbm)), 6),
         "xgb_mean_prob": round(float(np.mean(xgb)), 6),
     }
+    # raw / calibrated 分离（B1）：同一 test 子集上逐输出标注 —— 不分离就无法
+    # 判断一次改动是帮了模型还是帮了校准器（9/13 根因就是这么漏掉的）。
+    for scale_name, scores_by_output in (
+        ("raw", raw_scores),
+        ("calibrated", calibrated_scores),
+    ):
+        if not scores_by_output:
+            continue
+        for output_name, output_scores in scores_by_output.items():
+            health = _output_health(
+                y_true=y_true,
+                scores=output_scores,
+                precision_at_k_ratio=precision_at_k_ratio,
+                trade_dates=test_trade_dates,
+            )
+            for metric_name, value in health.items():
+                metrics[f"{metric_name}_{scale_name}_{output_name}"] = value
+    return metrics
 
 
 def _binary_auc(y_true: FloatArray, probabilities: FloatArray) -> float:
@@ -1075,9 +1252,26 @@ def _return_rank_labels_from_outcomes(
     *,
     outcomes: dict[str, OutcomeRecord],
     snapshots: dict[str, SignalSnapshot],
-    labels_config: LabelsConfig,
+    params: ReturnRankParams,
 ) -> dict[str, float]:
-    """schema v3（return_rank）整表现算横截面标签（生产链入口）。
+    """schema v3（return_rank）整表现算横截面标签（生产链入口）。见
+    :func:`_return_rank_labels_with_ledger` 的口径说明。"""
+
+    labels, _ledger = _return_rank_labels_with_ledger(
+        outcomes=outcomes,
+        snapshots=snapshots,
+        params=params,
+    )
+    return labels
+
+
+def _return_rank_labels_with_ledger(
+    *,
+    outcomes: dict[str, OutcomeRecord],
+    snapshots: dict[str, SignalSnapshot],
+    params: ReturnRankParams,
+) -> tuple[dict[str, float], dict[str, float]]:
+    """schema v3（return_rank）整表现算横截面标签 + 逐阶段互斥账本（B1）。
 
     - fwd_return 取 ``outcome.realized_return``（T+1 开盘入场 → 成熟日
       收盘，与 PIT 链 fwd_return 同公式，回填链 `_compute_outcome_metrics_for_row`
@@ -1087,43 +1281,74 @@ def _return_rank_labels_from_outcomes(
       折算与 v1/v2 的 decision_date_sh 统计口径一致，也与 PIT 链
       trade_date 同为上海决策日）；
     - realized_return 缺失（未成熟）的行不进截面；
-    - 分位/剔除/最小截面参数来自 ``labels.return_rank_*`` config（与
-      registry v3 契约同源，hash 绑定）；
-    - 返回 snapshot_id → label（仅含 0.0/1.0 硬标签；NaN 行缺失即剔除）。
+    - 分位/剔除/最小截面参数来自 manifest 绑定的 label policy 契约
+      （``params``，由 :func:`resolve_return_rank_params` 校验），**不读
+      当前 config**；
+    - 返回 ``(labels, ledger)``：labels 为 snapshot_id → 0.0/1.0；ledger 为
+      「进入阶段数 = 输出数 + 各互斥原因剔除数」的完整对账，原因分类见
+      ``labels/return_rank`` 的 LABEL_REASON_* 常量。
     """
 
     rows: list[tuple[str, str, float]] = []
+    missing_return = 0
+    missing_anchor = 0
     for snapshot_id, outcome in outcomes.items():
         realized_return = outcome.realized_return
         if realized_return is None:
+            missing_return += 1
             continue
         anchor = outcome.label_anchor_time
         if anchor is None:
             snapshot = snapshots.get(snapshot_id)
             anchor = snapshot.decision_time if snapshot is not None else None
         if anchor is None:
+            missing_anchor += 1
             continue
         trade_date = (anchor + timedelta(hours=8)).date().isoformat()
         rows.append((snapshot_id, trade_date, float(realized_return)))
+
+    entered = len(outcomes)
+    ledger: dict[str, float] = {"entered": float(entered)}
     if not rows:
-        return {}
+        ledger.update(
+            {
+                "labelled": 0.0,
+                "dropped_missing_or_nonfinite_return": float(missing_return),
+                "dropped_missing_anchor": float(missing_anchor),
+            }
+        )
+        return {}, ledger
     frame = pd.DataFrame(rows, columns=["snapshot_id", "trade_date", "fwd_return"])
-    labels = apply_return_rank_labels_by_day(
-        frame,
-        fwd_return_col="fwd_return",
-        date_col="trade_date",
-        top_quantile=float(labels_config.return_rank_top_quantile),
-        bottom_quantile=float(labels_config.return_rank_bottom_quantile),
-        drop_middle=bool(labels_config.return_rank_drop_middle),
-        min_cross_section=int(labels_config.return_rank_min_cross_section),
+    labels, reasons = build_return_rank_labels_with_reasons(
+        frame["fwd_return"],
+        top_quantile=float(params.top_quantile),
+        bottom_quantile=float(params.bottom_quantile),
+        drop_middle=bool(params.drop_middle),
+        min_cross_section=int(params.min_cross_section),
+        trade_dates=frame["trade_date"],
+    )
+    reason_counts = reasons.value_counts().to_dict()
+    ledger.update(
+        {
+            "labelled": float(int(pd.notna(labels).sum())),
+            "dropped_middle_dropped": float(reason_counts.get(LABEL_REASON_MIDDLE_DROPPED, 0)),
+            "dropped_thin_cross_section": float(
+                reason_counts.get(LABEL_REASON_THIN_CROSS_SECTION, 0)
+            ),
+            "dropped_missing_or_nonfinite_return": float(
+                reason_counts.get(LABEL_REASON_MISSING_RETURN, 0) + missing_return
+            ),
+            "dropped_missing_anchor": float(missing_anchor),
+        }
     )
     # labels 的 index 是 frame 的 RangeIndex（行位置），snapshot_id 必须从
     # 行数据里按位置对齐取回，不能拿 labels.items() 的键当 snapshot_id。
-    return {
+    resolved = {
         str(snapshot_id): float(value)
         for snapshot_id, value in zip(frame["snapshot_id"], labels, strict=True)
         if pd.notna(value)
     }
+    return resolved, ledger
 
 
 def _conflict_label_for_policy(*, policy: LabelPolicyRecord, allow_soft: bool) -> float:

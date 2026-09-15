@@ -1098,6 +1098,16 @@ class TrainingConfig(_StrictModel):
     bootstrap_max_symbols: int = 0
     bootstrap_dataset_max_rows: int = 500_000
     bootstrap_per_symbol_rows_cap: int = 500
+    # 行数 cap 策略：
+    # - "keep_last"（默认）历史语义——按行 keep-last-N 截断，保留的决策日数被
+    #   钉死在 max_rows/每日截面。
+    # - "per_day" 按日分层——每个决策日留固定条数，全局 max_rows 变为「整日滑窗」，
+    #   于是决策日数升到 max_rows/每日条数，测试段才可能跨过
+    #   min_test_split_window_days。
+    bootstrap_row_cap_strategy: str = "keep_last"
+    # 仅 per_day 策略使用：单决策日条数上限。0 = 自动，把整个
+    # bootstrap_dataset_max_rows 预算平摊到全部可用决策日（不引入人工试出的魔数）。
+    bootstrap_max_rows_per_day: int = 0
     bootstrap_auto_seed_watchlist: bool = True
     bootstrap_seed_watchlist_size: int = 200
     bootstrap_retry_enabled: bool = True

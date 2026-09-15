@@ -7,7 +7,15 @@ from stock_analyzer.types import ScoredSignal
 
 
 class ScoreEngine:
-    """Compute 0-100 score from weighted component probabilities."""
+    """把有界分量加权成 0-100 分。
+
+    **语义（C2）**：模型分量（``lgbm``/``xgb``/``meta``）是"分数"，其含义由
+    工件 label 契约决定（见 ``models/output_semantics.py``）：``event_probability``
+    下它近似事件概率，``rank_quantile``（return_rank v3，中间 40% 剔除）下它是
+    同日横截面分位归属、``0.5`` 是"上尾 vs 下尾"而不是"涨 vs 跌"。因此这里的
+    ``total_score`` 是**排序装置**，``total_score/100`` 不是上涨概率，等级阈值
+    也不得解释为概率阈值。
+    """
 
     def __init__(self, config: StockAnalyzerConfig) -> None:
         self._config = config
