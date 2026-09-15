@@ -374,3 +374,99 @@ def test_model_variants_score_raw_vs_calibrated_differently() -> None:
         raw_scores = raw.score(eval_frame).to_numpy(dtype=float)
         assert np.isfinite(blend_scores).all() and np.isfinite(raw_scores).all()
         assert not np.allclose(blend_scores, raw_scores)
+
+
+# --- C3 追加：对反转因子正交化后的残差 IC --------------------------------
+
+
+def _residual_ic_frame(*, days: int = 12, symbols: int = 60, mode: str, seed: int = 5):
+    """构造成束评估行（labeled）：含 trade_date / score / ret_20d / fwd_return。"""
+    rng = np.random.default_rng(seed)
+    rows = []
+    for day in range(days):
+        base = rng.normal(scale=0.05, size=symbols)  # 当作 ret_20d
+        noise = rng.normal(size=symbols)
+        if mode == "pure_reversal":
+            score = -base  # 与反转因子完全同向 → 残差应为 0
+        elif mode == "reversal_plus":
+            # base 的量纲是 0.05，独立分量必须同量级才谈得上"高 R² 但不满"
+            score = -base + 0.025 * noise
+        elif mode == "pure_noise":
+            score = noise  # 与反转无关 → 残差保留
+        else:
+            score = -base + 0.05 * noise  # 反转 + 一点额外信息
+        # 前向收益只由 base 的负向驱动（即反转有效），与 noise 无关
+        forward = -0.6 * base + rng.normal(scale=0.01, size=symbols)
+        for idx in range(symbols):
+            rows.append(
+                {
+                    "trade_date": f"2026-04-{day + 1:02d}",
+                    "symbol": f"{300000 + idx:06d}",
+                    "score": float(score[idx]),
+                    "ret_20d": float(base[idx]),
+                    "fwd_return": float(forward[idx]),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def test_pure_reversal_is_fully_explained_and_skipped() -> None:
+    """自检：分数 = −ret_20d 时，反转 R²≈1 且残差 IC 全部跳过（不编造数值）。
+
+    这正是 ``reversal`` 变体的情形。第一版实现会在残差方差≈0 时照算相关系数，
+    产出 −0.90/+0.76 这类纯数值噪声（已实测）——所以必须有退化日跳过与计数。
+    """
+    from stock_analyzer.backtest.walk_forward_xsec import _daily_reversal_diagnostics
+
+    residual, r2, degenerate = _daily_reversal_diagnostics(
+        _residual_ic_frame(mode="pure_reversal")
+    )
+    assert r2, "R² 序列必须产出"
+    assert float(np.mean([v for _, v in r2])) > 0.99
+    assert residual == []  # 全部退化，无残差 IC
+    assert degenerate == len(r2)
+
+
+def test_reversal_r2_low_and_residual_kept_for_independent_signal() -> None:
+    """与反转无关的独立信号：R²≈0，且残差 IC 保留该信号。"""
+    from stock_analyzer.backtest.walk_forward_xsec import _daily_reversal_diagnostics
+
+    frame = _residual_ic_frame(mode="pure_noise")
+    frame["fwd_return"] = 0.02 * frame["score"].to_numpy()
+    residual, r2, degenerate = _daily_reversal_diagnostics(frame)
+    assert float(np.mean([v for _, v in r2])) < 0.2
+    assert degenerate == 0
+    assert float(np.mean([v for _, v in residual])) > 0.5
+
+
+def test_partial_reversal_keeps_only_residual_signal() -> None:
+    """分数 = −ret_20d + 少量独立信息时：R² 高但不满，残差仍带正 IC。"""
+    from stock_analyzer.backtest.walk_forward_xsec import _daily_reversal_diagnostics
+
+    frame = _residual_ic_frame(mode="reversal_plus")
+    frame["fwd_return"] = 0.02 * frame["score"].to_numpy()
+    residual, r2, degenerate = _daily_reversal_diagnostics(frame)
+    mean_r2 = float(np.mean([v for _, v in r2]))
+    assert 0.4 < mean_r2 < 0.99
+    assert degenerate == 0
+    assert float(np.mean([v for _, v in residual])) > 0.2
+
+
+def test_reversal_diagnostics_skip_thin_or_degenerate_days() -> None:
+    """横截面过薄（<5）或因子为常数（秩退化）的日子必须跳过而不是编造数值。"""
+    from stock_analyzer.backtest.walk_forward_xsec import _daily_reversal_diagnostics
+
+    thin = _residual_ic_frame(days=3, symbols=4, mode="pure_noise")
+    assert _daily_reversal_diagnostics(thin) == ([], [], 0)
+
+    degenerate = _residual_ic_frame(days=3, symbols=40, mode="pure_noise")
+    degenerate["ret_20d"] = 0.5
+    assert _daily_reversal_diagnostics(degenerate) == ([], [], 0)
+
+
+def test_reversal_diagnostics_missing_column_returns_empty() -> None:
+    """面板不含预注册反转列时返回空，而不是抛错或给假数。"""
+    from stock_analyzer.backtest.walk_forward_xsec import _daily_reversal_diagnostics
+
+    frame = _residual_ic_frame(days=3, symbols=40, mode="pure_noise").drop(columns=["ret_20d"])
+    assert _daily_reversal_diagnostics(frame) == ([], [], 0)
