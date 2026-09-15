@@ -33,6 +33,10 @@ services:
     volumes:
       - ${SA_VENDOR_HISTORY_HOST_ROOT:?set SA_VENDOR_HISTORY_HOST_ROOT}:/data/vendor_history:ro
       - ${SA_INTRADAY_SUMMARY_HOST_ROOT:?set SA_INTRADAY_SUMMARY_HOST_ROOT}:/data/intraday_summary:ro
+      # QQ 自建分钟链的每日 zip 源：sync_market_duckdb.py --minute 的输入根。
+      # 2026-08-29~09-15 的静默空转就是这个挂载缺失导致的（容器看不到源目录 →
+      # 缺口检测恒为空 → 每天打印 no missing dates，而 intraday_summary 表停在 8/28）。
+      - ${SA_QQ_MINUTE_RAW_HOST_ROOT:?set SA_QQ_MINUTE_RAW_HOST_ROOT}:/data/qq_minute_raw:ro
 
   scheduler-critical:
     environment:
@@ -68,6 +72,10 @@ services:
     volumes:
       - ${SA_VENDOR_HISTORY_HOST_ROOT:?set SA_VENDOR_HISTORY_HOST_ROOT}:/data/vendor_history:ro
       - ${SA_INTRADAY_SUMMARY_HOST_ROOT:?set SA_INTRADAY_SUMMARY_HOST_ROOT}:/data/intraday_summary:ro
+      # QQ 自建分钟链的每日 zip 源：sync_market_duckdb.py --minute 的输入根。
+      # 2026-08-29~09-15 的静默空转就是这个挂载缺失导致的（容器看不到源目录 →
+      # 缺口检测恒为空 → 每天打印 no missing dates，而 intraday_summary 表停在 8/28）。
+      - ${SA_QQ_MINUTE_RAW_HOST_ROOT:?set SA_QQ_MINUTE_RAW_HOST_ROOT}:/data/qq_minute_raw:ro
 
   scheduler-heavy:
     environment:
@@ -103,3 +111,7 @@ services:
     volumes:
       - ${SA_VENDOR_HISTORY_HOST_ROOT:?set SA_VENDOR_HISTORY_HOST_ROOT}:/data/vendor_history:ro
       - ${SA_INTRADAY_SUMMARY_HOST_ROOT:?set SA_INTRADAY_SUMMARY_HOST_ROOT}:/data/intraday_summary:ro
+      # QQ 自建分钟链的每日 zip 源：sync_market_duckdb.py --minute 的输入根。
+      # 2026-08-29~09-15 的静默空转就是这个挂载缺失导致的（容器看不到源目录 →
+      # 缺口检测恒为空 → 每天打印 no missing dates，而 intraday_summary 表停在 8/28）。
+      - ${SA_QQ_MINUTE_RAW_HOST_ROOT:?set SA_QQ_MINUTE_RAW_HOST_ROOT}:/data/qq_minute_raw:ro
