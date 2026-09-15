@@ -30,10 +30,13 @@ from typing import Any
 
 import numpy as np
 
-# 允许直接从仓库根运行（容器内 site-packages 已装包，本地源码树用 src 布局）。
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(_REPO_ROOT / "src") not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT / "src"))
+# 允许两种跑法：仓库根直接运行（src 布局），或经 `docker exec -i python - < 本文件`
+# 在容器里跑（__file__ 是 <stdin>、包已装在 site-packages，此时不能去猜 parents）。
+_REPO_ROOT = Path(__file__).resolve().parents[1] if "__file__" in globals() else None
+if _REPO_ROOT is not None and (_REPO_ROOT / "src").is_dir():
+    _SRC = str(_REPO_ROOT / "src")
+    if _SRC not in sys.path:
+        sys.path.insert(0, _SRC)
 
 from stock_analyzer.learning.scoring_eval import (  # noqa: E402
     DEFAULT_BLOCK_TRADING_DAYS,
@@ -89,12 +92,22 @@ def paired_delta(
 
 
 def _corr(a: dict[str, float], b: dict[str, float]) -> float:
+    """两条逐日序列在**共同有效日**上的相关（误差相关）。
+
+    必须掩掉任一侧的非有限值：校准后的 blend 有 13 个无效日（分数塌成常数 → IC=NaN），
+    不掩的话 np.corrcoef 直接返回 NaN，而"错误相关≈0.94"正是判读"差异来自校准本身
+    而不是换了信号"的关键证据（C3 §3）。
+    """
     days = sorted(set(a) & set(b))
     if len(days) < 2:
         return float("nan")
     left = np.array([a[d] for d in days], dtype=float)
     right = np.array([b[d] for d in days], dtype=float)
-    if float(np.nanstd(left)) == 0.0 or float(np.nanstd(right)) == 0.0:
+    mask = np.isfinite(left) & np.isfinite(right)
+    left, right = left[mask], right[mask]
+    if len(left) < 2:
+        return float("nan")
+    if float(np.std(left)) == 0.0 or float(np.std(right)) == 0.0:
         return float("nan")
     return float(np.corrcoef(left, right)[0, 1])
 
