@@ -53,11 +53,12 @@ class SignalPredictor:
         batch = self.predict_rows(pd.DataFrame([features.to_dict()]))
         return {key: values[0] for key, values in batch.items()}
 
-    def predict_rows(self, features: pd.DataFrame) -> dict[str, list[float]]:
-        """Vectorized inference for a matrix of engineered features.
+    def _predict_matrix(self, features: pd.DataFrame) -> dict[str, list[float]]:
+        """raw 与 calibrated 的全量分数（内部单一实现，供两个公共入口共用）。
 
-        Missing feature columns are filled with 0.0, mirroring ``predict_row``.
-        Returns per-column lists ``{"lgbm": [...], "xgb": [...], "meta": [...]}``.
+        返回 ``raw_lgbm/raw_xgb/raw_blend``（校准前）与 ``lgbm/xgb/meta``（校准后）。
+        C3 的 ``raw_blend`` 变体靠它拿校准前分数：修后现有模型的校准器仍在塌
+        （唯一值 7、spread 为负），需要区分伤害排序的是校准还是模型本身。
         """
         blocked = self.inference_blocked_reason()
         if blocked:
@@ -65,7 +66,14 @@ class SignalPredictor:
                 f"predictor_rejected:{blocked}; refusing production inference on a legacy artifact"
             )
         if features.empty:
-            return {"lgbm": [], "xgb": [], "meta": []}
+            return {
+                "raw_lgbm": [],
+                "raw_xgb": [],
+                "raw_blend": [],
+                "lgbm": [],
+                "xgb": [],
+                "meta": [],
+            }
         frame = features
         if any(column not in frame.columns for column in self.feature_columns):
             frame = frame.reindex(columns=self.feature_columns, fill_value=0.0)
@@ -78,11 +86,33 @@ class SignalPredictor:
         lgbm_weight = self.meta_weights.get("lgbm", 0.5)
         xgb_weight = self.meta_weights.get("xgb", 0.5)
         meta_probs = lgbm_probs * lgbm_weight + xgb_probs * xgb_weight
+        raw_blend = raw_lgbm * lgbm_weight + raw_xgb * xgb_weight
         return {
+            "raw_lgbm": [_clamp_prob(float(value)) for value in raw_lgbm],
+            "raw_xgb": [_clamp_prob(float(value)) for value in raw_xgb],
+            "raw_blend": [_clamp_prob(float(value)) for value in raw_blend],
             "lgbm": [_clamp_prob(float(value)) for value in lgbm_probs],
             "xgb": [_clamp_prob(float(value)) for value in xgb_probs],
             "meta": [_clamp_prob(float(value)) for value in meta_probs],
         }
+
+    def predict_rows(self, features: pd.DataFrame) -> dict[str, list[float]]:
+        """Vectorized inference for a matrix of engineered features.
+
+        Missing feature columns are filled with 0.0, mirroring ``predict_row``.
+        Returns per-column lists ``{"lgbm": [...], "xgb": [...], "meta": [...]}``.
+        """
+        full = self._predict_matrix(features)
+        return {"lgbm": full["lgbm"], "xgb": full["xgb"], "meta": full["meta"]}
+
+    def predict_rows_with_raw(self, features: pd.DataFrame) -> dict[str, list[float]]:
+        """同 ``predict_rows``，但额外带**校准前**的 ``raw_*`` 分数。
+
+        独立入口而非扩宽 ``predict_rows`` 的返回：后者有按精确字典的契约测试，
+        且 ``service.py`` 在生产推理路径消费同一返回。raw 只服务诊断与研究
+        （C3 的 raw_blend 变体、B2 的 raw/calibrated 同口径对比）。
+        """
+        return self._predict_matrix(features)
 
     def mode_details(self) -> dict[str, object]:
         lgbm_backend = str(self.artifact_metadata.get("lgbm_backend", self.lgbm.backend))

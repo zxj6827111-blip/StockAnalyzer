@@ -39,6 +39,7 @@ import duckdb
 import numpy as np
 import pandas as pd
 
+from stock_analyzer.backtest.variants import VARIANTS, variant_definitions
 from stock_analyzer.learning.scoring_eval import (
     compute_auc_brier,
     compute_quantile_returns,
@@ -121,6 +122,11 @@ class FoldResult:
     # fold 评估行不整帧驻留：只保留池化统计所需的紧凑数组。
     eval_scores: np.ndarray | None = None
     eval_returns: np.ndarray | None = None
+    # C5：逐决策日的组合级量（只有日级聚合在内存里，不驻留成分股明细）。
+    # 口径说明：这里的收益是「当日前瞻收益的等权均值」，**不是**复利净值曲线，
+    # 也不含持有重叠/涨跌停不可成交——只用于成本与换手对照。
+    portfolio_gross: list[tuple[str, float]] = field(default_factory=list)
+    portfolio_turnover: list[tuple[str, float]] = field(default_factory=list)
 
 
 def _rss_mib() -> float:
@@ -369,6 +375,7 @@ def run_fold(
     feature_columns: list[str],
     embargo_days: int,
     k_precision: list[int],
+    variant: str = "blend",
 ) -> FoldResult:
     fold_id = int(fold["fold_id"])
     train_start = cast_date(fold["train_start"])
@@ -441,17 +448,20 @@ def run_fold(
     labels_series = pd.Series(
         train["label"].astype(float).to_numpy(), index=row_index, name="label_soup_tp_before_sl"
     )
+    from stock_analyzer.backtest.variants import build_fold_scorer  # noqa: WPS433
+
+    scorer = build_fold_scorer(
+        variant=variant, trainer=trainer, feature_columns=feature_columns
+    )
     try:
         print(
-            f"    [fold {fold_id}] training aligned={len(features_frame):,} "
+            f"    [fold {fold_id}] variant={variant} training aligned={len(features_frame):,} "
             f"rss={_rss_mib():.0f}MiB",
             flush=True,
         )
-        trained = trainer.train_on_feature_label(
-            features=features_frame, labels=labels_series
-        )
+        scorer.fit(features=features_frame, labels=labels_series)
         print(
-            f"    [fold {fold_id}] trained rss={_rss_mib():.0f}MiB",
+            f"    [fold {fold_id}] fitted rss={_rss_mib():.0f}MiB",
             flush=True,
         )
     except Exception as exc:  # noqa: BLE001 - fold 级失败可重跑
@@ -459,18 +469,20 @@ def run_fold(
         result.invalid_reason = f"{type(exc).__name__}: {exc}"
         return result
 
-    from stock_analyzer.models.predictor import SignalPredictor
-
-    predictor = SignalPredictor.from_artifact(trained.artifact)
-
     eval_parts: list[pd.DataFrame] = []
+    previous_weights: dict[str, float] = {}
     for day in test_dates:
         day_frame = store.fetch_eval_rows(on=day)
         if day_frame.empty:
             continue
-        scores = predictor.predict_rows(day_frame[feature_columns])["meta"]
-        day_frame["score"] = scores
+        day_frame["score"] = scorer.score(day_frame).to_numpy(dtype=float)
         eval_parts.append(day_frame)
+        _accumulate_portfolio_day(
+            result=result,
+            day=day,
+            day_frame=day_frame,
+            previous_weights=previous_weights,
+        )
     if not eval_parts:
         result.status = "failed"
         result.invalid_reason = "no_eval_rows"
@@ -533,15 +545,99 @@ def run_fold(
     result.status = "completed"
     # fold 间释放：trainer 内部 LightGBM/XGBoost 模型、isotonic 校准器与
     # fold 级中间帧在跨 fold 累积（RSS 实测 1.2GB → 3.0GB 后 OOM）。
-    del features_frame, labels_series, labeled, evaluation, train, predictor, trained
+    # 释放 fold 级中间体：trainer 内部适配器/校准器与 scorer 持有的 predictor
+    # 都不归 Python gc 管收益，跨 fold 累积过 1.2GB→3.0GB（2026-09-06 实测）。
+    del features_frame, labels_series, labeled, evaluation, train, scorer
     gc.collect()
     return result
+
+
+def _accumulate_portfolio_day(
+    *,
+    result: FoldResult,
+    day: date,
+    day_frame: pd.DataFrame,
+    previous_weights: dict[str, float],
+) -> None:
+    """累加当日的组合级量（C5 成本/换手口径，与反转基线共用同一实现）。
+
+    只累计**日级**的两个数（毛收益均值、换手），成分股明细用完即弃——
+    fold 评估行不驻留是本 harness 的内存纪律（Phase 2 记录过 5 类 OOM 根因）。
+
+    口径提醒：毛收益 = 上尾等权组合的**当日前瞻收益均值**，不是复利净值；
+    持有重叠、涨跌停不可成交、T+1 都不在此处建模，故它只用于成本与换手对照，
+    不可当作可交易收益曲线。
+    """
+    from stock_analyzer.learning.reversal_baseline import (  # noqa: WPS433
+        top_quantile_weights,
+        turnover,
+    )
+
+    needed = {"symbol", "score", "fwd_return"}
+    if not needed.issubset(day_frame.columns):
+        return
+    usable = day_frame[["symbol", "score", "fwd_return"]].dropna()
+    if usable.empty:
+        return
+    symbols = [str(value) for value in usable["symbol"].tolist()]
+    scores = dict(zip(symbols, usable["score"].astype(float).tolist(), strict=True))
+    returns = dict(zip(symbols, usable["fwd_return"].astype(float).tolist(), strict=True))
+    weights = top_quantile_weights(scores)
+    if not weights:
+        return
+    gross = float(sum(weight * returns.get(symbol, 0.0) for symbol, weight in weights.items()))
+    result.portfolio_gross.append((day.isoformat(), gross))
+    result.portfolio_turnover.append((day.isoformat(), float(turnover(previous_weights, weights))))
+    previous_weights.clear()
+    previous_weights.update(weights)
 
 
 def cast_date(value: object) -> date:
     if isinstance(value, date):
         return value
     return date.fromisoformat(str(value)[:10])
+
+
+def checkpoint_dir(out_dir: str | Path, variant: str) -> Path:
+    """变体独立的 fold checkpoint 目录。
+
+    同一目录被不同变体复用会让上一个变体的 fold 结果被当成当前变体的结果——
+    配对比较里最致命的静默错误，所以目录名必须带变体。
+    """
+    return Path(out_dir) / f"checkpoints_{str(variant).strip().lower()}"
+
+
+def _cost_report(folds: list[FoldResult], *, cost_bps: float | None) -> dict[str, object]:
+    """把一个变体的逐日组合量汇总成成本后概览（C5 验收项）。
+
+    成本口径与 ``learning.reversal_baseline`` 完全相同（单边 10 bps、换手 0.5·Σ|Δw|），
+    使五变体与反转基线可比。失效月份如实列出、不做剔除。
+    """
+    from stock_analyzer.learning.reversal_baseline import (  # noqa: WPS433
+        DEFAULT_COST_BPS,
+        net_returns,
+        summarize_baseline,
+    )
+
+    bps = float(DEFAULT_COST_BPS if cost_bps is None else cost_bps)
+    gross = [item for f in folds for item in f.portfolio_gross]
+    turns = [item for f in folds for item in f.portfolio_turnover]
+    if not gross:
+        summary = summarize_baseline([], cost_bps=bps)
+        summary["gross_mean"] = float("nan")
+        return summary
+    turn_by_day = dict(turns)
+    days = [day for day, _ in gross]
+    gross_values = [value for _, value in gross]
+    turnover_values = [float(turn_by_day.get(day, 0.0)) for day in days]
+    net = net_returns(gross_values, turnover_values, cost_bps=bps)
+    avg_turn = float(np.mean(turnover_values)) if turnover_values else float("nan")
+    summary = summarize_baseline(
+        list(zip(days, net, strict=True)), cost_bps=bps, avg_turnover=avg_turn
+    )
+    summary["gross_mean"] = float(np.mean(gross_values))
+    summary["net_mean"] = float(np.mean(net))
+    return summary
 
 
 def aggregate_report(
@@ -552,6 +648,8 @@ def aggregate_report(
     test_window: int,
     step: int,
     embargo_days: int,
+    variant: str = "blend",
+    cost_bps: float | None = None,
 ) -> dict[str, object]:
     completed = [f for f in folds if f.status in {"completed", "completed_unlabeled"}]
     daily_ic_all = [item for f in completed for item in f.daily_ic]
@@ -676,6 +774,8 @@ def aggregate_report(
             "coverage_gate_pass": coverage_ok,
         },
         "verdict": verdict,
+        "variant": variant,
+        "cost_report": _cost_report(completed, cost_bps=cost_bps),
         "params": {
             "train_window": train_window,
             "test_window": test_window,
@@ -694,6 +794,19 @@ def main() -> int:
     parser.add_argument("--test-window", type=int, default=20)
     parser.add_argument("--step", type=int, default=20)
     parser.add_argument("--k-list", default="5,10")
+    # C3 配对比较的变体选择（预注册定义见 docs/learning_chain_c3_preregistration_20260915.md）
+    parser.add_argument(
+        "--variant",
+        default="blend",
+        choices=list(VARIANTS),
+        help="评估变体：blend/raw_blend/ridge/stump/reversal（同一窗口/资格集/脚本下配对）",
+    )
+    parser.add_argument(
+        "--cost-bps",
+        type=float,
+        default=None,
+        help="单边成本（bps）；默认沿用 reversal_baseline 的 10bps，不另设口径",
+    )
     # 对照基线（方向一'验收要求）：旧 soup label 的 Phase 2 数字，写进
     # 报告作对照行。默认取 2026-09-06 NO-GO 结论；传 "none" 可省略。
     parser.add_argument(
@@ -704,6 +817,7 @@ def main() -> int:
     )
     args = parser.parse_args()
     k_list = [int(k) for k in args.k_list.split(",") if k.strip()]
+    variant = str(args.variant).strip().lower()
 
     from stock_analyzer.config import get_config
 
@@ -754,7 +868,8 @@ def main() -> int:
 
     # fold checkpoint（方案 §5）：每 fold 完成即落盘，重跑跳过已完成
     # fold（含 OOM/中断后续跑）。目录 {out_dir}/checkpoints/。
-    ckpt_dir = Path(args.out_dir) / "checkpoints"
+    # checkpoint 按变体隔离（原因见 checkpoint_dir 的 docstring）。
+    ckpt_dir = checkpoint_dir(args.out_dir, variant)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     def _fold_to_payload(f: FoldResult) -> dict[str, object]:
@@ -776,6 +891,8 @@ def main() -> int:
             "quantile_means": f.quantile_means,
             "top_minus_bottom": f.top_minus_bottom,
             "universe_stats": f.universe_stats,
+            "portfolio_gross": [[d, v] for d, v in f.portfolio_gross],
+            "portfolio_turnover": [[d, v] for d, v in f.portfolio_turnover],
         }
 
     loaded: dict[int, FoldResult] = {}
@@ -822,6 +939,7 @@ def main() -> int:
             feature_columns=feature_columns,
             embargo_days=embargo_days,
             k_precision=k_list,
+            variant=variant,
         )
         folds.append(result)
         (ckpt_dir / f"fold_{fid:02d}.json").write_text(
@@ -844,6 +962,8 @@ def main() -> int:
         test_window=args.test_window,
         step=args.step,
         embargo_days=embargo_days,
+        variant=variant,
+        cost_bps=args.cost_bps,
     )
     # 验收硬门（方向一'任务书）：新 label 下模型分数 IC 的 moving-block
     # bootstrap 95% CI 下界 > 0，且 fold 内不得有 lookahead 违规。
@@ -864,6 +984,8 @@ def main() -> int:
         "lookahead_gate_pass": report["verdict_inputs"]["lookahead_gate_pass"],  # type: ignore[index]
         "verdict": report["verdict"],
         "baseline_comparable": bool(baseline_payload["comparable"]),
+        "variant": variant,
+        "variant_definition": variant_definitions().get(variant, {}),
     }
 
     payload = {
