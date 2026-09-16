@@ -92,9 +92,18 @@ def _quantile(values: list[float], q: float) -> float:
 
 
 def evaluate_pairs(
-    pairs: Sequence[tuple[str, float, float]], *, block_days: int = 5
+    pairs: Sequence[tuple[str, float, float]],
+    *,
+    block_days: int = 5,
+    score_universe: Sequence[float] | None = None,
 ) -> dict[str, Any]:
     """核心判据（纯函数，无 IO）：``pairs`` = [(决策日, 生产分数, 已实现收益)]。
+
+    ``score_universe``：**全部候选**的分数（不限已配对者），只用于"离门槛还差几分"。
+    不给时退回 ``pairs`` 的分数。这个参数是必需的：实测（NAS 2026-09-16）候选分数
+    域 12.46~76.96、门槛 70，但当时只有 1 条候选够到成熟标签——若只用已配对者，
+    "最高分"会报成 25.85、"离门槛还差 44.15 分"，而真相是**有候选已经越过 70**。
+    门槛问题问的是"系统产出了多高的分"，与这条有没有结算无关。
 
     输出三组判据：
     1. **逐日 IC**（Spearman，复用 ``learning.scoring_eval.compute_rank_ic``）+ moving-block CI；
@@ -164,8 +173,12 @@ def evaluate_pairs(
         }
     # "离门槛还差几分"问的是**系统产出的最高分**，与这条有没有成熟标签无关：
     # 用全量有限分数，不用上面那组成对点（否则最高分恰好还没结算就会被漏掉）。
-    all_scores = [score for _, score, _ in pairs if math.isfinite(score)]
-    highest = max(all_scores) if all_scores else None
+    universe = (
+        [float(item) for item in score_universe if math.isfinite(item)]
+        if score_universe is not None
+        else [score for _, score, _ in pairs if math.isfinite(score)]
+    )
+    highest = max(universe) if universe else None
 
     verdict = "INCONCLUSIVE"
     ci_low = ci["ci_low"]
@@ -412,7 +425,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         for item in candidates
         if item["snapshot_id"] in returns
     ]
-    report = evaluate_pairs(pairs, block_days=args.block_days)
+    report = evaluate_pairs(
+        pairs,
+        block_days=args.block_days,
+        score_universe=[item["score"] for item in candidates],
+    )
     score_values = [item["score"] for item in candidates]
     days = sorted({day for day, _, _ in pairs})
     report["candidate_source"] = source_summary

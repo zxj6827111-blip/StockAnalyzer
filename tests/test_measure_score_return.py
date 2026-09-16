@@ -116,6 +116,23 @@ def test_highest_score_ignores_label_availability() -> None:
     assert report["nearest_to_threshold"]["distance_to_70"] == pytest.approx(70.0 - 88.0, abs=1e-4)
 
 
+def test_highest_score_uses_candidate_universe_not_only_paired() -> None:
+    """NAS 实测形态的回归：候选分数最高 76.96（越过门槛 70），但只有 1 条够到成熟标签。
+
+    只用已配对者会把"最高分"报成 25.85、"离门槛还差 44.15 分"——恰好把
+    "已经有候选越过门槛"这个关键事实说反。
+    """
+    pairs = [("2026-09-10", 25.85, 0.012)]
+    universe = [12.46, 25.85, 55.0, 65.89, 76.96]
+    report = MEASURE.evaluate_pairs(pairs, score_universe=universe)
+    assert report["samples"] == 1  # 判据样本仍只有 1 条
+    assert report["highest_score"] == pytest.approx(76.96)  # 但最高分取全量候选
+    assert report["nearest_to_threshold"]["distance_to_70"] == pytest.approx(70.0 - 76.96, abs=1e-4)
+    # 不给 universe 时退回 pairs（保持纯函数默认行为可测）
+    fallback = MEASURE.evaluate_pairs(pairs)
+    assert fallback["highest_score"] == pytest.approx(25.85)
+
+
 # --- 标签成熟口径与读库路径 ----------------------------------------------------
 
 
