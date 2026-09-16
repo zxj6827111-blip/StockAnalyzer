@@ -25,6 +25,10 @@ IDENTITY_NO_CHAMPION = "no_champion"
 IDENTITY_CHAMPION_HASH_MISSING = "champion_hash_missing"
 IDENTITY_LOADED_HASH_MISSING = "loaded_hash_missing"
 IDENTITY_REGISTRY_UNAVAILABLE = "registry_unavailable"
+# 注册表被**本进程持有的写锁**挡住 —— 属"这次读不到"，不是"身份对不上"。
+# 2026-09-16 盘中实测：巡检 10:50 报 registry_unavailable 被当 defect，其实只是 api 容器
+# 正在写这个库。探测器假警报一次就会被当噪音，必须与真错误分开。
+IDENTITY_REGISTRY_BUSY = "registry_busy"
 
 IDENTITY_STATUSES = (
     IDENTITY_MATCH,
@@ -33,6 +37,7 @@ IDENTITY_STATUSES = (
     IDENTITY_CHAMPION_HASH_MISSING,
     IDENTITY_LOADED_HASH_MISSING,
     IDENTITY_REGISTRY_UNAVAILABLE,
+    IDENTITY_REGISTRY_BUSY,
 )
 
 
@@ -60,16 +65,18 @@ def describe_artifact_identity(
     loaded_hash: object,
     champion: Mapping[str, Any] | None = None,
     registry_error: str = "",
+    registry_busy: bool = False,
 ) -> dict[str, object]:
     """判定在服工件与注册表 champion 的身份关系。
 
     判定顺序（先排除"无法判定"，再判等）：
-    1. ``registry_error`` 非空 → ``registry_unavailable``（读不到注册表 ≠ 身份不一致）；
-    2. 在服工件没算出哈希 → ``loaded_hash_missing``（无法比对，绝不能当成 match）；
-    3. ``champion`` 为 None → ``no_champion``；
-    4. champion 的 ``artifact_content_hash`` 为空 → ``champion_hash_missing``
+    1. ``registry_busy`` → ``registry_busy``（本进程的写锁挡着，属"这次读不到"）；
+    2. ``registry_error`` 非空 → ``registry_unavailable``（读不到注册表 ≠ 身份不一致）；
+    3. 在服工件没算出哈希 → ``loaded_hash_missing``（无法比对，绝不能当成 match）；
+    4. ``champion`` 为 None → ``no_champion``；
+    5. champion 的 ``artifact_content_hash`` 为空 → ``champion_hash_missing``
        （这正是 2026-09-05 quarantine 把唯一那条 champion 记录拦下的原因）；
-    5. 两侧哈希相等 → ``match``，否则 ``mismatch``。
+    6. 两侧哈希相等 → ``match``，否则 ``mismatch``。
 
     注意哈希比较**大小写不敏感、去空白**：registry 侧历史上写入过带大写/空白的值，
     格式差异不该被读成"身份不符"（那会制造假警报），但也绝不把空串当相等。
@@ -84,6 +91,12 @@ def describe_artifact_identity(
         "champion_content_hash": "",
         "detail": "",
     }
+    if registry_busy:
+        payload["status"] = IDENTITY_REGISTRY_BUSY
+        payload["detail"] = "注册表被本进程的写锁占用，这次读不到（属暂时读不到，不是身份不符）" + (
+            f": {registry_error}" if registry_error else ""
+        )
+        return payload
     if registry_error:
         payload["detail"] = f"注册表不可读: {registry_error}"
         return payload
