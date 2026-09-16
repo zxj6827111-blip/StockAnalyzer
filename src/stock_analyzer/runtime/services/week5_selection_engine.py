@@ -47,9 +47,9 @@ from stock_analyzer.runtime.services.week5_service import (
     _build_fresh_deep_frame,
     _build_intraday_freshness_blocked_report,
     _dedupe_preserve_order,
-    _latest_bar_dict,
     _normalize_a_share_symbol,
     _overextension_decision_dict,
+    _overextension_row,
     _prepare_intraday_sync_symbols,
     _record_intraday_sync_health_audits,
     _resolve_calendar_provider,
@@ -1142,8 +1142,11 @@ class Week5SelectionEngine:
                 "reasons": [],
             }
             if bars is not None and not bars.empty:
+                # 用 _overextension_row 而不是 _latest_bar_dict：后者只有 K 线列，
+                # 缺 ma5/atr14 时 evaluator 会取占位常量把闸门变成无条件否决
+                # （2026-09-16 实测 600/600 候选 level=reject）。
                 overextension_decision = _overextension_decision_dict(
-                    row=_latest_bar_dict(bars),
+                    row=_overextension_row(bars),
                     config=config.overextension,
                 )
                 board_decision = _board_decision_dict(
