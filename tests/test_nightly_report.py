@@ -109,10 +109,19 @@ def _night_scan(
 ) -> dict[str, object]:
     source_report: dict[str, object] = {
         "data_snapshot_id": _TRADE_DATE,
+        # 字段形状必须与**生产实测**一致（2026-09-16 夜扫产物核对）：
+        # 全市场输入/质量硬筛在质量选择器自己的账里；prefilter.universe_count 与
+        # eligible_count 是质量池裁完之后的候选域，两者都等于 300。早期夹具把
+        # 5486/3678 填进了 prefilter，掩盖了"把候选域当输入"这个真实缺陷。
         "prefilter": {
-            "universe_count": 5486,
-            "eligible_count": 3678,
-            "universe_quality_selection": {"selected_count": 300},
+            "universe_count": 300,
+            "eligible_count": 300,
+            "universe_quality_selection": {
+                "input_count": 5487,
+                "hard_eligible_count": 3678,
+                "target_size": 300,
+                "selected_count": 300,
+            },
             **(prefilter or {}),
         },
         "funnel": {
@@ -229,7 +238,7 @@ def test_body_carries_required_facts_and_funnel(service: _FakeService) -> None:
     assert "数据日期：2026-09-16" in content
     assert "入选依据：趋势一致" in content
     assert "风险说明：5 日涨幅偏大" in content
-    assert "筛选过程：输入5486 → 质量硬筛3678 → 质量池300 → 轻筛100 → 深评50 → 观察1" in content
+    assert "筛选过程：输入5487 → 质量硬筛3678 → 质量池300 → 轻筛100 → 深评50 → 观察1" in content
     assert "主要过滤原因：" in content and "低于门槛" not in content
     assert "最终筛选数量（审计字段，非买入信号）：0" in content
 
@@ -628,3 +637,65 @@ def test_entry_reasons_prefer_human_readable_shortlist_labels(service: _FakeServ
     content = report_service.render(_build(report_service, _night_scan([row]))).content
     assert "入选依据：趋势一致、资金面确认" in content
     assert "soup_entry" not in content
+
+
+def test_funnel_uses_the_quality_selector_ledger_not_the_trimmed_universe(
+    service: _FakeService,
+) -> None:
+    """漏斗必须取自质量选择器的账，不能拿"质量池裁完之后的候选域"当全市场输入。
+
+    2026-09-17 实测首条回放消息把 5487 只显示成 300 只：prefilter.universe_count 与
+    eligible_count 都等于 300（裁完之后的候选域），真正的输入/硬筛数在
+    universe_quality_selection 里。这条测试用与生产同形的字段把该语义钉住。
+    """
+    report_service = _report_service(service)
+    scan = _night_scan(
+        [_row("600000")],
+        prefilter={"universe_count": 300, "eligible_count": 300},
+    )
+    report = _build(report_service, scan)
+    assert report["funnel_counts"]["input_count"] == 5487
+    assert report["funnel_counts"]["eligible_count"] == 3678
+    assert report["funnel_counts"]["quality_pool_count"] == 300
+    # 候选域作为审计字段保留，但不顶替"输入"
+    assert report["funnel_counts"]["candidate_universe_count"] == 300
+    content = report_service.render(report).content
+    assert "输入5487" in content
+    assert "输入300" not in content
+
+
+def test_funnel_degrades_to_candidate_universe_when_selector_did_not_run(
+    service: _FakeService,
+) -> None:
+    """质量选择器没跑时不得硬凑"输入/质量硬筛"：换标签展示候选域。"""
+    report_service = _report_service(service)
+    scan = _night_scan([_row("600000")])
+    source = scan["source_report"]  # type: ignore[index]
+    source["prefilter"].pop("universe_quality_selection")  # type: ignore[union-attr]
+    content = report_service.render(_build(report_service, scan)).content
+    assert "筛选过程：候选域300 → 轻筛100 → 深评50 → 观察1" in content
+    assert "质量硬筛" not in content
+    assert "输入" not in content
+
+
+def test_legacy_unlabelled_candidates_are_not_described_as_missing_data(
+    service: _FakeService,
+) -> None:
+    """旧产物缺评估状态 ≠ 指标算不出来，措辞必须分开，否则会误导读者。"""
+    report_service = _report_service(service)
+    legacy = _row("600000")
+    del legacy["overextension"]["evaluation_status"]  # type: ignore[index]
+    content = report_service.render(_build(report_service, _night_scan([legacy]))).content
+    assert "评估状态未标注（旧版本产物，不计入观察候选）：" in content
+    assert "数据待补全" not in content
+    assert "（1 只评估状态未标注）" in content
+
+
+def test_insufficient_input_keeps_the_missing_data_wording(service: _FakeService) -> None:
+    """确实算不出指标时保留"数据待补全"，并列出缺哪些指标。"""
+    report_service = _report_service(service)
+    row = _row("600000", evaluation_status="insufficient_input", missing_inputs=["ma5", "atr14"])
+    content = report_service.render(_build(report_service, _night_scan([row]))).content
+    assert "数据待补全（风险指标输入不足，不计入观察候选）：" in content
+    assert "缺 ma5/atr14" in content
+    assert "评估状态未标注" not in content

@@ -687,11 +687,12 @@ class NightlyReportService:
 
         if status == SCAN_STATUS_COMPLETED:
             if not observation and incomplete:
-                # "完成 + 0 只观察"单独说会读成"今天没有机会"，但真实原因是候选的
-                # 风险输入没凑齐、根本没判过——必须把这句话说完整。
+                # "完成 + 0 只观察"单独说会读成"今天没有机会"，但真实原因是候选
+                # 根本没通过完整风险检查——必须说清是哪一种原因。
+                descriptor = _incomplete_descriptor(incomplete)
                 lines.append(
                     f"结果：今日选股完成，无通过完整风险检查的隔夜观察候选"
-                    f"（{len(incomplete)} 只数据待补全）"
+                    f"（{len(incomplete)} 只{descriptor}）"
                 )
             else:
                 lines.append(f"结果：今日选股完成，隔夜观察候选 {len(observation)} 只")
@@ -722,9 +723,7 @@ class NightlyReportService:
 
         if level <= 3 and incomplete:
             lines.append("")
-            lines.append("数据待补全（未通过完整风险检查，不计入观察候选）：")
-            for item in incomplete[: _max_incomplete_lines(level)]:
-                lines.append(self._incomplete_line(item, level=level))
+            lines.extend(self._incomplete_lines(incomplete, level=level))
 
         if level <= 2:
             funnel_line = self._funnel_line(funnel)
@@ -773,6 +772,44 @@ class NightlyReportService:
             lines.append(f"（另有 {remaining} 只候选未在正文展示，完整清单见报告）")
         return lines
 
+    def _incomplete_lines(
+        self,
+        incomplete: list[dict[str, object]],
+        *,
+        level: int,
+    ) -> list[str]:
+        """按原因分组列出未通过完整风险检查的候选。
+
+        两种原因的处置完全不同，混在一句话里会误导：
+        - ``insufficient_input``：**确实**算不出指标（行情太短/数值无效/ATR 为 0），
+          是真缺数据；
+        - ``unknown``：旧版本产物没有写评估状态字段，风控其实跑过，只是无法确认。
+          把它说成"数据待补全"会让人以为指标算不出来。
+        """
+        groups = (
+            (EVALUATION_INCOMPLETE, "数据待补全（风险指标输入不足，不计入观察候选）："),
+            (EVALUATION_UNKNOWN, "评估状态未标注（旧版本产物，不计入观察候选）："),
+        )
+        limit = _max_incomplete_lines(level)
+        handled: set[str] = set()
+        lines: list[str] = []
+        for status, heading in groups:
+            handled.add(status)
+            items = [
+                item for item in incomplete if _text(item.get("evaluation_status")) == status
+            ]
+            if not items:
+                continue
+            lines.append(heading)
+            lines.extend(self._incomplete_line(item, level=level) for item in items[:limit])
+        rest = [
+            item for item in incomplete if _text(item.get("evaluation_status")) not in handled
+        ]
+        if rest:
+            lines.append("其他未通过完整风险检查（不计入观察候选）：")
+            lines.extend(self._incomplete_line(item, level=level) for item in rest[:limit])
+        return lines
+
     def _incomplete_line(self, item: dict[str, object], *, level: int) -> str:
         symbol = _text(item.get("symbol"))
         name = _text(item.get("name")) or "名称暂缺"
@@ -784,19 +821,21 @@ class NightlyReportService:
         return f"- {symbol}｜{name}｜评分 {score}{detail}"
 
     def _funnel_line(self, funnel: Mapping[str, object]) -> str:
-        parts: list[str] = []
-        for key, label in (
+        pool_stages: tuple[tuple[str, str], ...] = (
             ("input_count", "输入"),
             ("eligible_count", "质量硬筛"),
             ("quality_pool_count", "质量池"),
+        )
+        if not any(key in funnel for key, _ in pool_stages):
+            # 质量选择器没跑时这三个位阶并不存在。此时退回展示候选域，并且换一个
+            # 标签——否则"输入"在两次运行里会表示完全不同的东西。
+            pool_stages = (("candidate_universe_count", "候选域"),)
+        stages = pool_stages + (
             ("light_count", "轻筛"),
             ("deep_count", "深评"),
             ("observation_count", "观察"),
-        ):
-            value = _optional_int(funnel.get(key))
-            if value is None:
-                continue
-            parts.append(f"{label}{value}")
+        )
+        parts = [f"{label}{funnel[key]}" for key, label in stages if key in funnel]
         if not parts:
             return ""
         return "筛选过程：" + " → ".join(parts)
@@ -969,11 +1008,17 @@ class NightlyReportService:
         selection = _mapping(prefilter.get("universe_quality_selection"))
         funnel = _mapping(source_report.get("funnel"))
         counts = {
-            "input_count": _optional_int(prefilter.get("universe_count")),
-            "eligible_count": _optional_int(
-                prefilter.get("eligible_count") or selection.get("selected_count")
-            ),
-            "quality_pool_count": _optional_int(selection.get("selected_count")),
+            # 全市场输入 / 质量硬筛 / 质量池只取自**质量选择器自己的账**
+            # （universe_quality_selection）。prefilter.universe_count 与
+            # eligible_count 是质量池裁完之后的候选域（实测两者都等于 300），
+            # 拿它当"输入"会把 5487 只显示成 300 只——2026-09-16 首条回放消息
+            # 就是这么错的。
+            "input_count": _optional_int(selection.get("input_count")),
+            "eligible_count": _optional_int(selection.get("hard_eligible_count")),
+            "quality_pool_count": _optional_int(selection.get("selected_count"))
+            or _optional_int(selection.get("target_size")),
+            # 质量选择器没跑时的退路：候选域（报告里保留作审计，正文按需展示）。
+            "candidate_universe_count": _optional_int(prefilter.get("universe_count")),
             "light_count": _optional_int(funnel.get("light_count")),
             "deep_count": _optional_int(funnel.get("deep_count")),
             "final_count": _optional_int(funnel.get("final_count")),
@@ -1009,6 +1054,16 @@ class NightlyReportService:
 
 def _max_incomplete_lines(level: int) -> int:
     return 5 if level <= 1 else 2
+
+
+def _incomplete_descriptor(incomplete: Sequence[Mapping[str, object]]) -> str:
+    """一句话概括"为什么这些候选没进观察池"（供状态行使用）。"""
+    statuses = {_text(item.get("evaluation_status")) for item in incomplete}
+    if statuses == {EVALUATION_INCOMPLETE}:
+        return "数据待补全"
+    if statuses == {EVALUATION_UNKNOWN}:
+        return "评估状态未标注"
+    return "未通过完整风险检查"
 
 
 def _localize_reason(reason: str) -> str:
