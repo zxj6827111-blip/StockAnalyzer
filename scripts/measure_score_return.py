@@ -321,8 +321,12 @@ def _read_returns(
             con = duckdb.connect(db_path, read_only=True)
         except Exception as exc:  # noqa: BLE001 - 多半是"Conflicting lock"
             last = exc
+            # 走 stderr：`--json` 时 stdout 必须是**干净的一个 JSON 对象**，
+            # 混一行重试提示进 stdout 会让下游 json.loads 直接炸（实测踩过）。
             print(
-                f"[retry {attempt}/{retries}] 只读打开失败（服务可能持有写锁）: {exc}", flush=True
+                f"[retry {attempt}/{retries}] 只读打开失败（服务可能持有写锁）: {exc}",
+                file=sys.stderr,
+                flush=True,
             )
             time.sleep(sleep_sec)
             continue
