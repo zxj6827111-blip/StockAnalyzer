@@ -13,7 +13,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
+import json
 import random
 from pathlib import Path
 
@@ -117,7 +120,11 @@ def test_highest_score_ignores_label_availability() -> None:
 
 
 def _seed_db(path: Path, rows: list[tuple[str, str, float | None, str]]) -> None:
-    """建最小可用的两表：signal_snapshots + outcome_records。"""
+    """建最小可用的两表：signal_snapshots + outcome_records。
+
+    注意 signal_snapshots 只存打分的**输入分量**（lgbm/xgb/meta/...），**没有 0~100 总分**——
+    这正是 2026-09-16 修正数据源的原因：总分只出现在夜扫产物里。
+    """
     con = duckdb.connect(str(path))
     try:
         con.execute(
@@ -131,7 +138,7 @@ def _seed_db(path: Path, rows: list[tuple[str, str, float | None, str]]) -> None
         for snapshot_id, decision_time, realized, maturity in rows:
             con.execute(
                 "INSERT INTO signal_snapshots VALUES (?, ?, ?, ?)",
-                [snapshot_id, decision_time, '{"score": 55.5}', "{}"],
+                [snapshot_id, decision_time, '{"lgbm": 0.5, "xgb": 0.5, "meta": 0.5}', "{}"],
             )
             con.execute(
                 "INSERT INTO outcome_records VALUES (?, ?, ?)",
@@ -141,7 +148,90 @@ def _seed_db(path: Path, rows: list[tuple[str, str, float | None, str]]) -> None
         con.close()
 
 
-def test_read_pairs_filters_immature_labels_but_reports_them(tmp_path: Path) -> None:
+def _write_artifact(
+    root: Path,
+    run_id: str,
+    *,
+    timestamp: str,
+    candidates: list[dict[str, object]],
+    commit: str = "deadbeefcafe",
+    group: str = "heavy",
+) -> Path:
+    """写一份最小夜扫产物（结构照抄生产：results[0].payload.report.source_report...）。"""
+    path = root / group / f"week5_night_scan.{run_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "job": "week5_night_scan",
+        "run_id": run_id,
+        "timestamp": timestamp,
+        "status": "success",
+        "build": {"commit": commit},
+        "results": [
+            {
+                "job": "week5_night_scan",
+                "ran": True,
+                "success": True,
+                "detail": "week5_automation:ok",
+                "payload": {
+                    "report": {
+                        "night_pool": candidates[:1],
+                        "source_report": {
+                            "signal_pool": {
+                                "candidate_count": len(candidates),
+                                "candidates": candidates,
+                            }
+                        },
+                    }
+                },
+            }
+        ],
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def test_read_candidates_takes_score_from_artifact_cross_section(tmp_path: Path) -> None:
+    """分数取自产物横截面（signal_pool.candidates），不是只有 0~1 条的 night_pool。"""
+    root = tmp_path / "results"
+    _write_artifact(
+        root,
+        "run1",
+        timestamp="2026-09-15T21:45:04",
+        candidates=[
+            {"snapshot_id": f"s{i}", "symbol": f"{i:06d}", "score": 70.0 - i, "grade": "A"}
+            for i in range(5)
+        ],
+    )
+    candidates, summary = MEASURE._read_candidates(str(root))
+    assert len(candidates) == 5
+    assert summary["runs_with_candidates"] == 1
+    assert summary["night_pool_total"] == 1  # 最终池单独计数，不进横截面
+    assert summary["commit_set"] == ["deadbeefcafe"]
+
+
+def test_read_candidates_dedups_by_snapshot_and_counts_bad_runs(tmp_path: Path) -> None:
+    """同一 snapshot 多次出现取最后一次；产物损坏只计数，不让整次测量失效。"""
+    root = tmp_path / "results"
+    _write_artifact(
+        root,
+        "run1",
+        timestamp="2026-09-15T21:45:04",
+        candidates=[{"snapshot_id": "s1", "symbol": "000001", "score": 60.0}],
+    )
+    _write_artifact(
+        root,
+        "run2",
+        timestamp="2026-09-15T22:45:04",
+        candidates=[{"snapshot_id": "s1", "symbol": "000001", "score": 66.0}],
+    )
+    (root / "heavy" / "week5_night_scan.broken.json").write_text("{not json", encoding="utf-8")
+    candidates, summary = MEASURE._read_candidates(str(root))
+    assert len(candidates) == 1
+    assert candidates[0]["score"] == 66.0
+    assert summary["runs_unreadable"] == 1
+
+
+def test_read_returns_filters_immature_labels_but_reports_them(tmp_path: Path) -> None:
     db = tmp_path / "learning_protocol.duckdb"
     _seed_db(
         db,
@@ -153,14 +243,24 @@ def test_read_pairs_filters_immature_labels_but_reports_them(tmp_path: Path) -> 
             ("s5", "2026-09-11T14:30:00", None, "pending"),  # 未结算
         ],
     )
-    pairs, tally = MEASURE._read_pairs(str(db), retries=1)
-    assert [row[0] for row in pairs] == ["2026-09-10"] * 3
-    # 分布按**未按成熟度过滤**口径统计：剔了多少必须看得见。注意 s5 收益为空，
-    # 在 SQL 层就被 realized_return IS NOT NULL 挡掉，不进这个分布（故 pending 计 1）。
-    assert tally == {"fully_matured": 1, "reconciled": 1, "label_matured": 1, "pending": 1}
+    got, ledger = MEASURE._read_returns(
+        str(db), ["s1", "s2", "s3", "s4", "s5", "missing"], retries=1
+    )
+    assert sorted(got) == ["s1", "s2", "s3"]
+    # 决策日取库里的 decision_time，不靠产物时间戳猜
+    assert got["s1"][0] == "2026-09-10"
+    assert ledger["not_in_outcome_records"] == 1
+    assert ledger["return_null"] == 1
+    assert ledger["immature_or_other"] == 1
+    assert ledger["maturity_breakdown"] == {
+        "fully_matured": 1,
+        "reconciled": 1,
+        "label_matured": 1,
+        "pending": 2,
+    }
 
 
-def test_read_pairs_all_keeps_pending(tmp_path: Path) -> None:
+def test_read_returns_all_keeps_pending(tmp_path: Path) -> None:
     db = tmp_path / "learning_protocol.duckdb"
     _seed_db(
         db,
@@ -169,8 +269,46 @@ def test_read_pairs_all_keeps_pending(tmp_path: Path) -> None:
             ("s4", "2026-09-11T14:30:00", 0.99, "pending"),
         ],
     )
-    pairs, _ = MEASURE._read_pairs(str(db), retries=1, maturity_statuses=())
-    assert len(pairs) == 2
+    got, _ = MEASURE._read_returns(str(db), ["s1", "s4"], retries=1, maturity_statuses=())
+    assert len(got) == 2
+
+
+def test_thin_sample_refuses_a_verdict(tmp_path: Path) -> None:
+    """样本不够时必须说"证据不足"，不能把噪声说成定论。
+
+    这是本脚本的底线：它存在的意义就是阻止"为了让输出非空而放宽门禁"。
+    """
+    root = tmp_path / "results"
+    db = tmp_path / "learning_protocol.duckdb"
+    _seed_db(db, [])
+    con = duckdb.connect(str(db))
+    try:
+        for i in range(3):
+            con.execute(
+                "INSERT INTO signal_snapshots VALUES (?, ?, ?, ?)",
+                [f"s{i}", "2026-09-10T14:30:00", "{}", "{}"],
+            )
+            con.execute(
+                "INSERT INTO outcome_records VALUES (?, ?, ?)", [f"s{i}", 0.01, "reconciled"]
+            )
+    finally:
+        con.close()
+    _write_artifact(
+        root,
+        "run1",
+        timestamp="2026-09-15T21:45:04",
+        candidates=[
+            {"snapshot_id": f"s{i}", "symbol": f"{i:06d}", "score": 60.0 + i} for i in range(3)
+        ],
+    )
+    with contextlib.redirect_stdout(io.StringIO()) as buf:
+        code = MEASURE.main(
+            ["--db", str(db), "--artifacts-root", str(root), "--retries", "1", "--json"]
+        )
+    assert code == 0
+    report = json.loads(buf.getvalue())
+    assert report["verdict"].startswith("INSUFFICIENT_SAMPLE")
+    assert report["samples"] == 3
 
 
 def test_cmdline_default_maturity_is_the_training_side_one(tmp_path: Path) -> None:
@@ -182,7 +320,16 @@ def test_cmdline_default_maturity_is_the_training_side_one(tmp_path: Path) -> No
     }
     db = tmp_path / "learning_protocol.duckdb"
     _seed_db(db, [("s1", "2026-09-10T14:30:00", 0.01, "pending")])
-    code = MEASURE.main(["--db", str(db), "--retries", "1", "--json"])
+    root = tmp_path / "results"
+    _write_artifact(
+        root,
+        "run1",
+        timestamp="2026-09-15T21:45:04",
+        candidates=[{"snapshot_id": "s1", "symbol": "000001", "score": 60.0}],
+    )
+    code = MEASURE.main(
+        ["--db", str(db), "--artifacts-root", str(root), "--retries", "1", "--json"]
+    )
     assert code == 0
 
 
