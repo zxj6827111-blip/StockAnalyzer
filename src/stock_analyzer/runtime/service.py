@@ -137,6 +137,7 @@ from stock_analyzer.research import (
     run_tft_sidecar,
 )
 from stock_analyzer.research.signal_quality_auditor import SignalQualityAuditor
+from stock_analyzer.risk.overextension import EVALUATION_EVALUATED
 from stock_analyzer.runtime.market_outcomes import summarize_market_observation
 from stock_analyzer.runtime.news_provider_factory import build_news_provider
 from stock_analyzer.runtime.notifier_factory import build_notifier
@@ -7289,6 +7290,12 @@ class StockAnalyzerService:
             # reject 也必须拒绝（此前只消费 board_risk，overextension 断链）。
             overextension = _coerce_object_mapping(signal.get("overextension"))
             board_risk = _coerce_object_mapping(signal.get("board_risk"))
+            # 缺输入门：evaluator 在 close/ma5/atr14 不全时不做判定（level=none），
+            # 那是"没算出来"，不是"没有风险"。买入准入按**输入不足**拒绝，对外
+            # 给出的原因是输入不足而非谎称过热。旧候选缺该字段时视为无法确认
+            # 已完整评估，一律拦下（fail-closed），不允许默认放行。
+            if str(overextension.get("evaluation_status", "")).strip() != EVALUATION_EVALUATED:
+                reasons.append("overextension_insufficient_input")
             if bool(board_risk.get("reject_new_buy", False)):
                 reasons.append("board_risk_reject_new_buy")
             elif bool(overextension.get("reject_new_buy", False)):

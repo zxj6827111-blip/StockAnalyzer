@@ -21,6 +21,8 @@ import pytest
 
 from stock_analyzer.config import OverextensionConfig
 from stock_analyzer.risk.overextension import (
+    EVALUATION_EVALUATED,
+    EVALUATION_INSUFFICIENT_INPUT,
     evaluate_overextension,
     overextension_inputs_from_ohlc,
     overextension_row_from_bars,
@@ -80,20 +82,76 @@ def test_inputs_none_when_history_too_short() -> None:
 # --- 生产路径：喂真值 vs 只有 OHLC 列 -----------------------------------------
 
 
-def test_bare_bar_row_reproduces_the_production_bug() -> None:
-    """**回归证据**：只喂 OHLC 列的末根 bar（旧生产路径），一只正常票也被判 reject。
+def test_bare_bar_row_is_insufficient_input_not_a_false_reject() -> None:
+    """只喂 OHLC 列的末根 bar（旧生产路径）**不再**被判"过热"，而是标记输入不足。
 
-    断言 bias ≈ close-1、atr/bias ≈ 33.333，把事故形态写进测试，防止有人再
-    "顺手"把 row 换回 _latest_bar_dict。
+    这是 P0 的两段式修法：第一段（PR #82）去掉占位常量，第二段（本批）把
+    "没算出来"显式标成 `insufficient_input`——因为 `level` 仍是 `none`，
+    只判 level 的调用方会把"缺输入"读成"没有风险"。
+
+    注意：占位常量已删除，所以 bias 不再出现（缺键，而不是 null 或假值），
+    也不会再有 atr/bias == 33.333 这种由假值算出的比值。
     """
     config = OverextensionConfig()
     bare = {"open": 12.0, "high": 13.0, "low": 11.0, "close": 12.0}
     decision = evaluate_overextension(row=bare, config=config)
-    assert decision.level == "reject"
-    assert decision.reject_new_buy is True
-    metrics = decision.metrics
-    assert metrics["bias_ma5"] == pytest.approx(12.0 - 1.0)  # close - 1
-    assert metrics["atr_distance"] / metrics["bias_ma5"] == pytest.approx(33.333, abs=0.01)
+    assert decision.level == "none"
+    assert decision.reject_new_buy is False
+    assert decision.evaluation_status == EVALUATION_INSUFFICIENT_INPUT
+    assert decision.missing_inputs == ["ma5", "atr14"]
+    assert "insufficient_input" in decision.reasons
+    # 缺输入指标用缺键表示，不得出现假默认值算出的乖离
+    assert "bias_ma5" not in decision.metrics
+    assert "atr_distance" not in decision.metrics
+
+
+def test_placeholder_fallbacks_are_gone_from_the_module() -> None:
+    """占位常量必须彻底删除：留着就还会有人接回去当"保守默认"。"""
+    from stock_analyzer.risk import overextension as module
+
+    assert not hasattr(module, "DEFAULT_MA5_FALLBACK")
+    assert not hasattr(module, "DEFAULT_ATR14_FALLBACK")
+
+
+@pytest.mark.parametrize(
+    ("row", "missing"),
+    [
+        ({"close": 12.0}, ["ma5", "atr14"]),
+        ({"close": 12.0, "ma5": 11.4}, ["atr14"]),
+        ({"close": 12.0, "atr14": 2.0}, ["ma5"]),
+        # 无效数值：NaN / inf / 0 / 负数 / 非数字字符串都算不可用
+        ({"close": 12.0, "ma5": float("nan"), "atr14": 2.0}, ["ma5"]),
+        ({"close": 12.0, "ma5": float("inf"), "atr14": 2.0}, ["ma5"]),
+        ({"close": 12.0, "ma5": 0.0, "atr14": 2.0}, ["ma5"]),
+        ({"close": 12.0, "ma5": -1.0, "atr14": 2.0}, ["ma5"]),
+        ({"close": 12.0, "ma5": "abc", "atr14": 2.0}, ["ma5"]),
+        ({"close": 12.0, "ma5": True, "atr14": 2.0}, ["ma5"]),
+        # 无有效 ATR（ATR 恒为 0：每根 bar 都收在最高价且无跳空）
+        ({"close": 12.0, "ma5": 11.4, "atr14": 0.0}, ["atr14"]),
+        ({"close": 0.0, "ma5": 11.4, "atr14": 2.0}, ["close"]),
+    ],
+)
+def test_invalid_or_missing_metrics_are_insufficient_input(
+    row: dict[str, object], missing: list[str]
+) -> None:
+    decision = evaluate_overextension(row=row, config=OverextensionConfig())
+    assert decision.evaluation_status == EVALUATION_INSUFFICIENT_INPUT
+    assert decision.missing_inputs == missing
+    assert decision.reject_new_buy is False
+
+
+def test_zero_atr_series_is_insufficient_input_end_to_end() -> None:
+    """整条 bar 序列 ATR 为 0（价格完全不动）时，生产入口必须给出输入不足，
+    而不是把 atr_distance 当成 0 判"安全"。"""
+    from stock_analyzer.runtime.services.week5_service import _overextension_decision_dict
+
+    flat = [(10.0, 10.0, 10.0, 10.0) for _ in range(8)]
+    decision = _overextension_decision_dict(
+        row=overextension_row_from_bars(_bars_frame(flat)),
+        config=OverextensionConfig(),
+    )
+    assert decision["evaluation_status"] == EVALUATION_INSUFFICIENT_INPUT
+    assert "atr14" in decision["missing_inputs"]
 
 
 def test_row_from_bars_clears_the_false_reject() -> None:
@@ -154,12 +212,15 @@ def test_production_entry_points_clear_the_false_reject() -> None:
     )
     assert decision["level"] == "none"
     assert decision["reject_new_buy"] is False
+    assert decision["evaluation_status"] == EVALUATION_EVALUATED
+    assert decision["missing_inputs"] == []
     # evaluator 的 metrics 保留 6 位小数
     assert decision["metrics"]["bias_ma5"] == pytest.approx(abs(12.0 / 11.4 - 1.0), abs=1e-6)
 
-    # 旧的裸 bar（只有 OHLC 列）在同一入口下必然 reject —— 对照
+    # 旧的裸 bar（只有 OHLC 列）在同一入口下标为输入不足（不再是假"过热"）
     bare = _overextension_decision_dict(
         row={"open": 12.0, "high": 13.0, "low": 11.0, "close": 12.0}, config=config
     )
-    assert bare["level"] == "reject"
-    assert bare["reject_new_buy"] is True
+    assert bare["level"] == "none"
+    assert bare["reject_new_buy"] is False
+    assert bare["evaluation_status"] == EVALUATION_INSUFFICIENT_INPUT

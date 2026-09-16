@@ -27,7 +27,11 @@ from stock_analyzer.evolution.execution_aware_scoring import (
 from stock_analyzer.learning.execution_risk_labels import build_execution_risk_feature_vector
 from stock_analyzer.models.execution_risk_predictor import ExecutionRiskPredictor
 from stock_analyzer.risk.board_risk import board_decision_to_dict, evaluate_board_risk
-from stock_analyzer.risk.overextension import evaluate_overextension, overextension_row_from_bars
+from stock_analyzer.risk.overextension import (
+    EVALUATION_INSUFFICIENT_INPUT,
+    evaluate_overextension,
+    overextension_row_from_bars,
+)
 from stock_analyzer.runtime.services.week5_notification_service import (
     RuntimeWeek5NotificationService,
 )
@@ -3011,16 +3015,23 @@ def _overextension_decision_dict(
     row: dict[str, object],
     config: object,
 ) -> dict[str, object]:
-    """evaluate_overextension → 可序列化 dict（写入扫描审计）。"""
+    """evaluate_overextension → 可序列化 dict（写入扫描审计）。
+
+    ``evaluation_status``/``missing_inputs`` 必须一起落到候选上：只传 ``level``
+    会让下游把"没算出来"（level=none）读成"没有风险"。
+    """
     try:
         decision = evaluate_overextension(row=row, config=config)  # type: ignore[arg-type]
     except Exception:
+        # evaluator 自身炸掉也不能冒充"评估完成"：按输入不足处理，让最终准入拦下。
         return {
             "level": "none",
             "penalty": 0.0,
             "reject_new_buy": False,
-            "reasons": [],
+            "reasons": ["insufficient_input"],
             "metrics": {},
+            "evaluation_status": EVALUATION_INSUFFICIENT_INPUT,
+            "missing_inputs": ["evaluator_error"],
         }
     return {
         "level": decision.level,
@@ -3028,6 +3039,8 @@ def _overextension_decision_dict(
         "reject_new_buy": decision.reject_new_buy,
         "reasons": list(decision.reasons),
         "metrics": dict(decision.metrics),
+        "evaluation_status": decision.evaluation_status,
+        "missing_inputs": list(decision.missing_inputs),
     }
 
 

@@ -39,6 +39,7 @@ from stock_analyzer.feature.snapshot import (
     build_feature_snapshot,
     snapshot_is_current,
 )
+from stock_analyzer.risk.overextension import EVALUATION_INSUFFICIENT_INPUT
 from stock_analyzer.runtime.services.week5_service import (
     _as_float,
     _as_int,
@@ -1131,8 +1132,12 @@ class Week5SelectionEngine:
                 "level": "none",
                 "penalty": 0.0,
                 "reject_new_buy": False,
-                "reasons": [],
+                "reasons": ["insufficient_input"],
                 "metrics": {},
+                # 拿不到 bars 就是"没评估"，不是"没有风险"：默认值必须带
+                # insufficient_input，否则最终买入准入会把缺评估的候选放行。
+                "evaluation_status": EVALUATION_INSUFFICIENT_INPUT,
+                "missing_inputs": ["bars"],
             }
             board_decision: dict[str, object] = {
                 "consecutive_limit_up": 0,

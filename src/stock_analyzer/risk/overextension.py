@@ -11,6 +11,10 @@ PLAN P1: bars 与 snapshot 两条 baseline 路径必须共用同一 evaluator，
 输入偏好 snapshot 新特征列（ma5/ma10/atr14/bias_ma5/ret5/gap_pct/volume_ratio_5d），
 缺失时回退到 bars 路径提供的近似字段（ma5/atr_20d/…），从而与直接 bars
 评分路径共用同一份决策逻辑。
+
+必要指标（close/ma5/atr14）任一不可用时**不做判定**，返回
+``evaluation_status="insufficient_input"``：``level`` 仍是 ``none`` 以保持旧字段
+兼容，但消费方不得据此认定"没有风险"——最终买入准入按输入不足显式拦截。
 """
 
 from __future__ import annotations
@@ -22,8 +26,12 @@ from typing import Any
 
 from stock_analyzer.config import OverextensionConfig
 
-DEFAULT_ATR14_FALLBACK = 0.03
-DEFAULT_MA5_FALLBACK = 1.0
+# 评估状态：缺输入必须与外层"评估完成但结论是安全"区分开。只依赖
+# ``level == "none"`` 判断安全的调用方会把"没算出来"读成"没有风险"
+# （2026-09-16 的 P0 就是这么发生的：指标缺失 → 占位常量 → 无条件 reject；
+# 修掉占位值后又变成缺输入静默 fail-open）。
+EVALUATION_EVALUATED = "evaluated"
+EVALUATION_INSUFFICIENT_INPUT = "insufficient_input"
 
 # 算 ma5/atr14 的口径参数（与 learning/gate_metrics 的 harness 口径一致）
 MA5_WINDOW = 5
@@ -163,6 +171,10 @@ class OverextensionRiskDecision:
     reject_new_buy: bool
     reasons: list[str] = field(default_factory=list)
     metrics: dict[str, float] = field(default_factory=dict)
+    # evaluated | insufficient_input。``level`` 继续保持旧语义（缺输入时仍是
+    # "none"），因此**只判 level 的调用方必须同时看 evaluation_status**。
+    evaluation_status: str = EVALUATION_EVALUATED
+    missing_inputs: list[str] = field(default_factory=list)
 
 
 def _numeric(value: object, default: float) -> float:
@@ -178,32 +190,106 @@ def _numeric(value: object, default: float) -> float:
     return default
 
 
-def _normalized_bias(row: Mapping[str, Any]) -> float:
-    """bias_ma5 = (close - ma5) / ma5，取绝对值上限封顶 1.0。"""
-    close = _numeric(row.get("close"), 0.0)
-    ma5 = _numeric(row.get("ma5"), _numeric(row.get("ma5_from_ma20"), DEFAULT_MA5_FALLBACK))
-    if close <= 0 or ma5 <= 0:
-        return 0.0
-    return abs(close / ma5 - 1.0)
+def _positive_metric(row: Mapping[str, Any], names: Sequence[str]) -> tuple[float, bool]:
+    """按名字顺序取第一个**可用**的正数指标，返回 (值, 是否可用)。
+
+    可用 = 键存在、不是布尔、可转 float、有限且 > 0。缺键、None、NaN、inf、
+    0、负数一律视为不可用——它们都算不出有意义的乖离，不能拿默认值顶上。
+    """
+    for name in names:
+        if name not in row:
+            continue
+        raw = row.get(name)
+        if raw is None or isinstance(raw, bool):
+            continue
+        value = _numeric(raw, float("nan"))
+        if not math.isfinite(value) or value <= 0:
+            continue
+        return value, True
+    return 0.0, False
 
 
-def _atr_distance(row: Mapping[str, Any]) -> float:
-    """(close - ma5) 以 ATR 衡量的距离；无 ATR 时用保守默认。"""
-    close = _numeric(row.get("close"), 0.0)
-    ma5 = _numeric(row.get("ma5"), _numeric(row.get("ma5_from_ma20"), DEFAULT_MA5_FALLBACK))
-    atr14 = _numeric(row.get("atr14"), _numeric(row.get("atr_20d"), DEFAULT_ATR14_FALLBACK))
-    if close <= 0 or ma5 <= 0 or atr14 <= 0:
-        return 0.0
-    return abs(close - ma5) / atr14
+@dataclass(slots=True)
+class _ResolvedInputs:
+    close: float
+    ma5: float
+    atr14: float
+    bias: float
+    atr_distance: float
+
+
+# 过热判定的必要指标：三者的真值都必须存在，缺任何一个都无法给出可信结论。
+_REQUIRED_METRIC_COLUMNS: dict[str, tuple[str, ...]] = {
+    "close": ("close",),
+    "ma5": ("ma5", "ma5_from_ma20"),
+    "atr14": ("atr14", "atr_20d"),
+}
+
+
+def _resolve_inputs(row: Mapping[str, Any]) -> tuple[_ResolvedInputs | None, list[str]]:
+    """解析必要指标；任一不可用时返回 (None, 缺失清单)。"""
+    resolved: dict[str, float] = {}
+    missing: list[str] = []
+    for label, names in _REQUIRED_METRIC_COLUMNS.items():
+        value, ok = _positive_metric(row, names)
+        if not ok:
+            missing.append(label)
+            continue
+        resolved[label] = value
+    if missing:
+        return None, missing
+    close = resolved["close"]
+    ma5 = resolved["ma5"]
+    atr14 = resolved["atr14"]
+    return (
+        _ResolvedInputs(
+            close=close,
+            ma5=ma5,
+            atr14=atr14,
+            bias=abs(close / ma5 - 1.0),
+            atr_distance=abs(close - ma5) / atr14,
+        ),
+        [],
+    )
 
 
 def evaluate_overextension(
     row: Mapping[str, Any],
     config: OverextensionConfig,
 ) -> OverextensionRiskDecision:
-    """单行（symbol/trade_date 对齐的 bar 或 snapshot 行）过热风险判定。"""
-    bias = _normalized_bias(row)
-    atr_distance = _atr_distance(row)
+    """单行（symbol/trade_date 对齐的 bar 或 snapshot 行）过热风险判定。
+
+    输入不足（历史太短、缺列、非有限值、无有效 ATR）时**不做判定**：返回
+    ``evaluation_status=insufficient_input``、``level="none"``、
+    ``reject_new_buy=False``，且 ``metrics`` 里**不出现** bias/atr 键（缺键，
+    不用 null 占位，也不用 1.0/0.03 之类的假默认值）。
+
+    为什么在这里 fail-open 而不直接 reject：把"没算出来"当成"过热"就是
+    2026-09-16 的 P0（600/600 候选被无条件否决）；但把它当成"安全"同样是错的。
+    真正的拦截放在最终买入准入（`_final_signal_selector`）——那里按"输入不足"
+    拒绝，对外原因是输入不足，而不是谎称过热。
+    """
+    resolved, missing = _resolve_inputs(row)
+    if resolved is None:
+        ret5 = _numeric(row.get("ret5"), 0.0)
+        gap_pct = _numeric(row.get("gap_pct"), 0.0)
+        volume_ratio_5d = _numeric(row.get("volume_ratio_5d"), 1.0)
+        return OverextensionRiskDecision(
+            level="none",
+            penalty=0.0,
+            reject_new_buy=False,
+            reasons=["insufficient_input"],
+            metrics={
+                "ret5": round(ret5, 6),
+                "gap_pct": round(gap_pct, 6),
+                "volume_ratio_5d": round(volume_ratio_5d, 6),
+            },
+            evaluation_status=EVALUATION_INSUFFICIENT_INPUT,
+            missing_inputs=missing,
+        )
+
+    bias = resolved.bias
+    atr_distance = resolved.atr_distance
     level = "none"
     penalty = 0.0
     reasons: list[str] = []
@@ -256,4 +342,5 @@ def evaluate_overextension(
         reject_new_buy=level == "reject",
         reasons=reasons,
         metrics=metrics,
+        evaluation_status=EVALUATION_EVALUATED,
     )
