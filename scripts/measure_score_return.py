@@ -48,6 +48,10 @@ DEFAULT_DB = "/app/artifacts/training/learning_protocol.duckdb"
 THRESHOLD_LEVELS = (50.0, 60.0, 65.0, 70.0)
 # 选股视角的 top-k：判断"按分位选前 k 名"是否优于"卡绝对分"
 TOP_KS = (1, 3, 5, 10)
+# 标签成熟口径**抄训练侧**（learning/dataset_manifest.py 的 _DEFAULT_MATURITY_STATUSES），
+# 不自己另立一套：pending 的 realized_return 是中途市值标记，不是模型学过的那个标签，
+# 混进来会把"分数能否预测标签"答成另一道题（并稀释 IC）。
+_DEFAULT_MATURITY_STATUSES = ("label_matured", "reconciled", "fully_matured")
 
 
 def _quantile(values: list[float], q: float) -> float:
@@ -94,19 +98,21 @@ def evaluate_pairs(
     ci = date_block_bootstrap_ci(daily_ic, block_days=block_days)
     ic_mean = sum(value for _, value in daily_ic) / len(daily_ic) if daily_ic else float("nan")
 
-    scores = [score for _, score, _ in pairs if math.isfinite(score)]
-    returns = [realized for _, _, realized in pairs if math.isfinite(realized)]
+    # 分位收益必须用**成对**的点：compute_quantile_returns 内部只做同位置掩码，
+    # 默认两侧本就一一对应。早先这里分数、收益各自过滤，于是"有限分数+NaN 收益"与
+    # "NaN 分数+有限收益"两条会被错位配成一条——最高分那一档会被一条无关收益污染，
+    # 而 top−bottom 正是本脚本要用来说"该不该改按分位选股"的那个数。
+    paired = [
+        (score, realized)
+        for _, score, realized in pairs
+        if math.isfinite(score) and math.isfinite(realized)
+    ]
+    scores = [score for score, _ in paired]
+    returns = [realized for _, realized in paired]
     quantiles = compute_quantile_returns(scores, returns, n_quantiles=5) if scores else {}
 
     # 门槛视角：各档占比 + top-k 收益均值 vs 其余
-    ordered = sorted(
-        (
-            (score, realized)
-            for _, score, realized in pairs
-            if math.isfinite(score) and math.isfinite(realized)
-        ),
-        key=lambda item: -item[0],
-    )
+    ordered = sorted(paired, key=lambda item: -item[0])
     total = len(ordered)
     threshold_stats: dict[str, Any] = {}
     for level in THRESHOLD_LEVELS:
@@ -127,7 +133,10 @@ def evaluate_pairs(
             "rest_mean_return": round(sum(tail) / len(tail), 6),
             "excess": round(sum(head) / len(head) - sum(tail) / len(tail), 6),
         }
-    highest = max(scores) if scores else None
+    # "离门槛还差几分"问的是**系统产出的最高分**，与这条有没有成熟标签无关：
+    # 用全量有限分数，不用上面那组成对点（否则最高分恰好还没结算就会被漏掉）。
+    all_scores = [score for _, score, _ in pairs if math.isfinite(score)]
+    highest = max(all_scores) if all_scores else None
 
     verdict = "INCONCLUSIVE"
     ci_low = ci["ci_low"]
@@ -175,12 +184,21 @@ def evaluate_pairs(
 
 
 def _read_pairs(
-    db_path: str, *, retries: int = 3, sleep_sec: float = 5.0
-) -> list[tuple[str, float, float]]:
-    """只读拉取（分数, 已实现收益）配对；写锁占用时重试，拿不到就如实抛错。"""
+    db_path: str,
+    *,
+    retries: int = 3,
+    sleep_sec: float = 5.0,
+    maturity_statuses: Sequence[str] = _DEFAULT_MATURITY_STATUSES,
+) -> tuple[list[tuple[str, float, float]], dict[str, int]]:
+    """只读拉取（分数, 已实现收益）配对 + **未过滤**的成熟度分布。
+
+    第二个返回值是"剔掉了多少"的证据：口径一旦过滤，就必须让人看见过滤掉了什么，
+    否则"样本少了"和"确实没样本"分不清。写锁占用时重试，拿不到就如实抛错。
+    """
     import duckdb
 
     last: Exception | None = None
+    wanted = {str(item) for item in maturity_statuses}
     for attempt in range(1, max(1, retries) + 1):
         try:
             con = duckdb.connect(db_path, read_only=True)
@@ -201,7 +219,8 @@ def _read_pairs(
                            ),
                            TRY_CAST(json_extract_string(s.model_outputs_json, '$.meta') AS DOUBLE)
                        ) AS score,
-                       o.realized_return
+                       o.realized_return,
+                       o.maturity_status
                 FROM signal_snapshots s
                 JOIN outcome_records o ON o.snapshot_id = s.snapshot_id
                 WHERE o.realized_return IS NOT NULL
@@ -210,11 +229,16 @@ def _read_pairs(
         finally:
             con.close()
         pairs: list[tuple[str, float, float]] = []
-        for day, score, realized in rows:
+        tally: dict[str, int] = {}
+        for day, score, realized, maturity in rows:
+            status = str(maturity or "")
+            tally[status] = tally.get(status, 0) + 1
             if score is None or realized is None:
                 continue
+            if wanted and status not in wanted:
+                continue
             pairs.append((str(day)[:10], float(score), float(realized)))
-        return pairs
+        return pairs, tally
     raise RuntimeError(f"读不到学习库（{retries} 次重试均失败）: {last}")
 
 
@@ -223,6 +247,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--db", default=DEFAULT_DB)
     parser.add_argument("--block-days", type=int, default=5)
     parser.add_argument("--retries", type=int, default=3)
+    parser.add_argument(
+        "--maturity",
+        choices=("matured", "all"),
+        default="matured",
+        help=(
+            "标签成熟口径：matured=只算训练侧认的成熟标签（默认，见 _DEFAULT_MATURITY_STATUSES）；"
+            "all=连 pending 一起算（口径对照用，不用于定论）"
+        ),
+    )
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--selftest", action="store_true", help="用合成数据验证判据公式")
     args = parser.parse_args(list(argv) if argv is not None else None)
@@ -249,12 +282,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("SELFTEST=" + ("PASS" if ok else "FAIL"))
         return 0 if ok else 1
 
-    pairs = _read_pairs(args.db, retries=args.retries)
+    maturity = () if args.maturity == "all" else _DEFAULT_MATURITY_STATUSES
+    pairs, tally = _read_pairs(args.db, retries=args.retries, maturity_statuses=maturity)
     report = evaluate_pairs(pairs, block_days=args.block_days)
+    included = sum(tally.get(status, 0) for status in maturity) if maturity else sum(tally.values())
+    days = sorted({day for day, _, _ in pairs})
+    report["label_status"] = {
+        "maturity_filter": args.maturity,
+        "included_statuses": list(maturity) or ["<all>"],
+        "breakdown": dict(sorted(tally.items())),
+        # 说清这个分布是在哪个口径上的：收益为空的配对在 SQL 层就被挡掉了，
+        # 不在其中。否则"剔掉多少"会被读成全量占比。
+        "breakdown_scope": "已结算配对（realized_return 非空）的成熟度分布",
+        "rows_after_maturity_filter": included,
+        "excluded_by_maturity": sum(tally.values()) - included,
+    }
+    report["decision_day_range"] = [days[0], days[-1]] if days else []
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
         return 0
-    print(f"样本 {report['samples']}（{report['days']} 个决策日，IC 有效 {report['ic_days']} 天）")
+    label = report["label_status"]
+    print(
+        f"标签口径 {label['maturity_filter']}（{'+'.join(label['included_statuses'])}）"
+        f"  成熟度分布 {label['breakdown']}"
+        f"  因成熟度剔掉 {label['excluded_by_maturity']} 条"
+    )
+    print(
+        f"决策日 {report['decision_day_range'] or '（无）'}"
+        f"  样本 {report['samples']}（{report['days']} 个决策日，IC 有效 {report['ic_days']} 天）"
+    )
     lo, hi = report["ic_ci95"]
     print(
         f"IC 均值 {report['ic_mean']:.4f}  95% CI [{lo:.4f}, {hi:.4f}]  "
