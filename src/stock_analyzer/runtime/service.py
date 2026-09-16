@@ -12116,6 +12116,7 @@ class StockAnalyzerService:
                 details = {}
         registry = getattr(self, "_model_registry", None)
         champion: dict[str, object] | None = None
+        registered: list[dict[str, object]] = []
         registry_error = ""
         if registry is not None:
             try:
@@ -12129,10 +12130,26 @@ class StockAnalyzerService:
                     }
             except Exception as exc:  # noqa: BLE001 - 读不到注册表要如实上报，不是 mismatch
                 registry_error = f"{type(exc).__name__}: {exc}"
+            # 登记清单只服务"身份可验证"那半：没有 champion 时，只要在服内容与某条
+            # challenger/trained 记录同哈希，也说明"这就是登记过的那份内容"。缺了它，
+            # 本报告在无 champion 的生产状态下只会恒答 no_champion，等于看不见真相。
+            # 读失败只降级为"这半判不了"，绝不覆盖上面如实上报的 registry_error。
+            try:
+                registered = [
+                    {
+                        "model_id": getattr(item, "model_id", ""),
+                        "artifact_content_hash": getattr(item, "artifact_content_hash", ""),
+                        "lifecycle_state": str(getattr(item, "lifecycle_state", "")),
+                    }
+                    for item in registry.list_records(limit=200, suppress_read_errors=True)
+                ]
+            except Exception:  # noqa: BLE001 - 同上门禁：身份查询不得影响健康端点
+                registered = []
         return describe_artifact_identity(
             loaded_uri=details.get("artifact_uri", ""),
             loaded_hash=details.get("artifact_content_hash", ""),
             champion=champion,
+            registered=registered,
             registry_error=registry_error,
         )
 

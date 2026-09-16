@@ -180,15 +180,34 @@ class _PredictorStub:
 
 
 class _RegistryStub:
-    def __init__(self, record: object | None, *, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        record: object | None,
+        *,
+        error: Exception | None = None,
+        registered: list[object] | None = None,
+        list_error: Exception | None = None,
+    ) -> None:
         self._record = record
         self._error = error
+        self._registered = list(registered or [])
+        self._list_error = list_error
 
     def active_champion(self, suppress_read_errors: bool = False) -> object:
         _ = suppress_read_errors
         if self._error is not None:
             raise self._error
         return self._record
+
+    def list_records(
+        self, *, limit: int | None = None, suppress_read_errors: bool = False
+    ) -> list[object]:
+        # 桩必须跟上真实 registry 的接口：2026-09-16 的缺口正是"服务只问 champion、
+        # 从不问登记清单"，桩缺 list_records 就会把这个缺口掩盖成"已覆盖"。
+        _ = (limit, suppress_read_errors)
+        if self._list_error is not None:
+            raise self._list_error
+        return list(self._registered)
 
 
 class _RecordStub:
@@ -240,6 +259,48 @@ def test_service_reports_registry_error_as_unavailable() -> None:
     report = service.artifact_identity_report()  # type: ignore[attr-defined]
     assert report["status"] == IDENTITY_REGISTRY_UNAVAILABLE
     assert "db locked" in str(report["detail"])
+
+
+def test_service_sees_registered_copy_when_no_champion() -> None:
+    """无 champion 但在服内容 == 某条登记记录：必须报 match_registered。
+
+    2026-09-16 实测缺口：PR #74 只把这条判定加进了 identity.py 与巡检器，服务报告
+    没传 ``registered=``，于是 ``/health/deep`` 恒答 no_champion —— 而巡检器的直连
+    路径又被学习库写锁挡死（实测 ``Conflicting lock is held``）。两条活路径一起瞎，
+    "身份可验证"这半在生产上根本看不见，登记了 challenger 也白登记。
+    """
+    service = _service(
+        _PredictorStub(
+            {"artifact_uri": "/app/artifacts/model_v1.json", "artifact_content_hash": HASH_A}
+        ),
+        _RegistryStub(
+            None,
+            registered=[
+                _RecordStub(
+                    model_id="model_v3_deadbeef",
+                    artifact_content_hash=HASH_A,
+                    lifecycle_state="trained",
+                )
+            ],
+        ),
+    )
+    report = service.artifact_identity_report()  # type: ignore[attr-defined]
+    assert report["status"] == IDENTITY_MATCH_REGISTERED
+    assert report["champion_model_id"] == "model_v3_deadbeef"
+
+
+def test_service_registered_read_failure_does_not_fake_a_verdict() -> None:
+    """登记清单读失败只降级那半判定，不得覆盖既有的 champion 结论（也不得报错）。"""
+    service = _service(
+        _PredictorStub({"artifact_uri": "x", "artifact_content_hash": HASH_A}),
+        _RegistryStub(
+            _RecordStub(model_id="m1", artifact_content_hash=HASH_A),
+            list_error=RuntimeError("registry busy"),
+        ),
+    )
+    report = service.artifact_identity_report()  # type: ignore[attr-defined]
+    assert report["status"] == IDENTITY_MATCH
+    assert report["champion_model_id"] == "m1"
 
 
 def test_service_tolerates_predictor_without_mode_details() -> None:

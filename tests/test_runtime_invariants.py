@@ -6,10 +6,13 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
+from stock_analyzer.ops import runtime_invariants
 from stock_analyzer.ops.runtime_invariants import (
     SEVERITY_DEFECT,
     SEVERITY_INFO,
@@ -353,3 +356,123 @@ def test_identity_match_registered_is_pending_not_defect() -> None:
     assert not result.ok
     assert result.severity == SEVERITY_PENDING
     assert summarize([result])["ok"] is True
+
+
+# --- 身份项取数路径：优先问服务，直连兜底 -------------------------------------
+
+
+class _FakeResponse:
+    def __init__(self, payload: object) -> None:
+        self._payload = payload
+
+    def read(self) -> bytes:
+        return json.dumps(self._payload).encode("utf-8")
+
+    def __enter__(self) -> _FakeResponse:
+        return self
+
+    def __exit__(self, *args: object) -> bool:
+        return False
+
+
+def _patch_health(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: object = None,
+    error: Exception | None = None,
+) -> None:
+    def fake_urlopen(url: str, timeout: float | None = None) -> _FakeResponse:
+        _ = (url, timeout)
+        if error is not None:
+            raise error
+        return _FakeResponse(payload if payload is not None else {})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+
+def _forbid_direct_db(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*args: object, **kwargs: object) -> None:
+        raise AssertionError("服务可用时不得再直连学习库（写锁必然冲突）")
+
+    monkeypatch.setattr(runtime_invariants, "_read_identity_from_db", boom)
+
+
+def test_identity_prefers_service_over_direct_db(monkeypatch: pytest.MonkeyPatch) -> None:
+    """服务进程才持着学习库写锁，身份项必须先问它。
+
+    2026-09-16 NAS 实测：直连（api 容器内、scheduler-critical 容器内）都报
+    ``Conflicting lock is held``，于是身份项在服务运行期恒答 registry_busy。
+    """
+    _forbid_direct_db(monkeypatch)
+    _patch_health(
+        monkeypatch,
+        {
+            "model_identity": {
+                "status": "match_registered",
+                "loaded_content_hash": "a" * 64,
+                "champion_model_id": "model_v3_deadbeef",
+                "detail": "在服工件 == 登记记录 model_v3_deadbeef（trained）",
+            }
+        },
+    )
+    got = runtime_invariants._artifact_identity(  # noqa: SLF001
+        Path("learning_protocol.duckdb"), ["http://127.0.0.1:8000/health/deep"]
+    )
+    assert got is not None
+    assert got["status"] == "match_registered"
+    # 取数来源必须留在证据里：同一状态可能来自"问服务"或"直连兜底"，排查要能分辨。
+    assert "服务 API" in str(got["detail"])
+
+
+def test_identity_falls_back_to_db_when_service_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """服务不可达时才直连——那时写锁已释放，直连反而能成。"""
+    _patch_health(monkeypatch, error=OSError("Connection refused"))
+    monkeypatch.setattr(
+        runtime_invariants,
+        "_read_identity_from_db",
+        lambda path: {"status": "no_champion", "detail": "兜底路径"},
+    )
+    got = runtime_invariants._artifact_identity(  # noqa: SLF001
+        Path("learning_protocol.duckdb"), ["http://127.0.0.1:8000/health/deep"]
+    )
+    assert got is not None
+    assert got["status"] == "no_champion"
+
+
+def test_identity_ignores_response_without_identity_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    """旧版服务（/health/deep 还没有 model_identity）不许被读成"身份正常"。
+
+    拿不到就是拿不到：必须降级到直连，而不是凭一个缺字段的响应给绿。
+    """
+    _patch_health(monkeypatch, {"status": "ok"})
+    monkeypatch.setattr(
+        runtime_invariants,
+        "_read_identity_from_db",
+        lambda path: {"status": "loaded_hash_missing", "detail": "兜底路径"},
+    )
+    got = runtime_invariants._artifact_identity(  # noqa: SLF001
+        Path("learning_protocol.duckdb"), ["http://127.0.0.1:8000/health/deep"]
+    )
+    assert got is not None
+    assert got["status"] == "loaded_hash_missing"
+
+
+def test_identity_without_health_urls_uses_direct_db(monkeypatch: pytest.MonkeyPatch) -> None:
+    """不传端点（离线/单测）时保持原行为：只直连，且一个 HTTP 请求都不发。"""
+    calls: list[str] = []
+
+    def spy(url: str, timeout: float | None = None) -> _FakeResponse:
+        calls.append(url)
+        return _FakeResponse({})
+
+    monkeypatch.setattr("urllib.request.urlopen", spy)
+    monkeypatch.setattr(
+        runtime_invariants,
+        "_read_identity_from_db",
+        lambda path: {"status": "mismatch", "detail": "直连"},
+    )
+    got = runtime_invariants._artifact_identity(Path("learning_protocol.duckdb"))  # noqa: SLF001
+    assert got is not None
+    assert got["status"] == "mismatch"
+    assert calls == []
