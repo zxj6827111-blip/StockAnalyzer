@@ -22,6 +22,7 @@ from stock_analyzer.ops.runtime_invariants import (
     check_freshness,
     check_mounts,
     check_night_scan_artifact,
+    check_overextension_inputs,
     check_readiness,
     check_scheduler,
     summarize,
@@ -476,3 +477,48 @@ def test_identity_without_health_urls_uses_direct_db(monkeypatch: pytest.MonkeyP
     assert got is not None
     assert got["status"] == "mismatch"
     assert calls == []
+
+
+# --- 过热闸输入退化：静默否决整条买入路径 -------------------------------------
+
+
+def _overext(bias: float, atr: float, level: str = "reject") -> dict[str, object]:
+    return {"overextension": {"level": level, "metrics": {"bias_ma5": bias, "atr_distance": atr}}}
+
+
+def test_overextension_fallback_inputs_are_a_defect() -> None:
+    """生产实测形态：bias = close-1、atr = (close-1)/0.03 → 无条件 reject。
+
+    2026-09-16 实据：12 轮夜扫 600 条候选 level 全是 reject，atr/bias 恒为 33.333
+    （即 1/0.03）——喂进去的行既无 ma5 也无 atr14，两处 fallback 同时生效。
+    这条探测若不在，故障只会表现成"夜扫长期 0 信号"，被误读成阈值或 alpha 问题。
+    """
+    candidates = [_overext(5.06, 168.66666666666669), _overext(16.11, 537.0)]
+    result = check_overextension_inputs(candidates)
+    assert not result.ok
+    assert result.severity == SEVERITY_DEFECT
+    assert summarize([result])["ok"] is False
+    assert result.evidence["implausible_bias"] == 2
+    assert result.evidence["ratio_like_fallback"] == 2
+
+
+def test_overextension_low_vol_row_is_not_a_false_positive() -> None:
+    """给真实输入时 atr/bias == ma5/atr14，低波动票也可能正好是 33.33。
+
+    所以主判据必须是"物理上不成立的乖离"，不能只看比值——否则会把正常票报成故障。
+    """
+    candidates = [_overext(0.02, 0.6666, level="none"), _overext(0.01, 0.3333, level="none")]
+    result = check_overextension_inputs(candidates)
+    assert result.ok
+    assert result.detail == "过热闸输入正常"
+    assert result.evidence["ratio_like_fallback"] == 2  # 比值确实像，但不是故障
+    assert result.evidence["implausible_bias"] == 0
+
+
+def test_overextension_detector_silent_when_nothing_to_judge() -> None:
+    """没有候选 / 没评估过指标 → 不得报警（否则噪声会把这条真信号淹掉）。"""
+    assert check_overextension_inputs([]).ok is True
+    assert check_overextension_inputs(None).ok is True
+    empty_metrics = [{"overextension": {"level": "none", "metrics": {}}}]
+    assert check_overextension_inputs(empty_metrics).ok is True
+    assert check_overextension_inputs([{"symbol": "000001"}]).ok is True
