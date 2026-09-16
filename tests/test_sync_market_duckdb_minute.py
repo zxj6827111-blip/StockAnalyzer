@@ -31,15 +31,57 @@ def _load_module():
     return module
 
 
-def _make_db(path: Path, dates: list[str]) -> None:
+def _make_db(path: Path, dates: list[str], *, table: str | None = None) -> None:
+    """建两张汇总表；``table=None`` 时把日期写进**两张**表（= 该日期已完成）。
+
+    2026-09-16 起缺口检测是**交集**语义（所有目标表都有才算完成），所以"已完成"的夹具
+    必须两张表都写——只写 1m 现在表示"半写、仍缺 5m"。
+    """
+    targets = [table] if table else ["intraday_summary_1m", "intraday_summary_5m"]
     con = duckdb.connect(str(path))
     try:
         con.execute("CREATE TABLE intraday_summary_1m (symbol VARCHAR, date DATE)")
         con.execute("CREATE TABLE intraday_summary_5m (symbol VARCHAR, date DATE)")
         for value in dates:
-            con.execute("INSERT INTO intraday_summary_1m VALUES ('600000', ?)", [value])
+            for target in targets:
+                con.execute(f"INSERT INTO {target} VALUES ('600000', ?)", [value])
     finally:
         con.close()
+
+
+def test_half_written_date_is_still_a_gap(tmp_path: Path, monkeypatch) -> None:
+    """1m 有、5m 缺的日期必须仍算缺口。
+
+    原实现只拿 `intraday_summary_1m` 判缺口，写入端却逐日写 1m+5m——"写 2 张、只查 1 张"
+    会让部分缺失**静默留存**（与 8/28 那次静默空转同一类）。
+    """
+    module = _load_module()
+    db = tmp_path / "market.duckdb"
+    _make_db(db, ["2026-09-15"], table="intraday_summary_1m")  # 只有 1m
+    monkeypatch.setattr(module, "MARKET_DB", str(db))
+    zip_root = tmp_path / "minute_raw"
+    zip_root.mkdir()
+    (zip_root / "minute_1m_20260915.zip").write_bytes(b"")
+
+    assert module._missing_minute_dates(zip_root, date(2026, 9, 1)) == [date(2026, 9, 15)]
+
+
+def test_fully_written_date_is_not_a_gap(tmp_path: Path, monkeypatch) -> None:
+    """1m 与 5m 都有的日期不算缺口（别把完整日期反复重写）。"""
+    module = _load_module()
+    db = tmp_path / "market.duckdb"
+    _make_db(db, ["2026-09-15"], table="intraday_summary_1m")
+    con = duckdb.connect(str(db))
+    try:
+        con.execute("INSERT INTO intraday_summary_5m VALUES ('600000', '2026-09-15')")
+    finally:
+        con.close()
+    monkeypatch.setattr(module, "MARKET_DB", str(db))
+    zip_root = tmp_path / "minute_raw"
+    zip_root.mkdir()
+    (zip_root / "minute_1m_20260915.zip").write_bytes(b"")
+
+    assert module._missing_minute_dates(zip_root, date(2026, 9, 1)) == []
 
 
 def test_sync_minute_refuses_to_noop_when_source_missing(tmp_path: Path) -> None:

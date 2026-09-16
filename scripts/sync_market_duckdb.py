@@ -52,6 +52,9 @@ _DAILY_SNAPSHOT_COLS = [
 ]
 _QQ_SYMBOL_RE = re.compile(r"([A-Za-z]{1,3})#?(\d{6})")
 _ZIP_DATE_RE = re.compile(r"minute_1m_(\d{8})\.zip$")
+# 分钟汇总的目标表集合：缺口检测与写入必须对同一组表——
+# "写 2 张、只查 1 张"会让部分缺失静默留存（2026-09-16 修）。
+MINUTE_SUMMARY_TABLES = ("intraday_summary_1m", "intraday_summary_5m")
 
 
 def _missing_daily_dates(since: date_type) -> list[date_type]:
@@ -193,7 +196,12 @@ def _sync_daily(
 
 
 def _missing_minute_dates(zip_root: Path, since: date_type) -> list[date_type]:
-    """minute_raw 目录有 zip 而 market.duckdb 缺失的日期。"""
+    """minute_raw 目录有 zip、而 market.duckdb 的**任一**目标表缺失的日期。
+
+    "任一"是 2026-09-16 修的口径：原实现只拿 ``intraday_summary_1m`` 判缺口，于是
+    "1m 有、5m 缺"的日期永远不会被检出也不会被修——又一次"部分缺失被静默当成完整"。
+    写入端本来就逐日写 1m+5m，缺口检测也必须对两张表取并集，口径才对得上。
+    """
     zip_dates: set[date_type] = set()
     if zip_root.exists():
         for entry in zip_root.iterdir():
@@ -209,13 +217,20 @@ def _missing_minute_dates(zip_root: Path, since: date_type) -> list[date_type]:
                 zip_dates.add(parsed)
     con = duckdb.connect(MARKET_DB, read_only=True)
     try:
-        have = {
-            row[0]
-            for row in con.execute(
-                "SELECT DISTINCT date FROM intraday_summary_1m WHERE date >= ?",
-                [since],
-            ).fetchall()
-        }
+        # **交集**语义：一个日期只有在**所有**目标表里都存在才算完成。用并集会把
+        # "1m 有、5m 缺"的半写日期当成完整的——那正是要修的那类静默缺失。
+        per_table: list[set[date_type]] = []
+        for table in MINUTE_SUMMARY_TABLES:
+            per_table.append(
+                {
+                    row[0]
+                    for row in con.execute(
+                        f"SELECT DISTINCT date FROM {table} WHERE date >= ?",
+                        [since],
+                    ).fetchall()
+                }
+            )
+        have: set[date_type] = set.intersection(*per_table) if per_table else set()
     finally:
         con.close()
     return sorted(zip_dates - have)
