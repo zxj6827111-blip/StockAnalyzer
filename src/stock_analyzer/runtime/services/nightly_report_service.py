@@ -275,8 +275,12 @@ class NightlyReportService:
                 return payload
         return None
 
-    def _recent_trade_date_dirs(self) -> list[str]:
-        """最近 N 个交易日目录名（按目录名倒序取，N=recovery_lookback_days）。"""
+    def recent_trade_dates(self) -> list[str]:
+        """最近 N 个交易日目录名（按目录名倒序，N=recovery_lookback_days）。
+
+        恢复只回看当前交易日与最近一个交易日：禁止扫描整个历史目录，否则目录一旦
+        累积，交付检查的每分钟一次读取会越来越慢。
+        """
         try:
             names = sorted(
                 (item.name for item in self.root.iterdir() if item.is_dir()),
@@ -285,6 +289,28 @@ class NightlyReportService:
         except OSError:
             return []
         return names[: max(1, int(self.config.recovery_lookback_days))]
+
+    def _recent_trade_date_dirs(self) -> list[str]:
+        return self.recent_trade_dates()
+
+    def reports_for(self, trade_date: str) -> list[dict[str, object]]:
+        """该交易日需要交付的报告（正式报告 + 已发布的说明）。"""
+        state = self.read_date_state(trade_date)
+        report_ids: list[str] = []
+        published_id = _text(state.get("published_report_id"))
+        if published_id:
+            report_ids.append(published_id)
+        notices = _mapping(state.get("notices"))
+        for report_id in notices.values():
+            normalized = _text(report_id)
+            if normalized and normalized not in report_ids:
+                report_ids.append(normalized)
+        reports: list[dict[str, object]] = []
+        for report_id in report_ids:
+            report = self.load_report(report_id, trade_date=trade_date)
+            if report is not None:
+                reports.append(report)
+        return reports
 
     # ------------------------------------------------------------ 报告构造
 
