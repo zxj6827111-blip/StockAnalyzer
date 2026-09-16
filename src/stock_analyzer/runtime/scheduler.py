@@ -450,11 +450,11 @@ class DailyScheduler:
         self._last_run = loaded_last_run
         self._last_interval_slot = loaded_interval_slot
         raw_jobs = raw.get("jobs")
-        self._job_runtime = {
-            str(name): dict(value)
-            for name, value in raw_jobs.items()
-            if isinstance(value, dict)
-        } if isinstance(raw_jobs, dict) else {}
+        self._job_runtime = (
+            {str(name): dict(value) for name, value in raw_jobs.items() if isinstance(value, dict)}
+            if isinstance(raw_jobs, dict)
+            else {}
+        )
 
     def _record_job_result(
         self,
@@ -474,7 +474,15 @@ class DailyScheduler:
             failures = 0
         if ran and success:
             failures = 0
-        elif ran or detail == "expired":
+        elif ran and not success:
+            # 只有"真的跑过并且失败"才算连败。**窗口过期**（``ran=False`` +
+            # ``detail="expired"``，见上面 latest_time 分支）是调度记账事件：时钟越过
+            # ``latest_time`` 而该任务当天还没被评估到，任务本身没被启动、更没有失败。
+            # 旧写法把它一起计入，于是 ``consecutive_failures`` 混了两种东西——
+            # 2026-09-16 实测 ``week5_automation_auction`` 的真实失败是每天 1 次
+            # （`unavailable`），而 cf 已涨到 26，失败计数不可信、也没法当判据。
+            # 注意：supervisor 侧的 ``status="expired"`` 是**子进程超时被 kill**，
+            # 那是真失败（走另一条记录路径，``ran=True``），不属这里。
             failures += 1
         if ran and not success:
             # 失败退避：失败的每日/间隔任务不能立即重试（旧实现把 next_due
@@ -497,11 +505,10 @@ class DailyScheduler:
             else str(previous.get("last_success_at", ""))
         )
         failure_detail = (
-            ""
-            if ran and success
-            else detail
-            if ran or detail == "expired"
-            else str(previous.get("last_failure", ""))
+            # ``last_failure`` 只记真实失败：窗口过期不算（否则 job state 里
+            # ``last_failure="expired"`` 会被当成失败原因读，排查时误导人）。
+            # 过期本身仍可从 ``last_expired`` 与 ``status`` 读到，信号没丢。
+            "" if ran and success else detail if ran else str(previous.get("last_failure", ""))
         )
         expired_iso = (
             attempted_at.isoformat()
@@ -526,9 +533,9 @@ class DailyScheduler:
             "last_expired": expired_iso,
             "running_since": "",
             "heartbeat_at": attempted_at.isoformat(),
-            "run_id": uuid4().hex if ran or detail == "expired" else str(
-                previous.get("run_id", "")
-            ),
+            "run_id": uuid4().hex
+            if ran or detail == "expired"
+            else str(previous.get("run_id", "")),
             "status": status,
             "consecutive_failures": failures,
             "next_due_at": next_due_at.isoformat(),
