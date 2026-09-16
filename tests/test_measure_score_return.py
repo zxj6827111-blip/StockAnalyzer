@@ -248,6 +248,74 @@ def test_read_candidates_dedups_by_snapshot_and_counts_bad_runs(tmp_path: Path) 
     assert summary["runs_unreadable"] == 1
 
 
+def test_read_candidates_tallies_final_reject_reasons(tmp_path: Path) -> None:
+    """0 信号的**直接答案**在 final_selection 的拒因里，必须被统计出来。
+
+    2026-09-14 实测形态：最高分候选 76.22（action=buy、各闸门 passed）仍被拒，
+    拒它的是 overextension_reject_new_buy 与 cross_review_failed，不是 70 分门槛。
+    只统计分数域会让人误判成"阈值问题"。
+    """
+    root = tmp_path / "results"
+    path = _write_artifact(
+        root,
+        "run1",
+        timestamp="2026-09-14T23:51:00",
+        candidates=[{"snapshot_id": "s1", "symbol": "002479", "score": 76.22}],
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    report = payload["results"][0]["payload"]["report"]
+    report["source_report"]["funnel"] = {
+        "final_selection": {
+            "min_threshold": 70.0,
+            "selected_count": 0,
+            "rejected_count": 2,
+            "rejected": [
+                {
+                    "symbol": "002479",
+                    "score": 76.22,
+                    "reject_reasons": ["overextension_reject_new_buy", "below_min_threshold"],
+                },
+                {
+                    "symbol": "300592",
+                    "score": 67.33,
+                    "reject_reasons": ["cross_review_failed", "below_min_threshold"],
+                },
+            ],
+        }
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    _, summary = MEASURE._read_candidates(str(root))
+    final = summary["final_selection"]
+    assert final["selected_total"] == 0
+    assert final["rejected_total"] == 2
+    assert final["min_thresholds"] == [70.0]
+    assert final["reason_counts"] == {
+        "below_min_threshold": 2,
+        "overextension_reject_new_buy": 1,
+        "cross_review_failed": 1,
+    }
+    # 最高被拒候选要能被单独看见——它就是"门槛不是瓶颈"的证据
+    assert final["highest_rejected"][0]["symbol"] == "002479"
+    assert final["highest_rejected"][0]["score"] == pytest.approx(76.22)
+
+
+def test_final_selection_tally_is_empty_when_absent(tmp_path: Path) -> None:
+    """没有 final_selection 字段时不得报错，也不得编造计数。"""
+    root = tmp_path / "results"
+    _write_artifact(
+        root,
+        "run1",
+        timestamp="2026-09-15T21:45:04",
+        candidates=[{"snapshot_id": "s1", "symbol": "000001", "score": 60.0}],
+    )
+    _, summary = MEASURE._read_candidates(str(root))
+    final = summary["final_selection"]
+    assert final["runs_with_selection"] == 0
+    assert final["reason_counts"] == {}
+    assert final["highest_rejected"] == []
+
+
 def test_read_returns_filters_immature_labels_but_reports_them(tmp_path: Path) -> None:
     db = tmp_path / "learning_protocol.duckdb"
     _seed_db(

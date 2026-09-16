@@ -54,7 +54,7 @@ import json
 import math
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -225,6 +225,54 @@ def evaluate_pairs(
     }
 
 
+def _tally_final_selection(
+    report: Mapping[str, Any],
+    summary: dict[str, Any],
+    thresholds: set[float],
+    reasons: dict[str, int],
+) -> None:
+    """统计 final 阶段的录取/拒因，回答"为什么 0 信号"。
+
+    只统计拒因、不解释业务含义——拒因本身（``cross_review_failed`` /
+    ``overextension_reject_new_buy`` / ``below_min_threshold``）就是分流依据：
+    若 0 信号主要由前两者贡献，那"放宽阈值"这条处置从一开始就打不到点上。
+    """
+    final = (
+        ((report.get("source_report") or {}).get("funnel") or {}).get("final_selection")
+    ) or None
+    if not isinstance(final, Mapping):
+        return
+    bucket = summary["final_selection"]
+    bucket["runs_with_selection"] += 1
+    bucket["selected_total"] += int(final.get("selected_count") or 0)
+    rejected = final.get("rejected")
+    rejected = rejected if isinstance(rejected, list) else []
+    bucket["rejected_total"] += int(final.get("rejected_count") or len(rejected))
+    try:
+        thresholds.add(float(final.get("min_threshold")))
+    except (TypeError, ValueError):
+        pass
+    top: dict[str, Any] | None = None
+    for item in rejected:
+        if not isinstance(item, Mapping):
+            continue
+        for reason in item.get("reject_reasons") or []:
+            key = str(reason)
+            reasons[key] = reasons.get(key, 0) + 1
+        score = item.get("score")
+        if score is None:
+            continue
+        if top is None or float(score) > float(top.get("score") or 0.0):
+            top = {
+                "symbol": str(item.get("symbol") or ""),
+                "score": float(score),
+                "reject_reasons": [str(r) for r in (item.get("reject_reasons") or [])],
+            }
+    if top is not None:
+        top["run_timestamp"] = str(report.get("timestamp") or "")
+        bucket["highest_rejected"].append(top)
+
+
 def _read_candidates(
     results_root: str, *, job: str = "week5_night_scan"
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -244,8 +292,22 @@ def _read_candidates(
         "candidate_source": "source_report.signal_pool.candidates",
         "night_pool_total": 0,
         "commit_set": [],
+        # final 阶段为什么 0 信号。**这是本脚本能给出的最直接答案**：2026-09-14 实测
+        # 最高分候选 76.22（action=buy、各闸门 passed）仍被拒，拒它的不是 70 分门槛，
+        # 而是 `overextension_reject_new_buy`（全局 soft degraded）与 `cross_review_failed`。
+        # 只盯着分数域会得出"阈值问题"的错觉，所以把拒因一并统计。
+        "final_selection": {
+            "runs_with_selection": 0,
+            "selected_total": 0,
+            "rejected_total": 0,
+            "reason_counts": {},
+            "min_thresholds": [],
+            "highest_rejected": [],
+        },
     }
     commits: set[str] = set()
+    thresholds: set[float] = set()
+    reasons: dict[str, int] = {}
     for path in files:
         try:
             payload = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -266,6 +328,7 @@ def _read_candidates(
         commit = str((payload.get("build") or {}).get("commit") or "")[:12]
         if commit:
             commits.add(commit)
+        _tally_final_selection(report, summary, thresholds, reasons)
         if not isinstance(candidates, list) or not candidates:
             summary["runs_without_candidates"] += 1
             continue
@@ -290,6 +353,9 @@ def _read_candidates(
         if taken:
             summary["runs_with_candidates"] += 1
     summary["commit_set"] = sorted(commits)
+    final = summary["final_selection"]
+    final["reason_counts"] = dict(sorted(reasons.items(), key=lambda item: (-item[1], item[0])))
+    final["min_thresholds"] = sorted(thresholds)
     return list(by_snapshot.values()), summary
 
 
@@ -466,6 +532,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"不可读 {src['runs_unreadable']}）"
         f"  最终池合计 {src['night_pool_total']} 条"
     )
+    final = src.get("final_selection") or {}
+    if final.get("runs_with_selection"):
+        print(
+            f"final 阶段 {final['runs_with_selection']} 轮：录取 {final['selected_total']}、"
+            f"被拒 {final['rejected_total']}，门槛 {final['min_thresholds']}"
+        )
+        print(f"  拒因计数（降序）：{final['reason_counts']}")
+        for item in sorted(
+            final.get("highest_rejected") or [], key=lambda x: -(x.get("score") or 0)
+        )[:3]:
+            print(
+                f"  最高被拒 {item['symbol']} score={item['score']}"
+                f" 原因={item['reject_reasons']} @{str(item.get('run_timestamp'))[:16]}"
+            )
     print(f"构建版本 {src['commit_set'] or '（未知）'}")
     scale = report["score_scale"]
     print(
