@@ -209,7 +209,7 @@ def check_artifact_identity(identity: Mapping[str, Any] | None) -> InvariantResu
     # 自己占着写锁（2026-09-16 盘中实测：巡检把 lock 冲突报成 defect = 假警报）。
     severity = (
         SEVERITY_PENDING
-        if status in {"no_champion", "champion_hash_missing", "registry_busy"}
+        if status in {"no_champion", "champion_hash_missing", "registry_busy", "match_registered"}
         else SEVERITY_DEFECT
     )
     return InvariantResult(
@@ -572,23 +572,27 @@ def _artifact_identity(protocol_db: Path) -> dict[str, object] | None:
         except Exception:  # noqa: BLE001
             loaded_hash = ""
     champion: dict[str, object] | None = None
+    registered: list[dict[str, object]] = []
     error = ""
     busy = False
     try:
         con = duckdb.connect(str(protocol_db), read_only=True)
         try:
             rows = con.execute(
-                "SELECT model_id, artifact_content_hash, lifecycle_state FROM model_registry "
-                "WHERE lifecycle_state = 'champion' ORDER BY updated_at DESC LIMIT 1"
+                "SELECT model_id, artifact_content_hash, lifecycle_state, updated_at "
+                "FROM model_registry ORDER BY updated_at DESC LIMIT 200"
             ).fetchall()
         finally:
             con.close()
-        if rows:
-            champion = {
-                "model_id": rows[0][0],
-                "artifact_content_hash": rows[0][1],
-                "lifecycle_state": rows[0][2],
+        for row in rows:
+            entry = {
+                "model_id": row[0],
+                "artifact_content_hash": row[1],
+                "lifecycle_state": row[2],
             }
+            registered.append(entry)
+            if champion is None and str(row[2]) == "champion":
+                champion = entry
     except Exception as exc:  # noqa: BLE001
         error = f"{type(exc).__name__}: {exc}"
         busy = "lock" in error.lower()
@@ -596,6 +600,7 @@ def _artifact_identity(protocol_db: Path) -> dict[str, object] | None:
         loaded_uri=str(artifact_path),
         loaded_hash=loaded_hash,
         champion=champion,
+        registered=registered,
         registry_error=error,
         registry_busy=busy,
     )

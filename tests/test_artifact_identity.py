@@ -19,6 +19,7 @@ from stock_analyzer.models.identity import (
     IDENTITY_CHAMPION_HASH_MISSING,
     IDENTITY_LOADED_HASH_MISSING,
     IDENTITY_MATCH,
+    IDENTITY_MATCH_REGISTERED,
     IDENTITY_MISMATCH,
     IDENTITY_NO_CHAMPION,
     IDENTITY_REGISTRY_BUSY,
@@ -100,6 +101,7 @@ def test_hash_comparison_ignores_case_and_whitespace() -> None:
 def test_statuses_are_the_declared_set() -> None:
     assert set(IDENTITY_STATUSES) == {
         IDENTITY_MATCH,
+        IDENTITY_MATCH_REGISTERED,
         IDENTITY_MISMATCH,
         IDENTITY_NO_CHAMPION,
         IDENTITY_CHAMPION_HASH_MISSING,
@@ -260,3 +262,35 @@ def test_registry_busy_is_distinct_from_unavailable() -> None:
         loaded_uri="x", loaded_hash=HASH_A, registry_error="CatalogException: no such table"
     )
     assert unavailable["status"] == IDENTITY_REGISTRY_UNAVAILABLE
+
+
+def test_registered_match_without_champion_is_its_own_state() -> None:
+    """身份"可验证"与"已批准"必须分开。
+
+    在服工件与某条 **challenger/trained** 记录同哈希、但没有 champion 时，答案是
+    "这就是登记过的那份内容、只是没人批准它"，而不是 "无登记身份"——后者会让
+    "我到底在跑什么"这个问题继续无解（2026-09-16 定案）。
+    """
+    result = describe_artifact_identity(
+        loaded_uri="/app/artifacts/model_v1.json",
+        loaded_hash=HASH_A,
+        champion=None,
+        registered=[
+            {"model_id": "m_other", "artifact_content_hash": HASH_B, "lifecycle_state": "revoked"},
+            {"model_id": "m_live", "artifact_content_hash": HASH_A, "lifecycle_state": "trained"},
+        ],
+    )
+    assert result["status"] == IDENTITY_MATCH_REGISTERED
+    assert result["champion_model_id"] == "m_live"
+    assert "trained" in str(result["detail"])
+
+
+def test_registered_empty_hash_never_matches() -> None:
+    """空哈希不得参与匹配——否则"没有任何哈希的记录"会被当成身份一致。"""
+    result = describe_artifact_identity(
+        loaded_uri="x",
+        loaded_hash=HASH_A,
+        champion=None,
+        registered=[{"model_id": "m", "artifact_content_hash": "", "lifecycle_state": "trained"}],
+    )
+    assert result["status"] == IDENTITY_NO_CHAMPION
