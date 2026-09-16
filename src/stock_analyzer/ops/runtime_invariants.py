@@ -221,6 +221,87 @@ def check_artifact_identity(identity: Mapping[str, Any] | None) -> InvariantResu
     )
 
 
+def check_overextension_inputs(candidates: Sequence[Mapping[str, Any]] | None) -> InvariantResult:
+    """过热闸的输入是否退化成 fallback（**闸门退化 = 静默否决整条买入路径**）。
+
+    2026-09-16 实据：12 轮夜扫 600 条候选，`overextension.level` **全部**是
+    ``reject``，且 ``atr_distance / bias_ma5`` **恒为 33.333**。喂进去的行既没有
+    ``ma5`` 也没有 ``atr14``（生产走 ``_latest_bar_dict(bars)``，bars 只有 OHLCV；
+    期望输入是特征快照的 ``ma5/atr14`` 列），于是两处 fallback 同时生效：
+    ``bias_ma5 = close - 1``、``atr_distance = (close - 1) / 0.03``，任何股价
+    > 1.15 元的票都会越过 ``bias_reject_min=0.15`` 与 ``atr_distance_reject=3.0``
+    → **无条件 reject**。
+
+    **判据不能只看那个比值**：给真实输入时
+    ``atr_distance / bias_ma5 = ma5 / atr14``，低波动票完全可能正好是 33.33。
+    所以主判据取**物理上不成立的乖离**——``bias_ma5 = |close/ma5 - 1|`` 超过
+    ``0.5`` 意味着收盘价高于 MA5 的 1.5 倍，真实行情不会在大半个池子里同时出现；
+    而 fallback 会让几乎所有 1.5 元以上的票都落到这里。比值只作旁证。
+
+    危害在于它是**静默**的：闸门"看起来在工作"（有 level、有 reasons、有 metrics），
+    只是每次都说"过热"。没有这条探测，它只会表现为"夜扫长期 0 信号"，
+    而被误读成"阈值太高"或"分数没 alpha"。
+    """
+    if not candidates:
+        return InvariantResult(
+            name="overextension_inputs",
+            ok=True,
+            severity=SEVERITY_INFO,
+            detail="无候选可判（不构成信号）",
+        )
+    fallback_ratio = 1.0 / 0.03  # DEFAULT_ATR14_FALLBACK
+    implausible_bias = 0
+    ratio_like = 0
+    rejected = 0
+    total = 0
+    for item in candidates:
+        if not isinstance(item, Mapping):
+            continue
+        decision = item.get("overextension")
+        metrics = decision.get("metrics") if isinstance(decision, Mapping) else None
+        if not isinstance(metrics, Mapping):
+            continue
+        bias = metrics.get("bias_ma5")
+        atr = metrics.get("atr_distance")
+        if not isinstance(bias, (int, float)):
+            continue
+        total += 1
+        if isinstance(decision, Mapping) and str(decision.get("level") or "") == "reject":
+            rejected += 1
+        if abs(float(bias)) > 0.5:
+            implausible_bias += 1
+        if isinstance(atr, (int, float)) and bias:
+            if abs(float(atr) / float(bias) - fallback_ratio) < 0.01:
+                ratio_like += 1
+    if total == 0:
+        return InvariantResult(
+            name="overextension_inputs",
+            ok=True,
+            severity=SEVERITY_INFO,
+            detail="候选里没有过热闸指标可判（未评估过）",
+        )
+    share = implausible_bias / total
+    evidence = {
+        "implausible_bias": implausible_bias,
+        "ratio_like_fallback": ratio_like,
+        "total": total,
+        "reject_share": round(rejected / total, 4),
+    }
+    detail = (
+        f"|bias_ma5|>0.5 的候选 {implausible_bias}/{total}"
+        f"（fallback 特征 atr/bias=={fallback_ratio:.3f} 的 {ratio_like}/{total}），"
+        f"reject 占比 {rejected / total:.1%}——疑似门槛取到 fallback（ma5=1.0/atr14=0.03），"
+        "闸门退化为无条件否决"
+    )
+    return InvariantResult(
+        name="overextension_inputs",
+        ok=share < 0.5,
+        severity=SEVERITY_DEFECT,
+        detail="过热闸输入正常" if share < 0.5 else detail,
+        evidence=evidence,
+    )
+
+
 def check_scheduler(
     *,
     jobs: Mapping[str, Mapping[str, object]],
@@ -515,11 +596,15 @@ def collect_and_evaluate(
         artifacts_root / "runtime" / "scheduler_job_results", "week5_night_scan"
     )
     identity = _artifact_identity(protocol_db, health_urls)
+    overext_candidates = _night_scan_candidates(
+        artifacts_root / "runtime" / "scheduler_job_results", "week5_night_scan"
+    )
 
     results: list[InvariantResult] = []
     results.extend(check_freshness(daily_max=daily_max, minute_max=minute_max, today=now.date()))
     results.append(check_mounts(exists=path_exists))
     results.append(check_artifact_identity(identity))
+    results.append(check_overextension_inputs(overext_candidates))
     results.extend(check_scheduler(jobs=jobs, now=now))
     results.append(
         check_readiness(
@@ -582,6 +667,27 @@ def _latest_job_result(results_root: Path, job: str) -> tuple[str, str, datetime
         str(payload.get("detail") or ""),
         _parse_dt(stamp),
     )
+
+
+def _night_scan_candidates(results_root: Path, job: str) -> list[Mapping[str, Any]]:
+    """最近一份夜扫产物里的候选列表（含过热门指标）；读不到就返回空。"""
+    files = sorted(
+        Path(results_root).glob(f"*/{job}.*.json"),
+        key=lambda item: item.stat().st_mtime,
+    )
+    if not files:
+        return []
+    payload = _read_json(files[-1])
+    results = payload.get("results")
+    entry = results[0] if isinstance(results, list) and results else {}
+    entry_payload = entry.get("payload") if isinstance(entry, Mapping) else None
+    report = entry_payload.get("report") if isinstance(entry_payload, Mapping) else None
+    source = report.get("source_report") if isinstance(report, Mapping) else None
+    pool = source.get("signal_pool") if isinstance(source, Mapping) else None
+    candidates = pool.get("candidates") if isinstance(pool, Mapping) else None
+    if not isinstance(candidates, list):
+        return []
+    return [item for item in candidates if isinstance(item, Mapping)]
 
 
 def _identity_from_service(
