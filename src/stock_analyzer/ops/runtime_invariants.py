@@ -328,6 +328,7 @@ def check_scheduler(
     failing: list[str] = []
     awaiting: list[str] = []
     stale: list[str] = []
+    expired: list[str] = []
     for name, entry in sorted(jobs.items()):
         running_since = str(entry.get("running_since") or "").strip()
         if running_since:
@@ -347,6 +348,13 @@ def check_scheduler(
             else:
                 stamp = last_attempt.date().isoformat() if last_attempt else "unknown"
                 awaiting.append(f"{name}(cf={failures}, 末次尝试 {stamp}, {reason})")
+        # 窗口过期单独看：自 2026-09-16 起它不再计入 consecutive_failures（那是调度
+        # 记账事件，不是任务失败），所以这里必须自己盯——否则"任务连续几天没跑进窗口"
+        # 这个信号会随修复一起消失。放着不染红：既有"任务已废弃"的良性情形，也有
+        # "supervisor 已启动、leader 又记一次过期"的重复记账（见 scheduler.py 注释）。
+        expired_at = _parse_dt(str(entry.get("last_expired") or ""))
+        if expired_at is not None and (now - expired_at) <= timedelta(days=recent_failure_days):
+            expired.append(f"{name}({expired_at.isoformat()[:19]})")
         due = _parse_dt(str(entry.get("next_due_at") or ""))
         if due is not None and (now - due) > timedelta(days=stale_due_days):
             stale.append(f"{name}(next_due={str(entry.get('next_due_at'))[:19]})")
@@ -370,6 +378,15 @@ def check_scheduler(
         "无陈旧条目"
         if not stale
         else f"{len(stale)} 条 next_due 已过期 >{stale_due_days} 天（多为设计内退出）：{stale}"
+    )
+    expired_detail = (
+        "近期内无窗口过期"
+        if not expired
+        else (
+            f"{len(expired)} 个任务近 {recent_failure_days} 天出现过窗口过期"
+            f"（时钟越过 latest_time 而当天未评估到，**不计入连败**；"
+            f"可能是任务已废弃，也可能是 supervisor 已跑而 leader 又记一次）：{expired}"
+        )
     )
     results.append(
         InvariantResult(
@@ -405,6 +422,15 @@ def check_scheduler(
             severity=SEVERITY_INFO,
             detail=stale_detail,
             evidence={"stale": stale},
+        )
+    )
+    results.append(
+        InvariantResult(
+            name="scheduler_recent_expiries",
+            ok=not expired,
+            severity=SEVERITY_INFO,
+            detail=expired_detail,
+            evidence={"expired": expired},
         )
     )
     return results

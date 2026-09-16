@@ -298,3 +298,77 @@ def test_scheduler_skips_callback_when_same_job_lock_is_held(tmp_path) -> None:
     assert result[0].success is True
     assert result[0].detail == "already_running"
     assert result[0].payload["lock_path"].endswith("locked_job.lock")
+
+
+def test_scheduler_window_expiry_is_not_counted_as_failure() -> None:
+    """窗口过期是**调度记账事件**，不是任务失败，不得计入 consecutive_failures。
+
+    回归（2026-09-16 NAS 实测）：``week5_automation_auction`` 真实失败是每天 1 次
+    （`week5_automation:unavailable`），但 cf 已涨到 26——因为时钟越过 latest_time
+    时那次记账也被算成一次失败。cf 混了两种东西后既不可信、也没法当判据用。
+    """
+    scheduler = DailyScheduler(config=SchedulerConfig(enabled=True))
+    calls: list[str] = []
+
+    def _callback() -> dict[str, object]:
+        calls.append("called")
+        return {"ok": True}
+
+    scheduler.register("daily", "08:30", callback=_callback, latest_hhmm="09:35")
+    expired = scheduler.run_due(datetime.fromisoformat("2026-03-02T09:56:00"))
+    state = scheduler.export_state()["jobs"]["daily"]
+
+    # 任务没被启动（不是"跑失败了"）
+    assert calls == []
+    assert expired[0].ran is False
+    assert expired[0].detail == "expired"
+    # 过期本身仍是可读信号
+    assert state["status"] == "expired"
+    assert state["last_expired"] == "2026-03-02T09:56:00"
+    # 但不得污染失败计数与失败原因
+    assert state["consecutive_failures"] == 0
+    assert state["last_failure"] == ""
+
+
+def test_scheduler_expiry_preserves_earlier_real_failure() -> None:
+    """过期不得把之前那次真实失败的计数与原因冲掉（这是旧写法最误导的地方）。"""
+    scheduler = DailyScheduler(config=SchedulerConfig(enabled=True))
+
+    def _callback() -> dict[str, object]:
+        raise RuntimeError("real_boom")
+
+    scheduler.register("daily", "08:30", callback=_callback, latest_hhmm="09:35")
+    failed = scheduler.run_due(datetime.fromisoformat("2026-03-02T08:31:00"))
+    state_after_failure = scheduler.export_state()["jobs"]["daily"]
+    assert failed[0].ran is True
+    assert state_after_failure["consecutive_failures"] == 1
+    assert state_after_failure["last_failure"] == "real_boom"
+
+    # 同一天稍后越过 latest_time → 记一次过期，但真实失败的状态必须原样保留
+    scheduler.run_due(datetime.fromisoformat("2026-03-02T09:56:00"))
+    state_after_expiry = scheduler.export_state()["jobs"]["daily"]
+    assert state_after_expiry["consecutive_failures"] == 1
+    assert state_after_expiry["last_failure"] == "real_boom"
+    assert state_after_expiry["last_expired"] == "2026-03-02T09:56:00"
+
+
+def test_scheduler_real_failure_still_counts_after_expiry_fix() -> None:
+    """反向护栏：把过期从计数里摘出去后，**真实失败必须照旧递增**（别改过头）。"""
+    scheduler = DailyScheduler(config=SchedulerConfig(enabled=True))
+    attempts = 0
+
+    def _callback() -> dict[str, object]:
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("real_boom")
+
+    scheduler.register("daily", "08:30", callback=_callback, latest_hhmm="09:35")
+    # 3/2 只发生过期（没跑）
+    scheduler.run_due(datetime.fromisoformat("2026-03-02T09:56:00"))
+    assert scheduler.export_state()["jobs"]["daily"]["consecutive_failures"] == 0
+    # 3/3 真跑并失败 → 必须从 0 涨到 1
+    scheduler.run_due(datetime.fromisoformat("2026-03-03T08:31:00"))
+    state = scheduler.export_state()["jobs"]["daily"]
+    assert attempts == 1
+    assert state["consecutive_failures"] == 1
+    assert state["last_failure"] == "real_boom"
