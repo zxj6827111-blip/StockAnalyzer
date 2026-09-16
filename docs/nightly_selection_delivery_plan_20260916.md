@@ -482,31 +482,109 @@ zcode 必须提交：
 
 ## 6. 实施状态与证据（滚动更新）
 
-最后更新：2026-09-16（批次 D 完成时同步）。
+最后更新：2026-09-17 00:55（批次 A—D 完成、已部署 NAS、离线回放与通道冒烟通过；真实夜间验收待 2026-09-17 21:45）。
 
-### 6.1 批次状态
+### 6.1 分批提交
 
-| 批次 | 状态 | 提交 | 关键证据 |
+工作分支：`codex/nightly-selection-delivery`（已推送 origin）。
+
+| 批次 | 状态 | 提交 | 内容 |
 |---|---|---|---|
-| A 冻结报告与口径 | 进行中 | — | — |
-| B 逐目标交付 | 未开始 | — | — |
-| C 夜扫调度预算 | 未开始 | — | — |
-| D 过热缺输入边界 | 未开始 | — | — |
-| E 部署与夜间验收 | 未开始 | — | — |
+| 文档 | 完成 | `d2ae736` | 本 v2 实施文档落库（v1 原文另存 `nightly_selection_delivery_plan_v1_20260916.md`） |
+| D | 完成 | `d1d10b7` | 过热闸缺输入显式标记 `insufficient_input`，买入准入按"输入不足"拦截 |
+| A | 完成 | `b845744` | `NightlyReportService`：冻结报告、四类结果、统一消息口径 |
+| B | 完成 | `f93739f` | `NightlyDeliveryService` + notify 逐目标显式交付、幂等、重试、恢复 |
+| C | 完成 | `9f4c203` | 夜扫检查入口、等待预算、漏跑检查、`nightly_delivery_tick`、查询/补发接口 |
+| C+ | 完成 | `1cda9f4` | 正文可读性（过滤原因本地化、入选依据去噪、补全态措辞）——离线回放暴露的问题 |
 
-### 6.2 基线（开工时核实）
+### 6.2 开工基线（实测，非引用）
 
-| 项目 | 实测值 | 核实时间 |
+| 项目 | 实测值 |
+|---|---|
+| 本地 HEAD / 分支 | `be6453c`（PR #82）→ 工作分支 `codex/nightly-selection-delivery` |
+| 本地工作区 | 仅两份未跟踪诊断文档（已保留并纳入提交） |
+| NAS HEAD / 分支 | `be6453c5b2d00569a2de17d8e5d0fcc452176d63` / `main` |
+| NAS 镜像 | `sha256:ce13eafe214c3fcc781898fab49c41a70f29a64adc1a791d34b304ba0b5802e9` |
+| NAS `.env` | 115 个 `SA__` 键；**无** `SA__NIGHTLY__*` |
+| 静默窗口（实测生效值） | `["00:30-08:30"]`（与方案 §3.8 一致） |
+| NAS 本地时间 | 2026-09-16 23:41（21:45 夜扫已于 22:06:44 成功；当晚窗口已过） |
+| NAS 交付相关只读事实 | `vendor_history` / `intraday_summary` 只读挂载、`advisory_only=true`、`primary=vendor_zip_overlay` |
+
+### 6.3 质量门（本地）
+
+| 检查 | 命令 | 结果 |
 |---|---|---|
-| 本地 HEAD | `be6453c`（PR #82） | 2026-09-16 本地 |
-| 工作分支 | `codex/nightly-selection-delivery` | 2026-09-16 本地 |
-| 工作区差异 | 仅两份未跟踪诊断文档 | 2026-09-16 本地 |
-| NAS 代码/镜像/挂载/目标 | 待 §5.2 第 3 步只读刷新 | 待执行 |
+| 全量回归 | `python -m pytest tests -q` | **2966 项收集，100% 跑完，0 FAILED / 0 ERROR，exit=0** |
+| 新增测试 | `tests/test_nightly_report.py`(28) / `test_nightly_delivery.py`(41) / `test_nightly_scheduling.py`(24) / `test_overextension_inputs.py`（扩充，含参数化） | 全通过 |
+| Lint | `python -m ruff check src tests` | 39 errors，与基线**完全相同**（无新增） |
+| 类型 | `python -m mypy src` | 379 errors / 51 files，归一化行号后与基线错误集**完全一致** |
 
-### 6.3 逐项完成状态
+期间修掉 13 处本批引入的 mypy 告警（`object` 属性访问 / 重载不匹配），未使用 `type: ignore` 掩盖。
 
-待各批次落地后填写（含测试命令与结果）。
+### 6.4 NAS 部署记录（脱敏）
 
-### 6.4 未通过项与剩余问题
+- **命令**：`bash scripts/nas_deploy_update.sh --branch codex/nightly-selection-delivery`（Compose 组合由 `scripts/nas_compose_files.sh` 提供，未手工拼 `-f`）
+- **部署前备份**：`/vol1/docker/StockAnalyzer_backups/nightly-20260916155412`（目录 700；含 `.env.bak` 600、镜像 ID、git HEAD、容器清单、api 启动时间）
+- **启用开关前再备份**：`/vol1/docker/StockAnalyzer_backups/.env.before-nightly-enable-<ts>`（600）
+- **部署后核实**（均在 1cda9f4 上实测）：
 
-待填写。
+| 项目 | 结果 |
+|---|---|
+| api / critical / heavy 镜像 | 三者同为 `sha256:8e6ae32903cf...`（即目标构建） |
+| 重启 / OOM | `RestartCount=0`、`OOMKilled=false` |
+| 内存限制 | api 4G / critical 3G / heavy 4G（未退化） |
+| 只读挂载 | `vendor_history`、`intraday_summary` 均 `ro=true` |
+| 配置不变量 | `advisory_only=true`、`mode=simulation`、`primary=vendor_zip_overlay`、`intraday_runtime_mode=duckdb_required`、`training.enabled=false`、`auto_promotion.enabled=false` |
+| 接口 | `http://127.0.0.1:18001/health` → 200 |
+| 调度心跳 | critical / heavy 均 `status=ok`、`leader=true` |
+
+**操作注意（本轮实测新增）**：`nas_deploy_update.sh` 的 SSH 输出会在健康检查中途**截断**（`nas_exec.py` 取流限制），而远端脚本仍在继续执行并成功完成。判定部署结果**必须**看 `.build_commit`、容器状态与心跳，不能因输出中断就重跑或回滚；本次两次部署都出现该现象，均以状态核实为准。
+
+### 6.5 灰度与真实发送（方案 §5.4）
+
+| 步骤 | 状态 | 证据 |
+|---|---|---|
+| 1 离线回放 | **通过** | `rp-20260916`：`scan_status=completed`、观察 0 / 待补全 2、漏斗 300→300→100→50→观察 0、正文 444 字符（未截断）、标题与正文首行均标注"验收回放 / 历史数据、非当日结果"、**未占用正式报告指针**（`published_report_id=None`） |
+| 2 通道冒烟 | **通过** | `feishu_app` → `delivered`，`message_id=om_x100b6598cfceb8a4b29e2752e703c6c`；`feishu_enterprise` → `delivered`，`message_id=bm-89dbbe952776fa0382e892d8988a4f6d`；`required_target_delivered=true`；`attempts=1` 无重试 |
+| 3 用户收件确认 | **待用户确认** | 回执只证明飞书 API 接受，**不能**证明用户已阅读——按要求列为待验收 |
+| 4 启用自动链 | **完成** | `.env:176 SA__NIGHTLY__ENABLED=true`；重建三容器后实测 `nightly.enabled=True`、静默窗口仍为 `["00:30-08:30"]`、`week5_night_scan` 已由单次触发改为 21:45—23:00@5 分钟间隔任务、`nightly_delivery_tick` 与 `nightly_delivery_resume` 均已注册 |
+| 5 真实夜间验收 | **待 2026-09-17 21:45** | 检查点见 §6.7 |
+
+冒烟发送的时间说明：实际发送时刻为 2026-09-17 00:47，处于静默窗口（00:30—08:30）内，自动链已正确拒绝发送（实测 `quiet_window=true, skipped=2`）。为完成方案 §5.4 第 2 步，手动冒烟在**单个进程内**用项目标准配置机制覆盖了静默窗口（`-e SA__NOTIFICATION_FILTER__QUIET_WINDOWS="[]"`）；生产容器与 `.env` 的静默窗口**未被修改**（事后实测仍为 `["00:30-08:30"]`）。
+
+### 6.6 回滚步骤
+
+1. **只回滚调度行为（首选）**：把 `.env` 的 `SA__NIGHTLY__ENABLED` 改为 `false`，
+   `source scripts/nas_compose_files.sh && docker compose --env-file .env "${NAS_COMPOSE_ARGS[@]}" up -d --force-recreate api scheduler-critical scheduler-heavy`。
+   夜扫恢复 21:45 单次触发，交付检查任务不再注册。
+2. **连代码一起回退**：用 `.rollback_image` 记录的标签（两次部署各打了一个 `stock-analyzer:rollback-pre-*`）重建，或按 §6.4 的部署前 HEAD 切回。
+3. **状态保留**：`artifacts/runtime/nightly_reports/` 与 `nightly_delivery/` **不清空**。回滚与重新启用都不会重发已 `delivered` 的目标（去重依据是记录里的 `state=delivered`，与进程生命周期无关）。
+4. **立即停止新增交付并回滚的触发条件**：构建与目标提交不一致、行情源退化、异常重启、消息重复风暴。
+
+### 6.7 待验收检查点（2026-09-17 夜）
+
+1. 21:45—23:00 每 5 分钟检查入口的推进顺序（数据未就绪应为 `waiting_data` 且**不计入**尝试次数，最多 2 次真扫描）。
+2. heavy 是否在 1800s 预算内完成扫描；`artifacts/runtime/nightly_reports/2026-09-17/` 是否出现正式报告。
+3. 报告的 `scan_status` / 漏斗 / 候选是否与 `scheduler_job_results` 里的夜扫产物一致；本次起候选应带 `evaluation_status=evaluated`（不再落在"数据待补全"）。
+4. 交付记录 `state=delivered` 且 `message_id` 非空，并与飞书实收正文核对一致。
+5. 22:30 延迟说明 / 23:30 未完成说明是否各**最多一次**（若已有正式结果则不应出现）。
+6. `GET /week5/night-scan/latest` 是否返回 `report_id` / `scan_status` / `delivery_status` / `required_target_delivered`。
+
+### 6.8 遗留与未验证（区分本轮阻断与后续事项）
+
+**本轮未闭合（需在真实夜间验收中确认）**
+
+1. **真实夜间闭环尚未验收**：9/16 的窗口在本轮实施期间已经过去，最早的真实验收节点是 2026-09-17 21:45。当前结论只能到"本地通过 + NAS 部署通过 + 消息交付通过"，**不能**判"夜间功能通过"。
+2. **连续 3 个交易日稳定运行未验证**：最快需到 2026-09-21。
+3. **用户收件确认未取得**：只有飞书 API 接受证据。
+4. **冷启动名称解析**：回放首跑实测名称为空（"名称暂缺"），第二次起正常。真实夜扫在刚跑完扫描的同一进程内构造报告（provider 是热的），预计不受影响，但需 9/17 实测确认；即使为空也已按方案降级为"名称暂缺"，不阻断报告。
+
+**设计内行为，不是缺陷**
+
+5. 9/16 真实产物的 2 只候选缺 `evaluation_status`（产物早于批次 D），按 fail-closed 归入"数据待补全"而非观察候选——这正是方案 §4.1"历史旧报告只能作为旧版本解释"的要求。
+6. 夜间消息不含买入指令、不进入 `actionable` 通知链（`overnight_advisory_only`）。
+
+**后续事项（本轮边界外，方案 §1.2）**
+
+7. 模型重训、自动晋升、自动交易、盘中雷达/竞价基线、东财 push2 封锁等工作不在本轮范围；只在有证据直接阻断夜间扫描时才纳入。
+8. 进化任务仍在跑，其短名单口径与正式晚报相互独立（进化消息的"入围 N 只"仍是复扫短名单，未与晚报合并）。
