@@ -27,7 +27,7 @@ from stock_analyzer.evolution.execution_aware_scoring import (
 from stock_analyzer.learning.execution_risk_labels import build_execution_risk_feature_vector
 from stock_analyzer.models.execution_risk_predictor import ExecutionRiskPredictor
 from stock_analyzer.risk.board_risk import board_decision_to_dict, evaluate_board_risk
-from stock_analyzer.risk.overextension import evaluate_overextension
+from stock_analyzer.risk.overextension import evaluate_overextension, overextension_row_from_bars
 from stock_analyzer.runtime.services.week5_notification_service import (
     RuntimeWeek5NotificationService,
 )
@@ -2988,6 +2988,23 @@ def _latest_bar_dict(bars: pd.DataFrame) -> dict[str, object]:
             pass
         result[str(column)] = value
     return result
+
+
+def _overextension_row(bars: pd.DataFrame) -> dict[str, object]:
+    """过热闸的输入行：末根 bar + **由 bars 现算的** ma5/atr14/ret5/gap_pct。
+
+    为什么必须现算：`post_scan_enrichment` 只保留 K 线/成交列，**没有 ma5/atr14**，
+    而 evaluator 在两者缺失时会取占位常量（`DEFAULT_MA5_FALLBACK=1.0`、
+    `DEFAULT_ATR14_FALLBACK=0.03`），算出 ``bias_ma5 = close - 1``、
+    ``atr_distance = (close - 1) / 0.03`` —— 于是任何股价 > 1.15 元的票都同时越过
+    `bias_reject_min=0.15` 与 `atr_distance_reject=3.0`，闸门退化为**无条件否决**。
+    2026-09-16 实测：12 轮夜扫 600 条候选 level 全是 reject、atr/bias 恒为 33.333。
+
+    公式复用 `risk.overextension.overextension_inputs_from_ohlc`（与
+    `learning/gate_metrics` 的 harness 口径同一份定义），历史不足时返回原末根 bar，
+    由调用方走"无法评估"分支（维持既有 `level: none` 默认），**不注入占位值**。
+    """
+    return overextension_row_from_bars(bars, base_row=_latest_bar_dict(bars))
 
 
 def _overextension_decision_dict(

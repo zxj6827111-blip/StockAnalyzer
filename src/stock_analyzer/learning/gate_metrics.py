@@ -1,9 +1,16 @@
-"""批量版：一次查询取全窗口所需全部 (symbol, date) 的 OHLC，再本地算 ma5/atr14。"""
-import time
+"""批量版：一次查询取全窗口所需全部 (symbol, date) 的 OHLC，再本地算 ma5/atr14。
+
+公式**不在本文件**——统一走 `risk.overextension.overextension_inputs_from_ohlc`，
+生产快照路径调的是同一份。2026-09-16 的事故正是"同一个 evaluator、两套输入"：
+生产路径喂的 bar 没有 ma5/atr14，evaluator 取占位常量把闸门变成无条件否决，
+而这里（harness 口径）算的是真值、显示"过热只拒 0.2~1.9%"——两边结论相反。
+"""
+
 from datetime import date, timedelta
 
 import duckdb
-import pandas as pd
+
+from stock_analyzer.risk.overextension import overextension_inputs_from_ohlc
 
 
 def gate_metrics_batch(
@@ -44,27 +51,21 @@ def gate_metrics_batch(
     day_set = set(days)
     metrics: dict[str, dict[str, float]] = {}
     for symbol, points in series.items():
-        n = len(points)
         for idx, (as_of, _h, _l, _c) in enumerate(points):
             if as_of not in day_set:
                 continue
             window = points[max(0, idx - lookback_days + 1) : idx + 1]
-            if len(window) < 6:
+            # 公式只此一份：与生产快照路径共用 overextension_inputs_from_ohlc。
+            # 日线查询里没有 open；open 只参与 gap_pct，而本函数不返回它，
+            # 故用 close 占位，不影响 bias_ma5 / atr_distance。
+            inputs = overextension_inputs_from_ohlc(
+                [[c, h, low, c] for _d, h, low, c in window],
+                lookback_bars=lookback_days,
+            )
+            if inputs is None:
                 continue
-            closes = [p[3] for p in window]
-            ma5 = sum(closes[-5:]) / 5.0
-            trs: list[float] = []
-            for i in range(1, len(window)):
-                prev_close = window[i - 1][3]
-                high_i, low_i = window[i][1], window[i][2]
-                trs.append(max(high_i - low_i, abs(high_i - prev_close), abs(low_i - prev_close)))
-            recent = trs[-14:]
-            atr14 = sum(recent) / len(recent)
-            close = closes[-1]
-            bias = abs(close / ma5 - 1.0) if ma5 > 0 else 0.0
-            atr_distance = abs(close - ma5) / atr14 if atr14 > 0 else 0.0
             metrics[f"{symbol}|{as_of.isoformat()}"] = {
-                "bias_ma5": bias,
-                "atr_distance": atr_distance,
+                "bias_ma5": inputs.bias_ma5,
+                "atr_distance": inputs.atr_distance,
             }
     return metrics
