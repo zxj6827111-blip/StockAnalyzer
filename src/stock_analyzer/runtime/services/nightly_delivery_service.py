@@ -549,6 +549,47 @@ class NightlyDeliveryService:
         self, *, now: datetime | None = None, max_targets: int | None = None
     ) -> dict[str, object]:
         """交付检查：修复中断状态 → 处理到期目标 → 必要时补发过程说明。"""
+        if not self._is_enabled():
+            current = self._now(now)
+            return {
+                "timestamp": current.isoformat(),
+                "reason": "disabled",
+                "processed": 0,
+                "targets": [],
+            }
+        return self._run(now=now, max_targets=max_targets)
+
+    def deliver_now(
+        self,
+        report: Mapping[str, object],
+        *,
+        now: datetime | None = None,
+        max_targets: int | None = None,
+    ) -> dict[str, object]:
+        """手动投递**一份指定报告**（验收回放 / 人工补发用）。
+
+        走与自动链完全相同的记录、锁、幂等与重试路径，只绕过 enabled 开关：
+        开关控制的是"自动链要不要自己跑"，不是"能不能手动发一份明确指定的报告"。
+        调用方必须自己保证这份报告该发——本方法不做任何"这是不是今天的结果"判断。
+        """
+        self.ensure_records(report)
+        return self._run(
+            now=now,
+            max_targets=max_targets,
+            trade_dates=[_text(report.get("trade_date"))],
+            # 手动投递一份指定报告时**不得**顺带补发截止/延迟说明：那会让一次
+            # 验收冒烟在用户那里变成"未完成说明 + 回放报告"两条消息。
+            with_notices=False,
+        )
+
+    def _run(
+        self,
+        *,
+        now: datetime | None,
+        max_targets: int | None,
+        trade_dates: Sequence[str] | None = None,
+        with_notices: bool = True,
+    ) -> dict[str, object]:
         current = self._now(now)
         budget = max(1, int(max_targets or self.config.max_delivery_targets_per_tick))
         summary: dict[str, object] = {
@@ -563,15 +604,12 @@ class NightlyDeliveryService:
             "targets": [],
             "recovery": {},
         }
-        if not self._is_enabled():
-            summary["reason"] = "disabled"
-            return summary
         quiet = self._quiet(current)
         summary["quiet_window"] = quiet
         summary["recovery"] = self.recover(now=current)
-        summary["notices"] = self._maybe_publish_notices(now=current)
+        summary["notices"] = self._maybe_publish_notices(now=current) if with_notices else []
         processed_targets: list[dict[str, object]] = []
-        for trade_date in self.report_service.recent_trade_dates():
+        for trade_date in trade_dates or self.report_service.recent_trade_dates():
             for report in self.report_service.reports_for(trade_date):
                 for record in self.records_for_report(
                     _text(report.get("report_id")), trade_date=trade_date

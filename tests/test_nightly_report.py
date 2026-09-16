@@ -541,3 +541,40 @@ def test_render_is_deterministic(service: _FakeService) -> None:
     first = report_service.render(report)
     second = report_service.render(json.loads(json.dumps(report)))
     assert (first.title, first.content) == (second.title, second.content)
+
+
+# ------------------------------------------------------------------ 验收回放
+
+
+def test_replay_report_is_labelled_and_isolated_from_the_formal_pointer(
+    service: _FakeService,
+) -> None:
+    """回放报告必须自带"历史数据、非当日结果"的标注，且不占用正式报告指针。
+
+    回放是交付链路的灰度手段（方案 §5.4 第 1、2 步）：既不能和正式结果混淆，
+    也不能因为做过一次回放就顶掉当天的正式报告。
+    """
+    report_service = _report_service(service)
+    formal = report_service.publish(_build(report_service, _night_scan([_row("600000")])))
+
+    replay = report_service.build_replay_report(
+        night_scan=_night_scan([_row("000001", score=66.0)]),
+        trade_date=_TRADE_DATE,
+        generated_at=_NOW,
+        source_label="2026-09-16 历史夜扫产物",
+    )
+    published = report_service.publish(replay)
+    assert published["published"] is True
+    assert published["report"]["report_kind"] == "replay"
+    assert published["report_id"].startswith("rp-")
+
+    rendered = report_service.render(published["report"])
+    assert "验收回放" in rendered.title
+    assert "是历史数据，不是当日结果" in rendered.content
+    assert "000001" in rendered.content
+
+    # 正式报告指针没有被回放顶掉
+    state = report_service.read_date_state(_TRADE_DATE)
+    assert state["published_report_id"] == formal["report_id"]
+    assert state["notices"]["replay"] == published["report_id"]
+    assert report_service.published_report(_TRADE_DATE)["report_id"] == formal["report_id"]

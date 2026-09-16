@@ -1033,3 +1033,24 @@ def test_notice_kinds_are_independent(env) -> None:  # type: ignore[no-untyped-d
     state = delivery.report_service.read_date_state(_TRADE_DATE)
     assert NOTICE_DELAY in state["notices"]
     assert NOTICE_DEADLINE in state["notices"]
+
+
+def test_manual_delivery_works_while_the_automatic_chain_is_disabled(env) -> None:  # type: ignore[no-untyped-def]
+    """开关控制"自动链要不要跑"，不控制"能不能手动发一份明确指定的报告"。
+
+    验收回放必须能在开关关闭（即 NAS 尚未启用自动链）时走完真实交付路径，
+    否则"先冒烟、后启用"这个顺序根本走不通。
+    """
+    service, _, install = env
+    notifier = _fake_app()
+    install("feishu_app", notifier)
+    service._config.nightly.enabled = False
+    delivery = _delivery(service)
+    report = _publish(delivery.report_service, rows=[_report_row()])
+
+    assert delivery.tick(now=_NOW)["reason"] == "disabled"
+
+    summary = delivery.deliver_now(report, now=_NOW)
+    assert summary["delivered"] == 1
+    assert len(notifier.calls) == 1
+    assert delivery.status(report["report_id"])["required_target_delivered"] is True

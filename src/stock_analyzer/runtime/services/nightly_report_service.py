@@ -32,6 +32,10 @@ from uuid import uuid4
 
 from stock_analyzer.config import NightlyReportConfig
 from stock_analyzer.ops.file_lock import DistributedFileLock
+from stock_analyzer.risk.overextension import (
+    EVALUATION_EVALUATED,
+    EVALUATION_INSUFFICIENT_INPUT,
+)
 
 SCHEMA_VERSION = 1
 
@@ -48,6 +52,9 @@ SCAN_STATUSES: tuple[str, ...] = (
 
 REPORT_KIND_FORMAL = "formal"
 REPORT_KIND_NOTICE = "notice"
+# 验收回放：用历史夜扫产物生成、明确标注"非当日结果"的报告。它只用于交付链路
+# 灰度（方案 §5.4 第 1、2 步），不占用正式报告的指针，也不可能被误当成当天结论。
+REPORT_KIND_REPLAY = "replay"
 
 # 延迟说明 / 截止未完成说明：两条固定行为各最多发一次，去重键与正式结果分开。
 NOTICE_DELAY = "delay"
@@ -60,9 +67,10 @@ PHASE_SCANNING = "scanning"
 PHASE_PUBLISHED = "published"
 PHASE_FAILED = "failed"
 
-# 风险评估状态：只有 evaluated 才算"通过完整风险检查"。
-EVALUATION_EVALUATED = "evaluated"
-EVALUATION_INCOMPLETE = "insufficient_input"
+# 风险评估状态复用 risk.overextension 的唯一定义：只有 evaluated 才算"通过完整
+# 风险检查"。报告层额外需要一个 unknown——旧产物根本没有这个字段，既不能当成
+# evaluated（等于默认已评估），也不该冒充 insufficient（那是明确的缺输入）。
+EVALUATION_INCOMPLETE = EVALUATION_INSUFFICIENT_INPUT
 EVALUATION_UNKNOWN = "unknown"
 
 # 理由/风险的中文口径。未知代号原样保留——宁可露出代号，也不编一个更好听的解释。
@@ -442,6 +450,41 @@ class NightlyReportService:
         suffix = "delay" if notice == NOTICE_DELAY else "deadline"
         return f"nn-{_text(trade_date).replace('-', '')}-{suffix}"
 
+    def build_replay_report(
+        self,
+        *,
+        night_scan: Mapping[str, object],
+        trade_date: str,
+        generated_at: datetime,
+        source_label: str = "",
+        display_top_k: int | None = None,
+        name_resolver: Callable[[str], str] | None = None,
+    ) -> dict[str, object]:
+        """由**历史**夜扫产物构造验收回放报告（离线回放 + 通道冒烟共用）。
+
+        与正式报告共用同一套构造与渲染，只改三件事：`report_kind=replay`、
+        `report_id` 前缀 `rp-`、正文首行加"非当日结果"的醒目标注。这样冒烟消息
+        不可能被误读成当天结论，回放本身也走的是真实交付链路。
+        """
+        report = self.build_formal_report(
+            night_scan=night_scan,
+            trade_date=trade_date,
+            generated_at=generated_at,
+            run_id="replay",
+            trace_id="nightly-replay",
+            data_snapshot_id=str(night_scan.get("data_snapshot_id", "") or trade_date),
+            display_top_k=display_top_k,
+            name_resolver=name_resolver,
+        )
+        report["report_kind"] = REPORT_KIND_REPLAY
+        report["replay_source"] = _text(source_label)
+        report["report_id"] = f"rp-{_text(trade_date).replace('-', '')}"
+        report["content_digest"] = self.content_digest(report)
+        return report
+
+    def latest_report_id(self, trade_date: str) -> str:
+        return _text(self.read_date_state(trade_date).get("published_report_id"))
+
     @staticmethod
     def content_digest(report: Mapping[str, object]) -> str:
         """业务内容摘要：**不含** generated_at / run_id / trace_id。
@@ -452,6 +495,7 @@ class NightlyReportService:
         business_keys = (
             "report_kind",
             "notice",
+            "replay_source",
             "trade_date",
             "scan_status",
             "data_snapshot_id",
@@ -481,13 +525,13 @@ class NightlyReportService:
         """
         trade_date = _text(report.get("trade_date"))
         state = self.read_date_state(trade_date)
-        pointer_key = (
-            "published_report_id"
-            if _text(report.get("report_kind")) == REPORT_KIND_FORMAL
-            else "notices"
-        )
-        if pointer_key == "published_report_id":
+        kind = _text(report.get("report_kind"))
+        # 三类报告各有各的指针：正式结果绝不会被过程说明或验收回放顶掉。
+        if kind == REPORT_KIND_FORMAL:
             current_id = _text(state.get("published_report_id"))
+            current = self.load_report(current_id, trade_date=trade_date) if current_id else None
+        elif kind == REPORT_KIND_REPLAY:
+            current_id = _text(_mapping(state.get("notices")).get("replay"))
             current = self.load_report(current_id, trade_date=trade_date) if current_id else None
         else:
             notices = _mapping(state.get("notices"))
@@ -508,8 +552,12 @@ class NightlyReportService:
         revision = max(1, (_optional_int(current.get("revision")) or 0) + 1) if current else 1
         finalized = dict(report)
         finalized["revision"] = revision
-        if _text(finalized.get("report_kind")) == REPORT_KIND_FORMAL:
+        if kind == REPORT_KIND_FORMAL:
             finalized["report_id"] = f"nr-{trade_date.replace('-', '')}-{revision:02d}"
+        elif kind == REPORT_KIND_REPLAY:
+            finalized["report_id"] = _text(finalized.get("report_id")) or (
+                f"rp-{trade_date.replace('-', '')}"
+            )
         else:
             finalized["report_id"] = _text(finalized.get("report_id")) or self.notice_report_id(
                 trade_date, _text(finalized.get("notice"))
@@ -520,7 +568,7 @@ class NightlyReportService:
             "last_published_report_id": _text(finalized.get("report_id")),
             "last_published_at": finalized.get("generated_at", ""),
         }
-        if pointer_key == "published_report_id":
+        if kind == REPORT_KIND_FORMAL:
             patch.update(
                 {
                     "published_report_id": _text(finalized.get("report_id")),
@@ -531,7 +579,10 @@ class NightlyReportService:
             )
         else:
             notices = _mapping(state.get("notices"))
-            notice_key = "delay" if finalized.get("notice") == NOTICE_DELAY else "deadline"
+            if kind == REPORT_KIND_REPLAY:
+                notice_key = "replay"
+            else:
+                notice_key = "delay" if finalized.get("notice") == NOTICE_DELAY else "deadline"
             notices[notice_key] = _text(finalized.get("report_id"))
             patch["notices"] = notices
         self.update_date_state(trade_date, patch)
@@ -570,9 +621,12 @@ class NightlyReportService:
 
     def _title(self, report: Mapping[str, object]) -> str:
         trade_date = _text(report.get("trade_date"))
-        if _text(report.get("report_kind")) == REPORT_KIND_NOTICE:
+        kind = _text(report.get("report_kind"))
+        if kind == REPORT_KIND_NOTICE:
             label = "延迟说明" if report.get("notice") == NOTICE_DELAY else "未完成说明"
             return f"【晚间选股报告】{trade_date}（{label}）"
+        if kind == REPORT_KIND_REPLAY:
+            return f"【晚间选股报告·验收回放】{trade_date}"
         revision = _optional_int(report.get("revision")) or 1
         suffix = "（修订版）" if revision > 1 else ""
         return f"【晚间选股报告】{trade_date}{suffix}"
@@ -609,6 +663,13 @@ class NightlyReportService:
         incomplete = _mapping_list(report.get("incomplete_candidates"))
         funnel = _mapping(report.get("funnel_counts"))
         lines: list[str] = [f"【晚间选股报告】{trade_date}"]
+        if _text(report.get("report_kind")) == REPORT_KIND_REPLAY:
+            source = _text(report.get("replay_source")) or "历史夜扫产物"
+            lines = [
+                f"【晚间选股报告·验收回放】{trade_date}",
+                f"【验收回放】本消息内容取自 {source}，是历史数据，不是当日结果；",
+                "仅用于验证晚间选股结果能否可靠送达，请不要据此做任何交易判断。",
+            ]
 
         if status == SCAN_STATUS_COMPLETED:
             lines.append(f"结果：今日选股完成，隔夜观察候选 {len(observation)} 只")

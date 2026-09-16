@@ -21,11 +21,13 @@ from pathlib import Path
 from threading import Lock, RLock, Thread, current_thread
 from time import perf_counter
 from typing import Any, Protocol, cast
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
 
 from stock_analyzer.backtest.walk_forward import WalkForwardEngine
+from stock_analyzer.build_identity import get_build_manifest
 from stock_analyzer.command.channel import (
     CommandEnvelope,
     RuntimeState,
@@ -108,7 +110,7 @@ from stock_analyzer.models.registry import (
 from stock_analyzer.models.trainer import ModelTrainer
 from stock_analyzer.notify.channels import NotificationMessage
 from stock_analyzer.notify.filter import NotificationFilter, is_quiet_time
-from stock_analyzer.pipeline import AnalyzerPipeline, SymbolStageTiming
+from stock_analyzer.pipeline import AnalyzerPipeline, SymbolStageTiming, _stable_config_hash
 from stock_analyzer.portfolio.book import PortfolioBook
 from stock_analyzer.research import (
     compute_daily_review_report,
@@ -153,6 +155,14 @@ from stock_analyzer.runtime.services.learning_governance_service import (
 )
 from stock_analyzer.runtime.services.market_sync_service import RuntimeMarketSyncService
 from stock_analyzer.runtime.services.news_service import RuntimeNewsService
+from stock_analyzer.runtime.services.nightly_delivery_service import NightlyDeliveryService
+from stock_analyzer.runtime.services.nightly_report_service import (
+    SCAN_STATUS_BLOCKED,
+    SCAN_STATUS_COMPLETED,
+    SCAN_STATUS_EMPTY,
+    SCAN_STATUS_FAILED,
+    NightlyReportService,
+)
 from stock_analyzer.runtime.services.reconcile_service import RuntimeReconcileService
 from stock_analyzer.runtime.services.runtime_ops_service import RuntimeOpsService
 from stock_analyzer.runtime.services.runtime_state_service import RuntimeStateService
@@ -234,6 +244,13 @@ _RECOMMENDATION_SIGNAL_EXIT_REASONS = {
 
 
 _BASELINE_BOOTSTRAP_LOCK = threading.Lock()
+
+# 晚报交付检查的两个窗口。夜扫 21:45 才开始，所以夜间窗口从 21:40 起（留一点
+# 余量）覆盖到 23:59，负责当晚送达、按 1/5/15 分钟退避重试、以及 22:30/23:30
+# 两次过程说明；次日 08:30（静默窗口结束）到 10:00 负责把"明确未发送"的积压
+# 结果按原日期补发。窗口外不注册任务，避免每分钟空转一个子进程。
+_NIGHTLY_DELIVERY_TICK_WINDOW = ("21:40", "23:59")
+_NIGHTLY_DELIVERY_RESUME_WINDOW = ("08:30", "10:00")
 
 # duckdb 的锁冲突与文件损坏都抛 IOException——恢复流程会把整个 learning db
 # 改名重建，误触发即丢库（2026-09-12 生产实锤：backfill 持锁期间并发训练
@@ -534,6 +551,10 @@ class StockAnalyzerService:
             self._config.command_channel.state_persist_path
         )
         self._week5_automation_service = RuntimeWeek5AutomationService(self)
+        # 正式晚报链路的两个窄职责服务：报告（构造/冻结/渲染）与交付（逐目标
+        # 状态/重试/恢复）。开关关闭时不注册调度、也不参与夜扫回调。
+        self._nightly_report_service = NightlyReportService(self)
+        self._nightly_delivery_service = NightlyDeliveryService(self)
         self._runtime_state_loaded_mtime_ns = 0
         self._runtime_state_base_revision = 0
         self._runtime_history_archive_dir = self._resolve_evolution_path(
@@ -16563,15 +16584,79 @@ class StockAnalyzerService:
         timestamp: datetime | None = None,
         notify_enabled: bool = False,
         sync_watchlist: bool = True,
+        readiness_wait_sec: int | None = None,
+        skip_shared_state_idempotency: bool = False,
     ) -> dict[str, object]:
         return self._week5_automation_service.run_night_scan(
             timestamp=timestamp,
             notify_enabled=notify_enabled,
             sync_watchlist=sync_watchlist,
+            readiness_wait_sec=readiness_wait_sec,
+            skip_shared_state_idempotency=skip_shared_state_idempotency,
         )
 
     def latest_week5_night_scan(self) -> dict[str, object]:
-        return self._week5_automation_service.latest_night_scan()
+        """夜扫最新状态：保留旧字段，并补上正式报告与交付状态（方案 §3.6）。
+
+        旧调用方仍能拿到 status / night_pool / overnight_top5 / *_gate / fallback；
+        新增字段只在晚报开关打开且当日确有报告时出现，缺省不制造"看起来有报告"
+        的假象。
+        """
+        payload = self._week5_automation_service.latest_night_scan()
+        if not bool(getattr(self._config.nightly, "enabled", False)):
+            return payload
+        try:
+            report = self._latest_nightly_report(str(payload.get("trade_date", "")).strip())
+        except Exception:  # noqa: BLE001 - 查询接口不得因报告目录异常而失败
+            report = None
+        if report is None:
+            return {**payload, "scan_status": "", "delivery_status": "not_enqueued"}
+        report_id = str(report.get("report_id", "")).strip()
+        delivery = self._nightly_delivery_service.status(report_id)
+        return {
+            **payload,
+            "report_id": report_id,
+            "report_trade_date": str(report.get("trade_date", "")),
+            "scan_status": str(report.get("scan_status", "")),
+            "report_revision": report.get("revision", 0),
+            "delivery_status": delivery.get("delivery_status", ""),
+            "required_target_delivered": bool(delivery.get("required_target_delivered", False)),
+            "last_delivery_error": str(delivery.get("last_delivery_error", "")),
+        }
+
+    def _latest_nightly_report(self, trade_date: str) -> dict[str, object] | None:
+        """取最近的正式晚报。
+
+        先看共享候选状态里的交易日，取不到就**按最新有报告的交易日回退**——直接
+        回落"今天"会漏掉刚发布的报告（跨零点、或候选状态被重置之后）。回退范围
+        仍限定在最近两个交易日目录内，不做全历史扫描。
+        """
+        report_service = self._nightly_report_service
+        ordered = [trade_date] if trade_date else []
+        ordered.extend(day for day in report_service.recent_trade_dates() if day != trade_date)
+        for day in ordered:
+            report = report_service.published_report(day)
+            if report is not None:
+                return report
+        return None
+
+    def retry_nightly_delivery(
+        self,
+        report_id: str,
+        *,
+        confirm_unknown: bool = False,
+    ) -> dict[str, object]:
+        """补发指定报告的未成功目标（仅入队，不等待网络结果）。"""
+        if not bool(getattr(self._config.nightly, "enabled", False)):
+            return {
+                "queued": False,
+                "reason": "nightly_disabled",
+                "report_id": str(report_id).strip(),
+            }
+        return self._nightly_delivery_service.request_retry(
+            report_id,
+            confirm_unknown=confirm_unknown,
+        )
 
     def run_week5_auction(
         self,
@@ -17946,14 +18031,51 @@ class StockAnalyzerService:
                 getattr(self._config.week5, "market_radar_full_market_enabled", True)
             )
             if full_market_automation:
-                self._scheduler.register(
-                    name="week5_night_scan",
-                    trigger_hhmm=self._config.scheduler.week5_night_scan_time,
-                    callback=self._job_week5_night_scan,
-                    latest_hhmm="23:59",
-                    weekdays=trading_weekdays,
-                    date_predicate=trading_day_filter,
-                )
+                if bool(getattr(self._config.nightly, "enabled", False)):
+                    # 晚报模式：夜扫从 21:45 起每 5 分钟检查一次，最晚 23:00 还能
+                    # 起一次新的重型扫描。检查入口很便宜（已有报告→幂等返回；
+                    # 数据未就绪→快速返回 waiting_data，不占扫描预算）。
+                    self._scheduler.register_interval(
+                        name="week5_night_scan",
+                        window_start_hhmm=self._config.scheduler.week5_night_scan_time,
+                        window_end_hhmm=self._config.nightly.last_scan_start_time,
+                        interval_minutes=max(1, int(self._config.nightly.scan_check_interval_minutes)),
+                        callback=self._job_week5_night_scan,
+                        weekdays=trading_weekdays,
+                        date_predicate=trading_day_filter,
+                    )
+                else:
+                    # 关闭晚报时保持旧调度行为：21:45 单次触发。
+                    self._scheduler.register(
+                        name="week5_night_scan",
+                        trigger_hhmm=self._config.scheduler.week5_night_scan_time,
+                        callback=self._job_week5_night_scan,
+                        latest_hhmm="23:59",
+                        weekdays=trading_weekdays,
+                        date_predicate=trading_day_filter,
+                    )
+                if bool(getattr(self._config.nightly, "enabled", False)):
+                    # 交付检查（critical 组，独立 120s 超时）：当晚重试/告警窗口，
+                    # 以及次日 08:30 后对静默窗口内积压的明确未发送结果做补发。
+                    # 夜间不进邮件/消息队列，只读写少量状态文件，不碰选股与行情。
+                    self._scheduler.register_interval(
+                        name="nightly_delivery_tick",
+                        window_start_hhmm=_NIGHTLY_DELIVERY_TICK_WINDOW[0],
+                        window_end_hhmm=_NIGHTLY_DELIVERY_TICK_WINDOW[1],
+                        interval_minutes=max(1, int(self._config.nightly.delivery_interval_minutes)),
+                        callback=self._job_nightly_delivery_tick,
+                        weekdays=trading_weekdays,
+                        date_predicate=trading_day_filter,
+                    )
+                    self._scheduler.register_interval(
+                        name="nightly_delivery_resume",
+                        window_start_hhmm=_NIGHTLY_DELIVERY_RESUME_WINDOW[0],
+                        window_end_hhmm=_NIGHTLY_DELIVERY_RESUME_WINDOW[1],
+                        interval_minutes=max(1, int(self._config.nightly.scan_check_interval_minutes)),
+                        callback=self._job_nightly_delivery_tick,
+                        weekdays=trading_weekdays,
+                        date_predicate=trading_day_filter,
+                    )
                 self._scheduler.register(
                     name="week5_weekend_learning",
                     trigger_hhmm=self._config.scheduler.week5_weekend_learning_time,
@@ -20159,13 +20281,298 @@ class StockAnalyzerService:
 
     def _job_week5_night_scan(self) -> dict[str, object]:
         current = self._job_now()
-        report = self.run_week5_night_scan(
-            timestamp=current,
-            # overnight_top5 是隔夜观察池，夜间任务不得发送买入类通知。
-            notify_enabled=False,
-            sync_watchlist=True,
+        if not bool(getattr(self._config.nightly, "enabled", False)):
+            report = self.run_week5_night_scan(
+                timestamp=current,
+                # overnight_top5 是隔夜观察池，夜间任务不得发送买入类通知。
+                notify_enabled=False,
+                sync_watchlist=True,
+            )
+            return self._week5_scheduler_result(report)
+        return self._nightly_scan_job(current)
+
+    def _nightly_scan_job(self, current: datetime) -> dict[str, object]:
+        """晚报链路的夜扫入口：先判"今晚是否已有结论"，再判数据，最后才扫描。
+
+        顺序是有意的：
+
+        1. 已有冻结报告 → 幂等返回。判定依据是**晚报自己的**完成记录（冻结报告 +
+           日期状态），不是会被盘中任务改写的共享 ``state.trade_date/data_version``；
+        2. 尝试次数用尽 → 快速返回，不再起重型扫描；
+        3. 数据未就绪 → 快速返回 waiting_data，**不计入尝试次数**，让下一个 5 分钟
+           槽位再试。旧实现让重型 worker 在这里 sleep 900 秒，等于吃掉一半扫描预算；
+        4. 真起扫，保留完整 1800 秒预算。
+        """
+        trade_date = current.date().isoformat()
+        report_service = self._nightly_report_service
+        state = report_service.read_date_state(trade_date)
+        published = report_service.published_report(trade_date)
+        if published is not None:
+            return {
+                "_scheduler_success": True,
+                "_scheduler_detail": f"nightly_already_published:{published.get('scan_status', '')}",
+                "_scheduler_ran": True,
+                "idempotent": True,
+                "trade_date": trade_date,
+                "report_id": str(published.get("report_id", "")),
+                "scan_status": str(published.get("scan_status", "")),
+            }
+        attempts = _as_int(state.get("scan_attempts"), 0)
+        max_attempts = max(1, int(self._config.nightly.max_scan_attempts))
+        if attempts >= max_attempts:
+            return {
+                "_scheduler_success": True,
+                "_scheduler_detail": "nightly_attempts_exhausted",
+                "_scheduler_ran": True,
+                "trade_date": trade_date,
+                "scan_attempts": attempts,
+            }
+        readiness = self._week5_automation_service.probe_nightly_readiness()
+        if not bool(readiness.get("allowed", False)):
+            reason = str(readiness.get("reason", "")).strip() or str(
+                readiness.get("status", "blocked")
+            )
+            report_service.update_date_state(
+                trade_date,
+                {
+                    "scan_phase": "waiting_data",
+                    "waiting_reason": reason,
+                    "last_readiness": dict(readiness),
+                },
+                updated_at=current,
+            )
+            self._record_audit_event(
+                event_type="nightly_scan_waiting_data",
+                level="info",
+                payload={
+                    "trade_date": trade_date,
+                    "reason": reason,
+                    "attempts": attempts,
+                    "readiness": dict(readiness),
+                },
+            )
+            return {
+                "_scheduler_success": True,
+                "_scheduler_detail": f"nightly_waiting_data:{reason}",
+                "_scheduler_ran": True,
+                "trade_date": trade_date,
+                "scan_phase": "waiting_data",
+                "waiting_reason": reason,
+            }
+        return self._run_nightly_scan_once(current=current, attempts=attempts)
+
+    def _run_nightly_scan_once(self, *, current: datetime, attempts: int) -> dict[str, object]:
+        trade_date = current.date().isoformat()
+        report_service = self._nightly_report_service
+        attempt_no = attempts + 1
+        report_service.update_date_state(
+            trade_date,
+            {
+                "scan_phase": "scanning",
+                "scan_attempts": attempt_no,
+                "last_scan_started_at": current.isoformat(),
+                "last_scan_run_id": uuid4().hex,
+                "waiting_reason": "",
+            },
+            updated_at=current,
         )
-        return self._week5_scheduler_result(report)
+        failure: str = ""
+        try:
+            night_scan = self.run_week5_night_scan(
+                timestamp=current,
+                notify_enabled=False,
+                sync_watchlist=True,
+                # 就绪已在上一步探过；这里不再等，把预算全部留给扫描本身。
+                readiness_wait_sec=0,
+                # 共享状态会被盘中任务改写，不能用来判断"今晚跑过没有"。
+                skip_shared_state_idempotency=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - 任何异常都要落成明确结论
+            night_scan = {}
+            failure = f"{exc.__class__.__name__}: {exc}"
+        status = str(night_scan.get("status", "")).strip().lower()
+        terminal = status in {"ok", "empty", "blocked_data_gate"}
+        fallback_reason = str(
+            _coerce_object_mapping(night_scan.get("fallback")).get("reason", "")
+        ).strip()
+        if not terminal and attempt_no < max(1, int(self._config.nightly.max_scan_attempts)):
+            # 非终态（readiness 在这个间隙翻转、扫描抛异常）且还有重试预算：
+            # 不发布报告，留给下一个槽位重试，避免一次抖动就钉死当晚结论。
+            report_service.update_date_state(
+                trade_date,
+                {
+                    "scan_phase": "failed" if failure else "waiting_data",
+                    "waiting_reason": failure or fallback_reason,
+                    "last_scan_status": status or "failed",
+                },
+                updated_at=current,
+            )
+            self._record_audit_event(
+                event_type="nightly_scan_attempt_failed",
+                level="warn",
+                payload={
+                    "trade_date": trade_date,
+                    "attempt": attempt_no,
+                    "status": status,
+                    "failure": failure,
+                },
+            )
+            return {
+                "_scheduler_success": True,
+                "_scheduler_detail": f"nightly_retry_pending:{status or 'failed'}",
+                "_scheduler_ran": True,
+                "trade_date": trade_date,
+                "scan_attempts": attempt_no,
+            }
+        return self._publish_nightly_report(
+            current=current,
+            night_scan=night_scan,
+            attempt_no=attempt_no,
+            failure=failure,
+        )
+
+    def _publish_nightly_report(
+        self,
+        *,
+        current: datetime,
+        night_scan: Mapping[str, object],
+        attempt_no: int,
+        failure: str,
+    ) -> dict[str, object]:
+        trade_date = current.date().isoformat()
+        report_service = self._nightly_report_service
+        status = str(night_scan.get("status", "")).strip().lower()
+        scan_status = ""
+        if failure:
+            scan_status = SCAN_STATUS_FAILED
+        elif status not in {"ok", "empty", "blocked_data_gate"}:
+            # 尝试次数用尽仍未拿到真实扫描结果：明确报失败，不伪装成"今天没有机会"。
+            scan_status = SCAN_STATUS_FAILED
+        fallback = night_scan.get("fallback")
+        fallback_source_date = ""
+        if isinstance(fallback, Mapping) and bool(fallback.get("applied", False)):
+            fallback_source_date = str(
+                self._week5_automation_service.candidate_state().get("night_pool_trade_date", "")
+            ).strip()
+        try:
+            report = report_service.build_formal_report(
+                night_scan=night_scan,
+                trade_date=trade_date,
+                generated_at=current,
+                run_id=str(report_service.read_date_state(trade_date).get("last_scan_run_id", "")),
+                data_snapshot_id=self._nightly_data_snapshot_id(),
+                scan_status=scan_status,
+                failure_stage="night_scan" if scan_status == SCAN_STATUS_FAILED else "",
+                failure_reason=failure,
+                fallback_source_date=fallback_source_date,
+                code_commit=self._nightly_code_commit(),
+                config_hash=self._nightly_config_hash(),
+            )
+        except Exception as exc:  # noqa: BLE001 - 报告构造失败也不能让调度崩掉
+            self._record_audit_event(
+                event_type="nightly_report_build_failed",
+                level="error",
+                payload={"trade_date": trade_date, "error": f"{exc.__class__.__name__}: {exc}"},
+            )
+            report_service.update_date_state(
+                trade_date,
+                {"scan_phase": "failed", "last_scan_status": "report_build_failed"},
+                updated_at=current,
+            )
+            return {
+                "_scheduler_success": False,
+                "_scheduler_detail": "nightly_report_build_failed",
+                "_scheduler_ran": True,
+                "trade_date": trade_date,
+            }
+        published = report_service.publish(report)
+        frozen = _coerce_object_mapping(published.get("report"))
+        report_id = str(published.get("report_id", "")).strip()
+        scan_status = str(frozen.get("scan_status", "")).strip()
+        records = self._nightly_delivery_service.ensure_records(frozen)
+        report_service.update_date_state(
+            trade_date,
+            {
+                "scan_phase": "published",
+                "last_scan_status": scan_status,
+                "waiting_reason": "",
+                # 报告先落盘、指针后发布、待发记录再建立：任何一步中断都能被
+                # 交付检查的恢复逻辑接上（它有同样的确定性 delivery_id）。
+                "delivery_ids": [
+                    str(item.get("delivery_id", "")) for item in records if item.get("delivery_id")
+                ],
+            },
+            updated_at=current,
+        )
+        self._record_audit_event(
+            event_type="nightly_report_published",
+            level="info",
+            payload={
+                "trade_date": trade_date,
+                "report_id": report_id,
+                "scan_status": scan_status,
+                "publish_reason": str(published.get("reason", "")),
+                "attempt": attempt_no,
+                "delivery_targets": [str(item.get("target_key", "")) for item in records],
+            },
+        )
+        # 发布成功即视为调度成功：交付是**独立**的后续状态，不在这里假装送达。
+        return {
+            "_scheduler_success": scan_status
+            in {SCAN_STATUS_COMPLETED, SCAN_STATUS_EMPTY, SCAN_STATUS_BLOCKED},
+            "_scheduler_detail": f"nightly_published:{scan_status}",
+            "_scheduler_ran": True,
+            "trade_date": trade_date,
+            "report_id": report_id,
+            "scan_status": scan_status,
+            "publish_reason": str(published.get("reason", "")),
+        }
+
+    def _nightly_data_snapshot_id(self) -> str:
+        value = getattr(self, "current_week5_data_version", "")
+        if callable(value):
+            try:
+                value = value()
+            except Exception:  # noqa: BLE001
+                value = ""
+        return str(value).strip()
+
+    @staticmethod
+    def _nightly_code_commit() -> str:
+        try:
+            manifest = get_build_manifest()
+        except Exception:  # noqa: BLE001
+            return ""
+        return str(manifest.get("commit", "") or manifest.get("short_commit", "")).strip()
+
+    def _nightly_config_hash(self) -> str:
+        try:
+            return _stable_config_hash(self._config)
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _job_nightly_delivery_tick(self) -> dict[str, object]:
+        """每 5 分钟/每分钟一次的轻量交付检查：不选股、不更新行情、不等重型扫描。"""
+        if not bool(getattr(self._config.nightly, "enabled", False)):
+            return {
+                "_scheduler_success": True,
+                "_scheduler_detail": "nightly_disabled",
+                "_scheduler_ran": True,
+            }
+        summary = self._nightly_delivery_service.tick(now=self._job_now())
+        delivered = _as_int(summary.get("delivered"), 0)
+        processed = _as_int(summary.get("processed"), 0)
+        failed = _as_int(summary.get("failed"), 0)
+        unknown = _as_int(summary.get("unknown"), 0)
+        exhausted = _as_int(summary.get("exhausted"), 0)
+        return {
+            "report": summary,
+            "_scheduler_success": True,
+            "_scheduler_detail": (
+                f"nightly_delivery:processed={processed},delivered={delivered},"
+                f"failed={failed},unknown={unknown},exhausted={exhausted}"
+            ),
+        }
 
     def _job_week5_weekend_learning(self) -> dict[str, object]:
         current = self._job_now()

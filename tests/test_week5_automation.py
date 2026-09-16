@@ -192,7 +192,7 @@ def test_night_scan_is_idempotent_for_trade_date_and_data_version(tmp_path: Path
             "waited_sec": 0.0,
         }
 
-    automation._await_nightly_readiness = readiness
+    automation._await_nightly_readiness = lambda **_kwargs: readiness()
 
     first = automation.run_night_scan(timestamp=now)
     second = automation.run_night_scan(timestamp=now)
@@ -270,7 +270,7 @@ def test_readiness_failure_falls_back_to_previous_night_pool(tmp_path: Path) -> 
         updated_at=datetime(2026, 8, 24, 21, 0, tzinfo=UTC),
         trade_date="2026-08-24",
     )
-    automation._await_nightly_readiness = lambda: {
+    automation._await_nightly_readiness = lambda **_kwargs: {
         "status": "blocked",
         "allowed": False,
         "reason": "updater_not_ready",
@@ -1740,7 +1740,7 @@ def test_fallback_night_scan_does_not_satisfy_idempotent_rerun(tmp_path: Path) -
         trade_date="2026-08-24",
         data_version="snapshot-v1",
     )
-    automation._await_nightly_readiness = lambda: {
+    automation._await_nightly_readiness = lambda **_kwargs: {
         "status": "blocked",
         "allowed": False,
         "reason": "updater_not_ready",
@@ -1751,7 +1751,7 @@ def test_fallback_night_scan_does_not_satisfy_idempotent_rerun(tmp_path: Path) -
     assert service.scan_call_count == 0
 
     # readiness 恢复后同晚重跑：必须真正执行扫描，而不是 already_ran。
-    automation._await_nightly_readiness = lambda: {
+    automation._await_nightly_readiness = lambda **_kwargs: {
         "status": "ready",
         "allowed": True,
         "waited_sec": 0.0,

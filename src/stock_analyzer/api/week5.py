@@ -7,7 +7,11 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Query
 
 from stock_analyzer.api.deps import get_service, get_verify_api_auth, parse_optional_datetime
-from stock_analyzer.api.models import Week5AutomationRunRequest, Week5ScanRunRequest
+from stock_analyzer.api.models import (
+    NightlyRedeliveryRequest,
+    Week5AutomationRunRequest,
+    Week5ScanRunRequest,
+)
 
 router = APIRouter()
 
@@ -72,7 +76,27 @@ def week5_night_scan_run(
 def week5_night_scan_latest(
     _auth: None = Depends(get_verify_api_auth()),
 ) -> dict[str, object]:
+    """旧字段全部保留；晚报开关打开时额外返回 report_id / scan_status / 交付状态。
+
+    只返回目标键名与状态，不含凭据，也不含完整接收人身份。
+    """
     return get_service().latest_week5_night_scan()
+
+
+@router.post("/week5/night-scan/reports/{report_id}/retry-delivery")
+def week5_night_scan_retry_delivery(
+    report_id: str,
+    request: NightlyRedeliveryRequest,
+    _auth: None = Depends(get_verify_api_auth()),
+) -> dict[str, object]:
+    """补发指定正式报告的未成功目标。仅入队，不阻塞等待网络结果。
+
+    只接受已存在的 report_id（不允许传路径或接收人）；已全部成功时是幂等无操作。
+    """
+    return get_service().retry_nightly_delivery(
+        report_id,
+        confirm_unknown=request.confirm_unknown,
+    )
 
 
 @router.post("/week5/auction/run")
