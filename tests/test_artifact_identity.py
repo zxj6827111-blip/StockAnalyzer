@@ -21,6 +21,7 @@ from stock_analyzer.models.identity import (
     IDENTITY_MATCH,
     IDENTITY_MISMATCH,
     IDENTITY_NO_CHAMPION,
+    IDENTITY_REGISTRY_BUSY,
     IDENTITY_REGISTRY_UNAVAILABLE,
     IDENTITY_STATUSES,
     content_hash_matches_stamp,
@@ -104,6 +105,7 @@ def test_statuses_are_the_declared_set() -> None:
         IDENTITY_CHAMPION_HASH_MISSING,
         IDENTITY_LOADED_HASH_MISSING,
         IDENTITY_REGISTRY_UNAVAILABLE,
+        IDENTITY_REGISTRY_BUSY,
     }
 
 
@@ -242,3 +244,19 @@ def test_service_tolerates_predictor_without_mode_details() -> None:
     service = _service(object(), _RegistryStub(None))
     report = service.artifact_identity_report()  # type: ignore[attr-defined]
     assert report["status"] == IDENTITY_LOADED_HASH_MISSING
+
+
+def test_registry_busy_is_distinct_from_unavailable() -> None:
+    """写锁占用（registry_busy）与真读不到（registry_unavailable）必须分开。"""
+    busy = describe_artifact_identity(
+        loaded_uri="x",
+        loaded_hash=HASH_A,
+        registry_error="IO Error: Could not set lock",
+        registry_busy=True,
+    )
+    assert busy["status"] == IDENTITY_REGISTRY_BUSY
+    assert "锁" in str(busy["detail"])
+    unavailable = describe_artifact_identity(
+        loaded_uri="x", loaded_hash=HASH_A, registry_error="CatalogException: no such table"
+    )
+    assert unavailable["status"] == IDENTITY_REGISTRY_UNAVAILABLE

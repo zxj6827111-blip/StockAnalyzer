@@ -205,8 +205,12 @@ def check_artifact_identity(identity: Mapping[str, Any] | None) -> InvariantResu
             detail=f"在服工件与 champion 一致（{str(identity.get('champion_model_id'))}）",
             evidence={"status": status, "loaded_content_hash": loaded},
         )
+    # "等治理决定"与"这次读不到"都归 pending，不该染红：前者等批准，后者只是本进程
+    # 自己占着写锁（2026-09-16 盘中实测：巡检把 lock 冲突报成 defect = 假警报）。
     severity = (
-        SEVERITY_PENDING if status in {"no_champion", "champion_hash_missing"} else SEVERITY_DEFECT
+        SEVERITY_PENDING
+        if status in {"no_champion", "champion_hash_missing", "registry_busy"}
+        else SEVERITY_DEFECT
     )
     return InvariantResult(
         name="artifact_identity",
@@ -569,6 +573,7 @@ def _artifact_identity(protocol_db: Path) -> dict[str, object] | None:
             loaded_hash = ""
     champion: dict[str, object] | None = None
     error = ""
+    busy = False
     try:
         con = duckdb.connect(str(protocol_db), read_only=True)
         try:
@@ -586,11 +591,13 @@ def _artifact_identity(protocol_db: Path) -> dict[str, object] | None:
             }
     except Exception as exc:  # noqa: BLE001
         error = f"{type(exc).__name__}: {exc}"
+        busy = "lock" in error.lower()
     return describe_artifact_identity(
         loaded_uri=str(artifact_path),
         loaded_hash=loaded_hash,
         champion=champion,
         registry_error=error,
+        registry_busy=busy,
     )
 
 
