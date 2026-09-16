@@ -476,3 +476,49 @@ def test_identity_without_health_urls_uses_direct_db(monkeypatch: pytest.MonkeyP
     assert got is not None
     assert got["status"] == "mismatch"
     assert calls == []
+
+
+# --- 窗口过期：单列一项，不染红也不消失 ---------------------------------------
+
+
+def test_window_expiry_is_visible_but_never_red() -> None:
+    """过期不再计入连败（scheduler.py），所以巡检必须自己盯住它——否则信号会消失。
+
+    实测形态：jobs 里 ``consecutive_failures=0``、``last_expired`` 是今天。
+    既不红（既可能是任务已废弃，也可能是 supervisor 已跑而 leader 又记一次），
+    也要在输出里看得见。
+    """
+    now = datetime(2026, 9, 16, 16, 0, tzinfo=CST)
+    jobs = {
+        "week5_automation_auction": {
+            "consecutive_failures": 0,
+            "last_failure": "",
+            "last_expired": "2026-09-16T09:56:41",
+            "last_attempt_at": "2026-09-16T09:25:23",
+            "next_due_at": "2026-09-17T09:25:00",
+            "running_since": "",
+        }
+    }
+    results = _by_name(check_scheduler(jobs=jobs, now=now))
+    expired = results["scheduler_recent_expiries"]
+    assert not expired.ok
+    assert expired.severity == SEVERITY_INFO
+    assert "week5_automation_auction" in expired.detail
+    # 不染红：INFO 不进 defects
+    assert summarize([expired])["ok"] is True
+    # 过期不算连败 → 不得出现在"正在失败"里
+    assert results["scheduler_failing_jobs"].ok is True
+
+
+def test_old_window_expiry_is_not_reported_forever() -> None:
+    """过期项只看近 recent_failure_days 天，历史过期不该常亮。"""
+    now = datetime(2026, 9, 16, 16, 0, tzinfo=CST)
+    jobs = {
+        "long_retired_job": {
+            "consecutive_failures": 0,
+            "last_expired": "2026-08-01T09:56:41",
+            "running_since": "",
+        }
+    }
+    results = _by_name(check_scheduler(jobs=jobs, now=now))
+    assert results["scheduler_recent_expiries"].ok is True
