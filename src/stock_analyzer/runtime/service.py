@@ -264,6 +264,22 @@ def _is_likely_learning_protocol_corruption(error_text: str) -> bool:
     return any(marker in normalized for marker in _LEARNING_PROTOCOL_CORRUPTION_MARKERS)
 
 
+# 全市场自动化雷达的窗口节奏（分钟）。
+#
+# **不变式：节奏必须 >= 单轮成本。** 2026-09-16 实测单轮 p50 125s / p90 146s /
+# max 150s（撞当时的 150s 超时）；而原先 09:30-10:30 用 @2、13:00-14:00 用 @3、
+# 14:00-14:57 用 @2 —— 间隔都短于一次运行，于是 61% 的轮次被记成"慢"、连续两次即
+# 跳闸，最终 **55% 的调度窗口被熔断跳过**（雷达近似停摆，且全程不报警）。
+# 09:25-09:26 只有 1 个槽位（开盘前一次性快照），保持 @1。
+# 见 tests/test_week5_automation.py::test_radar_cadence_exceeds_measured_run_cost
+AUTOMATION_RADAR_PROFILES: tuple[tuple[str, str, int], ...] = (
+    ("09:25", "09:26", 1),
+    ("09:30", "10:30", 5),
+    ("10:30", "11:30", 5),
+    ("13:00", "14:00", 5),
+    ("14:00", "14:57", 5),
+)
+
 class StockAnalyzerService:
     """Stateful runtime service used by FastAPI handlers and scheduled tasks."""
 
@@ -17929,13 +17945,13 @@ class StockAnalyzerService:
                     weekdays=trading_weekdays,
                     date_predicate=trading_day_filter,
                 )
-                automation_radar_profiles = [
-                    ("09:25", "09:26", 1),
-                    ("09:30", "10:30", 2),
-                    ("10:30", "11:30", 5),
-                    ("13:00", "14:00", 3),
-                    ("14:00", "14:57", 2),
-                ]
+                # 节奏必须 **>= 单轮成本**，否则每轮还没跑完下一次触发就到了：
+                # 2026-09-16 实测单轮 p50 125s / p90 146s / max 150s（撞超时），
+                # 而原先 09:30-10:30 用 @2、13:00-14:00 用 @3、14:00-14:57 用 @2
+                # —— 这些窗口的间隔都短于一次运行，导致 61% 的轮次被记成"慢"、
+                # 连续两次即跳闸，最终 **55% 的调度窗口被熔断跳过**（雷达近似停摆）。
+                # 09:25-09:26 那一档只有 1 个槽位（开盘前一次性快照），保持 @1 无妨。
+                automation_radar_profiles = AUTOMATION_RADAR_PROFILES
                 for index, (start_hhmm, end_hhmm, interval_minutes) in enumerate(
                     automation_radar_profiles, start=1
                 ):

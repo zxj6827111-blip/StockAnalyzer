@@ -375,13 +375,13 @@ week5:
   market_snapshot_min_rows: 5000
   market_radar_circuit_breaker_failures: 3
   market_radar_circuit_breaker_slow_runs: 2
-  market_radar_slow_run_sec: 120
+  market_radar_slow_run_sec: 180
   market_radar_circuit_breaker_cooldown_min: 10
   # radar 单次实测 76.8s（capture 5.7~11.9s，其余在主体逻辑），原 90s 余量不足 15%：
   # 一旦超时，调用方放弃等待但 worker 是 daemon 线程不会真取消，它会一直持有
   # _market_radar_active，使后续 slot 只能拿到 busy 报告直到该线程自然结束
   # （2026-09-11 实测需重启 api 才恢复）。150s 给正常路径留足余量，避免误判超时。
-  market_radar_timeout_sec: 150
+  market_radar_timeout_sec: 210
   market_radar_window_intervals:
     - "09:35-11:20@10"
     - "13:05-14:50@10"

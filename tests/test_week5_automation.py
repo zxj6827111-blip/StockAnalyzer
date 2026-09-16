@@ -1301,13 +1301,21 @@ def test_snapshot_age_sec_excludes_no_quote_rows() -> None:
     now = datetime(2026, 8, 25, 10, 0, tzinfo=UTC)
     rows = [
         # 有行情行：最旧 5 分钟前（真实 age 来源）
-        {"symbol": "600000", "price": 10.0, "change_pct": 0.5,
-         "snapshot_time": (now - timedelta(minutes=5)).isoformat()},
-        {"symbol": "600001", "price": 8.0, "change_pct": -0.2,
-         "snapshot_time": now.isoformat()},
+        {
+            "symbol": "600000",
+            "price": 10.0,
+            "change_pct": 0.5,
+            "snapshot_time": (now - timedelta(minutes=5)).isoformat(),
+        },
+        {"symbol": "600001", "price": 8.0, "change_pct": -0.2, "snapshot_time": now.isoformat()},
         # 僵尸行：北交所退市票，price 显式 null + 08:00 占位时间戳
-        {"symbol": "920680", "price": None, "change_pct": None, "prev_close": 0.86,
-         "snapshot_time": "2026-08-25T08:00:00+00:00"},
+        {
+            "symbol": "920680",
+            "price": None,
+            "change_pct": None,
+            "prev_close": 0.86,
+            "snapshot_time": "2026-08-25T08:00:00+00:00",
+        },
     ]
 
     age = automation_module._snapshot_age_sec(rows, now)
@@ -1444,9 +1452,7 @@ def test_snapshot_naive_full_datetime_uses_market_timezone() -> None:
     assert abs(age - 45.0) < 1e-6
 
 
-def test_backup_source_failure_does_not_abort_fallback_chain(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_backup_source_failure_does_not_abort_fallback_chain(monkeypatch, tmp_path: Path) -> None:
     """东财源抛异常不得中断后续备源（腾讯/新浪）——多源兜底的核心契约。
 
     回归 2026-09-10：akshare 循环整体包在同一个 try 内，``stock_zh_a_spot_em``
@@ -1660,9 +1666,7 @@ def test_fetch_batch_frame_primary_duplicates_do_not_pass_coverage(
     assert any(str(item) == "stock_zh_a_spot_em_merge_partial_coverage:1" for item in errors)
 
 
-def test_fetch_batch_frame_merges_heterogeneous_symbol_columns(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_fetch_batch_frame_merges_heterogeneous_symbol_columns(monkeypatch, tmp_path: Path) -> None:
     """真实列名契约：efinance 用 股票代码、AkShare 用 代码——合并后两源股票都必须存活。"""
     service = FakeService(tmp_path)
     service._config.week5.market_snapshot_min_rows = 3
@@ -1771,9 +1775,7 @@ def test_theme_injection_rejects_stale_state(tmp_path: Path) -> None:
         "status": "ok",
         "mode": "boost",
         "dry_run": False,
-        "generated_at": (
-            datetime.now(tz=UTC) - timedelta(days=7)
-        ).isoformat(),
+        "generated_at": (datetime.now(tz=UTC) - timedelta(days=7)).isoformat(),
         "active_themes": ["geo_oil"],
         "pinned_pool": ["600028", "601857"],
     }
@@ -1825,7 +1827,6 @@ def test_theme_injection_unavailable_state_is_noop(tmp_path: Path) -> None:
     injection = automation._resolve_theme_injection()
     assert injection["mode"] == "off"
     assert injection["pinned_symbols"] is None
-
 
 
 def test_night_pool_gates_on_final_deep_score_not_shortlist_copy(tmp_path: Path) -> None:
@@ -1949,3 +1950,45 @@ def test_night_pool_falls_back_when_final_score_is_none(tmp_path: Path) -> None:
     )
 
     assert sorted(item["symbol"] for item in result["night_pool"]) == ["600002", "600003"]
+
+
+# --- 雷达节奏不变式 -----------------------------------------------------------
+
+# 2026-09-16 实测（radar job 结果真跑轮次，n=18）：p50 125.4s / p90 146.2s / max 150.1s。
+# 当时的超时是 150s（被截断）、"慢"棒 120s（61% 的轮次越过它）。
+_RADAR_MEASURED_P50_SEC = 125.4
+_RADAR_MEASURED_P90_SEC = 146.2
+
+
+def test_radar_cadence_exceeds_measured_run_cost() -> None:
+    """节奏必须 >= 单轮成本，否则每轮没跑完下次触发就到了。
+
+    回归的是 2026-09-16 的实测故障：09:30-10:30 用 @2、13:00-14:00 用 @3、
+    14:00-14:57 用 @2，全都短于一次运行（p50 125s）→ 61% 轮次被判"慢"→ 连续两次
+    跳闸 → **55% 的调度窗口被熔断跳过**，而雷达全程不报警（近似停摆）。
+    09:25-09:26 只有 1 个槽位（开盘前一次性快照），允许 @1。
+    """
+    from stock_analyzer.runtime.service import AUTOMATION_RADAR_PROFILES
+
+    single_slot_windows = {("09:25", "09:26")}
+    for start, end, interval in AUTOMATION_RADAR_PROFILES:
+        if (start, end) in single_slot_windows:
+            continue
+        assert interval >= 5, (
+            f"雷达窗口 {start}-{end} 的节奏 @{interval} 分钟短于实测单轮成本"
+            f"（p50 {_RADAR_MEASURED_P50_SEC}s）——这正是 55% 窗口被熔断跳过的成因"
+        )
+
+
+def test_radar_budgets_sit_above_measured_p90() -> None:
+    """超时与"慢"棒都必须落在实测 p90 之上，否则正常成本会被当成退化。
+
+    超时低于 p90 → 运行被截断（实测 max 150.1s 正好等于当时的 150s 超时）；
+    "慢"棒低于 p90 → 61% 的正常轮次被记成"慢"而触发熔断。
+    """
+    from stock_analyzer.config import load_config
+
+    config = load_config().week5
+
+    assert config.market_radar_timeout_sec > _RADAR_MEASURED_P90_SEC
+    assert config.market_radar_slow_run_sec > _RADAR_MEASURED_P90_SEC
