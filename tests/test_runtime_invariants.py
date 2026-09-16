@@ -338,3 +338,18 @@ def test_identity_registry_busy_is_pending_not_defect() -> None:
     assert not result.ok
     assert result.severity == SEVERITY_PENDING
     assert summarize([result])["ok"] is True
+
+
+def test_identity_match_registered_is_pending_not_defect() -> None:
+    """有登记副本但无 champion：身份可验证了，仍然只是"等批准"，不染红。"""
+    result = check_artifact_identity(
+        {
+            "status": "match_registered",
+            "loaded_content_hash": "a" * 64,
+            "champion_model_id": "m_live",
+            "detail": "在服工件 == 登记记录 m_live（trained），但注册表无 champion",
+        }
+    )
+    assert not result.ok
+    assert result.severity == SEVERITY_PENDING
+    assert summarize([result])["ok"] is True
