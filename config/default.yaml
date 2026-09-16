@@ -500,6 +500,30 @@ week5:
   empty_signal_drawdown_pct: 10
   empty_signal_no_buy_runs: 5
 
+# 正式晚间报告与飞书交付（2026-09-16 v2 方案）。enabled 默认 false：关闭时
+# 调度注册、夜扫回调与通知路径全部保持旧行为。NAS 验收通过后再用
+# SA__NIGHTLY__ENABLED=true 显式开启（不要改本文件——它打进镜像且受跟踪，
+# 手工改会与 git pull 冲突且运行期不生效）。
+nightly:
+  enabled: false
+  display_top_k: 5
+  target_time: "22:30"
+  last_scan_start_time: "23:00"
+  deadline_time: "23:30"
+  scan_check_interval_minutes: 5
+  max_scan_attempts: 2
+  delivery_interval_minutes: 1
+  max_delivery_targets_per_tick: 2
+  retry_delays_sec: [60, 300, 900]
+  max_delivery_attempts: 4
+  unknown_retry_window_sec: 3000
+  request_timeout_sec: 20
+  message_max_chars: 3000
+  reports_root: artifacts/runtime/nightly_reports
+  delivery_root: artifacts/runtime/nightly_delivery
+  recovery_lookback_days: 2
+  attempt_history_limit: 20
+
 holiday_risk:
   pre_holiday_reduce_days: 3
   max_position_multiplier: 0.5

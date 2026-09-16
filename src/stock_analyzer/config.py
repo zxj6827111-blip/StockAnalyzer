@@ -11,7 +11,13 @@ from typing import Any
 import yaml
 from dotenv import load_dotenv
 
-from stock_analyzer._pydantic_compat import BaseModel, ConfigDict, Field, field_validator
+from stock_analyzer._pydantic_compat import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 load_dotenv()
 
@@ -645,6 +651,137 @@ class Week5Config(_StrictModel):
     intraday_sync_deadline_sec: int = 180
     intraday_fresh_ratio_min: float = 0.95
     intraday_single_ticker_budget_sec: int = 5
+
+
+class NightlyReportConfig(_StrictModel):
+    """正式晚间报告与飞书交付的独立开关与预算。
+
+    默认 ``enabled=False``：关闭时调度注册、扫描回调、通知路径全部保持旧行为，
+    NAS 验收通过后再用 ``SA__NIGHTLY__ENABLED=true`` 显式开启。配置值不合法
+    直接在加载期报错，不静默纠正——这些值决定"当晚是否会发消息"，猜错的代价
+    是漏报或重复推送。
+    """
+
+    enabled: bool = False
+    # 正文最多展示几只候选；少于该数就展示几只，不补足数量。
+    display_top_k: int = 5
+    # 22:30 仍未完成发一次"延迟说明"；23:00 是最后一次允许起重型扫描的时刻；
+    # 23:30 仍无有效结果则发一次明确的失败/阻断摘要。
+    target_time: str = "22:30"
+    last_scan_start_time: str = "23:00"
+    deadline_time: str = "23:30"
+    # 检查入口每 5 分钟一次（窗口 21:45—last_scan_start_time），保证晚到数据
+    # 仍能起扫；重型扫描本身保留 1800s 预算。
+    scan_check_interval_minutes: int = 5
+    # 同一交易日最多真正执行几次重型扫描（数据等待检查不计入）。
+    max_scan_attempts: int = 2
+    # 交付检查（nightly_delivery_tick）节奏与每次处理的到期目标上限。
+    delivery_interval_minutes: int = 1
+    max_delivery_targets_per_tick: int = 2
+    # 首次失败后的退避；首次 + len(retry_delays_sec) 次重试 = max_delivery_attempts。
+    retry_delays_sec: list[int] = Field(default_factory=lambda: [60, 300, 900])
+    max_delivery_attempts: int = 4
+    # 结果不确定（超时/落盘前崩溃）时，用同一 uuid 重试的时间窗。飞书的
+    # uuid 幂等窗是 1 小时，超过就停止自动重发、留 unknown 交人工，避免跨窗重复。
+    unknown_retry_window_sec: int = 3000
+    # 单次网络调用总预算（秒）；必须远小于交付锁的 stale 阈值，否则"持有者还活着
+    # 但请求慢"会被别的 worker 判成失联并重复发送。
+    request_timeout_sec: int = 20
+    # 正文长度上限（中文字符），超出按固定顺序截断理由，日期/状态/股票/风险优先保留。
+    message_max_chars: int = 3000
+    reports_root: str = "artifacts/runtime/nightly_reports"
+    delivery_root: str = "artifacts/runtime/nightly_delivery"
+    # 恢复只回看当前交易日与最近一个交易日，禁止全目录扫描。
+    recovery_lookback_days: int = 2
+    # 交付记录里保留的尝试历史条数上限（避免无限增长）。
+    attempt_history_limit: int = 20
+
+    @field_validator("target_time", "last_scan_start_time", "deadline_time")
+    @classmethod
+    def _validate_nightly_hhmm(cls, value: str) -> str:
+        normalized = _normalize_hhmm(value)
+        if not normalized:
+            raise ValueError(f"nightly time must not be empty: {value!r}")
+        return normalized
+
+    @field_validator(
+        "scan_check_interval_minutes",
+        "delivery_interval_minutes",
+        "max_delivery_targets_per_tick",
+        "request_timeout_sec",
+        "recovery_lookback_days",
+        "attempt_history_limit",
+    )
+    @classmethod
+    def _validate_nightly_positive_int(cls, value: int) -> int:
+        if int(value) <= 0:
+            raise ValueError(f"must be > 0, got {value}")
+        return int(value)
+
+    @field_validator("max_scan_attempts")
+    @classmethod
+    def _validate_nightly_max_scan_attempts(cls, value: int) -> int:
+        if int(value) < 1:
+            raise ValueError(f"max_scan_attempts must be >= 1, got {value}")
+        return int(value)
+
+    @field_validator("display_top_k")
+    @classmethod
+    def _validate_nightly_display_top_k(cls, value: int) -> int:
+        if int(value) < 1:
+            raise ValueError(f"display_top_k must be >= 1, got {value}")
+        return int(value)
+
+    @field_validator("message_max_chars")
+    @classmethod
+    def _validate_nightly_message_max_chars(cls, value: int) -> int:
+        # 低于 200 个字符连状态行都放不下，属于配置事故而非"更短的消息"。
+        if int(value) < 200:
+            raise ValueError(f"message_max_chars must be >= 200, got {value}")
+        return int(value)
+
+    @field_validator("retry_delays_sec")
+    @classmethod
+    def _validate_nightly_retry_delays(cls, value: list[int]) -> list[int]:
+        normalized = [int(item) for item in value]
+        if not normalized:
+            raise ValueError("retry_delays_sec must not be empty")
+        if any(item <= 0 for item in normalized):
+            raise ValueError(f"retry_delays_sec entries must be > 0, got {normalized}")
+        return normalized
+
+    @model_validator(mode="after")
+    def _validate_nightly_consistency(self) -> NightlyReportConfig:
+        if not self.enabled:
+            # 关闭时不因为"用不到的组合"拦住启动：只有开启后这些约束才决定行为。
+            return self
+        if _to_minutes(self.target_time) > _to_minutes(self.last_scan_start_time):
+            raise ValueError(
+                "target_time must be <= last_scan_start_time "
+                f"({self.target_time} > {self.last_scan_start_time})"
+            )
+        if _to_minutes(self.last_scan_start_time) > _to_minutes(self.deadline_time):
+            raise ValueError(
+                "last_scan_start_time must be <= deadline_time "
+                f"({self.last_scan_start_time} > {self.deadline_time})"
+            )
+        expected_attempts = len(self.retry_delays_sec) + 1
+        if self.max_delivery_attempts != expected_attempts:
+            raise ValueError(
+                "max_delivery_attempts must equal len(retry_delays_sec) + 1 "
+                f"(got {self.max_delivery_attempts}, expected {expected_attempts})"
+            )
+        if self.unknown_retry_window_sec >= 3600:
+            raise ValueError(
+                "unknown_retry_window_sec must be < 3600（飞书 uuid 幂等窗为 1 小时，"
+                f"超窗重试会重复推送）, got {self.unknown_retry_window_sec}"
+            )
+        return self
+
+
+def _to_minutes(hhmm: str) -> int:
+    hours, minutes = hhmm.split(":", maxsplit=1)
+    return int(hours) * 60 + int(minutes)
 
 
 class HolidayRiskConfig(_StrictModel):
@@ -1730,6 +1867,7 @@ class StockAnalyzerConfig(_StrictModel):
     board_risk: BoardRiskConfig = Field(default_factory=BoardRiskConfig)
     theme: MacroThemeConfig = Field(default_factory=MacroThemeConfig)
     week5: Week5Config = Field(default_factory=Week5Config)
+    nightly: NightlyReportConfig = Field(default_factory=NightlyReportConfig)
     holiday_risk: HolidayRiskConfig = Field(default_factory=HolidayRiskConfig)
     global_market: GlobalMarketConfig = Field(default_factory=GlobalMarketConfig)
     regulatory_factor: RegulatoryFactorConfig = Field(default_factory=RegulatoryFactorConfig)
