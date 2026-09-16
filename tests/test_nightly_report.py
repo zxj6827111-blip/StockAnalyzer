@@ -699,3 +699,88 @@ def test_insufficient_input_keeps_the_missing_data_wording(service: _FakeService
     assert "数据待补全（风险指标输入不足，不计入观察候选）：" in content
     assert "缺 ma5/atr14" in content
     assert "评估状态未标注" not in content
+
+
+def test_changed_replay_content_gets_a_new_version_file(service: _FakeService) -> None:
+    """回放内容变化必须**真的写出新版本文件**，不能只把指针挪到不存在的版本。
+
+    2026-09-17 实测踩到：回放 report_id 固定为 rp-<日期>，第二次内容变化时撞上
+    "同 id 不覆盖"，publish 仍报告 new_revision、指针也照挪，但盘上还是第 1 版。
+    """
+    report_service = _report_service(service)
+    first = report_service.publish(
+        report_service.build_replay_report(
+            night_scan=_night_scan([_row("600000")]),
+            trade_date=_TRADE_DATE,
+            generated_at=_NOW,
+        )
+    )
+    assert first["report"]["revision"] == 1
+    assert first["report_id"].endswith("-01")
+
+    second = report_service.publish(
+        report_service.build_replay_report(
+            night_scan=_night_scan([_row("600000"), _row("000001")]),
+            trade_date=_TRADE_DATE,
+            generated_at=_NOW,
+        )
+    )
+    assert second["report"]["revision"] == 2
+    assert second["report_id"].endswith("-02")
+    assert second["report_id"] != first["report_id"]
+
+    # 两个版本都真实落盘，且内容各不相同
+    stored_v1 = report_service.load_report(first["report_id"], trade_date=_TRADE_DATE)
+    stored_v2 = report_service.load_report(second["report_id"], trade_date=_TRADE_DATE)
+    assert stored_v1 is not None and stored_v2 is not None
+    assert len(stored_v1["observation_candidates"]) == 1
+    assert len(stored_v2["observation_candidates"]) == 2
+    assert stored_v2["content_digest"] == second["report"]["content_digest"]
+    # 指针指向的版本必须确实存在
+    state = report_service.read_date_state(_TRADE_DATE)
+    assert state["notices"]["replay"] == second["report_id"]
+
+
+def test_same_id_with_different_content_never_claims_a_new_version(
+    service: _FakeService,
+) -> None:
+    """同 id 已冻结成另一份内容时：以磁盘为准，不声称新版本、指针校准回它。
+
+    只有 id 不带版本号的报告（延迟/未完成说明）可能走到这里。真正的风险不是报错缺
+    失，而是**静默声称一个新版本、把指针挪向没写进磁盘的内容**——那会让"报告文件
+    写成功之后才发布指针"的契约失效。
+    """
+    report_service = _report_service(service)
+    first = report_service.publish(
+        report_service.build_notice(
+            trade_date=_TRADE_DATE,
+            generated_at=_NOW,
+            notice=NOTICE_DELAY,
+            scan_status=SCAN_STATUS_BLOCKED,
+            reason="重型扫描尚未完成",
+        )
+    )
+    # 模拟日期状态丢失（指针没了但报告文件还在）
+    state = report_service.read_date_state(_TRADE_DATE)
+    state.pop("notices", None)
+    report_service.update_date_state(_TRADE_DATE, {"notices": {}})
+
+    second = report_service.publish(
+        report_service.build_notice(
+            trade_date=_TRADE_DATE,
+            generated_at=_NOW,
+            notice=NOTICE_DELAY,
+            scan_status=SCAN_STATUS_BLOCKED,
+            reason="另一段不同的说明文字",
+        )
+    )
+    assert second["published"] is False
+    assert second["reason"] == "already_frozen_with_different_content"
+    assert second["report_id"] == first["report_id"]
+    assert second["report"]["revision"] == 1
+    # 指针被校准回磁盘上那份，避免交付检查每分钟重复尝试
+    assert report_service.read_date_state(_TRADE_DATE)["notices"]["delay"] == first["report_id"]
+    # 磁盘内容没有被覆盖
+    assert "重型扫描尚未完成" in str(
+        report_service.load_report(first["report_id"], trade_date=_TRADE_DATE)["reason"]
+    )

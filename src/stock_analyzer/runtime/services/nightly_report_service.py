@@ -259,11 +259,14 @@ class NightlyReportService:
 
     # ------------------------------------------------------------ 报告读写
 
-    def freeze_report(self, report: Mapping[str, object]) -> Path:
-        """原子写入报告文件。
+    def freeze_report(self, report: Mapping[str, object]) -> tuple[Path, bool]:
+        """原子写入报告文件，返回 ``(路径, 是否写入)``。
 
-        报告是**不可变**的：同 ``report_id`` 已存在时只校验、不覆盖（覆盖会让已经
-        发出去的正文与磁盘内容不一致，回执就再也对不上账）。
+        报告是**不可变**的：同 ``report_id`` 已存在时不覆盖（覆盖会让已经发出去的
+        正文与磁盘内容不一致，回执就再也对不上账）。
+
+        返回"是否写入"而不是静默返回路径：调用方必须能区分"写成功了"和"因为
+        已存在而没写"——后者配上"要写的内容不同"就是指针指向不存在的版本。
         """
         trade_date = _text(report.get("trade_date"))
         report_id = _text(report.get("report_id"))
@@ -272,10 +275,10 @@ class NightlyReportService:
         path = self.report_path(trade_date, report_id)
         existing = self.load_report(report_id, trade_date=trade_date)
         if existing is not None:
-            return path
+            return path, False
         path.parent.mkdir(parents=True, exist_ok=True)
         _write_json_atomic(path, dict(report))
-        return path
+        return path, True
 
     def load_report(self, report_id: str, *, trade_date: str = "") -> dict[str, object] | None:
         normalized_id = _text(report_id)
@@ -492,7 +495,9 @@ class NightlyReportService:
         )
         report["report_kind"] = REPORT_KIND_REPLAY
         report["replay_source"] = _text(source_label)
-        report["report_id"] = f"rp-{_text(trade_date).replace('-', '')}"
+        # report_id 由 publish() 按实际版本号生成（rp-<日期>-<版本>）：回放会按需
+        # 重建，版本号必须体现在文件名上，否则新内容写不进去（见 publish 注释）。
+        report["report_id"] = ""
         report["content_digest"] = self.content_digest(report)
         return report
 
@@ -569,43 +574,95 @@ class NightlyReportService:
         if kind == REPORT_KIND_FORMAL:
             finalized["report_id"] = f"nr-{trade_date.replace('-', '')}-{revision:02d}"
         elif kind == REPORT_KIND_REPLAY:
-            finalized["report_id"] = _text(finalized.get("report_id")) or (
-                f"rp-{trade_date.replace('-', '')}"
-            )
+            # 版本号必须进 report_id。回放是按需重建的，固定 id 会在内容变化时撞上
+            # "同 id 不覆盖"的保护：既写不进新内容，又照样把指针指过去，于是"盘上
+            # 是第 1 版、声称已发布第 N 版"，而且不报错（2026-09-17 实测踩到）。
+            finalized["report_id"] = f"rp-{trade_date.replace('-', '')}-{revision:02d}"
         else:
             finalized["report_id"] = _text(finalized.get("report_id")) or self.notice_report_id(
                 trade_date, _text(finalized.get("notice"))
             )
         finalized["content_digest"] = self.content_digest(finalized)
-        self.freeze_report(finalized)
+        resolved_id = _text(finalized.get("report_id"))
+        _, written = self.freeze_report(finalized)
+        if not written:
+            stored = self.load_report(resolved_id, trade_date=trade_date)
+            if stored is None:
+                # 文件路径存在但读不出来：存储故障，不能假装发布成功。
+                raise RuntimeError(f"report {resolved_id} exists but cannot be read")
+            if _text(stored.get("content_digest")) != _text(finalized.get("content_digest")):
+                # 同一个 id 已经被冻结成**另一份内容**（id 不带版本号的那些报告才会
+                # 走到这里）。此时既不能声称发布了新版本，也不能把指针挪向一份没写
+                # 进磁盘的内容——以磁盘上那份为准，并把指针校准回它，保持幂等。
+                self.update_date_state(
+                    trade_date,
+                    self._pointer_patch(
+                        trade_date=trade_date,
+                        kind=kind,
+                        report_id=resolved_id,
+                        report=stored,
+                        revision=_optional_int(stored.get("revision")) or 1,
+                    ),
+                )
+                return {
+                    "published": False,
+                    "reason": "already_frozen_with_different_content",
+                    "report_id": resolved_id,
+                    "report": stored,
+                }
+        self.update_date_state(
+            trade_date,
+            self._pointer_patch(
+                trade_date=trade_date,
+                kind=kind,
+                report_id=resolved_id,
+                report=finalized,
+                revision=revision,
+            ),
+        )
+        return {
+            "published": True,
+            "reason": "new_revision" if revision > 1 else "created",
+            "report_id": resolved_id,
+            "report": finalized,
+        }
+
+    def _pointer_patch(
+        self,
+        *,
+        trade_date: str,
+        kind: str,
+        report_id: str,
+        report: Mapping[str, object],
+        revision: int,
+    ) -> dict[str, object]:
+        """构造"把日期状态的指针挪到这份报告"所需的 patch。
+
+        三类报告各有各的指针：正式结果绝不会被过程说明或验收回放顶掉。
+        """
         patch: dict[str, object] = {
-            "last_published_report_id": _text(finalized.get("report_id")),
-            "last_published_at": finalized.get("generated_at", ""),
+            "last_published_report_id": report_id,
+            "last_published_at": report.get("generated_at", ""),
         }
         if kind == REPORT_KIND_FORMAL:
             patch.update(
                 {
-                    "published_report_id": _text(finalized.get("report_id")),
-                    "published_at": finalized.get("generated_at", ""),
-                    "published_scan_status": _text(finalized.get("scan_status")),
+                    "published_report_id": report_id,
+                    "published_at": report.get("generated_at", ""),
+                    "published_scan_status": _text(report.get("scan_status")),
                     "published_revision": revision,
                 }
             )
+            return patch
+        state = self.read_date_state(trade_date)
+        notices = _mapping(state.get("notices"))
+        if kind == REPORT_KIND_REPLAY:
+            notice_key = "replay"
         else:
-            notices = _mapping(state.get("notices"))
-            if kind == REPORT_KIND_REPLAY:
-                notice_key = "replay"
-            else:
-                notice_key = "delay" if finalized.get("notice") == NOTICE_DELAY else "deadline"
-            notices[notice_key] = _text(finalized.get("report_id"))
-            patch["notices"] = notices
-        self.update_date_state(trade_date, patch)
-        return {
-            "published": True,
-            "reason": "new_revision" if revision > 1 else "created",
-            "report_id": _text(finalized.get("report_id")),
-            "report": finalized,
-        }
+            notice_key = "delay" if report.get("notice") == NOTICE_DELAY else "deadline"
+        notices[notice_key] = report_id
+        patch["notices"] = notices
+        return patch
 
     def published_report(self, trade_date: str) -> dict[str, object] | None:
         state = self.read_date_state(trade_date)
@@ -795,16 +852,12 @@ class NightlyReportService:
         lines: list[str] = []
         for status, heading in groups:
             handled.add(status)
-            items = [
-                item for item in incomplete if _text(item.get("evaluation_status")) == status
-            ]
+            items = [item for item in incomplete if _text(item.get("evaluation_status")) == status]
             if not items:
                 continue
             lines.append(heading)
             lines.extend(self._incomplete_line(item, level=level) for item in items[:limit])
-        rest = [
-            item for item in incomplete if _text(item.get("evaluation_status")) not in handled
-        ]
+        rest = [item for item in incomplete if _text(item.get("evaluation_status")) not in handled]
         if rest:
             lines.append("其他未通过完整风险检查（不计入观察候选）：")
             lines.extend(self._incomplete_line(item, level=level) for item in rest[:limit])
