@@ -578,3 +578,53 @@ def test_replay_report_is_labelled_and_isolated_from_the_formal_pointer(
     assert state["published_report_id"] == formal["report_id"]
     assert state["notices"]["replay"] == published["report_id"]
     assert report_service.published_report(_TRADE_DATE)["report_id"] == formal["report_id"]
+
+
+def test_all_incomplete_candidates_do_not_read_as_no_opportunity(
+    service: _FakeService,
+) -> None:
+    """ "完成 + 0 只观察"必须说清真实原因，不能被读成"今天没有机会"。"""
+    report_service = _report_service(service)
+    rows = [
+        _row("600000", evaluation_status="insufficient_input", missing_inputs=["ma5"]),
+        _row("000001", evaluation_status="insufficient_input", missing_inputs=["atr14"]),
+    ]
+    report = _build(report_service, _night_scan(rows))
+    assert report["scan_status"] == SCAN_STATUS_COMPLETED
+    content = report_service.render(report).content
+    assert "无通过完整风险检查的隔夜观察候选（2 只数据待补全）" in content
+
+
+def test_exclusion_reasons_are_localized_for_readers(service: _FakeService) -> None:
+    """主要过滤原因要给人看：不能直接暴露 below_min_threshold 这类内部代号。"""
+    report_service = _report_service(service)
+    scan = _night_scan(
+        [_row("600000")],
+        funnel={
+            "final_selection": {
+                "selected_count": 0,
+                "rejected": [
+                    {"symbol": "000001", "reject_reasons": ["below_min_threshold"]},
+                    {"symbol": "000002", "reject_reasons": ["below_min_threshold"]},
+                    {"symbol": "000003", "reject_reasons": ["cross_review_failed"]},
+                    {"symbol": "000004", "reject_reasons": ["overextension_reject_new_buy"]},
+                ],
+            }
+        },
+    )
+    content = report_service.render(_build(report_service, scan)).content
+    assert "低于最低分门槛 2" in content
+    assert "交叉复核未通过 1" in content
+    assert "过热拒绝新建仓 1" in content
+    assert "below_min_threshold" not in content
+    assert "cross_review_failed" not in content
+
+
+def test_entry_reasons_prefer_human_readable_shortlist_labels(service: _FakeService) -> None:
+    """入选依据优先用漏斗声明的可读短句，而不是内部信号代号。"""
+    report_service = _report_service(service)
+    row = _row("600000", shortlist_reasons=["trend_alignment", "capital_confirmation"])
+    row["reasons"] = ["soup_entry", "news_component_unavailable"]
+    content = report_service.render(_build(report_service, _night_scan([row]))).content
+    assert "入选依据：趋势一致、资金面确认" in content
+    assert "soup_entry" not in content

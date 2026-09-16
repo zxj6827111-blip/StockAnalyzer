@@ -92,6 +92,20 @@ _OVEREXTENSION_REASON_LABELS: dict[str, str] = {
     "insufficient_input": "风险指标输入不足",
 }
 
+# final selector 的拒因代号（`final_selection.rejected[].reject_reasons`）。
+# 空结果时正文要展示的"主要过滤原因"就是这些计数，直接用代号对用户没有信息量。
+_REJECT_REASON_LABELS: dict[str, str] = {
+    "below_min_threshold": "低于最低分门槛",
+    "cross_review_failed": "交叉复核未通过",
+    "risk_gate_failed": "风险门未通过",
+    "board_risk_reject_new_buy": "连板风险拒绝新建仓",
+    "overextension_reject_new_buy": "过热拒绝新建仓",
+    "overextension_insufficient_input": "风控输入不足",
+    "risk_gate_reject_new_buy": "风险门拒绝新建仓",
+    "predictor_rejected": "模型否决",
+    "news_risk_veto": "新闻风险否决",
+}
+
 _BLOCKING_REASON_LABELS: dict[str, str] = {
     "intraday_freshness_missing": "分钟数据新鲜度证据缺失",
     "intraday_freshness_below_80pct": "分钟数据新鲜率低于 80%",
@@ -672,7 +686,15 @@ class NightlyReportService:
             ]
 
         if status == SCAN_STATUS_COMPLETED:
-            lines.append(f"结果：今日选股完成，隔夜观察候选 {len(observation)} 只")
+            if not observation and incomplete:
+                # "完成 + 0 只观察"单独说会读成"今天没有机会"，但真实原因是候选的
+                # 风险输入没凑齐、根本没判过——必须把这句话说完整。
+                lines.append(
+                    f"结果：今日选股完成，无通过完整风险检查的隔夜观察候选"
+                    f"（{len(incomplete)} 只数据待补全）"
+                )
+            else:
+                lines.append(f"结果：今日选股完成，隔夜观察候选 {len(observation)} 只")
         elif status == SCAN_STATUS_EMPTY:
             lines.append("结果：今日正常完成，无合格候选")
         elif status == SCAN_STATUS_BLOCKED:
@@ -896,13 +918,18 @@ class NightlyReportService:
             # 旧产物没有这个字段：不能默认"已经完整评估"，否则缺输入的候选会被
             # 当成通过检查的观察候选混进正文。
             evaluation_status = EVALUATION_UNKNOWN
+        # 入选依据优先用漏斗自己声明的 shortlist_reasons（已是可读短句）；只有在
+        # 它为空时才回落到原始信号代号——把 soup_entry / news_component:0.5 这类
+        # 内部代号堆在用户面前，等于什么都没说。
         reasons: list[str] = []
         for code in _string_list(row.get("shortlist_reasons")):
-            reasons.append(_SHORTLIST_REASON_LABELS.get(code, code))
-        for raw in _string_list(row.get("reasons")):
-            if raw.startswith(("board_component:", "completion_component:")):
-                continue
-            if raw not in reasons:
+            label = _SHORTLIST_REASON_LABELS.get(code, code)
+            if label not in reasons:
+                reasons.append(label)
+        if not reasons:
+            for raw in _string_list(row.get("reasons")):
+                if raw.startswith(("board_component:", "completion_component:")):
+                    continue
                 reasons.append(raw)
         risks: list[str] = []
         for code in _string_list(overextension.get("reasons")):
@@ -986,7 +1013,14 @@ def _max_incomplete_lines(level: int) -> int:
 
 def _localize_reason(reason: str) -> str:
     normalized = _text(reason)
-    return _BLOCKING_REASON_LABELS.get(normalized, normalized)
+    if normalized in _BLOCKING_REASON_LABELS:
+        return _BLOCKING_REASON_LABELS[normalized]
+    if normalized in _REJECT_REASON_LABELS:
+        return _REJECT_REASON_LABELS[normalized]
+    if normalized.startswith("data_gate:"):
+        # data_gate 的拒因带状态后缀（如 data_gate:blocked），前缀可读化即可
+        return f"数据门禁未通过（{normalized.split(':', 1)[1]}）"
+    return normalized
 
 
 def _write_json_atomic(path: Path, payload: Mapping[str, object]) -> None:
