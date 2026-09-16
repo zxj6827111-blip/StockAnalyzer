@@ -513,9 +513,11 @@ class Week5Config(_StrictModel):
     market_radar_min_residency_min: int = 10
     market_radar_circuit_breaker_failures: int = 3
     market_radar_circuit_breaker_slow_runs: int = 2
-    market_radar_slow_run_sec: int = 120
+    market_radar_slow_run_sec: int = 180
     market_radar_circuit_breaker_cooldown_min: int = 10
-    market_radar_timeout_sec: int = 90
+    # 单轮雷达实测 p50 125s / p90 146s / max 150s（2026-09-16）：超时必须落在
+    # p90 之上留余量，否则正常成本会被截断、并连带把"慢"判成"退化"。
+    market_radar_timeout_sec: int = 210
     actionable_realtime_max_age_sec: int = 120
     weekend_learning_enabled: bool = True
     universe_prefilter_enabled: bool = True
