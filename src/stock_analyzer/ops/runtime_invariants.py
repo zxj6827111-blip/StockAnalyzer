@@ -470,6 +470,7 @@ def collect_and_evaluate(
     protocol_db: Path,
     now: datetime,
     exists: Callable[[str], bool] | None = None,
+    health_urls: Sequence[str] = (),
 ) -> dict[str, object]:
     """读真实来源并跑全部检查。DB 一律只读打开。"""
 
@@ -487,7 +488,7 @@ def collect_and_evaluate(
     scan_status, scan_detail, scan_ts = _latest_job_result(
         artifacts_root / "runtime" / "scheduler_job_results", "week5_night_scan"
     )
-    identity = _artifact_identity(protocol_db)
+    identity = _artifact_identity(protocol_db, health_urls)
 
     results: list[InvariantResult] = []
     results.extend(check_freshness(daily_max=daily_max, minute_max=minute_max, today=now.date()))
@@ -557,8 +558,43 @@ def _latest_job_result(results_root: Path, job: str) -> tuple[str, str, datetime
     )
 
 
-def _artifact_identity(protocol_db: Path) -> dict[str, object] | None:
-    """复用 models/identity.py 的判定，读注册表 champion 与在服文件哈希。"""
+def _identity_from_service(
+    health_urls: Sequence[str], *, timeout: float = 15.0
+) -> dict[str, object] | None:
+    """向服务本身要身份报告（首个可用地址为准）。
+
+    为什么不直连学习库：服务进程在运行期持着该库的写锁，**只有它能读注册表**。
+    2026-09-16 在 NAS 实测：任何其它进程（同容器的 api 容器内、scheduler-critical
+    容器内都一样）用 ``read_only=True`` 直连必然报 ``Conflicting lock is held``；
+    于是身份项在服务运行期只能恒答 ``registry_busy`` —— 而服务运行期恰恰是唯一
+    需要它的时刻。故选"先问服务，直连仅作服务不可达时的兜底"（那时锁已释放）。
+
+    返回 ``None`` 表示问不到（服务不可达 / 响应里没有身份块），调用方据此降级。
+    """
+    import urllib.request  # noqa: WPS433
+
+    for url in health_urls:
+        if not url:
+            continue
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as response:  # noqa: S310
+                payload = json.loads(response.read().decode("utf-8"))
+        except Exception:  # noqa: BLE001 - 服务不可达属预期降级路径，不是异常
+            continue
+        identity = payload.get("model_identity") if isinstance(payload, Mapping) else None
+        if not isinstance(identity, Mapping) or not identity.get("status"):
+            continue
+        served = dict(identity)
+        # 标注来源：同一状态可能来自"问服务"或"直连兜底"，排查时必须能分辨。
+        detail = str(served.get("detail") or "")
+        provenance = f"（来源：服务 API {url}）"
+        served["detail"] = f"{detail}{provenance}" if detail else provenance
+        return served
+    return None
+
+
+def _read_identity_from_db(protocol_db: Path) -> dict[str, object] | None:
+    """兜底路径：直连学习库读注册表（**只在服务不可达时才有意义**，见上）。"""
     import duckdb  # noqa: WPS433
 
     from stock_analyzer.models.bundle import compute_artifact_identity_hash  # noqa: WPS433
@@ -606,6 +642,16 @@ def _artifact_identity(protocol_db: Path) -> dict[str, object] | None:
     )
 
 
+def _artifact_identity(
+    protocol_db: Path, health_urls: Sequence[str] = ()
+) -> dict[str, object] | None:
+    """身份报告：优先问服务，问不到再直连兜底（两条路径同用 models/identity.py 判定）。"""
+    served = _identity_from_service(health_urls)
+    if served is not None:
+        return served
+    return _read_identity_from_db(protocol_db)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     import argparse
     import os
@@ -615,8 +661,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--state-path", default="/app/artifacts/runtime/runtime_state.json")
     parser.add_argument("--market-db", default="/app/artifacts/warehouse/market.duckdb")
     parser.add_argument("--protocol-db", default="/app/artifacts/training/learning_protocol.duckdb")
+    parser.add_argument(
+        "--health-url",
+        default="",
+        help=(
+            "服务健康端点（身份项优先走它，因为学习库写锁在服务进程手里）。"
+            "留空则用 SA_INVARIANTS_HEALTH_URL，再退到内建候选 127.0.0.1:8000 / api:8000。"
+        ),
+    )
     parser.add_argument("--json", action="store_true", help="只输出 JSON")
     args = parser.parse_args(list(argv) if argv is not None else None)
+
+    configured = args.health_url or os.environ.get("SA_INVARIANTS_HEALTH_URL", "")
+    # 内建候选覆盖「在 api 容器里跑」与「在姊妹容器里跑」两种用法；问不到就各自降级。
+    health_urls = ([configured] if configured else []) + [
+        "http://127.0.0.1:8000/health/deep",
+        "http://api:8000/health/deep",
+    ]
 
     now = datetime.now(CST)
     summary = collect_and_evaluate(
@@ -626,6 +687,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         protocol_db=Path(args.protocol_db),
         now=now,
         exists=os.path.exists,
+        health_urls=health_urls,
     )
     if args.json:
         print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
