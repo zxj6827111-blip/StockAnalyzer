@@ -555,6 +555,70 @@ class AnalyzerPipeline:
         """Reset capital-curve peak so a rebased equity does not inherit old drawdown."""
         self._risk_controller.rebaseline_capital(equity=equity)
 
+    def model_identity_facts(self) -> dict[str, object]:
+        """本 pipeline **实际加载**的模型工件身份事实（S01，只读）。
+
+        规则：Pipeline 实际加载谁，报告就必须报告谁。因此这里的事实只来自
+        ``self._predictor``（加载期实算内容哈希 + 工件自述契约）；registry 登记值
+        与 bootstrap 运行时状态都不是事实，由调用方用
+        ``models/identity.build_model_identity_report`` 作为**补充**合并进来。
+
+        工件缺失/加载失败时同样返回结构完整的 facts（``predictor_loaded=False`` +
+        ``load_error``），并沿用 ``self._predictor_status`` 的 reason——身份必须永远
+        可报告，"加载失败"本身就是要被记录的身份事实。
+        """
+        facts: dict[str, object] = {
+            "artifact_uri": str(self._config.training.artifact_path),
+            "artifact_path_requested": str(self._config.training.artifact_path),
+            "artifact_exists": False,
+            "artifact_content_hash": "",
+            "artifact_created_at": "",
+            "feature_schema_id": "",
+            "feature_schema_hash": "",
+            "label_policy_id": "",
+            "label_policy_hash": "",
+            "dataset_manifest_id": "",
+            "claimed_content_hash": "",
+            "predictor_loaded": False,
+            "score_source": self._score_source,
+            "output_semantics": "",
+            "inference_allowed": False,
+            "inference_blocked_reason": "",
+            "load_error": str(self._predictor_status.get("reason", "")),
+        }
+        predictor = self._predictor
+        if predictor is None:
+            return facts
+        facts_fn = getattr(predictor, "model_identity_facts", None)
+        if not callable(facts_fn):
+            # 旧接口 predictor / 桩对象：只保留可安全读取的字段，绝不猜身份。
+            facts["predictor_loaded"] = True
+            return facts
+        payload = facts_fn()
+        if isinstance(payload, dict):
+            facts.update(payload)
+        facts["score_source"] = self._score_source
+        return facts
+
+    def model_identity(self, registry: object | None = None) -> dict[str, object]:
+        """实际加载模型的身份报告（事实 + registry 补充 + 状态判定）。
+
+        ``registry`` 缺省用 :meth:`configure_learning_protocol` 附加的注册表；
+        注册表不可读只降级为 ``registry_unavailable``（"这次判不了"），不得被读成
+        身份不符。
+        """
+        from stock_analyzer.models.identity import (  # noqa: WPS433 - 延迟导入避免环
+            build_model_identity_report,
+        )
+
+        facts = self.model_identity_facts()
+        target_registry = registry if registry is not None else self._model_registry
+        return build_model_identity_report(
+            facts,
+            registry=target_registry,
+            claimed_content_hash=facts.get("claimed_content_hash", ""),
+        )
+
     def provider_status(self) -> dict[str, object]:
         health_status = self._health_monitor.snapshot()
         predictor_status = dict(self._predictor_status)

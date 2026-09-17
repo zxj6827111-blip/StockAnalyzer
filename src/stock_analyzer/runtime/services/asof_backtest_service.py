@@ -35,6 +35,73 @@ _HISTORY_FILENAME = "history.jsonl"
 _LATEST_FILENAME = "latest.json"
 
 
+def _resolve_backtest_model_identity(
+    *, service: object, config: StockAnalyzerConfig
+) -> dict[str, object]:
+    """解析本次 asof 回测**实际会加载**的模型身份（S01，只读）。
+
+    事实来自 ``config.training.artifact_path`` 指向的工件本身（内容哈希 +
+    created_at + feature schema / label policy 契约）；registry 只补充"这份内容
+    登记叫什么"；bootstrap 的 ``last_bootstrap_at`` 单独标注，**绝不**再当作
+    ``model_trained_at``（旧行为见蓝图 §2.9）。
+
+    与 pipeline 路径的差别只在于"从哪里读事实"：这里没有已加载的 predictor，
+    因此直接读磁盘（``load_artifact_facts``），两者共用同一套判定
+    （``models/identity.build_model_identity_report``）。
+    """
+    from stock_analyzer.models.identity import (  # noqa: WPS433 - 延迟导入避免环
+        build_model_identity_report,
+        load_artifact_facts,
+        registry_identity,
+    )
+
+    facts = load_artifact_facts(config.training.artifact_path)
+    registry = getattr(service, "_model_registry", None)
+    try:
+        registry_snapshot = registry_identity(registry)
+    except Exception:  # noqa: BLE001 - 身份收集失败不得打断回测
+        registry_snapshot = {
+            "champion": None,
+            "registered": [],
+            "registry_error": "registry_identity_failed",
+            "registry_busy": False,
+        }
+    report = build_model_identity_report(
+        facts,
+        registry_snapshot=registry_snapshot,
+        claimed_content_hash=facts.get("claimed_content_hash", ""),
+    )
+    bootstrap_last_bootstrap_at = ""
+    bootstrap_status_fn = getattr(service, "training_bootstrap_status", None)
+    if callable(bootstrap_status_fn):
+        try:
+            status = bootstrap_status_fn()
+        except Exception:  # noqa: BLE001 - 只做标注
+            status = {}
+        if isinstance(status, Mapping):
+            bootstrap_last_bootstrap_at = str(status.get("last_bootstrap_at", "") or "")
+    return {
+        "model_id": (
+            str(report.get("registry_model_id", "") or "")
+            if bool(report.get("identity_verified", False))
+            else ""
+        ),
+        "artifact_path": str(report.get("artifact_uri", "") or ""),
+        "artifact_content_hash": str(report.get("artifact_content_hash", "") or ""),
+        "artifact_created_at": str(report.get("artifact_created_at", "") or ""),
+        "feature_schema_id": str(report.get("feature_schema_id", "") or ""),
+        "feature_schema_hash": str(report.get("feature_schema_hash", "") or ""),
+        "label_policy_id": str(report.get("label_policy_id", "") or ""),
+        "label_policy_hash": str(report.get("label_policy_hash", "") or ""),
+        "dataset_manifest_id": str(report.get("dataset_manifest_id", "") or ""),
+        "identity_status": str(report.get("status", "") or ""),
+        "identity_detail": str(report.get("detail", "") or ""),
+        "identity_verified": bool(report.get("identity_verified", False)),
+        "research_fail_closed": bool(report.get("research_fail_closed", False)),
+        "bootstrap_last_bootstrap_at": bootstrap_last_bootstrap_at,
+    }
+
+
 def _read_intraday_coverage_until(config: StockAnalyzerConfig) -> str:
     """动态读取 intraday 摘要 DuckDB 实际覆盖到的最新日期（返工第 3 项）。
 
@@ -158,15 +225,18 @@ class AsofBacktestService:
         candidate_pool_bias = candidate_pool_source == "watchlist"
 
         as_of_dates = _trading_days_in_range(start_date, end_date)
-        bootstrap_status = self._service.training_bootstrap_status()
-        model_trained_at = str(bootstrap_status.get("last_bootstrap_at", "") or "").strip()
+        # S01：模型身份必须来自**实际加载的工件**，不是 bootstrap 运行时状态。
+        # 旧实现在这里把 ``last_bootstrap_at`` 当 ``model_trained_at``，于是报告写
+        # 2026-09-15 训练、实际加载的却是 2026-08-16 的工件（蓝图 §2.9）。
+        model_identity = _resolve_backtest_model_identity(service=self._service, config=config)
 
         scan_report = run_asof_scan(
             config=config,
             symbols=resolved_symbols,
             as_of_dates=as_of_dates,
             top_n=resolved_top_n,
-            model_trained_at=model_trained_at,
+            model_trained_at=str(model_identity.get("artifact_created_at", "") or ""),
+            model_identity=model_identity,
         )
 
         holding_reports: dict[str, HoldingCurveReport] = {}
@@ -267,6 +337,9 @@ class AsofBacktestService:
         )
         resolved_holding_top_n = holding_top_n
         as_of_dates = _trading_days_in_range(start_date, end_date)
+        # S01：请求级模型身份（事实来自实际会加载的工件）。各日期运行上下文里的
+        # 身份应与它一致；不一致在 caveats 里如实记录，不自动纠正。
+        model_identity = _resolve_backtest_model_identity(service=self._service, config=config)
         max_dates = max(1, int(config.asof_backtest.week5_max_dates_per_run))
         dates_truncated = False
         if len(as_of_dates) > max_dates:
@@ -314,13 +387,22 @@ class AsofBacktestService:
             for entry in dates_payload.values()
             if isinstance(entry, dict) and isinstance(entry.get("historical_context"), dict)
         ]
-        model_trained_at = ""
-        model_id = ""
+        # 每次运行上下文里的身份来自各日期 pipeline 实际加载的工件；与请求级身份
+        # （上面按 config.training.artifact_path 解析）一致说明"整轮跑的是同一个工件"。
+        # 不一致时**如实记录**，不做任何自动纠正——身份异常必须可见。
+        run_trained_at = ""
+        run_model_id = ""
+        run_identity_status = ""
         for context in historical_contexts:
             model = context.get("model") if isinstance(context, dict) else None
             if isinstance(model, dict):
-                model_trained_at = str(model.get("trained_at", "") or "") or model_trained_at
-                model_id = str(model.get("model_id", "") or "") or model_id
+                run_trained_at = str(model.get("trained_at", "") or "") or run_trained_at
+                run_model_id = str(model.get("model_id", "") or "") or run_model_id
+                run_identity_status = (
+                    str(model.get("identity_status", "") or "") or run_identity_status
+                )
+        request_artifact_created_at = str(model_identity.get("artifact_created_at", "") or "")
+        model_identity_consistent = run_trained_at in {"", request_artifact_created_at}
         intraday_degraded = any(
             bool(
                 (entry.get("historical_context") or {}).get("intraday_degraded")
@@ -339,8 +421,31 @@ class AsofBacktestService:
             "caveats": {
                 "algorithm": "week5_daily",
                 "lookahead_bias": True,
-                "model_id": model_id,
-                "model_trained_at": model_trained_at,
+                "model_id": str(model_identity.get("model_id", "") or "") or run_model_id,
+                "model_trained_at": request_artifact_created_at or run_trained_at,
+                # S01 身份块：事实（artifact）+ 判定状态 + 研究侧 fail-closed 标记。
+                "model_trained_at_source": "artifact_created_at",
+                "model_artifact_path": str(model_identity.get("artifact_path", "") or ""),
+                "model_artifact_content_hash": str(
+                    model_identity.get("artifact_content_hash", "") or ""
+                ),
+                "model_artifact_created_at": request_artifact_created_at,
+                "feature_schema_id": str(model_identity.get("feature_schema_id", "") or ""),
+                "feature_schema_hash": str(model_identity.get("feature_schema_hash", "") or ""),
+                "label_policy_id": str(model_identity.get("label_policy_id", "") or ""),
+                "label_policy_hash": str(model_identity.get("label_policy_hash", "") or ""),
+                "model_identity_status": str(model_identity.get("identity_status", "") or ""),
+                "model_identity_detail": str(model_identity.get("identity_detail", "") or ""),
+                "model_identity_verified": bool(model_identity.get("identity_verified", False)),
+                "model_identity_research_fail_closed": bool(
+                    model_identity.get("research_fail_closed", False)
+                ),
+                "model_identity_consistent_with_runs": model_identity_consistent,
+                "model_identity_status_in_runs": run_identity_status,
+                # bootstrap 时间只作**独立标注**，不再冒充模型训练时间。
+                "bootstrap_last_bootstrap_at": str(
+                    model_identity.get("bootstrap_last_bootstrap_at", "") or ""
+                ),
                 "news_neutralized": True,
                 "intraday_degraded": intraday_degraded,
                 "intraday_coverage_until": _read_intraday_coverage_until(config),

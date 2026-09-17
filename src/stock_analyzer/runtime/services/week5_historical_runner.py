@@ -67,37 +67,62 @@ def _resolve_model_info(
     *,
     service: Any,
     config: StockAnalyzerConfig,
+    pipeline: AnalyzerPipeline | None = None,
 ) -> Week5ModelInfo:
-    """记录本轮使用的模型 ID / 训练时间 / 代码 commit / 配置 hash。"""
-    model_id = ""
-    trained_at = ""
+    """记录本轮**实际加载**的模型身份 + 代码 commit + 配置 hash（S01）。
+
+    唯一真相源：``pipeline.model_identity_facts()``（加载期实算哈希 + 工件自述
+    created_at / schema / label 契约）。registry 只补充"这份内容登记叫什么"，
+    bootstrap 状态只单独标注，**都不参与** ``trained_at``。
+
+    2026-09-17 之前此处会在找不到 champion 时把 bootstrap 的 ``last_bootstrap_at``
+    当 ``trained_at`` 报出去（蓝图 §2.9 的"报告一个模型、实际加载另一个"），
+    S01 起该字段只等于工件 created_at；取不到就是空 + ``trained_at_source=unavailable``。
+    """
+    from stock_analyzer.models.identity import (  # noqa: WPS433 - 与 pipeline 同层延迟导入
+        build_model_identity_report,
+        registry_identity,
+    )
+
+    registry = getattr(service, "_model_registry", None)
     try:
-        registry = getattr(service, "_model_registry", None)
-        champion = (
-            registry.active_champion(suppress_read_errors=True)
-            if registry is not None
-            else None
-        )
-        if champion is not None:
-            model_id = str(getattr(champion, "model_id", "") or "")
-            raw_trained_at = (
-                getattr(champion, "trained_at", None)
-                or getattr(champion, "created_at", None)
-                or ""
-            )
-            trained_at = str(raw_trained_at or "")
-            metrics = getattr(champion, "metrics_summary", {})
-            if not trained_at and isinstance(metrics, dict):
-                trained_at = str(metrics.get("trained_at", "") or "")
-    except Exception:
-        model_id = ""
-        trained_at = ""
+        registry_snapshot = registry_identity(registry)
+    except Exception:  # noqa: BLE001 - 身份收集失败不得打断回测
+        registry_snapshot = {
+            "champion": None,
+            "registered": [],
+            "registry_error": "registry_identity_failed",
+            "registry_busy": False,
+        }
+
+    facts: dict[str, object]
+    if pipeline is not None:
+        facts = pipeline.model_identity_facts()
+    else:
+        # 没有已加载 pipeline（不应发生，保留兜底）：退回磁盘事实，绝不用 bootstrap 顶替。
+        from stock_analyzer.models.identity import load_artifact_facts  # noqa: WPS433
+
+        facts = load_artifact_facts(config.training.artifact_path)
+        facts.setdefault("score_source", str(config.models.inference_score_source))
+
+    report = build_model_identity_report(
+        facts,
+        registry_snapshot=registry_snapshot,
+        claimed_content_hash=facts.get("claimed_content_hash", ""),
+    )
+
+    bootstrap_status: object = {}
     try:
         bootstrap_status = service.training_bootstrap_status()
-        if isinstance(bootstrap_status, dict) and not trained_at:
-            trained_at = str(bootstrap_status.get("last_bootstrap_at", "") or "")
-    except Exception:
-        pass
+    except Exception:  # noqa: BLE001 - 只做标注，取不到就留空
+        bootstrap_status = {}
+    bootstrap_last_bootstrap_at = (
+        str(bootstrap_status.get("last_bootstrap_at", "") or "")
+        if isinstance(bootstrap_status, dict)
+        else ""
+    )
+
+    artifact_created_at = str(report.get("artifact_created_at", "") or "")
     code_commit = str(getattr(config.evolution, "code_commit_id", "") or "")
     try:
         config_hash = hashlib.sha256(
@@ -105,11 +130,38 @@ def _resolve_model_info(
         ).hexdigest()[:16]
     except Exception:
         config_hash = ""
+    hash_verified = report.get("content_hash_verified")
     return Week5ModelInfo(
-        model_id=model_id,
-        trained_at=trained_at,
+        # model_id 是 registry 的**补充**身份：只有在与实算哈希对得上（match）时才是
+        # 可信的名字，其余状态（含 no_champion）保持空串，避免"名字对不上内容"。
+        model_id=(
+            str(report.get("registry_model_id", "") or "")
+            if bool(report.get("identity_verified", False))
+            else ""
+        ),
+        trained_at=artifact_created_at,
+        trained_at_source="artifact_created_at" if artifact_created_at else "unavailable",
         code_commit=code_commit,
         config_hash=config_hash,
+        artifact_path=str(report.get("artifact_uri", "") or ""),
+        artifact_content_hash=str(report.get("artifact_content_hash", "") or ""),
+        artifact_created_at=artifact_created_at,
+        feature_schema_id=str(report.get("feature_schema_id", "") or ""),
+        feature_schema_hash=str(report.get("feature_schema_hash", "") or ""),
+        label_policy_id=str(report.get("label_policy_id", "") or ""),
+        label_policy_hash=str(report.get("label_policy_hash", "") or ""),
+        dataset_manifest_id=str(report.get("dataset_manifest_id", "") or ""),
+        score_source=str(report.get("score_source", "") or ""),
+        output_semantics=str(report.get("output_semantics", "") or ""),
+        identity_status=str(report.get("status", "") or ""),
+        identity_detail=str(report.get("detail", "") or ""),
+        identity_verified=bool(report.get("identity_verified", False)),
+        research_fail_closed=bool(report.get("research_fail_closed", False)),
+        content_hash_verified=hash_verified if isinstance(hash_verified, bool) else None,
+        registry_model_id=str(report.get("registry_model_id", "") or ""),
+        registry_content_hash=str(report.get("registry_content_hash", "") or ""),
+        registry_error=str(report.get("registry_error", "") or ""),
+        bootstrap_last_bootstrap_at=bootstrap_last_bootstrap_at,
     )
 
 
@@ -215,7 +267,7 @@ def run_week5_historical_day(
             no_buy_streak=0,
             monster_positions=[],
         ),
-        model_info=_resolve_model_info(service=service, config=hist_config),
+        model_info=_resolve_model_info(service=service, config=hist_config, pipeline=pipeline),
         artifact_dir=Path(task_dir),
         progress=on_progress,
         scan_profile=scan_profile,

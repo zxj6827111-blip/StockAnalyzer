@@ -84,19 +84,74 @@ class Week5AccountState:
 
 @dataclass(slots=True)
 class Week5ModelInfo:
-    """本轮使用的模型/代码/配置身份（历史回测的可复现性标注）。"""
+    """本轮使用的模型/代码/配置身份（历史回测的可复现性标注）。
+
+    S01 起本结构区分**事实**与**补充**（见 ``models/identity.py``）：
+
+    - 事实（``artifact_*`` / ``feature_schema_*`` / ``label_policy_*``）：来自实际加载
+      的工件；
+    - 补充（``model_id`` 的 registry 来源、``registry_*``、
+      ``bootstrap_last_bootstrap_at``）：只做标注，**不得覆盖事实**。
+
+    ``trained_at`` 语义在 S01 收紧为"实际加载工件的 created_at"
+    （``trained_at_source = artifact_created_at``）。此前实现会在找不到 champion 时把
+    bootstrap 的 ``last_bootstrap_at`` 当训练时间报出去，于是报告写 2026-09-15、实际
+    加载的是 2026-08-16 的工件（蓝图 §2.9）；bootstrap 时间现在单独放在
+    ``bootstrap_last_bootstrap_at``，不再冒充模型身份。
+    """
 
     model_id: str = ""
     trained_at: str = ""
     code_commit: str = ""
     config_hash: str = ""
+    # --- S01：真实模型身份链 ---
+    trained_at_source: str = ""  # artifact_created_at | unavailable
+    artifact_path: str = ""
+    artifact_content_hash: str = ""
+    artifact_created_at: str = ""
+    feature_schema_id: str = ""
+    feature_schema_hash: str = ""
+    label_policy_id: str = ""
+    label_policy_hash: str = ""
+    dataset_manifest_id: str = ""
+    score_source: str = ""
+    output_semantics: str = ""
+    identity_status: str = ""
+    identity_detail: str = ""
+    identity_verified: bool = False
+    research_fail_closed: bool = False
+    content_hash_verified: bool | None = None
+    registry_model_id: str = ""
+    registry_content_hash: str = ""
+    registry_error: str = ""
+    bootstrap_last_bootstrap_at: str = ""
 
-    def to_payload(self) -> dict[str, str]:
+    def to_payload(self) -> dict[str, object]:
         return {
             "model_id": self.model_id,
             "trained_at": self.trained_at,
             "code_commit": self.code_commit,
             "config_hash": self.config_hash,
+            "trained_at_source": self.trained_at_source,
+            "artifact_path": self.artifact_path,
+            "artifact_content_hash": self.artifact_content_hash,
+            "artifact_created_at": self.artifact_created_at,
+            "feature_schema_id": self.feature_schema_id,
+            "feature_schema_hash": self.feature_schema_hash,
+            "label_policy_id": self.label_policy_id,
+            "label_policy_hash": self.label_policy_hash,
+            "dataset_manifest_id": self.dataset_manifest_id,
+            "score_source": self.score_source,
+            "output_semantics": self.output_semantics,
+            "identity_status": self.identity_status,
+            "identity_detail": self.identity_detail,
+            "identity_verified": self.identity_verified,
+            "research_fail_closed": self.research_fail_closed,
+            "content_hash_verified": self.content_hash_verified,
+            "registry_model_id": self.registry_model_id,
+            "registry_content_hash": self.registry_content_hash,
+            "registry_error": self.registry_error,
+            "bootstrap_last_bootstrap_at": self.bootstrap_last_bootstrap_at,
         }
 
 
