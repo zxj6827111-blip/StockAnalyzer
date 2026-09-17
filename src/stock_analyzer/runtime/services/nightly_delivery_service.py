@@ -25,10 +25,11 @@ from __future__ import annotations
 import json
 import os
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
+from time import monotonic, sleep
 from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -37,6 +38,7 @@ from stock_analyzer.config import NightlyReportConfig
 from stock_analyzer.notify.channels import (
     OUTCOME_ACCEPTED,
     OUTCOME_UNKNOWN,
+    ConsoleNotifier,
     FeishuAppNotifier,
     NotificationMessage,
     TargetDeliveryOutcome,
@@ -44,12 +46,13 @@ from stock_analyzer.notify.channels import (
 )
 from stock_analyzer.notify.filter import is_quiet_time
 from stock_analyzer.ops.file_lock import DistributedFileLock
-from stock_analyzer.runtime.notifier_factory import build_channel
+from stock_analyzer.runtime.notifier_factory import _force_console_notifier, build_channel
 from stock_analyzer.runtime.services.nightly_report_service import (
     NOTICE_DEADLINE,
     NOTICE_DELAY,
     SCAN_STATUS_BLOCKED,
     NightlyReportService,
+    RenderedMessage,  # noqa: F401 - 仅用于类型标注
 )
 
 STATE_PENDING = "pending"
@@ -93,6 +96,9 @@ class NightlyDeliveryService:
         self.report_service = NightlyReportService(service)
         self.root = self._resolve_path(self.config.delivery_root)
         self._targets_cache: list[DeliveryTarget] | None = None
+        # 交付记录的等待上限：正常竞争只发生在"发送中"与"补发/恢复"之间，等一小会儿
+        # 拿不到就明确让位（不改状态），而不是去改写别人正在用的记录。
+        self._record_lock_timeout_sec = 2.0
 
     # ------------------------------------------------------------------ 路径
 
@@ -113,6 +119,59 @@ class NightlyDeliveryService:
 
     def lock_path(self, delivery_id: str) -> Path:
         return self.root / f"{_text(delivery_id)}.lock"
+
+    def _delivery_lock(self, delivery_id: str) -> DistributedFileLock:
+        return DistributedFileLock(self.lock_path(delivery_id), stale_after_sec=self._lease_sec())
+
+    @staticmethod
+    def _acquire_bounded(lock: DistributedFileLock, timeout_sec: float) -> bool:
+        """有界等待地尝试取得锁；失败返回 False（**不**改写任何状态）。
+
+        ``DistributedFileLock.acquire()`` 被占用时返回 False 而不是抛异常，且
+        ``is_held()`` 只表示"这个对象自己有没有持锁"——新建对象永远是 False，
+        拿它探测别的持有者等于没探测。所以占用判定只能来自 acquire 的返回值。
+        """
+        deadline = monotonic() + max(0.0, float(timeout_sec))
+        while True:
+            if lock.acquire():
+                return True
+            if monotonic() >= deadline:
+                return False
+            sleep(0.05)
+
+    def _mutate_record(
+        self,
+        delivery_id: str,
+        *,
+        now: datetime,
+        decide: Callable[[dict[str, object]], tuple[dict[str, object] | None, str]],
+        timeout_sec: float | None = None,
+    ) -> tuple[dict[str, object] | None, str]:
+        """在**该 delivery_id 的交付锁**内重读最新记录、按 decide 决策后写回。
+
+        所有写记录的路径都必须走这里：发送端持锁不代表补发端、恢复端也持锁，
+        而"读-改-写"分散在不同锁之外时，旧副本会覆盖新状态（例如把 delivered
+        改回 pending，或把在途发送重置成待发）。
+        """
+        lock = self._delivery_lock(delivery_id)
+        if not self._acquire_bounded(
+            lock, self._record_lock_timeout_sec if timeout_sec is None else timeout_sec
+        ):
+            return None, "in_progress"
+        try:
+            latest = self.load_record(delivery_id)
+            if latest is None:
+                return None, "missing"
+            updated, label = decide(dict(latest))
+            if updated is None:
+                # 约定：**None 表示"什么都没写"**。返回 latest 会让调用方把"不用改
+                # 的状态"当成"已处理"，从而跳过本该发送的记录。
+                return None, label
+            updated["updated_at"] = now.isoformat()
+            self.save_record(updated)
+            return updated, label
+        finally:
+            lock.release()
 
     @staticmethod
     def delivery_id_for(report_id: str, target_key: str) -> str:
@@ -138,6 +197,21 @@ class NightlyDeliveryService:
         notifications = getattr(self._service._config, "notifications", None)
         if notifications is None:
             return []
+        if _force_console_notifier():
+            # 沿用项目既有的"禁止外部通知"机制（SA_DISABLE_EXTERNAL_NOTIFICATIONS /
+            # SA_FORCE_CONSOLE_NOTIFIER，以及 pytest 环境）。它以前只在
+            # build_notifier 里生效，而这里直接调 build_channel——等于新链路能绕过
+            # 运维的停发开关。console 目标永远不会产生 delivered，所以这既是尊重
+            # 开关，也保证"日志写出去了"不会被当成送达。
+            console = ConsoleNotifier()
+            return [
+                DeliveryTarget(
+                    key="console",
+                    required=True,
+                    notifier=console,
+                    idempotent=False,
+                )
+            ]
         primary_name = str(getattr(notifications, "primary", "") or "").strip().lower()
         if not primary_name:
             return []
@@ -254,53 +328,88 @@ class NightlyDeliveryService:
             return []
         rendered = self.report_service.render(report)
         records: list[dict[str, object]] = []
+        created: list[str] = []
         for target in self.targets():
             delivery_id = self.delivery_id_for(report_id, target.key)
-            existing = self.load_record(delivery_id)
-            if existing is not None:
-                records.append(existing)
+            # 取记录锁再决定"要不要建"：否则两个 worker 会各自认为"不存在"并各写
+            # 一份（uuid 与正文可能不同），幂等就是假的了。
+            lock = self._delivery_lock(delivery_id)
+            if not self._acquire_bounded(lock, self._record_lock_timeout_sec):
+                existing = self.load_record(delivery_id)
+                if existing is not None:
+                    records.append(existing)
                 continue
-            now_iso = datetime.now().isoformat()
-            record: dict[str, object] = {
-                "schema_version": 1,
-                "delivery_id": delivery_id,
-                "report_id": report_id,
-                "report_kind": _text(report.get("report_kind")),
-                "trade_date": trade_date,
-                "revision": report.get("revision", 0),
-                "target_key": target.key,
-                "required": target.required,
-                "idempotent": target.idempotent,
-                "state": STATE_PENDING,
-                "attempts": 0,
-                "max_attempts": max(1, int(self.config.max_delivery_attempts)),
-                "request_uuid": uuid4().hex,
-                "content_digest": _text(report.get("content_digest")),
-                "title": rendered.title,
-                "content": rendered.content,
-                "message_truncated": rendered.truncated,
-                # 空串 = 立即可发。这里刻意不写"当前墙钟"：记录创建时间与调用方的
-                # 逻辑时钟（调度时间/测试注入时间）不是同一个时间轴，写死墙钟会让
-                # 新建记录在一段时间内被判成"还没到点"而静默漏发。
-                "next_retry_at": "",
-                "lease_owner": "",
-                "lease_until": "",
-                "first_attempt_at": "",
-                "last_attempt_at": "",
-                "accepted_at": "",
-                "message_id": "",
-                "error_code": "",
-                "error_message": "",
-                "needs_attention": False,
-                "manual_retries": 0,
-                "created_at": now_iso,
-                "updated_at": now_iso,
-                "history": [],
-            }
-            self.save_record(record)
+            try:
+                existing = self.load_record(delivery_id)
+                if existing is not None:
+                    records.append(existing)
+                    continue
+                record = self._new_record(
+                    report=report,
+                    trade_date=trade_date,
+                    report_id=report_id,
+                    target=target,
+                    delivery_id=delivery_id,
+                    rendered=rendered,
+                )
+                self.save_record(record)
+                records.append(record)
+                created.append(delivery_id)
+            finally:
+                lock.release()
+        # 注册放到释放交付锁之后：避免"交付锁 → 日期锁"的嵌套（与 publish 的
+        # "只持日期锁"路径交叉时不会有环）。
+        for delivery_id in created:
             self._register_delivery_id(trade_date, delivery_id)
-            records.append(record)
         return records
+
+    def _new_record(
+        self,
+        *,
+        report: Mapping[str, object],
+        trade_date: str,
+        report_id: str,
+        target: DeliveryTarget,
+        delivery_id: str,
+        rendered: RenderedMessage,
+    ) -> dict[str, object]:
+        now_iso = datetime.now().isoformat()
+        return {
+            "schema_version": 1,
+            "delivery_id": delivery_id,
+            "report_id": report_id,
+            "report_kind": _text(report.get("report_kind")),
+            "trade_date": trade_date,
+            "revision": report.get("revision", 0),
+            "target_key": target.key,
+            "required": target.required,
+            "idempotent": target.idempotent,
+            "state": STATE_PENDING,
+            "attempts": 0,
+            "max_attempts": max(1, int(self.config.max_delivery_attempts)),
+            "request_uuid": uuid4().hex,
+            "content_digest": _text(report.get("content_digest")),
+            "title": rendered.title,
+            "content": rendered.content,
+            "message_truncated": rendered.truncated,
+            # 空串 = 立即可发。这里刻意不写"当前墙钟"：记录创建时间与调用方的
+            # 逻辑时钟（调度时间/测试注入时间）不是同一个时间轴，写死墙钟会让
+            # 新建记录在一段时间内被判成"还没到点"而静默漏发。
+            "next_retry_at": "",
+            "lease_owner": "",
+            "lease_until": "",
+            "first_attempt_at": "",
+            "last_attempt_at": "",
+            "accepted_at": "",
+            "message_id": "",
+            "error_code": "",
+            "error_message": "",
+            "needs_attention": False,
+            "manual_retries": 0,
+            "created_at": now_iso,
+            "updated_at": now_iso,
+            "history": [],
+        }
 
     def _register_delivery_id(self, trade_date: str, delivery_id: str) -> None:
         """把 delivery_id 记进日期状态：交付检查据此定位记录，不必扫描交付目录。"""
@@ -395,59 +504,98 @@ class NightlyDeliveryService:
         queued: list[str] = []
         conflicts: list[dict[str, object]] = []
         skipped: list[str] = []
-        pending_writes: list[dict[str, object]] = []
+        in_progress: list[str] = []
         for record in records:
-            state = _text(record.get("state"))
-            if state == STATE_DELIVERED:
-                skipped.append(_text(record.get("target_key")))
-                continue
-            uncertain_outside_window = _text(
-                record.get("last_outcome")
-            ) == OUTCOME_UNKNOWN and not self._within_unknown_window(record, now=current)
-            if uncertain_outside_window and not confirm_unknown:
-                # 上一次结果不确定且已经出了去重窗口：再发一次有可能真的重复推送，
-                # 必须由人显式确认（例如已经核对过飞书里没有收到）。
+            delivery_id = _text(record.get("delivery_id"))
+            target_key = _text(record.get("target_key"))
+            # 每个目标都在**它自己的交付锁**内重读最新状态再决定：补发端与发送端
+            # 对同一条记录的读-改-写必须在同一把锁下，否则补发能把在途 sending
+            # 改回 pending（也可能覆盖刚写下的 delivered）。
+            def _requeue(
+                latest: dict[str, object],
+                *,
+                _now: datetime = current,
+                _confirm: bool = confirm_unknown,
+            ) -> tuple[dict[str, object] | None, str]:
+                return self._requeue_decision(latest, now=_now, confirm_unknown=_confirm)
+
+            _, label = self._mutate_record(delivery_id, now=current, decide=_requeue)
+            if label == "queued":
+                queued.append(target_key)
+            elif label == "delivered":
+                skipped.append(target_key)
+            elif label == "in_progress":
+                in_progress.append(target_key)
+            elif label == "confirm_required":
                 conflicts.append(
                     {
-                        "target_key": _text(record.get("target_key")),
+                        "target_key": target_key,
                         "reason": "unknown_outside_dedup_window",
                         "error_code": _text(record.get("error_code")),
                     }
                 )
-                continue
-            updated = dict(record)
-            updated["state"] = STATE_PENDING
-            updated["next_retry_at"] = current.isoformat()
-            updated["attempts"] = 0
-            updated["manual_retries"] = _int(record.get("manual_retries")) + 1
-            updated["needs_attention"] = False
-            updated["updated_at"] = current.isoformat()
-            pending_writes.append(updated)
-            queued.append(_text(record.get("target_key")))
-        for updated in pending_writes:
-            self.save_record(updated)
-        if conflicts:
-            return {
-                "queued": False,
-                "reason": "confirm_required",
-                "report_id": _text(report_id),
-                "conflicts": conflicts,
-                "queued_targets": queued,
-                "skipped_targets": skipped,
-            }
-        return {
-            "queued": bool(queued),
-            "reason": "queued" if queued else "nothing_to_do",
+            else:
+                skipped.append(target_key)
+        result: dict[str, object] = {
             "report_id": _text(report_id),
             "queued_targets": queued,
             "skipped_targets": skipped,
-            "conflicts": [],
+            "in_progress_targets": in_progress,
+            "conflicts": conflicts,
         }
+        if conflicts:
+            return {**result, "queued": False, "reason": "confirm_required"}
+        if queued:
+            return {**result, "queued": True, "reason": "queued"}
+        # 有人正在发同一个目标：不改状态、也不谎报"已排队"，让调用方稍后重试。
+        return {
+            **result,
+            "queued": False,
+            "reason": "in_progress" if in_progress else "nothing_to_do",
+        }
+
+    def _requeue_decision(
+        self,
+        record: dict[str, object],
+        *,
+        now: datetime,
+        confirm_unknown: bool,
+    ) -> tuple[dict[str, object] | None, str]:
+        """在锁内决定"这条记录能不能被补发"；返回 (要写入的记录或 None, 结论标签)。"""
+        state = _text(record.get("state"))
+        if state == STATE_DELIVERED:
+            return None, "delivered"
+        if state == STATE_SENDING:
+            lease_until = _parse_datetime(record.get("lease_until"))
+            if lease_until is None or lease_until > now:
+                # 正在发送中：**绝不**改状态、绝不重置次数与 uuid。
+                return None, "in_progress"
+        uncertain_outside_window = _text(
+            record.get("last_outcome")
+        ) == OUTCOME_UNKNOWN and not self._within_unknown_window(record, now=now)
+        if uncertain_outside_window and not confirm_unknown:
+            # 上一次结果不确定且已经出了去重窗口：再发一次有可能真的重复推送，
+            # 必须由人显式确认（例如已经核对过飞书里没有收到）。
+            return None, "confirm_required"
+        updated = dict(record)
+        updated["state"] = STATE_PENDING
+        updated["next_retry_at"] = now.isoformat()
+        updated["attempts"] = 0
+        updated["manual_retries"] = _int(record.get("manual_retries")) + 1
+        updated["needs_attention"] = False
+        return updated, "queued"
 
     # ------------------------------------------------------------ 恢复 / 检查
 
     def recover(self, *, now: datetime | None = None) -> dict[str, object]:
-        """修复"报告中途落盘/发送后未并账/持锁进程消失"三类中断状态。
+        """修复四类中断状态。
+
+        1. **报告已冻结、指针未写**（写盘与写指针之间崩溃）：``reports_for`` 看不到
+           这类报告，于是永远不会有待发记录——最终漏发。这里先在最近交易日目录里
+           **有界发现**孤儿正式报告，补回指针，再建待发记录。
+        2. 报告指针齐了、待发记录没建：直接补建。
+        3. 发送成功后、并账前崩溃：认回执证据，不重发。
+        4. 持锁进程消失：遗留 sending 按"不确定"恢复。
 
         只回看当前交易日与最近一个交易日；不扫描整个历史目录。
         """
@@ -455,7 +603,25 @@ class NightlyDeliveryService:
         applied_receipts: list[str] = []
         recovered_sending: list[str] = []
         created_records: list[str] = []
+        adopted_reports: list[str] = []
+        orphan_other: list[str] = []
+        invalid_reports: list[dict[str, object]] = []
         for trade_date in self.report_service.recent_trade_dates():
+            discovery = self.report_service.discover_reports(trade_date)
+            # 先补指针：孤儿正式报告确认后，后续 reports_for 才能看到它。
+            orphans = sorted(
+                (_mapping(item) for item in _list_of(discovery.get("orphan_formal"))),
+                key=lambda item: _int(item.get("revision")),
+            )
+            for report in orphans:
+                report_id = _text(report.get("report_id"))
+                if self.report_service.adopt_orphan_report(report, trade_date=trade_date):
+                    adopted_reports.append(report_id)
+            for item in _list_of(discovery.get("orphan_other")):
+                orphan_other.append(_text(_mapping(item).get("report_id")))
+            invalid_reports.extend(
+                _mapping(item) for item in _list_of(discovery.get("invalid"))
+            )
             for report in self.report_service.reports_for(trade_date):
                 report_id = _text(report.get("report_id"))
                 before = {
@@ -474,6 +640,11 @@ class NightlyDeliveryService:
             "created_records": created_records,
             "applied_receipts": applied_receipts,
             "recovered_sending": recovered_sending,
+            "adopted_reports": adopted_reports,
+            # 孤儿回放/说明只记录不自动采用：它们不得冒充当天正式结果，也不该凭空
+            # 触发一次推送（回放是手动验收工具，需要时由脚本显式发起）。
+            "orphan_not_delivered": orphan_other,
+            "invalid_reports": invalid_reports,
         }
 
     def _apply_pending_receipt(self, delivery_id: str, *, now: datetime) -> bool:
@@ -488,72 +659,103 @@ class NightlyDeliveryService:
             return False
         if not isinstance(payload, dict):
             return False
-        record = self.load_record(delivery_id)
-        if record is None:
-            return False
-        if _text(record.get("state")) == STATE_DELIVERED:
-            _safe_unlink(path)
-            return False
         outcome_text = _text(payload.get("outcome"))
         if not outcome_text:
             _safe_unlink(path)
             return False
-        updated = dict(record)
-        self._apply_outcome(
-            updated,
-            outcome=outcome_text,
-            message_id=_text(payload.get("message_id")),
-            error_code=_text(payload.get("error_code")),
-            error_message=_text(payload.get("error_message")),
-            accepted_at=_text(payload.get("accepted_at")),
-            retryable=bool(payload.get("retryable", False)),
-            now=now,
-            target_idempotent=bool(record.get("idempotent", False)),
-            target_required=bool(record.get("required", False)),
-        )
-        self.save_record(updated)
-        _safe_unlink(path)
-        return True
+
+        def _decide(record: dict[str, object]) -> tuple[dict[str, object] | None, str]:
+            if _text(record.get("state")) == STATE_DELIVERED:
+                return None, "already_delivered"
+            updated = dict(record)
+            self._apply_outcome(
+                updated,
+                outcome=outcome_text,
+                message_id=_text(payload.get("message_id")),
+                error_code=_text(payload.get("error_code")),
+                error_message=_text(payload.get("error_message")),
+                accepted_at=_text(payload.get("accepted_at")),
+                retryable=bool(payload.get("retryable", False)),
+                now=now,
+                target_idempotent=bool(record.get("idempotent", False)),
+                target_required=bool(record.get("required", False)),
+            )
+            return updated, "applied"
+
+        updated, label = self._mutate_record(delivery_id, now=now, decide=_decide)
+        if label == "missing":
+            return False
+        # 并账（锁内）先于删证据（锁外）：万一在两者之间崩溃，回执还在，下次重放会
+        # 因为状态已是 delivered 而走 already_delivered 分支并清掉它——幂等且不丢账。
+        if label == "applied" and updated is not None:
+            _safe_unlink(path)
+            return True
+        if label == "already_delivered":
+            _safe_unlink(path)
+            return False
+        # in_progress（有人正在用这条记录）：回执留着，下次再认。
+        return False
 
     def _recover_stale_sending(self, delivery_id: str, *, now: datetime) -> bool:
-        record = self.load_record(delivery_id)
-        if record is None or _text(record.get("state")) != STATE_SENDING:
-            return False
-        lease_until = _parse_datetime(record.get("lease_until"))
-        if lease_until is not None and lease_until > now:
-            return False
-        lock = DistributedFileLock(self.lock_path(delivery_id), stale_after_sec=self._lease_sec())
-        if lock.is_held():
-            return False
-        updated = dict(record)
-        # 持有者进程消失：结果**不确定**，不能当成"从未发送"。按不确定结果恢复，
-        # 于是走"同一 uuid 在去重窗内重试、超窗停手"的固定路径。
-        self._apply_outcome(
-            updated,
-            outcome=OUTCOME_UNKNOWN,
-            message_id="",
-            error_code="lease_expired",
-            error_message="发送期间进程消失，结果不确定",
-            accepted_at="",
-            retryable=True,
+        def _decide(record: dict[str, object]) -> tuple[dict[str, object] | None, str]:
+            if _text(record.get("state")) != STATE_SENDING:
+                return None, "not_sending"
+            lease_until = _parse_datetime(record.get("lease_until"))
+            if lease_until is not None and lease_until > now:
+                return None, "lease_alive"
+            updated = dict(record)
+            # 持有者进程消失：结果**不确定**，不能当成"从未发送"。按不确定结果恢复，
+            # 于是走"同一 uuid 在去重窗内重试、超窗停手"的固定路径。
+            self._apply_outcome(
+                updated,
+                outcome=OUTCOME_UNKNOWN,
+                message_id="",
+                error_code="lease_expired",
+                error_message="发送期间进程消失，结果不确定",
+                accepted_at="",
+                retryable=True,
+                now=now,
+                target_idempotent=bool(record.get("idempotent", False)),
+                target_required=bool(record.get("required", False)),
+            )
+            return updated, "recovered"
+
+        # 关键：**真的去抢锁**。抢不到说明持有者还活着（或刚拿到），此时绝不能改写。
+        # 旧实现用新建锁对象的 is_held() 当占用探测——那个方法只表示"这个对象自己
+        # 持不持锁"，新对象恒为 False，等于没探测（2026-09-17 独立验收实测）。
+        _, label = self._mutate_record(
+            delivery_id,
             now=now,
-            target_idempotent=bool(record.get("idempotent", False)),
-            target_required=bool(record.get("required", False)),
+            decide=_decide,
+            timeout_sec=min(self._record_lock_timeout_sec, 1.0),
         )
-        self.save_record(updated)
-        return True
+        return label == "recovered"
 
     # ------------------------------------------------------------------ 主循环
 
     def tick(
         self, *, now: datetime | None = None, max_targets: int | None = None
     ) -> dict[str, object]:
-        """交付检查：修复中断状态 → 处理到期目标 → 必要时补发过程说明。"""
+        """交付检查：修复中断状态 → 处理到期目标 → 必要时补发过程说明。
+
+        自动链必须同时服从两个开关：``nightly.enabled``（晚报功能）与
+        ``notifications.enabled``（全局停发）。后者以前在本仓库没有任何消费方，
+        等于死开关；现在至少晚报链路会真正听它。停发时**保持 pending**，恢复后
+        继续发，不丢也不重发。
+        """
         if not self._is_enabled():
             current = self._now(now)
             return {
                 "timestamp": current.isoformat(),
                 "reason": "disabled",
+                "processed": 0,
+                "targets": [],
+            }
+        if not self._notifications_enabled():
+            current = self._now(now)
+            return {
+                "timestamp": current.isoformat(),
+                "reason": "notifications_disabled",
                 "processed": 0,
                 "targets": [],
             }
@@ -568,10 +770,19 @@ class NightlyDeliveryService:
     ) -> dict[str, object]:
         """手动投递**一份指定报告**（验收回放 / 人工补发用）。
 
-        走与自动链完全相同的记录、锁、幂等与重试路径，只绕过 enabled 开关：
-        开关控制的是"自动链要不要自己跑"，不是"能不能手动发一份明确指定的报告"。
+        走与自动链完全相同的记录、锁、幂等与重试路径，只绕过 ``nightly.enabled``
+        （那个开关管的是"自动链要不要自己跑"）。**不**绕过 ``notifications.enabled``：
+        全局停发是运维"别再往外发消息"的指令，不该被脚本悄悄跳过。
         调用方必须自己保证这份报告该发——本方法不做任何"这是不是今天的结果"判断。
         """
+        if not self._notifications_enabled():
+            current = self._now(now)
+            return {
+                "timestamp": current.isoformat(),
+                "reason": "notifications_disabled",
+                "processed": 0,
+                "targets": [],
+            }
         self.ensure_records(report)
         return self._run(
             now=now,
@@ -614,9 +825,21 @@ class NightlyDeliveryService:
                 for record in self.records_for_report(
                     _text(report.get("report_id")), trade_date=trade_date
                 ):
-                    parked = self._park_expired_uncertain(record, now=current)
-                    if parked is not None:
-                        self.save_record(parked)
+                    # 停机决策也在交付锁内做：锁外读到的 record 可能已经被发送端
+                    # 更新成 delivered，用旧副本覆盖会把"已送达"打回 unknown。
+                    def _park_decide(
+                        latest: dict[str, object],
+                        *,
+                        _now: datetime = current,
+                    ) -> tuple[dict[str, object] | None, str]:
+                        return self._park_decision(latest, now=_now)
+
+                    parked, _label = self._mutate_record(
+                        _text(record.get("delivery_id")),
+                        now=current,
+                        decide=_park_decide,
+                    )
+                    if _label == "park" and parked is not None:
                         summary["unknown"] = _int(summary["unknown"]) + 1
                         processed_targets.append(parked)
                         continue
@@ -658,6 +881,12 @@ class NightlyDeliveryService:
             state = _text(fresh.get("state"))
             if state in {STATE_DELIVERED, STATE_EXHAUSTED}:
                 return {**fresh, "skipped": f"already_{state}"}
+            if state == STATE_SENDING:
+                # 兜底：租约未过期的 sending 说明"可能已经发出去了"，必须先由恢复
+                # 逻辑按不确定处理，绝不能在这里当成一次全新发送。
+                lease_until = _parse_datetime(fresh.get("lease_until"))
+                if lease_until is None or lease_until > now:
+                    return {**fresh, "skipped": "sending"}
             target = self._target_for(_text(fresh.get("target_key")))
             if target is None:
                 return {**fresh, "skipped": "target_unconfigured"}
@@ -888,6 +1117,18 @@ class NightlyDeliveryService:
         index = max(0, min(attempts - 1, len(delays) - 1))
         return (now + timedelta(seconds=delays[index])).isoformat()
 
+    def _park_decision(
+        self,
+        record: dict[str, object],
+        *,
+        now: datetime,
+    ) -> tuple[dict[str, object] | None, str]:
+        """停机决策的薄包装：把"要不要写"翻译成 (记录, 标签)。"""
+        parked = self._park_expired_uncertain(record, now=now)
+        if parked is None:
+            return None, "noop"
+        return parked, "park"
+
     def _park_expired_uncertain(
         self,
         record: Mapping[str, object],
@@ -1003,6 +1244,13 @@ class NightlyDeliveryService:
     def _is_enabled(self) -> bool:
         return bool(self.config.enabled)
 
+    def _notifications_enabled(self) -> bool:
+        """全局通知开关。缺失时按"允许"处理（老配置没有这个组）。"""
+        notifications = getattr(self._service._config, "notifications", None)
+        if notifications is None:
+            return True
+        return bool(getattr(notifications, "enabled", True))
+
     def _lease_sec(self) -> int:
         return max(
             _LEASE_MIN_SEC,
@@ -1045,6 +1293,12 @@ def _mapping(value: object) -> dict[str, object]:
     if isinstance(value, Mapping):
         return {str(key): item for key, item in value.items()}
     return {}
+
+
+def _list_of(value: object) -> list[object]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return []
+    return list(value)
 
 
 def _string_list(value: object) -> list[str]:

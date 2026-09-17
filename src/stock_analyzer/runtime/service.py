@@ -12019,7 +12019,18 @@ class StockAnalyzerService:
         trace_id: str = "",
     ) -> dict[str, object]:
         quiet_windows = list(self._config.notification_filter.quiet_windows)
-        if self._config.security.suppress_plain_test_notifications and _is_plain_test_notification(
+        if not bool(getattr(self._config.notifications, "enabled", True)):
+            # 全局停发：notifications.enabled 以前在本仓库没有任何消费方，是个死开关
+            # ——设成 false 也不会有任何效果。2026-09-17 独立验收指出晚报链路必须服从
+            # 它；既然它表达的是"别再往外发消息"，就让整条通知出口（含旧链路）真听它，
+            # 而不是只让新链路听——否则同一个开关在不同链路有不同含义。
+            payload = {
+                "success": False,
+                "channel": "notifications_disabled",
+                "error": "notifications_disabled",
+                "suppressed": True,
+            }
+        elif self._config.security.suppress_plain_test_notifications and _is_plain_test_notification(
             title,
             content,
             trace_id=trace_id,

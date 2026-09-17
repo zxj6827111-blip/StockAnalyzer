@@ -27,6 +27,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from time import monotonic, sleep
 from typing import Any
 from uuid import uuid4
 
@@ -119,6 +120,14 @@ _MAX_CANDIDATE_RISKS = 2
 _MAX_EXCLUSION_REASONS = 6
 
 
+class DateStateBusyError(RuntimeError):
+    """日期状态锁在等待上限内未能取得。
+
+    宁可让调用方明确失败（调度器会记为失败并在下一个槽位重试），也不能在没拿到
+    锁的情况下裸写——那正是"报告指针 / notices / delivery_ids 相互覆盖"的来源。
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class RenderedMessage:
     title: str
@@ -203,6 +212,11 @@ class NightlyReportService:
             NightlyReportConfig()
         )
         self.root = self._resolve_path(self.config.reports_root)
+        # 日期状态锁的 stale 窗口与等待上限。stale 只需覆盖"单次读改写"（毫秒级
+        # 文件操作），故意取小值：持有者崩溃后能很快被接管；而等待上限取大些，
+        # 让正常的短竞争自然排上队而不是直接失败。
+        self._date_lock_stale_sec = 60
+        self._date_lock_timeout_sec = 10.0
 
     # ------------------------------------------------------------------ 路径
 
@@ -234,6 +248,49 @@ class NightlyReportService:
             return {}
         return payload if isinstance(payload, dict) else {}
 
+    def _date_lock(self, trade_date: str) -> DistributedFileLock:
+        return DistributedFileLock(
+            self.date_state_path(trade_date).with_suffix(".lock"),
+            stale_after_sec=self._date_lock_stale_sec,
+        )
+
+    def _acquire_date_lock(self, trade_date: str) -> DistributedFileLock:
+        """有界等待地取得日期状态锁；超时必须抛错。
+
+        ``DistributedFileLock.acquire()`` 在被别人占用时返回 False 而**不抛异常**
+        ——忽略返回值就等于没有加锁（2026-09-17 独立验收实测：持锁在别人手里时
+        仍然照写不误）。这里对返回值做显式处理：等一会儿再抢，超时才失败。
+        """
+        lock = self._date_lock(trade_date)
+        deadline = monotonic() + max(0.0, float(self._date_lock_timeout_sec))
+        while True:
+            if lock.acquire():
+                return lock
+            if monotonic() >= deadline:
+                raise DateStateBusyError(
+                    f"date state lock busy for trade_date={trade_date} "
+                    f"(waited {float(self._date_lock_timeout_sec):.1f}s)"
+                )
+            sleep(0.05)
+
+    def _write_date_state_locked(
+        self,
+        trade_date: str,
+        patch: Mapping[str, object],
+        *,
+        updated_at: datetime | None = None,
+    ) -> dict[str, object]:
+        """**调用方已持锁**前提下的读-改-写。合并必须基于锁内读到的最新状态。"""
+        path = self.date_state_path(trade_date)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        state = self.read_date_state(trade_date)
+        state.update({str(key): value for key, value in patch.items()})
+        state["schema_version"] = SCHEMA_VERSION
+        state["trade_date"] = _text(trade_date)
+        state["updated_at"] = (updated_at or datetime.now()).isoformat()
+        _write_json_atomic(path, state)
+        return state
+
     def update_date_state(
         self,
         trade_date: str,
@@ -242,18 +299,9 @@ class NightlyReportService:
         updated_at: datetime | None = None,
     ) -> dict[str, object]:
         """加锁 + 原子替换地合并日期状态（读-改-写全程持锁）。"""
-        path = self.date_state_path(trade_date)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        lock = DistributedFileLock(path.with_suffix(".lock"), stale_after_sec=60)
-        lock.acquire()
+        lock = self._acquire_date_lock(trade_date)
         try:
-            state = self.read_date_state(trade_date)
-            state.update({str(key): value for key, value in patch.items()})
-            state["schema_version"] = SCHEMA_VERSION
-            state["trade_date"] = _text(trade_date)
-            state["updated_at"] = (updated_at or datetime.now()).isoformat()
-            _write_json_atomic(path, state)
-            return state
+            return self._write_date_state_locked(trade_date, patch, updated_at=updated_at)
         finally:
             lock.release()
 
@@ -318,24 +366,141 @@ class NightlyReportService:
     def _recent_trade_date_dirs(self) -> list[str]:
         return self.recent_trade_dates()
 
-    def reports_for(self, trade_date: str) -> list[dict[str, object]]:
-        """该交易日需要交付的报告（正式报告 + 已发布的说明）。"""
+    def referenced_report_ids(self, trade_date: str) -> list[str]:
+        """日期状态**已经指向**的报告 id（正式报告 + 说明 + 回放）。"""
         state = self.read_date_state(trade_date)
         report_ids: list[str] = []
         published_id = _text(state.get("published_report_id"))
         if published_id:
             report_ids.append(published_id)
-        notices = _mapping(state.get("notices"))
-        for report_id in notices.values():
+        for report_id in _mapping(state.get("notices")).values():
             normalized = _text(report_id)
             if normalized and normalized not in report_ids:
                 report_ids.append(normalized)
+        return report_ids
+
+    def reports_for(self, trade_date: str) -> list[dict[str, object]]:
+        """该交易日需要交付的报告（正式报告 + 已发布的说明）。"""
         reports: list[dict[str, object]] = []
-        for report_id in report_ids:
+        for report_id in self.referenced_report_ids(trade_date):
             report = self.load_report(report_id, trade_date=trade_date)
             if report is not None:
                 reports.append(report)
         return reports
+
+    def discover_reports(self, trade_date: str) -> dict[str, object]:
+        """列出该交易日目录里的全部报告文件，区分"已被指针引用"与"孤儿"。
+
+        为什么需要它：报告文件落盘成功、日期指针还没写就崩溃时，``reports_for``
+        什么都看不到——于是"报告已经生成并保存，却一直没有任何待发记录"，最终漏发
+        或被误报成未完成。这正是方案要求恢复的中断窗口，所以恢复必须先能**发现**
+        这类孤儿，而不是只看指针。
+
+        范围仍然有界：只扫最近 N 个交易日目录（``recovery_lookback_days``），且只认
+        结构自洽的文件（目录日期、文件名、report_id、类型、版本号一致）。内容摘要
+        做二次核验并作为证据返回，**不**用它当准入条件——业务字段变化导致的摘要差异
+        不该让一份真实报告永远发不出去。
+        """
+        referenced_ids = set(self.referenced_report_ids(trade_date))
+        referenced: list[dict[str, object]] = []
+        orphan_formal: list[dict[str, object]] = []
+        orphan_other: list[dict[str, object]] = []
+        invalid: list[dict[str, object]] = []
+        try:
+            paths = sorted(self.date_dir(trade_date).glob("*.json"))
+        except OSError:
+            paths = []
+        for path in paths:
+            if path.stem == "state":
+                continue
+            payload = self._load_report_file(path)
+            if payload is None:
+                continue
+            problem = self._validate_report_payload(payload, trade_date=trade_date, path=path)
+            if problem:
+                invalid.append({"file": path.name, "reason": problem})
+                continue
+            enriched = dict(payload)
+            enriched["content_digest_verified"] = _text(
+                payload.get("content_digest")
+            ) == self.content_digest(payload)
+            if path.stem in referenced_ids:
+                referenced.append(enriched)
+            elif _text(payload.get("report_kind")) == REPORT_KIND_FORMAL:
+                orphan_formal.append(enriched)
+            else:
+                orphan_other.append(enriched)
+        return {
+            "trade_date": trade_date,
+            "referenced": referenced,
+            "orphan_formal": orphan_formal,
+            "orphan_other": orphan_other,
+            "invalid": invalid,
+        }
+
+    def _load_report_file(self, path: Path) -> dict[str, object] | None:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    @staticmethod
+    def _validate_report_payload(
+        payload: Mapping[str, object],
+        *,
+        trade_date: str,
+        path: Path,
+    ) -> str:
+        """结构自洽性检查；返回空串表示通过，否则返回不可用的原因。"""
+        if _text(payload.get("trade_date")) != _text(trade_date):
+            return "trade_date_mismatch"
+        report_id = _text(payload.get("report_id"))
+        if not report_id or report_id != path.stem:
+            return "report_id_filename_mismatch"
+        kind = _text(payload.get("report_kind"))
+        if kind not in {REPORT_KIND_FORMAL, REPORT_KIND_NOTICE, REPORT_KIND_REPLAY}:
+            return "unknown_report_kind"
+        if (_optional_int(payload.get("revision")) or 0) < 1:
+            return "invalid_revision"
+        if kind == REPORT_KIND_FORMAL and _text(payload.get("scan_status")) not in SCAN_STATUSES:
+            return "invalid_scan_status"
+        return ""
+
+    def adopt_orphan_report(self, report: Mapping[str, object], *, trade_date: str) -> bool:
+        """把"已冻结但指针未写"的正式报告补回指针（不改内容、不改版本号）。
+
+        只处理正式报告：过程说明与验收回放不得冒充当天正式结果。
+        """
+        report_id = _text(report.get("report_id"))
+        if not report_id or _text(report.get("report_kind")) != REPORT_KIND_FORMAL:
+            return False
+        lock = self._acquire_date_lock(trade_date)
+        try:
+            # 锁内复核：拿锁期间别人可能已经发布了这份报告，或发布了更新的版本。
+            state = self.read_date_state(trade_date)
+            current_id = _text(state.get("published_report_id"))
+            current = self.load_report(current_id, trade_date=trade_date) if current_id else None
+            if current is not None and (_optional_int(current.get("revision")) or 0) >= (
+                _optional_int(report.get("revision")) or 0
+            ):
+                return False
+            stored = self.load_report(report_id, trade_date=trade_date)
+            if stored is None:
+                return False
+            self._write_date_state_locked(
+                trade_date,
+                self._pointer_patch(
+                    trade_date=trade_date,
+                    kind=REPORT_KIND_FORMAL,
+                    report_id=report_id,
+                    report=stored,
+                    revision=_optional_int(stored.get("revision")) or 1,
+                ),
+            )
+            return True
+        finally:
+            lock.release()
 
     # ------------------------------------------------------------ 报告构造
 
@@ -541,8 +706,27 @@ class NightlyReportService:
 
         顺序不可颠倒：先落报告文件，成功后才动指针。消费者只认指针，因此"指针指向
         一份已存在的报告"始终成立；反过来（先写指针后写报告）会出现悬空指针。
+
+        **整个"读当前版本 → 分配 revision → 冻结文件 → 写指针"在同一个日期锁内**
+        完成：否则两个发布者会各自读到同一版、各自分配同一个 revision，最后一个
+        指针覆盖前一个，甚至两个进程写出同一个 report_id 的不同内容。
         """
         trade_date = _text(report.get("trade_date"))
+        if not trade_date:
+            raise ValueError("report requires trade_date")
+        lock = self._acquire_date_lock(trade_date)
+        try:
+            return self._publish_locked(report, trade_date=trade_date)
+        finally:
+            lock.release()
+
+    def _publish_locked(
+        self,
+        report: Mapping[str, object],
+        *,
+        trade_date: str,
+    ) -> dict[str, object]:
+        """**调用方已持日期锁**前提下的发布流程。"""
         state = self.read_date_state(trade_date)
         kind = _text(report.get("report_kind"))
         # 三类报告各有各的指针：正式结果绝不会被过程说明或验收回放顶掉。
@@ -594,7 +778,7 @@ class NightlyReportService:
                 # 同一个 id 已经被冻结成**另一份内容**（id 不带版本号的那些报告才会
                 # 走到这里）。此时既不能声称发布了新版本，也不能把指针挪向一份没写
                 # 进磁盘的内容——以磁盘上那份为准，并把指针校准回它，保持幂等。
-                self.update_date_state(
+                self._write_date_state_locked(
                     trade_date,
                     self._pointer_patch(
                         trade_date=trade_date,
@@ -610,7 +794,7 @@ class NightlyReportService:
                     "report_id": resolved_id,
                     "report": stored,
                 }
-        self.update_date_state(
+        self._write_date_state_locked(
             trade_date,
             self._pointer_patch(
                 trade_date=trade_date,

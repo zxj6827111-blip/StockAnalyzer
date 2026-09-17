@@ -22,6 +22,7 @@ from stock_analyzer.runtime.services.nightly_report_service import (
     SCAN_STATUS_COMPLETED,
     SCAN_STATUS_EMPTY,
     SCAN_STATUS_FAILED,
+    DateStateBusyError,
     NightlyReportService,
 )
 
@@ -784,3 +785,133 @@ def test_same_id_with_different_content_never_claims_a_new_version(
     assert "重型扫描尚未完成" in str(
         report_service.load_report(first["report_id"], trade_date=_TRADE_DATE)["reason"]
     )
+
+
+# --------------------------------------------------- R1 日期状态锁 / 发布事务
+
+
+def test_date_state_update_waits_for_the_lock_instead_of_writing_through(
+    service: _FakeService,
+) -> None:
+    """别人持着锁时**必须等待**，不能照写。
+
+    2026-09-17 独立验收复现：update_date_state 调用 acquire() 后忽略返回值，
+    而 acquire() 被占用时返回 False 不抛异常 → 锁等于没加，
+    `{"lock_owner_alive":true,"state":"OVERWRITTEN_WITHOUT_LOCK"}`。
+    """
+    report_service = _report_service(service)
+    report_service.update_date_state(_TRADE_DATE, {"seed": 1})
+
+    holder = report_service._date_lock(_TRADE_DATE)  # noqa: SLF001
+    assert holder.acquire() is True
+    released: list[float] = []
+    import threading
+    import time
+
+    def _release_later() -> None:
+        time.sleep(0.4)
+        holder.release()
+        released.append(1.0)
+
+    thread = threading.Thread(target=_release_later, daemon=True)
+    thread.start()
+    try:
+        # 等待上限给足：应当等到持有者释放后完成写入，而不是穿透写进去
+        report_service._date_lock_timeout_sec = 5.0  # noqa: SLF001
+        report_service.update_date_state(_TRADE_DATE, {"late": True})
+        # 关键是**顺序**：返回时持锁者必须已经释放。旧行为会在锁仍被持有时就写完返回。
+        assert released, "更新函数在持锁者仍持锁时就写入了（锁没起作用）"
+    finally:
+        thread.join(timeout=5)
+    state = report_service.read_date_state(_TRADE_DATE)
+    assert state["seed"] == 1
+    assert state["late"] is True
+
+
+def test_date_state_update_fails_loudly_when_the_lock_stays_busy(
+    service: _FakeService,
+) -> None:
+    """等不到锁必须明确失败，不能裸写。"""
+    report_service = _report_service(service)
+    report_service._date_lock_timeout_sec = 0.2  # noqa: SLF001
+    holder = report_service._date_lock(_TRADE_DATE)  # noqa: SLF001
+    assert holder.acquire() is True
+    try:
+        with pytest.raises(DateStateBusyError):
+            report_service.update_date_state(_TRADE_DATE, {"should_not_land": True})
+    finally:
+        holder.release()
+    assert "should_not_land" not in report_service.read_date_state(_TRADE_DATE)
+
+
+def test_concurrent_publishes_keep_both_writers_updates(service: _FakeService) -> None:
+    """两个写者分别更新不同字段时，后写者不得把前者的更新整段丢掉。"""
+    report_service = _report_service(service)
+    report_service.update_date_state(_TRADE_DATE, {"scan_phase": "scanning"})
+    published = report_service.publish(_build(report_service, _night_scan([_row("600000")])))
+
+    state = report_service.read_date_state(_TRADE_DATE)
+    assert state["scan_phase"] == "scanning"  # 未被发布流程抹掉
+    assert state["published_report_id"] == published["report_id"]
+    # 交付登记与报告指针也不该互相覆盖
+    report_service.update_date_state(_TRADE_DATE, {"delivery_ids": ["d1"]})
+    state = report_service.read_date_state(_TRADE_DATE)
+    assert state["scan_phase"] == "scanning"
+    assert state["published_report_id"] == published["report_id"]
+    assert state["delivery_ids"] == ["d1"]
+
+
+def test_publish_holds_the_date_lock_for_the_whole_transaction(service: _FakeService) -> None:
+    """发布期间日期锁必须被持有：否则两个发布者会分到同一个 revision。"""
+    report_service = _report_service(service)
+    holder = report_service._date_lock(_TRADE_DATE)  # noqa: SLF001
+    assert holder.acquire() is True
+    report_service._date_lock_timeout_sec = 0.2  # noqa: SLF001
+    try:
+        with pytest.raises(DateStateBusyError):
+            report_service.publish(_build(report_service, _night_scan([_row("600000")])))
+    finally:
+        holder.release()
+    # 失败时不得留下任何"已发布"的痕迹
+    assert report_service.read_date_state(_TRADE_DATE).get("published_report_id") in (None, "")
+
+
+def test_concurrent_publishes_do_not_share_a_revision(service: _FakeService) -> None:
+    """两个发布者并发时不得分到同一个 revision、也不得互相覆盖冻结文件。
+
+    版本分配与冻结/指针发布必须在一个日期级事务里。旧实现是"锁外读当前版本 →
+    分配 revision → 冻结 → 写指针"，两个发布者会各自读到同一版、各自分配同一个
+    revision，最后一个指针覆盖前一个。
+    """
+    report_service = _report_service(service)
+    results: list[dict[str, object]] = []
+    errors: list[BaseException] = []
+    import threading
+
+    def _publish(rows: list[dict[str, object]]) -> None:
+        try:
+            results.append(report_service.publish(_build(report_service, _night_scan(rows))))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=_publish, args=([_row("600000")],), daemon=True),
+        threading.Thread(target=_publish, args=([_row("600000"), _row("000001")],), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert errors == []
+    ids = sorted(str(item["report_id"]) for item in results)
+    assert len(set(ids)) == 2, f"并发发布分到了同一个 report_id: {ids}"
+    # 两份文件都真实落盘，且各自的内容摘要与自身一致
+    for report_id in ids:
+        stored = report_service.load_report(report_id, trade_date=_TRADE_DATE)
+        assert stored is not None, f"{report_id} 只被声称发布，磁盘上不存在"
+        assert stored["content_digest"] == report_service.content_digest(stored)
+    # 指针指向版本号最大的那一份
+    pointer = report_service.read_date_state(_TRADE_DATE)["published_report_id"]
+    assert pointer == max(ids)
+    assert report_service.published_report(_TRADE_DATE)["report_id"] == pointer

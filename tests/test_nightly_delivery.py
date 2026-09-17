@@ -234,6 +234,10 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):  # type: ignore[no-unt
         return notifiers.get(channel_name) or _FakeNotifier(channel_name)
 
     monkeypatch.setattr(delivery_module, "build_channel", _fake_build_channel)
+    # 生产里 _force_console_notifier() 会在 pytest 环境下返回 True（防止测试真发消息）。
+    # 本夹具已经用自己的假 notifier 取代了全部发送，所以这里明确关掉它，让被测的是
+    # 真实的链路逻辑；需要验证该开关本身的测试会自己再打开。
+    monkeypatch.setattr(delivery_module, "_force_console_notifier", lambda: False)
     yield service, notifiers, _install
 
 
@@ -1054,3 +1058,345 @@ def test_manual_delivery_works_while_the_automatic_chain_is_disabled(env) -> Non
     assert summary["delivered"] == 1
     assert len(notifier.calls) == 1
     assert delivery.status(report["report_id"])["required_target_delivered"] is True
+
+
+def _night_scan_payload(rows: list[dict[str, object]]) -> dict[str, object]:
+    return {
+        "status": "ok" if rows else "empty",
+        "trace_id": "t",
+        "night_pool": rows,
+        "overnight_top5": rows[:5],
+        "candidate_data_gate": {"status": "ok", "reasons": []},
+        "fallback": {"applied": False, "reason": ""},
+        "readiness": {"status": "ready", "allowed": True},
+        "source_report": {
+            "data_snapshot_id": _TRADE_DATE,
+            "prefilter": {"universe_count": 100, "eligible_count": 90},
+            "funnel": {
+                "light_count": 20,
+                "deep_count": 10,
+                "final_count": 0,
+                "final_selection": {"selected_count": 0, "rejected": []},
+            },
+        },
+    }
+
+
+def _build_report(
+    report_service: NightlyReportService,
+    *,
+    rows: list[dict[str, object]] | None = None,
+    trade_date: str = _TRADE_DATE,
+) -> dict[str, object]:
+    """只构造（不发布）一份正式报告，供"冻结后指针未写"的中断现场使用。"""
+    return report_service.build_formal_report(
+        night_scan=_night_scan_payload(rows or []),
+        trade_date=trade_date,
+        generated_at=datetime.fromisoformat(f"{trade_date}T21:45:04+08:00"),
+        run_id="run-1",
+        data_snapshot_id=trade_date,
+        name_resolver=lambda _symbol: "",
+    )
+
+
+# ---------------------------------------- R2 所有写入者统一到同一把交付锁下
+
+
+def test_request_retry_never_touches_a_record_held_by_a_live_sender(env) -> None:  # type: ignore[no-untyped-def]
+    """补发端不得改写在途记录（旧实现直接 save pending，不看锁）。
+
+    2026-09-17 独立验收复现：持有者仍存活、记录为 sending 时，补发把状态改成
+    pending：``{"owner_alive":true,"response_queued":true,"record_state":"pending"}``。
+    这里特意把记录置成 retry_wait：状态层面看不出"正在发送"，只有锁能拦住。
+    """
+    service, _, install = env
+    install("feishu_app", _fake_app())
+    delivery = _delivery(service)
+    report = _publish(delivery.report_service, rows=[_report_row()])
+    records = delivery.ensure_records(report)
+    delivery_id = records[0]["delivery_id"]
+
+    mid_flight = dict(records[0])
+    mid_flight.update({"state": STATE_RETRY_WAIT, "attempts": 1})
+    delivery.save_record(mid_flight)
+    holder = DistributedFileLock(delivery.lock_path(delivery_id), stale_after_sec=120)
+    assert holder.acquire() is True
+    try:
+        result = delivery.request_retry(report["report_id"], now=_NOW)
+        assert result["queued"] is False
+        assert result["reason"] == "in_progress"
+        assert result["in_progress_targets"] == ["feishu_app"]
+        after = delivery.load_record(delivery_id)
+        assert after["state"] == STATE_RETRY_WAIT
+        assert after["attempts"] == 1
+    finally:
+        holder.release()
+
+
+def test_request_retry_reports_in_progress_for_a_live_sending_record(env) -> None:  # type: ignore[no-untyped-def]
+    """在途 sending（租约未过期）必须原样保留：不改状态、不重置次数、不换 uuid。"""
+    service, _, install = env
+    install("feishu_app", _fake_app())
+    delivery = _delivery(service)
+    report = _publish(delivery.report_service, rows=[_report_row()])
+    records = delivery.ensure_records(report)
+    delivery_id = records[0]["delivery_id"]
+    uuid_before = records[0]["request_uuid"]
+
+    flying = dict(records[0])
+    flying.update(
+        {
+            "state": STATE_SENDING,
+            "attempts": 1,
+            "lease_until": (_NOW + timedelta(minutes=5)).isoformat(),
+        }
+    )
+    delivery.save_record(flying)
+
+    result = delivery.request_retry(report["report_id"], now=_NOW)
+    assert result["queued"] is False
+    after = delivery.load_record(delivery_id)
+    assert after["state"] == STATE_SENDING
+    assert after["request_uuid"] == uuid_before
+    assert after["attempts"] == 1
+
+
+def test_recovery_does_not_rewrite_a_record_while_the_holder_is_alive(env) -> None:  # type: ignore[no-untyped-def]
+    """即使租约看起来已过期，只要锁还在持有者手里就不得改写。
+
+    旧实现用新建锁对象的 ``is_held()`` 当占用探测——它只表示"这个对象自己持不持
+    锁"，新对象恒为 False，等于没探测（独立验收实测 recover 仍把记录改成
+    retry_wait：``{"owner_alive":true,"changed":true,"record_state":"retry_wait"}``）。
+    """
+    service, _, install = env
+    install("feishu_app", _fake_app())
+    delivery = _delivery(service)
+    report = _publish(delivery.report_service, rows=[_report_row()])
+    records = delivery.ensure_records(report)
+    delivery_id = records[0]["delivery_id"]
+
+    expired = dict(records[0])
+    expired.update(
+        {
+            "state": STATE_SENDING,
+            "attempts": 1,
+            "first_attempt_at": _NOW.isoformat(),
+            "lease_until": (_NOW - timedelta(seconds=1)).isoformat(),
+        }
+    )
+    delivery.save_record(expired)
+    holder = DistributedFileLock(delivery.lock_path(delivery_id), stale_after_sec=120)
+    assert holder.acquire() is True
+    try:
+        recovery = delivery.recover(now=_NOW)
+        assert recovery["recovered_sending"] == []
+        assert delivery.load_record(delivery_id)["state"] == STATE_SENDING
+    finally:
+        holder.release()
+
+
+def test_record_mutation_always_sees_the_latest_state(env) -> None:  # type: ignore[no-untyped-def]
+    """锁内决策必须基于**磁盘上最新**的记录，而不是调用方手里的旧副本。"""
+    service, _, install = env
+    install("feishu_app", _fake_app())
+    delivery = _delivery(service)
+    report = _publish(delivery.report_service, rows=[_report_row()])
+    records = delivery.ensure_records(report)
+    delivery_id = records[0]["delivery_id"]
+
+    # 外部（例如发送端）先把记录改成 delivered
+    updated = dict(records[0])
+    updated["state"] = STATE_DELIVERED
+    delivery.save_record(updated)
+
+    seen: dict[str, object] = {}
+
+    def _decide(latest: dict[str, object]) -> tuple[dict[str, object] | None, str]:
+        seen.update(latest)
+        return None, "noop"
+
+    delivery._mutate_record(delivery_id, now=_NOW, decide=_decide)  # noqa: SLF001
+    assert seen["state"] == STATE_DELIVERED
+    # 且"没改动"时不得回写（回写旧副本正是把 delivered 打回旧状态的路径）
+    assert delivery.load_record(delivery_id)["state"] == STATE_DELIVERED
+
+
+# ------------------------------------------- R3 报告已冻结、指针未写也能恢复
+
+
+def test_recovery_adopts_a_frozen_report_whose_pointer_never_landed(env) -> None:  # type: ignore[no-untyped-def]
+    """freeze 成功、published_report_id 未写就崩溃：恢复必须能发现并补上。
+
+    旧实现只遍历 ``reports_for``（只认指针），这类报告对它完全不可见，于是永远
+    没有待发记录——最终漏发或被误报成未完成。
+    """
+    service, _, install = env
+    notifier = _fake_app()
+    install("feishu_app", notifier)
+    delivery = _delivery(service)
+    report_service = delivery.report_service
+
+    report = _build_report(report_service, rows=[_report_row("600000")])
+    report["revision"] = 1
+    report["report_id"] = "nr-20260916-01"
+    report_service.freeze_report(report)  # 文件落盘
+    assert report_service.read_date_state(_TRADE_DATE).get("published_report_id") in (None, "")
+
+    recovery = delivery.recover(now=_NOW)
+    assert recovery["adopted_reports"] == ["nr-20260916-01"]
+    assert report_service.read_date_state(_TRADE_DATE)["published_report_id"] == "nr-20260916-01"
+    assert recovery["created_records"], "没有为被找回的报告建立待发记录"
+
+    # 补上之后就能正常送达
+    delivery.tick(now=_NOW)
+    assert len(notifier.calls) == 1
+    assert delivery.status("nr-20260916-01")["delivery_status"] == "delivered"
+
+
+def test_recovery_does_not_promote_a_replay_to_a_formal_report(env) -> None:  # type: ignore[no-untyped-def]
+    """孤儿回放只记录、不自动采用：不得冒充当天正式结果，也不该凭空触发推送。"""
+    service, _, install = env
+    notifier = _fake_app()
+    install("feishu_app", notifier)
+    delivery = _delivery(service)
+    report_service = delivery.report_service
+
+    replay = report_service.build_replay_report(
+        night_scan=_night_scan_payload([_report_row("600000")]),
+        trade_date=_TRADE_DATE,
+        generated_at=_NOW,
+    )
+    replay["revision"] = 1
+    replay["report_id"] = "rp-20260916-01"
+    report_service.freeze_report(replay)
+
+    recovery = delivery.recover(now=_NOW)
+    assert recovery["adopted_reports"] == []
+    assert recovery["orphan_not_delivered"] == ["rp-20260916-01"]
+    assert report_service.read_date_state(_TRADE_DATE).get("published_report_id") in (None, "")
+    delivery.tick(now=_NOW)
+    assert notifier.calls == []
+
+
+def test_recovery_ignores_structurally_inconsistent_report_files(env) -> None:  # type: ignore[no-untyped-def]
+    """文件名与 report_id 不符、目录日期不符的文件不得被当成可恢复报告。"""
+    service, _, install = env
+    install("feishu_app", _fake_app())
+    delivery = _delivery(service)
+    report_service = delivery.report_service
+    target_dir = report_service.date_dir(_TRADE_DATE)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    (target_dir / "nr-20260916-09.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "report_kind": "formal",
+                "report_id": "nr-20260916-08",
+                "trade_date": "2026-09-15",
+                "revision": 1,
+                "scan_status": "completed",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    recovery = delivery.recover(now=_NOW)
+    assert recovery["adopted_reports"] == []
+    reasons = {item["reason"] for item in recovery["invalid_reports"]}
+    assert "trade_date_mismatch" in reasons
+
+
+# ------------------------------------------------- R4 全局停发开关必须生效
+
+
+def test_global_notification_switch_stops_the_automatic_chain(env) -> None:  # type: ignore[no-untyped-def]
+    """notifications.enabled=false 时自动链不得发送，且记录保持 pending。
+
+    旧实现只读 nightly.enabled，全局停发开关对新链路完全无效（独立验收实测
+    ``{"notifications_enabled":false,"fake_send_calls":1,"delivered":1}``）。
+    """
+    service, _, install = env
+    notifier = _fake_app()
+    install("feishu_app", notifier)
+    service._config.notifications.enabled = False
+    delivery = _delivery(service)
+    report = _publish(delivery.report_service, rows=[_report_row()])
+    # 生产流程是"发布报告 → 立即建待发记录"，这两步都不受停发开关影响
+    delivery.ensure_records(report)
+
+    summary = delivery.tick(now=_NOW)
+    assert summary["reason"] == "notifications_disabled"
+    assert notifier.calls == []
+    assert delivery.status(report["report_id"])["delivery_status"] == STATE_PENDING
+
+    # 重新打开后继续发：不丢、也不重复
+    service._config.notifications.enabled = True
+    delivery.tick(now=_NOW + timedelta(minutes=1))
+    assert len(notifier.calls) == 1
+    assert delivery.status(report["report_id"])["delivery_status"] == "delivered"
+
+
+def test_global_notification_switch_also_blocks_manual_delivery(env) -> None:  # type: ignore[no-untyped-def]
+    """手动投递绕过的是 nightly 开关，**不**绕过全局停发开关。"""
+    service, _, install = env
+    notifier = _fake_app()
+    install("feishu_app", notifier)
+    service._config.notifications.enabled = False
+    delivery = _delivery(service)
+    report = _publish(delivery.report_service, rows=[_report_row()])
+
+    summary = delivery.deliver_now(report, now=_NOW)
+    assert summary["reason"] == "notifications_disabled"
+    assert notifier.calls == []
+
+
+def test_existing_external_notification_kill_switch_applies_to_nightly(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:  # type: ignore[no-untyped-def]
+    """项目既有的停发机制（SA_DISABLE_EXTERNAL_NOTIFICATIONS / 强制 console）必须对新链路生效。
+
+    该机制以前只在 ``build_notifier`` 里生效，而晚报链路直接调 ``build_channel``，
+    等于可以绕过运维的停发开关。现在目标会被强制成 console，而 console 永远不产生
+    ``delivered``。
+    """
+    service, _, install = env
+    install("feishu_app", _fake_app())
+    monkeypatch.setattr(delivery_module, "_force_console_notifier", lambda: True)
+    delivery = _delivery(service)
+    report = _publish(delivery.report_service, rows=[_report_row()])
+    delivery.ensure_records(report)
+
+    targets = delivery.targets()
+    assert [item.key for item in targets] == ["console"]
+    assert targets[0].required is True
+
+    delivery.tick(now=_NOW)
+    status = delivery.status(report["report_id"])
+    assert status["required_target_delivered"] is False
+    assert status["targets"][0]["error_code"] == "console_not_a_delivery"
+
+
+def test_a_stale_requeue_cannot_resurrect_a_delivered_record(env) -> None:  # type: ignore[no-untyped-def]
+    """发送端刚写下的 delivered 不能被补发端手里的旧副本覆盖回去。
+
+    独立验收 R2 要求的场景："sender 写入 delivered 与补发并发"。这里让补发端先拿到
+    一份 pending 快照，随后发送完成，再发起补发——补发必须在锁内看到最新状态并让位。
+    """
+    service, _, install = env
+    notifier = _fake_app()
+    install("feishu_app", notifier)
+    delivery = _delivery(service)
+    report = _publish(delivery.report_service, rows=[_report_row()])
+    records = delivery.ensure_records(report)
+    delivery_id = records[0]["delivery_id"]
+
+    delivery.tick(now=_NOW)  # 发送完成 → delivered
+    assert delivery.load_record(delivery_id)["state"] == STATE_DELIVERED
+
+    result = delivery.request_retry(report["report_id"], now=_NOW + timedelta(minutes=1))
+    assert result["skipped_targets"] == ["feishu_app"]
+    assert result["queued"] is False
+    after = delivery.load_record(delivery_id)
+    assert after["state"] == STATE_DELIVERED
+    assert after["attempts"] == 1  # 次数没有被重置
+    assert after["message_id"] == "om_test_1"  # 回执没有被抹掉

@@ -480,3 +480,38 @@ def test_zero_signal_scan_still_produces_a_publishable_report(
     assert report is not None
     assert report["scan_status"] == "empty"
     assert report["observation_candidates"] == []
+
+
+# ------------------------------------------------- 全局停发开关（旧通知链）
+
+
+def test_global_notification_switch_suppresses_the_legacy_notify_path(
+    service: StockAnalyzerService,
+) -> None:
+    """notifications.enabled=false 必须让整条通知出口静默，而不只是新晚报链路。
+
+    这个开关在此之前**没有任何消费方**：设成 false 什么都不会发生。既然它表达的是
+    "别再往外发消息"，就应让旧链路也真正服从——否则同一个开关在不同链路有不同含义。
+    """
+    calls: list[object] = []
+
+    class _SpyNotifier:
+        def send(self, message: object) -> object:
+            calls.append(message)
+            from stock_analyzer.notify.channels import NotificationResult
+
+            return NotificationResult(success=True, channel="spy")
+
+    service._config.notifications.enabled = False
+    service._notifier = _SpyNotifier()  # type: ignore[assignment]
+    payload = service.notify(title="t", content="c", level="info", trace_id="x")
+    assert calls == []
+    assert payload["success"] is False
+    assert payload["channel"] == "notifications_disabled"
+    assert payload["suppressed"] is True
+
+    # 打开后恢复发送
+    service._config.notifications.enabled = True
+    payload = service.notify(title="t", content="c", level="info", trace_id="x")
+    assert len(calls) == 1
+    assert payload["success"] is True
