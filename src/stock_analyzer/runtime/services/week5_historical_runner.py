@@ -165,6 +165,65 @@ def _resolve_model_info(
     )
 
 
+def _resolve_run_model(
+    *,
+    service: Any,
+    config: StockAnalyzerConfig,
+    decision_time: datetime,
+) -> Any:
+    """按 S06 解析本次 as_of 可用的历史模型（无合法模型 → unscorable，绝不回退在服模型）。"""
+    from stock_analyzer.models.historical_resolver import (
+        load_registry_candidates,
+        resolve_historical_model,
+    )
+
+    mode = str(getattr(config.alpha_v2, "model_resolver_mode", "pit_research") or "pit_research")
+    candidates = load_registry_candidates(getattr(service, "_model_registry", None))
+    return resolve_historical_model(
+        as_of=decision_time,
+        candidates=candidates,
+        mode=mode,
+    )
+
+
+def _unscorable_report(
+    *,
+    as_of: Any,
+    decision_time: datetime,
+    resolution: Any,
+    scan_profile: str,
+) -> dict[str, object]:
+    """不可评分报告：结构完整但**零结果**（不跑扫描、不产出任何候选）。
+
+    M1 的 fail-closed 原则：找不到合法的 as_of 历史模型时，正确结果是"这天不可评分"，
+    而不是用当前在服模型算出一个看起来正常的结果。
+    """
+    payload = resolution.to_payload()
+    return {
+        "status": "unscorable",
+        "scan_profile": scan_profile,
+        "funnel": {
+            "policy": "scorable_gate",
+            "universe_count": 0,
+            "light_count": 0,
+            "deep_count": 0,
+            "final_count": 0,
+            "final_selection": {"selected_count": 0, "final_signals": []},
+            "allow_zero_signal": True,
+        },
+        "prefilter": {"applied": False, "reason": "unscorable"},
+        "final_selection": {"selected_count": 0, "final_signals": []},
+        "historical_context": {
+            "as_of": str(as_of),
+            "decision_time": decision_time.isoformat(),
+            "model_resolution": payload,
+            "realtime_data_allowed": False,
+            "news_neutralized": True,
+        },
+        "model_resolution": payload,
+    }
+
+
 def _pipeline_payload(report: object, pipeline: AnalyzerPipeline) -> dict[str, object]:
     """把 ``PipelineReport`` 转成共享引擎期望的 run_pipeline payload。"""
     if is_dataclass(report) and not isinstance(report, type):
@@ -231,6 +290,17 @@ def run_week5_historical_day(
     # 历史决策时点：与 pipeline as-of 模式的 _AS_OF_DECISION_TIME(15:30)
     # 严格一致，保证同一轮回测内报告时间戳与信号决策时点同源。
     decision_time = datetime.combine(as_of, datetime.min.time()).replace(hour=15, minute=30)
+    # S06 时间闸门：as_of 之后创建/激活的模型一律不得加载；找不到合法模型即 unscorable。
+    model_resolution = _resolve_run_model(
+        service=service, config=hist_config, decision_time=decision_time
+    )
+    if not model_resolution.scorable:
+        return _unscorable_report(
+            as_of=as_of,
+            decision_time=decision_time,
+            resolution=model_resolution,
+            scan_profile=scan_profile,
+        )
     pipeline = AnalyzerPipeline(config=hist_config, provider=provider)
 
     def run_pipeline_fn(
@@ -280,7 +350,9 @@ def run_week5_historical_day(
         context=context,
         policy=Week5RunPolicy.historical(),
     )
-    return engine.run()
+    report = engine.run()
+    report["model_resolution"] = model_resolution.to_payload()
+    return report
 
 
 def build_historical_base_provider(config: StockAnalyzerConfig, *, task_dir: Path) -> object:

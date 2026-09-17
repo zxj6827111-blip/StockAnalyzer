@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -546,6 +547,54 @@ def _historical_config(tmp_path: Path) -> StockAnalyzerConfig:
     return config
 
 
+def _register_pit_model(
+    service: object, *, tmp_path: Path, created_at: str = "2026-05-01T10:00:00"
+) -> str:
+    """在 service 的 registry 登记一个"as_of 之前就存在"的模型（S06 时间闸门需要）。
+
+    S06 起历史重放要求"as_of 之前真实存在且可用的模型"；测试夹具若不给任何登记
+    记录，解析器会（正确地）判 unscorable。这里造一份 PIT 合法的登记记录，
+    使夹具反映真实研究环境。
+    """
+    from stock_analyzer.models.artifact import ModelArtifact
+    from stock_analyzer.models.bundle import compute_artifact_identity_hash
+    from stock_analyzer.models.registry import ModelLifecycleState, ModelRole
+
+    # 每次调用用唯一 nonce：model_id 是内容寻址的，若复用同一内容，第二次注册会撞上
+    # 上一次遗留的记录（其 artifact_uri 指向已被清理的临时目录 → 闸门会正确判 artifact_missing）。
+    nonce = uuid.uuid4().hex
+    artifact_path = tmp_path / f"pit_model_{nonce}.json"
+    artifact = ModelArtifact.create(
+        feature_schema_id="fs_pit_v1",
+        feature_schema_hash="fs-hash",
+        label_policy_id="label_policy_v1_e2afc1135a3f",
+        label_policy_hash="label-hash",
+        dataset_manifest_id="dataset_manifest_pit",
+        feature_columns=["close", "ret_5d"],
+        lgbm_model={},
+        xgb_model={},
+        lgbm_calibrator={},
+        xgb_calibrator={},
+        training_metrics={"auc": 0.5},
+        metadata={"test_nonce": nonce},
+    )
+    artifact.created_at = created_at  # 模拟"训练发生在 as_of 之前"
+    artifact.save(artifact_path)
+    registry = service._model_registry  # noqa: SLF001 - 测试夹具直接取注册表
+    try:
+        record = registry.register_artifact(
+            artifact=artifact,
+            artifact_uri=str(artifact_path),
+            role=ModelRole.CHALLENGER,
+            lifecycle_state=ModelLifecycleState.TRAINED,
+            artifact_content_hash=compute_artifact_identity_hash(artifact_path),
+        )
+    except ValueError:
+        # nonce 已保证内容唯一，撞 id 只可能来自并发/复用；此时不掩盖，直接失败。
+        raise
+    return str(record.model_id)
+
+
 def _historical_context(
     *,
     config: StockAnalyzerConfig,
@@ -781,6 +830,7 @@ def test_week5_historical_day_end_to_end_full_funnel_with_isolation(tmp_path: Pa
     config.evolution.news_risk_mode = "penalty"
     service = _new_service(config, provider=SyntheticProvider(seed_offset=17))
     service.state.watchlist = ["600999"]
+    _register_pit_model(service, tmp_path=tmp_path)
 
     symbols = ["600000", "000001", "600519"]
     provider = _FakeHistoricalProvider(symbols, data_end=AS_OF)
@@ -832,6 +882,7 @@ def test_week5_historical_day_explicit_pool_marks_manual_source(tmp_path: Path) 
     config.week5.auto_sync_watchlist = False
     config.week5.market_breadth_enabled = False
     service = _new_service(config, provider=SyntheticProvider(seed_offset=19))
+    _register_pit_model(service, tmp_path=tmp_path)
 
     provider = _FakeHistoricalProvider(["600000", "000001"], data_end=AS_OF)
     task_dir = tmp_path / "week5_task_explicit"
@@ -952,6 +1003,8 @@ def test_api_week5_daily_end_to_end_full_market(
     )
     monkeypatch.setattr(main_module, "_config", patched_config)
     monkeypatch.setattr(main_module._service, "_config", patched_config)
+    # S06 时间闸门：历史重放需要 as_of 之前就存在的合法模型登记
+    _register_pit_model(main_module._service, tmp_path=tmp_path)
     monkeypatch.setattr(
         main_module._service,
         "_asof_backtest_service",
