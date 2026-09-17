@@ -1013,3 +1013,218 @@ def test_api_week5_daily_end_to_end_full_market(
     # latest 落盘且带算法标注
     latest = client.get("/backtest/asof-scan/latest").json()["report"]
     assert latest["algorithm"] == "week5_daily"
+
+
+# ---------------------------------------------------------------------------
+# Part E：历史广度门的覆盖率边缘（2026-09-17 修复回归）
+#
+# 实测口径：list_symbols() 返回全索引 5833，其中约 5% 是当日停牌/未上市的非交易
+# 标的，真实覆盖率天然停在 95% 门槛附近——2026-09-01 为 0.9501（通过）、
+# 2026-09-16 为 0.9489（不通过）。落入不通过分支时旧实现直接禁止新开仓，终门把
+# 当天 100 个候选全拒（2026-09-04 起连续 9 个交易日 0 票）。
+# ---------------------------------------------------------------------------
+
+_BREADTH_NOW = datetime(2026, 9, 16, 15, 30)
+
+
+def _breadth_snapshot(
+    *,
+    coverage_ratio: float,
+    advancers: int,
+    decliners: int,
+    limit_up_count: int,
+    limit_down_count: int,
+    median_return: float,
+    new_highs_20d: int,
+    new_lows_20d: int,
+    turnover_change_pct: float,
+    total_symbols: int = 5535,
+) -> dict[str, Any]:
+    from stock_analyzer.ops.market_breadth import build_breadth_snapshot
+
+    return build_breadth_snapshot(
+        advancers=advancers,
+        decliners=decliners,
+        limit_up_count=limit_up_count,
+        limit_down_count=limit_down_count,
+        median_return=median_return,
+        new_highs_20d=new_highs_20d,
+        new_lows_20d=new_lows_20d,
+        turnover_change_pct=turnover_change_pct,
+        total_symbols=total_symbols,
+        coverage_ratio=coverage_ratio,
+        as_of=_BREADTH_NOW,
+        source="warehouse_daily",
+        freshness={"date_max": "2026-09-16"},
+    )
+
+
+def _healthy_breadth(*, coverage_ratio: float) -> dict[str, Any]:
+    return _breadth_snapshot(
+        coverage_ratio=coverage_ratio,
+        advancers=3200,
+        decliners=1800,
+        limit_up_count=80,
+        limit_down_count=10,
+        median_return=0.004,
+        new_highs_20d=300,
+        new_lows_20d=80,
+        turnover_change_pct=0.05,
+    )
+
+
+def _weak_breadth(*, coverage_ratio: float) -> dict[str, Any]:
+    return _breadth_snapshot(
+        coverage_ratio=coverage_ratio,
+        advancers=300,
+        decliners=4700,
+        limit_up_count=2,
+        limit_down_count=150,
+        median_return=-0.03,
+        new_highs_20d=20,
+        new_lows_20d=900,
+        turnover_change_pct=-0.3,
+    )
+
+
+def _breadth_engine(
+    *,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    snapshot: Any,
+    symbols: list[str] | None = None,
+) -> tuple[Week5SelectionEngine, StockAnalyzerConfig]:
+    config = _historical_config(tmp_path)
+    config.week5.market_breadth_enabled = True
+    monkeypatch.setattr(
+        "stock_analyzer.ops.market_breadth.compute_market_breadth_from_warehouse",
+        lambda *args, **kwargs: snapshot,
+    )
+    backend = _StubBackend(config, symbols=list(symbols or ["600000"]))
+    context = Week5RunContext(
+        mode="historical",
+        now=_BREADTH_NOW,
+        as_of=date(2026, 9, 16),
+        config=config,
+        provider=object(),
+        run_pipeline_fn=lambda **kwargs: backend.run_pipeline(**kwargs),
+        symbols=list(symbols or ["600000"]),
+        artifact_dir=tmp_path,
+    )
+    engine = Week5SelectionEngine(
+        backend=backend,
+        context=context,
+        policy=Week5RunPolicy.historical(),
+    )
+    return engine, config
+
+
+def _breadth_meta(engine: Week5SelectionEngine) -> dict[str, Any]:
+    meta, _lift = engine._historical_market_breadth(now=_BREADTH_NOW)  # noqa: SLF001
+    return meta
+
+
+def test_breadth_coverage_knife_edge_flips_availability() -> None:
+    """覆盖率卡在 0.95 门槛两侧时 available 翻转——这是被修的噪声源本身。"""
+    passed = _healthy_breadth(coverage_ratio=0.9501)
+    failed = _healthy_breadth(coverage_ratio=0.9489)
+    assert passed["coverage_ok"] is True
+    assert passed["score"]["available"] is True
+    assert failed["coverage_ok"] is False
+    assert failed["score"]["available"] is False
+    # 两次覆盖面只差万分之十二，分数完全相同：差异不来自市场本身
+    assert failed["score"]["value"] == pytest.approx(passed["score"]["value"])
+
+
+def test_historical_breadth_low_coverage_with_healthy_score_does_not_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """覆盖率不达标但分数健康：不得据此禁止整条买入路径。"""
+    snapshot = _healthy_breadth(coverage_ratio=0.9489)
+    engine, config = _breadth_engine(tmp_path=tmp_path, monkeypatch=monkeypatch, snapshot=snapshot)
+    assert snapshot["score"]["available"] is False
+    assert snapshot["score"]["value"] >= float(config.week5.market_breadth_disable_if_below)
+
+    meta = _breadth_meta(engine)
+
+    assert meta["block_new_buy"] is False
+    assert meta["reason"] == "breadth_ok_low_coverage"
+    assert meta["coverage_ratio"] == snapshot["coverage_ratio"]
+    assert meta["trend_min_threshold_lift"] == 0.0
+
+
+def test_historical_breadth_low_coverage_with_weak_score_still_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """覆盖率不达标且分数确实偏低：低分否决语义必须保留。"""
+    snapshot = _weak_breadth(coverage_ratio=0.9489)
+    engine, config = _breadth_engine(tmp_path=tmp_path, monkeypatch=monkeypatch, snapshot=snapshot)
+    assert snapshot["coverage_ok"] is False
+    assert snapshot["score"]["value"] < float(config.week5.market_breadth_disable_if_below)
+
+    meta = _breadth_meta(engine)
+
+    assert meta["block_new_buy"] is True
+    assert meta["reason"] == "breadth_score_unavailable"
+
+
+def test_historical_breadth_healthy_coverage_weak_score_still_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """反例：覆盖率完全正常时，低分否决不得被新分支改写。"""
+    snapshot = _weak_breadth(coverage_ratio=0.99)
+    engine, _config = _breadth_engine(tmp_path=tmp_path, monkeypatch=monkeypatch, snapshot=snapshot)
+    assert snapshot["coverage_ok"] is True
+
+    meta = _breadth_meta(engine)
+
+    assert meta["block_new_buy"] is True
+    assert meta["reason"] == "breadth_below_threshold"
+
+
+def test_historical_breadth_missing_score_still_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """反例：真取不到数据（分数为 0）时仍按不可用处理，不放行。"""
+    snapshot = _breadth_snapshot(
+        coverage_ratio=0.0,
+        advancers=0,
+        decliners=0,
+        limit_up_count=0,
+        limit_down_count=0,
+        median_return=0.0,
+        new_highs_20d=0,
+        new_lows_20d=0,
+        turnover_change_pct=0.0,
+        total_symbols=0,
+    )
+    engine, _config = _breadth_engine(tmp_path=tmp_path, monkeypatch=monkeypatch, snapshot=snapshot)
+    assert snapshot["score"]["value"] == 0.0
+
+    meta = _breadth_meta(engine)
+
+    assert meta["block_new_buy"] is True
+    assert meta["reason"] == "breadth_score_unavailable"
+
+
+def test_engine_historical_low_coverage_breadth_keeps_buy_path_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """端到端接线：低覆盖率+健康分数时，终门不得再挂 market_breadth_blocked。"""
+    engine, _config = _breadth_engine(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        snapshot=_healthy_breadth(coverage_ratio=0.9489),
+        symbols=["600000", "000001"],
+    )
+
+    report = engine.run()
+
+    assert report["market_breadth"]["block_new_buy"] is False
+    assert report["market_breadth"]["reason"] == "breadth_ok_low_coverage"
+    rejected_reasons = {
+        str(reason)
+        for item in report["funnel"]["final_selection"]["rejected"]
+        for reason in item.get("reject_reasons", [])
+    }
+    assert not any(reason.startswith("data_gate:market_breadth") for reason in rejected_reasons)

@@ -1769,7 +1769,23 @@ class Week5SelectionEngine:
         return covered / max(1, len(symbols))
 
     def _historical_market_breadth(self, *, now: datetime) -> tuple[dict[str, object], float]:
-        """从 as-of 日线现算历史市场广度（不读生产 market_breadth.json）。"""
+        """从 as-of 日线现算历史市场广度（不读生产 market_breadth.json）。
+
+        覆盖率边缘修正（2026-09-17）：``build_breadth_snapshot`` 规定
+        ``coverage_ok = coverage_ratio >= 0.95``，而 ``coverage_ratio`` 的分母是
+        ``list_symbols()`` 返回的**全索引**（含当日停牌/未上市的非交易标的），
+        因此真实覆盖率天然停在 95% 附近抖动——实测 2026-09-01 为 0.9501（通过）、
+        2026-09-16 为 0.9489（不通过），**万分之十二的差异决定整个市场能否开仓**。
+        一旦落入不通过分支，``breadth_usage_policy`` 判 ``breadth_score_unavailable``
+        并禁止新开仓，终门即把当天全部候选拒掉（历史链路 2026-09-04 起连续 9 个
+        交易日因此 0 票），这不是风控判断而是阈值噪声。
+
+        修正只作用于本历史分支：当评分被标记为不可用**但已算出正分数**时，退回
+        用同一个 ``market_breadth_disable_if_below`` 阈值对分数本身做判定——分数
+        仍然偏低时照旧禁止开仓（低分否决语义不变），只有分数达标才放行并在
+        reason 上留下 ``breadth_ok_low_coverage`` 标记。无分数（=真取不到数据）
+        与 live 路径一样按"广度不可用"处理，不阻断扫描。
+        """
         from stock_analyzer.ops.market_breadth import (
             breadth_usage_policy,
             compute_market_breadth_from_warehouse,
@@ -1791,13 +1807,24 @@ class Week5SelectionEngine:
             max_intraday_heartbeat_sec=48.0 * 3600.0,
         )
         stale_lift = float(_as_float(policy.get("trend_min_threshold_lift"), default=0.0))
+        reason = str(policy.get("reason", "breadth_ok"))
+        block_new_buy = bool(policy.get("block_new_buy", False))
+        score_value = _as_float(policy.get("score"), default=0.0)
+        if block_new_buy and reason == "breadth_score_unavailable" and score_value > 0.0:
+            disable_below = float(self._config.week5.market_breadth_disable_if_below)
+            if score_value >= disable_below:
+                block_new_buy = False
+                reason = "breadth_ok_low_coverage"
         meta: dict[str, object] = {
             "enabled": True,
-            "block_new_buy": bool(policy.get("block_new_buy", False)),
-            "reason": str(policy.get("reason", "breadth_ok")),
+            "block_new_buy": block_new_buy,
+            "reason": reason,
             "score": policy.get("score"),
             "trend_min_threshold_lift": round(stale_lift, 4),
             "source": "historical_recompute",
+            # 覆盖率进 meta 是为了让"为什么判不可用"在回测载荷里可见：此前该值
+            # 只存在于函数内部，排查时无法从产物里复核。
+            "coverage_ratio": snapshot.get("coverage_ratio"),
         }
         return meta, stale_lift
 
