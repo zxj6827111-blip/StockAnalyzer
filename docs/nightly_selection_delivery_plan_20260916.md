@@ -498,6 +498,7 @@ zcode 必须提交：
 | C+ | 完成 | `1cda9f4` | 正文可读性（过滤原因本地化、入选依据去噪、补全态措辞）——离线回放暴露的问题 |
 | C++ | 完成 | `c032d70` | 漏斗取数改用质量选择器的账（用户实测发现 5487 被显示成 300）；"输入不足"与"旧产物未标注"分开表述 |
 | C+++ | 完成 | `6869481` | 回放报告 id 带版本号，堵住"指针指向未写入版本"的静默不一致 |
+| R | 完成 | `4ad1399` | 独立验收 R1—R4（锁 / 恢复 / 全局停发）与同族漏项修复，13 条反例测试 |
 
 ### 6.2 开工基线（实测，非引用）
 
@@ -622,3 +623,24 @@ zcode 必须提交：
 
 9. 模型重训、自动晋升、自动交易、盘中雷达/竞价基线、东财 push2 封锁等工作不在本轮范围；只在有证据直接阻断夜间扫描时才纳入。
 10. 进化任务仍在跑，其短名单口径与正式晚报相互独立（进化消息的"入围 N 只"仍是复扫短名单，未与晚报合并）。
+
+### 6.9 独立验收（2026-09-17 08:07）四条问题的修复
+
+独立验收报告：[nightly_selection_independent_review_20260917.md](nightly_selection_independent_review_20260917.md)。
+其结论为"部署与回放通过、可靠交付验收 NO-GO（R1—R4）"。四条经我逐条复现**全部成立**，连同一条同族漏项一并修复，提交 `4ad1399`。
+
+每条都补了**在修复前会失败**的反例测试——逐条用临时还原旧行为的代码验证过失败，再确认修复后通过，避免"测试通过但没测到东西"的假保证。
+
+| 编号 | 问题（独立验收复现结论） | 修复 | 反例测试（修复前失败） |
+|---|---|---|---|
+| R1 / P1 | 日期状态锁未取得也继续写入：`update_date_state` 忽略 `acquire()` 返回值，而它被占用时返回 False 不抛异常 → 锁等于没加 | `_acquire_date_lock` 有界等待 + 超时抛 `DateStateBusyError`，绝不裸写；并按验收意见把 `publish` 的"读版本 → 分配 revision → 冻结文件 → 写指针"收进**同一个日期级事务**，事务内用 `_write_date_state_locked` 避免重复获取非重入锁，合并基于锁内最新状态 | `test_date_state_update_waits_for_the_lock_instead_of_writing_through`／`test_date_state_update_fails_loudly_when_the_lock_stays_busy`／`test_publish_holds_the_date_lock_for_the_whole_transaction`／`test_concurrent_publishes_do_not_share_a_revision` |
+| R2 / P1 | 补发与恢复绕过交付锁：`request_retry` 直接写 pending；`_recover_stale_sending` 用新建锁对象的 `is_held()` 探测占用（该方法只表示"这个对象自己持不持锁"，新对象恒为 False） | 新增 `_mutate_record`：在该 `delivery_id` 的交付锁内重读最新记录再决策；`ensure_records`／`request_retry`／回执并账／sending 恢复／过期 unknown 停机全部统一走它。在途 sending 返回 `in_progress`，不改状态、不重置次数、不换 uuid | `test_request_retry_never_touches_a_record_held_by_a_live_sender`／`test_request_retry_reports_in_progress_for_a_live_sending_record`／`test_recovery_does_not_rewrite_a_record_while_the_holder_is_alive`／`test_record_mutation_always_sees_the_latest_state`／`test_a_stale_requeue_cannot_resurrect_a_delivered_record` |
+| R3 / P1 | 报告落盘后、指针发布前崩溃无法恢复：`recover` 只看 `reports_for`（只认指针），已冻结文件对它不可见 → 永远没有待发记录 | 新增 `discover_reports`：有界枚举最近交易日目录并按"目录日期/文件名/report_id/类型/版本号"结构自洽校验，区分已引用与孤儿；`adopt_orphan_report` 把孤儿**正式**报告锁内复核后补回指针。内容摘要做二次核验并作为证据返回，但**不**当准入条件——业务字段变化不该让一份真实报告永远发不出去。回放/说明类孤儿只记录不采用 | `test_recovery_adopts_a_frozen_report_whose_pointer_never_landed`／`test_recovery_does_not_promote_a_replay_to_a_formal_report`／`test_recovery_ignores_structurally_inconsistent_report_files` |
+| R4 / P2 | 全局停发开关未生效：`notifications.enabled=false` 时新链路仍发送 | 自动链同时服从 `nightly.enabled` 与 `notifications.enabled`（停发时保持 pending，恢复后继续）；手动入口绕过的是 nightly 开关、**不**绕过全局停发 | `test_global_notification_switch_stops_the_automatic_chain`／`test_global_notification_switch_also_blocks_manual_delivery`／`test_global_notification_switch_suppresses_the_legacy_notify_path` |
+| 同族漏项（自查） | `SA_DISABLE_EXTERNAL_NOTIFICATIONS` / `SA_FORCE_CONSOLE_NOTIFIER` 既有停发机制只在 `build_notifier` 生效，晚报链路直接调 `build_channel` → 可绕过运维停发 | `_build_targets` 先看 `_force_console_notifier()`，命中即强制 console 目标（永远不产生 `delivered`） | `test_existing_external_notification_kill_switch_applies_to_nightly` |
+
+**顺带纠正的一处既有语义**：`notifications.enabled` 在此之前于全仓库**没有任何消费方**——是个死开关，设成 false 什么都不会发生。既然它表达"别再往外发消息"，就让整条通知出口（含旧链路）都真正服从它；否则同一个开关在不同链路有不同含义。这条改动会影响白天通知路径，属于**有意把死开关做实**，已单独在测试中固定行为。
+
+**未改动**：候选池大小、评分阈值、风险阈值、21:45／23:00／23:30 调度时间点与其预算。
+
+**待与检查方确认的一处观察（非阻断）**：NAS 上 `nightly_reports/2026-09-16/state.json` 在 2026-09-17 07:22:11 被写过一次，写下的 `last_published_report_id` 仍是**不带版本号**的 `rp-20260916`。而部署中的 `6869481` 及之后的代码只会生成 `rp-<日期>-<版本>`，写不出这种形式；容器 `/tmp` 无残留探针、投递记录仍为 delivered、无新文件、无新消息。因此推断为**带外运行**（容器内跑了回放脚本但用了另一份旧代码副本，或未覆盖 `reports_root`）。影响为零，但来源需要检查方或用户说明——若是回放脚本未覆盖目录，说明验收脚本缺少"不得写生产目录"的自检，后续可加。

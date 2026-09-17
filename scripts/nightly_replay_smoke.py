@@ -78,6 +78,16 @@ def main() -> int:
 
     service = StockAnalyzerService(config=get_config())
 
+    # 显式声明"这次会写到哪里"。2026-09-17 出现过一次带外写入：有人在容器里跑本脚本
+    # 但以为在临时目录（实际写进了生产 artifacts），事后只能靠比对 report_id 形式才
+    # 推断出来源。无条件打印目标路径，至少让这类误操作在输出里可见。
+    print(f"[nightly-replay] reports_root  = {service._nightly_report_service.root}")
+    print(f"[nightly-replay] delivery_root = {service._nightly_delivery_service.root}")
+    print(
+        "[nightly-replay] 若不是有意写这里，请加 "
+        "-e SA__NIGHTLY__REPORTS_ROOT=<tmp> -e SA__NIGHTLY__DELIVERY_ROOT=<tmp>"
+    )
+
     if args.status:
         print(
             json.dumps(
