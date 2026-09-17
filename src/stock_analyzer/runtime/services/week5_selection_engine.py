@@ -33,6 +33,12 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import pandas as pd
 
+from stock_analyzer.data.asof_universe import (
+    DEFAULT_EXPECTED_ACTIVE_LOOKBACK_DAYS,
+    build_pit_stats,
+    history_window_days,
+    resolve_asof_universe,
+)
 from stock_analyzer.feature.snapshot import (
     SNAPSHOT_FILENAME,
     FeatureSnapshotManifest,
@@ -1713,21 +1719,46 @@ class Week5SelectionEngine:
                 if normalized
             ]
         )
-        # as-of 有效性：批量取 lookback=1 的"最近一根"（≤ as_of），只保留
-        # 截止 as_of 仍有数据、且最近数据在 staleness 窗口内的 symbol。
-        # 未来上市（as_of 前无任何数据）与 as_of 前已退市（数据早已停更）
-        # 都在这一步被剔除，不依赖当前退市名单。
+        # as-of 有效性（S03）：用 PIT resolver 生成"当时可观测"的历史股票池，
+        # 而不是拿完整 provider 索引 + 单一 staleness 阈值当股票池。
+        # 未来上市（≤ as_of 无任何 bar）在这里被硬排除；停牌（eligible 但最近
+        # 窗口无 bar）单列且不进 coverage 分母；数据源无法证明退市覆盖时
+        # survivorship_coverage 如实标 incomplete_or_unknown。
         max_staleness_days = max(
             0, _as_int(config.week5.universe_quality_max_staleness_days, default=10)
         )
+        min_history_days = max(
+            1, _as_int(config.week5.universe_quality_min_history_days, default=60)
+        )
+        lookback_days = DEFAULT_EXPECTED_ACTIVE_LOOKBACK_DAYS
+        probe_window_days = history_window_days(
+            min_history_days=min_history_days, lookback_days=lookback_days
+        )
         valid_symbols: list[str] = []
         batch_error = ""
+        universe_snapshot = None
         try:
             probe = provider.fetch_universe_quality_metrics(
                 symbols=index_symbols,
-                lookback_days=1,
+                lookback_days=probe_window_days,
                 end_date=ctx.as_of,
             )
+            pit_stats = build_pit_stats(
+                metrics=probe if isinstance(probe, pd.DataFrame) else pd.DataFrame(),
+                as_of=ctx.as_of,
+                lookback_days=lookback_days,
+                history_window_days=probe_window_days,
+            )
+            universe_snapshot = resolve_asof_universe(
+                as_of=ctx.as_of,
+                index_symbols=index_symbols,
+                stats=pit_stats,
+                min_history_days=min_history_days,
+                expected_active_lookback_days=lookback_days,
+            )
+            # 外层 staleness 门仍保留（数据停更 > N 天不得入选），与 PIT 判定叠加：
+            # 两者都过才进质量选择（fail-closed 取交集，不放宽任何一条）。
+            expected_active = set(universe_snapshot.expected_active_symbols)
             if isinstance(probe, pd.DataFrame) and not probe.empty:
                 dates = pd.to_datetime(probe["date"], errors="coerce")
                 probe = probe.assign(_date=dates).dropna(subset=["_date"])
@@ -1736,7 +1767,7 @@ class Week5SelectionEngine:
                     probe["symbol"].astype(str), probe["_date"], strict=True
                 ):
                     normalized = _normalize_a_share_symbol(symbol_value)
-                    if not normalized:
+                    if not normalized or normalized not in expected_active:
                         continue
                     if (as_of_ts - row_date).days <= max_staleness_days:
                         valid_symbols.append(normalized)
@@ -1787,6 +1818,11 @@ class Week5SelectionEngine:
                 "max_staleness_days": max_staleness_days,
                 "batch_error": batch_error,
                 "quality_target": quality_target,
+                # S03：PIT 股票池快照（universe_snapshot_id / counts / coverage /
+                # 排除原因分布），供报告与研究侧核对"当时到底可选哪些票"。
+                "universe_snapshot": (
+                    universe_snapshot.to_payload() if universe_snapshot is not None else {}
+                ),
             },
         }
 

@@ -486,7 +486,12 @@ class _StubBackend:
 
 
 class _FakeUniverseProvider:
-    """as-of 上下文用：索引 + 批量质量 + 日线（全部受 end_date 限制）。"""
+    """as-of 上下文用：索引 + 批量质量 + 日线（全部受 end_date 限制）。
+
+    S03 起批量探针必须给出**一段窗口**的 bar（真实 provider 的行为），否则 PIT
+    股票池会正确地判定"窗口内历史不足"而拒绝全部标的。这里按 ``lookback_days``
+    生成截止 ``end_date`` 的连续交易日 bar。
+    """
 
     def __init__(self, symbols: list[str]) -> None:
         self._symbols = list(symbols)
@@ -505,13 +510,13 @@ class _FakeUniverseProvider:
         self.batch_calls.append(
             {"symbols": list(symbols), "lookback_days": lookback_days, "end_date": end_date}
         )
+        effective_end = end_date or AS_OF
+        sessions = max(1, int(lookback_days))
+        dates = pd.bdate_range(end=pd.Timestamp(effective_end), periods=sessions)
         rows = [
-            {
-                "symbol": symbol,
-                "date": pd.Timestamp(AS_OF),
-                "close": 10.0,
-            }
+            {"symbol": symbol, "date": timestamp, "close": 10.0}
             for symbol in symbols
+            for timestamp in dates
         ]
         return pd.DataFrame(rows)
 
@@ -622,6 +627,14 @@ def test_engine_historical_full_market_resolves_universe_with_end_date(tmp_path:
     assert prefilter["historical_universe"]["provider_index_count"] == len(symbols)
     assert prefilter["historical_universe"]["as_of_valid_count"] == len(symbols)
     assert prefilter["historical_universe"]["selected_count"] == 3
+    # S03：报告必须带 PIT 股票池快照（可复现 id + 分母口径 + 覆盖度如实标注）
+    snapshot = prefilter["historical_universe"]["universe_snapshot"]
+    assert str(snapshot["universe_snapshot_id"]).startswith("asofuniv_")
+    assert snapshot["as_of"] == AS_OF.isoformat()
+    assert snapshot["eligible_count"] == len(symbols)
+    assert snapshot["expected_active_count"] == len(symbols)
+    assert snapshot["coverage_denominator"] == "expected_active"
+    assert snapshot["survivorship_coverage"] == "incomplete_or_unknown"
     # 质量选择收到 as_of end_date + 任务独立 selection snapshot 路径
     assert backend.quality_selection_kwargs, "quality selection should be invoked"
     kwargs = backend.quality_selection_kwargs[0]
