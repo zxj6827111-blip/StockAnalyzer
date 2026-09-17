@@ -1248,7 +1248,13 @@ class TrainingConfig(_StrictModel):
     # 内容寻址 bundle 归档根目录（P0-a）：训练产物只进这里并注册 challenger，
     # 运行时别名 artifact_path 仅由两阶段发布流程原子切换。
     model_archive_dir: str = "artifacts/model_archive"
+    # S05：retention_count 是**保留下限**（最新 N 个永不删，含 protected bundle）；
+    # 容量由 model_archive_max_bytes 管理：超预算时删最旧的，但不低于保留下限。
+    # 因而默认值 5 = 至少保 5 个（阶段施工提示词 S05 允许"至少 50 或按容量管理"）。
     model_archive_retention_count: int = 5
+    model_archive_max_bytes: int = 2 * 1024 * 1024 * 1024
+    # 在服模型清单（S05）：serving 身份的独立真相源，由发布流程在 CAS 成功后写入。
+    serving_manifest_path: str = "artifacts/model_serving_manifest.json"
     # 晋级硬门（P1-b 补救）：完整 test split 的去重交易日下限。
     min_test_trade_dates: int = 20
     min_hard_class_samples: int = 30

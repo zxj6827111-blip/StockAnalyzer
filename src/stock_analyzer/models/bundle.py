@@ -348,13 +348,32 @@ def latest_bundle_artifact_path(archive_root: str | Path) -> Path | None:
     return max(candidates, key=lambda item: item.stat().st_mtime)
 
 
+def _directory_size_bytes(root: Path) -> int:
+    total = 0
+    for path in root.rglob("*"):
+        try:
+            if path.is_file():
+                total += path.stat().st_size
+        except OSError:  # pragma: no cover - 并发删除下的竞态
+            continue
+    return total
+
+
 def prune_model_bundle_archive(
     archive_root: str | Path,
     *,
     retention_count: int = 5,
     protected_bundle_ids: set[str] | None = None,
+    max_total_bytes: int | None = None,
 ) -> list[str]:
-    """Remove old unreferenced content-addressed bundles and return their ids."""
+    """Remove old unreferenced content-addressed bundles and return their ids.
+
+    S05 起支持**按容量管理**（阶段施工提示词 S05：retention 至少 50 或按容量管理）：
+
+    - ``retention_count`` 是**保留下限**（最新 N 个永不删，含 protected 集合）；
+    - ``max_total_bytes`` 给出归档总字节预算；超过预算时继续删最旧的 bundle，
+      但**绝不低于保留下限**——容量失控不能让"最新模型也被删掉"。
+    """
 
     root = Path(archive_root).expanduser().resolve()
     if not root.is_dir():
@@ -374,9 +393,19 @@ def prune_model_bundle_archive(
         str(item).strip() for item in (protected_bundle_ids or set()) if str(item).strip()
     )
     removed: list[str] = []
-    for item in candidates:
-        if item.name in keep_ids:
-            continue
+    # 先按保留下限之外 + 容量预算决定删除顺序（最旧优先）。
+    remaining = [item for item in candidates if item.name not in keep_ids]
+    if max_total_bytes is not None and max_total_bytes > 0:
+        total = sum(_directory_size_bytes(item) for item in candidates if item.name in keep_ids)
+        for item in remaining:
+            if total <= int(max_total_bytes):
+                break
+            size = _directory_size_bytes(item)
+            shutil.rmtree(item)
+            removed.append(item.name)
+            total -= size
+        remaining = [item for item in remaining if item.name not in set(removed)]
+    for item in remaining:
         shutil.rmtree(item)
         removed.append(item.name)
     return removed

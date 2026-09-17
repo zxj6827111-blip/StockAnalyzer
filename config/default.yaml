@@ -805,6 +805,10 @@ training:
   artifact_path: "artifacts/model_v1.json"
   # 内容寻址 bundle 归档根目录（训练产物只进这里，别名仅由发布流程切换）
   model_archive_dir: "artifacts/model_archive"
+  # S05：retention_count 是保留下限（最新 N 个永不删）；容量由 max_bytes 管理，
+  # 超预算删最旧的但绝不低于下限。在服身份写在 serving_manifest_path（独立真相源）。
+  model_archive_max_bytes: 2147483648
+  serving_manifest_path: "artifacts/model_serving_manifest.json"
   model_archive_retention_count: 5
   # 晋级硬门：完整 test split 去重交易日下限（P1-b）
   min_test_trade_dates: 20

@@ -2365,7 +2365,12 @@ class _TwoPhaseReleaseExecutor:
         return mode_details
 
     def commit_registry_cas(self, *, now: datetime) -> dict[str, object]:
-        """步骤⑤：单事务 expected-champion CAS 完成 champion 降级 + 目标晋级。"""
+        """步骤⑤：单事务 expected-champion CAS 完成 champion 降级 + 目标晋级。
+
+        CAS 成功后写**在服模型清单**（S05）：别名切换与晋级完成后的身份快照。
+        写清单是最佳努力（失败只体现在返回值里），不得因为清单写不出来而让发布失败——
+        已完成的 aliases/registry 切换由发布流程自己的回滚负责。
+        """
 
         promoted, demoted = self._service._model_registry.promote_model_with_cas(
             target_model_id=self._target.model_id,
@@ -2373,10 +2378,40 @@ class _TwoPhaseReleaseExecutor:
             now=now,
         )
         self._registry_committed = True
+        serving_manifest = self._write_serving_manifest()
         return {
             "promoted": promoted.model_dump(mode="json"),
             "demoted": [record.model_dump(mode="json") for record in demoted],
+            "serving_manifest": serving_manifest,
         }
+
+    def _write_serving_manifest(self) -> dict[str, object]:
+        """写 artifacts/model_serving_manifest.json（在服身份唯一真相源）。"""
+
+        from stock_analyzer.models.serving_manifest import write_serving_manifest
+
+        configured_path = str(
+            getattr(self._service._config.training, "serving_manifest_path", "") or ""
+        ).strip()
+        result = write_serving_manifest(
+            artifact_path=self._alias_path,
+            registry=getattr(self._service, "_model_registry", None),
+            alias_path=self._alias_path,
+            source="release_flow_registry_cas",
+            manifest_path=configured_path or None,
+        )
+        self._service._record_audit_event(
+            event_type="model_serving_manifest_written",
+            level="info" if result.get("written") else "warning",
+            trace_id=self._source_trace_id,
+            payload={
+                "written": bool(result.get("written")),
+                "path": str(result.get("path", "")),
+                "error": str(result.get("error", "")),
+                "target_model_id": self._target.model_id,
+            },
+        )
+        return result
 
     def _evaluate_candidate_validity(
         self,

@@ -1551,6 +1551,10 @@ class StockAnalyzerService:
                 int(self._config.training.model_archive_retention_count),
             ),
             protected_bundle_ids=protected_bundle_ids,
+            # S05：容量管理——超预算删最旧的，但绝不低于保留下限（模型归档不再只靠计数）。
+            max_total_bytes=max(
+                0, int(getattr(self._config.training, "model_archive_max_bytes", 0))
+            ),
         )
         return {
             "bundle_id": publication.bundle_id,
