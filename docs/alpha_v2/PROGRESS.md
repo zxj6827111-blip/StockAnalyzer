@@ -11,7 +11,7 @@
 ```text
 Project = StockAnalyzer Alpha V2.0
 Current Batch = M1
-Current Stage = S00 DONE（S01 施工中）
+Current Stage = S02 DONE（本轮施工停止于 S03 之前，见 §11 批次小结）
 M1 Acceptance = PENDING
 M2 Acceptance = LOCKED
 Production Promotion = LOCKED
@@ -23,6 +23,9 @@ Production Promotion = LOCKED
 branch = feat/alpha-v2-m1-0917
 review baseline = fix/asof-breadth-gate-coverage-0917 @ 7e9e33bdb9d03506cff5dfff29c78b1c95019541
 S00 commit = 83e4fd7 (feat(alpha-v2): add shadow feature flags and no-op baseline)
+S00 docs   = f6ed795 (docs(alpha-v2): S00 PROGRESS 记录)
+S01 commit = a78a990 (feat(alpha-v2): 真实模型身份链)
+S02 commit = 5b1e504 (feat(alpha-v2): 盘后信号改 T+1 真实可成交入场)
 ```
 
 ---
@@ -62,7 +65,9 @@ Codex Acceptance = PENDING
 | Stage | Task | ZCode Status | Tests | Audit Artifact | Codex Acceptance | Notes |
 |---|---|---|---|---|---|---|
 | S00 | Alpha V2 Feature Flag / No-op Baseline | DONE | 40 定向 + 3031 全量 / 0 failed | `artifacts/alpha_v2/audit/s00_validation.json` | PENDING | Legacy 零行为变化（结构性 + golden 双向锁定） |
-| S01 | Model Identity Truth | IN_PROGRESS | - | - | PENDING | |
+| S01 | Model Identity Truth | DONE | 29 新增 + 447 相关 / 0 failed | `artifacts/alpha_v2/audit/s01_validation.json` | PENDING | 事实（工件）与补充（registry/bootstrap）分离；trained_at 不再取 bootstrap |
+| S02 | T+1 Entry Simulation | DONE | 19 新增 + 197 相关 / 0 failed | `artifacts/alpha_v2/audit/s02_validation.json` | PENDING | entry_date > signal_date 或 no_fill；600000 基准在新口径逐项复现 |
+| S03 | Point-in-Time Historical Universe | NOT_STARTED | - | - | PENDING | 本轮停止点（见批次小结） |
 | S02 | T+1 Entry Simulation | NOT_STARTED | - | - | PENDING | |
 | S03 | Point-in-Time Historical Universe | NOT_STARTED | - | - | PENDING | |
 | S04 | SelectionContract 300/100/50 | NOT_STARTED | - | - | PENDING | |
@@ -254,8 +259,14 @@ rollback_point
 | ID | Found At | Description | Severity | Owner | Target Stage | Status |
 |---|---|---|---|---|---|---|
 | DF-S00-001 | S00 | `StockAnalyzerConfig.model_dump()` 无法 `model_validate` 回填（limit_rule alias `from`），影响"配置 dump 后重放"类工具 | low | unassigned | S04 或独立修复 | OPEN |
-| DF-S00-002 | S00 | 生产有效 `models.inference_score_source=calibrated` vs 受跟踪默认 `raw`，基线清单需带环境口径 | info | unassigned | S01 | OPEN |
+| DF-S00-002 | S00 | 生产有效 `models.inference_score_source=calibrated` vs 受跟踪默认 `raw`，基线清单需带环境口径 | info | unassigned | S01 | CLOSED（`config_hash_scope` + 双口径记录） |
 | DF-S00-003 | S00 | `scripts/` 旧临时脚本与根目录 `tmp_*` 残留较多 | info | unassigned | 批次收尾清理 | OPEN |
+| DF-S01-001 | S01 | registry 无 champion → 身份状态恒为 no_champion / match_registered（仅可见，未治理） | info | unassigned | S05 | OPEN |
+| DF-S01-002 | S01 | 历史回测仍加载当前 serving 工件（无 HistoricalModelResolver）→ as_of 早于工件 created_at 时存在未来模型风险 | high | unassigned | S06 | OPEN |
+| DF-S01-003 | S01 | `asof_scan.model_trained_at` 字段名沿用旧契约（值语义已修正） | info | unassigned | S04 | OPEN |
+| DF-S02-001 | S02 | `holding_curve._bar_snapshot` 缺列时注入 `close*1.1/0.9` 估算涨跌停且被当权威值 → 掩盖真实板块涨跌幅（一字涨停在该路径被判可成交，已实测） | high | unassigned | S07 | OPEN |
+| DF-S02-002 | S02 | provider 涨跌停价 NaN 被 `_optional_float` 当有值 → `build_price_limits` fail-open（NaN 比较恒 False） | high | unassigned | S07/S08 | OPEN |
+| DF-S02-003 | S02 | asof 回测 holding curve 主口径仍为 0 滑点（参数已暴露，服务层未设值） | medium | unassigned | S07 | OPEN |
 
 ---
 
@@ -376,3 +387,202 @@ NONE
 
 ### Next Stage
 S01 — Model Identity Truth
+
+## S01 — Model Identity Truth
+
+### Status
+DONE
+
+### Date
+2026-09-17
+
+### Batch
+M1
+
+### Starting HEAD
+f6ed79561159b1d2240ceb524d3e1ed5bbaa1d58（S00 记录提交）
+
+### Ending HEAD / Working Tree
+a78a990（S01 代码提交；审计工件随后生成）
+
+### Files Changed
+- `src/stock_analyzer/models/identity.py`：新增 `load_artifact_facts`（磁盘事实）、`registry_identity`（registry 补充，生产健康端点与历史路径共用）、`build_model_identity_report`（事实 + 补充 + 六态判定 + `research_fail_closed` / `identity_verified`）
+- `src/stock_analyzer/models/predictor.py`：`SignalPredictor` 保存并暴露工件自述契约（created_at / feature schema / label policy / dataset manifest）+ `model_identity_facts()`
+- `src/stock_analyzer/pipeline.py`：新增只读 `model_identity_facts()` / `model_identity()`（artifact 缺失时同样给出结构完整的事实）
+- `src/stock_analyzer/runtime/service.py`：`artifact_identity_report` 的 registry 收集改为复用同一 helper（响应字段与状态口径不变）
+- `src/stock_analyzer/backtest/asof_scan.py`：新增 `model_identity` 入参，caveats 携带身份块
+- `src/stock_analyzer/runtime/services/asof_backtest_service.py`：新增 `_resolve_backtest_model_identity`；`model_trained_at` 改取工件 created_at；caveats 增加身份块与"请求级 vs 各日期运行身份"一致性标注
+- `src/stock_analyzer/runtime/services/week5_historical_runner.py`：`_resolve_model_info` 改为读 pipeline 事实 + registry 补充；不再用 bootstrap 时间冒充身份
+- `src/stock_analyzer/runtime/services/week5_selection_engine.py`：`Week5ModelInfo` 扩展身份字段与 `to_payload()`
+- `tests/test_model_identity_truth.py`（新，29 例）
+
+### Behavior Changes
+- 新增：pipeline 只读身份 API；Week5ModelInfo / caveats 身份块；研究侧 fail-closed 标记。
+- 语义修正：`trained_at` = 实际加载工件 created_at（`trained_at_source=artifact_created_at`）；bootstrap 时间只作 `bootstrap_last_bootstrap_at`；registry `model_id` 仅在身份可验证时报告。
+- registry hash ≠ actual hash → `status=mismatch` → `research_fail_closed=true`；`no_champion` / registry 读失败不算 mismatch（不锁死研究链）。
+- Legacy 未变：阈值 / Cross Review / 300-100-50 / final cap / 风险门 / 在服模型 / 飞书通知；健康端点响应字段与状态口径不变。
+
+### Tests
+Commands:
+- `python -m pytest tests/test_model_identity_truth.py` → 29 passed
+- `python -m pytest tests/test_pipeline.py tests/test_pipeline_asof.py tests/test_pipeline_model_artifact.py tests/test_artifact_identity.py tests/test_inference_score_source.py tests/test_output_semantics_contract.py tests/test_asof_backtest_service.py tests/test_week5_historical_backtest.py tests/test_api_backtest.py tests/test_model_identity_truth.py` → 158 passed
+- `python -m pytest tests/test_service_week5.py tests/test_week5_automation.py tests/test_week5_dual_track.py tests/test_week5_scan_funnel_policy.py tests/test_main_health.py tests/test_main_week5.py tests/test_service_model_registry.py tests/test_model_registry_state_machine.py tests/test_probability_health.py tests/test_model_inference_safety.py tests/test_holding_curve.py` → 225 passed
+- `python -m pytest tests/test_runtime_invariants.py` → 35 passed
+
+Results:
+- S01 相关 447 passed / 0 failed
+- 期间 1 例既有测试（test_artifact_identity 的 registry unavailable）曾拦下我的实现变更（把 "db locked" 文本猜成 registry_busy），已按"不从异常文本猜分类"回退，未放宽断言
+
+### Audit Artifacts
+- `artifacts/alpha_v2/audit/s01_validation.json`
+- `artifacts/alpha_v2/audit/baseline_manifest.json`
+
+### Deviation From Blueprint
+- 蓝图 §4.1 的 `DecisionIdentity` 全字段（data_snapshot_id / universe_snapshot_id / resolver_mode 等）尚未一次到位：S01 先落地"实际加载工件"这一侧（model_id / artifact_uri / content_hash / created_at / schema / label），其余字段随 S03/S04/S06/S10 补齐。
+
+### Deferred Findings
+- DF-S01-001（info）：registry 无 champion → 生产身份状态恒为 no_champion / match_registered，S01 只让其可见，治理动作属 S05。
+- DF-S01-002（high）：历史回测仍加载**当前** serving 工件（无 HistoricalModelResolver），as_of 早于工件 created_at 时存在未来模型风险；S01 只如实报告身份（见 s01_validation）。
+- DF-S01-003（info）：`asof_scan` 的 `model_trained_at` 字段名沿用旧契约（值语义已修正为 artifact created_at），字段重命名留待 S04 contract 统一。
+
+### Rollback
+- `git revert a78a990`（仅 S01；S00 不受影响）。
+- 无生产影响：未 push / 未部署 / 未改 .env 或容器。
+
+### ZCode Conclusion
+DONE
+
+### Codex Acceptance
+PENDING
+
+### Codex Blocking Findings
+NONE
+
+### Next Stage
+S02 — T+1 Entry Simulation
+
+---
+
+## S02 — T+1 Entry Simulation
+
+### Status
+DONE
+
+### Date
+2026-09-17
+
+### Batch
+M1
+
+### Starting HEAD
+a78a990（S01 代码提交）
+
+### Ending HEAD / Working Tree
+5b1e504（S02 代码提交；审计工件随后生成）
+
+### Files Changed
+- `src/stock_analyzer/backtest/matcher.py`：新增 `EntrySimulation` + `ExecutionMatcher.simulate_entry()`（主口径 T+1 / sensitivity 窗口 / 五类 no_fill 原因 / 滑点与成本）
+- `src/stock_analyzer/backtest/holding_curve.py`：入场改为 T+1 可成交开盘；`SymbolHoldingResult` 增加信号日/延迟/raw 价格/滑点/成本/no_fill 字段；`HoldingCurveSummary` 增加 no_fill 计数与原因分布
+- `src/stock_analyzer/runtime/services/asof_backtest_service.py`：caveats 增加 `execution_contract` 块（entry_mode=next_session_open 等）
+- `tests/test_entry_simulation.py`（新，19 例）
+- `tests/test_holding_curve.py`（更新 14 例至 T+1 契约）
+
+### Behavior Changes
+- 新增：统一入场模拟与 no_fill 语义；holding curve 报告信号日/成交日分离。
+- 修正：holding_curve 不再用信号日收盘价当成交价（蓝图 §2.12）；退出模拟从成交日之后起算，T+1 卖出规则在入场层面即被尊重。
+- Legacy 未变：ExecutionEngine / ExecutionMatcher 既有 `can_buy` / `can_sell` / `simulate_exit` 语义未改（只新增 `simulate_entry`）；阈值 / 门禁 / 在服模型 / 通知未动。
+
+### Tests
+Commands:
+- `python -m pytest tests/test_entry_simulation.py` → 19 passed
+- `python -m pytest tests/test_holding_curve.py tests/test_asof_backtest_service.py tests/test_week5_historical_backtest.py tests/test_api_backtest.py tests/test_backtest_matcher.py tests/test_execution_engine.py` → 108 passed
+- `python -m pytest tests/test_walk_forward.py tests/test_walk_forward_variants_c3.py tests/test_walk_forward_xsec_verdict_gates.py tests/test_backtest_live_consistency.py tests/test_measure_score_return.py tests/test_pipeline_asof.py tests/test_time_semantics.py` → 89 passed
+
+Results:
+- S02 相关 197 passed / 0 failed（含 600000 对照基准在新口径下的逐项复现）
+
+### Audit Artifacts
+- `artifacts/alpha_v2/audit/s02_validation.json`
+
+### Deviation From Blueprint
+- 蓝图 §4.3 的 EntryContract 里 `secondary_entry` 的"<=3 sessions"上限本阶段只作为 `max_entry_sessions` 入参暴露（默认 1 = 主口径）；服务层尚未调用 sensitivity 口径（属 S07 的执行口径工作）。
+- 未做完整 P0-06 corporate action 治理（阶段提示词明确本轮不做）。
+
+### Deferred Findings
+- DF-S02-001（high）：`holding_curve._bar_snapshot` 在缺列时注入 `close*1.1/0.9` 估算涨跌停，且被引擎当权威 source 值 → 掩盖真实板块涨跌幅（一字涨停在该路径被判可成交，已实测）。
+- DF-S02-002（high）：provider 涨跌停价为 NaN 时 `_optional_float` 返回 nan（非 None）→ `build_price_limits` 视为有值，而 NaN 比较恒 False → 涨停门 fail-open。
+- DF-S02-003（medium）：asof 回测 holding curve 主口径仍为 0 滑点（参数已暴露，服务层未设值）。
+
+### Rollback
+- `git revert 5b1e504`（仅 S02）。
+- 无生产影响：未 push / 未部署。
+
+### ZCode Conclusion
+DONE
+
+### Codex Acceptance
+PENDING
+
+### Codex Blocking Findings
+NONE
+
+### Next Stage
+S03 — Point-in-Time Historical Universe（本轮未开始）
+
+---
+
+# 12. 批次小结（M1，本轮）
+
+## M1 Batch Status
+
+```text
+Batch = M1（S00-S10）
+Batch Status = PARTIAL
+Stages Completed = S00, S01, S02
+Stopped At = S03（未开始）
+Stopping HEAD = 5b1e504
+Review Baseline = 7e9e33bdb9d03506cff5dfff29c78b1c95019541
+Codex Batch Acceptance = PENDING
+```
+
+## 停止原因（非 Blocking Failure）
+
+本轮施工容量与验证预算用尽。S00/S01/S02 各自通过质量门（定向测试 + failure 路径 +
+审计工件 + 本台账追加 + 回归），但 S03（PIT Universe）尚未开始。按批次纪律
+"每个 SXX 必须独立验证后才进入下一个"，不带未验证代码继续 S03-S10。
+
+## Stage Matrix（本轮）
+
+| Stage | Task | ZCode | 定向测试 | 审计工件 | Codex |
+|---|---|---|---|---|---|
+| S00 | Feature Flag / No-op Baseline | DONE | 40 passed | `s00_validation.json` | PENDING |
+| S01 | Model Identity Truth | DONE | 447 passed | `s01_validation.json` | PENDING |
+| S02 | T+1 Entry Simulation | DONE | 197 passed | `s02_validation.json` | PENDING |
+| S03-S10 | 其余 M1 阶段 | NOT_STARTED | - | - | PENDING |
+
+## Batch Test Summary
+
+```text
+命令：python -m pytest -n 4 --dist loadfile
+结果：3079 passed / 2 skipped / 0 failed（526.73s，S00+S01+S02 全部提交后的工作树）
+对照：批次开始前基线 3031 passed / 2 skipped / 0 failed（新增 48 例）
+```
+
+## 本轮不变量核对
+
+```text
+final_signal_min_threshold = 70           未改（S00 golden 契约锁定）
+Cross Review 四阈值                        未改
+night 300/100/50、final cap 5            未改
+风险门（breadth/overextension/board）      未改
+serving model / challenger                未切换、未 promote
+飞书正式通知                              未改、未接 V2
+生产部署 / git push / 容器重启 /.env 修改   均未执行
+```
+
+## 下一轮建议入口
+
+1. 先把 M1 交 Codex 独立验收（重点：S00 no-op 证据链、S01 mismatch fail-closed 语义、S02 no_fill 口径）；
+2. Codex PASS 后从 **S03（PIT Historical Universe）** 继续，随后 S04（SelectionContract 300/100/50）；
+3. S07 必须一并处理本轮新发现的两条 high 级执行缺陷（DF-S02-001 / DF-S02-002），
+   它们会直接影响"raw execution / 可成交率"的可信度。
