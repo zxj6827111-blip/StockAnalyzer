@@ -1842,6 +1842,96 @@ class BlacklistConfig(_StrictModel):
         return self.matches(symbol) is not None
 
 
+_ALPHA_V2_MODEL_RESOLVER_MODES = frozenset({"pit_research", "strict_production_replay"})
+_ALPHA_V2_ENTRY_MODES = frozenset({"next_session_open", "next_tradable_open"})
+
+
+class AlphaV2Config(_StrictModel):
+    """Alpha V2 独立 Feature Flag（P0-00，蓝图 §5 P0-00 / §10）。
+
+    三个开关的职责边界：
+    - ``enabled``：Alpha V2 子系统总开关。``false`` 时 V2 代码路径不执行、
+      不读写 ``artifacts/alpha_v2``；Legacy 夜扫/通知链路不读本块任何字段。
+    - ``shadow_only``：V2 只落盘 + 影子对照（蓝图 §10.2），不参与正式选股。
+    - ``enforce_final_selection``：V2 接管正式 final selection（蓝图 §10.5 的
+      唯一切换开关）；回滚 = 设回 false，不删任何 Legacy 代码。
+
+    两条 fail-closed 组合规则（禁止"声明关闭/仅影子却又能接管生产"）：
+    1. ``enforce_final_selection=true`` 必须 ``enabled=true``——否则将来某条只读
+       enforce 标志的代码路径会在"总开关关闭"时依旧接管 Legacy，等于开关失效；
+    2. ``enforce_final_selection=true`` 必须 ``shadow_only=false``——shadow 的语义
+       是"只记账不改结果"，与接管正式输出直接矛盾。
+
+    本类只做类型与闭集校验，不引入任何策略逻辑：P0-00 只建立安全基础。
+    """
+
+    enabled: bool = False
+    shadow_only: bool = True
+    enforce_final_selection: bool = False
+    artifact_root: str = "artifacts/alpha_v2"
+    selection_contract: str = "night_alpha_v2_v1"
+    model_resolver_mode: str = "pit_research"
+    entry_mode: str = "next_session_open"
+    primary_horizon_days: int = 5
+    candidate_output_top_k: int = 5
+
+    @field_validator("artifact_root", "selection_contract")
+    @classmethod
+    def _validate_alpha_v2_nonempty(cls, value: str) -> str:
+        normalized = str(value).strip()
+        if not normalized:
+            raise ValueError("alpha_v2 artifact_root/selection_contract must not be empty")
+        return normalized
+
+    @field_validator("model_resolver_mode")
+    @classmethod
+    def _validate_alpha_v2_model_resolver_mode(cls, value: str) -> str:
+        # 闭集校验：写错的 mode 会在 P0-03 的 resolver 里静默落到"当前模型"，
+        # 正是蓝图 §2.9 那类"报告一个模型、实际加载另一个"的假象源头。
+        normalized = str(value).strip().lower()
+        if normalized not in _ALPHA_V2_MODEL_RESOLVER_MODES:
+            supported = ",".join(sorted(_ALPHA_V2_MODEL_RESOLVER_MODES))
+            raise ValueError(
+                f"unsupported alpha_v2.model_resolver_mode: {value} (supported: {supported})"
+            )
+        return normalized
+
+    @field_validator("entry_mode")
+    @classmethod
+    def _validate_alpha_v2_entry_mode(cls, value: str) -> str:
+        # 主口径为 T+1 开盘（蓝图 §4.3）；next_tradable_open 表示停牌/一字板顺延
+        # 到下一可成交开盘的 sensitivity 口径。写错同样 fail-closed，避免将来
+        # P0-05 的入场模拟静默退回 T 日收盘价（已知错误实现）。
+        normalized = str(value).strip().lower()
+        if normalized not in _ALPHA_V2_ENTRY_MODES:
+            supported = ",".join(sorted(_ALPHA_V2_ENTRY_MODES))
+            raise ValueError(f"unsupported alpha_v2.entry_mode: {value} (supported: {supported})")
+        return normalized
+
+    @field_validator("primary_horizon_days", "candidate_output_top_k")
+    @classmethod
+    def _validate_alpha_v2_positive_int(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError(f"alpha_v2 primary_horizon_days/top_k must be > 0, got {value}")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_alpha_v2_switches(self) -> AlphaV2Config:
+        if self.enforce_final_selection:
+            if not self.enabled:
+                raise ValueError(
+                    "alpha_v2.enforce_final_selection=true requires enabled=true："
+                    "总开关关闭时声明“接管正式 final selection”是矛盾状态，"
+                    "fail-closed 拒绝（避免只读 enforce 标志的路径在关闭态生效）"
+                )
+            if self.shadow_only:
+                raise ValueError(
+                    "alpha_v2.enforce_final_selection=true requires shadow_only=false："
+                    "shadow_only 语义是只记账不改结果，与接管正式输出互斥"
+                )
+        return self
+
+
 class StockAnalyzerConfig(_StrictModel):
     app: AppConfig
     data_source: DataSourceConfig
@@ -1899,6 +1989,9 @@ class StockAnalyzerConfig(_StrictModel):
     idle_queue: IdleQueueConfig = Field(default_factory=IdleQueueConfig)
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
     param_freeze: ParamFreezeConfig = Field(default_factory=ParamFreezeConfig)
+    # Alpha V2（P0-00）：默认关闭的独立 Feature Flag 块。放在字段表末尾以保持
+    # 既有字段顺序不变；Legacy 代码路径不得读取本块。
+    alpha_v2: AlphaV2Config = Field(default_factory=AlphaV2Config)
 
 
 def _parse_env_value(raw: str) -> Any:

@@ -1196,3 +1196,28 @@ param_freeze:
     - "/learning/models/release/confirmation/watchdog"
   frozen_queries:
     - "execution_mode_set"
+
+# ---------------------------------------------------------------------------
+# Alpha V2（P0-00）：独立 Feature Flag 块。
+# 与 Legacy 参数完全分离：本块任何取值都不得改变 week5/models/notify 链路行为。
+# enabled=false（默认）时 V2 代码路径不执行、不写 artifacts/alpha_v2。
+#
+# 三个开关的合法组合（fail-closed 校验，见 config.AlphaV2Config）：
+#   enabled=false, shadow_only=true,  enforce_final_selection=false  # 当前默认
+#   enabled=true,  shadow_only=true,  enforce_final_selection=false  # Shadow 期
+#   enabled=true,  shadow_only=false, enforce_final_selection=true   # 接管正式选股
+# 非法组合（加载期直接报错）：enforce=true 而 enabled=false；enforce=true 而
+# shadow_only=true。其余字段只做闭集/正数校验，消费者由 P0-03/P0-05 实现。
+#
+# NAS 开启 Shadow：SA__ALPHA_V2__ENABLED=true（不改本文件）。
+# ---------------------------------------------------------------------------
+alpha_v2:
+  enabled: false
+  shadow_only: true
+  enforce_final_selection: false
+  artifact_root: "artifacts/alpha_v2"
+  selection_contract: "night_alpha_v2_v1"
+  model_resolver_mode: pit_research   # pit_research | strict_production_replay
+  entry_mode: next_session_open       # next_session_open | next_tradable_open
+  primary_horizon_days: 5
+  candidate_output_top_k: 5

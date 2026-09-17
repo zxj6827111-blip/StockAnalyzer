@@ -1,0 +1,53 @@
+{
+  "baseline_commit": "7e9e33bdb9d03506cff5dfff29c78b1c95019541",
+  "behavior_surface": {
+    "legacy": {
+      "allow_zero_signal": true,
+      "cross_review": {
+        "dynamic_enabled": true,
+        "max_diff": 0.18,
+        "p_lgbm_min": 0.6,
+        "p_meta_min": 0.54,
+        "p_xgb_min": 0.55
+      },
+      "deep_candidate_target": 20,
+      "final_signal_cap": 5,
+      "final_signal_min_threshold": 70.0,
+      "light_candidate_target": 100,
+      "night_deep_candidate_target": 50,
+      "night_light_candidate_target": 100,
+      "night_quality_target": 300,
+      "risk_gates": {
+        "board_risk_consecutive_limit_up_reject": 3,
+        "market_breadth_disable_if_below": 45.0,
+        "market_breadth_enabled": true,
+        "overextension_atr_distance_reject": 3.0,
+        "overextension_bias_reject_min": 0.15
+      },
+      "universe_quality_target_size": 100,
+      "week5_enabled": true
+    },
+    "models": {
+      "calibration": "isotonic",
+      "inference_score_source": "raw"
+    },
+    "runtime": {
+      "advisory_only": true,
+      "app_mode": "simulation",
+      "auto_load_predictor": true,
+      "auto_promotion_enabled": false,
+      "news_risk_mode": "shadow",
+      "theme_mode": "shadow"
+    },
+    "training": {
+      "artifact_path": "artifacts/model_v1.json",
+      "embargo_days": 0,
+      "enabled": false,
+      "model_archive_dir": "artifacts/model_archive"
+    }
+  },
+  "captured_at": "2026-09-17",
+  "captured_from": "config/default.yaml（清空 SA__* 环境覆盖后加载，即受跟踪默认值）",
+  "note": "Alpha V2 P0-00 冻结的 Legacy 行为面。这些值在 alpha_v2.enabled=false 时必须保持不变；任何有意的业务参数变更都需要连同本 fixture 一起提交，使变更在 review 里可见。",
+  "schema": "alpha_v2_legacy_baseline_contract.v1"
+}
