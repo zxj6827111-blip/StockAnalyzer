@@ -450,6 +450,13 @@ class AsofBacktestService:
                 "intraday_degraded": intraday_degraded,
                 "intraday_coverage_until": _read_intraday_coverage_until(config),
                 "neutral_account": True,
+                # S02 执行契约：盘后信号 → T+1 可成交开盘；不可成交即 no_fill（不进收益统计）。
+                "execution_contract": {
+                    "entry_mode": "next_session_open",
+                    "entry_delay_days_max": 1,
+                    "no_fill_policy": "excluded_from_return_stats_counted_separately",
+                    "entry_price_basis": "raw_open",
+                },
                 "candidate_pool_source": "explicit" if explicit_symbols else "full_market",
                 "candidate_pool_bias": bool(explicit_symbols),
                 "candidate_pool_note": (
@@ -689,6 +696,13 @@ class AsofBacktestService:
                 "intraday_coverage_until": _read_intraday_coverage_until(self._config),
                 "candidate_pool_source": candidate_pool_source,
                 "candidate_pool_bias": candidate_pool_bias,
+                # S02 执行契约（同 week5 路径）：主口径入场 = T+1 可成交开盘。
+                "execution_contract": {
+                    "entry_mode": "next_session_open",
+                    "entry_delay_days_max": 1,
+                    "no_fill_policy": "excluded_from_return_stats_counted_separately",
+                    "entry_price_basis": "raw_open",
+                },
             },
         }
 

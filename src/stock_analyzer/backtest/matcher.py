@@ -9,18 +9,52 @@ shared engine; this module keeps the backtest-only exit sequence simulation
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 
 from stock_analyzer.config import BacktestMatcherConfig, LimitRuleConfig
 from stock_analyzer.execution.engine import ExecutionEngine, MatchDecision, OrderPlan
 
 __all__ = [
+    "EntrySimulation",
     "ExecutionMatcher",
     "ExitSimulation",
     "MatchDecision",
     "OrderPlan",
 ]
+
+
+@dataclass(slots=True)
+class EntrySimulation:
+    """入场模拟结果（S02：盘后信号 → 次日真实可成交）。
+
+    字段语义（稳定契约，供 outcome / 回测报告消费）：
+
+    - ``executed``：是否真的成交；False 时 ``no_fill_reason`` 必有值；
+    - ``signal_date``：产生信号的交易日（T，收盘后决策）；
+    - ``entry_date``：实际成交日（主口径必须 > signal_date）；未成交时为 None；
+    - ``entry_price_raw``：raw 成交价（未计成本前的开盘价，含滑点前）；
+    - ``reference_open_raw``：该成交日 raw 开盘价（审计用，等于滑点前价格）；
+    - ``slippage``：滑点后的成交价（含滑点，未含手续费）；
+    - ``cost``：按成交价与数量估算的买入成本（手续费等）；
+    - ``net_entry_price``：计入滑点后的成交价（成本另计，便于 outcome 计算）；
+    - ``no_fill_reason``：suspended / limit_up_open / no_valid_price_data /
+      no_future_bars / beyond_delay_window；
+    - ``entry_delay_days``：成交日相对 signal_date 的**交易日**延迟（1 = T+1）。
+    """
+
+    executed: bool
+    signal_date: datetime
+    entry_price_raw: float
+    reference_open_raw: float
+    slippage: float
+    cost: float
+    entry_date: datetime | None = None
+    net_entry_price: float = 0.0
+    no_fill_reason: str = ""
+    entry_delay_days: int = 0
+    deferred_sessions: int = 0
+    details: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -94,6 +128,121 @@ class ExecutionMatcher:
             side=side,
             price=price,
             requested_quantity=requested_quantity,
+        )
+
+    def simulate_entry(
+        self,
+        *,
+        signal_date: datetime,
+        future_bars: list[tuple[datetime, dict[str, float | bool]]],
+        slippage_ratio: float = 0.0,
+        max_entry_sessions: int = 1,
+        quantity: int = 0,
+    ) -> EntrySimulation:
+        """盘后信号 → 次日（或延迟窗口内）**真实可成交**入场模拟（S02）。
+
+        主口径（``max_entry_sessions=1``）：只能在 T+1 交易日开盘成交，不可成交
+        即 ``no_fill``，不得回退到 T 日收盘价（那是不可实现的成交——蓝图 §2.12）。
+
+        敏感性口径（``max_entry_sessions>1``）：允许顺延到窗口内下一可成交开盘；
+        调用方必须把它与主口径分开报告，不得混成一个主结果。
+
+        不可成交判据（全部 fail-closed，不猜测）：
+        - 该日停牌（``suspended``）；
+        - **开盘**价达到/超过涨停价（``limit_up_open``）：开盘即在涨停队列里，
+          不假设能成交；开盘=最高=最低=涨停时另标 ``one_price_limit_up``；
+        - 无有效价格/涨跌停数据（``no_valid_price_data``，含 IPO 无涨跌幅基准期）。
+
+        判据用**开盘价**而不是收盘价：引擎的 ``can_buy`` 按收盘价拒绝涨停买入
+        （对 T 日收盘买入口径正确），但本模拟买的是 T+1 开盘——"开盘在涨停以下、
+        盘中封板收盘涨停"这种 bar 是**可以**成交的（S02 测试用例明确区分
+        "一字涨停不可成交"与"普通涨停但可成交"）。
+
+        成交价 = raw 开盘价 + 滑点（``apply_slippage``，side="buy"），并按 ``quantity``
+        估算买入成本；``entry_date`` 恒晚于 ``signal_date``（交易日维度）。
+        """
+        sessions = max(1, int(max_entry_sessions))
+        bars = list(future_bars)
+        deferred = 0
+        last_reason = "no_future_bars"
+        last_details: dict[str, object] = {}
+        for position, (bar_date, bar) in enumerate(bars, start=1):
+            if position > sessions:
+                break
+            decision = self.can_buy(bar)
+            up_limit = _optional_numeric(
+                dict(decision.details).get("up_limit"), default=None
+            )
+            open_price = _price(bar, key="open", fallback_key="close")
+            high_price = _price(bar, key="high", fallback_key="close")
+            low_price = _price(bar, key="low", fallback_key="close")
+            if not decision.executable and str(decision.reason) in {
+                "suspended",
+                "no_valid_price_data",
+            }:
+                last_reason = str(decision.reason)
+                last_details = dict(decision.details)
+                deferred = position
+                continue
+            if open_price <= 0 or up_limit is None:
+                last_reason = "no_valid_price_data"
+                last_details = {"open": open_price, "up_limit": up_limit}
+                deferred = position
+                continue
+            if open_price >= up_limit:
+                last_reason = "limit_up_open"
+                last_details = {
+                    "open": open_price,
+                    "up_limit": up_limit,
+                    "one_price_limit_up": bool(
+                        low_price >= up_limit and high_price >= up_limit
+                    ),
+                }
+                deferred = position
+                continue
+            slipped = self._engine.apply_slippage(
+                price=open_price, side="buy", slippage_ratio=max(0.0, float(slippage_ratio))
+            )
+            net_price = self._engine.apply_price_tick(slipped, side="buy")
+            cost = (
+                self.estimate_cost("buy", net_price, int(quantity), trade_date=bar_date)
+                if quantity > 0
+                else 0.0
+            )
+            return EntrySimulation(
+                executed=True,
+                signal_date=signal_date,
+                entry_date=bar_date,
+                entry_price_raw=open_price,
+                reference_open_raw=open_price,
+                slippage=net_price - open_price,
+                cost=cost,
+                net_entry_price=net_price,
+                entry_delay_days=position,
+                deferred_sessions=deferred,
+                details={
+                    "buy_reason": str(decision.reason),
+                    "close_at_limit_up": bool(
+                        up_limit is not None
+                        and _price(bar, key="close", fallback_key="open") >= up_limit
+                    ),
+                },
+            )
+        if not bars:
+            last_reason = "no_future_bars"
+        elif deferred >= sessions and last_reason == "no_future_bars":
+            # 窗口用尽仍不可成交：区分"窗口内一直没有可成交日"与"这就是最后一天"。
+            last_reason = "beyond_delay_window"
+        return EntrySimulation(
+            executed=False,
+            signal_date=signal_date,
+            entry_price_raw=0.0,
+            reference_open_raw=0.0,
+            slippage=0.0,
+            cost=0.0,
+            no_fill_reason=last_reason,
+            deferred_sessions=deferred,
+            details=last_details,
         )
 
     def simulate_exit(
