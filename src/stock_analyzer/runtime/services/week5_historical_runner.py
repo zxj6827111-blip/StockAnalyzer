@@ -200,7 +200,10 @@ def run_week5_historical_day(
     symbols: list[str] | None = None,
     base_provider: object | None = None,
     on_progress: Any = None,
-    scan_profile: str = "week5_daily",
+    # S04：历史重放必须与**生产夜扫**同口径（300/100/50 + cap5 + allow_zero），
+    # 因此默认 profile 是显式的 night-equivalent（引擎据此解析
+    # night_alpha_v2_v1 契约）；此前默认 "week5_daily" 会落到 legacy 目标 100/100/20。
+    scan_profile: str = "historical_night_equivalent",
 ) -> dict[str, object]:
     """对单个历史日期执行完整 Week5 每日主选股链路（historical context）。
 

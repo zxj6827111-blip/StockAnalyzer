@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import pandas as pd
 
+from stock_analyzer.contracts.alpha_v2 import resolve_selection_contract
 from stock_analyzer.data.asof_universe import (
     DEFAULT_EXPECTED_ACTIVE_LOOKBACK_DAYS,
     build_pit_stats,
@@ -404,6 +405,21 @@ class Week5EngineBackend(Protocol):
     def runtime_source_mode(self) -> str: ...
 
 
+def _contract_profile(context: Week5RunContext) -> str:
+    """契约解析用的 profile：历史上下文未显式指定时按 night-equivalent 处理。
+
+    S04 的教训是"历史回测悄悄落到 legacy 目标（100/100/20）"——那会让历史与生产
+    不可比。历史 mode 的语义就是"重放生产夜扫"，因此缺省即 night-equivalent；
+    live 缺省仍为 "default"（不改变生产既有口径）。
+    """
+    profile = str(context.scan_profile or "").strip()
+    if profile:
+        return profile
+    if str(context.mode or "").strip() == "historical":
+        return "historical_night_equivalent"
+    return "default"
+
+
 class Week5SelectionEngine:
     """共享漏斗编排器：一次 run() 产出一份完整 Week5 扫描报告。"""
 
@@ -419,6 +435,10 @@ class Week5SelectionEngine:
         self._policy = policy
         self._config = context.config if context.config is not None else backend.config
         self._historical = policy.mode == "historical"
+        # S04：运行期契约在 run() 里解析；默认值只在 run() 之前被读取时兜底。
+        self._run_contract = resolve_selection_contract(
+            self._config, profile=_contract_profile(context),
+        )
 
     # ------------------------------------------------------------------
     # 主流程
@@ -428,6 +448,11 @@ class Week5SelectionEngine:
         config = self._config
         backend = self._backend
         now = ctx.now
+        # S04：一次运行绑定一个 SelectionContract（profile → 目标 + final_cap），
+        # 生产夜扫与历史 night-equivalent 必须拿到同一个 contract_id 与 300/100/50。
+        scan_profile_name = ctx.scan_profile.strip() or "default"
+        contract = resolve_selection_contract(config, profile=_contract_profile(ctx))
+        self._run_contract = contract
         quality_selection_ms = 0
         light_stage_ms = 0
         deep_stage_ms = 0
@@ -446,11 +471,13 @@ class Week5SelectionEngine:
             latest_trade_date=str(snapshot_manifest.trade_date) if snapshot_manifest else "",
         )
         gate_status = str(data_gate.get("status", "ok"))
+        # S04：deep 目标默认取本次运行契约（夜扫/night-equivalent = 50），
+        # 显式 override 仍然优先（生产夜间扫描就是把契约值当 override 传进来的）。
         deep_candidate_target = max(
             1,
             _resolve_positive_int(
                 ctx.deep_candidate_target_override,
-                fallback=_as_int(config.week5.deep_candidate_target, default=20),
+                fallback=contract.deep_target,
             ),
         )
         intraday_scheduler_mode = (
@@ -676,7 +703,6 @@ class Week5SelectionEngine:
             )
             gate_status = str(data_gate.get("status", "ok"))
 
-        scan_profile_name = ctx.scan_profile.strip() or "default"
         if scan_profile_name in ("offhours_friday_full_deep", "offhours_weekend_full_deep"):
             funnel_policy = "intentional_full_deep"
         elif should_scan_universe:
@@ -737,7 +763,7 @@ class Week5SelectionEngine:
                 return blocked_payload
             if snapshot_mode:
                 light_started = perf_counter()
-                light_target = max(1, int(config.week5.light_candidate_target))
+                light_target = max(1, int(contract.light_target))
                 allowed_exchanges_for_light = {
                     str(item).strip().upper()
                     for item in config.evolution.universe_spec.board_scope
@@ -1496,7 +1522,10 @@ class Week5SelectionEngine:
             },
             "funnel": {
                 **funnel_report,
-                "light_candidate_target": max(1, int(config.week5.light_candidate_target)),
+                # S04：契约块（id + 三个目标 + cap + allow_zero）必须原样落报告，
+                # 生产夜扫与历史 night-equivalent 靠它证明"同口径"。
+                "selection_contract": contract.to_payload(),
+                "light_candidate_target": max(1, int(contract.light_target)),
                 "deep_candidate_target": deep_candidate_target,
                 "final_signal_cap": max(0, int(config.week5.final_signal_cap)),
                 "allow_zero_signal": bool(config.week5.allow_zero_signal),
@@ -1774,9 +1803,9 @@ class Week5SelectionEngine:
         except Exception as exc:  # noqa: BLE001 - 股票池解析失败降级为空池 + 报告
             batch_error = f"{type(exc).__name__}: {exc}"
         valid_symbols = _dedupe_preserve_order(sorted(valid_symbols))
-        quality_target = max(
-            1, _as_int(config.week5.universe_quality_target_size, default=300)
-        )
+        # S04：质量池目标取本次运行契约（夜扫/night-equivalent = 300），
+        # 不再固定读 universe_quality_target_size（历史曾经因此是 100）。
+        quality_target = max(1, int(self._run_contract.quality_target))
         quality_selection_report: dict[str, object] | None = None
         selected = valid_symbols
         selector_error = ""
