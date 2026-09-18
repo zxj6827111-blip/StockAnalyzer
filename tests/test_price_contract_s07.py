@@ -97,6 +97,54 @@ def test_nan_up_limit_does_not_let_one_price_limit_up_be_bought(
     assert result.no_fill_reason == "limit_up_open"
 
 
+def test_case_b_nan_limits_no_price_basis_one_price_limit_up_is_rejected(
+    matcher: ExecutionMatcher,
+) -> None:
+    """B3 的 Case B 形态（复审指定）：真实一字涨停 + 涨跌停列整列 NaN + 无 pre_close。
+
+    此形态此前可穿透：``_resolve_limit_prices`` 拿不到 fallback 就回落到 bar 里的
+    NaN，而 NaN 比较恒 False → can_buy 判 ok。修复后必须 fail-closed。
+    """
+    bar = {
+        "open": 11.0,
+        "high": 11.0,
+        "low": 11.0,
+        "close": 11.0,
+        "up_limit": float("nan"),
+        "down_limit": float("nan"),
+        "suspended": False,
+    }
+    decision = matcher.can_buy(bar)
+    assert decision.executable is False
+    assert decision.reason == "no_valid_price_data"
+
+    result = matcher.simulate_entry(
+        signal_date=_SIGNAL, future_bars=[(datetime(2026, 9, 18), bar)]
+    )
+    assert result.executed is False
+    assert result.no_fill_reason == "no_valid_price_data"
+
+
+def test_infinite_limits_are_also_treated_as_missing(matcher: ExecutionMatcher) -> None:
+    """Inf 与 NaN 同口径：不得因为"比任何价都大"而被当成有效上限。"""
+    bar = {
+        "open": 10.5,
+        "high": 10.6,
+        "low": 10.4,
+        "close": 10.5,
+        "pre_close": 10.0,
+        "up_limit": float("inf"),
+        "down_limit": float("-inf"),
+        "suspended": False,
+    }
+    result = matcher.simulate_entry(
+        signal_date=_SIGNAL, future_bars=[(datetime(2026, 9, 18), bar)]
+    )
+    # 回落 fallback（pre_close×1.1=11.0）→ 开盘 10.5 在涨停下方 → 可成交
+    assert result.executed is True
+    assert result.entry_price_raw == pytest.approx(10.5)
+
+
 # ---------------------------------------------------------------------------
 # DF-S02-001：不再注入估算涨跌停（缺列 → fail-closed）
 # ---------------------------------------------------------------------------
