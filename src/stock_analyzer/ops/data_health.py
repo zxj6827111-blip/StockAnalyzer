@@ -192,8 +192,23 @@ def evaluate_data_health(
                     {"expected_active_count": 0},
                 )
             )
+        elif valid_symbol_count is None:
+            # N2（半批审）：分母有了但**分子拿不到**时不得当成 1.0 判 ok——
+            # 模块自立的"缺失/无法验证不得记 ok"不能被默认值绕过。
+            missing.append("valid_symbol_count")
+            checks.append(
+                DataHealthCheck(
+                    CHECK_EXPECTED_ACTIVE_COVERAGE,
+                    CHECK_DEGRADED,
+                    (
+                        f"expected_active={expected_active} 已知，但 valid_symbol_count 缺失，"
+                        "覆盖率无法验证（不得当健康）"
+                    ),
+                    {"expected_active_count": expected_active, "coverage_ratio": None},
+                )
+            )
         else:
-            valid = int(valid_symbol_count if valid_symbol_count is not None else expected_active)
+            valid = int(valid_symbol_count)
             coverage_ratio = max(0.0, min(1.0, valid / expected_active))
             status = (
                 CHECK_OK

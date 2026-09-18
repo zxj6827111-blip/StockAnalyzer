@@ -186,19 +186,89 @@ def _resolve_run_model(
     )
 
 
+def _bind_resolved_artifact(config: StockAnalyzerConfig, resolution: Any) -> StockAnalyzerConfig:
+    """把 pipeline 的加载路径绑定到解析器选出的工件（Codex B1 修复）。
+
+    此前解析结果只进报告，``AnalyzerPipeline`` 仍按 ``config.training.artifact_path``
+    加载当前在服工件——"resolve 了但不加载 resolved 的那个"，于是 as_of 之后创建的
+    模型照样进了历史回测。这里让加载路径与解析结果同源。
+    """
+    resolved_uri = str(getattr(resolution, "artifact_uri", "") or "").strip()
+    if not resolved_uri:
+        return config
+    return config.model_copy(
+        update={
+            "training": config.training.model_copy(update={"artifact_path": resolved_uri}),
+        }
+    )
+
+
+def _verify_loaded_artifact(
+    pipeline: AnalyzerPipeline,
+    resolution: Any,
+    *,
+    decision_time: datetime,
+) -> dict[str, object]:
+    """加载后复核：实算哈希一致 + created_at <= 决策时刻；不符即返回原因。
+
+    返回空 dict 表示通过；非空 dict 含 ``reason`` 与事实，供 unscorable 报告落痕。
+    """
+    from stock_analyzer.models.historical_resolver import created_within_decision
+
+    try:
+        facts = pipeline.model_identity_facts()
+    except Exception as exc:  # noqa: BLE001 - 校验失败按 fail-closed 处理
+        return {
+            "reason": "loaded_artifact_identity_unavailable",
+            "detail": f"{type(exc).__name__}: {exc}",
+        }
+    loaded_uri = str(facts.get("artifact_uri", "") or "")
+    loaded_hash = str(facts.get("artifact_content_hash", "") or "")
+    expected_hash = str(getattr(resolution, "artifact_content_hash", "") or "")
+    expected_uri = str(getattr(resolution, "artifact_uri", "") or "")
+    verification: dict[str, object] = {
+        "expected_uri": expected_uri,
+        "expected_content_hash": expected_hash,
+        "loaded_uri": loaded_uri,
+        "loaded_content_hash": loaded_hash,
+        "predictor_loaded": bool(facts.get("predictor_loaded", False)),
+    }
+    if not bool(facts.get("predictor_loaded", False)):
+        return {**verification, "reason": "loaded_artifact_missing"}
+    if expected_hash and loaded_hash.lower() != expected_hash.lower():
+        return {**verification, "reason": "loaded_artifact_hash_mismatch"}
+    created_ok = created_within_decision(
+        artifact_created_at=facts.get("artifact_created_at", ""),
+        decision_time=decision_time,
+    )
+    verification["created_within_decision"] = created_ok
+    if created_ok is not True:
+        return {**verification, "reason": "loaded_artifact_created_after_decision"}
+    return {}
+
+
 def _unscorable_report(
     *,
     as_of: Any,
     decision_time: datetime,
     resolution: Any,
     scan_profile: str,
+    reason: str = "",
+    verification: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """不可评分报告：结构完整但**零结果**（不跑扫描、不产出任何候选）。
 
     M1 的 fail-closed 原则：找不到合法的 as_of 历史模型时，正确结果是"这天不可评分"，
     而不是用当前在服模型算出一个看起来正常的结果。
+
+    ``reason``/``verification`` 供 B1 的"解析过门但加载不过门"场景覆盖解析器结论
+    （例如加载到的工件哈希与解析结果不符）。
     """
     payload = resolution.to_payload()
+    if reason:
+        payload = {**payload, "status": "unscorable", "reason": reason}
+    if verification:
+        payload = {**payload, "load_verification": dict(verification)}
     return {
         "status": "unscorable",
         "scan_profile": scan_profile,
@@ -301,7 +371,21 @@ def run_week5_historical_day(
             resolution=model_resolution,
             scan_profile=scan_profile,
         )
+    # B1：解析出来的工件必须**真的被加载**（把加载路径绑定到 resolved URI）
+    hist_config = _bind_resolved_artifact(hist_config, model_resolution)
     pipeline = AnalyzerPipeline(config=hist_config, provider=provider)
+    load_verification = _verify_loaded_artifact(
+        pipeline, model_resolution, decision_time=decision_time
+    )
+    if load_verification:
+        return _unscorable_report(
+            as_of=as_of,
+            decision_time=decision_time,
+            resolution=model_resolution,
+            scan_profile=scan_profile,
+            reason=str(load_verification.get("reason", "loaded_artifact_mismatch")),
+            verification=load_verification,
+        )
 
     def run_pipeline_fn(
         *,

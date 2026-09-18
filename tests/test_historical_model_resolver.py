@@ -33,6 +33,8 @@ from stock_analyzer.models.historical_resolver import (
     resolve_historical_model,
 )
 
+_ROOT = Path(__file__).resolve().parents[1]
+
 # 决策时刻：2026-09-30 15:30（Asia/Shanghai，aware）
 DECISION = datetime(2026, 9, 30, 15, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
 
@@ -368,3 +370,179 @@ def test_payload_is_auditable_for_both_modes(mode: str) -> None:
     for key in ("status", "mode", "as_of", "decision_time", "time_semantics", "fallback_used"):
         assert key in payload
     assert payload["fallback_used"] is False
+
+
+def _train_loadable_artifact(tmp_path: Path, *, name: str, created_at: str) -> Path:
+    """训练一个**真可加载**的工件并把 created_at 改成指定时间（B1 校验需要真实加载）。
+
+    手写的最小 JSON 过不了适配器反序列化（unsupported serialized backend），
+    因此这里用 ModelTrainer 产出真实工件；改 created_at 后重算哈希。
+    """
+    import json as _json
+
+    from stock_analyzer.config import load_config
+    from stock_analyzer.data.provider import SyntheticProvider
+    from stock_analyzer.models.trainer import ModelTrainer
+
+    config = load_config(_ROOT / "config" / "default.yaml")
+    config.training.min_samples = 40
+    path = tmp_path / name
+    provider = SyntheticProvider(seed_offset=11)
+    bars = provider.fetch_daily_bars("600000", lookback_days=300)
+    ModelTrainer(training=config.training, labels=config.labels).train_and_save(
+        bars=bars, output_path=str(path)
+    )
+    payload = _json.loads(path.read_text(encoding="utf-8"))
+    payload["created_at"] = created_at
+    path.write_text(_json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+# ---------------------------------------------------------------------------
+# B1 回归：解析出来的工件必须**真的被加载**（resolve 过门 ≠ 加载过门）
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_checkout_uses_resolved_artifact_not_serving_path(tmp_path: Path) -> None:
+    """对抗场景：registry 只有旧 PIT 模型，config 指向**更新的在服工件**。
+
+    修复前：resolver 判 resolved（旧工件），但 pipeline 仍按 config 加载新工件 →
+    as_of 之后创建的模型进了历史回测。修复后：加载路径绑定到 resolved 工件，
+    且加载后校验哈希与 created_at。
+    """
+    from stock_analyzer.models.bundle import compute_artifact_identity_hash
+    from stock_analyzer.runtime.services.week5_historical_runner import (
+        _bind_resolved_artifact,
+        _verify_loaded_artifact,
+    )
+
+    old_artifact = _train_loadable_artifact(
+        tmp_path, name="archive/model_old.json", created_at="2026-05-01T10:00:00"
+    )
+    serving_artifact = _train_loadable_artifact(
+        tmp_path, name="serving_new.json", created_at="2026-10-15T10:00:00"
+    )
+    old_hash = compute_artifact_identity_hash(old_artifact)
+    new_hash = compute_artifact_identity_hash(serving_artifact)
+    assert old_hash != new_hash
+
+    from stock_analyzer.config import load_config
+
+    config = load_config(_ROOT / "config" / "default.yaml")
+    config = config.model_copy(
+        update={
+            "training": config.training.model_copy(
+                update={"artifact_path": str(serving_artifact)}
+            )
+        }
+    )
+    resolution = resolve_historical_model(
+        as_of=DECISION,
+        candidates=[
+            _candidate(
+                model_id="m_old",
+                artifact_uri=str(old_artifact),
+                artifact_content_hash=old_hash,
+                artifact_created_at="2026-05-01T10:00:00+08:00",
+            )
+        ],
+        mode=MODE_PIT_RESEARCH,
+    )
+    assert resolution.status == STATUS_RESOLVED
+    assert resolution.artifact_uri == str(old_artifact)
+
+    bound = _bind_resolved_artifact(config, resolution)
+    assert bound.training.artifact_path == str(old_artifact)
+    assert bound.training.artifact_path != str(serving_artifact)
+
+    from stock_analyzer.data.provider import SyntheticProvider
+    from stock_analyzer.pipeline import AnalyzerPipeline
+
+    pipeline = AnalyzerPipeline(config=bound, provider=SyntheticProvider(seed_offset=3))
+    verification = _verify_loaded_artifact(pipeline, resolution, decision_time=DECISION)
+    assert verification == {}, verification
+    facts = pipeline.model_identity_facts()
+    # 关键：实际加载的是 resolved 的那份（不是 config 原来指向的在服新工件）
+    assert facts["artifact_uri"] == str(old_artifact)
+    assert facts["artifact_content_hash"] == old_hash
+    assert facts["artifact_content_hash"] != new_hash
+
+
+def test_verification_flags_hash_mismatch_and_future_creation(tmp_path: Path) -> None:
+    """校验必须能拦住"加载到的不是解析那份"与"加载到未来工件"。"""
+    from stock_analyzer.models.bundle import compute_artifact_identity_hash
+    from stock_analyzer.runtime.services.week5_historical_runner import _verify_loaded_artifact
+
+    artifact = _train_loadable_artifact(
+        tmp_path, name="model_future.json", created_at="2026-10-15T10:00:00"
+    )
+
+    from stock_analyzer.config import load_config
+    from stock_analyzer.data.provider import SyntheticProvider
+    from stock_analyzer.pipeline import AnalyzerPipeline
+
+    config = load_config(_ROOT / "config" / "default.yaml")
+    config = config.model_copy(
+        update={"training": config.training.model_copy(update={"artifact_path": str(artifact)})}
+    )
+    pipeline = AnalyzerPipeline(config=config, provider=SyntheticProvider(seed_offset=4))
+
+    mismatched = resolve_historical_model(
+        as_of=DECISION,
+        candidates=[
+            _candidate(
+                artifact_uri=str(artifact),
+                artifact_content_hash="f" * 64,
+                artifact_created_at="2026-05-01T10:00:00+08:00",
+            )
+        ],
+        mode=MODE_PIT_RESEARCH,
+    )
+    result = _verify_loaded_artifact(pipeline, mismatched, decision_time=DECISION)
+    assert result["reason"] == "loaded_artifact_hash_mismatch"
+
+    expected = resolve_historical_model(
+        as_of=DECISION,
+        candidates=[
+            _candidate(
+                artifact_uri=str(artifact),
+                artifact_content_hash=compute_artifact_identity_hash(artifact),
+                artifact_created_at="2026-10-15T10:00:00+08:00",
+            )
+        ],
+        mode=MODE_PIT_RESEARCH,
+    )
+    result2 = _verify_loaded_artifact(pipeline, expected, decision_time=DECISION)
+    assert result2["reason"] == "loaded_artifact_created_after_decision"
+    assert result2["created_within_decision"] is False
+
+
+def test_missing_resolved_artifact_is_unscorable_via_runner(tmp_path: Path) -> None:
+    """解析结果指向不存在的文件：绑定后加载不到 → unscorable（不静默用别的工件）。"""
+    from stock_analyzer.config import load_config
+    from stock_analyzer.data.provider import SyntheticProvider
+    from stock_analyzer.pipeline import AnalyzerPipeline
+    from stock_analyzer.runtime.services.week5_historical_runner import (
+        _bind_resolved_artifact,
+        _verify_loaded_artifact,
+    )
+
+    missing = tmp_path / "gone.json"
+    # （missing 文件不需要存在：本用例验证"解析声明存在但实际加载不到"）
+    resolution = resolve_historical_model(
+        as_of=DECISION,
+        candidates=[
+            _candidate(
+                artifact_uri=str(missing),
+                artifact_exists=True,
+                artifact_content_hash="a" * 64,
+            )
+        ],
+        mode=MODE_PIT_RESEARCH,
+    )
+    assert resolution.status == STATUS_RESOLVED  # 候选表声明存在（桩）
+    config = load_config(_ROOT / "config" / "default.yaml")
+    bound = _bind_resolved_artifact(config, resolution)
+    pipeline = AnalyzerPipeline(config=bound, provider=SyntheticProvider(seed_offset=5))
+    verification = _verify_loaded_artifact(pipeline, resolution, decision_time=DECISION)
+    assert verification["reason"] == "loaded_artifact_missing"

@@ -590,40 +590,40 @@ def _register_pit_model(
 ) -> str:
     """给 service 注入"as_of 之前就存在"的合法模型登记（S06 时间闸门需要）。
 
-    只写进程内桩，**不写共享 DuckDB**（避免多 worker 并发锁竞争导致的间歇失败）。
+    两条硬约束（都是本轮实测教训）：
+    1. 只写进程内桩，**不写共享 DuckDB**（否则多 xdist worker 撞锁 → 间歇失败）；
+    2. 工件必须**真的可加载**（ModelTrainer 产出）：B1 起解析结果会被绑到实际加载
+       路径，手写的最小 JSON 过不了适配器反序列化 → 会被正确地判 unscorable。
     """
-    from stock_analyzer.models.artifact import ModelArtifact
-    from stock_analyzer.models.bundle import compute_artifact_identity_hash
+    import json as _json
 
+    from stock_analyzer.data.provider import SyntheticProvider
+    from stock_analyzer.models.bundle import compute_artifact_identity_hash
+    from stock_analyzer.models.trainer import ModelTrainer
+
+    cfg = _load_test_config()
+    cfg.training.min_samples = 40
     nonce = uuid.uuid4().hex
     artifact_path = tmp_path / f"pit_model_{nonce}.json"
-    artifact = ModelArtifact.create(
-        feature_schema_id="fs_pit_v1",
-        feature_schema_hash="fs-hash",
-        label_policy_id="label_policy_v1_e2afc1135a3f",
-        label_policy_hash="label-hash",
-        dataset_manifest_id="dataset_manifest_pit",
-        feature_columns=["close", "ret_5d"],
-        lgbm_model={},
-        xgb_model={},
-        lgbm_calibrator={},
-        xgb_calibrator={},
-        training_metrics={"auc": 0.5},
-        metadata={"test_nonce": nonce},
+    bars = SyntheticProvider(seed_offset=11).fetch_daily_bars("600000", lookback_days=300)
+    ModelTrainer(training=cfg.training, labels=cfg.labels).train_and_save(
+        bars=bars, output_path=str(artifact_path)
     )
-    artifact.created_at = created_at  # 模拟"训练发生在 as_of 之前"
-    artifact.save(artifact_path)
+    payload = _json.loads(artifact_path.read_text(encoding="utf-8"))
+    payload["created_at"] = created_at  # 模拟"训练发生在 as_of 之前"
+    artifact_path.write_text(_json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
     model_id = f"model_pit_{nonce[:12]}"
     record = _RegistryRecord(
         model_id=model_id,
         artifact_uri=str(artifact_path),
         artifact_content_hash=compute_artifact_identity_hash(artifact_path),
         artifact_created_at=datetime.fromisoformat(created_at),
-        feature_schema_id="fs_pit_v1",
-        feature_schema_hash="fs-hash",
-        label_policy_id="label_policy_v1_e2afc1135a3f",
-        label_policy_hash="label-hash",
-        dataset_manifest_id="dataset_manifest_pit",
+        feature_schema_id=str(payload.get("feature_schema_id", "")) or "fs_pit_v1",
+        feature_schema_hash=str(payload.get("feature_schema_hash", "")),
+        label_policy_id=str(payload.get("label_policy_id", "")),
+        label_policy_hash=str(payload.get("label_policy_hash", "")),
+        dataset_manifest_id=str(payload.get("dataset_manifest_id", "")),
         lifecycle_state="trained",
         promoted_at=None,
     )
@@ -1028,13 +1028,29 @@ def test_api_week5_daily_end_to_end_full_market(
             "final_signal_cap": 2,
             "market_breadth_enabled": False,
             "auto_sync_watchlist": False,
+            # B2 盲区修复：端到端必须**真的产生候选**，否则 holding 段（滑点/入场口径）
+            # 根本不会被跑到——此前该夹具 final_count=0，服务层调用签名漂移长期隐身。
+            # 放宽终门与共识门只为让合成数据走到 final（夹具口径，不动生产配置）。
+            "final_signal_min_threshold": 0.0,
         }
+    )
+    cross_review = main_module._service._config.models.cross_review.model_copy(
+        update={
+            "p_lgbm_min": 0.0,
+            "p_xgb_min": 0.0,
+            "p_meta_min": 0.0,
+            "max_diff": 1.0,
+            "dynamic_enabled": False,
+        }
+    )
+    models = main_module._service._config.models.model_copy(
+        update={"cross_review": cross_review}
     )
     patched_asof = main_module._service._config.asof_backtest.model_copy(
         update={"output_dir": str(output_dir)}
     )
     patched_config = main_module._service._config.model_copy(
-        update={"asof_backtest": patched_asof, "week5": week5}
+        update={"asof_backtest": patched_asof, "week5": week5, "models": models}
     )
     monkeypatch.setattr(main_module, "_config", patched_config)
     monkeypatch.setattr(main_module._service, "_config", patched_config)
@@ -1110,7 +1126,20 @@ def test_api_week5_daily_end_to_end_full_market(
         "holding_curve",
         "historical_context",
     }
-    assert entry["holding_curve"] is not None or entry["candidate_count"] == 0
+    # B2 回归堵漏：候选非空时必须真的跑出 holding 段（此前该断言允许
+    # holding_curve=None，服务层 slippage_ratio 传参错误因此长期隐身）。
+    assert entry["funnel"]["final_count"] > 0, (
+        "端到端夹具必须产生候选，否则 holding 段断言是空的（B2 盲区）"
+    )
+    if entry["candidate_count"] > 0:
+        holding = entry["holding_curve"]
+        assert holding is not None, "有候选却没有 holding 段（服务层调用签名漂移）"
+        assert holding["results"], "holding 段为空"
+        for item in holding["results"]:
+            assert item["entry_mode"] == "next_session_open"
+            assert item["entry_slippage"] >= 0.0
+    else:
+        assert entry["holding_curve"] is None
     # latest 落盘且带算法标注
     latest = client.get("/backtest/asof-scan/latest").json()["report"]
     assert latest["algorithm"] == "week5_daily"
@@ -1329,3 +1358,88 @@ def test_engine_historical_low_coverage_breadth_keeps_buy_path_open(
         for reason in item.get("reject_reasons", [])
     }
     assert not any(reason.startswith("data_gate:market_breadth") for reason in rejected_reasons)
+
+
+# ---------------------------------------------------------------------------
+# B1 回归（runner 级）：as_of 之后创建的在服工件不得被历史重放加载
+# ---------------------------------------------------------------------------
+
+
+def test_runner_loads_resolved_pit_artifact_not_newer_serving_artifact(tmp_path: Path) -> None:
+    """对抗场景（Codex B1 复现路径）：config 指向比 as_of 更新的在服工件，
+    registry 里只有更早创建的 PIT 合法模型。
+
+    期望：重放加载 **resolved 的那份旧工件**（报告身份 = 旧工件哈希），
+    而不是 config 指向的新工件——即"解析过门"必须等价于"加载过门"。
+    """
+    from stock_analyzer.data.provider import SyntheticProvider
+    from stock_analyzer.models.bundle import compute_artifact_identity_hash
+    from stock_analyzer.models.trainer import ModelTrainer
+    from stock_analyzer.runtime.services.week5_historical_runner import run_week5_historical_day
+
+    def _train(name: str, created_at: str) -> Path:
+        import json as _json
+
+        cfg = _load_test_config()
+        cfg.training.min_samples = 40
+        path = tmp_path / name
+        bars = SyntheticProvider(seed_offset=13).fetch_daily_bars("600000", lookback_days=300)
+        ModelTrainer(training=cfg.training, labels=cfg.labels).train_and_save(
+            bars=bars, output_path=str(path)
+        )
+        payload = _json.loads(path.read_text(encoding="utf-8"))
+        payload["created_at"] = created_at
+        path.write_text(_json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        return path
+
+    pit_artifact = _train("pit_old.json", "2026-05-01T10:00:00")
+    newer_serving = _train("serving_new.json", "2026-09-15T10:00:00")  # AS_OF=2026-07-31 之后
+    pit_hash = compute_artifact_identity_hash(pit_artifact)
+    newer_hash = compute_artifact_identity_hash(newer_serving)
+    assert pit_hash != newer_hash
+
+    config = _load_test_config()
+    _enable_universe_quality_selector(config)
+    config.week5.feature_snapshot_root = str(tmp_path / "production_features_light")
+    config.week5.auto_sync_watchlist = False
+    config.week5.market_breadth_enabled = False
+    config.training.artifact_path = str(newer_serving)  # 在服工件比 as_of 新
+
+    service = _new_service(config, provider=SyntheticProvider(seed_offset=15))
+    service._model_registry = _InMemoryRegistry(  # noqa: SLF001 - 只登记的旧 PIT 模型
+        [
+            _RegistryRecord(
+                model_id="model_pit_old",
+                artifact_uri=str(pit_artifact),
+                artifact_content_hash=pit_hash,
+                artifact_created_at=datetime(2026, 5, 1, 10, 0),
+                feature_schema_id="fs_pit_v1",
+                feature_schema_hash="fs-hash",
+                label_policy_id="label_policy_v1_e2afc1135a3f",
+                label_policy_hash="label-hash",
+                dataset_manifest_id="dataset_manifest_pit",
+                lifecycle_state="trained",
+                promoted_at=None,
+            )
+        ]
+    )
+
+    task_dir = tmp_path / "week5_task_b1"
+    task_dir.mkdir(parents=True, exist_ok=True)
+    report = run_week5_historical_day(
+        service=service,
+        as_of=AS_OF,
+        task_dir=task_dir,
+        symbols=["600000", "000001"],
+        base_provider=_FakeHistoricalProvider(["600000", "000001"], data_end=AS_OF),
+    )
+
+    # 可评分（旧模型 PIT 合法）→ 实际加载的必须是旧工件
+    assert report.get("status") != "unscorable", report.get("model_resolution")
+    resolution = report["model_resolution"]
+    assert resolution["status"] == "resolved"
+    assert resolution["artifact_uri"] == str(pit_artifact)
+    model = report["historical_context"]["model"]
+    assert model["artifact_content_hash"] == pit_hash
+    assert model["artifact_content_hash"] != newer_hash
+    assert model["trained_at"] == "2026-05-01T10:00:00"

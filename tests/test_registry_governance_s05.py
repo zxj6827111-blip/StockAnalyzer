@@ -369,6 +369,39 @@ def test_prune_protected_bundles_survive_budget_pressure(tmp_path: Path) -> None
     assert "model_v2_1" in removed
 
 
+def test_prune_with_generous_budget_deletes_nothing(tmp_path: Path) -> None:
+    """N1 回归：给了足够预算时**一个都不删**。
+
+    此前实现里预算分支是 no-op（结尾循环仍把 remaining 全删），实际行为恒等于
+    "只留 retention_count + protected"，与"按容量管理"的声明不符。
+    """
+    from stock_analyzer.models.bundle import prune_model_bundle_archive
+
+    for index in range(4):
+        _make_bundle(tmp_path, f"model_v2_{index}", size_bytes=2000, mtime=1000 + index)
+    removed = prune_model_bundle_archive(
+        tmp_path, retention_count=2, max_total_bytes=1024 * 1024
+    )
+    assert removed == []
+    assert len(list(tmp_path.glob("model_v2_*"))) == 4
+
+
+def test_prune_budget_deletes_oldest_until_within_budget(tmp_path: Path) -> None:
+    """超预算时从最旧开始删，删到进预算即停（且不低于保留下限）。"""
+    from stock_analyzer.models.bundle import prune_model_bundle_archive
+
+    for index in range(4):
+        _make_bundle(tmp_path, f"model_v2_{index}", size_bytes=2000, mtime=1000 + index)
+    # 每个 bundle ≈ 2000B + 工件；预算只允许保留 3 个 ≈ 6000B
+    removed = prune_model_bundle_archive(
+        tmp_path, retention_count=1, max_total_bytes=6500
+    )
+    remaining = sorted(item.name for item in tmp_path.glob("model_v2_*"))
+    assert len(remaining) <= 3
+    assert "model_v2_3" in remaining  # 最新必留
+    assert "model_v2_0" in removed  # 最旧先删
+
+
 def test_prune_without_budget_keeps_legacy_count_semantics(tmp_path: Path) -> None:
     """不传预算时行为与既有 count 语义一致（Legacy 回归保护）。"""
     from stock_analyzer.models.bundle import prune_model_bundle_archive

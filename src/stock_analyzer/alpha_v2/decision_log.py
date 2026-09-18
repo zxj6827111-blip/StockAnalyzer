@@ -207,6 +207,8 @@ def compute_outcomes(
     evaluation_date: date,
     horizons: Sequence[int] = DEFAULT_HORIZONS,
     trading_days: Sequence[date] | None = None,
+    matcher: Any = None,
+    config: Any = None,
 ) -> OutcomeMaturity:
     """按 S02 的 T+1 可成交入场 + raw 价格计算已成熟 horizon 的 outcome。
 
@@ -218,9 +220,21 @@ def compute_outcomes(
     ``no_fill_reason``，收益字段保留 ``not_available``（不假设理想成交）。
     """
     from stock_analyzer.backtest.matcher import ExecutionMatcher
-    from stock_analyzer.config import BacktestMatcherConfig, LimitRuleConfig
 
-    matcher = ExecutionMatcher(BacktestMatcherConfig(), limit_rule=LimitRuleConfig())
+    # N3（半批审）：成本档位/涨跌停规则必须来自**运行配置**，不能用裸默认值——
+    # 否则 outcome 的净收益与运行期其他环节口径不一致（stamp tax/commission/板块幅度）。
+    resolved_matcher = matcher
+    if resolved_matcher is None:
+        if config is not None:
+            resolved_matcher = ExecutionMatcher(
+                config.backtest_matcher, limit_rule=config.limit_rule
+            )
+        else:
+            from stock_analyzer.config import BacktestMatcherConfig, LimitRuleConfig
+
+            resolved_matcher = ExecutionMatcher(
+                BacktestMatcherConfig(), limit_rule=LimitRuleConfig()
+            )
     calendar = list(trading_days) if trading_days else None
 
     matured: list[int] = []
@@ -246,7 +260,7 @@ def compute_outcomes(
                     signal_date=signal_date,
                     horizon=horizon,
                     target_date=target_date,
-                    matcher=matcher,
+                    matcher=resolved_matcher,
                 )
             )
     return OutcomeMaturity(

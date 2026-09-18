@@ -412,6 +412,8 @@ def analyze_holding_curve(
     take_profit_pct: float = _DEFAULT_TAKE_PROFIT_PCT,
     stop_loss_pct: float = _DEFAULT_STOP_LOSS_PCT,
     symbols: Sequence[str] | None = None,
+    slippage_ratio: float = 0.0,
+    max_entry_sessions: int = 1,
 ) -> HoldingCurveReport:
     """对一批标的跑持有期走势分析，并产出汇总统计。
 
@@ -419,10 +421,14 @@ def analyze_holding_curve(
         bars_by_symbol: symbol -> 日线 DataFrame 的映射（调用方负责提供，
             通常是 as-of 扫描结果里 buy 候选对应的完整历史行情，覆盖到
             entry_date 之后 horizon_days 根记录或截止今日）。
-        entry_date: 统一买入日。
+        entry_date: 统一买入日（S02 起语义为**信号日 T**）。
         matcher: 复用的 ExecutionMatcher 实例。
         symbols: 可选的标的子集/顺序（None 时使用 bars_by_symbol 的全部键，
             按输入顺序）。
+        slippage_ratio: 买入滑点比例（S07/DF-S02-003：调用方应传策略静态滑点，
+            不再默认 0）。**半批审 B2 修复**：此前本函数没有该参数，服务层却按
+            关键字传入 → TypeError，导致"有候选的 as-of 回测"必崩、滑点修复空转。
+        max_entry_sessions: 入场延迟窗口（1 = 主口径 T+1；>1 = sensitivity）。
     """
     ordered_symbols = list(symbols) if symbols is not None else list(bars_by_symbol.keys())
     results: list[SymbolHoldingResult] = []
@@ -437,6 +443,8 @@ def analyze_holding_curve(
                 horizon_days=horizon_days,
                 take_profit_pct=take_profit_pct,
                 stop_loss_pct=stop_loss_pct,
+                slippage_ratio=slippage_ratio,
+                max_entry_sessions=max_entry_sessions,
             )
         except Exception as exc:  # noqa: BLE001 - 单只票的意外异常不能打断整批
             result = SymbolHoldingResult(

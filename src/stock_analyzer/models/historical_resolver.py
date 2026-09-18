@@ -247,6 +247,36 @@ def _raw_timestamp_aware(row: Mapping[str, object], *, mode: str) -> bool:
     return False
 
 
+def created_within_decision(
+    *,
+    artifact_created_at: object,
+    decision_time: datetime,
+    assume_local_timezone: bool = True,
+    local_timezone: str = "Asia/Shanghai",
+) -> bool | None:
+    """工件创建时间是否 <= 决策时刻（timezone-aware 比较，语义与解析器同一套）。
+
+    返回 ``None`` 表示"判不了"（解析失败或禁止 naive 假定）——调用方必须按
+    fail-closed 处理，不得当成 True。
+
+    用途（Codex 复审 B1）：解析器选出的工件必须**真的被加载**，加载后要用同一套
+    时间语义复核 created_at <= decision_time，避免"解析过门、加载没过门"。
+    """
+    created = _parse_dt(
+        artifact_created_at,
+        assume_local_timezone=assume_local_timezone,
+        tz=local_timezone,
+    )
+    if created is None:
+        return None
+    decision = _as_aware(
+        decision_time, assume_local_timezone=assume_local_timezone, tz=local_timezone
+    )
+    if decision is None:
+        return None
+    return created <= decision
+
+
 def _reject_reason(
     row: Mapping[str, object],
     *,
@@ -386,6 +416,7 @@ def _parse_dt(
 
 __all__ = [
     "MODE_PIT_RESEARCH",
+    "created_within_decision",
     "MODE_STRICT_PRODUCTION_REPLAY",
     "MODES",
     "REASON_MODE_UNSUPPORTED",

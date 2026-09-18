@@ -108,6 +108,22 @@ def test_low_expected_active_coverage_is_broken() -> None:
     assert report.coverage_ratio == pytest.approx(0.5)
 
 
+def test_missing_valid_symbol_count_is_degraded_not_ok() -> None:
+    """N2 回归：分子缺失（valid_symbol_count=None）必须判 degraded。
+
+    此前实现把它当成 valid == expected_active → 覆盖率 1.0 → ok，等于用默认值
+    绕过了模块自立的"缺失/无法验证不得记 ok"。
+    """
+    report = evaluate_data_health(
+        **_healthy_kwargs(valid_symbol_count=None)  # type: ignore[arg-type]
+    )
+    check = report.check(CHECK_EXPECTED_ACTIVE_COVERAGE)
+    assert check is not None
+    assert check.status == CHECK_DEGRADED
+    assert report.status != HEALTH_HEALTHY
+    assert "valid_symbol_count" in report.missing_artifacts
+
+
 def test_zero_expected_active_is_broken_not_100_percent() -> None:
     report = evaluate_data_health(
         **_healthy_kwargs(  # type: ignore[arg-type]

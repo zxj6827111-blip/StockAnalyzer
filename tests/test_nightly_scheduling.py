@@ -503,6 +503,10 @@ def test_global_notification_switch_suppresses_the_legacy_notify_path(
             return NotificationResult(success=True, channel="spy")
 
     service._config.notifications.enabled = False
+    # N4（Codex 半批审）：本用例与墙钟无关，但默认 quiet_windows（如 .env 的
+    # 11:30-13:00）会在午间静默窗内把"打开后恢复发送"这段断言打挂——那是测试
+    # 环境敏感而非功能回归。这里显式清空静默窗，让用例只考验开关语义。
+    service._config.notification_filter.quiet_windows = []
     service._notifier = _SpyNotifier()  # type: ignore[assignment]
     payload = service.notify(title="t", content="c", level="info", trace_id="x")
     assert calls == []

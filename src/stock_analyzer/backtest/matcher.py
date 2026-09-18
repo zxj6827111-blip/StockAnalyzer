@@ -8,6 +8,7 @@ shared engine; this module keeps the backtest-only exit sequence simulation
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -435,13 +436,21 @@ def _price(
 
 
 def _optional_numeric(value: object, default: float) -> float:
+    """数值解析（B3 修复）：NaN/Inf 一律按**缺失**处理。
+
+    此前只在 ``limit_rule._optional_float`` 过滤 NaN，引擎/matcher 这一层仍会把它
+    透传；而 NaN 比较恒 False → 涨停门静默放行（"涨跌停列整列 NaN"的一字涨停形态
+    仍可被买入，Codex B3 实证）。
+    """
     if isinstance(value, bool):
         return default
     if isinstance(value, (int, float)):
-        return float(value)
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else default
     if isinstance(value, str):
         try:
-            return float(value)
+            parsed = float(value)
         except ValueError:
             return default
+        return parsed if math.isfinite(parsed) else default
     return default

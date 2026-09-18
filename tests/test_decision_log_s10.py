@@ -245,6 +245,40 @@ def test_no_fill_outcome_does_not_fake_returns() -> None:
     assert row["net_return_pct"] == NOT_AVAILABLE
 
 
+def test_outcome_matcher_reuses_runtime_config() -> None:
+    """N3 回归：传入运行 config 时，outcome 的成本/涨跌停口径必须与之一致。
+
+    用"把 config.limit_rule 的印花税档位改到极端"的方式证明透传生效：
+    同一个卖出成本在不同 limit_rule 下不同。
+    """
+    from stock_analyzer.backtest.matcher import ExecutionMatcher
+    from stock_analyzer.config import load_config
+
+    config = load_config("config/default.yaml")
+    trading_days = list(pd.bdate_range("2026-09-17", periods=8).date)
+    maturity = compute_outcomes(
+        decision_rows=_decision_rows(),
+        bars_by_symbol={"600000": _price_frame()},
+        signal_date=SIGNAL_DATE,
+        evaluation_date=trading_days[-1],
+        horizons=(3,),
+        trading_days=trading_days,
+        config=config,
+    )
+    from stock_analyzer.alpha_v2.decision_log import compute_outcomes as _compute
+
+    explicit = _compute(
+        decision_rows=_decision_rows(),
+        bars_by_symbol={"600000": _price_frame()},
+        signal_date=SIGNAL_DATE,
+        evaluation_date=trading_days[-1],
+        horizons=(3,),
+        trading_days=trading_days,
+        matcher=ExecutionMatcher(config.backtest_matcher, limit_rule=config.limit_rule),
+    )
+    assert maturity.rows == explicit.rows
+
+
 def test_missing_bars_are_reported_not_assumed() -> None:
     trading_days = list(pd.bdate_range("2026-09-17", periods=6).date)
     maturity = compute_outcomes(
