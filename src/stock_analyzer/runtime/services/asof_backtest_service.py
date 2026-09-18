@@ -208,6 +208,21 @@ def _build_data_health_payload(
     return payload
 
 
+def _build_model_semantics_payload(
+    *, model: Mapping[str, object], config: StockAnalyzerConfig
+) -> dict[str, object]:
+    """按 S09 汇总模型输出语义（只声明与守卫，不改任何输出值）。"""
+    from stock_analyzer.models.semantics_guard import describe_model_semantics
+
+    return describe_model_semantics(
+        label_policy_id=model.get("label_policy_id", ""),
+        label_basis=str(getattr(config.labels, "basis", "") or ""),
+        output_semantics=model.get("output_semantics", ""),
+        # OOS 校准证据当前链路拿不到 → 不允许概率化文案（fail-closed 的是文案）
+        has_oos_calibration=None,
+    ).to_payload()
+
+
 def _text_field(value: object) -> str:
     return str(value or "").strip()
 
@@ -639,6 +654,9 @@ class AsofBacktestService:
         quality_selection = _dict_of(prefilter.get("universe_quality_selection"))
         historical_context = _dict_of(report.get("historical_context"))
         anomalies = _dict_of(report.get("anomalies"))
+        model_semantics_payload = _build_model_semantics_payload(
+            model=_dict_of(historical_context.get("model")), config=self._config
+        )
         data_health_payload = _build_data_health_payload(
             as_of=as_of,
             historical_universe=historical_universe,
@@ -689,6 +707,8 @@ class AsofBacktestService:
             # S08：Data Health 与 Market Breadth 分层（数据健康先判，广度后判）。
             # 灰度默认只观测：enforce=False 时 block_new_buy 恒 False，只记录建议。
             "data_health": data_health_payload,
+            # S09：模型输出语义声明（output_kind / label 契约 / 展示口径守卫）
+            "model_semantics": model_semantics_payload,
             "anomalies_count": _as_int_field(anomalies.get("event_count"), fallback=0),
             "holding_curve": holding_payload,
         }
