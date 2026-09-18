@@ -547,21 +547,54 @@ def _historical_config(tmp_path: Path) -> StockAnalyzerConfig:
     return config
 
 
+class _InMemoryRegistry:
+    """进程内 registry 桩：只提供读接口（S06 闸门需要），**不碰共享 DuckDB**。
+
+    背景（2026-09-18 实测）：conftest 把 ``bootstrap_state_path`` 指向一个所有 xdist
+    worker 共享的临时文件，而 registry 库是它同目录的 ``learning_protocol.duckdb``。
+    若测试夹具往这个共享库里写模型，多 worker 并发时会撞 DuckDB 锁 → 闸门读不到候选
+    → 历史重放被判 unscorable → 测试**间歇性失败**。进程内桩同时消除了写竞争与
+    跨测试耦合，且仍能真实覆盖"有 PIT 合法登记"的路径。
+    """
+
+    def __init__(self, records: list[object] | None = None) -> None:
+        self._records = list(records or [])
+
+    def active_champion(self, *, suppress_read_errors: bool = False) -> object | None:
+        _ = suppress_read_errors
+        return None
+
+    def list_records(
+        self, *, limit: int | None = None, suppress_read_errors: bool = False
+    ) -> list[object]:
+        _ = (limit, suppress_read_errors)
+        return list(self._records)
+
+    def get_by_id(self, model_id: str, *, suppress_read_errors: bool = False) -> object | None:
+        _ = suppress_read_errors
+        return next(
+            (item for item in self._records if getattr(item, "model_id", "") == model_id), None
+        )
+
+    def register_artifact(self, **kwargs: object) -> object:
+        raise AssertionError("测试夹具不得写共享 registry 库")
+
+
+class _RegistryRecord:
+    def __init__(self, **kwargs: object) -> None:
+        self.__dict__.update(kwargs)
+
+
 def _register_pit_model(
     service: object, *, tmp_path: Path, created_at: str = "2026-05-01T10:00:00"
 ) -> str:
-    """在 service 的 registry 登记一个"as_of 之前就存在"的模型（S06 时间闸门需要）。
+    """给 service 注入"as_of 之前就存在"的合法模型登记（S06 时间闸门需要）。
 
-    S06 起历史重放要求"as_of 之前真实存在且可用的模型"；测试夹具若不给任何登记
-    记录，解析器会（正确地）判 unscorable。这里造一份 PIT 合法的登记记录，
-    使夹具反映真实研究环境。
+    只写进程内桩，**不写共享 DuckDB**（避免多 worker 并发锁竞争导致的间歇失败）。
     """
     from stock_analyzer.models.artifact import ModelArtifact
     from stock_analyzer.models.bundle import compute_artifact_identity_hash
-    from stock_analyzer.models.registry import ModelLifecycleState, ModelRole
 
-    # 每次调用用唯一 nonce：model_id 是内容寻址的，若复用同一内容，第二次注册会撞上
-    # 上一次遗留的记录（其 artifact_uri 指向已被清理的临时目录 → 闸门会正确判 artifact_missing）。
     nonce = uuid.uuid4().hex
     artifact_path = tmp_path / f"pit_model_{nonce}.json"
     artifact = ModelArtifact.create(
@@ -580,20 +613,22 @@ def _register_pit_model(
     )
     artifact.created_at = created_at  # 模拟"训练发生在 as_of 之前"
     artifact.save(artifact_path)
-    registry = service._model_registry  # noqa: SLF001 - 测试夹具直接取注册表
-    try:
-        record = registry.register_artifact(
-            artifact=artifact,
-            artifact_uri=str(artifact_path),
-            role=ModelRole.CHALLENGER,
-            lifecycle_state=ModelLifecycleState.TRAINED,
-            artifact_content_hash=compute_artifact_identity_hash(artifact_path),
-        )
-    except ValueError:
-        # nonce 已保证内容唯一，撞 id 只可能来自并发/复用；此时不掩盖，直接失败。
-        raise
-    return str(record.model_id)
-
+    model_id = f"model_pit_{nonce[:12]}"
+    record = _RegistryRecord(
+        model_id=model_id,
+        artifact_uri=str(artifact_path),
+        artifact_content_hash=compute_artifact_identity_hash(artifact_path),
+        artifact_created_at=datetime.fromisoformat(created_at),
+        feature_schema_id="fs_pit_v1",
+        feature_schema_hash="fs-hash",
+        label_policy_id="label_policy_v1_e2afc1135a3f",
+        label_policy_hash="label-hash",
+        dataset_manifest_id="dataset_manifest_pit",
+        lifecycle_state="trained",
+        promoted_at=None,
+    )
+    service._model_registry = _InMemoryRegistry([record])  # noqa: SLF001 - 测试夹具注入
+    return model_id
 
 def _historical_context(
     *,

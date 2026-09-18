@@ -75,26 +75,82 @@ def test_legacy_behavior_surface_unchanged_when_alpha_v2_enabled(
         assert behavior_surface_snapshot(patched) == fixture["behavior_surface"]
 
 
-def test_legacy_source_tree_does_not_consume_alpha_v2_flag() -> None:
-    """P0-00 架构守卫：Legacy 源码不得读取 alpha_v2 配置。
+# V2 Feature Flag 的**消费点**白名单（S00 起建立，随消费者显式增长）。
+# 判据是"读配置 flag"而不是"出现字符串 alpha_v2"：模块名（contracts/alpha_v2.py）
+# 与工具复用（alpha_v2.artifacts.write_json_atomic）不算消费 flag。
+_ALPHA_V2_FLAG_CONSUMERS = {
+    "src/stock_analyzer/runtime/services/week5_historical_runner.py": (
+        "读取 alpha_v2.model_resolver_mode（历史重放的 PIT 解析模式）"
+    ),
+}
+_FLAG_CONSUMPTION_MARKERS = ("config.alpha_v2", "SA__ALPHA_V2")
 
-    允许清单只有"配置定义本身"与"Alpha V2 自己的包"。后续任务（P0-01+）新增
-    V2 消费者时，必须同时更新这里——把"V2 会不会影响 Legacy"从口头承诺变成
-    必须显式修改白名单的可审查动作。
-    """
+# 生产入口：这些文件**永远**不得消费 V2 flag（V2 只能 shadow / 研究侧）。
+_PRODUCTION_ENTRYPOINTS = (
+    "src/stock_analyzer/pipeline.py",
+    "src/stock_analyzer/main.py",
+    "src/stock_analyzer/runtime/service.py",
+    "src/stock_analyzer/runtime/services/nightly_report_service.py",
+    "src/stock_analyzer/runtime/services/week5_notification_service.py",
+)
+
+
+def _flag_consumption_offenders() -> list[str]:
     src_root = _ROOT / "src" / "stock_analyzer"
-    allowed = {
-        src_root / "config.py",
-        src_root / "config_identity.py",
-    }
     offenders: list[str] = []
     for path in sorted(src_root.rglob("*.py")):
-        if path in allowed or src_root / "alpha_v2" in path.parents:
+        if src_root / "alpha_v2" in path.parents or path.name == "config.py":
             continue
         text = path.read_text(encoding="utf-8")
-        if "alpha_v2" in text:
-            offenders.append(str(path.relative_to(_ROOT)))
-    assert offenders == [], f"Legacy 源码出现 alpha_v2 引用: {offenders}"
+        if any(marker in text for marker in _FLAG_CONSUMPTION_MARKERS):
+            offenders.append(path.relative_to(_ROOT).as_posix())
+    return offenders
+
+
+def test_alpha_v2_flag_consumers_are_explicitly_declared() -> None:
+    """架构守卫：读 V2 flag 的文件必须逐个显式登记（新增消费者=可审查动作）。
+
+    2026-09-18 起本守卫测量的是"flag 消费"而非字符串出现：S03-S10 引入了合法的
+    模块名与工具复用（contracts/alpha_v2.py、alpha_v2.artifacts.write_json_atomic），
+    它们不是消费者；真正的消费者只有白名单里的历史重放路径。
+    """
+    offenders = _flag_consumption_offenders()
+    assert offenders == sorted(_ALPHA_V2_FLAG_CONSUMERS), (
+        "V2 flag 消费者与白名单不一致（新增/移除消费者都必须显式更新白名单）: "
+        f"actual={offenders} declared={sorted(_ALPHA_V2_FLAG_CONSUMERS)}"
+    )
+
+
+def test_production_entrypoints_never_consume_alpha_v2_flag() -> None:
+    """生产入口不得消费 V2 flag：V2 关闭/Shadow 时生产路径结构上不可能被影响。"""
+    offenders: list[str] = []
+    for relative in _PRODUCTION_ENTRYPOINTS:
+        path = _ROOT / relative
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        if any(marker in text for marker in _FLAG_CONSUMPTION_MARKERS):
+            offenders.append(relative)
+    assert offenders == []
+
+
+def test_production_selection_contract_ignores_alpha_v2_flag(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """行为守卫：把 flag 打开/关闭/改模式，生产契约都必须逐字段不变。
+
+    （S04 的契约只读 week5 目标与 final cap；live 缺省 profile 仍走 legacy_profile 契约。）
+    """
+    from stock_analyzer.contracts.alpha_v2 import resolve_selection_contract
+
+    config = _clean_default_config(monkeypatch)
+    baseline = resolve_selection_contract(config, profile="default").to_payload()
+    for alpha_v2 in (
+        AlphaV2Config(enabled=True, shadow_only=True),
+        AlphaV2Config(enabled=True, shadow_only=False, enforce_final_selection=True),
+    ):
+        patched = config.model_copy(update={"alpha_v2": alpha_v2})
+        assert resolve_selection_contract(patched, profile="default").to_payload() == baseline
 
 
 # ---------------------------------------------------------------------------

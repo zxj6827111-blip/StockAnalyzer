@@ -67,9 +67,7 @@ Codex Acceptance = PENDING
 | S00 | Alpha V2 Feature Flag / No-op Baseline | DONE | 40 定向 + 3031 全量 / 0 failed | `artifacts/alpha_v2/audit/s00_validation.json` | PENDING | Legacy 零行为变化（结构性 + golden 双向锁定） |
 | S01 | Model Identity Truth | DONE | 29 新增 + 447 相关 / 0 failed | `artifacts/alpha_v2/audit/s01_validation.json` | PENDING | 事实（工件）与补充（registry/bootstrap）分离；trained_at 不再取 bootstrap |
 | S02 | T+1 Entry Simulation | DONE | 19 新增 + 197 相关 / 0 failed | `artifacts/alpha_v2/audit/s02_validation.json` | PENDING | entry_date > signal_date 或 no_fill；600000 基准在新口径逐项复现 |
-| S03 | Point-in-Time Historical Universe | NOT_STARTED | - | - | PENDING | 本轮停止点（见批次小结） |
-| S02 | T+1 Entry Simulation | NOT_STARTED | - | - | PENDING | |
-| S03 | Point-in-Time Historical Universe | NOT_STARTED | - | - | PENDING | |
+| S03 | Point-in-Time Historical Universe | NOT_STARTED | - | - | PENDING | S03 起为 M1 剩余阶段（首轮 Codex FAIL 为完整性判定） |
 | S04 | SelectionContract 300/100/50 | NOT_STARTED | - | - | PENDING | |
 | S05 | Registry / Archive Governance | NOT_STARTED | - | - | PENDING | |
 | S06 | HistoricalModelResolver | NOT_STARTED | - | - | PENDING | |
@@ -531,58 +529,516 @@ S03 — Point-in-Time Historical Universe（本轮未开始）
 
 ---
 
-# 12. 批次小结（M1，本轮）
+# 12. 批次小结（M1）
 
 ## M1 Batch Status
 
 ```text
 Batch = M1（S00-S10）
-Batch Status = PARTIAL
-Stages Completed = S00, S01, S02
-Stopped At = S03（未开始）
-Stopping HEAD = 5b1e504
+Batch Status = DONE（等待 Codex 整批验收）
+Stages Completed = S00, S01, S02, S03, S04, S05, S06, S07, S08, S09, S10
+Stopped At = （无）
+Ending HEAD = be28ff9（S10 提交；批次收尾提交见 git log）
 Review Baseline = 7e9e33bdb9d03506cff5dfff29c78b1c95019541
 Codex Batch Acceptance = PENDING
 ```
 
-## 停止原因（非 Blocking Failure）
+首轮 Codex 验收结果：**FAIL（唯一原因：批次不完整，S03-S10 未实施；S00-S02 判 PASS）**。
+本轮按"先验收后继续"的纪律补齐 S03-S10，并逐条落实复审要求（N1-N5、DF-S02-001/002/003）。
 
-本轮施工容量与验证预算用尽。S00/S01/S02 各自通过质量门（定向测试 + failure 路径 +
-审计工件 + 本台账追加 + 回归），但 S03（PIT Universe）尚未开始。按批次纪律
-"每个 SXX 必须独立验证后才进入下一个"，不带未验证代码继续 S03-S10。
+## Stage Matrix（M1 全量）
 
-## Stage Matrix（本轮）
+| Stage | Task | ZCode | 定向测试 | 提交 | 审计工件 | Codex |
+|---|---|---|---|---|---|---|
+| S00 | Feature Flag / No-op Baseline | DONE | 40 passed | 83e4fd7 | `s00_validation.json` | PENDING |
+| S01 | Model Identity Truth | DONE | 447 passed | a78a990 | `s01_validation.json` | PENDING |
+| S02 | T+1 Entry Simulation | DONE | 197 passed | 5b1e504 | `s02_validation.json` | PENDING |
+| S03 | Point-in-Time Historical Universe | DONE | 162 passed | 3d919c7 | `s03_validation.json` | PENDING |
+| S04 | SelectionContract 300/100/50 | DONE | 139 passed | 89f08f0 | `s04_validation.json` | PENDING |
+| S05 | Registry / Archive Governance | DONE | 109 passed | 6243cd0 | `s05_validation.json` | PENDING |
+| S06 | HistoricalModelResolver | DONE | 135 passed | 8d3248d | `s06_validation.json` | PENDING |
+| S07 | Feature / Execution Price Split | DONE | 154 passed | 1a199a6 | `s07_validation.json` | PENDING |
+| S08 | Data Health / Breadth Split | DONE | 58 passed | 053b4b1 | `s08_validation.json` | PENDING |
+| S09 | Model / Label Semantic Guard | DONE | 55 passed | d0a58f7 | `s09_validation.json` | PENDING |
+| S10 | Decision Log + Outcome Maturation | DONE | 13 passed | be28ff9 | `s10_validation.json` | PENDING |
 
-| Stage | Task | ZCode | 定向测试 | 审计工件 | Codex |
-|---|---|---|---|---|---|
-| S00 | Feature Flag / No-op Baseline | DONE | 40 passed | `s00_validation.json` | PENDING |
-| S01 | Model Identity Truth | DONE | 447 passed | `s01_validation.json` | PENDING |
-| S02 | T+1 Entry Simulation | DONE | 197 passed | `s02_validation.json` | PENDING |
-| S03-S10 | 其余 M1 阶段 | NOT_STARTED | - | - | PENDING |
+## Codex 复审要求落实
+
+| 项 | 要求 | 落实 |
+|---|---|---|
+| N1 | PROGRESS Stage Matrix 重复行 | 已修（单行 S03，且状态随本轮更新） |
+| N2 | resolver 对"工件缺失"与 registry 状态无关地硬拒绝 | `historical_resolver._reject_reason` 首条判 artifact_exists，含测试 |
+| N3 | `EntrySimulation.slippage` 措辞 | 改为"价格增量（net_entry_price - entry_price_raw）"，含测试 |
+| N4 | M1 Implementation Report 落盘 | `docs/alpha_v2/M1_Implementation_Report.md` |
+| N5 | 明确哪份工件权威 | serving manifest `authority` 块 + 对账报告 authority_note |
+| DF-S02-001 | 删除估算涨跌停注入 | holding_curve / walk_forward 只透传真实列，缺列 fail-closed |
+| DF-S02-002 | NaN 涨跌停不得 fail-open | `limit_rule._optional_float` 对 NaN/Inf 返回 None |
+| DF-S02-003 | 执行滑点不再默认 0 | asof/week5 回测传策略静态滑点（trend=0.0015） |
 
 ## Batch Test Summary
 
 ```text
 命令：python -m pytest -n 4 --dist loadfile
-结果：3079 passed / 2 skipped / 0 failed（526.73s，S00+S01+S02 全部提交后的工作树）
-对照：批次开始前基线 3031 passed / 2 skipped / 0 failed（新增 48 例）
+结果：3194 passed / 2 skipped / 0 failed（552.25s，S00-S10 全部提交后的工作树）
+对照：批次开始前基线 3031 passed / 2 skipped / 0 failed（新增 163 例）
+说明：首轮批次级运行曾出现 1 例间歇失败（S06/S07 夹具写共享 learning_protocol.duckdb
+      与 xdist 并发撞锁）；已改为进程内 registry 桩，压力复跑 2/2 通过后重跑全量得上述结果。
 ```
+
 
 ## 本轮不变量核对
 
 ```text
 final_signal_min_threshold = 70           未改（S00 golden 契约锁定）
 Cross Review 四阈值                        未改
-night 300/100/50、final cap 5            未改
+night 300/100/50、final cap 5            未改（S04 让历史与夜扫同口径，未改数值）
 风险门（breadth/overextension/board）      未改
 serving model / challenger                未切换、未 promote
 飞书正式通知                              未改、未接 V2
 生产部署 / git push / 容器重启 /.env 修改   均未执行
 ```
 
-## 下一轮建议入口
+## M1 新增的高价值事实（供 M2 决策）
 
-1. 先把 M1 交 Codex 独立验收（重点：S00 no-op 证据链、S01 mismatch fail-closed 语义、S02 no_fill 口径）；
-2. Codex PASS 后从 **S03（PIT Historical Universe）** 继续，随后 S04（SelectionContract 300/100/50）；
-3. S07 必须一并处理本轮新发现的两条 high 级执行缺陷（DF-S02-001 / DF-S02-002），
-   它们会直接影响"raw execution / 可成交率"的可信度。
+1. 历史回测此前实际使用 100/100/20，与夜扫 300/100/50 不可比（S04 已统一为 night-equivalent）。
+2. `holding_curve` 曾注入 ±10% 估算涨跌停 → 一字涨停被判可成交；NaN 涨跌停会让涨停门 fail-open（S07 已修）。
+3. 生产 label basis `soup_10d_tp8_before_sl5` 未登记语义 → 在服输出语义为 unknown（DF-S09-001）。
+4. 本机受跟踪默认执行口径 = qfq（生产应为 raw）；守卫会把这类配置标 execution_uncertain（DF-S07-001）。
+5. registry 无 champion + 历史坏记录：本机 0 行，NAS 需跑对账 CLI 得到权威分类（DF-S05-001）。
+
+
+## S03 — Point-in-Time Historical Universe
+
+### Status
+DONE
+
+### Date
+2026-09-18
+
+### Batch
+M1
+
+### Starting HEAD
+faf0a1e4cb29a3b6b16ca489c8d895ca6956d160
+
+### Ending HEAD / Working Tree
+3d919c7（S03 代码提交）
+
+### Files Changed
+- `src/stock_analyzer/data/asof_universe.py`（新）：PIT 股票池解析（build_pit_stats / resolve_asof_universe / 快照 id）
+- `src/stock_analyzer/runtime/services/week5_selection_engine.py`：历史 universe 走 PIT 解析 + 报告带 universe_snapshot
+- `tests/test_asof_universe.py`（新，12 例）；`tests/test_week5_historical_backtest.py`（夹具探针改为窗口 + PIT 快照断言）
+
+### Behavior Changes
+- 新增：eligible（窗口内 bar 数 ≥ min_history）/ expected_active（最近 5 交易日有 bar）/ known_suspended（单列，不进分母）/ future_listed 硬排除；覆盖率分母 = expected_active；快照 id 可复现
+- 收紧：历史股票池新增"历史充足性"硬门，并与外层 staleness 门取交集（fail-closed）
+- 未变：live 路径不经过本模块；阈值/门禁/在服模型/通知未动
+
+### Tests
+Commands:
+- `python -m pytest tests/test_asof_universe.py` → 12 passed
+- `python -m pytest tests/test_week5_historical_backtest.py tests/test_asof_backtest_service.py` → 21 passed
+- `python -m pytest tests/test_asof_backtest_service.py tests/test_api_backtest.py tests/test_week5_scan_funnel_policy.py tests/test_pipeline_asof.py tests/test_delisted_symbols.py tests/test_universe_candidate_selector.py tests/test_service_universe_fallback.py tests/test_probe_universe_quality_selector.py` → 129 passed
+
+Results: S03 相关 162 passed / 0 failed
+
+### Audit Artifacts
+- `artifacts/alpha_v2/audit/s03_validation.json`
+
+### Deviation From Blueprint
+- 第一版用"窗口内 bar 数"代理上市时长（不做全历史扫描）；新上市与长期停牌在窗口口径下不可区分，统一归 `insufficient_history_window_bars`（如实命名，见 DF-S03-001）。
+
+### Deferred Findings
+- DF-S03-001（medium）：精确上市日需要 provider 提供 list_date/listing_days（当前批量探针不返回）。
+- DF-S03-002（medium）：当日停牌但窗口内有 bar 的票仍进分母（执行层用 no_fill 兜住，完整停牌日历属 S08）。
+
+### Rollback
+- `git revert 3d919c7`。
+
+### ZCode Conclusion
+DONE
+
+### Codex Acceptance
+PENDING
+
+### Next Stage
+S04
+
+---
+
+## S04 — SelectionContract 300/100/50
+
+### Status
+DONE
+
+### Date
+2026-09-18
+
+### Starting HEAD
+3d919c7
+
+### Ending HEAD / Working Tree
+89f08f0（S04 代码提交）
+
+### Files Changed
+- `src/stock_analyzer/contracts/__init__.py`、`contracts/alpha_v2.py`（新）：SelectionContract + resolve_selection_contract
+- `week5_selection_engine.py`：一次 run 绑定一个契约（light/deep/quality 取契约值，显式 override 优先）；funnel 段新增 selection_contract 块；历史上下文默认按 night-equivalent 解析
+- `week5_historical_runner.py`：默认 scan_profile = historical_night_equivalent
+- `tests/test_selection_contract.py`（新，9 例）
+
+### Behavior Changes
+- 统一：历史 night-equivalent 改用夜扫契约 300/100/50（此前 100/100/20）
+- 新增：契约 id + 三目标 + cap + allow_zero + 来源配置键落报告
+- 未变：live 缺省 profile 仍 legacy 目标（未获授权不动生产口径）
+
+### Tests
+Commands:
+- `python -m pytest tests/test_selection_contract.py` → 9 passed
+- `python -m pytest tests/test_week5_historical_backtest.py tests/test_week5_scan_funnel_policy.py tests/test_asof_backtest_service.py tests/test_api_backtest.py tests/test_week5_automation.py tests/test_selection_contract.py` → 139 passed
+
+Results: S04 相关 139 passed / 0 failed
+
+### Audit Artifacts
+- `artifacts/alpha_v2/audit/s04_validation.json`
+
+### Deferred Findings
+- DF-S04-001（info）：live 周扫仍是 100/100/20，与夜扫不同口径（M2 shadow 双轨再决定是否统一）。
+
+### Rollback
+- `git revert 89f08f0`。
+
+### ZCode Conclusion
+DONE
+
+### Codex Acceptance
+PENDING
+
+### Next Stage
+S05
+
+---
+
+## S05 — Registry / Archive Governance
+
+### Status
+DONE
+
+### Date
+2026-09-18
+
+### Starting HEAD
+89f08f0
+
+### Ending HEAD / Working Tree
+6243cd0（S05 代码提交）
+
+### Files Changed
+- `src/stock_analyzer/models/serving_manifest.py`（新）：在服模型清单（事实 + registry 补充 + authority 口径）
+- `src/stock_analyzer/models/registry_reconciliation.py`（新）：六类对账（只读）
+- `src/stock_analyzer/models/bundle.py`：归档容量管理（保留下限 + 字节预算）
+- `src/stock_analyzer/models/trainer.py`、`runtime/service.py`：接线容量预算
+- `runtime/services/learning_governance_service.py`：发布流程步骤⑤ CAS 成功后写 serving manifest（best-effort）
+- `config.py` / `config/default.yaml`：model_archive_max_bytes、serving_manifest_path
+- `scripts/reconcile_model_registry_artifacts.py`（新）
+- `tests/test_registry_governance_s05.py`（新，17 例）
+
+### Behavior Changes
+- 新增：serving manifest（`artifacts/model_serving_manifest.json`）；registry↔磁盘对账；归档容量管理
+- 未变：registry 表结构与历史行未改（不伪造修复）；alias 仍兼容；发布流程与回滚未改
+
+### Tests
+Commands:
+- `python -m pytest tests/test_registry_governance_s05.py` → 17 passed
+- `python -m pytest tests/test_model_training.py tests/test_registry_governance_s05.py tests/test_model_bundle_release.py` → 37 passed
+- `python -m pytest tests/test_service_model_registry.py tests/test_model_registry_state_machine.py tests/test_release_snapshot.py tests/test_manifest_identity_remediation.py tests/test_service_learning_governance.py tests/test_model_bundle_release.py` → 55 passed
+- `python scripts/reconcile_model_registry_artifacts.py`（本机实跑：registry 0 行、归档 5 个 bundle）
+
+Results: S05 相关 109 passed / 0 failed
+
+### Audit Artifacts
+- `artifacts/alpha_v2/audit/s05_validation.json`
+- `artifacts/alpha_v2/audit/model_registry_reconciliation.json`（本机；权威分类需 NAS 侧跑同一 CLI）
+
+### Deferred Findings
+- DF-S05-001（info）：本机 model_v1.json 是开发工件，权威对账需在 NAS 跑（Codex N5）。
+- DF-S05-002（medium）：历史坏记录的治理动作（重登记/重训）待 M2 拍板。
+
+### Rollback
+- `git revert 6243cd0`。
+
+### ZCode Conclusion
+DONE
+
+### Codex Acceptance
+PENDING
+
+### Next Stage
+S06
+
+---
+
+## S06 — HistoricalModelResolver
+
+### Status
+DONE
+
+### Date
+2026-09-18
+
+### Starting HEAD
+6243cd0
+
+### Ending HEAD / Working Tree
+8d3248d（S06 代码提交）
+
+### Files Changed
+- `src/stock_analyzer/models/historical_resolver.py`（新）：两模式解析 + 合法性条件 + 时区语义 + registry 适配器
+- `week5_historical_runner.py`：pipeline 构造前的时间闸门；unscorable 返回零结果报告；可评分时报告带 model_resolution
+- `tests/test_historical_model_resolver.py`（新，20 例）；`tests/test_week5_historical_backtest.py`（夹具补 PIT 合法模型登记）
+
+### Behavior Changes
+- 新增：as_of 时间闸门与 unscorable 报告；registry/磁盘适配器
+- 改变：历史回测在 as_of 早于所有合法模型时不再出结果（fail-closed，DF-S01-002 闭合）
+- 未变：live 路径不经过 resolver
+
+### Tests
+Commands:
+- `python -m pytest tests/test_historical_model_resolver.py` → 20 passed
+- `python -m pytest tests/test_week5_historical_backtest.py tests/test_asof_backtest_service.py tests/test_api_backtest.py` → 115 passed
+
+Results: S06 相关 135 passed / 0 failed
+
+### Audit Artifacts
+- `artifacts/alpha_v2/audit/s06_validation.json`
+
+### Deferred Findings
+- DF-S06-001（medium）：无逐日激活历史 → strict_production_replay 当前几乎恒 unscorable。
+- DF-S06-002（medium）：asof（非 week5）回测的 as_of 闸门待 M2 接入。
+
+### Rollback
+- `git revert 8d3248d`。
+
+### ZCode Conclusion
+DONE
+
+### Codex Acceptance
+PENDING
+
+### Next Stage
+S07
+
+---
+
+## S07 — Feature Price / Execution Price Split（含 DF-S02-001/002/003、N3）
+
+### Status
+DONE
+
+### Date
+2026-09-18
+
+### Starting HEAD
+8d3248d
+
+### Ending HEAD / Working Tree
+1a199a6（S07 代码提交）
+
+### Files Changed
+- `src/stock_analyzer/backtest/price_contract.py`（新）
+- `src/stock_analyzer/data/limit_rule.py`：NaN/Inf 视为缺失
+- `src/stock_analyzer/backtest/holding_curve.py`、`walk_forward.py`：删除估算涨跌停注入
+- `src/stock_analyzer/backtest/matcher.py`：static_slippage_ratio 透传 + N3 措辞
+- `runtime/services/asof_backtest_service.py`：价格口径 + 执行滑点落 caveats
+- `tests/test_price_contract_s07.py`（新，13 例）；`tests/test_holding_curve.py`（夹具补 pre_close）
+
+### Behavior Changes
+- 新增：price_contract（feature/execution 双口径 + execution_uncertain）；执行滑点非 0
+- 修复：NaN 涨跌停 fail-open；估算涨跌停掩盖真实板块幅度；0 滑点主口径
+- 未变：live 决策路径
+
+### Tests
+Commands:
+- `python -m pytest tests/test_price_contract_s07.py` → 13 passed
+- `python -m pytest tests/test_api_backtest.py tests/test_asof_backtest_service.py tests/test_holding_curve.py tests/test_entry_simulation.py tests/test_walk_forward.py tests/test_backtest_matcher.py tests/test_execution_engine.py tests/test_week5_historical_backtest.py tests/test_measure_score_return.py tests/test_backtest_live_consistency.py` → 141 passed
+
+Results: S07 相关 154 passed / 0 failed
+
+### Audit Artifacts
+- `artifacts/alpha_v2/audit/s07_validation.json`
+
+### Deferred Findings
+- DF-S07-001（high）：本机受跟踪默认执行口径 = qfq（生产按蓝图 §2.13 应为 raw）；NAS 部署时核验。
+- DF-S07-002（medium）：corporate action 完整治理留待 M2（当前以 execution_uncertain 标注）。
+
+### Rollback
+- `git revert 1a199a6`。
+
+### ZCode Conclusion
+DONE
+
+### Codex Acceptance
+PENDING
+
+### Next Stage
+S08
+
+---
+
+## S08 — Data Health / Market Breadth Split
+
+### Status
+DONE
+
+### Date
+2026-09-18
+
+### Batch
+M1
+
+### Starting HEAD
+1a199a6
+
+### Ending HEAD / Working Tree
+053b4b1（S08 代码提交）
+
+### Files Changed
+- `src/stock_analyzer/ops/data_health.py`（新）：七项检查 + Data Health/Market Breadth 分层门 + 灰度开关
+- `src/stock_analyzer/runtime/services/asof_backtest_service.py`：week5 日期条目新增 data_health 观测块（enforce=False）
+- `tests/test_data_health_gate_s08.py`（新，16 例）
+
+### Behavior Changes
+- 新增：数据健康分层（broken/degraded/healthy）+ 分层门；缺失不得 healthy（含 breadth artifact）；coverage 坏但广度高分不得放行；灰度默认只观测
+- 未变：live 决策路径与广度 artifact 生成链路（生产接线属部署灰度期）
+
+### Tests
+Commands:
+- `python -m pytest tests/test_data_health_gate_s08.py` → 16 passed
+- `python -m pytest tests/test_asof_backtest_service.py tests/test_week5_historical_backtest.py tests/test_api_backtest.py` → 42 passed
+
+Results: S08 相关 58 passed / 0 failed
+
+### Audit Artifacts
+- `artifacts/alpha_v2/audit/s08_validation.json`
+
+### Deferred Findings
+- DF-S08-001（medium）：生产侧 Data Health 数据源接线与 enforce 开启需按灰度（≥5 生产日 + ≥60 日回放）。
+- DF-S08-002（high）：live 路径的广度缺失 fail-open 语义接线属部署灰度期。
+
+### Rollback
+- `git revert 053b4b1`。
+
+### ZCode Conclusion
+DONE
+
+### Codex Acceptance
+PENDING
+
+### Next Stage
+S09
+
+---
+
+## S09 — Model / Label Semantic Guard
+
+### Status
+DONE
+
+### Date
+2026-09-18
+
+### Batch
+M1
+
+### Starting HEAD
+053b4b1
+
+### Ending HEAD / Working Tree
+d0a58f7（S09 代码提交）
+
+### Files Changed
+- `src/stock_analyzer/models/semantics_guard.py`（新）：output_kind 映射 + 展示口径守卫 + legacy 标记
+- `src/stock_analyzer/runtime/services/asof_backtest_service.py`：week5 日期条目新增 model_semantics 块
+- `tests/test_semantics_guard_s09.py`（新，13 例）
+
+### Behavior Changes
+- 新增：语义声明（label 契约 + output_kind + 展示词白/黑名单）与守卫 API；未登记 basis 不抛异常但禁止概率化文案
+- 未变：任何模型输出值、打分、cross review、阈值、在服模型（不反转、不替换）
+
+### Tests
+Commands:
+- `python -m pytest tests/test_semantics_guard_s09.py` → 13 passed
+- `python -m pytest tests/test_asof_backtest_service.py tests/test_week5_historical_backtest.py tests/test_api_backtest.py` → 42 passed
+
+Results: S09 相关 55 passed / 0 failed
+
+### Audit Artifacts
+- `artifacts/alpha_v2/audit/s09_validation.json`
+
+### Deferred Findings
+- DF-S09-001（medium）：生产 label basis `soup_10d_tp8_before_sl5` 未登记 → 在服语义 unknown（方向安全），M2 登记或扩展前缀规则。
+- DF-S09-002（medium）：UI/飞书文案层替换属 M2（S21）。
+
+### Rollback
+- `git revert d0a58f7`。
+
+### ZCode Conclusion
+DONE
+
+### Codex Acceptance
+PENDING
+
+### Next Stage
+S10
+
+---
+
+## S10 — Decision Log + Outcome Maturation
+
+### Status
+DONE
+
+### Date
+2026-09-18
+
+### Batch
+M1
+
+### Starting HEAD
+d0a58f7
+
+### Ending HEAD / Working Tree
+be28ff9（S10 代码提交）
+
+### Files Changed
+- `src/stock_analyzer/alpha_v2/decision_log.py`（新）：决策/outcome/manifest 落盘 + 成熟计算
+- `tests/test_decision_log_s10.py`（新，13 例）
+
+### Behavior Changes
+- 新增：`decisions|outcomes|manifests/YYYY/MM/` 契约；V2 Head 未实现字段恒 `not_available`；outcome 只在成熟日之后写（signal 当天 0 行）；入场用 S02 的 T+1 可成交开盘 + raw 价格；不可成交不伪造收益
+- 未变：未接生产夜扫（属 M2 S20）
+
+### Tests
+Commands:
+- `python -m pytest tests/test_decision_log_s10.py` → 13 passed
+
+Results: S10 相关 13 passed / 0 failed
+
+### Audit Artifacts
+- `artifacts/alpha_v2/audit/s10_validation.json`
+
+### Deferred Findings
+- DF-S10-001（medium）：决策日志接入生产夜扫属 M2（S20）。
+- DF-S10-002（medium）：outcome 成熟调度接入属 M2（S20/S21）。
+
+### Rollback
+- `git revert be28ff9`。
+
+### ZCode Conclusion
+DONE
+
+### Codex Acceptance
+PENDING
+
+### Next Stage
+M1 批次验收（Codex）
+
