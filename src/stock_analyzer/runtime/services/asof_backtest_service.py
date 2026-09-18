@@ -165,6 +165,53 @@ def _to_jsonable(value: Any) -> Any:
     return value
 
 
+def _build_data_health_payload(
+    *,
+    as_of: date,
+    historical_universe: Mapping[str, object],
+    historical_context: Mapping[str, object],
+    market_breadth: Mapping[str, object],
+    config: StockAnalyzerConfig,
+    date_payload: Mapping[str, object],
+) -> dict[str, object]:
+    """按 S08 口径汇总当日数据健康（观测口径，不改变决策）。"""
+    from stock_analyzer.ops.data_health import combined_gate_decision, evaluate_data_health
+
+    model = _dict_of(historical_context.get("model"))
+    universe_snapshot = _dict_of(historical_universe.get("universe_snapshot"))
+    report = evaluate_data_health(
+        as_of=as_of,
+        latest_trade_date=_text_field(historical_universe.get("latest_trade_date"))
+        or _text_field(_dict_of(date_payload.get("data_gate")).get("latest_trade_date")),
+        universe_snapshot=universe_snapshot or None,
+        valid_symbol_count=_as_int_field(
+            historical_universe.get("as_of_valid_count"), fallback=None
+        ),
+        model_identity=(
+            {
+                "status": model.get("identity_status", ""),
+                "identity_verified": model.get("identity_verified", False),
+                "research_fail_closed": model.get("research_fail_closed", False),
+            }
+            if model
+            else None
+        ),
+        price_contract=resolve_price_contract(config).to_payload(),
+        breadth_artifact_present=bool(market_breadth),
+    )
+    payload = report.to_payload()
+    payload["gate"] = combined_gate_decision(
+        report=report,
+        breadth_policy=_dict_of(market_breadth.get("usage_policy")) or None,
+        enforce=False,  # 灰度：先产报告，观察期结束后再谈 fail-closed
+    )
+    return payload
+
+
+def _text_field(value: object) -> str:
+    return str(value or "").strip()
+
+
 class AsofBacktestService:
     """历史回溯选股 + 持有期走势的编排、落盘与查询。
 
@@ -592,6 +639,14 @@ class AsofBacktestService:
         quality_selection = _dict_of(prefilter.get("universe_quality_selection"))
         historical_context = _dict_of(report.get("historical_context"))
         anomalies = _dict_of(report.get("anomalies"))
+        data_health_payload = _build_data_health_payload(
+            as_of=as_of,
+            historical_universe=historical_universe,
+            historical_context=historical_context,
+            market_breadth=_dict_of(report.get("market_breadth")),
+            config=self._config,
+            date_payload=report,
+        )
         return {
             "as_of": as_of.isoformat(),
             "run_mode": "historical",
@@ -631,6 +686,9 @@ class AsofBacktestService:
             "historical_context": historical_context,
             "data_gate": report.get("data_gate"),
             "market_breadth": report.get("market_breadth"),
+            # S08：Data Health 与 Market Breadth 分层（数据健康先判，广度后判）。
+            # 灰度默认只观测：enforce=False 时 block_new_buy 恒 False，只记录建议。
+            "data_health": data_health_payload,
             "anomalies_count": _as_int_field(anomalies.get("event_count"), fallback=0),
             "holding_curve": holding_payload,
         }
