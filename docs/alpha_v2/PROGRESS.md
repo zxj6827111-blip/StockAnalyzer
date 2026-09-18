@@ -10,10 +10,11 @@
 
 ```text
 Project = StockAnalyzer Alpha V2.0
-Current Batch = M1
-Current Stage = S02 DONE（本轮施工停止于 S03 之前，见 §11 批次小结）
-M1 Acceptance = PENDING
-M2 Acceptance = LOCKED
+Current Batch = M2（S11-S23 工程实现完成）
+Current Stage = S23 DONE
+M1 Acceptance = PASS（第三轮独立验收；外部独立验收结论，用户转达，2026-09-18 转录）
+M2 Acceptance = PASS（工程实现层；外部独立验收结论，用户转达，2026-09-18 转录）
+                 待办：M2 工作区尚未 commit（验收建议按"方式 B"批次固化，需用户授权）
 Production Promotion = LOCKED
 ```
 
@@ -60,6 +61,12 @@ Ending HEAD = TBD
 Codex Acceptance = PENDING
 ```
 
+> 说明（2026-09-18 追加）：**上面这段 Batch Status 与下面的 Stage Matrix 都是
+> 「首轮」（S00–S02 提交后）的快照**：`IN_PROGRESS` / `Ending HEAD = TBD` /
+> `Codex Acceptance = PENDING` / S03–S10 的 `NOT_STARTED` 均已被后续施工取代。
+> **最终状态以 §12「M1 全量 Stage Matrix」与 §14 验收记录为准**（全部 DONE / PASS）。
+> 保留本节是为了让「首轮 FAIL 是完整性判定」这一事实有出处。
+
 ## Stage Matrix
 
 | Stage | Task | ZCode Status | Tests | Audit Artifact | Codex Acceptance | Notes |
@@ -77,6 +84,11 @@ Codex Acceptance = PENDING
 | S10 | Decision Log + Outcome Maturation | NOT_STARTED | - | - | PENDING | |
 
 ---
+
+> 说明（2026-09-18 追加）：本节是 **M2 开工前**的快照（`LOCKED` / `Starting HEAD = TBD` /
+> `Codex Engineering Acceptance = PENDING` 与整表 `LOCKED` 均已被后续施工取代）。
+> **最终状态以 §13「M2 批次」与 §14 验收记录为准**（全部 DONE / PASS）。
+> 保留本节是为了让「M2 在 M1 PASS 前不得开工」这一事实有出处。
 
 # 3. M2 — Alpha Research & Shadow
 
@@ -117,10 +129,16 @@ Research Evidence Status = LOCKED
 
 | Gate | Required Evidence | Status | Evidence Window | Notes |
 |---|---|---|---|---|
-| 20D Alert Gate | >=20 mature decision dates | LOCKED | - | 仅用于发现明显失败 |
-| 60D Research Gate | >=60 mature decision dates | LOCKED | - | 允许第一轮方向判断 |
-| 120D Advisory Gate | >=120 clean OOS dates | LOCKED | - | 才允许讨论 Advisory |
-| 250D Governance Gate | ~250 OOS trading days | LOCKED | - | 才讨论自动 promotion / 稳定阈值 |
+| 20D Alert Gate | >=20 mature decision dates | AVAILABLE（本地开发窗口） | 197 成熟决策日 | 仅用于发现明显失败；口径见 §13.5 |
+| 60D Research Gate | >=60 mature decision dates | AVAILABLE（本地开发窗口） | 197 成熟决策日 | 允许第一轮方向判断；**不等于已验证有效** |
+| 120D Advisory Gate | >=120 clean OOS dates | AWAITING_DATA | S19 clean OOS 仅 60 日 | 才允许讨论 Advisory；S16/S21 的 197 日**非** clean OOS |
+| 250D Governance Gate | ~250 OOS trading days | AWAITING_DATA | - | 才讨论自动 promotion / 稳定阈值 |
+
+> 更新依据（2026-09-18）：S11 在本地真实数据（400 票 / 202 交易日 / 80,800 决策）上产出了
+> **真实成熟 outcome**，故 20D/60D 可标 AVAILABLE——但这是**本地开发窗口**口径，
+> 该窗口已被反复用于开发与选择，**不是 clean OOS**；120D 只能依赖 S19 的 walk-forward，
+> 当前 60 日 → 仍 `AWAITING_DATA`。
+> 结论表述边界：`AVAILABLE` 只描述样本量，不构成「模型有效」；S19 判定为 `INCONCLUSIVE`。
 
 ---
 
@@ -193,11 +211,11 @@ LOCKED / SXX
 ## M1 Acceptance
 
 ```text
-Engineering Verdict = PENDING
-Codex Verdict = PENDING
-Permission To Proceed To M2 = NO
-Reviewed HEAD = TBD
-Review Date = TBD
+Engineering Verdict = PASS
+Codex Verdict = PASS（第三轮；外部独立验收结论，用户转达，2026-09-18 转录）
+Permission To Proceed To M2 = YES
+Reviewed HEAD = 43e91cc266027bca3fa7f5b78a73929d741b03e9
+Review Date = 2026-09-18
 ```
 
 ### Blocking Findings
@@ -211,12 +229,12 @@ Review Date = TBD
 ## M2 Acceptance
 
 ```text
-Engineering Verdict = PENDING
-Codex Verdict = PENDING
-Research Evidence Status = LOCKED
+Engineering Verdict = PASS
+Codex Verdict = PASS（工程实现层；外部独立验收结论，用户转达，2026-09-18 转录）
+Research Evidence Status = 60D AVAILABLE / 120D·250D AWAITING_DATA
 Production Promotion = LOCKED
-Reviewed HEAD = TBD
-Review Date = TBD
+Reviewed HEAD = 43e91cc 之上的工作区（未 commit；21 项变更）
+Review Date = 2026-09-18
 ```
 
 ### Blocking Findings
@@ -290,14 +308,13 @@ Execution 使用 raw price
 # 10. 当前下一步
 
 ```text
-NEXT ACTION:
-ZCode M1 施工中 — S00 DONE，当前 S01（Model Identity Truth）
+NEXT ACTION（2026-09-18）:
+M1 = PASS（第三轮）；M2 = PASS（工程实现层，见 §14）
+M2 工作区尚未 commit —— 待用户授权后按"方式 B"做批次 commit 固化
 
-AFTER M1:
-Run Codex CURRENT_BATCH = M1
-
-Only after Codex PASS:
-Unlock M2
+AFTER COMMIT:
+本批结束；生产部署 / 模型切换 / 阈值调整仍需**另行授权**
+（M2 验收明确：Production Promotion = LOCKED）
 ```
 
 ---
@@ -540,7 +557,7 @@ Stages Completed = S00, S01, S02, S03, S04, S05, S06, S07, S08, S09, S10
 Stopped At = （无）
 Ending HEAD = be28ff9（S10 提交；批次收尾提交见 git log）
 Review Baseline = 7e9e33bdb9d03506cff5dfff29c78b1c95019541
-Codex Batch Acceptance = PENDING
+Codex Batch Acceptance = PASS（第三轮；外部独立验收结论，用户转达，2026-09-18 转录）
 ```
 
 首轮 Codex 验收结果：**FAIL（唯一原因：批次不完整，S03-S10 未实施；S00-S02 判 PASS）**。
@@ -550,17 +567,17 @@ Codex Batch Acceptance = PENDING
 
 | Stage | Task | ZCode | 定向测试 | 提交 | 审计工件 | Codex |
 |---|---|---|---|---|---|---|
-| S00 | Feature Flag / No-op Baseline | DONE | 40 passed | 83e4fd7 | `s00_validation.json` | PENDING |
-| S01 | Model Identity Truth | DONE | 447 passed | a78a990 | `s01_validation.json` | PENDING |
-| S02 | T+1 Entry Simulation | DONE | 197 passed | 5b1e504 | `s02_validation.json` | PENDING |
-| S03 | Point-in-Time Historical Universe | DONE | 162 passed | 3d919c7 | `s03_validation.json` | PENDING |
-| S04 | SelectionContract 300/100/50 | DONE | 139 passed | 89f08f0 | `s04_validation.json` | PENDING |
-| S05 | Registry / Archive Governance | DONE | 109 passed | 6243cd0 | `s05_validation.json` | PENDING |
-| S06 | HistoricalModelResolver | DONE | 135 passed | 8d3248d | `s06_validation.json` | PENDING |
-| S07 | Feature / Execution Price Split | DONE | 154 passed | 1a199a6 | `s07_validation.json` | PENDING |
-| S08 | Data Health / Breadth Split | DONE | 58 passed | 053b4b1 | `s08_validation.json` | PENDING |
-| S09 | Model / Label Semantic Guard | DONE | 55 passed | d0a58f7 | `s09_validation.json` | PENDING |
-| S10 | Decision Log + Outcome Maturation | DONE | 13 passed | be28ff9 | `s10_validation.json` | PENDING |
+| S00 | Feature Flag / No-op Baseline | DONE | 40 passed | 83e4fd7 | `s00_validation.json` | PASS |
+| S01 | Model Identity Truth | DONE | 447 passed | a78a990 | `s01_validation.json` | PASS |
+| S02 | T+1 Entry Simulation | DONE | 197 passed | 5b1e504 | `s02_validation.json` | PASS |
+| S03 | Point-in-Time Historical Universe | DONE | 162 passed | 3d919c7 | `s03_validation.json` | PASS |
+| S04 | SelectionContract 300/100/50 | DONE | 139 passed | 89f08f0 | `s04_validation.json` | PASS |
+| S05 | Registry / Archive Governance | DONE | 109 passed | 6243cd0 | `s05_validation.json` | PASS |
+| S06 | HistoricalModelResolver | DONE | 135 passed | 8d3248d | `s06_validation.json` | PASS |
+| S07 | Feature / Execution Price Split | DONE | 154 passed | 1a199a6 | `s07_validation.json` | PASS |
+| S08 | Data Health / Breadth Split | DONE | 58 passed | 053b4b1 | `s08_validation.json` | PASS |
+| S09 | Model / Label Semantic Guard | DONE | 55 passed | d0a58f7 | `s09_validation.json` | PASS |
+| S10 | Decision Log + Outcome Maturation | DONE | 13 passed | be28ff9 | `s10_validation.json` | PASS |
 
 ## Codex 复审要求落实
 
@@ -1073,3 +1090,257 @@ PENDING
 ### Next Stage
 M1 批次验收（Codex）
 
+
+---
+
+# 13. M2 批次（Alpha Research & Shadow，S11–S23）
+
+## M2 Batch Status
+
+```text
+Batch = M2（S11-S23）
+Batch Status = DONE（等待 Codex 整批验收）
+Stages Completed = S11 S12 S13 S14 S15 S16 S17 S18 S19 S20 S21 S22 S23
+Stopped At = （无）
+Starting HEAD = 43e91cc266027bca3fa7f5b78a73929d741b03e9（= M1 最终验收基线）
+Ending HEAD = 工作区未提交（未 push；见 §13.3 变更清单）
+Codex Batch Acceptance = PASS（工程实现层；外部独立验收结论，用户转达，2026-09-18 转录）
+Research Evidence Status = 60D AVAILABLE / 120D·250D AWAITING_DATA（见 §13.5）
+Production Promotion = LOCKED
+```
+
+前提确认：M1 经 Codex 第三轮独立验收 **PASS**，M1 基线 `43e91cc` 未回退、未重做。
+
+## 13.1 Stage Matrix（M2 全量）
+
+| Stage | Task | ZCode | 定向测试 | 审计工件 | Codex | Research |
+|---|---|---|---|---|---|---|
+| S11 | Label V2（多 horizon 可执行 outcome） | DONE | 34 passed | `s11_validation.json` | PASS | 早期证据 |
+| S12 | Benchmark 体系（Eligible/Quality/Style） | DONE | 17 passed | `s12_validation.json` | PASS | 早期证据 |
+| S13 | Winner Recall | DONE | 14 passed | `s13_validation.json` | PASS | 早期证据 |
+| S14 | Feature Availability / Leakage Audit | DONE | 21 passed | `s14_validation.json` | PASS | 已完成 |
+| S15 | Simple Factor Baseline | DONE | 34 passed | `s15_validation.json` | PASS | 早期证据 |
+| S16 | Shared Feature Matrix + Multi-Head | DONE | 25 passed | `s16_validation.json` | PASS | 早期证据 |
+| S17 | Cross Review V2（分歧观测） | DONE | 19 passed | `s17_validation.json` | PASS | 早期证据 |
+| S18 | Final Decision Policy V2 Shadow | DONE | 22 passed | `s18_validation.json` | PASS | N/A |
+| S19 | Purged Walk-Forward / Clean OOS | DONE | 24 passed | `s19_validation.json` | PASS | 早期证据 |
+| S20 | Legacy vs V2 Shadow Dual Run | DONE | 23 passed | `s20_validation.json` | PASS | AWAITING_DATA |
+| S21 | Daily Alpha Health Report | DONE | 23 passed | `s21_validation.json` + `.md` | PASS | AWAITING_DATA |
+| S22 | NAS Performance Hardening | DONE | 18 passed | `s22_validation.json` | PASS | 本地实测 |
+| S23 | Theme / News / Intraday 增量框架 | DONE | 19 passed | `s23_validation.json` | PASS | AWAITING_DATA |
+
+定向测试合计 **293** 例（0 failed）。
+
+## 13.2 新增文件（按模块）
+
+```text
+src/stock_analyzer/alpha_v2/research/__init__.py
+src/stock_analyzer/alpha_v2/research/panel.py                PIT 日线面板 + 价格口径认证
+src/stock_analyzer/alpha_v2/research/outcomes.py             S11 Label V2
+src/stock_analyzer/alpha_v2/research/metrics.py              统一评价指标（共用）
+src/stock_analyzer/alpha_v2/research/benchmarks.py           S12 三层基准 + 风格匹配
+src/stock_analyzer/alpha_v2/research/winner_recall.py        S13
+src/stock_analyzer/alpha_v2/research/feature_audit.py        S14 特征可用性/穿越审计
+src/stock_analyzer/alpha_v2/research/factors.py              S15 可解释因子族
+src/stock_analyzer/alpha_v2/research/simple_baseline.py      S15 基线组合与 ML 对照
+src/stock_analyzer/alpha_v2/research/multi_head.py           S16 共享矩阵 + 四 Head
+src/stock_analyzer/alpha_v2/research/cross_review_v2.py      S17 分歧观测
+src/stock_analyzer/alpha_v2/research/decision_policy.py      S18 Shadow 策略
+src/stock_analyzer/alpha_v2/research/purged_walk_forward.py  S19
+src/stock_analyzer/alpha_v2/research/shadow_dual_run.py      S20 双轨 + 台账接线
+src/stock_analyzer/alpha_v2/research/health_report.py        S21 八块日报
+src/stock_analyzer/alpha_v2/research/perf.py                 S22 性能/预算/determinism
+src/stock_analyzer/alpha_v2/research/experiments.py          S23 增量实验框架
+scripts/alpha_v2_research_run.py                             M2 全链路跑批（审计工件生成）
+tests/_alpha_v2_research_helpers.py                          M2 测试共用夹具
+tests/test_alpha_v2_s11..s23_*.py                            13 个阶段测试文件
+```
+
+对既有文件的**增量**改动（不改语义）：
+
+```text
+src/stock_analyzer/backtest/matcher.py       新增 apply_price_tick 公开透传（研究侧复用同一 tick 规则）
+src/stock_analyzer/alpha_v2/decision_log.py  新增 read_decision_rows / read_outcome_rows（S20/S21 复核用）
+```
+
+## 13.3 行为变化
+
+**新增**：PIT 研究面板与价格口径认证；多 horizon 可执行 outcome；三层基准 + 风格匹配对照；
+winner recall；特征可用性登记表与 Base V2 准入断言；可解释因子基线与 ML 公平对照；
+共享矩阵多 Head（Rank/Return/Direction/Risk）+ OOS isotonic 校准；分歧观测量与证据块；
+Shadow 策略与双轨报告；purged walk-forward；每日健康报告（八块）；性能/预算/determinism 证据；
+Theme/News/Intraday 增量实验门。
+
+**Legacy 不变量（未改）**：`final_signal_min_threshold=70`；Cross Review 四阈值；
+night 300/100/50 与 final cap；风险门；在服模型与 challenger；飞书正式通知；
+`alpha_v2.enabled=false` / `shadow_only=true` / `enforce_final_selection=false`。
+
+## 13.4 施工中发现并修复的真实缺陷
+
+1. **PIT 股票池列名错配**（`panel.pit_universe`）：向 M1 `build_pit_stats` 传 `trade_date`，
+   而后者只认 `date` → stats 静默变空，整个股票池被误判成 `future_listed`（eligible=0）。
+   修复：显式改名 `trade_date → date`，并补 4 条 PIT 池回归测试。
+2. **基准合并产生 `_x/_y` 后缀**（`merge_primary_excess`）：先按原名取列再 merge，
+   `benchmark_return_*d` 已存在 → 合并后被改名，随后 `KeyError`。修复：合并前统一清掉同名旧列。
+3. **评价口径对缺列不 fail-closed**（`metrics.usable_mask`）：指标列整体缺失时
+   `pd.to_numeric(None)` 变标量 → 抛 `AttributeError`。修复：缺列即返回全 False 掩码。
+4. **S19 训练集泄漏 20 行**（本次自查最有价值的发现）：日历口径 purge 假设
+   「决策日 + purge 个交易日即成熟」，而真实成熟日按**标的自身 bar 序列**推进，
+   停牌/停更的票会越界。修复：在 `run_fold` 增加按真实成熟日的二次 purge
+   （`maturity_purged_rows` 如实计数，`purge_adequacy` 标 `calendar_purge_insufficient`），
+   独立复核保持原样（`lookahead_violations` 现在是 0 而不是被掩盖）。
+5. **特征审计把身份列当特征**：`decision_date`/`symbol` 混进「未登记列」。修复：
+   显式 `IDENTITY_COLUMNS` 跳过。
+
+## 13.5 研究样本门状态（本地跑批口径，非生产）
+
+本地证据运行：`artifacts/warehouse/market.duckdb`，窗口 2025-06-02→2026-03-31，
+400 只票、202 交易日、132,947 根 bar、80,800 条决策（主样本 79,355）。
+价格口径：行内无声明 → 实测一致性探针认证为 `raw`（超限比例 6.8e-05）。
+
+```text
+20D Alert       = AVAILABLE（197 成熟决策日 > 20）
+60D Research    = AVAILABLE（197 > 60，仅"第一轮方向判断"）
+120D Advisory   = 未达（S19 clean OOS 60 日；S16/S21 的 197 日非 clean OOS 口径）
+250D Governance = AWAITING_DATA
+```
+
+关键读数（诚实记录，不修饰）：
+
+```text
+S16/S21  alpha_rank Rank IC：3D +0.049 / 5D +0.052 / 10D +0.048 / 15D +0.040（197 日）
+S21      Top5 5D 超额 +0.0041/日（命中率 47.1%）；Top1 5D 超额 −0.0138（命中率 46.4%）
+S21      分位单调性 ρ=+0.60，top−bottom +0.0013（弱单调）
+S15      Simple Baseline 5D IC −0.022（CI 跨 0，本窗口无效）
+S16      ML vs Baseline：ic_delta +0.074、topk_delta +0.0022 → ml_beats_baseline
+S19      Purged WF：3 折、泄漏 0、pooled IC +0.016、CI[−0.018,+0.057] → INCONCLUSIVE
+S13      Winner Recall：light 0.427 / deep 0.220 / final 0.029（研究代理漏斗）
+S14      Base V2 安全特征 120 列 / 排除 88 列 / 未登记 0 / 常数疑似 101 列
+S17      分歧高−低 = −0.00065（仅 36 成熟日 → observation_only）
+S23      theme 可实验但样本不足；news/intraday 前置条件阻断
+```
+
+**结论表述边界**：以上是**本地开发窗口**读数，且该窗口已被反复用于开发与选择，
+**不是 clean OOS**；`INCONCLUSIVE` 与 `AWAITING_DATA` 是正确状态，
+不得据此宣称模型有效或进入 Advisory/Production。
+
+## 13.6 M2 新增的 Deferred Findings
+
+| ID | 严重度 | 内容 | 目标 |
+|---|---|---|---|
+| DF-M2-001 | medium | 研究代理漏斗（流动性 top-N）与生产真实 300/100/50 不是同一件事；`quality_pool_source=research_proxy:alpha_v2_quality_v1` 已如实标注，真实成员需生产链路注入 | NAS/部署期 |
+| DF-M2-002 | medium | 本机 `peak_rss_mib` 在 Windows 无可读 `/proc` → `unavailable`；内存预算判定需在 NAS(Linux) 复核 | NAS |
+| DF-M2-003 | medium | 101/208 特征列在本窗口近乎常数或近全空（背景/资金/分钟组），与 Phase 2 归因的「98 特征全 NaN」同源；这些组已排除出 Base V2，但上游回填仍需治理 | 数据侧 |
+| DF-M2-004 | low | `alpha_target_5d` 采用截面 rank 分位作为排序目标；与 `return_rank v3` 生产标签语义（top/bottom 分位阈值）未在本轮统一 | M3 |
+| DF-M2-005 | low | S18 Shadow 候选池依赖研究侧 `deep_pool` 名次列；真实 Deep50 成员需从夜扫产物注入后才算生产同口径 | NAS |
+| DF-S07-001 | high | **仍未闭合**：本机受跟踪配置 `execution_spec.price_series_mode=qfq`；本轮用实测探针认证了 `market_duckdb` 面板为 raw，但生产 vendor 链路口径仍需在 NAS 核验 | NAS |
+| DF-S06-001 | medium | **仍未闭合**：无逐日激活历史 → `strict_production_replay` 仍基本恒 `unscorable`（M2 未涉及该链路） | NAS |
+| DF-S06-002 | medium | **仍未闭合**：asof（非 week5）回测的 as_of 闸门未接（M2 未改动该路径） | M3 |
+| DF-S08-002 | high | **仍未闭合**：live breadth 缺失 fail-open 的生产接线属部署灰度期 | NAS |
+| DF-S10-001/002 | — | 决策日志与 outcome 成熟**接线能力已在 S20 实现**（`build_shadow_decision_rows` / `mature_shadow_outcomes` + 测试），但**尚未接入生产调度**（需部署授权） | NAS |
+
+## 13.7 回滚
+
+- 整批：删除 `src/stock_analyzer/alpha_v2/research/`、`scripts/alpha_v2_research_run.py`、
+  `tests/_alpha_v2_research_helpers.py`、`tests/test_alpha_v2_s11..s23_*.py`
+  与 `docs/alpha_v2/M2_Implementation_Report.md`（全部为新增文件）；
+- 增量改动：`git checkout -- src/stock_analyzer/backtest/matcher.py src/stock_analyzer/alpha_v2/decision_log.py`
+  （两处均为纯新增函数，回滚不影响 M1 与 Legacy）；
+- **无生产影响**：未 push、未部署、未重启容器、未改 `.env`、未切 serving model、未 promote、
+  未开启 `alpha_v2.enforce_final_selection`；`artifacts/alpha_v2/**` 为运行时产物。
+
+## 13.8 Codex Acceptance
+
+PENDING —— 建议重点复核见 `docs/alpha_v2/M2_Implementation_Report.md` §32。
+
+
+---
+
+# 14. 验收记录（外部独立验收结论的转录）
+
+> **本节的 `PASS` 全部来自外部独立验收，经用户转达后转录**；
+> ZCode **没有**、也不能自行把 Codex Acceptance 写成 PASS（两阶段提示词 §15）。
+> 转录只做「记录 + 标注来源与日期」，不改变任何施工内容。
+
+## 14.1 M1（第三轮）
+
+```text
+M1 Verdict = PASS（第三轮最终）
+Permission To Proceed To M2 = YES
+Reviewed HEAD = 43e91cc266027bca3fa7f5b78a73929d741b03e9
+基线测试 = 3204 passed / 2 skipped / 0 failed（施工提示词记录）
+```
+
+## 14.2 M2（第二批）
+
+```text
+Batch Verdict = PASS（工程实现层）
+Engineering Verdict = PASS
+Blocking Findings = 无
+Research Gate = 60D AVAILABLE / 120D·250D AWAITING_DATA（与蓝图要求一致）
+Production Promotion = LOCKED
+```
+
+独立验收做过的三层证据（转述）：
+
+1. **读代码核实不变量**：S11 `executable=False` 全部收益列恒 `not_available`；
+   S12 风格窗口止于决策日且排除自身；S13 自证循环防护落在代码里；
+   S14 黑名单优先于分组匹配；S16 矩阵指纹断言与校准窗互斥；
+   S17/S18/S20/S21 的结构守卫均在实现而非文档层；S19 双口径 purge 真实生效。
+2. **重跑测试**（非引用施工方数据）：
+
+```text
+M2 定向（13 文件）        = 293 passed / 0 failed
+M1 回归定向（7 文件）     = 105 passed / 0 failed
+批次级全量（-n 4 loadfile）= 3496 passed / 2 skipped / 0 failed
+（验收方临时加入 10 条独立反例探针后为 3506 passed；剔除后与报告数字精确吻合）
+独立反例探针              = 10 passed
+ruff（M2 全部文件）       = All checks passed
+```
+
+3. **自编对抗探针**（按验收门禁 §13 抽查）：预测分数定义赢家必须抛错、
+   未证明特征进 Base V2 必须抛错、Head 指纹不一致必须抛错、
+   随机切分必须抛错、自动动作必须被拒、`enforce_final_selection=True` 必须抛错、
+   `not_available` 不被编造 —— 全部符合预期。
+
+其他核查结论：`matcher.py` / `decision_log.py` 两处改动确认为纯增量；
+凭据扫描零命中；审计工件 15 件齐备且关键字段与报告一致；
+报告把 197 日标为「开发窗口、非 clean OOS」，`INCONCLUSIVE` / `AWAITING_DATA`
+未被包装成 PASS。
+
+## 14.3 非阻塞观察（验收方提出，不要求返工）
+
+| # | 观察 | 本轮处置 |
+|---|---|---|
+| 1 | M2 成果全部未 commit（工作区 21 项变更）；建议验收通过后按「方式 B」做批次 commit 固化，否则后续改动会与「已验收内容」混在一起 | **待用户授权**（见 §14.4） |
+| 2 | M1 基线计数分歧：M1 报告 §21 记 3202 vs 施工提示词记 3204，两者均 0 failed | 已在本节与 M2 报告 §21 双处如实标注；**下批复核一次**（当前树已含 M2 改动，无法回溯复算历史状态） |
+| 3 | 本节所在的 §2 首轮矩阵 Codex 列曾是 `PENDING`（文本段落已写 PASS，表格未回写） | **已修**：§12 最终矩阵、§13.1 M2 矩阵、§6 验收记录、§0 状态表全部回写，§2 首轮快照加指针说明 |
+| 4 | 遗留 Deferred（DF-S07-001 生产价格口径、DF-S06-001/002、DF-S08-002、DF-M2-001/003/005 等）属 NAS / 数据侧验证 | 本就在 M2 范围外，已在 §8 / §13.6 登记，不因验收 PASS 而消失 |
+
+## 14.4 待决事项（需要用户决定，ZCode 不擅自执行）
+
+```text
+1) M2 工作区按「方式 B」做批次 commit 固化 —— 需用户明确授权
+   拟纳入（21 项）：docs/alpha_v2/{PROGRESS.md, M2_Implementation_Report.md}
+                    scripts/alpha_v2_research_run.py
+                    src/stock_analyzer/alpha_v2/research/**（18 个新模块）
+                    src/stock_analyzer/alpha_v2/decision_log.py（+2 只读函数）
+                    src/stock_analyzer/backtest/matcher.py（+1 透传方法）
+                    tests/_alpha_v2_research_helpers.py
+                    tests/test_alpha_v2_s11..s23_*.py（13 个文件）
+   不纳入：docs/system_issues_for_review_20260917.md（用户未跟踪文件，全程未动）
+           artifacts/alpha_v2/**（.gitignore 内，运行时产物）
+2) 是否把 DF-M2-003（101/208 特征列近乎常数/近全空）排入数据侧治理
+3) 生产部署 / 模型切换 / 阈值调整 —— 仍未授权，不在本轮考虑范围
+```
+
+## 14.5 Legacy 与生产不变量（验收后仍成立）
+
+```text
+final_signal_min_threshold = 70            未改
+Cross Review 四阈值                         未改
+night 300/100/50、final cap 5              未改
+serving model / challenger                 未切换、未 promote
+alpha_v2 三开关                             enabled=false / shadow_only=true / enforce_final_selection=false
+git push / 部署 / 容器重启 / .env 修改       均未执行
+```

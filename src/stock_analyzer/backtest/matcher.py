@@ -133,6 +133,14 @@ class ExecutionMatcher:
             slippage_ratio=slippage_ratio,
         )
 
+    def apply_price_tick(self, price: float, *, side: str) -> float:
+        """按最小报价单位取整（研究与执行共用同一 tick 规则，避免两套口径）。
+
+        S11 的 outcome 需要把**卖出**价按 tick 取整后计入净收益；此前只有引擎内部
+        可达，研究侧若自行 round 会产生与真实成交价不一致的收益。
+        """
+        return self._engine.apply_price_tick(price, side=side)
+
     def plan_order(self, *, side: str, price: float, requested_quantity: int) -> OrderPlan:
         return self._engine.plan_order(
             side=side,

@@ -451,6 +451,20 @@ def _first_present(
     return default
 
 
+def read_decision_rows(path: str | Path) -> list[dict[str, object]]:
+    """读取决策 JSONL（报告/审计/复核用；文件不存在返回空列表）。
+
+    M2 起 S20/S21 需要重读决策台账来算漏斗与监控指标，故把读取能力公开——
+    与写入同样保证"坏行跳过、不抛异常"，避免一行脏数据让整份报告失败。
+    """
+    return _read_jsonl(Path(path))
+
+
+def read_outcome_rows(path: str | Path) -> list[dict[str, object]]:
+    """读取 outcome JSONL（同上）。"""
+    return _read_jsonl(Path(path))
+
+
 def _read_jsonl(path: Path) -> list[dict[str, object]]:
     if not path.exists():
         return []
@@ -484,6 +498,8 @@ __all__ = [
     "compute_outcomes",
     "decision_path",
     "outcome_path",
+    "read_decision_rows",
+    "read_outcome_rows",
     "resolve_decision_root",
     "write_decision_rows",
     "write_manifest",
