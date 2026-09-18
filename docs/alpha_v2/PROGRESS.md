@@ -579,11 +579,42 @@ Codex Batch Acceptance = PENDING
 
 ```text
 命令：python -m pytest -n 4 --dist loadfile
-结果：3194 passed / 2 skipped / 0 failed（552.25s，S00-S10 全部提交后的工作树）
-对照：批次开始前基线 3031 passed / 2 skipped / 0 failed（新增 163 例）
-说明：首轮批次级运行曾出现 1 例间歇失败（S06/S07 夹具写共享 learning_protocol.duckdb
-      与 xdist 并发撞锁）；已改为进程内 registry 桩，压力复跑 2/2 通过后重跑全量得上述结果。
+结果：3202 passed / 2 skipped / 0 failed（633.33s，S00-S10 + 半批审 B1/B2/B3/N1-N4 修复后）
+对照：批次开始前基线 3031 passed / 2 skipped / 0 failed（新增 171 例）
+
+过程说明（三次运行的由来）：
+1. 首轮（S00-S02）：3079 passed；2. 二轮（S00-S10）：3194 passed，
+   其中 1 例间歇失败源自 S06/S07 夹具写共享 learning_protocol.duckdb 与 xdist 并发撞锁
+   → 改为进程内 registry 桩（压力复跑 2/2 通过）；
+3. 三轮（半批审修复后）：3202 passed / 0 failed，含 B1/B2/B3 与 N1-N3 的全部新回归。
 ```
+
+## 半批审（第二轮 Codex）修复记录
+
+```text
+B1（S06 阻断）：解析结果与加载路径脱钩
+  → run_week5_historical_day 把 hist_config.training.artifact_path 绑定到
+    resolution.artifact_uri，并在加载后复核 实算哈希 == resolution 哈希 且
+    created_at <= decision_time；不符即 unscorable（带 load_verification 落痕）
+  → 对抗测试：helper 级 3 例 + runner 级 1 例（config 指向"更新的在服工件"时
+    实际加载旧 PIT 工件，报告哈希 = 旧哈希 ≠ 新哈希）
+
+B2（S07 阻断）：analyze_holding_curve 缺 slippage_ratio 参数 → 服务层必崩
+  → 补 slippage_ratio / max_entry_sessions 透传；端到端夹具改为真的产生候选
+    （放宽终门/共识门只为让合成数据走到 final），并断言"有候选 → holding 段存在
+    且 entry_mode=next_session_open"
+
+B3（S07 阻断）：NaN 封堵只修了 limit_rule 一层
+  → engine/matcher 的 _optional_numeric 统一过滤 NaN/Inf；补 Case B 形态
+    （整列 NaN + 无 pre_close 的一字涨停 → no_valid_price_data）与 Inf 同口径回归
+
+N1（S05）：prune 容量分支 no-op → 重写（预算约束整个归档；预算内不删；
+  超预算从最旧非保留 bundle 删到进预算；绝不低于保留下限）+ 两条回归
+N2（S08）：valid_symbol_count=None 被当 1.0 判 ok → 改判 degraded + 回归
+N3（S10）：compute_outcomes 用裸默认 matcher → 支持 matcher/config 复用运行配置 + 回归
+N4（既有）：test_nightly_scheduling 的墙钟敏感用例 → 显式清空 quiet_windows
+```
+
 
 
 ## 本轮不变量核对

@@ -82,6 +82,21 @@ SelectionContract；serving manifest 与对账；历史模型解析闸门；价�
 night 300/100/50 与 final cap 数值；风险门（breadth/overextension/board）；
 在服模型与 challenger；飞书正式通知；生产 live 决策路径（S04 保留 live 缺省 legacy 目标）。
 
+## 5b. 第二轮 Codex 验收（半批审）修复
+
+第一轮 S00–S02 通过；第二轮（完整 S00–S10）判 **FAIL**，原因是三个实证缺陷与三个必修项，
+本轮已全部修复并各自带回归/对抗测试：
+
+| 项 | 缺陷 | 修复 | 回归证据 |
+|---|---|---|---|
+| **B1**（阻断） | S06 解析结果与加载路径脱钩："resolve 了但不加载 resolved 的那个"，config 指向更新的在服工件时未来模型进历史回测 | scorable 后把加载路径绑定到 `resolution.artifact_uri`；加载后复核实算哈希与 `created_at <= decision_time`，不符即 `unscorable` | helper 级 3 例 + **runner 级 1 例**（报告哈希 = 旧 PIT 哈希 ≠ 新在服哈希） |
+| **B2**（阻断） | `analyze_holding_curve` 无 `slippage_ratio` 参数，服务层按关键字传入 → 有候选必 TypeError（滑点修复空转） | 补参数透传；端到端夹具改为真的产生候选 | 端到端断言"有候选 → holding 段存在且 `entry_mode=next_session_open`" |
+| **B3**（阻断） | NaN 封堵只到 `limit_rule`，引擎/matcher 数值层仍 fail-open（整列 NaN + 无 pre_close 的一字涨停可成交） | `engine`/`matcher` 的 `_optional_numeric` 统一过滤 NaN/Inf | Case B 形态回归 + Inf 同口径回归 |
+| N1 | `prune_model_bundle_archive` 容量分支 no-op | 预算约束整个归档：预算内不删、超预算从最旧删到进预算、不低于保留下限 | 两条回归（预算充裕不删 / 超预算删到进预算） |
+| N2 | `valid_symbol_count=None` 被当 1.0 判 ok | 分子缺失 → `degraded` + 进 `missing_artifacts` | 回归 1 例 |
+| N3 | `compute_outcomes` 用裸默认 matcher | 支持 `matcher`/`config` 入参复用运行配置 | 一致性回归 1 例 |
+| N4 | `test_nightly_scheduling` 墙钟敏感（午间静默窗） | 用例显式清空 `quiet_windows` | 该文件 25 passed |
+
 ## 6. Codex 复审要求落实
 
 | 项 | 落实位置 |
@@ -98,7 +113,9 @@ night 300/100/50 与 final cap 数值；风险门（breadth/overextension/board�
 ## 7. 测试与证据
 
 - 各阶段定向测试：见 §4（合计 1509，含跨阶段重复计入的回归集）。
-- 批次级集成：`python -m pytest -n 4 --dist loadfile`（见 `artifacts/alpha_v2/audit/m1_summary.json` 的 `batch_tests`）。
+- 批次级集成：`python -m pytest -n 4 --dist loadfile`
+  → **3202 passed / 2 skipped / 0 failed（633.33s）**，在 S00–S10 + 半批审修复全部提交后运行
+  （见 `artifacts/alpha_v2/audit/m1_summary.json` 的 `batch_tests`）。
 - 审计工件：`artifacts/alpha_v2/audit/{baseline_manifest,s00..s10_validation,model_registry_reconciliation,m1_summary}.json`。
 - 测试隔离修复（本批次自查发现）：S06/S07 夹具最初向**共享** `learning_protocol.duckdb` 写模型，
   多 xdist worker 并发时撞 DuckDB 锁 → 间歇性失败；已改为进程内 registry 桩（2/2 压力复跑通过）。
@@ -108,6 +125,7 @@ night 300/100/50 与 final cap 数值；风险门（breadth/overextension/board�
 | ID | 级别 | 内容 | 目标 |
 |---|---|---|---|
 | DF-S00-001 | low | `model_dump()`→`model_validate` 整份配置不可回填（limit_rule alias `from`） | S04/M2 |
+| —— | 已闭合 | B1/B2/B3（第二轮阻断项）、N1/N2/N3/N4 均已修复并带回归 | 本轮 |
 | DF-S03-001 | medium | 上市日仍为"窗口内 bar 数"代理（新上市 vs 长期停牌不可区分） | 数据侧/M2 |
 | DF-S03-002 | medium | 当日停牌票仍进 expected_active 分母（执行层 no_fill 兜住） | S08 |
 | DF-S05-001 | info | 本机 registry 0 行；权威对账需 NAS 跑同一 CLI | 部署期 |
@@ -129,6 +147,7 @@ night 300/100/50 与 final cap 数值；风险门（breadth/overextension/board�
 ## 10. Codex Acceptance
 
 **PENDING** —— 建议重点复核：
+0. 半批审 B1/B2/B3 的对抗测试是否确实拦住原缺陷（B1 runner 级、B2 端到端 holding 段、B3 Case B）；
 1. S03 未来上市票是否**同时**排除出 universe 与覆盖率分母；
 2. S04 生产夜扫与历史 night-equivalent 是否都报 `night_alpha_v2_v1` 与 300/100/50；
 3. S06 是否存在任何"回退当前在服模型"的路径（应为零）；
