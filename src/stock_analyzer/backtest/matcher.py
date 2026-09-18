@@ -35,7 +35,8 @@ class EntrySimulation:
     - ``entry_date``：实际成交日（主口径必须 > signal_date）；未成交时为 None；
     - ``entry_price_raw``：raw 成交价（未计成本前的开盘价，含滑点前）；
     - ``reference_open_raw``：该成交日 raw 开盘价（审计用，等于滑点前价格）；
-    - ``slippage``：滑点后的成交价（含滑点，未含手续费）；
+    - ``slippage``：滑点带来的**价格增量**（``net_entry_price - entry_price_raw``，
+      非成交价本身）；实际成交价见 ``net_entry_price``（Codex N3 措辞修正）；
     - ``cost``：按成交价与数量估算的买入成本（手续费等）；
     - ``net_entry_price``：计入滑点后的成交价（成本另计，便于 outcome 计算）；
     - ``no_fill_reason``：suspended / limit_up_open / no_valid_price_data /
@@ -94,6 +95,14 @@ class ExecutionMatcher:
             last_buy_date=last_buy_date,
             current_date=current_date,
         )
+
+    def static_slippage_ratio(self, strategy: str) -> float:
+        """策略静态滑点（S07：执行侧不再默认 0 滑点）。
+
+        与 ``dynamic_slippage_ratio`` 并列：无 ATR/量比信息时的基准滑点，
+        取自 ``backtest_matcher.slippage_by_strategy``。
+        """
+        return self._engine.static_slippage_ratio(strategy)
 
     def dynamic_slippage_ratio(
         self,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
@@ -226,15 +227,20 @@ def _optional_float(value: object) -> float | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return float(value)
+        parsed = float(value)
+        # NaN/Inf 不是"有效涨跌停价"：返回 None 让调用方走 fail-closed 分支。
+        # 此前 NaN 被当作"有 source 值"透传，而 NaN 比较恒 False → 涨停门静默放行
+        # （DF-S02-002，2026-09-18 实测复现）。
+        return parsed if math.isfinite(parsed) else None
     if isinstance(value, str):
         text = value.strip()
         if not text:
             return None
         try:
-            return float(text)
+            parsed = float(text)
         except ValueError:
             return None
+        return parsed if math.isfinite(parsed) else None
     return None
 
 

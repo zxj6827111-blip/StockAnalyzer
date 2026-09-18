@@ -28,6 +28,7 @@ import pandas as pd
 from stock_analyzer.backtest.asof_scan import AsofScanReport, run_asof_scan
 from stock_analyzer.backtest.holding_curve import HoldingCurveReport, analyze_holding_curve
 from stock_analyzer.backtest.matcher import ExecutionMatcher
+from stock_analyzer.backtest.price_contract import resolve_price_contract
 from stock_analyzer.config import StockAnalyzerConfig
 from stock_analyzer.market_calendar import is_a_share_trading_day
 
@@ -241,6 +242,9 @@ class AsofBacktestService:
 
         holding_reports: dict[str, HoldingCurveReport] = {}
         matcher = ExecutionMatcher(config.backtest_matcher, limit_rule=config.limit_rule)
+        # S07（DF-S02-003）：执行滑点取策略静态滑点（backtest_matcher.slippage_by_strategy），
+        # 不再默认 0——0 滑点会把"理想成交"当真实结果。
+        resolved_slippage_ratio = matcher.static_slippage_ratio("trend")
         for as_of in as_of_dates:
             candidates = scan_report.candidates_for(as_of)
             if not candidates:
@@ -259,6 +263,7 @@ class AsofBacktestService:
                 take_profit_pct=config.asof_backtest.take_profit_pct,
                 stop_loss_pct=config.asof_backtest.stop_loss_pct,
                 symbols=[signal.symbol for signal in candidates],
+                slippage_ratio=resolved_slippage_ratio,
             )
             holding_reports[as_of.isoformat()] = holding_report
 
@@ -335,6 +340,10 @@ class AsofBacktestService:
         resolved_horizon = (
             horizon_days if horizon_days is not None else config.asof_backtest.default_horizon_days
         )
+        # S07（DF-S02-003）：执行滑点取策略静态滑点（trend），不再默认 0 滑点。
+        resolved_slippage_ratio = ExecutionMatcher(
+            config.backtest_matcher, limit_rule=config.limit_rule
+        ).static_slippage_ratio("trend")
         resolved_holding_top_n = holding_top_n
         as_of_dates = _trading_days_in_range(start_date, end_date)
         # S01：请求级模型身份（事实来自实际会加载的工件）。各日期运行上下文里的
@@ -450,6 +459,9 @@ class AsofBacktestService:
                 "intraday_degraded": intraday_degraded,
                 "intraday_coverage_until": _read_intraday_coverage_until(config),
                 "neutral_account": True,
+                # S07 价格口径：特征（可能 qfq）与成交（必须 raw）分开写进报告。
+                "price_contract": resolve_price_contract(config).to_payload(),
+                "execution_slippage_ratio": resolved_slippage_ratio,
                 # S02 执行契约：盘后信号 → T+1 可成交开盘；不可成交即 no_fill（不进收益统计）。
                 "execution_contract": {
                     "entry_mode": "next_session_open",
@@ -555,6 +567,8 @@ class AsofBacktestService:
             matcher = ExecutionMatcher(
                 self._config.backtest_matcher, limit_rule=self._config.limit_rule
             )
+            # S07（DF-S02-003）：执行滑点取策略静态滑点，不再默认 0。
+            resolved_slippage_ratio = matcher.static_slippage_ratio("trend")
             bars_by_symbol = _fetch_extended_bars_for_holding_curve(
                 config=self._config,
                 symbols=holding_symbols,
@@ -570,6 +584,7 @@ class AsofBacktestService:
                 take_profit_pct=self._config.asof_backtest.take_profit_pct,
                 stop_loss_pct=self._config.asof_backtest.stop_loss_pct,
                 symbols=holding_symbols,
+                slippage_ratio=resolved_slippage_ratio,
             )
             holding_payload = _to_jsonable(holding_report)
 
@@ -696,6 +711,11 @@ class AsofBacktestService:
                 "intraday_coverage_until": _read_intraday_coverage_until(self._config),
                 "candidate_pool_source": candidate_pool_source,
                 "candidate_pool_bias": candidate_pool_bias,
+                # S07 价格口径（同 week5 路径）：特征/成交口径显式落报告 + 执行滑点。
+                "price_contract": resolve_price_contract(self._config).to_payload(),
+                "execution_slippage_ratio": ExecutionMatcher(
+                    self._config.backtest_matcher, limit_rule=self._config.limit_rule
+                ).static_slippage_ratio("trend"),
                 # S02 执行契约（同 week5 路径）：主口径入场 = T+1 可成交开盘。
                 "execution_contract": {
                     "entry_mode": "next_session_open",

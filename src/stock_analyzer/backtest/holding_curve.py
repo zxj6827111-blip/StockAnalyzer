@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -116,15 +117,29 @@ def _bar_snapshot(row: pd.Series) -> dict[str, float | bool]:
     open_price = float(row.get("open", close))
     high_price = float(row.get("high", max(open_price, close)))
     low_price = float(row.get("low", min(open_price, close)))
-    return {
+    # S07（DF-S02-001）：**不再注入** close*1.1/0.9 的估算涨跌停。
+    # 估算值会被 ExecutionEngine 的 use_source_first 当成权威 source 值，从而掩盖
+    # 真实板块涨跌幅（ST 5% / 创业板科创板 20% / IPO 无限制）——实测一字涨停在该
+    # 路径下会被判成"可成交"。这里只透传真实存在的列；缺列时引擎按 pre_close/board
+    # 解析，仍解析不出就 fail-closed（no_valid_price_data），不猜测。
+    snapshot: dict[str, float | bool] = {
         "open": open_price,
         "high": high_price,
         "low": low_price,
         "close": close,
-        "up_limit": float(row.get("up_limit", close * 1.1)),
-        "down_limit": float(row.get("down_limit", close * 0.9)),
         "suspended": bool(row.get("suspended", False)),
     }
+    optional_keys = ("up_limit", "down_limit", "pre_close", "pct_change", "is_st", "name", "board")
+    for optional_key in optional_keys:
+        if optional_key not in row:
+            continue
+        value = row.get(optional_key)
+        if value is None:
+            continue
+        if isinstance(value, float) and not math.isfinite(value):
+            continue  # NaN/Inf：视为缺失（与 limit_rule 同口径）
+        snapshot[optional_key] = value
+    return snapshot
 
 
 def _future_bars(

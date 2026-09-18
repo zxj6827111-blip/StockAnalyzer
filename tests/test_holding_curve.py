@@ -50,12 +50,16 @@ def _bars_from_closes(
     low_series = (
         pd.Series(lows, index=dates, dtype=float) if lows is not None else close_series * 1.0
     )
+    # S07：夹具必须给真实的涨跌停基准（pre_close），不能依赖"缺列时按 ±10% 估算"——
+    # 那条估算路径已被删除（会掩盖 ST 5% / 创业板科创板 20% / IPO 无限制）。
+    pre_close_series = close_series.shift(1).fillna(close_series)
     frame = pd.DataFrame(
         {
             "open": close_series,
             "high": high_series,
             "low": low_series,
             "close": close_series,
+            "pre_close": pre_close_series,
             "volume": 1_000_000.0,
             "turnover": close_series * 1_000_000.0,
             "suspended": False,
@@ -217,6 +221,8 @@ class TestExecutionMatcherReuse:
                 "high": [10.0, 10.0, 10.0],
                 "low": [10.0, 10.0, 10.0],
                 "close": [10.0, 10.0, 10.0],
+                # S07：真实涨跌停基准（缺列会 fail-closed 成 no_fill，不再按 ±10% 估算）
+                "pre_close": [10.0, 10.0, 10.0],
                 "suspended": [False, False, True],
             },
             index=dates,
