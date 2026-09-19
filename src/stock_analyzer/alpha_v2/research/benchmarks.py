@@ -444,7 +444,9 @@ def _style_control_group(
             )
         for offset in range(chunk.shape[0]):
             row_index = start + offset
-            dist[row_index, row_index] = np.inf
+            # 行维是"当前 chunk 内偏移"，列维才是组内全局序号——自配对必须摘出去，
+            # 否则 size > block 时 row_index 越界（dist 形状是 chunk_rows × size）。
+            dist[offset, row_index] = np.inf
         order = np.argsort(dist, axis=1)[:, :width]
         peers[start:stop, :width] = order
         distances[start:stop, :width] = np.take_along_axis(dist, order, axis=1)

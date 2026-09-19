@@ -1344,3 +1344,252 @@ serving model / challenger                 未切换、未 promote
 alpha_v2 三开关                             enabled=false / shadow_only=true / enforce_final_selection=false
 git push / 部署 / 容器重启 / .env 修改       均未执行
 ```
+
+---
+
+# 15. M3 — Production Shadow Validation & Clean OOS（冻结纪律 + 验证链）
+
+> 2026-09-18 起施工；生产部署 / git push / 模型权重阈值调整均未授权未执行。
+> 冻结基线 `55c7592fe88ac3b3ab5b233df422b0f528141074`（= M1+M2 合并验收锚点）。
+
+## 15.1 新增能力（全部工程态，证据可复现）
+
+- `alpha_v2/validation/freeze.py`：Validation Freeze Manifest（冻结 22 个基本面 + 嵌套 model/benchmark/policy_freeze）+ canonical sha256。
+- `alpha_v2/validation/epoch.py`：epoch 注册表——单开、原因闭、关闭后写入拒绝、身份对账。
+- `alpha_v2/validation/frozen_model.py`：冻结 Shadow 模型工件（17 个目标的 lgbm 原生 booster + OOS isotonic 校准器 + `model_manifest.json`，含 per-file sha256 与聚合 artifact_hash；加载逐文件验证）。
+- `alpha_v2/validation/shadow_capture.py`：T 日预测冻结（全套 M3 §6 字段）+ 同键改写逐字段一致校验（`ShadowTamperError`）+ `missing_prediction_day` 台账。
+- `alpha_v2/validation/outcome_maturation.py`：日更成熟回填（S11 T+1、raw 价、成本、MAE/MFE、四层冻结基准并行落列、信号当天 0 行、重述防护）。
+- `alpha_v2/validation/validation_kpis.py`：M3 KPI（Top1/3/5 命中+均值+中位+三层超额、Rank IC 3/5/10/15 与 20D/60D、十分位单调、winner recall、下行 MAE/5%tail/止损命中、T+1 成交/缺口/滑点、样本门 + alpha_verified=False/permanent LOCKED 品牌词）。
+- `alpha_v2/validation/feature_diagnosis.py`：DF-M2-003 五分类诊断 + market.duckdb 上游源探针。
+- CLI 六件套：`alpha_v2_validation_freeze.py / alpha_v2_shadow_model_freeze.py / alpha_v2_shadow_capture.py / alpha_v2_shadow_mature.py / alpha_v2_validation_report.py / alpha_v2_feature_diagnosis.py`。
+
+## 15.2 施工中发现并修复的真实缺陷
+
+| ID | 位置 | 缺陷 | 证据 |
+|---|---|---|---|
+| DF-M3-B1 | `research/benchmarks.py::_style_control_group` | 风格 kNN 的"排除自身"把组内全局行号当成块内偏移:组规模 > 512 即 IndexError；M2 的 400 票小窗从未踩到 | `tests/test_alpha_v2_m3_benchmark_block_bug.py`（含暴力对照、block 不变性） |
+| DF-M3-B2 | `validation/frozen_model.py` | 派生目标列（mae_le_5pct_{10,15}d）不匹配 S14 黑名单前缀、被误吸为特征 | `fit_frozen_model` 内安全列准入前预过滤 + 回归 |
+
+## 15.3 NAS 只读核验（§15 A–E）
+
+证据文件：`artifacts/alpha_v2/audit/nas_readonly_verification_20260918.json`。
+
+- A Registry：21 行/0 冠军/17 revoked 指 dataset manifest；serving=model_v1.json hash 71f64a21c131…= registry 中 `model_v3_6d7486bc1af6`；**serving_manifest.json 在生产不存在**（M1 能力未部署）。
+- B 执行价：**SA__EVOLUTION__EXECUTION_SPEC__PRICE_SERIES_MODE=raw ✓**（DF-S07-001 生产侧闭合证据）。
+- C Breadth：`market_breadth.json` 当前生产不存在（fail-open 态：缺失≠健康）；`nightly_data_ready.json` 2026-09-18 12:32Z 正常。
+- D/E 决策日志 + 成熟调度：生产无对应 job（预期内，部署后接通）。
+
+## 15.4 DF-M2-003 诊断结果（本批只做诊断，不改特征）
+
+窗口 2025-06-02→2026-03-31 / 400 票 / 208 列：
+
+```text
+FILL_ZERO_ARTIFACT   = 99（模式 0、占比≈1、零覆盖=1.000）
+REAL_CONSTANT        = 2  （block_trade_frequency_20 / background_completion_score）
+UNKNOWN              = 107（含全部正常技术特征）
+```
+
+上游探针：`moneyflow_net_amount / hk_hold_* / inst_net_amount / block_trade_amount` 在
+`daily_bars` 里近乎零填充（270 / 4 / 0 / 8 行），`northbound_net` 97.7% 恰为 0 值——
+99 个"常数"的本质是上游未填充被工程师末端 `fillna(0.0)` 伪造成 0。
+数据侧治理决定（回填或删除）必须走"关 epoch → 新 epoch"，本批不动。
+
+## 15.5 本地排练（machinery proof，不是 clean OOS）
+
+```text
+冻结模型训练窗: 2025-06-02 → 2026-02-13（再 -60 交易日校准窗）
+冻结工件:      artifacts/alpha_v2_rehearsal/model/alpha_v2_shadow_epoch_001/
+              （artifact_hash=5978ef5d…；17/17 目标全训成功）
+冻结清单+epoch: artifacts/alpha_v2_rehearsal/validation/{validation_freeze_manifest.json, epochs.json}
+T 日快照:      2026-02-27（Deep50 50 行；预测字段非 not_available 率 100%）
+成熟:          evaluation=2026-03-31 → 50 行 × 3/5/10/15D 全部成熟
+KPI 报告:      reports/validation_kpi_alpha_v2_epoch_001_20260919.{json,md}，
+               rank_ic 5d=+0.19（单日，不构成结论）；
+               alpha_verified=False / production_promotion=LOCKED；样本门全 False
+```
+
+## 15.6 测试（初版口径有误，已更正为 junit 为准）
+
+```text
+M3 定向             = 9 文件 / 76 passed / 0 failed / 0 skipped
+                      （初版误写 50：把 shadow_capture 记 9=实 8、kpis 记 5=实 4；
+                        Readiness 旧文另有 7 文件/52 例的笔误。修复轮新增 enforcement 26 例。
+                        数字以 junitxml 实测为准）
+全量回归（-n4 loadfile）= 3574 collected / 0 failed / 0 errors / 2 skipped
+                      （3574 = 3498 基线 + 76 M3）
+ruff                  = 全部 M3 改动文件 All checks passed
+```
+
+> **以上是 F1–F7 修复轮（R2）的历史快照，保留不覆盖。** R3 最终口径（权威）：
+> M3 定向 = 10 文件 / **112** collected / **112** passed / 0 failed / 0 skipped；
+> 全量 = **3610** collected / **3608** passed / 0 failed / 0 errors / 2 skipped
+> （见 §15.10.4 / §15.11.2 与 `artifacts/alpha_v2/audit/m3_batch_regression.json`）。
+
+## 15.9 M3 Blocking Fix Round（2026-09-19）：F1–F7 代码落地
+
+Codex 首轮验收 M3 判 FAIL（含 B1–B8；其中"脏树/旧 SHA 冒充生产 code identity"与
+"T 日快照可事后创建"属于明确"不许 CONDITIONAL PASS"级别）。本轮未 commit 未 push，
+仅以工作区修复 + 测试 + 演练留证：
+
+```text
+F1  shadow_capture.py   T 日写入窗口强制（capture_date/backfill）；补写必落
+                        backfilled=true 且 clean_oos_eligible=false；missing/快照冲突双向拒绝
+F2  epoch.py            身份严格对账 require_epoch_identity_match（缺失即违例）；
+                        shadow/missing/mature 三路径接入
+F3  outcome_maturation.py closed epoch 先于面板加载即拒；影子外 symbol 拒绝写入
+F4  freeze_precheck.py 生产五项硬门（raw/脏树/build 身份/窗口/schema），
+                        rehearsal 模式显式单开（清单落 validation_mode=rehearsal）
+F5  runtime_identity.py porcelain 语义修正（空输出=干净）；构建身份对账
+F6  validation_kpis.py  Clean OOS 两层资格分块 + 治理计数；严格 JSON（NaN→not_available）
+F7  scripts/…           capture 侧 deep_rank 修正（名次 1..N + deep_rank_pct）；
+                        quality_pool_source 不再绕回 proxy
+```
+
+附证据（$TEMP/m3_acceptance/）：
+- `rehearsal_a_freeze_gates.py` → 7 项生产门禁场景全 PASS（干净+raw 才可写清单开 epoch）；
+- `rehearsal_b_capture_mature.py` → 10 项 fail-closed 场景全 PASS（含 manifest 替换、
+  closed epoch、T+1 补写、missing 冲突、backfill 治理、严格 JSON）。
+
+## 15.7 交付约束边界（本批始终遵守）
+
+```text
+- 未 git push、未部署 NAS、未重启容器、未改 .env、未切 serving model、未 promote
+- alpha_v2.enabled / shadow_only / enforce_final_selection 仍为 false/true/false
+- Legacy 阈值 70 / cross review / 300-100-50 / 风险门零改动
+- 用户文件 docs/system_issues_for_review_20260917.md 保持未跟踪、未纳入任何产物
+```
+
+## 15.8 验收请求要点（供 Codex M3 独立验收参考）
+
+1. epoch 双开 / 关闭后再写 / 同 id 重开 —— 都必须被拒（test_alpha_v2_m3_epoch.py）
+2. 同日快照篡改必须被拒（test_rewrite_with_different_prediction_is_refused）
+3. 信号当天写 outcome 必须是 0 行（test_signal_day_writes_nothing）
+4. 已成熟 outcome 重算不一致必须抛（test_restatement_is_refused）
+5. 冻结清单 hash 被改必须 fail（test_tampered_manifest_fails_integrity）
+6. 训练/校准窗重叠必须被拒（test_train_calibration_overlap_is_refused）
+7. KPI 的 alpha_verified=False / production_promotion=LOCKED 没有条件可写成 True
+8. benchmarks 分块修复的暴力对照回归（刚入库的 R1）
+
+## 15.10 M3 Final Blocking Fix R3（2026-09-19）：BLK-R2-1 / BLK-R2-2 / N-R2-1
+
+### 15.10.0 验收历史（保留，不覆盖）
+
+```text
+M3 Acceptance Round 1（外部独立验收）  = FAIL（B1–B8）
+M3 Recheck Round 2（独立复核）         = FAIL（BLK-R2-1 伪造 capture_date / BLK-R2-2 构建身份双源未同时校验）
+M3 Final Blocking Fix R3（修复落地）   = 完成（BLK-R2-1 / BLK-R2-2 / N-R2-1）
+Codex Recheck（Round 3，外部独立）      = PASS（2026-09-19）
+```
+
+> Round 1 FAIL / Round 2 FAIL 是历史结论，保留不覆盖；Round 3 复核的权威计数与
+> 封存状态见 §15.11。
+
+### 15.10.1 BLK-R2-1 写入日 = 真实墙钟
+
+- `write_shadow_snapshot` **删除** `capture_date` 参数（攻击面消失）；写入日取 `wall_clock_now()`；
+- 每行落 `actual_capture_date`（真实写入日）与 `deterministic_clock`（是否用了确定性时钟）；
+- **production 永久不可注入时钟**（无任何开关）：`capture_clock_policy` 唯一条件 = `validation_mode != production`，
+  否则 `ShadowClockNotAuthorizedError`；生产 freeze CLI 只产 production / rehearsal；
+  测试套件用 `validation_mode="test"`（与 production 同语义、可进 clean，CLI 产不出）；
+- capture CLI：生产模式 `--capture-date` → exit 8；无 flag 且 `signal_date != 真实今天` → exit 8；
+- 显式 backfill 固定 `backfilled=true / clean_oos_eligible=false / backfill_reason` 非空，
+  并保留 `signal_date / recorded_at / actual_capture_date`；
+- KPI 新增第二道闸：行 `recorded_at`（与 `actual_capture_date`）必须与 `signal_date` 同日，
+  否则该日不进 clean 且 `reason=late_recorded_at`；治理块新增 `late_recorded_days`。
+
+### 15.10.2 BLK-R2-2 构建身份四值一致
+
+- `assert_build_identity` 改为四值硬门：`git HEAD == requested == .build_commit == build_manifest.commit`；
+- 两源**都必须存在且可解析**；`build_manifest` 必须 `trusted=true`、`dirty=false`；任一不满足 exit 5；
+- `runtime_identity.read_build_manifest_file`（存在性即证据，不再环境变量兜底）+ `build_manifest_present`；
+- freeze CLI 把 `build_identity` 段写进清单（纳入 `freeze_manifest_hash`）；
+- 唯一例外：容器内 git 不可得时必须 `--code-commit` 显式给值 + 两源互证，来源记
+  `cli_override_git_unavailable`。
+
+### 15.10.3 N-R2-1 capture 侧 data_health 接线
+
+- 新增 `validation/data_health_capture.py`：`capture_data_health_block`（同日 + 状态映射）与
+  `data_health_gate_ok`（**唯一一份** clean 判定，捕获与 KPI 共用）；
+- 新增 `scripts/alpha_v2_data_health_snapshot.py`：按 S08 契约产当天工件（拿不到的输入不喂 →
+  S08 判 degraded → 不进 clean）；
+- capture CLI 新增 `--data-health`；行与当日清单写结构块；缺失/陈旧/降级 → 记录照写、clean=false、
+  样本门不推进。
+
+### 15.10.4 验证实绩
+
+```text
+M3 定向   = 10 文件 / 112 collected / 112 passed / 0 failed / 0 skipped（junit 实测；R2 口径为 9 文件 / 76 例）
+全量回归   = 3610 collected / 3608 passed / 0 failed / 0 errors / 2 skipped
+             （junit 实测；见 artifacts/alpha_v2/audit/m3_batch_regression.json，R3 刷新）
+Attack A  = 20 天固定时钟注入 20/20 被拒；生产 CLI --capture-date exit 8；clean_oos_days=0、
+            backfilled_days=20、failure_alert(20).reached=False
+Attack B  = 四值一致 PASS；缺 .build_commit / 缺 build_manifest / 双源矛盾 / git HEAD 不符 /
+            requested 不符 / trusted=false / dirty=true 全部 FAIL（每条 exit 5）
+data_health = 同日 healthy → clean；missing / not_available / stale / degraded → 写快照但不进 clean
+```
+
+### 15.10.5 新增部署前置（比 §15 原口径更严）
+
+```text
+- production freeze 需要 .build_commit 与 build_manifest.json **同时**存在、可解析、
+  trusted=true、dirty=false，且与 git HEAD / 冻结清单 code_commit 四值一致；
+- capture 之前必须先产当天 data_health 工件（scripts/alpha_v2_data_health_snapshot.py），
+  否则该日 data_health=not_available → 不进 clean OOS。
+```
+
+### 15.10.6 本轮边界
+
+```text
+未 commit / 未 push / 未部署 / 未重启容器 / 未改 .env / 未切 serving model / 未 promote；
+未动 feature set / label / benchmark / alpha rank / 模型参数 / Legacy 70 / cross review。
+```
+
+## 15.11 M3 外部独立验收结论与封存状态（2026-09-19）
+
+### 15.11.1 验收历史（保留，不覆盖）
+
+```text
+M3 Acceptance Round 1（外部独立验收）  = FAIL（B1–B8）
+M3 Recheck Round 2（独立复核）         = FAIL（BLK-R2-1 伪造 capture_date / BLK-R2-2 构建身份双源未同时校验）
+M3 Final Blocking Fix R3（修复落地）   = 完成（BLK-R2-1 / BLK-R2-2 / N-R2-1）
+M3 Round 3（外部独立最终复核）          = PASS
+```
+
+### 15.11.2 Round 3 复核的权威计数（junit 实测为准）
+
+```text
+M3 定向    = 10 文件 / 112 collected / 112 passed / 0 failed / 0 skipped
+全量回归    = 3610 collected / 3608 passed / 0 failed / 0 errors / 2 skipped
+              （2 skipped = NAS bash 语法检查，仅 Linux CI 执行；
+                见 artifacts/alpha_v2/audit/m3_batch_regression.json）
+冻结基准层 = 3（eligible_ew / quality_pool_ew / style_matched）+ primary = quality_pool_ew
+              simple_baseline 由 KPI 层做同日配对，**不属于 frozen benchmark layer**
+```
+
+### 15.11.3 封存状态
+
+```text
+M3 Engineering Acceptance           = PASS
+M3 Accepted Baseline Commit         = 本次本地封存 commit（SHA 见该 commit 记录）
+Production Shadow Deployment        = NOT_STARTED
+Production Deployment Authorization = NOT_EXECUTED
+
+BLK-D1 = OPEN（生产容器无 git、无 /app/.build_commit → production freeze 不可执行；容器形态实测 exit 5）
+BLK-D2 = OPEN（capture / mature 的 code_commit 在容器内恒为 unknown → 运行身份闸 exit 3）
+  ↑ 二者属后续独立的 Production Runtime Identity Hardening，不在 M3 封存范围内。
+
+Clean OOS Days       = 0
+Alpha Verified       = FALSE
+Production Promotion = LOCKED
+```
+
+### 15.11.4 生产身份口径（禁止混用）
+
+```text
+M3_ACCEPTED_BASELINE_COMMIT     = 本批封存 commit（M1+M2+M3 工程基线）
+PRODUCTION_SHADOW_FROZEN_COMMIT = PENDING_AFTER_BLK_D1_D2
+```
+
+真实验证 epoch（`alpha_v2_epoch_001`）的 freeze manifest `code_commit` 必须指向
+**包含 Production Runtime Identity Hardening 的后续最终部署 commit**，
+不得用 `M3_ACCEPTED_BASELINE_COMMIT` 冒充生产冻结身份。

@@ -595,6 +595,31 @@ def _predict_model(model: Any, features: np.ndarray) -> np.ndarray:
     return values.reshape(-1) if values.ndim > 1 else values
 
 
+# ---------------------------------------------------------------------------
+# 公开出口：M3 冻结模型（shadow 工件）必须与 M2 研究链路共用同一套
+# LightGBM 原生参数与确定性设置，而不是复制一份容易漂移的实现。
+# ---------------------------------------------------------------------------
+
+
+def lightgbm_train_params(
+    *, task: str, seed: int = DEFAULT_SEED, n_jobs: int = DEFAULT_N_JOBS
+) -> dict[str, Any]:
+    """训练参数（公开别名；冻结模型与研究链路同一口径，M3 冻结清单引用它）。"""
+    return _lightgbm_params(task=task, seed=seed, n_jobs=n_jobs)
+
+
+def fit_lightgbm_native(
+    *, features: np.ndarray, labels: np.ndarray, task: str, spec: HeadFitSpec
+) -> Any:
+    """原生 LightGBM 训练（公开别名；确定性设置固定）。"""
+    return _fit_model(features=features, labels=labels, task=task, spec=spec)
+
+
+def predict_model_scores(model: Any, features: np.ndarray) -> np.ndarray:
+    """原生 Booster 推理（公开别名）。"""
+    return _predict_model(model, features)
+
+
 def _fit_alpha_rank(
     frame: pd.DataFrame,
     feature_columns: Sequence[str],
@@ -921,8 +946,11 @@ __all__ = [
     "build_shared_feature_matrix",
     "calibrate_direction",
     "fit_and_predict_heads",
+    "fit_lightgbm_native",
     "head_display_semantics",
     "head_spec",
+    "lightgbm_train_params",
     "matrix_fingerprint",
     "multi_head_payload",
+    "predict_model_scores",
 ]
