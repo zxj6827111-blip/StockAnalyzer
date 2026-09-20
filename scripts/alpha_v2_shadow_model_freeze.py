@@ -54,15 +54,18 @@ from stock_analyzer.alpha_v2.research.panel import (  # noqa: E402
 from stock_analyzer.alpha_v2.validation.feature_frame import (  # noqa: E402
     daily_feature_frame,
 )
+from stock_analyzer.alpha_v2.validation.freeze_precheck import (  # noqa: E402
+    FreezeGateError,
+    assert_runtime_identity,
+)
 from stock_analyzer.alpha_v2.validation.frozen_model import (  # noqa: E402
     fit_frozen_model,
     persist_frozen_model,
 )
 from stock_analyzer.alpha_v2.validation.runtime_identity import (  # noqa: E402
     config_hash_of,
-    git_branch,
-    git_head,
     price_contract_block,
+    resolve_runtime_code_identity,
 )
 from stock_analyzer.backtest.matcher import ExecutionMatcher  # noqa: E402
 from stock_analyzer.config import load_config  # noqa: E402
@@ -90,6 +93,16 @@ def main(argv: list[str] | None = None) -> int:
     window_start = date.fromisoformat(args.window_start)
     window_end = date.fromisoformat(args.window_end)
     config = load_config(Path(args.config))
+
+    # BLK-D2 同类修复：模型 provenance 的 code_commit 必须来自统一 resolver，
+    # 与 validation freeze / capture / mature 是同一个值（容器里取构建身份）。
+    # 放在面板加载**之前**：身份不可证就没必要跑几小时训练（fail-fast）。
+    try:
+        model_code_identity = resolve_runtime_code_identity(REPO_ROOT)
+        model_code_commit = assert_runtime_identity(model_code_identity)
+    except FreezeGateError as exc:
+        print(f"[freeze-model] 运行身份硬门未通过: {exc}", file=sys.stderr)
+        return 3
 
     panel = load_daily_panel(
         market_db=REPO_ROOT / args.market_db,
@@ -171,8 +184,10 @@ def main(argv: list[str] | None = None) -> int:
             "slippage_ratio": float(slippage),
         },
         extra_identity={
-            "code_commit": git_head(REPO_ROOT),
-            "git_branch": git_branch(REPO_ROOT),
+            "code_commit": model_code_commit,
+            "code_commit_source": model_code_identity.code_commit_source,
+            "identity_source": model_code_identity.identity_source,
+            "git_branch": model_code_identity.git_branch,
             "config_hash": config_hash_of(config),
             "price_contract": price,
         },

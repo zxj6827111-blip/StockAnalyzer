@@ -15,7 +15,10 @@ python scripts/alpha_v2_shadow_capture.py \
 - 没有合法校准的方向分写 ``not_available``（不制造伪概率）；
 - 候选缺 quality/light/deep 标记时成员字段仍是 not_available——不猜；
 - T 日快照只允许 T 日写：``--allow-backfill`` 显式打开后，行落
-  ``backfilled=true`` + ``clean_oos_eligible=false``。
+  ``backfilled=true`` + ``clean_oos_eligible=false``；
+- 运行身份（BLK-D2 修复）：``code_commit`` 来自 ``resolve_runtime_code_identity``
+  ——源码检出用 git HEAD，不可变容器用镜像构建身份（.build_commit ==
+  build_manifest.commit）。**不再**直接取 ``git_head()``（容器里恒为 unknown）。
 """
 
 from __future__ import annotations
@@ -58,6 +61,11 @@ from stock_analyzer.alpha_v2.validation.freeze import (  # noqa: E402
     label_policy_payload,
     load_validation_freeze,
 )
+from stock_analyzer.alpha_v2.validation.freeze_precheck import (  # noqa: E402
+    FreezeGateError,
+    assert_model_training_commit,
+    assert_runtime_identity,
+)
 from stock_analyzer.alpha_v2.validation.frozen_model import (  # noqa: E402
     FrozenModelError,
     load_frozen_model,
@@ -65,8 +73,8 @@ from stock_analyzer.alpha_v2.validation.frozen_model import (  # noqa: E402
 )
 from stock_analyzer.alpha_v2.validation.runtime_identity import (  # noqa: E402
     config_hash_of,
-    git_head,
     price_contract_block,
+    resolve_runtime_code_identity,
 )
 from stock_analyzer.alpha_v2.validation.shadow_capture import (  # noqa: E402
     ShadowCaptureError,
@@ -194,6 +202,36 @@ def main(argv: list[str] | None = None) -> int:
             print("[shadow] 拒绝：--allow-backfill 必须同时给 --backfill-reason", file=sys.stderr)
             return 8
 
+    # 第二道闸的第一步（BLK-D2）：**运行身份**——只依赖代码身份，不依赖模型/面板，
+    # 所以放在最前面 fail-fast。code_commit 不能再取 git_head(REPO_ROOT)（容器里恒为
+    # unknown）；走与 freeze 同一个 resolver：git_checkout 用 HEAD，容器用构建身份。
+    try:
+        runtime_identity_resolved = resolve_runtime_code_identity(
+            REPO_ROOT, validation_mode=validation_mode
+        )
+        runtime_code_commit = assert_runtime_identity(
+            runtime_identity_resolved, validation_mode=validation_mode
+        )
+    except FreezeGateError as exc:
+        print(f"[shadow] 运行身份硬门未通过: {exc}", file=sys.stderr)
+        return 3
+
+    # ── R4.1：模型训练身份绑定（本 epoch 冻结值 == 当前运行身份）────────────────
+    # 读的是**磁盘冻结清单**里由 freeze_manifest_hash 锚定的
+    # model.model_training_code_commit（epoch 成立的前提条件已在 freeze 阶段强制过一次，
+    # 这里是每日写入路径上的复查：epoch 被换/清单被改/跑的是另一份代码都拦下）。
+    try:
+        assert_model_training_commit(
+            model_training_code_commit=str(
+                (freeze.get("model") or {}).get("model_training_code_commit", "")
+            ),
+            runtime_code_commit=runtime_code_commit,
+            validation_mode=validation_mode,
+        )
+    except FreezeGateError as exc:
+        print(f"[shadow] 模型训练身份硬门未通过: {exc}", file=sys.stderr)
+        return 3
+
     # ── 当天 data_health（N-R2-1）：读 S08 契约工件；读不到 = not_available（不阻塞写）──
     data_health_payload, data_health_source = load_data_health_artifact(
         path=(args.data_health or None), root=root
@@ -224,11 +262,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[shadow] 冻结模型校验失败: {exc}", file=sys.stderr)
         return 5
 
-    # 第二道闸：运行身份全键核验（8 键严格缺失判违例）——model 已载入
+    # 第二道闸的第二步：运行身份全键核验（8 键严格缺失判违例）——需要 model 已载入
     contract = resolve_selection_contract(config, profile="night_scan")
     price = price_contract_block(config)
     runtime_identity = {
-        "code_commit": git_head(REPO_ROOT),
+        "code_commit": runtime_code_commit,
         "config_hash": config_hash_of(config),
         "model_id": str(model.manifest.get("model_id", "")),
         "model_artifact_hash": str(model.manifest.get("artifact_hash", "")),
@@ -298,7 +336,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # 质量池代理：本机没有生产链路成员 => PIT 合格即研究代理（台账如实标记）。
     identity = {
-        "code_commit": git_head(REPO_ROOT),
+        "code_commit": runtime_code_commit,
         "config_hash": config_hash_of(config),
         "model_id": model.model_id,
         "model_artifact_hash": str(model.manifest.get("artifact_hash", "")),
@@ -405,6 +443,8 @@ def main(argv: list[str] | None = None) -> int:
                 "backfilled": bool(is_backfill),
             },
             "data_health": dict(data_health_block),
+            # 运行身份来源（BLK-D2）：容器形态与源码检出形态在此可区分
+            "runtime_identity": runtime_identity_resolved.to_payload(),
             "counts": {
                 "eligible": len(eligible),
                 "deep50": int(len(deep50_records)),

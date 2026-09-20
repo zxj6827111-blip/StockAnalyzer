@@ -15,10 +15,26 @@ python scripts/alpha_v2_validation_freeze.py --epoch-id alpha_v2_epoch_900 \
 生产模式硬门（任一不过即退出非零；`validation/freeze_precheck.py` 是同源实现）：
 
 1. ``execution_price_mode == raw``（否则 exit 4）
-2. 工作区必须干净（部署期身份文件 `.build_commit`/``build_manifest.json`` 豁免）
-3. code_commit 必须可证（git HEAD ↔ .build_commit / build_manifest 逐位一致）
-4. ``--start-date`` 必须给出且不早于今天
-5. feature schema 必须非空（来自 --feature-columns-file 或 --model-dir），两源都给必须一致
+2. **运行身份必须可证**（`runtime_identity.resolve_runtime_code_identity` 先判环境，
+   再套该环境的规则；任一违例 exit 5）：
+
+   ```text
+   git_checkout             git HEAD == --code-commit == .build_commit ==
+                            build_manifest.commit，且工作区必须可证干净
+   container_build_identity .build_commit == build_manifest.commit、
+                            trusted=true、dirty=false
+                            （容器里没有 git checkout，工作区门不适用）
+   ```
+
+3. ``--start-date`` 必须给出且不早于今天（exit 6）
+4. feature schema 必须非空（来自 --feature-columns-file 或 --model-dir），两源都给必须一致
+5. **模型训练身份绑定（R4.1）**：``--model-dir`` 工件的 ``code_commit`` 必须存在、形态合法、
+   且等于本次运行 identity 的 code_commit（缺 / unknown / 非法 / 不一致都 exit 5）。
+   也就是说 train=A 而 runtime=B 的模型，在**开 epoch 之前**就被拒——
+   不允许"先开 epoch、等 capture 才发现"。
+
+> 生产形状：`--model-dir` 指向**已经冻结**的 shadow 模型工件（`alpha_v2_shadow_model_freeze.py`
+> 的产物），feature schema、model 身份与训练身份都从它派生——所以模型冻结必须先于本步骤执行。
 """
 
 from __future__ import annotations
@@ -47,22 +63,21 @@ from stock_analyzer.alpha_v2.validation.freeze import (  # noqa: E402
 )
 from stock_analyzer.alpha_v2.validation.freeze_precheck import (  # noqa: E402
     FreezeGateError,
-    assert_build_identity,
     assert_execution_price_raw,
+    assert_model_training_commit,
+    assert_runtime_identity,
     assert_validation_start_date,
-    assert_worktree_clean,
-    resolve_code_commit,
     resolve_feature_schema_columns,
 )
 from stock_analyzer.alpha_v2.validation.frozen_model import (  # noqa: E402
     frozen_model_identity_payload,
 )
 from stock_analyzer.alpha_v2.validation.runtime_identity import (  # noqa: E402
-    build_identity_block,
+    IDENTITY_SOURCE_CONTAINER_BUILD,
     config_hash_of,
-    git_branch,
-    git_head,
+    is_valid_commit,
     price_contract_block,
+    resolve_runtime_code_identity,
 )
 from stock_analyzer.config import load_config  # noqa: E402
 from stock_analyzer.contracts.alpha_v2 import resolve_selection_contract  # noqa: E402
@@ -102,29 +117,30 @@ def main(argv: list[str] | None = None) -> int:
     validation_mode = "rehearsal" if args.rehearsal else "production"
 
     try:
-        code_commit, code_commit_source = resolve_code_commit(
-            args.code_commit, git_head_value=git_head(REPO_ROOT)
-        )
         assert_execution_price_raw(
             str(price["execution_price_mode"]), validation_mode=validation_mode
         )
-        identity = build_identity_block(REPO_ROOT)
-        assert_worktree_clean(
-            identity.get("worktree_dirty_entries"),  # None = git 不可证 → 按脏处理
+        # Runtime Identity Hardening（BLK-D1）：**先判运行环境再套规则**。
+        # 源码检出用 git HEAD + 工作区干净门；不可变容器用构建身份
+        # （.build_commit == build_manifest.commit、trusted、dirty=false）替代——
+        # 旧实现在判定环境之前先要 git status，容器里永远撞 exit 5。
+        identity = resolve_runtime_code_identity(
+            REPO_ROOT,
+            requested_code_commit=args.code_commit,
             validation_mode=validation_mode,
+            require_build_identity=True,
         )
-        # R3/BLK-R2-2：四值一致（git HEAD / requested / .build_commit / build_manifest.commit），
-        # 两源必须都存在、可解析、trusted=true 且 dirty=false —— 不再"任选一源"。
-        assert_build_identity(
-            git_head=str(identity.get("git_head") or ""),
-            requested_code_commit=code_commit,
-            build_commit_file=str(identity.get("build_commit_file") or ""),
-            build_manifest_commit=str(identity.get("build_manifest_commit") or ""),
-            build_manifest_present=bool(identity.get("build_manifest_present")),
-            build_manifest_trusted=identity.get("build_manifest_trusted"),
-            build_manifest_dirty=identity.get("build_manifest_dirty"),
-            validation_mode=validation_mode,
-        )
+        code_commit = assert_runtime_identity(identity, validation_mode=validation_mode)
+        code_commit_source = identity.code_commit_source
+        # 清单结构上要求 code_commit 非空（assert_freeze_complete）。rehearsal 不做身份硬门，
+        # 所以这里单独兜底：既没有 git HEAD、也没有构建身份时**干净拒绝**，
+        # 而不是让 FreezeIncompleteError 从落盘层以 traceback 的形式冒出来。
+        if not is_valid_commit(code_commit):
+            raise FreezeGateError(
+                f"无法解析运行 code_commit（{code_commit or '(空)'}）：既没有 git HEAD，"
+                "也没有构建身份；冻结清单必须能证明跑的是哪一份代码",
+                exit_code=5,
+            )
         assert_validation_start_date(
             args.start_date,
             today=datetime.now().astimezone().date(),
@@ -164,11 +180,28 @@ def main(argv: list[str] | None = None) -> int:
         spec.group_id for spec in FEATURE_GROUPS if spec.in_base_v2
     ]
 
+    # ── R4.1：模型训练身份绑定（生产强不变量）──────────────────────────────────
+    # runtime code_commit 必须等于冻结模型工件的训练 code_commit。放在 schema 门之后、
+    # 写盘/开 epoch 之前：训练身份不可证就绝不产出"合法 production freeze"，也绝不 open
+    # epoch（train=A / runtime=B 必须死在这一步，而不是等 capture 才发现）。
+    try:
+        assert_model_training_commit(
+            model_training_code_commit=str(model_block.get("model_training_code_commit", "")),
+            runtime_code_commit=code_commit,
+            validation_mode=validation_mode,
+        )
+    except FreezeGateError as exc:
+        print(
+            f"[freeze] 拒绝（模型训练身份硬门 exit_code={exc.exit_code}）: {exc}",
+            file=sys.stderr,
+        )
+        return exc.exit_code
+
     contract = resolve_selection_contract(config, profile="night_scan")
     manifest = build_validation_freeze(
         validation_epoch_id=str(args.epoch_id),
         code_commit=code_commit,
-        git_branch=git_branch(REPO_ROOT),
+        git_branch=identity.git_branch,
         config_hash=config_hash_of(config),
         config_hash_scope="effective_config_with_env_overrides",
         model=model_block,
@@ -197,19 +230,10 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     manifest["code_commit_source"] = code_commit_source
-    # R3：把构建身份四值与工作区状态写进清单（纳入 freeze_manifest_hash 覆盖）
-    manifest["build_identity"] = {
-        "git_head": str(identity.get("git_head") or ""),
-        "build_commit_file": str(identity.get("build_commit_file") or ""),
-        "build_manifest_commit": str(identity.get("build_manifest_commit") or ""),
-        "build_manifest_present": bool(identity.get("build_manifest_present")),
-        "build_manifest_trusted": identity.get("build_manifest_trusted"),
-        "build_manifest_dirty": identity.get("build_manifest_dirty"),
-        "build_manifest_path": str(identity.get("build_manifest_path") or ""),
-        "code_commit": code_commit,
-        "code_commit_source": code_commit_source,
-        "worktree_dirty_entries": list(identity.get("worktree_dirty_entries") or []),
-    }
+    # R3：把构建身份与工作区状态写进清单（纳入 freeze_manifest_hash 覆盖）。
+    # 硬化后同一块新增 identity_source / git_available / identity_verified / violations，
+    # 让审计能直接看到"这次身份来自哪种 runtime context"。
+    manifest["build_identity"] = identity.to_payload()
     manifest["freeze_manifest_hash"] = freeze_manifest_hash(manifest)
 
     if args.print_only:
@@ -222,19 +246,36 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[freeze] 冻结清单已写入: {path}")
     print(f"[freeze] freeze_manifest_hash = {manifest['freeze_manifest_hash']}")
     print(
-        "[freeze] 构建身份: git_head="
-        f"{str(identity.get('git_head'))[:12]}… / .build_commit="
-        f"{str(identity.get('build_commit_file') or '(缺失)')[:12]}… / build_manifest="
-        f"{str(identity.get('build_manifest_commit') or '(缺失)')[:12]}…"
-        f"（trusted={identity.get('build_manifest_trusted')}, "
-        f"dirty={identity.get('build_manifest_dirty')}, source={code_commit_source}）"
+        f"[freeze] 运行身份: identity_source={identity.identity_source} "
+        f"(git_available={identity.git_available}) / code_commit={code_commit[:12]}…"
+        f"（source={code_commit_source}）"
     )
-    if validation_mode == "production" and code_commit_source == "cli_override_git_unavailable":
+    print(
+        "[freeze] 构建身份: git_head="
+        f"{identity.git_head[:12]}… / .build_commit="
+        f"{(identity.build_commit or '(缺失)')[:12]}… / build_manifest="
+        f"{(identity.build_manifest_commit or '(缺失)')[:12]}…"
+        f"（trusted={identity.build_manifest_trusted}, "
+        f"dirty={identity.build_manifest_dirty}）"
+    )
+    if identity.identity_source == IDENTITY_SOURCE_CONTAINER_BUILD:
+        print(
+            "[freeze] 不可变容器形态：身份取自镜像构建期写入的 .build_commit + "
+            "build_manifest.json 双源互证（容器内没有 git checkout，工作区门不适用）"
+        )
+    elif code_commit_source == "cli_override_git_unavailable":
         print(
             "[freeze] 注意：git HEAD 不可得，本清单的 code_commit 由 --code-commit 声明、"
             "并由 .build_commit + build_manifest 双源互证（审计字段 code_commit_source 已落盘）",
             file=sys.stderr,
         )
+    # R4.1：把训练身份绑定结果打出来（生产走到这里必然相等，非生产如实显示）
+    training_commit = str(model_block.get("model_training_code_commit", "") or "")
+    print(
+        "[freeze] 模型训练身份: "
+        f"{training_commit[:12] or '(缺失)'}…"
+        f"（== 运行身份: {training_commit == code_commit}）"
+    )
     if validation_mode == "rehearsal":
         print(
             "[freeze] 排演模式：本清单 clean_oos 资格恒为 false，KPI 样本门不会计入",
@@ -252,6 +293,9 @@ def main(argv: list[str] | None = None) -> int:
                     "config_hash": manifest["config_hash"],
                     "model_id": manifest["model"]["model_id"],
                     "model_artifact_hash": manifest["model"]["artifact_hash"],
+                    # R4.1：epoch 冻结并审计模型训练身份（不塞进 FROZEN_IDENTITY_KEYS 的
+                    # 平面 8 键——它会随 epoch 一起落账，并由 freeze_manifest_hash 锚定）
+                    "model_training_code_commit": manifest["model"]["model_training_code_commit"],
                     "feature_schema_hash": manifest["feature_schema_hash"],
                     "label_policy_hash": manifest["label_policy_hash"],
                     "selection_contract_id": manifest["selection_contract_id"],

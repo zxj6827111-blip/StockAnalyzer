@@ -360,6 +360,11 @@ def frozen_model_identity_payload(model_dir: str | Path) -> dict[str, object]:
 
     修复轮起同时带 ``feature_columns`` / ``feature_schema_hash`` —— 冻结清单的
     feature_schema 默认就是从工件派生，避免"清单有一个 schema、模型跑的是另一个"。
+
+    R4.1 起带 ``model_training_code_commit``：训练身份的唯一权威字段，取自工件 manifest
+    顶层的 ``code_commit``（由 ``alpha_v2_shadow_model_freeze.py`` 在训练时从统一
+    Runtime Identity Resolver 取得并写入）。**不猜、不从别处回退**——缺失就是空串，
+    由调用方的生产门禁拒绝。
     """
     manifest = _read_manifest(model_dir)
     return {
@@ -373,6 +378,7 @@ def frozen_model_identity_payload(model_dir: str | Path) -> dict[str, object]:
         "provenance": manifest.get("provenance", {}),
         "feature_columns": list(manifest.get("feature_columns", []) or []),
         "feature_schema_hash": manifest.get("feature_schema_hash", ""),
+        "model_training_code_commit": str(manifest.get("code_commit", "") or ""),
         "training": dict(manifest.get("training", {}) or {}),
     }
 
@@ -548,6 +554,12 @@ def _build_manifest(
 
 
 def _artifact_hash(model: FrozenModel, files: Mapping[str, str]) -> str:
+    """工件内容哈希（R4.1 起包含训练身份）。
+
+    ``code_commit`` 必须进哈希：它是"这份模型由哪份代码训练出来"的唯一权威表达，
+    若不在哈希覆盖内，事后改写 manifest 里的该字段不会被任何完整性检查发现
+    （独立复核 Case 6b：改训练身份后 capture 仍然 rc=0）。
+    """
     body = {
         "model_id": model.model_id,
         "feature_columns": list(model.feature_columns),
@@ -555,6 +567,7 @@ def _artifact_hash(model: FrozenModel, files: Mapping[str, str]) -> str:
         "targets": model.manifest.get("targets", []),
         "calibration": model.manifest.get("calibration", {}),
         "files": dict(sorted(files.items())),
+        "code_commit": str(model.manifest.get("code_commit", "") or ""),
     }
     return stable_payload_hash(body)
 
@@ -568,6 +581,8 @@ def _artifact_hash_from_manifest(manifest: Mapping[str, object]) -> str:
         "targets": manifest.get("targets", []),
         "calibration": manifest.get("calibration", {}),
         "files": dict(sorted(dict(files).items())) if isinstance(files, Mapping) else {},
+        # 与 _artifact_hash 必须逐字段一致，否则加载期复算会与写入期不符
+        "code_commit": str(manifest.get("code_commit", "") or ""),
     }
     return stable_payload_hash(body)
 

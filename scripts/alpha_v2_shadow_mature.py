@@ -9,6 +9,10 @@ python scripts/alpha_v2_shadow_mature.py --epoch-id alpha_v2_epoch_001 --evaluat
 
 修复轮 (F2/F3)：成熟任务与影子写入同一条"epoch 开 + 冻结清单锚定 + 身份一致"
 的门，先过门再加载面板（fail-fast）。
+
+Runtime Identity Hardening（BLK-D2）：运行身份同样走
+``runtime_identity.resolve_runtime_code_identity``——源码检出取 git HEAD，
+不可变容器取镜像构建身份；两者都必须与 epoch 冻结身份逐位一致。
 """
 
 from __future__ import annotations
@@ -29,14 +33,22 @@ from stock_analyzer.alpha_v2.validation.epoch import (  # noqa: E402
     get_epoch,
     require_epoch_identity_match,
 )
-from stock_analyzer.alpha_v2.validation.freeze import label_policy_payload  # noqa: E402
+from stock_analyzer.alpha_v2.validation.freeze import (  # noqa: E402
+    label_policy_payload,
+    load_validation_freeze,
+)
+from stock_analyzer.alpha_v2.validation.freeze_precheck import (  # noqa: E402
+    FreezeGateError,
+    assert_model_training_commit,
+    assert_runtime_identity,
+)
 from stock_analyzer.alpha_v2.validation.outcome_maturation import (  # noqa: E402
     mature_epoch_outcomes,
 )
 from stock_analyzer.alpha_v2.validation.runtime_identity import (  # noqa: E402
     config_hash_of,
-    git_head,
     price_contract_block,
+    resolve_runtime_code_identity,
 )
 from stock_analyzer.backtest.matcher import ExecutionMatcher  # noqa: E402
 from stock_analyzer.config import load_config  # noqa: E402
@@ -67,8 +79,32 @@ def main(argv: list[str] | None = None) -> int:
     config = load_config(Path(args.config))
     contract = resolve_selection_contract(config, profile="night_scan")
     price = price_contract_block(config)
+    # BLK-D2：运行身份走与 freeze / capture 同一个 resolver（容器里取构建身份，
+    # 源码检出取 git HEAD），不允许再直接 git_head(REPO_ROOT)。
+    freeze = load_validation_freeze(root)
+    validation_mode = str((freeze or {}).get("validation_mode", "production"))
+    try:
+        runtime_code_commit = assert_runtime_identity(
+            resolve_runtime_code_identity(REPO_ROOT, validation_mode=validation_mode),
+            validation_mode=validation_mode,
+        )
+    except FreezeGateError as exc:
+        print(f"[mature] 运行身份硬门未通过: {exc}", file=sys.stderr)
+        return 3
+    # R4.1：模型训练身份绑定——本 epoch 冻结的训练 commit 必须等于当前运行身份
+    try:
+        assert_model_training_commit(
+            model_training_code_commit=str(
+                (dict(freeze or {}).get("model") or {}).get("model_training_code_commit", "")
+            ),
+            runtime_code_commit=runtime_code_commit,
+            validation_mode=validation_mode,
+        )
+    except FreezeGateError as exc:
+        print(f"[mature] 模型训练身份硬门未通过: {exc}", file=sys.stderr)
+        return 3
     runtime_identity = {
-        "code_commit": git_head(REPO_ROOT),
+        "code_commit": runtime_code_commit,
         "config_hash": config_hash_of(config),
         "label_policy_hash": stable_payload_hash(label_policy_payload(OutcomeSpec())),
         "selection_contract_id": str(

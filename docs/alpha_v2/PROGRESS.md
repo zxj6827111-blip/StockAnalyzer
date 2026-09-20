@@ -8,6 +8,9 @@
 
 # 0. 当前总状态
 
+> **本区块已由下方 "0.1 当前状态（superseding）" 取代。** 下面这段是 M2 收尾时的
+> current-state 快照，保留不删、不重写（只追加指针），以便对账当时的判断。
+
 ```text
 Project = StockAnalyzer Alpha V2.0
 Current Batch = M2（S11-S23 工程实现完成）
@@ -28,6 +31,105 @@ S00 docs   = f6ed795 (docs(alpha-v2): S00 PROGRESS 记录)
 S01 commit = a78a990 (feat(alpha-v2): 真实模型身份链)
 S02 commit = 5b1e504 (feat(alpha-v2): 盘后信号改 T+1 真实可成交入场)
 ```
+
+---
+
+## 0.1 当前状态（superseding，2026-09-19）
+
+> **本区块已由下方 "0.2 当前状态（superseding，2026-09-20）" 取代**，原文保留不删、
+> 不重写，以便对账 R4.1 mini recheck 之前的判断。
+
+```text
+Project = StockAnalyzer Alpha V2.0
+
+M1 = PASS
+M2 = PASS
+M3 = PASS
+
+M3_ACCEPTED_BASELINE_COMMIT = 33d0f7f97e79215ad8c65f972c0e56eeead10614
+                              （feat(alpha-v2): freeze M3 validated shadow OOS baseline）
+
+Current Phase = PRODUCTION_RUNTIME_IDENTITY_HARDENING
+
+BLK-D1 = CLOSED（R4 独立验收）
+BLK-D2 = CLOSED（R4 独立验收）
+R4.1 MODEL_PROVENANCE_BINDING = IMPLEMENTATION DONE / CODEX_MINI_RECHECK = PENDING
+
+PRODUCTION_SHADOW_FROZEN_COMMIT = PENDING
+Production Shadow = NOT_STARTED
+Clean OOS Days = 0
+
+Alpha Verified = FALSE
+Production Promotion = LOCKED
+```
+
+当前分支与动作边界（本地）：
+
+```text
+branch = feat/alpha-v2-production-runtime-identity
+          （从 M3_ACCEPTED_BASELINE_COMMIT 切出，用于本硬化阶段）
+commit  = NOT CREATED（R4.1 按要求不提交，等 Codex mini recheck）
+push    = NOT PERFORMED
+deploy  = NOT PERFORMED（NAS 未部署、生产镜像未重建）
+epoch   = alpha_v2_epoch_001 NOT STARTED（真实 epoch 尚未创建）
+```
+
+本阶段详情见 `docs/alpha_v2/Production_Runtime_Identity_Hardening_Report.md`
+（§1–§14 = R4；§15 = R4.1）；
+M3 部署顺序修订见 `docs/alpha_v2/M3_Production_Readiness_Report.md` §17.2 / §17.4 / §17.5。
+
+---
+
+## 0.2 当前状态（superseding，2026-09-20）
+
+```text
+Project = StockAnalyzer Alpha V2.0
+
+M1 = PASS
+M2 = PASS
+M3 = PASS
+
+R4   RUNTIME_IDENTITY_HARDENING = PASS（2026-09-20 外部独立验收）
+BLK-D1                          = CLOSED
+BLK-D2                          = CLOSED
+R4.1 MODEL_PROVENANCE_BINDING   = PASS（2026-09-20 Codex mini recheck）
+
+M3_ACCEPTED_BASELINE_COMMIT = 33d0f7f97e79215ad8c65f972c0e56eeead10614
+                              （feat(alpha-v2): freeze M3 validated shadow OOS baseline）
+
+FINAL_RUNTIME_HARDENING_COMMIT  = READY_TO_CREATE（本文档定稿后由本批次创建）
+PRODUCTION_SHADOW_FROZEN_COMMIT = PENDING（= Final Commit 的 SHA，创建后记录）
+PRODUCTION_SHADOW_DEPLOYMENT    = READY_AFTER_NAS_BUILD_PREFLIGHT
+
+Current Phase = NAS_BUILD_PREFLIGHT
+
+Production Shadow   = NOT_STARTED
+alpha_v2_epoch_001  = NOT_STARTED
+Live Clean OOS Days = 0
+
+Alpha Verified       = FALSE
+Production Promotion = LOCKED
+```
+
+当前分支与动作边界（本地）：
+
+```text
+branch = feat/alpha-v2-production-runtime-identity
+          （从 M3_ACCEPTED_BASELINE_COMMIT 切出，用于本硬化阶段）
+commit  = NOT CREATED（Phase A 文档定稿后创建；该 SHA 即 PRODUCTION_SHADOW_FROZEN_COMMIT）
+push    = NOT PERFORMED（仅在 NAS 部署流程明确需要时执行）
+deploy  = NOT PERFORMED（NAS 未部署、生产镜像未重建）
+epoch   = alpha_v2_epoch_001 NOT STARTED（真实 epoch 尚未创建）
+```
+
+验收历史（完整保留，不覆盖）：M3 Round 1 FAIL → M3 Round 2 FAIL → M3 Round 3 PASS
+→ R4 PASS → R4.1 首轮窄复核 FAIL（修复不在树里）→ R4.1 实施 → R4.1 mini recheck PASS。
+
+> R4.1 的 PASS **只覆盖"冻结模型工件训练 commit 绑定"这一窄域**，不等于整套 Runtime
+> Identity 被重新大验收；R4 的 PASS 仍以其自身验收记录为准。R4.1 详情见
+> `docs/alpha_v2/Production_Runtime_Identity_Hardening_Report.md` §1.1 与 §15；
+> M3 部署顺序修订见 `docs/alpha_v2/M3_Production_Readiness_Report.md`
+> §17.2 / §17.4 / §17.5。
 
 ---
 
@@ -1593,3 +1695,160 @@ PRODUCTION_SHADOW_FROZEN_COMMIT = PENDING_AFTER_BLK_D1_D2
 真实验证 epoch（`alpha_v2_epoch_001`）的 freeze manifest `code_commit` 必须指向
 **包含 Production Runtime Identity Hardening 的后续最终部署 commit**，
 不得用 `M3_ACCEPTED_BASELINE_COMMIT` 冒充生产冻结身份。
+
+---
+
+# 16. Production Runtime Identity Hardening（2026-09-19，BLK-D1 / BLK-D2）
+
+> 阶段性质：生产前硬化，不是 M4，不继续研究 Alpha，不改动模型算法。
+> 详细报告：`docs/alpha_v2/Production_Runtime_Identity_Hardening_Report.md`。
+> 基线：`M3_ACCEPTED_BASELINE_COMMIT = 33d0f7f97e79215ad8c65f972c0e56eeead10614`。
+> 分支：`feat/alpha-v2-production-runtime-identity`（本地，未 commit、未 push、未部署）。
+
+## 16.1 目标
+
+解决 Codex 生产环境实测确认的两项部署域 Blocking，使已 PASS 的 M3 Validation Framework
+能在**不含 Git 仓库与 git binary 的生产容器**里安全、可审计地执行
+freeze / capture / mature：`BLK-D1`（容器内 production freeze 不可执行，exit 5）、
+`BLK-D2`（容器内 capture/mature 运行身份对账必然失败，exit 3）。
+
+## 16.2 根因与修复（共同根因：用错了证据来源）
+
+```text
+BLK-D1  旧 freeze CLI 在判定"这是哪种运行环境"之前先要 git 工作区证据，
+        容器里 git_worktree_dirt=None → 生产判为"无法证明干净" → 永远 exit 5，
+        根本到不了用它自身可证的构建身份。
+BLK-D2  capture / mature / model freeze 各自直接调用 git_head()，容器内恒为
+        "unknown"，与 epoch 冻结的真 SHA 不符。
+```
+
+修复方式（不是放宽校验，而是按 runtime context 选可信来源）：
+
+```text
+git_checkout             git HEAD 四值一致 + 工作区可证干净（R3 语义不变）
+container_build_identity .build_commit == build_manifest.commit、trusted=true、dirty=false
+                         （容器里没有 git checkout，工作区门不适用）
+```
+
+四个 CLI 统一走 `runtime_identity.resolve_runtime_code_identity` +
+`freeze_precheck.assert_runtime_identity`；新增 AST 级回归闸门禁止它们再调用
+`git_head()`；`assert_build_identity` 的实现改为调用唯一的判定函数（不出现第二套规则）。
+
+## 16.3 构建身份（镜像侧）
+
+镜像构建阶段同一次调用产出 `/app/build_manifest.json` 与 `/app/.build_commit`
+（两源相等是构造性的）；部署脚本 build 前用 git 现场取证 commit/dirty/built_at，
+build 后**从镜像里读出这两个文件复核**（`scripts/verify_container_build_identity.py`），
+任一不满足即拒绝继续部署。顺带修掉两个真实缺陷：
+
+```text
+1) generate_build_manifest.py 把非布尔来源的 --dirty（如默认 "unknown"）写成布尔 false
+   → "只传 commit 不传 dirty" 即可得到 trusted=true；现改为如实写 unknown 且探测失败
+   也写 unknown。
+2) nas_deploy_update.sh 把 BUILD_DIRTY 写死 0、BUILD_TIME_UTC 只 export 未传进 build
+   （镜像里 built_at_utc=unknown）；现改为现场取证 + 显式传递 + build 后镜像内复核。
+```
+
+## 16.4 部署顺序修订（原 §17.2 顺序自相矛盾）
+
+原版把"模型冻结"排在"生成冻结清单"之后，而清单步骤又要求 `--model-dir <冻结模型目录>`
+——引用一个尚未产出的目录。依赖是代码事实：生产模式 feature schema 必须非空且只能来自
+`--model-dir` 工件，`open_epoch` 冻结的 model 身份三键又必须与之后 capture 的运行期身份
+一致。**机器可验证形式**：沙箱里不给 `--model-dir` 跑生产 freeze → exit 6。
+最终顺序 = 部署/身份复核 → 模型冻结 → 清单+开 epoch → data_health → capture → mature → KPI，
+已同步修正 `M3_Production_Readiness_Report.md` §17.2（原顺序保留为"原版（已作废）"）。
+
+## 16.5 证据
+
+```text
+NO_GIT_CONTAINER_SMOKE  A–G 七步 PASS（无 .git 沙箱里真跑四个 CLI；每个 CLI 再加一次
+                        "破坏身份"对照，按既有退出码被拦下：freeze=5，shadow 三件套=3）
+                        证据 artifacts/alpha_v2/audit/no_git_container_smoke.json
+真实 Docker 容器        stock-analyzer:local-identity-smoke（身份层与生产 Dockerfile 同构，
+                        省略前端阶段）：容器内 command -v git = 空；/app/.build_commit 与
+                        /app/build_manifest.json 都在；resolver identity_verified=true、
+                        identity_source=container_build_identity；freeze CLI exit 0 并开启
+                        epoch；mature exit 0；capture 身份门放行（exit 5 ≠ 3）
+                        证据 artifacts/alpha_v2/audit/docker_identity_smoke*.{json,log,sh}
+定向测试                tests/test_alpha_v2_production_runtime_identity.py（39 例全过）
+M3 定向                 tests/test_alpha_v2_m3_*.py（10 文件 / 112 例全过）
+fail-closed 矩阵        容器形态 11 例 + 检出形态 4 例，全部拒绝；CLI 层"无 git 且无构建
+                        身份"必须干净 exit 5（不得 traceback）
+Legacy 隔离             final_signal_min_threshold / Cross Review / 300-100-50 / cap 5 /
+                        serving model / registry / 飞书 / 正式推荐 全部未改动；
+                        alpha_v2.enforce_final_selection 仍为 false
+```
+
+## 16.6 状态与授权边界
+
+```text
+BLK-D1 = FIX IMPLEMENTED, CODEX RECHECK PENDING
+BLK-D2 = FIX IMPLEMENTED, CODEX RECHECK PENDING
+PRODUCTION_RUNTIME_IDENTITY_HARDENING = READY_FOR_CODEX_RECHECK
+PRODUCTION_SHADOW_FROZEN_COMMIT = PENDING_UNTIL_CODEX_PASS_AND_FINAL_COMMIT
+                                  （supersedes §15.11.4 的 PENDING_AFTER_BLK_D1_D2）
+PRODUCTION_SHADOW_DEPLOYMENT    = LOCKED_PENDING_CODEX_RUNTIME_RECHECK
+Production Shadow = NOT_STARTED；alpha_v2_epoch_001 = NOT STARTED；Clean OOS Days = 0
+
+commit = NOT CREATED（按要求本轮不提交）
+push = NOT PERFORMED；deploy = NOT PERFORMED；.env = 未修改；scheduler 未接线
+```
+
+---
+
+# 17. R4.1 — Frozen Model Provenance Commit Binding（2026-09-20）
+
+> 前情：R4（#16）已由 Codex 独立验收 PASS，BLK-D1 / BLK-D2 CLOSED。
+> 独立复核另提一项 Non-Blocking（Case A5）：模型训练 commit 与运行 commit 不一致时没有任何
+> 门禁，且改写工件里的训练身份不被任何完整性检查发现。R4.1 只解决这一项。
+
+## 17.1 修复前实测（真实 CLI）
+
+```text
+train=A / runtime=B      → validation freeze rc=0 且 epoch 已 open
+训练 commit missing/unknown/malformed → freeze rc=0 且 epoch 已 open
+改写工件训练身份          → capture rc=0（未被发现）
+```
+
+## 17.2 实现（唯一语义，不新增同义字段）
+
+```text
+model_training_code_commit  ← 工件 manifest 顶层 code_commit（训练时由统一 Runtime
+                              Identity Resolver 取得，无人工入口）
+传播：frozen_model_identity_payload → build_validation_freeze 的 model 块（规范化保留）
+     → freeze manifest（freeze_manifest_hash 覆盖）→ epoch identity（可审计）
+完整性：_artifact_hash 的哈希体纳入 code_commit（改写即工件校验失败）
+门禁：freeze CLI（写盘/开 epoch 前，exit 5）、capture / mature（生产形态，exit 3）
+非 production（rehearsal/test）不做此门
+```
+
+不做：不要求模型每天重训；不支持历史 commit 训练的模型跑到新 commit（需另行设计兼容契约）。
+
+## 17.3 修复后实测（同一套对抗夹具复跑）
+
+```text
+Case 1  train=A / runtime=A       → freeze rc=0 + epoch open；身份链 6 项全等（唯一值 1）
+Case 2  train=A / runtime=B       → rc=5，epoch_open=False，清单未落盘
+Case 3/4/5 missing/unknown/malformed → rc=5，epoch_open=False
+Case 6a 篡改 freeze manifest      → freeze_manifest_hash 失锚（保持）
+Case 6b 篡改工件训练身份           → artifact_hash 与内容不符 → 拒绝加载（真实工件实测）
+```
+
+## 17.4 测试与回归
+
+```text
+新增 tests/test_alpha_v2_m41_model_provenance_binding.py（14 例，含真跑 CLI 的 Case2 端到端）
+变异测试 3/3 被抓住（哈希不覆盖训练身份 / 门变空操作 / 规范化丢弃字段）
+Runtime Identity 定向（39）+ M3 定向（112）= 151 passed / 0 failed
+全量回归与 ruff 见下方 §17.5
+```
+
+## 17.5 状态
+
+```text
+R4   RUNTIME_IDENTITY_HARDENING = PASS（Codex 独立验收）
+R4.1 MODEL_PROVENANCE_BINDING   = IMPLEMENTATION DONE / CODEX_MINI_RECHECK = PENDING
+FINAL_RUNTIME_HARDENING_COMMIT  = LOCKED_PENDING_MINI_RECHECK
+PRODUCTION_SHADOW_DEPLOYMENT    = LOCKED_PENDING_MINI_RECHECK
+commit / push / deploy / epoch_001 = 均未执行
+```

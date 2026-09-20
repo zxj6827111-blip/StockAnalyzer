@@ -1,12 +1,24 @@
 """Alpha V2 M3 生产冻结硬门（`scripts/alpha_v2_validation_freeze.py` 的同源实现）。
 
-把"生产 freeze 必须满足什么"从 CLI 的逐行 print/exit 里抽出成一个纯函数集：
-这份清单既被 CLI 调用（接了它才允许写盘），也被测试直接断言——否则 CLI
-文字提示与 CI 断言会再次漂移成两个版本。
+把"生产 freeze / capture / mature 必须满足什么"从 CLI 的逐行 print/exit 里抽出成
+一组纯函数：这份清单既被 CLI 调用（接了它才允许写盘），也被测试直接断言——否则
+CLI 文字提示与 CI 断言会再次漂移成两个版本。
 
 原则：每一个 gate 都是显式的 ``FreezeGateError``，顺序执行，first-fail-stop；
 ``--rehearsal`` 只换掉执行口径/工作区/构建身份/起始日期的硬门（清单如实标
 ``validation_mode=rehearsal``），feature schema 的空表只在 rehearsal 容忍。
+
+**Runtime Identity Hardening（BLK-D1/BLK-D2）**：身份门改为
+:func:`assert_runtime_identity`——它接一份 :class:`RuntimeCodeIdentity`（由
+``runtime_identity.resolve_runtime_code_identity`` 产出，**先判环境再套规则**）：
+
+```text
+git_checkout             → git HEAD 四值一致 + 工作区必须可证干净
+container_build_identity → .build_commit == build_manifest.commit、trusted、dirty=false
+                           （容器里没有 git checkout，工作区门不适用）
+```
+
+这不是降低要求：两种 runtime context 各自使用**本环境可证**的可信身份来源。
 """
 
 from __future__ import annotations
@@ -14,47 +26,33 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 
+from stock_analyzer.alpha_v2.validation.runtime_identity import (
+    IDENTITY_SOURCE_GIT_CHECKOUT,
+    FreezeGateError,
+    RuntimeCodeIdentity,
+    build_identity_violations,
+    is_valid_commit,
+    resolve_code_commit,
+)
 
-class FreezeGateError(RuntimeError):
-    """生产冻结硬门未通过（CLI 接到它时应 exit ``exit_code``）。"""
-
-    def __init__(self, message: str, *, exit_code: int = 6) -> None:
-        super().__init__(message)
-        self.exit_code = int(exit_code)
+__all__ = [
+    "FeatureSchemaResult",
+    "FreezeGateError",
+    "assert_build_identity",
+    "assert_execution_price_raw",
+    "assert_model_training_commit",
+    "assert_runtime_identity",
+    "assert_validation_start_date",
+    "assert_worktree_clean",
+    "resolve_code_commit",
+    "resolve_feature_schema_columns",
+]
 
 
 @dataclass(frozen=True, slots=True)
 class FeatureSchemaResult:
     feature_columns: tuple[str, ...]
     source: str
-
-
-def resolve_code_commit(
-    override: str | None, *, git_head_value: str
-) -> tuple[str, str]:
-    """生产 code_commit：显式传参优先，但必须与 git HEAD 一致时才允许放行。
-
-    返回 ``(code_commit, source)``。容器里 git 不可得时允许只靠
-    --code-commit 证明（那时必须通过 .build_commit/build_manifest 双重验证，
-    见 :func:`assert_build_identity`）；此时 source 会如实标为
-    ``cli_override_git_unavailable``，让审计能看到"这一份不是 git 自证"。
-    """
-    given = str(override or "").strip()
-    git_known = git_head_value not in {"", "unknown"}
-    if given:
-        if git_known and git_head_value != given:
-            raise FreezeGateError(
-                f"--code-commit {given[:12]}… 与 git HEAD {git_head_value[:12]}… 不一致",
-                exit_code=5,
-            )
-        return given, ("cli_override_verified" if git_known else "cli_override_git_unavailable")
-    if not git_known:
-        raise FreezeGateError(
-            "git rev-parse HEAD 不可用（容器内？）、且未传 --code-commit；"
-            "生产模式不允许把 code_commit 写为 unknown",
-            exit_code=5,
-        )
-    return git_head_value, "git_rev_parse"
 
 
 def assert_execution_price_raw(
@@ -69,10 +67,54 @@ def assert_execution_price_raw(
         )
 
 
+def assert_model_training_commit(
+    *,
+    model_training_code_commit: str,
+    runtime_code_commit: str,
+    validation_mode: str = "production",
+) -> None:
+    """**R4.1 模型训练身份绑定**：生产强不变量
+
+    ```text
+    runtime code_commit == frozen model training code_commit
+    ```
+
+    训练身份的唯一权威来源是冻结模型工件 manifest 的 ``code_commit``（由
+    ``alpha_v2_shadow_model_freeze.py`` 在训练时从统一 Runtime Identity Resolver 取得）。
+    生产模式下 missing / empty / ``unknown`` / 非法 SHA 一律拒绝——**不允许**任何形式的
+    回退（不拿 runtime commit 顶替、不假设"就是当前这份"），因为那正是"用别的代码训过的
+    模型在不知情的情况下被当成生产模型"的入口。
+
+    非 production（rehearsal / test）不做此门：排演工件本来就不是生产身份。
+    """
+    if validation_mode != "production":
+        return
+    training = str(model_training_code_commit or "").strip()
+    if not is_valid_commit(training):
+        raise FreezeGateError(
+            "冻结模型工件缺少可证的训练 code_commit"
+            f"（读到的值 {training!r}）；生产模式不允许缺失/unknown/非法形态，"
+            "也不允许回退成当前运行 commit",
+            exit_code=5,
+        )
+    runtime = str(runtime_code_commit or "").strip()
+    if training != runtime:
+        raise FreezeGateError(
+            f"模型训练身份 {training[:12]}… != 运行身份 {runtime[:12]}…；"
+            "生产 epoch 只允许由「训练该模型的同一份代码」开启与推进"
+            "（引入他处训练的模型需要显式的兼容性契约与迁移，不是静默放行）",
+            exit_code=5,
+        )
+
+
 def assert_worktree_clean(
     dirty_entries: list[str] | None, *, validation_mode: str = "production"
 ) -> None:
-    """``dirty_entries = None`` 表示 git 不可用 / 仓库损坏——生产一律视为不可证明干净。"""
+    """``dirty_entries = None`` 表示 git 不可用 / 仓库损坏——生产一律视为不可证明干净。
+
+    ⚠️ 只对 ``git_checkout`` 形态适用：不可变容器里根本没有工作区，容器形态的等价
+    门是"构建身份两源一致 + trusted + clean"（见 :func:`assert_runtime_identity`）。
+    """
     if validation_mode != "production":
         return
     if dirty_entries is None:
@@ -88,6 +130,28 @@ def assert_worktree_clean(
             "先 commit / 清理再冻结——'跑 M3 代码、记 M1/M2 commit' 这条路径必须封死",
             exit_code=5,
         )
+
+
+def assert_runtime_identity(
+    identity: RuntimeCodeIdentity, *, validation_mode: str = "production"
+) -> str:
+    """四个 CLI 共用的**唯一**运行身份门，返回通过校验的 ``code_commit``。
+
+    - ``identity.violations`` 非空 → exit 5（构建身份/commit 不可证，两类 context 通用）；
+    - 仅当 ``identity_source == git_checkout`` 时才追加工作区干净门：容器形态没有
+      worktree 这一概念，拿它当门会让生产容器永远冻结不了（BLK-D1 的成因）。
+    """
+    if validation_mode != "production":
+        return identity.code_commit
+    if identity.violations:
+        raise FreezeGateError(
+            f"运行身份不可证（identity_source={identity.identity_source}，"
+            f"code_commit={identity.code_commit or '(空)'}）：" + "；".join(identity.violations),
+            exit_code=5,
+        )
+    if identity.identity_source == IDENTITY_SOURCE_GIT_CHECKOUT:
+        assert_worktree_clean(identity.git_worktree_state, validation_mode="production")
+    return identity.code_commit
 
 
 def assert_build_identity(
@@ -112,52 +176,28 @@ def assert_build_identity(
     任一项 missing / unknown / malformed / mismatch 都 fail-closed（exit 5）；
     ``build_manifest`` 的 ``trusted`` 必须为 True、``dirty`` 必须为 False。
 
-    唯一的显式例外：**容器内 git 不可得**时，``git HEAD`` 这一项无法比较，
-    此时必须 `--code-commit` 显式给值，并由 ``.build_commit`` 与 ``build_manifest``
-    两源互相印证（比"任选一源"更强）；该例外会以
-    ``cli_override_git_unavailable`` 记进冻结清单的 ``code_commit_source``。
+    判定本体是 :func:`runtime_identity.build_identity_violations`（唯一实现）；
+    本函数是它的 exit-code 呈现层，同时保留 R3 起被回归测试钉住的入参签名。
+    容器内 git 不可得的形态由 :func:`assert_runtime_identity` 走完整 resolver 判定。
     """
     requested = str(requested_code_commit or "").strip()
-    git_value = str(git_head or "").strip()
-    file_value = str(build_commit_file or "").strip()
-    manifest_value = str(build_manifest_commit or "").strip()
     if validation_mode != "production":
         return requested
-    problems: list[str] = []
-    if not requested or requested.lower() == "unknown":
-        problems.append("requested code_commit 缺失/unknown")
-    if not build_manifest_present:
-        problems.append("build_manifest.json 缺失或不可解析")
-    elif manifest_value in {"", "unknown"}:
-        problems.append("build_manifest.commit 缺失/unknown")
-    if file_value in {"", "unknown"}:
-        problems.append(".build_commit 缺失/不可读")
-    if build_manifest_trusted is not True:
-        problems.append(f"build_manifest.trusted={build_manifest_trusted!r}（要求 true）")
-    if build_manifest_dirty is not False:
-        problems.append(f"build_manifest.dirty={build_manifest_dirty!r}（要求 false）")
+    problems = build_identity_violations(
+        git_head=git_head,
+        code_commit=requested,
+        build_commit_file=str(build_commit_file or ""),
+        build_manifest_commit=str(build_manifest_commit or ""),
+        build_manifest_present=bool(build_manifest_present),
+        build_manifest_trusted=build_manifest_trusted,
+        build_manifest_dirty=build_manifest_dirty,
+        # 冻结对象必须锚定构建身份：两源缺席也算不可证（R3 语义）
+        require_build_identity=True,
+        validation_mode="production",
+    )
     if problems:
         raise FreezeGateError(
             "构建身份不完整（任一缺失即拒绝）：" + "；".join(problems), exit_code=5
-        )
-    if git_value not in {"", "unknown"} and git_value != requested:
-        raise FreezeGateError(
-            f"git HEAD {git_value[:12]}… != requested code_commit {requested[:12]}…",
-            exit_code=5,
-        )
-    mismatched = [
-        name
-        for name, value in (
-            (".build_commit", file_value),
-            ("build_manifest.commit", manifest_value),
-        )
-        if value != requested
-    ]
-    if mismatched:
-        raise FreezeGateError(
-            f"构建身份不一致：{'、'.join(mismatched)} 与 code_commit "
-            f"{requested[:12]}… 不同（两个来源都必须逐位相等）",
-            exit_code=5,
         )
     return requested
 
@@ -208,15 +248,3 @@ def assert_validation_start_date(
             f"--start-date={start} 早于今天 {today}；生产 epoch 不允许写到历史里",
             exit_code=6,
         )
-
-
-__all__ = [
-    "FeatureSchemaResult",
-    "FreezeGateError",
-    "assert_build_identity",
-    "assert_execution_price_raw",
-    "assert_validation_start_date",
-    "assert_worktree_clean",
-    "resolve_code_commit",
-    "resolve_feature_schema_columns",
-]

@@ -105,6 +105,8 @@ REQUIRED_MODEL_FIELDS: tuple[str, ...] = (
     "status",
     "calibration",
     "provenance",
+    # R4.1：训练身份是模型身份块的一部分（存在性强制；取值是否可证由生产门禁判定）
+    "model_training_code_commit",
 )
 
 
@@ -261,6 +263,8 @@ def _normalize_model_block(model: Mapping[str, object] | None) -> dict[str, obje
         "calibration": dict(block.get("calibration", {}) or {}),
         "status": status,
         "provenance": dict(block.get("provenance", {}) or {}),
+        # R4.1：规范化必须**保留**训练身份，否则 CLI 传进来的值会在写入前被静默丢掉
+        "model_training_code_commit": str(block.get("model_training_code_commit", "") or ""),
     }
 
 
@@ -357,6 +361,7 @@ def verify_freeze_against_runtime(
     code_commit: str | None = None,
     config_hash: str | None = None,
     model_artifact_hash: str | None = None,
+    model_training_code_commit: str | None = None,
     feature_schema_hash: str | None = None,
     label_policy_hash: str | None = None,
 ) -> list[str]:
@@ -364,6 +369,8 @@ def verify_freeze_against_runtime(
 
     这是 read-only 校验（不抛错），供 readiness 报告与每日 shadow 自检使用：
     任何一项不一致都意味着"当前运行已不在被冻结的口径上"。
+    ``model_training_code_commit`` 为 R4.1 新增项：传 ``None`` 时跳过（不传给老调用方
+    加一个"必须知道模型训练身份"的新前提）。
     """
     violations: list[str] = []
     if not verify_freeze_integrity(manifest):
@@ -378,6 +385,11 @@ def verify_freeze_against_runtime(
     if isinstance(model, Mapping):
         checks += (
             ("model_artifact_hash", model_artifact_hash, model.get("artifact_hash")),
+            (
+                "model_training_code_commit",
+                model_training_code_commit,
+                model.get("model_training_code_commit"),
+            ),
         )
     for name, actual, expected in checks:
         if actual is None:
