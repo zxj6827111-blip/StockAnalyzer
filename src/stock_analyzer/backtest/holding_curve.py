@@ -21,9 +21,11 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from typing import Any, cast
 
 import pandas as pd
 
@@ -56,7 +58,7 @@ class SymbolHoldingResult:
     symbol: str
     entry_date: date
     entry_price: float
-    status: str  # "ok" | "insufficient_data" | "error"
+    status: str  # "ok" | "no_fill" | "insufficient_data" | "error"
     error: str = ""
     horizon_days: int = 0
     available_trading_days: int = 0
@@ -68,6 +70,14 @@ class SymbolHoldingResult:
     stop_loss_triggered: bool = False
     matched_exit: ExitSimulation | None = None
     matched_net_return_pct: float = 0.0  # 计入成本后的真实净收益（仅 executed 时有意义）
+    # --- S02：T+1 入场契约 ---
+    signal_date: date | None = None  # 产生信号的交易日（T，收盘后决策）
+    entry_delay_days: int = 0  # 成交日相对信号日的交易日延迟（主口径恒为 1）
+    entry_price_raw: float = 0.0  # raw 开盘价（滑点前）
+    entry_slippage: float = 0.0  # 滑点后的成交价 - raw 开盘价
+    entry_cost: float = 0.0  # 买入成本（按 quantity=1000 估算）
+    no_fill_reason: str = ""  # 未成交原因（status == "no_fill" 时必有值）
+    entry_mode: str = "next_session_open"  # next_session_open | next_tradable_open
 
 
 @dataclass(slots=True)
@@ -83,6 +93,10 @@ class HoldingCurveSummary:
     profit_loss_ratio: float = 0.0  # 平均盈利 / 平均亏损（绝对值），无亏损时为 0
     # 各持有天数（T+1..T+N）的平均收益分布：直接回答「第几天卖最赚」。
     avg_return_by_offset: dict[int, float] = field(default_factory=dict)
+    # S02：买入未成交（不可成交）的标的数及其原因分布——这些标的**不进入**
+    # 收益统计，但必须可审计（可成交率是 V2 的核心指标之一）。
+    no_fill_count: int = 0
+    no_fill_reason_counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -104,15 +118,29 @@ def _bar_snapshot(row: pd.Series) -> dict[str, float | bool]:
     open_price = float(row.get("open", close))
     high_price = float(row.get("high", max(open_price, close)))
     low_price = float(row.get("low", min(open_price, close)))
-    return {
+    # S07（DF-S02-001）：**不再注入** close*1.1/0.9 的估算涨跌停。
+    # 估算值会被 ExecutionEngine 的 use_source_first 当成权威 source 值，从而掩盖
+    # 真实板块涨跌幅（ST 5% / 创业板科创板 20% / IPO 无限制）——实测一字涨停在该
+    # 路径下会被判成"可成交"。这里只透传真实存在的列；缺列时引擎按 pre_close/board
+    # 解析，仍解析不出就 fail-closed（no_valid_price_data），不猜测。
+    snapshot: dict[str, float | bool] = {
         "open": open_price,
         "high": high_price,
         "low": low_price,
         "close": close,
-        "up_limit": float(row.get("up_limit", close * 1.1)),
-        "down_limit": float(row.get("down_limit", close * 0.9)),
         "suspended": bool(row.get("suspended", False)),
     }
+    optional_keys = ("up_limit", "down_limit", "pre_close", "pct_change", "is_st", "name", "board")
+    for optional_key in optional_keys:
+        if optional_key not in row:
+            continue
+        value = row.get(optional_key)
+        if value is None:
+            continue
+        if isinstance(value, float) and not math.isfinite(value):
+            continue  # NaN/Inf：视为缺失（与 limit_rule 同口径）
+        snapshot[optional_key] = value
+    return snapshot
 
 
 def _future_bars(
@@ -159,6 +187,15 @@ def _resolve_entry_position(bars: pd.DataFrame, entry_date: date) -> int | None:
     return int(positions)
 
 
+def _bar_datetime(bar_date: object) -> datetime:
+    """bar 的 index 值 → 该交易日的 datetime（当日 00:00）。"""
+    if isinstance(bar_date, pd.Timestamp):
+        return bar_date.to_pydatetime()
+    if isinstance(bar_date, datetime):
+        return bar_date
+    return pd.Timestamp(cast(Any, bar_date)).to_pydatetime()
+
+
 def analyze_symbol_holding(
     *,
     symbol: str,
@@ -168,20 +205,27 @@ def analyze_symbol_holding(
     horizon_days: int = _DEFAULT_HORIZON_DAYS,
     take_profit_pct: float = _DEFAULT_TAKE_PROFIT_PCT,
     stop_loss_pct: float = _DEFAULT_STOP_LOSS_PCT,
+    slippage_ratio: float = 0.0,
+    max_entry_sessions: int = 1,
 ) -> SymbolHoldingResult:
-    """单只标的的持有期走势分析。
+    """单只标的的持有期走势分析（S02：入场为 T+1 真实可成交开盘价）。
+
+    ``entry_date`` 的语义在 S02 起是**信号日 T**（盘后决策），不是买入日：
+    买入发生在 T 之后第一个可成交交易日的开盘，成交价 = raw 开盘价 + 滑点；
+    T 日收盘价**不再**被当作入场价（那是不可实现的成交，蓝图 §2.12）。
 
     Args:
         symbol: 标的代码。
         bars: 该标的的日线 DataFrame（index 为 DatetimeIndex，至少含
             open/high/low/close；可选 up_limit/down_limit/suspended）。
-            应覆盖到「截止今日」或至少 entry_date 之后 horizon_days 根记录
-            （数据不足时如实返回 available_trading_days 并降级）。
-        entry_date: 买入日（用于定位入场 bar；实际入场价取该日或其后最近一根
-            记录的收盘价）。
+        entry_date: 信号日 T（收盘后决策时点所属交易日）。
         matcher: 复用的 ExecutionMatcher 实例（涨跌停/T+1/滑点/成本规则）。
         horizon_days: 目标持有交易日数（默认 10，对齐 config.py labels 默认值）。
         take_profit_pct/stop_loss_pct: 止盈止损百分比（默认对齐 labels 配置）。
+        slippage_ratio: 买入滑点比例（默认 0，调用方按策略/波动给定）。
+        max_entry_sessions: 入场延迟窗口（交易日）。1 = 主口径（只能 T+1）；
+            >1 = sensitivity（允许顺延到窗口内下一可成交开盘）。窗口内的成交日
+            在 ``entry_delay_days`` 如实标注，两者不得混成一个主结果。
     """
     if bars.empty:
         return SymbolHoldingResult(
@@ -209,14 +253,41 @@ def analyze_symbol_holding(
             error="entry_date_not_found_in_bars",
         )
 
-    entry_row = normalized_bars.iloc[anchor_pos]
-    entry_price = float(entry_row.get("close", 0.0))
-    actual_entry_date = normalized_bars.index[anchor_pos]
-    actual_entry_date_value = (
-        actual_entry_date.date()
-        if isinstance(actual_entry_date, pd.Timestamp)
-        else pd.Timestamp(actual_entry_date).date()
+    signal_row_date = _bar_datetime(normalized_bars.index[anchor_pos])
+    # 入场候选 = 信号日**之后**的 bar（T+1 起）。信号日当天的 bar 只用于定位，
+    # 绝不作为成交价来源。
+    entry_window = _future_bars(
+        normalized_bars,
+        anchor_pos=anchor_pos,
+        horizon_days=max(1, int(max_entry_sessions)),
     )
+    entry = matcher.simulate_entry(
+        signal_date=signal_row_date,
+        future_bars=entry_window,
+        slippage_ratio=slippage_ratio,
+        max_entry_sessions=max(1, int(max_entry_sessions)),
+    )
+    if not entry.executed or entry.entry_date is None:
+        return SymbolHoldingResult(
+            symbol=symbol,
+            entry_date=entry_date,
+            entry_price=0.0,
+            status="no_fill",
+            error=entry.no_fill_reason,
+            signal_date=signal_row_date.date(),
+            entry_delay_days=0,
+            entry_price_raw=0.0,
+            entry_slippage=0.0,
+            entry_cost=0.0,
+            no_fill_reason=entry.no_fill_reason,
+            entry_mode=(
+                "next_session_open" if max_entry_sessions <= 1 else "next_tradable_open"
+            ),
+            horizon_days=horizon_days,
+        )
+
+    entry_price = float(entry.net_entry_price)
+    actual_entry_date_value = entry.entry_date.date()
     if entry_price <= 0:
         return SymbolHoldingResult(
             symbol=symbol,
@@ -224,12 +295,17 @@ def analyze_symbol_holding(
             entry_price=entry_price,
             status="error",
             error="non_positive_entry_price",
+            signal_date=signal_row_date.date(),
+            entry_delay_days=entry.entry_delay_days,
+            no_fill_reason="",
         )
 
+    # 入场后的 bar 位置：entry_delay_days 是交易日延迟（1 = T+1）。
+    entry_pos = anchor_pos + entry.entry_delay_days
     # 缓冲窗口对齐 walk_forward.py 的做法：多留 max_exit_carry_days + 1 根，
     # 让延迟成交/强制平仓有足够未来 bar 推进，不被 horizon_days 正好截断。
     buffer_horizon = horizon_days + matcher.max_exit_carry_days + 1
-    future = _future_bars(normalized_bars, anchor_pos=anchor_pos, horizon_days=buffer_horizon)
+    future = _future_bars(normalized_bars, anchor_pos=entry_pos, horizon_days=buffer_horizon)
     available_trading_days = min(len(future), horizon_days)
 
     daily_returns: list[HoldingDayReturn] = []
@@ -302,6 +378,14 @@ def analyze_symbol_holding(
         stop_loss_triggered=stop_loss_triggered,
         matched_exit=matched_exit,
         matched_net_return_pct=matched_net_return_pct,
+        signal_date=signal_row_date.date(),
+        entry_delay_days=entry.entry_delay_days,
+        entry_price_raw=entry.entry_price_raw,
+        entry_slippage=entry.slippage,
+        entry_cost=entry.cost,
+        entry_mode=(
+            "next_session_open" if max_entry_sessions <= 1 else "next_tradable_open"
+        ),
     )
 
 
@@ -329,6 +413,8 @@ def analyze_holding_curve(
     take_profit_pct: float = _DEFAULT_TAKE_PROFIT_PCT,
     stop_loss_pct: float = _DEFAULT_STOP_LOSS_PCT,
     symbols: Sequence[str] | None = None,
+    slippage_ratio: float = 0.0,
+    max_entry_sessions: int = 1,
 ) -> HoldingCurveReport:
     """对一批标的跑持有期走势分析，并产出汇总统计。
 
@@ -336,10 +422,14 @@ def analyze_holding_curve(
         bars_by_symbol: symbol -> 日线 DataFrame 的映射（调用方负责提供，
             通常是 as-of 扫描结果里 buy 候选对应的完整历史行情，覆盖到
             entry_date 之后 horizon_days 根记录或截止今日）。
-        entry_date: 统一买入日。
+        entry_date: 统一买入日（S02 起语义为**信号日 T**）。
         matcher: 复用的 ExecutionMatcher 实例。
         symbols: 可选的标的子集/顺序（None 时使用 bars_by_symbol 的全部键，
             按输入顺序）。
+        slippage_ratio: 买入滑点比例（S07/DF-S02-003：调用方应传策略静态滑点，
+            不再默认 0）。**半批审 B2 修复**：此前本函数没有该参数，服务层却按
+            关键字传入 → TypeError，导致"有候选的 as-of 回测"必崩、滑点修复空转。
+        max_entry_sessions: 入场延迟窗口（1 = 主口径 T+1；>1 = sensitivity）。
     """
     ordered_symbols = list(symbols) if symbols is not None else list(bars_by_symbol.keys())
     results: list[SymbolHoldingResult] = []
@@ -354,6 +444,8 @@ def analyze_holding_curve(
                 horizon_days=horizon_days,
                 take_profit_pct=take_profit_pct,
                 stop_loss_pct=stop_loss_pct,
+                slippage_ratio=slippage_ratio,
+                max_entry_sessions=max_entry_sessions,
             )
         except Exception as exc:  # noqa: BLE001 - 单只票的意外异常不能打断整批
             result = SymbolHoldingResult(
@@ -376,8 +468,20 @@ def analyze_holding_curve(
 
 def _summarize(results: list[SymbolHoldingResult], *, horizon_days: int) -> HoldingCurveSummary:
     ok_results = [item for item in results if item.status == "ok"]
+    # S02：未成交（no_fill）必须**计数可见**：这类票不进收益统计，但"有多少票
+    # 根本买不到"本身就是研究结论（蓝图 §1.2 的 no-fill / 可成交率指标）。
+    no_fill_results = [item for item in results if item.status == "no_fill"]
+    no_fill_counts: dict[str, int] = {}
+    for item in no_fill_results:
+        reason = item.no_fill_reason or "unknown"
+        no_fill_counts[reason] = no_fill_counts.get(reason, 0) + 1
     if not ok_results:
-        return HoldingCurveSummary(symbol_count=len(results), ok_count=0)
+        return HoldingCurveSummary(
+            symbol_count=len(results),
+            ok_count=0,
+            no_fill_count=len(no_fill_results),
+            no_fill_reason_counts=no_fill_counts,
+        )
 
     wins = [item for item in ok_results if item.matched_net_return_pct > 0]
     losses = [item for item in ok_results if item.matched_net_return_pct <= 0]
@@ -413,4 +517,6 @@ def _summarize(results: list[SymbolHoldingResult], *, horizon_days: int) -> Hold
         avg_best_exit_offset=avg_best_exit_offset,
         profit_loss_ratio=profit_loss_ratio,
         avg_return_by_offset=avg_return_by_offset,
+        no_fill_count=len(no_fill_results),
+        no_fill_reason_counts=no_fill_counts,
     )

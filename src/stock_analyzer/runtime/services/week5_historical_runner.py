@@ -67,37 +67,62 @@ def _resolve_model_info(
     *,
     service: Any,
     config: StockAnalyzerConfig,
+    pipeline: AnalyzerPipeline | None = None,
 ) -> Week5ModelInfo:
-    """记录本轮使用的模型 ID / 训练时间 / 代码 commit / 配置 hash。"""
-    model_id = ""
-    trained_at = ""
+    """记录本轮**实际加载**的模型身份 + 代码 commit + 配置 hash（S01）。
+
+    唯一真相源：``pipeline.model_identity_facts()``（加载期实算哈希 + 工件自述
+    created_at / schema / label 契约）。registry 只补充"这份内容登记叫什么"，
+    bootstrap 状态只单独标注，**都不参与** ``trained_at``。
+
+    2026-09-17 之前此处会在找不到 champion 时把 bootstrap 的 ``last_bootstrap_at``
+    当 ``trained_at`` 报出去（蓝图 §2.9 的"报告一个模型、实际加载另一个"），
+    S01 起该字段只等于工件 created_at；取不到就是空 + ``trained_at_source=unavailable``。
+    """
+    from stock_analyzer.models.identity import (  # noqa: WPS433 - 与 pipeline 同层延迟导入
+        build_model_identity_report,
+        registry_identity,
+    )
+
+    registry = getattr(service, "_model_registry", None)
     try:
-        registry = getattr(service, "_model_registry", None)
-        champion = (
-            registry.active_champion(suppress_read_errors=True)
-            if registry is not None
-            else None
-        )
-        if champion is not None:
-            model_id = str(getattr(champion, "model_id", "") or "")
-            raw_trained_at = (
-                getattr(champion, "trained_at", None)
-                or getattr(champion, "created_at", None)
-                or ""
-            )
-            trained_at = str(raw_trained_at or "")
-            metrics = getattr(champion, "metrics_summary", {})
-            if not trained_at and isinstance(metrics, dict):
-                trained_at = str(metrics.get("trained_at", "") or "")
-    except Exception:
-        model_id = ""
-        trained_at = ""
+        registry_snapshot = registry_identity(registry)
+    except Exception:  # noqa: BLE001 - 身份收集失败不得打断回测
+        registry_snapshot = {
+            "champion": None,
+            "registered": [],
+            "registry_error": "registry_identity_failed",
+            "registry_busy": False,
+        }
+
+    facts: dict[str, object]
+    if pipeline is not None:
+        facts = pipeline.model_identity_facts()
+    else:
+        # 没有已加载 pipeline（不应发生，保留兜底）：退回磁盘事实，绝不用 bootstrap 顶替。
+        from stock_analyzer.models.identity import load_artifact_facts  # noqa: WPS433
+
+        facts = load_artifact_facts(config.training.artifact_path)
+        facts.setdefault("score_source", str(config.models.inference_score_source))
+
+    report = build_model_identity_report(
+        facts,
+        registry_snapshot=registry_snapshot,
+        claimed_content_hash=facts.get("claimed_content_hash", ""),
+    )
+
+    bootstrap_status: object = {}
     try:
         bootstrap_status = service.training_bootstrap_status()
-        if isinstance(bootstrap_status, dict) and not trained_at:
-            trained_at = str(bootstrap_status.get("last_bootstrap_at", "") or "")
-    except Exception:
-        pass
+    except Exception:  # noqa: BLE001 - 只做标注，取不到就留空
+        bootstrap_status = {}
+    bootstrap_last_bootstrap_at = (
+        str(bootstrap_status.get("last_bootstrap_at", "") or "")
+        if isinstance(bootstrap_status, dict)
+        else ""
+    )
+
+    artifact_created_at = str(report.get("artifact_created_at", "") or "")
     code_commit = str(getattr(config.evolution, "code_commit_id", "") or "")
     try:
         config_hash = hashlib.sha256(
@@ -105,12 +130,168 @@ def _resolve_model_info(
         ).hexdigest()[:16]
     except Exception:
         config_hash = ""
+    hash_verified = report.get("content_hash_verified")
     return Week5ModelInfo(
-        model_id=model_id,
-        trained_at=trained_at,
+        # model_id 是 registry 的**补充**身份：只有在与实算哈希对得上（match）时才是
+        # 可信的名字，其余状态（含 no_champion）保持空串，避免"名字对不上内容"。
+        model_id=(
+            str(report.get("registry_model_id", "") or "")
+            if bool(report.get("identity_verified", False))
+            else ""
+        ),
+        trained_at=artifact_created_at,
+        trained_at_source="artifact_created_at" if artifact_created_at else "unavailable",
         code_commit=code_commit,
         config_hash=config_hash,
+        artifact_path=str(report.get("artifact_uri", "") or ""),
+        artifact_content_hash=str(report.get("artifact_content_hash", "") or ""),
+        artifact_created_at=artifact_created_at,
+        feature_schema_id=str(report.get("feature_schema_id", "") or ""),
+        feature_schema_hash=str(report.get("feature_schema_hash", "") or ""),
+        label_policy_id=str(report.get("label_policy_id", "") or ""),
+        label_policy_hash=str(report.get("label_policy_hash", "") or ""),
+        dataset_manifest_id=str(report.get("dataset_manifest_id", "") or ""),
+        score_source=str(report.get("score_source", "") or ""),
+        output_semantics=str(report.get("output_semantics", "") or ""),
+        identity_status=str(report.get("status", "") or ""),
+        identity_detail=str(report.get("detail", "") or ""),
+        identity_verified=bool(report.get("identity_verified", False)),
+        research_fail_closed=bool(report.get("research_fail_closed", False)),
+        content_hash_verified=hash_verified if isinstance(hash_verified, bool) else None,
+        registry_model_id=str(report.get("registry_model_id", "") or ""),
+        registry_content_hash=str(report.get("registry_content_hash", "") or ""),
+        registry_error=str(report.get("registry_error", "") or ""),
+        bootstrap_last_bootstrap_at=bootstrap_last_bootstrap_at,
     )
+
+
+def _resolve_run_model(
+    *,
+    service: Any,
+    config: StockAnalyzerConfig,
+    decision_time: datetime,
+) -> Any:
+    """按 S06 解析本次 as_of 可用的历史模型（无合法模型 → unscorable，绝不回退在服模型）。"""
+    from stock_analyzer.models.historical_resolver import (
+        load_registry_candidates,
+        resolve_historical_model,
+    )
+
+    mode = str(getattr(config.alpha_v2, "model_resolver_mode", "pit_research") or "pit_research")
+    candidates = load_registry_candidates(getattr(service, "_model_registry", None))
+    return resolve_historical_model(
+        as_of=decision_time,
+        candidates=candidates,
+        mode=mode,
+    )
+
+
+def _bind_resolved_artifact(config: StockAnalyzerConfig, resolution: Any) -> StockAnalyzerConfig:
+    """把 pipeline 的加载路径绑定到解析器选出的工件（Codex B1 修复）。
+
+    此前解析结果只进报告，``AnalyzerPipeline`` 仍按 ``config.training.artifact_path``
+    加载当前在服工件——"resolve 了但不加载 resolved 的那个"，于是 as_of 之后创建的
+    模型照样进了历史回测。这里让加载路径与解析结果同源。
+    """
+    resolved_uri = str(getattr(resolution, "artifact_uri", "") or "").strip()
+    if not resolved_uri:
+        return config
+    return config.model_copy(
+        update={
+            "training": config.training.model_copy(update={"artifact_path": resolved_uri}),
+        }
+    )
+
+
+def _verify_loaded_artifact(
+    pipeline: AnalyzerPipeline,
+    resolution: Any,
+    *,
+    decision_time: datetime,
+) -> dict[str, object]:
+    """加载后复核：实算哈希一致 + created_at <= 决策时刻；不符即返回原因。
+
+    返回空 dict 表示通过；非空 dict 含 ``reason`` 与事实，供 unscorable 报告落痕。
+    """
+    from stock_analyzer.models.historical_resolver import created_within_decision
+
+    try:
+        facts = pipeline.model_identity_facts()
+    except Exception as exc:  # noqa: BLE001 - 校验失败按 fail-closed 处理
+        return {
+            "reason": "loaded_artifact_identity_unavailable",
+            "detail": f"{type(exc).__name__}: {exc}",
+        }
+    loaded_uri = str(facts.get("artifact_uri", "") or "")
+    loaded_hash = str(facts.get("artifact_content_hash", "") or "")
+    expected_hash = str(getattr(resolution, "artifact_content_hash", "") or "")
+    expected_uri = str(getattr(resolution, "artifact_uri", "") or "")
+    verification: dict[str, object] = {
+        "expected_uri": expected_uri,
+        "expected_content_hash": expected_hash,
+        "loaded_uri": loaded_uri,
+        "loaded_content_hash": loaded_hash,
+        "predictor_loaded": bool(facts.get("predictor_loaded", False)),
+    }
+    if not bool(facts.get("predictor_loaded", False)):
+        return {**verification, "reason": "loaded_artifact_missing"}
+    if expected_hash and loaded_hash.lower() != expected_hash.lower():
+        return {**verification, "reason": "loaded_artifact_hash_mismatch"}
+    created_ok = created_within_decision(
+        artifact_created_at=facts.get("artifact_created_at", ""),
+        decision_time=decision_time,
+    )
+    verification["created_within_decision"] = created_ok
+    if created_ok is not True:
+        return {**verification, "reason": "loaded_artifact_created_after_decision"}
+    return {}
+
+
+def _unscorable_report(
+    *,
+    as_of: Any,
+    decision_time: datetime,
+    resolution: Any,
+    scan_profile: str,
+    reason: str = "",
+    verification: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """不可评分报告：结构完整但**零结果**（不跑扫描、不产出任何候选）。
+
+    M1 的 fail-closed 原则：找不到合法的 as_of 历史模型时，正确结果是"这天不可评分"，
+    而不是用当前在服模型算出一个看起来正常的结果。
+
+    ``reason``/``verification`` 供 B1 的"解析过门但加载不过门"场景覆盖解析器结论
+    （例如加载到的工件哈希与解析结果不符）。
+    """
+    payload = resolution.to_payload()
+    if reason:
+        payload = {**payload, "status": "unscorable", "reason": reason}
+    if verification:
+        payload = {**payload, "load_verification": dict(verification)}
+    return {
+        "status": "unscorable",
+        "scan_profile": scan_profile,
+        "funnel": {
+            "policy": "scorable_gate",
+            "universe_count": 0,
+            "light_count": 0,
+            "deep_count": 0,
+            "final_count": 0,
+            "final_selection": {"selected_count": 0, "final_signals": []},
+            "allow_zero_signal": True,
+        },
+        "prefilter": {"applied": False, "reason": "unscorable"},
+        "final_selection": {"selected_count": 0, "final_signals": []},
+        "historical_context": {
+            "as_of": str(as_of),
+            "decision_time": decision_time.isoformat(),
+            "model_resolution": payload,
+            "realtime_data_allowed": False,
+            "news_neutralized": True,
+        },
+        "model_resolution": payload,
+    }
 
 
 def _pipeline_payload(report: object, pipeline: AnalyzerPipeline) -> dict[str, object]:
@@ -148,7 +329,10 @@ def run_week5_historical_day(
     symbols: list[str] | None = None,
     base_provider: object | None = None,
     on_progress: Any = None,
-    scan_profile: str = "week5_daily",
+    # S04：历史重放必须与**生产夜扫**同口径（300/100/50 + cap5 + allow_zero），
+    # 因此默认 profile 是显式的 night-equivalent（引擎据此解析
+    # night_alpha_v2_v1 契约）；此前默认 "week5_daily" 会落到 legacy 目标 100/100/20。
+    scan_profile: str = "historical_night_equivalent",
 ) -> dict[str, object]:
     """对单个历史日期执行完整 Week5 每日主选股链路（historical context）。
 
@@ -176,7 +360,32 @@ def run_week5_historical_day(
     # 历史决策时点：与 pipeline as-of 模式的 _AS_OF_DECISION_TIME(15:30)
     # 严格一致，保证同一轮回测内报告时间戳与信号决策时点同源。
     decision_time = datetime.combine(as_of, datetime.min.time()).replace(hour=15, minute=30)
+    # S06 时间闸门：as_of 之后创建/激活的模型一律不得加载；找不到合法模型即 unscorable。
+    model_resolution = _resolve_run_model(
+        service=service, config=hist_config, decision_time=decision_time
+    )
+    if not model_resolution.scorable:
+        return _unscorable_report(
+            as_of=as_of,
+            decision_time=decision_time,
+            resolution=model_resolution,
+            scan_profile=scan_profile,
+        )
+    # B1：解析出来的工件必须**真的被加载**（把加载路径绑定到 resolved URI）
+    hist_config = _bind_resolved_artifact(hist_config, model_resolution)
     pipeline = AnalyzerPipeline(config=hist_config, provider=provider)
+    load_verification = _verify_loaded_artifact(
+        pipeline, model_resolution, decision_time=decision_time
+    )
+    if load_verification:
+        return _unscorable_report(
+            as_of=as_of,
+            decision_time=decision_time,
+            resolution=model_resolution,
+            scan_profile=scan_profile,
+            reason=str(load_verification.get("reason", "loaded_artifact_mismatch")),
+            verification=load_verification,
+        )
 
     def run_pipeline_fn(
         *,
@@ -215,7 +424,7 @@ def run_week5_historical_day(
             no_buy_streak=0,
             monster_positions=[],
         ),
-        model_info=_resolve_model_info(service=service, config=hist_config),
+        model_info=_resolve_model_info(service=service, config=hist_config, pipeline=pipeline),
         artifact_dir=Path(task_dir),
         progress=on_progress,
         scan_profile=scan_profile,
@@ -225,7 +434,9 @@ def run_week5_historical_day(
         context=context,
         policy=Week5RunPolicy.historical(),
     )
-    return engine.run()
+    report = engine.run()
+    report["model_resolution"] = model_resolution.to_payload()
+    return report
 
 
 def build_historical_base_provider(config: StockAnalyzerConfig, *, task_dir: Path) -> object:

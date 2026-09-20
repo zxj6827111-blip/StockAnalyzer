@@ -624,6 +624,17 @@ class Week5AutomationRunRequest(BaseModel):
     sync_watchlist: bool = True
 
 
+class NightlyRedeliveryRequest(BaseModel):
+    """晚报补发：只补未成功的目标，不重新扫描。
+
+    ``confirm_unknown`` 用于上一次结果"不确定且已超出 uuid 去重窗"的情形：
+    再发有可能真的重复推送，因此必须由人显式确认（例如已在飞书里核对过没收到）。
+    默认 false，接口会返回冲突状态而不是直接发。
+    """
+
+    confirm_unknown: bool = False
+
+
 class Week6RunRequest(BaseModel):
     symbols: list[str] = Field(default_factory=list)
     notify_enabled: bool | None = None

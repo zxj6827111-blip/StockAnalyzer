@@ -348,13 +348,37 @@ def latest_bundle_artifact_path(archive_root: str | Path) -> Path | None:
     return max(candidates, key=lambda item: item.stat().st_mtime)
 
 
+def _directory_size_bytes(root: Path) -> int:
+    total = 0
+    for path in root.rglob("*"):
+        try:
+            if path.is_file():
+                total += path.stat().st_size
+        except OSError:  # pragma: no cover - 并发删除下的竞态
+            continue
+    return total
+
+
 def prune_model_bundle_archive(
     archive_root: str | Path,
     *,
     retention_count: int = 5,
     protected_bundle_ids: set[str] | None = None,
+    max_total_bytes: int | None = None,
 ) -> list[str]:
-    """Remove old unreferenced content-addressed bundles and return their ids."""
+    """Remove old unreferenced content-addressed bundles and return their ids.
+
+    语义（半批审 N1 修复后）：
+
+    - **未给预算**（``max_total_bytes`` 为 None/<=0）：保留最新
+      ``retention_count`` 个 + protected 集合，其余全部删除（既有计数语义）。
+    - **给了预算**：``retention_count`` 退化为**保留下限**，归档按容量管理——
+      只要"保留集合"的总字节 ≤ 预算就**一个都不删**；超预算时从最旧的非保护
+      bundle 开始删，直到进预算为止，且**绝不会删到保留下限以下**。
+
+    此前实现是 no-op：预算循环删完后，结尾的循环仍把 remaining 全删，实际行为
+    恒等于"只留 retention_count + protected"，与"按容量管理"的声明不符。
+    """
 
     root = Path(archive_root).expanduser().resolve()
     if not root.is_dir():
@@ -374,11 +398,25 @@ def prune_model_bundle_archive(
         str(item).strip() for item in (protected_bundle_ids or set()) if str(item).strip()
     )
     removed: list[str] = []
-    for item in candidates:
-        if item.name in keep_ids:
-            continue
+    prunable = [item for item in candidates if item.name not in keep_ids]
+    budget = int(max_total_bytes) if max_total_bytes is not None else 0
+    if budget <= 0:
+        # 计数语义：非保留集合一律删除。
+        for item in prunable:
+            shutil.rmtree(item)
+            removed.append(item.name)
+        return removed
+    # 容量语义：预算约束**整个归档**（不只是保留集合）。保留集合永不动；从最旧
+    # 的非保留 bundle 开始删，直到归档总量进预算；保留下限本身超预算时也只保留
+    # 下限（容量失控不能让最新模型被删掉）。
+    total = sum(_directory_size_bytes(item) for item in candidates)
+    for item in sorted(prunable, key=lambda entry: entry.stat().st_mtime):
+        if total <= budget:
+            break
+        size = _directory_size_bytes(item)
         shutil.rmtree(item)
         removed.append(item.name)
+        total -= size
     return removed
 
 

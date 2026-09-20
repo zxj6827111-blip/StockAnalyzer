@@ -129,12 +129,33 @@ fi
 
 COMMIT="$(git rev-parse HEAD)"
 SHORT="$(git rev-parse --short HEAD)"
-echo "${COMMIT}" > "${ROOT}/.build_commit"
+# ---------------------------------------------------------------------------
+# 构建身份（Alpha V2 Production Runtime Identity Hardening）
+#
+# 镜像里既没有 git 二进制也没有 .git，所以"这份运行代码是谁"只能在**构建之前**
+# 由本机 git 取证一次，再作为不可变产物打进镜像：
+#   .build_commit        = COMMIT          （运行期 resolver 的容器身份来源）
+#   build_manifest.json  = commit + dirty  （同一 commit，见 Dockerfile）
+# dirty 现场取值而不写死 0：否则一旦上面那条"拒绝脏树"的检查被绕过或前移，镜像里
+# 会留下一个"声称干净但无证据"的 trusted=true 身份。
+# ---------------------------------------------------------------------------
+SOURCE_DIRTY_TRACKED="$(git status --porcelain --untracked-files=no 2>/dev/null || true)"
+if [[ -n "${SOURCE_DIRTY_TRACKED}" ]]; then
+  echo "ERROR: 源码树存在已跟踪改动，拒绝生成 trusted 构建身份（先 commit 或 reset）：" >&2
+  git status --short --untracked-files=no >&2
+  exit 1
+fi
+if [[ -z "${COMMIT}" || -z "${SHORT}" ]]; then
+  echo "ERROR: 无法解析 git HEAD/短 SHA，拒绝构建无身份的镜像。" >&2
+  exit 1
+fi
+BUILD_DIRTY=0
+BUILD_TIME_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 export STOCK_ANALYZER_BUILD_COMMIT="${COMMIT}"
 export STOCK_ANALYZER_BUILD_SHORT_COMMIT="${SHORT}"
-export STOCK_ANALYZER_BUILD_DIRTY="0"
-export STOCK_ANALYZER_BUILD_TIME_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-echo "build_commit=${COMMIT}"
+export STOCK_ANALYZER_BUILD_DIRTY="${BUILD_DIRTY}"
+export STOCK_ANALYZER_BUILD_TIME_UTC="${BUILD_TIME_UTC}"
+echo "build_commit=${COMMIT} dirty=${BUILD_DIRTY} built_at=${BUILD_TIME_UTC}"
 
 COMPOSE_FILES_SRC="${ROOT}/scripts/nas_compose_files.sh"
 if [[ ! -f "${COMPOSE_FILES_SRC}" ]]; then
@@ -552,13 +573,60 @@ on_exit() {
 trap on_exit EXIT
 
 echo "[3/6] build api image with commit metadata while the current runtime remains available"
-"${COMPOSE[@]}" build --build-arg STOCK_ANALYZER_BUILD_COMMIT="${COMMIT}" --build-arg STOCK_ANALYZER_BUILD_SHORT_COMMIT="${SHORT}" --build-arg STOCK_ANALYZER_BUILD_DIRTY=0 api
+"${COMPOSE[@]}" build \
+  --build-arg STOCK_ANALYZER_BUILD_COMMIT="${COMMIT}" \
+  --build-arg STOCK_ANALYZER_BUILD_SHORT_COMMIT="${SHORT}" \
+  --build-arg STOCK_ANALYZER_BUILD_DIRTY="${BUILD_DIRTY}" \
+  --build-arg STOCK_ANALYZER_BUILD_TIME_UTC="${BUILD_TIME_UTC}" \
+  api
 
 LABEL_COMMIT="$(docker image inspect stock-analyzer:latest --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')"
 if [[ "${LABEL_COMMIT}" != "${COMMIT}" ]]; then
   echo "ERROR: image label commit ${LABEL_COMMIT} != source ${COMMIT}" >&2
   exit 1
 fi
+
+# ---------------------------------------------------------------------------
+# 镜像内身份复核（Alpha V2 Production Runtime Identity Hardening）
+#
+# build-arg 是**输入**，不是证据：真正要证明的是"落进镜像的那两个文件里写的是什么"。
+# 这里把 /app/.build_commit 与 /app/build_manifest.json 从镜像里读出来直接核对，
+# 任何不一致都不许继续部署——否则运行期 resolver 会因为身份缺失/矛盾而 fail-closed，
+# 部署看起来成功、夜扫却天天拒绝，排查成本极高。
+# ---------------------------------------------------------------------------
+BUILD_IDENTITY_TMP="${ROOT}/.tmp-build-identity.$$"
+mkdir -p "${BUILD_IDENTITY_TMP}"
+if ! docker run --rm --entrypoint cat stock-analyzer:latest /app/build_manifest.json > "${BUILD_IDENTITY_TMP}/build_manifest.json"; then
+  echo "ERROR: 无法从镜像读取 /app/build_manifest.json（构建身份缺失）。" >&2
+  rm -rf "${BUILD_IDENTITY_TMP}"
+  exit 1
+fi
+if ! docker run --rm --entrypoint cat stock-analyzer:latest /app/.build_commit > "${BUILD_IDENTITY_TMP}/.build_commit"; then
+  echo "ERROR: 无法从镜像读取 /app/.build_commit（构建身份缺失）。" >&2
+  rm -rf "${BUILD_IDENTITY_TMP}"
+  exit 1
+fi
+# 复核证据归档（评审 P3-3）：把校验器的 JSON 结论（verdict + problems + 镜像内
+# 两文件的实际取值）落到 artifacts/alpha_v2/audit/——成功与失败都留档。没有这份留档，
+# "部署时复核过"只是口述；留档后可事后对账"当时镜像身份到底是什么"。
+VERIFY_LOG_DIR="${ROOT}/artifacts/alpha_v2/audit"
+mkdir -p "${VERIFY_LOG_DIR}"
+VERIFY_LOG="${VERIFY_LOG_DIR}/build_identity_verify_$(date -u +%Y%m%dT%H%M%SZ).json"
+if ! "${HOST_PYTHON}" "${ROOT}/scripts/verify_container_build_identity.py" \
+    --manifest "${BUILD_IDENTITY_TMP}/build_manifest.json" \
+    --build-commit-file "${BUILD_IDENTITY_TMP}/.build_commit" \
+    --expect-commit "${COMMIT}" --json 2>&1 | tee "${VERIFY_LOG}"; then
+  echo "ERROR: 镜像内构建身份复核未通过，拒绝继续部署（证据留档: ${VERIFY_LOG}）。" >&2
+  rm -rf "${BUILD_IDENTITY_TMP}"
+  exit 1
+fi
+echo "镜像内构建身份复核通过（证据留档: ${VERIFY_LOG}）"
+rm -rf "${BUILD_IDENTITY_TMP}"
+
+# 宿主侧身份标记：**复核通过之后**才写。写在构建之前会让"构建失败但文件已更新"的
+# 组合把未部署成功的 commit 记成当前运行版本，宿主上的读取方（如环境采集脚本）会据此
+# 得出错误结论。
+echo "${COMMIT}" > "${ROOT}/.build_commit"
 
 # ---------------------------------------------------------------------------
 # Managed stock_updater: install the version-controlled NAS updater only when

@@ -273,13 +273,21 @@ def _validate_matcher_config(config: BacktestMatcherConfig) -> None:
 
 
 def _optional_numeric(value: object, default: float) -> float:
+    """数值解析（B3 修复）：NaN/Inf 一律按**缺失**处理。
+
+    ``_resolve_limit_prices`` 在 ``build_price_limits`` 返回 None 时会回落到
+    ``bar["up_limit"]``/``bar["down_limit"]``；若那里是 NaN，此前会被当"有值"透传，
+    而 NaN 比较恒 False → 涨停门 fail-open（真实一字涨停形态可被买入）。
+    """
     if isinstance(value, bool):
         return default
     if isinstance(value, (int, float)):
-        return float(value)
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else default
     if isinstance(value, str):
         try:
-            return float(value)
+            parsed = float(value)
         except ValueError:
             return default
+        return parsed if math.isfinite(parsed) else default
     return default

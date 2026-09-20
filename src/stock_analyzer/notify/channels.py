@@ -14,8 +14,9 @@ import threading
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from email.message import EmailMessage
-from typing import ClassVar, Protocol
+from typing import Any, ClassVar, Protocol
 from urllib import parse, request
 
 _logger = logging.getLogger(__name__)
@@ -34,6 +35,43 @@ class NotificationResult:
     success: bool
     channel: str
     error: str = ""
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+# 逐目标交付结果（正式晚报专用）。与 NotificationResult 并存：旧 ``send()`` 的
+# 返回字段与语义保持不变，白天通知链路不受影响。
+OUTCOME_ACCEPTED = "accepted"
+OUTCOME_FAILED = "failed"
+OUTCOME_UNKNOWN = "unknown"
+
+
+@dataclass(slots=True)
+class TargetDeliveryOutcome:
+    """单个接收目标的一次投递结果。
+
+    ``accepted`` 只表示**目标 API 明确接受**（可解析响应 + 明确业务成功），
+    既不表示用户读过，也不表示内容正确。``unknown`` 表示"可能已接受但本地
+    无法确认"（超时、连接中断、响应无法解析），调用方必须按不确定处理：
+    可确认幂等时用同一 uuid 重试，否则停手交人工。
+
+    ``retryable`` 只表达"重试有可能变好"。明确失败（认证/目标不存在/权限/
+    参数错误）一律 False，避免高频重试刷屏并可能触发平台限频。
+    """
+
+    target_key: str
+    outcome: str
+    message_id: str = ""
+    error_code: str = ""
+    error_message: str = ""
+    accepted_at: str = ""
+    retryable: bool = False
+    http_status: int = 0
+
+    @property
+    def delivered(self) -> bool:
+        return self.outcome == OUTCOME_ACCEPTED
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -168,6 +206,27 @@ class ConsoleNotifier:
         )
         return NotificationResult(success=True, channel="console")
 
+    def send_explicit(
+        self,
+        message: NotificationMessage,
+        *,
+        request_uuid: str = "",
+        target_key: str = "console",
+    ) -> TargetDeliveryOutcome:
+        """console 输出**永远不算送达**：它只证明"日志写出去了"。
+
+        2026-09-16 取证：主渠道失败后 FailoverNotifier 回退到 console，最终返回
+        ``success=True, channel=console``，于是"夜扫成功"与"用户收到结果"被混为一谈。
+        """
+        _ = message, request_uuid
+        return TargetDeliveryOutcome(
+            target_key=target_key,
+            outcome=OUTCOME_FAILED,
+            error_code="console_not_a_delivery",
+            error_message="console 输出不能作为送达依据",
+            retryable=False,
+        )
+
 
 @dataclass(slots=True)
 class DingTalkNotifier:
@@ -267,6 +326,38 @@ class FeishuNotifier:
             timeout_sec=self.timeout_sec,
         )
 
+    def send_explicit(
+        self,
+        message: NotificationMessage,
+        *,
+        request_uuid: str = "",
+        target_key: str = "feishu",
+    ) -> TargetDeliveryOutcome:
+        """严格版发送：HTTP 2xx **不足以**算成功，必须解析出明确的业务状态。
+
+        旧 ``send()`` 走 ``_post_json`` 只看状态码，飞书自定义机器人在签名/token
+        错误时会返回 HTTP 200 + ``{"code": 9499,...}``，被误判为成功。新接口只
+        影响晚报交付链，不改白天通知的既有语义。webhook 无幂等参数，故不传 uuid。
+        """
+        _ = request_uuid
+        if not self.webhook:
+            return TargetDeliveryOutcome(
+                target_key=target_key,
+                outcome=OUTCOME_FAILED,
+                error_code="missing_webhook",
+                error_message="未配置 webhook",
+            )
+        body = {
+            "msg_type": "text",
+            "content": {"text": _format_feishu_message(message)},
+        }
+        return _post_json_strict(
+            target_key=target_key,
+            url=self.webhook,
+            body=body,
+            timeout_sec=self.timeout_sec,
+        )
+
 
 @dataclass(slots=True)
 class FeishuAppNotifier:
@@ -314,12 +405,80 @@ class FeishuAppNotifier:
                 separators=(",", ":"),
             ),
         }
-        url = (
-            "https://open.feishu.cn/open-apis/im/v1/messages"
-            f"?receive_id_type={receive_id_type}"
-        )
+        url = f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={receive_id_type}"
         return _post_feishu_app_json(
             channel="feishu_app",
+            url=url,
+            body=body,
+            timeout_sec=self.timeout_sec,
+            tenant_access_token=access_token_result,
+        )
+
+    def send_explicit(
+        self,
+        message: NotificationMessage,
+        *,
+        request_uuid: str = "",
+        target_key: str = "feishu_app",
+    ) -> TargetDeliveryOutcome:
+        """严格版发送，带稳定 ``uuid`` 与 ``message_id`` 回执。
+
+        ``uuid`` 的语义（飞书官方文档：同一 uuid 在 1 小时内至多成功执行一次）
+        只用于**降低**重复推送概率，不能替代本地持久化交付记录——它只覆盖 1 小时，
+        而"这条今天到底发没发成功"要记一整晚并且要能跨重启追溯。故 uuid 必须由
+        调用方在**首次尝试前**生成并冻结，重试沿用同一个。
+        """
+        app_id = self.app_id.strip()
+        app_secret = self.app_secret.strip()
+        receive_id = self.receive_id.strip()
+        receive_id_type = self.receive_id_type.strip().lower() or "open_id"
+        if not app_id or not app_secret:
+            return TargetDeliveryOutcome(
+                target_key=target_key,
+                outcome=OUTCOME_FAILED,
+                error_code="missing_app_config",
+                error_message="缺少飞书应用凭据",
+            )
+        if not receive_id:
+            return TargetDeliveryOutcome(
+                target_key=target_key,
+                outcome=OUTCOME_FAILED,
+                error_code="missing_receive_id",
+                error_message="缺少接收方配置",
+            )
+
+        access_token_result = self._tenant_access_token_value(
+            app_id=app_id,
+            app_secret=app_secret,
+        )
+        if isinstance(access_token_result, NotificationResult):
+            # 取 token 失败：可能是网络抖动（unknown，值得重试），也可能是凭据错误
+            # （failed，重试无意义）。按错误文本里是否含鉴权字样区分，宁可保守。
+            error_text = access_token_result.error or "auth_failed"
+            permanent = "missing" in error_text or "invalid" in error_text
+            return TargetDeliveryOutcome(
+                target_key=target_key,
+                outcome=OUTCOME_FAILED if permanent else OUTCOME_UNKNOWN,
+                error_code="tenant_access_token_failed",
+                error_message=error_text[:200],
+                retryable=not permanent,
+            )
+
+        body: dict[str, object] = {
+            "receive_id": receive_id,
+            "msg_type": "text",
+            "content": json.dumps(
+                {"text": _format_feishu_message(message)},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        }
+        normalized_uuid = request_uuid.strip()
+        if normalized_uuid:
+            body["uuid"] = normalized_uuid
+        url = f"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type={receive_id_type}"
+        return _post_feishu_app_delivery(
+            target_key=target_key,
             url=url,
             body=body,
             timeout_sec=self.timeout_sec,
@@ -419,10 +578,7 @@ class FeishuAppNotifier:
         if shared_token:
             self._tenant_access_token = shared_token
             return shared_token
-        if (
-            self._tenant_access_token
-            and now_ts + 60 < self._tenant_access_token_expire_at
-        ):
+        if self._tenant_access_token and now_ts + 60 < self._tenant_access_token_expire_at:
             return self._tenant_access_token
 
         req = request.Request(
@@ -557,6 +713,65 @@ class FeishuEnterpriseBatchNotifier:
             tenant_access_token=access_token_result,
         )
 
+    def send_explicit(
+        self,
+        message: NotificationMessage,
+        *,
+        request_uuid: str = "",
+        target_key: str = "feishu_enterprise",
+    ) -> TargetDeliveryOutcome:
+        """企业分发目标（可选目标）的严格版发送。
+
+        ``uuid`` 被忽略：批量发送接口**没有已核实的幂等参数**。因此调用方对
+        ``unknown`` 结果不得自动重试（可选渠道没有幂等能力时重试就是重复推送），
+        这一点由交付服务负责，不在这里假装支持。
+        """
+        _ = request_uuid
+        app_id = self.app_id.strip()
+        app_secret = self.app_secret.strip()
+        if not app_id or not app_secret:
+            return TargetDeliveryOutcome(
+                target_key=target_key,
+                outcome=OUTCOME_FAILED,
+                error_code="missing_app_config",
+                error_message="缺少飞书应用凭据",
+            )
+        targets_or_result = self._target_payload()
+        if isinstance(targets_or_result, NotificationResult):
+            return TargetDeliveryOutcome(
+                target_key=target_key,
+                outcome=OUTCOME_FAILED,
+                error_code=targets_or_result.error or "invalid_target",
+                error_message="企业分发目标配置无效",
+            )
+        access_token_result = self._tenant_access_token_value(
+            app_id=app_id,
+            app_secret=app_secret,
+        )
+        if isinstance(access_token_result, NotificationResult):
+            error_text = access_token_result.error or "auth_failed"
+            permanent = "missing" in error_text or "invalid" in error_text
+            return TargetDeliveryOutcome(
+                target_key=target_key,
+                outcome=OUTCOME_FAILED if permanent else OUTCOME_UNKNOWN,
+                error_code="tenant_access_token_failed",
+                error_message=error_text[:200],
+                retryable=not permanent,
+            )
+        body = {
+            **targets_or_result,
+            "msg_type": "text",
+            "content": {"text": _format_feishu_message(message)},
+        }
+        url = self.batch_url.strip() or "https://open.feishu.cn/open-apis/message/v4/batch_send"
+        return _post_feishu_app_delivery(
+            target_key=target_key,
+            url=url,
+            body=body,
+            timeout_sec=self.timeout_sec,
+            tenant_access_token=access_token_result,
+        )
+
     @classmethod
     def clear_shared_token_cache(cls) -> None:
         with cls._shared_tenant_access_tokens_lock:
@@ -622,10 +837,7 @@ class FeishuEnterpriseBatchNotifier:
         if shared_token:
             self._tenant_access_token = shared_token
             return shared_token
-        if (
-            self._tenant_access_token
-            and now_ts + 60 < self._tenant_access_token_expire_at
-        ):
+        if self._tenant_access_token and now_ts + 60 < self._tenant_access_token_expire_at:
             return self._tenant_access_token
 
         req = request.Request(
@@ -916,6 +1128,259 @@ class FailoverNotifier:
         )
 
 
+def send_explicit(
+    notifier: object,
+    message: NotificationMessage,
+    *,
+    request_uuid: str = "",
+    target_key: str = "",
+) -> TargetDeliveryOutcome:
+    """逐目标显式交付入口：把"发送过一次"变成"这个目标到底收没收到"。
+
+    永远不抛异常——交付服务要能把结果落盘成记录，抛出去就只剩一条日志。
+    走不到严格实现时退回旧 ``send()`` 映射，但**console 一律不算送达**：旧链路
+    的 failover 会把 console 的 ``success=True`` 当成整体成功（2026-09-16 实据），
+    那正是"调度 green、用户没收到"的来源。
+    """
+    key = target_key.strip() or getattr(notifier, "channel", "") or "unknown"
+    explicit = getattr(notifier, "send_explicit", None)
+    if callable(explicit):
+        try:
+            outcome = explicit(message, request_uuid=request_uuid, target_key=key)
+        except Exception as exc:  # noqa: BLE001 - 任何异常都降级为不确定结果
+            return TargetDeliveryOutcome(
+                target_key=key,
+                outcome=OUTCOME_UNKNOWN,
+                error_code="send_explicit_raised",
+                error_message=f"{exc.__class__.__name__}: {exc}"[:200],
+                retryable=True,
+            )
+        if isinstance(outcome, TargetDeliveryOutcome):
+            return outcome
+        return TargetDeliveryOutcome(
+            target_key=key,
+            outcome=OUTCOME_UNKNOWN,
+            error_code="invalid_explicit_outcome",
+            error_message="send_explicit 返回值类型不符",
+            retryable=True,
+        )
+    return _legacy_send_explicit(notifier=notifier, message=message, target_key=key)
+
+
+def _legacy_send_explicit(
+    *,
+    notifier: object,
+    message: NotificationMessage,
+    target_key: str,
+) -> TargetDeliveryOutcome:
+    sender = getattr(notifier, "send", None)
+    if not callable(sender):
+        return TargetDeliveryOutcome(
+            target_key=target_key,
+            outcome=OUTCOME_FAILED,
+            error_code="notifier_has_no_send",
+            error_message="目标对象既无 send_explicit 也无 send",
+        )
+    try:
+        result = sender(message)
+    except Exception as exc:  # noqa: BLE001
+        return TargetDeliveryOutcome(
+            target_key=target_key,
+            outcome=OUTCOME_UNKNOWN,
+            error_code="send_raised",
+            error_message=f"{exc.__class__.__name__}: {exc}"[:200],
+            retryable=True,
+        )
+    if not isinstance(result, NotificationResult):
+        return TargetDeliveryOutcome(
+            target_key=target_key,
+            outcome=OUTCOME_UNKNOWN,
+            error_code="invalid_send_result",
+            error_message="send 返回值类型不符",
+            retryable=True,
+        )
+    channel = str(result.channel).lower()
+    if channel == "console":
+        return TargetDeliveryOutcome(
+            target_key=target_key,
+            outcome=OUTCOME_FAILED,
+            error_code="console_not_a_delivery",
+            error_message="console 输出不能作为送达依据",
+        )
+    if result.success:
+        return TargetDeliveryOutcome(target_key=target_key, outcome=OUTCOME_ACCEPTED)
+    return TargetDeliveryOutcome(
+        target_key=target_key,
+        outcome=OUTCOME_FAILED,
+        error_code="send_failed",
+        error_message=str(result.error)[:200],
+        retryable=True,
+    )
+
+
+def _post_json_strict(
+    *,
+    target_key: str,
+    url: str,
+    body: Mapping[str, object],
+    timeout_sec: int,
+) -> TargetDeliveryOutcome:
+    """严格版 webhook 投递：HTTP 2xx 不足以算成功，必须解析出明确业务状态。"""
+    encoded = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = request.Request(
+        url=url,
+        data=encoded,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with request.urlopen(req, timeout=timeout_sec) as resp:
+            status = int(resp.status)
+            raw_payload = resp.read()
+    except Exception as exc:  # noqa: BLE001 - 网络异常按不确定处理
+        return TargetDeliveryOutcome(
+            target_key=target_key,
+            outcome=OUTCOME_UNKNOWN,
+            error_code="request_exception",
+            error_message=f"{exc.__class__.__name__}: {exc}"[:200],
+            retryable=True,
+        )
+    if status >= 500 or status == 429:
+        return TargetDeliveryOutcome(
+            target_key=target_key,
+            outcome=OUTCOME_FAILED,
+            error_code=f"http_{status}",
+            error_message="服务端临时错误",
+            retryable=True,
+            http_status=status,
+        )
+    if not (200 <= status < 300):
+        return TargetDeliveryOutcome(
+            target_key=target_key,
+            outcome=OUTCOME_FAILED,
+            error_code=f"http_{status}",
+            error_message="请求被拒绝（认证/权限/参数）",
+            http_status=status,
+        )
+    payload = _read_json_mapping(raw_payload)
+    if not payload or "code" not in payload:
+        return TargetDeliveryOutcome(
+            target_key=target_key,
+            outcome=OUTCOME_UNKNOWN,
+            error_code="unparseable_response",
+            error_message="HTTP 2xx 但响应缺少明确业务状态",
+            retryable=True,
+            http_status=status,
+        )
+    code = _mapping_int(payload, "code", default=-1)
+    if code != 0:
+        return TargetDeliveryOutcome(
+            target_key=target_key,
+            outcome=OUTCOME_FAILED,
+            error_code=str(code),
+            error_message=str(payload.get("msg", ""))[:200],
+            http_status=status,
+        )
+    return TargetDeliveryOutcome(
+        target_key=target_key,
+        outcome=OUTCOME_ACCEPTED,
+        accepted_at=datetime.now().isoformat(),
+        http_status=status,
+    )
+
+
+def _post_feishu_app_delivery(
+    *,
+    target_key: str,
+    url: str,
+    body: Mapping[str, object],
+    timeout_sec: int,
+    tenant_access_token: str,
+) -> TargetDeliveryOutcome:
+    """飞书应用消息的严格版投递（正式晚报的主/可选目标都走这里）。
+
+    判定阶梯：HTTP 2xx → 响应可解析 → ``code`` 存在且为 0 → 才算 accepted。
+    中间任何一步不满足都不是成功：飞书在业务失败时同样返回 HTTP 200。
+    """
+    encoded = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = request.Request(
+        url=url,
+        data=encoded,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {tenant_access_token}",
+        },
+    )
+    try:
+        with request.urlopen(req, timeout=timeout_sec) as resp:
+            status = int(resp.status)
+            raw_payload = resp.read()
+    except Exception as exc:  # noqa: BLE001
+        # 超时/连接重置：请求可能已经到达服务端。按**不确定**处理，绝不当成
+        # "没发出去"直接重发——那是重复推送的来源。
+        return TargetDeliveryOutcome(
+            target_key=target_key,
+            outcome=OUTCOME_UNKNOWN,
+            error_code="request_exception",
+            error_message=f"{exc.__class__.__name__}: {exc}"[:200],
+            retryable=True,
+        )
+    if status >= 500 or status == 429:
+        return TargetDeliveryOutcome(
+            target_key=target_key,
+            outcome=OUTCOME_FAILED,
+            error_code=f"http_{status}",
+            error_message="飞书服务端临时错误",
+            retryable=True,
+            http_status=status,
+        )
+    if not (200 <= status < 300):
+        # 4xx：认证、权限、目标不存在、参数错误——重试不会变好，记录为需处理状态。
+        return TargetDeliveryOutcome(
+            target_key=target_key,
+            outcome=OUTCOME_FAILED,
+            error_code=f"http_{status}",
+            error_message="请求被拒绝（认证/权限/目标/参数）",
+            http_status=status,
+        )
+    payload = _read_json_mapping(raw_payload)
+    if not payload or "code" not in payload:
+        return TargetDeliveryOutcome(
+            target_key=target_key,
+            outcome=OUTCOME_UNKNOWN,
+            error_code="unparseable_response",
+            error_message="HTTP 2xx 但响应缺少明确业务状态",
+            retryable=True,
+            http_status=status,
+        )
+    code = _mapping_int(payload, "code", default=-1)
+    if code != 0:
+        # 业务错误码同样返回 HTTP 200。这里不猜哪些码可重试：一律记为明确失败，
+        # 交给人工核对，避免对着认证/权限类错误高频重试。
+        return TargetDeliveryOutcome(
+            target_key=target_key,
+            outcome=OUTCOME_FAILED,
+            error_code=str(code),
+            error_message=str(payload.get("msg", ""))[:200],
+            http_status=status,
+        )
+    return TargetDeliveryOutcome(
+        target_key=target_key,
+        outcome=OUTCOME_ACCEPTED,
+        message_id=_extract_message_id(payload),
+        accepted_at=datetime.now().isoformat(),
+        http_status=status,
+    )
+
+
+def _extract_message_id(payload: Mapping[str, Any]) -> str:
+    data = payload.get("data")
+    if not isinstance(data, Mapping):
+        return ""
+    return str(data.get("message_id", "")).strip()
+
+
 def _post_json(
     channel: str,
     url: str,
@@ -1145,9 +1610,7 @@ _FEISHU_CATEGORY_LABELS = {
     "\u5347\u7ea7": "\U0001f680 \u5347\u7ea7\u901a\u77e5",
 }
 
-_FEISHU_KV_LINE_RE = re.compile(
-    r"^(?P<key>[A-Za-z0-9_\-/\u4e00-\u9fff ]{1,24})=(?P<value>.+)$"
-)
+_FEISHU_KV_LINE_RE = re.compile(r"^(?P<key>[A-Za-z0-9_\-/\u4e00-\u9fff ]{1,24})=(?P<value>.+)$")
 
 
 def _format_feishu_message(message: NotificationMessage) -> str:

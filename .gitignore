@@ -45,6 +45,10 @@ htmlcov/
 manual_test_tmp/
 /data/
 /build_manifest.json
+# 部署期写入的运行身份标记（nas_deploy_update.sh / 镜像构建阶段）：与
+# build_manifest.json 同性质的一次性产物，绝不能进版本库——一个被 commit 的
+# 旧 SHA 会让身份对账出现极难排查的"真清单 + 假来源"组合。
+/.build_commit
 suggestions/
 artifacts/*
 !artifacts/model_v1.json

@@ -11,7 +11,13 @@ from typing import Any
 import yaml
 from dotenv import load_dotenv
 
-from stock_analyzer._pydantic_compat import BaseModel, ConfigDict, Field, field_validator
+from stock_analyzer._pydantic_compat import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 load_dotenv()
 
@@ -647,6 +653,137 @@ class Week5Config(_StrictModel):
     intraday_single_ticker_budget_sec: int = 5
 
 
+class NightlyReportConfig(_StrictModel):
+    """正式晚间报告与飞书交付的独立开关与预算。
+
+    默认 ``enabled=False``：关闭时调度注册、扫描回调、通知路径全部保持旧行为，
+    NAS 验收通过后再用 ``SA__NIGHTLY__ENABLED=true`` 显式开启。配置值不合法
+    直接在加载期报错，不静默纠正——这些值决定"当晚是否会发消息"，猜错的代价
+    是漏报或重复推送。
+    """
+
+    enabled: bool = False
+    # 正文最多展示几只候选；少于该数就展示几只，不补足数量。
+    display_top_k: int = 5
+    # 22:30 仍未完成发一次"延迟说明"；23:00 是最后一次允许起重型扫描的时刻；
+    # 23:30 仍无有效结果则发一次明确的失败/阻断摘要。
+    target_time: str = "22:30"
+    last_scan_start_time: str = "23:00"
+    deadline_time: str = "23:30"
+    # 检查入口每 5 分钟一次（窗口 21:45—last_scan_start_time），保证晚到数据
+    # 仍能起扫；重型扫描本身保留 1800s 预算。
+    scan_check_interval_minutes: int = 5
+    # 同一交易日最多真正执行几次重型扫描（数据等待检查不计入）。
+    max_scan_attempts: int = 2
+    # 交付检查（nightly_delivery_tick）节奏与每次处理的到期目标上限。
+    delivery_interval_minutes: int = 1
+    max_delivery_targets_per_tick: int = 2
+    # 首次失败后的退避；首次 + len(retry_delays_sec) 次重试 = max_delivery_attempts。
+    retry_delays_sec: list[int] = Field(default_factory=lambda: [60, 300, 900])
+    max_delivery_attempts: int = 4
+    # 结果不确定（超时/落盘前崩溃）时，用同一 uuid 重试的时间窗。飞书的
+    # uuid 幂等窗是 1 小时，超过就停止自动重发、留 unknown 交人工，避免跨窗重复。
+    unknown_retry_window_sec: int = 3000
+    # 单次网络调用总预算（秒）；必须远小于交付锁的 stale 阈值，否则"持有者还活着
+    # 但请求慢"会被别的 worker 判成失联并重复发送。
+    request_timeout_sec: int = 20
+    # 正文长度上限（中文字符），超出按固定顺序截断理由，日期/状态/股票/风险优先保留。
+    message_max_chars: int = 3000
+    reports_root: str = "artifacts/runtime/nightly_reports"
+    delivery_root: str = "artifacts/runtime/nightly_delivery"
+    # 恢复只回看当前交易日与最近一个交易日，禁止全目录扫描。
+    recovery_lookback_days: int = 2
+    # 交付记录里保留的尝试历史条数上限（避免无限增长）。
+    attempt_history_limit: int = 20
+
+    @field_validator("target_time", "last_scan_start_time", "deadline_time")
+    @classmethod
+    def _validate_nightly_hhmm(cls, value: str) -> str:
+        normalized = _normalize_hhmm(value)
+        if not normalized:
+            raise ValueError(f"nightly time must not be empty: {value!r}")
+        return normalized
+
+    @field_validator(
+        "scan_check_interval_minutes",
+        "delivery_interval_minutes",
+        "max_delivery_targets_per_tick",
+        "request_timeout_sec",
+        "recovery_lookback_days",
+        "attempt_history_limit",
+    )
+    @classmethod
+    def _validate_nightly_positive_int(cls, value: int) -> int:
+        if int(value) <= 0:
+            raise ValueError(f"must be > 0, got {value}")
+        return int(value)
+
+    @field_validator("max_scan_attempts")
+    @classmethod
+    def _validate_nightly_max_scan_attempts(cls, value: int) -> int:
+        if int(value) < 1:
+            raise ValueError(f"max_scan_attempts must be >= 1, got {value}")
+        return int(value)
+
+    @field_validator("display_top_k")
+    @classmethod
+    def _validate_nightly_display_top_k(cls, value: int) -> int:
+        if int(value) < 1:
+            raise ValueError(f"display_top_k must be >= 1, got {value}")
+        return int(value)
+
+    @field_validator("message_max_chars")
+    @classmethod
+    def _validate_nightly_message_max_chars(cls, value: int) -> int:
+        # 低于 200 个字符连状态行都放不下，属于配置事故而非"更短的消息"。
+        if int(value) < 200:
+            raise ValueError(f"message_max_chars must be >= 200, got {value}")
+        return int(value)
+
+    @field_validator("retry_delays_sec")
+    @classmethod
+    def _validate_nightly_retry_delays(cls, value: list[int]) -> list[int]:
+        normalized = [int(item) for item in value]
+        if not normalized:
+            raise ValueError("retry_delays_sec must not be empty")
+        if any(item <= 0 for item in normalized):
+            raise ValueError(f"retry_delays_sec entries must be > 0, got {normalized}")
+        return normalized
+
+    @model_validator(mode="after")
+    def _validate_nightly_consistency(self) -> NightlyReportConfig:
+        if not self.enabled:
+            # 关闭时不因为"用不到的组合"拦住启动：只有开启后这些约束才决定行为。
+            return self
+        if _to_minutes(self.target_time) > _to_minutes(self.last_scan_start_time):
+            raise ValueError(
+                "target_time must be <= last_scan_start_time "
+                f"({self.target_time} > {self.last_scan_start_time})"
+            )
+        if _to_minutes(self.last_scan_start_time) > _to_minutes(self.deadline_time):
+            raise ValueError(
+                "last_scan_start_time must be <= deadline_time "
+                f"({self.last_scan_start_time} > {self.deadline_time})"
+            )
+        expected_attempts = len(self.retry_delays_sec) + 1
+        if self.max_delivery_attempts != expected_attempts:
+            raise ValueError(
+                "max_delivery_attempts must equal len(retry_delays_sec) + 1 "
+                f"(got {self.max_delivery_attempts}, expected {expected_attempts})"
+            )
+        if self.unknown_retry_window_sec >= 3600:
+            raise ValueError(
+                "unknown_retry_window_sec must be < 3600（飞书 uuid 幂等窗为 1 小时，"
+                f"超窗重试会重复推送）, got {self.unknown_retry_window_sec}"
+            )
+        return self
+
+
+def _to_minutes(hhmm: str) -> int:
+    hours, minutes = hhmm.split(":", maxsplit=1)
+    return int(hours) * 60 + int(minutes)
+
+
 class HolidayRiskConfig(_StrictModel):
     pre_holiday_reduce_days: int = 3
     max_position_multiplier: float = 0.5
@@ -1111,7 +1248,13 @@ class TrainingConfig(_StrictModel):
     # 内容寻址 bundle 归档根目录（P0-a）：训练产物只进这里并注册 challenger，
     # 运行时别名 artifact_path 仅由两阶段发布流程原子切换。
     model_archive_dir: str = "artifacts/model_archive"
+    # S05：retention_count 是**保留下限**（最新 N 个永不删，含 protected bundle）；
+    # 容量由 model_archive_max_bytes 管理：超预算时删最旧的，但不低于保留下限。
+    # 因而默认值 5 = 至少保 5 个（阶段施工提示词 S05 允许"至少 50 或按容量管理"）。
     model_archive_retention_count: int = 5
+    model_archive_max_bytes: int = 2 * 1024 * 1024 * 1024
+    # 在服模型清单（S05）：serving 身份的独立真相源，由发布流程在 CAS 成功后写入。
+    serving_manifest_path: str = "artifacts/model_serving_manifest.json"
     # 晋级硬门（P1-b 补救）：完整 test split 的去重交易日下限。
     min_test_trade_dates: int = 20
     min_hard_class_samples: int = 30
@@ -1705,6 +1848,96 @@ class BlacklistConfig(_StrictModel):
         return self.matches(symbol) is not None
 
 
+_ALPHA_V2_MODEL_RESOLVER_MODES = frozenset({"pit_research", "strict_production_replay"})
+_ALPHA_V2_ENTRY_MODES = frozenset({"next_session_open", "next_tradable_open"})
+
+
+class AlphaV2Config(_StrictModel):
+    """Alpha V2 独立 Feature Flag（P0-00，蓝图 §5 P0-00 / §10）。
+
+    三个开关的职责边界：
+    - ``enabled``：Alpha V2 子系统总开关。``false`` 时 V2 代码路径不执行、
+      不读写 ``artifacts/alpha_v2``；Legacy 夜扫/通知链路不读本块任何字段。
+    - ``shadow_only``：V2 只落盘 + 影子对照（蓝图 §10.2），不参与正式选股。
+    - ``enforce_final_selection``：V2 接管正式 final selection（蓝图 §10.5 的
+      唯一切换开关）；回滚 = 设回 false，不删任何 Legacy 代码。
+
+    两条 fail-closed 组合规则（禁止"声明关闭/仅影子却又能接管生产"）：
+    1. ``enforce_final_selection=true`` 必须 ``enabled=true``——否则将来某条只读
+       enforce 标志的代码路径会在"总开关关闭"时依旧接管 Legacy，等于开关失效；
+    2. ``enforce_final_selection=true`` 必须 ``shadow_only=false``——shadow 的语义
+       是"只记账不改结果"，与接管正式输出直接矛盾。
+
+    本类只做类型与闭集校验，不引入任何策略逻辑：P0-00 只建立安全基础。
+    """
+
+    enabled: bool = False
+    shadow_only: bool = True
+    enforce_final_selection: bool = False
+    artifact_root: str = "artifacts/alpha_v2"
+    selection_contract: str = "night_alpha_v2_v1"
+    model_resolver_mode: str = "pit_research"
+    entry_mode: str = "next_session_open"
+    primary_horizon_days: int = 5
+    candidate_output_top_k: int = 5
+
+    @field_validator("artifact_root", "selection_contract")
+    @classmethod
+    def _validate_alpha_v2_nonempty(cls, value: str) -> str:
+        normalized = str(value).strip()
+        if not normalized:
+            raise ValueError("alpha_v2 artifact_root/selection_contract must not be empty")
+        return normalized
+
+    @field_validator("model_resolver_mode")
+    @classmethod
+    def _validate_alpha_v2_model_resolver_mode(cls, value: str) -> str:
+        # 闭集校验：写错的 mode 会在 P0-03 的 resolver 里静默落到"当前模型"，
+        # 正是蓝图 §2.9 那类"报告一个模型、实际加载另一个"的假象源头。
+        normalized = str(value).strip().lower()
+        if normalized not in _ALPHA_V2_MODEL_RESOLVER_MODES:
+            supported = ",".join(sorted(_ALPHA_V2_MODEL_RESOLVER_MODES))
+            raise ValueError(
+                f"unsupported alpha_v2.model_resolver_mode: {value} (supported: {supported})"
+            )
+        return normalized
+
+    @field_validator("entry_mode")
+    @classmethod
+    def _validate_alpha_v2_entry_mode(cls, value: str) -> str:
+        # 主口径为 T+1 开盘（蓝图 §4.3）；next_tradable_open 表示停牌/一字板顺延
+        # 到下一可成交开盘的 sensitivity 口径。写错同样 fail-closed，避免将来
+        # P0-05 的入场模拟静默退回 T 日收盘价（已知错误实现）。
+        normalized = str(value).strip().lower()
+        if normalized not in _ALPHA_V2_ENTRY_MODES:
+            supported = ",".join(sorted(_ALPHA_V2_ENTRY_MODES))
+            raise ValueError(f"unsupported alpha_v2.entry_mode: {value} (supported: {supported})")
+        return normalized
+
+    @field_validator("primary_horizon_days", "candidate_output_top_k")
+    @classmethod
+    def _validate_alpha_v2_positive_int(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError(f"alpha_v2 primary_horizon_days/top_k must be > 0, got {value}")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_alpha_v2_switches(self) -> AlphaV2Config:
+        if self.enforce_final_selection:
+            if not self.enabled:
+                raise ValueError(
+                    "alpha_v2.enforce_final_selection=true requires enabled=true："
+                    "总开关关闭时声明“接管正式 final selection”是矛盾状态，"
+                    "fail-closed 拒绝（避免只读 enforce 标志的路径在关闭态生效）"
+                )
+            if self.shadow_only:
+                raise ValueError(
+                    "alpha_v2.enforce_final_selection=true requires shadow_only=false："
+                    "shadow_only 语义是只记账不改结果，与接管正式输出互斥"
+                )
+        return self
+
+
 class StockAnalyzerConfig(_StrictModel):
     app: AppConfig
     data_source: DataSourceConfig
@@ -1730,6 +1963,7 @@ class StockAnalyzerConfig(_StrictModel):
     board_risk: BoardRiskConfig = Field(default_factory=BoardRiskConfig)
     theme: MacroThemeConfig = Field(default_factory=MacroThemeConfig)
     week5: Week5Config = Field(default_factory=Week5Config)
+    nightly: NightlyReportConfig = Field(default_factory=NightlyReportConfig)
     holiday_risk: HolidayRiskConfig = Field(default_factory=HolidayRiskConfig)
     global_market: GlobalMarketConfig = Field(default_factory=GlobalMarketConfig)
     regulatory_factor: RegulatoryFactorConfig = Field(default_factory=RegulatoryFactorConfig)
@@ -1761,6 +1995,9 @@ class StockAnalyzerConfig(_StrictModel):
     idle_queue: IdleQueueConfig = Field(default_factory=IdleQueueConfig)
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
     param_freeze: ParamFreezeConfig = Field(default_factory=ParamFreezeConfig)
+    # Alpha V2（P0-00）：默认关闭的独立 Feature Flag 块。放在字段表末尾以保持
+    # 既有字段顺序不变；Legacy 代码路径不得读取本块。
+    alpha_v2: AlphaV2Config = Field(default_factory=AlphaV2Config)
 
 
 def _parse_env_value(raw: str) -> Any:

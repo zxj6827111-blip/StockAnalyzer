@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 # 状态取值（稳定契约，供接口与测试引用）
@@ -158,3 +159,244 @@ def describe_artifact_identity(
             f"loaded={loaded_hash_text[:12]}… champion={champion_hash[:12]}…）"
         )
     return payload
+
+
+# ---------------------------------------------------------------------------
+# S01（Alpha V2 M1）：真实模型身份链
+#
+# 上面的判定函数回答"两侧哈希关系如何"；本节回答"身份事实从哪来、谁能覆盖谁"。
+#
+# 唯一真相源规则（S01 验收项）：**Pipeline 实际加载谁，报告就必须报告谁**。
+#   事实（facts）= 磁盘/加载路径上的 artifact：内容哈希、created_at、feature schema、
+#                 label policy、dataset manifest；
+#   补充（supplement）= registry 登记信息与 bootstrap 运行时状态：只能标注"这份内容在
+#                 注册表里叫什么/被谁批准过"，**不得覆盖事实**。
+#
+# 2026-09-17 之前的实际行为违反这条：``week5_historical_runner._resolve_model_info``
+# 与 ``asof_backtest_service`` 在找不到 champion 时把 **bootstrap 的
+# ``last_bootstrap_at`` 当成 ``model_trained_at`` 报出去**——于是报告写 2026-09-15
+# 训练、实际加载的却是 2026-08-16 的工件（蓝图 §2.9）。S01 把"事实"与"补充"分开记录，
+# 并对"已证实不符/无法比对"的身份 fail-closed 到研究侧。
+# ---------------------------------------------------------------------------
+
+# 事实字段（稳定契约）：取值必须来自 artifact 本身或加载进程的直接观测。
+MODEL_IDENTITY_FACT_KEYS = (
+    "artifact_uri",
+    "artifact_exists",
+    "artifact_content_hash",
+    "artifact_created_at",
+    "feature_schema_id",
+    "feature_schema_hash",
+    "label_policy_id",
+    "label_policy_hash",
+    "dataset_manifest_id",
+)
+
+# 研究侧 fail-closed 的状态：只含"已证实不符"与"无法比对"两类**硬信号**。
+# 刻意不含 no_champion / registry_unavailable / registry_busy：
+#   - no_champion：身份可验证（match_registered）但没有批准记录，属治理缺口，
+#     当前生产就是这个状态（蓝图 §2.5），一刀切会把整条研究链锁死；
+#   - registry 读不到 / 写锁占用：属"这次判不了"，不是"身份不符"（假警报会让
+#     探测器被当噪音，见本模块开头 2026-09-16 记录）。
+IDENTITY_RESEARCH_FAIL_CLOSED_STATUSES = (
+    IDENTITY_MISMATCH,
+    IDENTITY_LOADED_HASH_MISSING,
+    IDENTITY_CHAMPION_HASH_MISSING,
+)
+
+# 身份"可验证"的状态（事实与登记内容对得上）。
+IDENTITY_VERIFIED_STATUSES = (IDENTITY_MATCH, IDENTITY_MATCH_REGISTERED)
+
+
+def research_fail_closed(status: object) -> bool:
+    """该身份状态是否必须让 V2 研究/回测拒绝出结果。"""
+    return _text(status) in IDENTITY_RESEARCH_FAIL_CLOSED_STATUSES
+
+
+def identity_verified(status: object) -> bool:
+    """该身份状态是否已"可验证"（而非仅"可读"）。"""
+    return _text(status) in IDENTITY_VERIFIED_STATUSES
+
+
+def load_artifact_facts(artifact_path: str | Path) -> dict[str, object]:
+    """从磁盘工件读"事实"身份（只读 JSON 头字段，不解模型后端）。
+
+    供**没有已加载 predictor** 的调用方使用：例如 asof 回测在跑扫描前先固定一次
+    身份，避免把运行期 bootstrap 时间当模型身份报出去。
+
+    任何一步失败只写进 ``load_error`` / ``artifact_exists``，不抛异常：身份必须
+    永远可报告——"读不到"本身就是要被记录的事实。
+    """
+    from stock_analyzer.models.artifact import ModelArtifact  # noqa: WPS433 - 避免环导入
+    from stock_analyzer.models.bundle import compute_artifact_identity_hash  # noqa: WPS433
+
+    resolved = Path(artifact_path).expanduser()
+    facts: dict[str, object] = {
+        "artifact_uri": str(resolved),
+        "artifact_exists": False,
+        "artifact_content_hash": "",
+        "artifact_created_at": "",
+        "feature_schema_id": "",
+        "feature_schema_hash": "",
+        "label_policy_id": "",
+        "label_policy_hash": "",
+        "dataset_manifest_id": "",
+        "load_error": "",
+    }
+    if not resolved.exists():
+        facts["load_error"] = "artifact_missing"
+        return facts
+    facts["artifact_exists"] = True
+    try:
+        artifact = ModelArtifact.load(resolved)
+    except Exception as exc:  # noqa: BLE001 - 身份读取不得抛
+        facts["load_error"] = f"artifact_load_failed:{type(exc).__name__}"
+    else:
+        facts.update(
+            {
+                "artifact_created_at": _text(artifact.created_at),
+                "feature_schema_id": _text(artifact.feature_schema_id),
+                "feature_schema_hash": _text(artifact.feature_schema_hash),
+                "label_policy_id": _text(artifact.label_policy_id),
+                "label_policy_hash": _text(artifact.label_policy_hash),
+                "dataset_manifest_id": _text(artifact.dataset_manifest_id),
+            }
+        )
+    try:
+        facts["artifact_content_hash"] = _text(compute_artifact_identity_hash(resolved))
+    except Exception as exc:  # noqa: BLE001 - 同上门禁
+        facts["load_error"] = facts["load_error"] or f"hash_failed:{type(exc).__name__}"
+    return facts
+
+
+def registry_identity(registry: object | None) -> dict[str, object]:
+    """只读收集 registry 侧补充身份（champion / 登记清单 / 错误）。
+
+    与 ``service.artifact_identity_report`` 原本的内联逻辑同源；抽出来是为了让历史/
+    研究路径与生产健康端点用**同一套**判定输入，避免两处口径漂移。
+
+    ``registry_busy`` 一律为 False：本函数**观测到写锁占用**的能力有限，
+    不从异常文本里猜（"db locked" 这类文本既可能是本进程持锁，也可能是别的进程
+    持锁或其它 IO 错误）。生产健康端点的既有契约是把读失败报成
+    ``registry_unavailable``，这里保持同口径；确实知道自己持写锁的调用方
+    （如巡检的直连兜底路径）自行构造 snapshot 传 ``registry_snapshot``。
+    """
+    payload: dict[str, object] = {
+        "champion": None,
+        "registered": [],
+        "registry_error": "",
+        "registry_busy": False,
+    }
+    if registry is None:
+        return payload
+    champion: dict[str, object] | None = None
+    try:
+        record = registry.active_champion(suppress_read_errors=True)  # type: ignore[attr-defined]
+        if record is not None:
+            champion = {
+                "model_id": getattr(record, "model_id", ""),
+                "artifact_uri": getattr(record, "artifact_uri", ""),
+                "artifact_content_hash": getattr(record, "artifact_content_hash", ""),
+                "lifecycle_state": str(getattr(record, "lifecycle_state", "")),
+            }
+    except Exception as exc:  # noqa: BLE001 - 读不到注册表要如实上报
+        payload["registry_error"] = f"{type(exc).__name__}: {exc}"
+    registered: list[dict[str, object]] = []
+    try:
+        registered = [
+            {
+                "model_id": getattr(item, "model_id", ""),
+                "artifact_content_hash": getattr(item, "artifact_content_hash", ""),
+                "lifecycle_state": str(getattr(item, "lifecycle_state", "")),
+            }
+            for item in registry.list_records(  # type: ignore[attr-defined]
+                limit=200, suppress_read_errors=True
+            )
+        ]
+    except Exception:  # noqa: BLE001 - 登记清单读不到只降级为"这半判不了"
+        registered = []
+    payload["champion"] = champion
+    payload["registered"] = registered
+    return payload
+
+
+def build_model_identity_report(
+    facts: Mapping[str, Any],
+    *,
+    registry: object | None = None,
+    claimed_content_hash: object = "",
+    registry_snapshot: Mapping[str, Any] | None = None,
+) -> dict[str, object]:
+    """合并"工件事实 + registry 补充"，输出可审计的身份报告。
+
+    Args:
+        facts: 事实字段（见 :data:`MODEL_IDENTITY_FACT_KEYS`），至少含
+            ``artifact_uri`` 与 ``artifact_content_hash``。
+        registry: 注册表对象（鸭子类型：``active_champion`` / ``list_records``）。
+            None 表示调用方不持有注册表，此时判定为 ``registry_unavailable``。
+        claimed_content_hash: 发布时**盖章**的哈希（bundle 自描述），与加载期实算
+            哈希比对得到 ``content_hash_verified``（三态 True/False/None）。
+        registry_snapshot: 已收集好的 registry 身份，避免重复读库。
+
+    Returns:
+        报告 dict：事实字段原样透传 + ``status``（六态判定）+ registry 补充字段
+        （**一律带 ``registry_`` / ``champion_`` / ``claimed_`` 前缀**，结构上区分
+        "补充"与"事实"，防止下游把登记值当真相读）+ ``research_fail_closed`` /
+        ``identity_verified``。
+    """
+    if registry_snapshot is not None:
+        snapshot = dict(registry_snapshot)
+    elif registry is not None:
+        snapshot = registry_identity(registry)
+    else:
+        # 未附加注册表**不是**错误（`registry_unavailable` 会掩盖真正的工件问题，
+        # 例如工件缺失导致的 loaded_hash_missing）。这里按"没有登记信息"处理：
+        # champion=None / registered=[] / 无错误，由 ``registry_attached=False``
+        # 让调用方知道"状态里没有 registry 那一半"。
+        snapshot = {
+            "champion": None,
+            "registered": [],
+            "registry_error": "",
+            "registry_busy": False,
+        }
+    champion = snapshot.get("champion")
+    registered = snapshot.get("registered")
+    status_payload = describe_artifact_identity(
+        loaded_uri=facts.get("artifact_uri", ""),
+        loaded_hash=facts.get("artifact_content_hash", ""),
+        champion=champion if isinstance(champion, Mapping) else None,
+        registered=registered if isinstance(registered, list) else [],
+        registry_error=_text(snapshot.get("registry_error", "")),
+        registry_busy=bool(snapshot.get("registry_busy", False)),
+    )
+    report: dict[str, object] = {key: facts.get(key, "") for key in MODEL_IDENTITY_FACT_KEYS}
+    for extra_key in (
+        "predictor_loaded",
+        "artifact_path_requested",
+        "score_source",
+        "output_semantics",
+        "inference_allowed",
+        "inference_blocked_reason",
+        "load_error",
+    ):
+        if extra_key in facts:
+            report[extra_key] = facts[extra_key]
+    report.update(
+        {
+            "status": status_payload.get("status", ""),
+            "detail": status_payload.get("detail", ""),
+            "claimed_content_hash": _text(claimed_content_hash),
+            "content_hash_verified": content_hash_matches_stamp(
+                claimed=claimed_content_hash,
+                actual=facts.get("artifact_content_hash", ""),
+            ),
+        }
+    )
+    report["registry_model_id"] = _text(status_payload.get("champion_model_id", ""))
+    report["registry_content_hash"] = _text(status_payload.get("champion_content_hash", ""))
+    report["registry_error"] = _text(snapshot.get("registry_error", ""))
+    report["registry_busy"] = bool(snapshot.get("registry_busy", False))
+    report["registry_attached"] = registry is not None or registry_snapshot is not None
+    report["research_fail_closed"] = research_fail_closed(report["status"])
+    report["identity_verified"] = identity_verified(report["status"])
+    return report

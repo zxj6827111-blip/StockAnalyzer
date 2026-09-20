@@ -239,6 +239,9 @@ def test_final_signal_selector_gates_and_cap(tmp_path: Path) -> None:
                 "risk_gate": {"passed": risk_ok},
                 "cross_review_gate": {"passed": cross_ok},
             },
+            # 完整评估过的候选：缺 evaluation_status 会被"输入不足"门拦下
+            # （见 test_final_selector_fails_closed_when_evaluation_status_is_absent）。
+            "overextension": {"reject_new_buy": False, "evaluation_status": "evaluated"},
         }
 
     signals = [

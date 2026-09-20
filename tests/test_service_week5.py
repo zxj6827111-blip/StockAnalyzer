@@ -32,6 +32,23 @@ from stock_analyzer.runtime.services.week5_service import (
     _record_intraday_sync_health_audits,
 )
 
+# 一段"可被风控完整评估"的横盘 K 线（``post_scan_enrichment`` 格式）。
+#
+# 2026-09-16 批次 D 起，风控算不出必要指标（close/ma5/atr14）的候选会被最终
+# 买入准入按"输入不足"拒绝。生产路径的候选都带 post_scan_enrichment K 线，
+# 夹具也必须带——否则夹具默认的就是"没跑过风控"这种生产里不该出现的形态。
+# 横盘 8 根：bias=0、ATR=0.4>0，既算得出又不触发过热。
+#
+# 副作用（已知且符合预期）：候选带 K 线后，first_board 阶段会**复用**它而不再
+# 按 first_board_scan_lookback_days 回源拉取（复用本就是该阶段的设计）。需要
+# 验证取数路径的测试请用 post_scan_enrichment=False 的夹具。
+_CALM_ENRICHMENT = json.dumps(
+    [
+        {"open": 10.0, "high": 10.2, "low": 9.8, "close": 10.0, "turnover": 1_000_000.0}
+        for _ in range(8)
+    ]
+)
+
 
 def _as_mapping(value: object) -> Mapping[str, object]:
     if isinstance(value, Mapping):
@@ -380,6 +397,7 @@ def _build_week5_execution_rerank_pipeline() -> object:
                     "target_position": 0.08,
                     "grade": "A",
                     "reasons": ["high_score"],
+                    "post_scan_enrichment": _CALM_ENRICHMENT,
                     "probabilities": {"meta": 0.46, "lgbm": 0.45, "xgb": 0.47},
                     "decision_trace": {
                         "learning_protocol": {"snapshot_id": "snap-high-risk"},
@@ -398,6 +416,7 @@ def _build_week5_execution_rerank_pipeline() -> object:
                     "target_position": 0.08,
                     "grade": "A",
                     "reasons": ["high_score"],
+                    "post_scan_enrichment": _CALM_ENRICHMENT,
                     "probabilities": {"meta": 0.73, "lgbm": 0.71, "xgb": 0.72},
                     "decision_trace": {
                         "learning_protocol": {"snapshot_id": "snap-low-risk"},
@@ -432,6 +451,7 @@ def _build_week5_execution_rerank_pipeline_without_snapshots() -> object:
                     "target_position": 0.08,
                     "grade": "A",
                     "reasons": ["high_score"],
+                    "post_scan_enrichment": _CALM_ENRICHMENT,
                     "probabilities": {"meta": 0.46, "lgbm": 0.45, "xgb": 0.47},
                 },
                 {
@@ -443,6 +463,7 @@ def _build_week5_execution_rerank_pipeline_without_snapshots() -> object:
                     "target_position": 0.08,
                     "grade": "A",
                     "reasons": ["high_score"],
+                    "post_scan_enrichment": _CALM_ENRICHMENT,
                     "probabilities": {"meta": 0.73, "lgbm": 0.71, "xgb": 0.72},
                 },
             ],
@@ -663,6 +684,7 @@ def _build_lightweight_week5_pipeline(
     *,
     provider: RecordingSyntheticProvider | None = None,
     emitted_symbols: list[str] | None = None,
+    post_scan_enrichment: bool = True,
 ) -> object:
     def _fake_run_pipeline(
         *,
@@ -705,6 +727,7 @@ def _build_lightweight_week5_pipeline(
                 "target_position": 0.08 if index == 0 else 0.04,
                 "grade": "A" if index == 0 else "B",
                 "reasons": ["high_score"] if index == 0 else ["watch_signal"],
+                **(dict(post_scan_enrichment=_CALM_ENRICHMENT) if post_scan_enrichment else {}),
                 "decision_trace": {
                     "risk_gate": {"passed": True},
                     "cross_review_gate": {"passed": True},
@@ -730,6 +753,7 @@ def _seed_lightweight_week5_pipeline_with_provider(
     provider: RecordingSyntheticProvider,
     *,
     emitted_symbols: list[str] | None = None,
+    post_scan_enrichment: bool = True,
 ) -> None:
     _patch_attr(
         service,
@@ -738,6 +762,7 @@ def _seed_lightweight_week5_pipeline_with_provider(
             service,
             provider=provider,
             emitted_symbols=emitted_symbols,
+            post_scan_enrichment=post_scan_enrichment,
         ),
     )
 
@@ -852,10 +877,13 @@ def _build_shared_week5_lookback_service() -> StockAnalyzerService:
     service = _new_service(config, provider=provider)
     _patch_attr(service, "test_provider", provider)
     _patch_attr(service, "test_config", config)
+    # 这条夹具专门验取数路径：候选**不带** post_scan_enrichment，first_board
+    # 阶段才会按 first_board_scan_lookback_days 回源拉取。
     _seed_lightweight_week5_pipeline_with_provider(
         service,
         provider,
         emitted_symbols=["600000"],
+        post_scan_enrichment=False,
     )
     return service
 

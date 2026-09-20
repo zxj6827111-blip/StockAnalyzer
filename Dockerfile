@@ -58,8 +58,16 @@ ARG STOCK_ANALYZER_BUILD_COMMIT=unknown
 ARG STOCK_ANALYZER_BUILD_SHORT_COMMIT=unknown
 ARG STOCK_ANALYZER_BUILD_DIRTY=unknown
 ARG STOCK_ANALYZER_BUILD_TIME_UTC=unknown
+# 生产运行身份（Alpha V2 M3 Runtime Identity Hardening / BLK-D1）：
+# 容器里没有 git 二进制、也没有 .git，所以代码身份只能来自**构建期**写入的不可变产物。
+# 同一次调用同时产出两个文件，保证 .build_commit == build_manifest.commit 是构造性的：
+#   .build_commit        → 运行期 resolver 的容器身份来源
+#   build_manifest.json  → 同一 commit + trusted/dirty（由部署脚本在构建前用 git 取证）
+# 不传任何 build-arg 就构建（例如手工 docker build）时 commit=unknown、dirty=unknown
+# → 清单 trusted=false → 生产 freeze/capture/mature 一律 fail-closed。
 RUN python /app/scripts/generate_build_manifest.py \
     --output /app/build_manifest.json \
+    --build-commit-file /app/.build_commit \
     --commit "${STOCK_ANALYZER_BUILD_COMMIT}" \
     --short-commit "${STOCK_ANALYZER_BUILD_SHORT_COMMIT}" \
     --dirty "${STOCK_ANALYZER_BUILD_DIRTY}" \

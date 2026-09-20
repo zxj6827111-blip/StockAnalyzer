@@ -151,6 +151,7 @@ def test_final_selector_rejects_triple_limit_up_signal() -> None:
             "cross_review_gate": {"passed": True},
         },
         "reasons": [],
+        "overextension": {"reject_new_buy": False, "evaluation_status": "evaluated"},
         "board_risk": {
             "consecutive_limit_up": 3,
             "current_limit_state": "limit_up",
@@ -168,6 +169,7 @@ def test_final_selector_rejects_triple_limit_up_signal() -> None:
             "cross_review_gate": {"passed": True},
         },
         "reasons": [],
+        "overextension": {"reject_new_buy": False, "evaluation_status": "evaluated"},
         "board_risk": {
             "consecutive_limit_up": 1,
             "current_limit_state": "none",

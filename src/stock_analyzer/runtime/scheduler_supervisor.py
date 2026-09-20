@@ -29,6 +29,11 @@ CRITICAL_JOBS = frozenset(
         "week5_automation_live_runtime",
         "midday_news_brief",
         "close_reconcile",
+        # 晚报交付检查必须放在 critical：它不能排在 heavy 单槽后面——那正是
+        # "夜扫占满 heavy、交付检查/告警整晚发不出去"的失败模式。任务本身很轻
+        # （只读写少量状态文件），独立 120s 超时。
+        "nightly_delivery_tick",
+        "nightly_delivery_resume",
     }
 )
 _VALID_GROUPS = frozenset({"critical", "heavy"})
@@ -60,6 +65,10 @@ def timeout_for_job(config: StockAnalyzerConfig, *, group: str, job: str) -> int
     configured = scheduler.job_timeout_sec
     if job in configured:
         return max(1, int(configured[job]))
+    # 交付检查：只处理有限几个到期目标，不选股、不更新行情、不等重型扫描。
+    # 走 120s 独立预算而不是 critical 默认值，避免它被误当成重任务拖长。
+    if job.startswith("nightly_delivery_"):
+        return 120
     for family in ("week5", "evolution"):
         if job.startswith(f"{family}_") and family in configured:
             return max(1, int(configured[family]))

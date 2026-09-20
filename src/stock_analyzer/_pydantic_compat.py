@@ -52,8 +52,15 @@ if TYPE_CHECKING:
         check_fields: bool | None = None,
         **kwargs: object,
     ) -> Callable[[_Decorator], _Decorator]: ...
+
+    def model_validator(
+        *,
+        mode: str = "after",
+        **kwargs: object,
+    ) -> Callable[[_Decorator], _Decorator]: ...
 else:
     from pydantic import BaseModel as BaseModel
     from pydantic import ConfigDict as ConfigDict
     from pydantic import Field as Field
     from pydantic import field_validator as field_validator
+    from pydantic import model_validator as model_validator

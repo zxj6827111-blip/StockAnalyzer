@@ -121,19 +121,33 @@ class RuntimeWeek5AutomationService:
         timestamp: datetime | None = None,
         notify_enabled: bool = False,
         sync_watchlist: bool = True,
+        readiness_wait_sec: int | None = None,
+        skip_shared_state_idempotency: bool = False,
     ) -> dict[str, object]:
+        """执行一轮夜扫。
+
+        ``readiness_wait_sec``：None=沿用配置的等待预算（旧行为）；0=只探测一次
+        立即返回（晚报链路用，配合调度器每 5 分钟重来）。
+
+        ``skip_shared_state_idempotency``：跳过基于**共享** ``state.trade_date`` /
+        ``state.data_version`` 的"今晚跑过了"判断。共享状态会被盘中任务改写，
+        用它判断夜扫是否完成会得出错误结论（例如盘中把 trade_date 改到今天，
+        夜扫就被误判成"已经跑过"而直接返回旧池）。晚报链路改用自己那份不会被
+        改写的完成记录（冻结报告 + 日期状态）判定，因此必须跳过这一层。
+        """
         service = self._service
         now = self._automation_now(timestamp)
         trace_id = f"week5-night-scan-{now.strftime('%Y%m%d%H%M%S')}"
         data_version_hint = self._resolve_current_data_version(now)
-        existing = self._idempotent_night_scan(
-            state=self.candidate_state(),
-            trade_date=now.date().isoformat(),
-            data_version=data_version_hint,
-        )
-        if existing is not None:
-            return existing
-        readiness = self._await_nightly_readiness()
+        if not skip_shared_state_idempotency:
+            existing = self._idempotent_night_scan(
+                state=self.candidate_state(),
+                trade_date=now.date().isoformat(),
+                data_version=data_version_hint,
+            )
+            if existing is not None:
+                return existing
+        readiness = self._await_nightly_readiness(wait_sec_override=readiness_wait_sec)
         if not bool(readiness.get("allowed", False)):
             # Plan 验收口径：readiness 失败时回退使用前一晚候选池（带过期
             # 语义），而不是清空旧池导致次日盘中无池可用。
@@ -1638,8 +1652,13 @@ class RuntimeWeek5AutomationService:
             return [], expires.isoformat()
         return pool, expires.isoformat()
 
-    def _await_nightly_readiness(self) -> dict[str, object]:
-        """Wait for the updater readiness artifact when a real date is known."""
+    def probe_nightly_readiness(self) -> dict[str, object]:
+        """单次就绪探测，**不等待**。
+
+        晚报链路的等待策略是"由调度器每 5 分钟再来一次"，而不是让重型 worker 在
+        里面 sleep 900 秒——后者会把 1800 秒的扫描预算挤掉 15 分钟（21:45 起等，
+        23:00 才轮到真正扫描，然后 23:30 撞截止），并在等待期间白占 heavy 单槽。
+        """
         resolver = getattr(self._service, "_resolve_nightly_expected_trade_date", None)
         if not callable(resolver):
             return {"status": "not_configured", "allowed": True, "waited_sec": 0.0}
@@ -1660,16 +1679,31 @@ class RuntimeWeek5AutomationService:
                 "expected_trade_date": expected_text,
                 "waited_sec": 0.0,
             }
+        gate = check_nightly_readiness(expected_trade_date=expected)
+        return {
+            "status": "ready" if gate.ready else "blocked",
+            "allowed": bool(gate.ready),
+            "reason": gate.reason,
+            "expected_trade_date": gate.expected_trade_date,
+            "payload": gate.payload,
+            "waited_sec": 0.0,
+        }
 
-        wait_sec = self._cfg_int("night_scan_readiness_wait_sec", 900)
-        poll_sec = max(1, self._cfg_int("night_scan_readiness_poll_sec", 15))
-        started = monotonic()
-        last_gate = check_nightly_readiness(expected_trade_date=expected)
-        while not last_gate.ready and monotonic() - started < wait_sec:
-            sleep(min(poll_sec, max(0.0, wait_sec - (monotonic() - started))))
-            last_gate = check_nightly_readiness(expected_trade_date=expected)
-        waited = round(max(0.0, monotonic() - started), 3)
-        if not last_gate.ready:
+    def _await_nightly_readiness(
+        self,
+        *,
+        wait_sec_override: int | None = None,
+    ) -> dict[str, object]:
+        """Wait for the updater readiness artifact when a real date is known."""
+        first = self.probe_nightly_readiness()
+        budget = (
+            max(0, int(wait_sec_override))
+            if wait_sec_override is not None
+            else self._cfg_int("night_scan_readiness_wait_sec", 900)
+        )
+        if first.get("status") in {"not_configured", "ready"} or budget <= 0:
+            if first.get("allowed"):
+                return first
             recorder = getattr(self._service, "_record_audit_event", None)
             if callable(recorder):
                 recorder(
@@ -1677,19 +1711,34 @@ class RuntimeWeek5AutomationService:
                     trace_id="week5-night-scan",
                     level="warn",
                     payload={
-                        "expected_trade_date": last_gate.expected_trade_date,
-                        "waited_sec": waited,
-                        "readiness": last_gate.payload,
+                        "expected_trade_date": first.get("expected_trade_date", ""),
+                        "waited_sec": 0.0,
+                        "readiness": first.get("payload", {}),
                     },
                 )
-        return {
-            "status": "ready" if last_gate.ready else "blocked",
-            "allowed": bool(last_gate.ready),
-            "reason": last_gate.reason,
-            "expected_trade_date": last_gate.expected_trade_date,
-            "payload": last_gate.payload,
-            "waited_sec": waited,
-        }
+            return first
+        expected = first.get("expected_trade_date", "")
+        poll_sec = max(1, self._cfg_int("night_scan_readiness_poll_sec", 15))
+        started = monotonic()
+        last = first
+        while not bool(last.get("allowed", False)) and monotonic() - started < budget:
+            sleep(min(poll_sec, max(0.0, budget - (monotonic() - started))))
+            last = self.probe_nightly_readiness()
+        waited = round(max(0.0, monotonic() - started), 3)
+        if not bool(last.get("allowed", False)):
+            recorder = getattr(self._service, "_record_audit_event", None)
+            if callable(recorder):
+                recorder(
+                    event_type="week5_night_scan_blocked_readiness",
+                    trace_id="week5-night-scan",
+                    level="warn",
+                    payload={
+                        "expected_trade_date": expected,
+                        "waited_sec": waited,
+                        "readiness": last.get("payload", {}),
+                    },
+                )
+        return {**last, "waited_sec": waited}
 
     def _resolve_current_data_version(self, now: datetime) -> str:
         explicit = getattr(self._service, "current_week5_data_version", "")

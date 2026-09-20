@@ -500,6 +500,30 @@ week5:
   empty_signal_drawdown_pct: 10
   empty_signal_no_buy_runs: 5
 
+# 正式晚间报告与飞书交付（2026-09-16 v2 方案）。enabled 默认 false：关闭时
+# 调度注册、夜扫回调与通知路径全部保持旧行为。NAS 验收通过后再用
+# SA__NIGHTLY__ENABLED=true 显式开启（不要改本文件——它打进镜像且受跟踪，
+# 手工改会与 git pull 冲突且运行期不生效）。
+nightly:
+  enabled: false
+  display_top_k: 5
+  target_time: "22:30"
+  last_scan_start_time: "23:00"
+  deadline_time: "23:30"
+  scan_check_interval_minutes: 5
+  max_scan_attempts: 2
+  delivery_interval_minutes: 1
+  max_delivery_targets_per_tick: 2
+  retry_delays_sec: [60, 300, 900]
+  max_delivery_attempts: 4
+  unknown_retry_window_sec: 3000
+  request_timeout_sec: 20
+  message_max_chars: 3000
+  reports_root: artifacts/runtime/nightly_reports
+  delivery_root: artifacts/runtime/nightly_delivery
+  recovery_lookback_days: 2
+  attempt_history_limit: 20
+
 holiday_risk:
   pre_holiday_reduce_days: 3
   max_position_multiplier: 0.5
@@ -781,6 +805,10 @@ training:
   artifact_path: "artifacts/model_v1.json"
   # 内容寻址 bundle 归档根目录（训练产物只进这里，别名仅由发布流程切换）
   model_archive_dir: "artifacts/model_archive"
+  # S05：retention_count 是保留下限（最新 N 个永不删）；容量由 max_bytes 管理，
+  # 超预算删最旧的但绝不低于下限。在服身份写在 serving_manifest_path（独立真相源）。
+  model_archive_max_bytes: 2147483648
+  serving_manifest_path: "artifacts/model_serving_manifest.json"
   model_archive_retention_count: 5
   # 晋级硬门：完整 test split 去重交易日下限（P1-b）
   min_test_trade_dates: 20
@@ -1172,3 +1200,28 @@ param_freeze:
     - "/learning/models/release/confirmation/watchdog"
   frozen_queries:
     - "execution_mode_set"
+
+# ---------------------------------------------------------------------------
+# Alpha V2（P0-00）：独立 Feature Flag 块。
+# 与 Legacy 参数完全分离：本块任何取值都不得改变 week5/models/notify 链路行为。
+# enabled=false（默认）时 V2 代码路径不执行、不写 artifacts/alpha_v2。
+#
+# 三个开关的合法组合（fail-closed 校验，见 config.AlphaV2Config）：
+#   enabled=false, shadow_only=true,  enforce_final_selection=false  # 当前默认
+#   enabled=true,  shadow_only=true,  enforce_final_selection=false  # Shadow 期
+#   enabled=true,  shadow_only=false, enforce_final_selection=true   # 接管正式选股
+# 非法组合（加载期直接报错）：enforce=true 而 enabled=false；enforce=true 而
+# shadow_only=true。其余字段只做闭集/正数校验，消费者由 P0-03/P0-05 实现。
+#
+# NAS 开启 Shadow：SA__ALPHA_V2__ENABLED=true（不改本文件）。
+# ---------------------------------------------------------------------------
+alpha_v2:
+  enabled: false
+  shadow_only: true
+  enforce_final_selection: false
+  artifact_root: "artifacts/alpha_v2"
+  selection_contract: "night_alpha_v2_v1"
+  model_resolver_mode: pit_research   # pit_research | strict_production_replay
+  entry_mode: next_session_open       # next_session_open | next_tradable_open
+  primary_horizon_days: 5
+  candidate_output_top_k: 5

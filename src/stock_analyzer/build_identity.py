@@ -12,9 +12,18 @@ from typing import Any
 CONFIG_SCHEMA_VERSION = "stock-analyzer-config.v1"
 RUNTIME_STATE_SCHEMA_VERSION = 9
 
+# ``source`` 取该值表示"没读到任何清单文件、只能退回环境变量"——调用方若要求
+# "产物存在性即证据"，必须把它当成缺失，而不是当成一份清单。
+MANIFEST_SOURCE_ENVIRONMENT = "environment"
 
-def get_build_manifest() -> dict[str, object]:
-    for path in _manifest_candidates():
+
+def get_build_manifest(root: str | Path | None = None) -> dict[str, object]:
+    """读构建清单；``root`` 给出时优先在它下面找 ``build_manifest.json``。
+
+    ``root`` 是给"运行根不一定是 CWD"的调用方用的（M3 冻结/快照 CLI 显式传仓库根，
+    容器里就是 ``/app``）。不传时行为与旧版一致：环境变量 → ``/app`` → CWD。
+    """
+    for path in _manifest_candidates(root):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -34,9 +43,20 @@ def get_build_manifest() -> dict[str, object]:
     )
 
 
-def _manifest_candidates() -> list[Path]:
+__all__ = [
+    "CONFIG_SCHEMA_VERSION",
+    "MANIFEST_SOURCE_ENVIRONMENT",
+    "RUNTIME_STATE_SCHEMA_VERSION",
+    "generated_at_utc",
+    "get_build_manifest",
+]
+
+
+def _manifest_candidates(root: str | Path | None = None) -> list[Path]:
     configured = os.getenv("STOCK_ANALYZER_BUILD_MANIFEST", "").strip()
     candidates = [Path(configured)] if configured else []
+    if root is not None:
+        candidates.append(Path(root) / "build_manifest.json")
     candidates.extend([Path("/app/build_manifest.json"), Path("build_manifest.json")])
     return candidates
 

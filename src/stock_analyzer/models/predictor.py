@@ -94,12 +94,50 @@ class SignalPredictor:
     meta_weights: dict[str, float] = field(default_factory=lambda: {"lgbm": 0.5, "xgb": 0.5})
     artifact_metadata: dict[str, object] = field(default_factory=dict)
     label_policy_id: str = ""
+    # S01 身份事实：这些字段直接来自加载的 ModelArtifact，是"报告必须报告谁"的唯一真相源。
+    # 之所以在 predictor 上再存一份（而不是每次回读文件头），是为了让身份报告不依赖
+    # 磁盘 IO——工件在加载后被换掉时，报告仍描述**本进程真正加载的那一份**，
+    # 而不一致会由 artifact_content_hash 与盖章哈希的比对暴露出来。
+    artifact_created_at: str = ""
+    feature_schema_id: str = ""
+    feature_schema_hash: str = ""
+    label_policy_hash: str = ""
+    dataset_manifest_id: str = ""
+    artifact_path_requested: str = ""
 
     @property
     def output_semantics(self) -> str | None:
         """本工件输出语义（未登记契约返回 None，详情见 ``output_semantics_report``）。"""
 
         return _resolve_artifact_semantics(self.label_policy_id)[0]
+
+    def model_identity_facts(self) -> dict[str, object]:
+        """工件身份**事实**（S01）：实际加载路径、实算内容哈希、工件自述契约。
+
+        registry 的登记值与 bootstrap 运行时状态都属于"补充"，只能由调用方在
+        fact 之外另行合并（``models/identity.build_model_identity_report``），
+        不得覆盖这里的任何字段。
+        """
+        return {
+            "artifact_uri": str(self.artifact_metadata.get("artifact_uri", "")),
+            "artifact_exists": True,
+            "artifact_content_hash": str(
+                self.artifact_metadata.get("artifact_content_hash", "")
+            ),
+            "artifact_created_at": self.artifact_created_at,
+            "feature_schema_id": self.feature_schema_id,
+            "feature_schema_hash": self.feature_schema_hash,
+            "label_policy_id": self.label_policy_id,
+            "label_policy_hash": self.label_policy_hash,
+            "dataset_manifest_id": self.dataset_manifest_id,
+            "artifact_path_requested": self.artifact_path_requested,
+            "claimed_content_hash": str(self.artifact_metadata.get("bundle_content_hash", "")),
+            "predictor_loaded": True,
+            "output_semantics": self.output_semantics or "",
+            "inference_allowed": not bool(self.inference_blocked_reason()),
+            "inference_blocked_reason": self.inference_blocked_reason(),
+            "load_error": "",
+        }
 
     def output_semantics_report(self) -> dict[str, object]:
         """语义 + 未登记原因，供概率健康/审计字段落痕（C2）。"""
@@ -129,6 +167,11 @@ class SignalPredictor:
             meta_weights=meta_weights,
             artifact_metadata=dict(artifact.metadata),
             label_policy_id=str(artifact.label_policy_id),
+            artifact_created_at=str(artifact.created_at),
+            feature_schema_id=str(artifact.feature_schema_id),
+            feature_schema_hash=str(artifact.feature_schema_hash),
+            label_policy_hash=str(artifact.label_policy_hash),
+            dataset_manifest_id=str(artifact.dataset_manifest_id),
         )
 
     @classmethod
@@ -147,6 +190,7 @@ class SignalPredictor:
         artifact = ModelArtifact.load(artifact_path)
         predictor = cls.from_artifact(artifact, artifact_root=artifact_path.parent)
         predictor.artifact_metadata["artifact_uri"] = str(artifact_path)
+        predictor.artifact_path_requested = str(path)
         try:
             predictor.artifact_metadata["artifact_content_hash"] = compute_artifact_identity_hash(
                 artifact_path

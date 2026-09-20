@@ -33,12 +33,20 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import pandas as pd
 
+from stock_analyzer.contracts.alpha_v2 import resolve_selection_contract
+from stock_analyzer.data.asof_universe import (
+    DEFAULT_EXPECTED_ACTIVE_LOOKBACK_DAYS,
+    build_pit_stats,
+    history_window_days,
+    resolve_asof_universe,
+)
 from stock_analyzer.feature.snapshot import (
     SNAPSHOT_FILENAME,
     FeatureSnapshotManifest,
     build_feature_snapshot,
     snapshot_is_current,
 )
+from stock_analyzer.risk.overextension import EVALUATION_INSUFFICIENT_INPUT
 from stock_analyzer.runtime.services.week5_service import (
     _as_float,
     _as_int,
@@ -83,19 +91,74 @@ class Week5AccountState:
 
 @dataclass(slots=True)
 class Week5ModelInfo:
-    """本轮使用的模型/代码/配置身份（历史回测的可复现性标注）。"""
+    """本轮使用的模型/代码/配置身份（历史回测的可复现性标注）。
+
+    S01 起本结构区分**事实**与**补充**（见 ``models/identity.py``）：
+
+    - 事实（``artifact_*`` / ``feature_schema_*`` / ``label_policy_*``）：来自实际加载
+      的工件；
+    - 补充（``model_id`` 的 registry 来源、``registry_*``、
+      ``bootstrap_last_bootstrap_at``）：只做标注，**不得覆盖事实**。
+
+    ``trained_at`` 语义在 S01 收紧为"实际加载工件的 created_at"
+    （``trained_at_source = artifact_created_at``）。此前实现会在找不到 champion 时把
+    bootstrap 的 ``last_bootstrap_at`` 当训练时间报出去，于是报告写 2026-09-15、实际
+    加载的是 2026-08-16 的工件（蓝图 §2.9）；bootstrap 时间现在单独放在
+    ``bootstrap_last_bootstrap_at``，不再冒充模型身份。
+    """
 
     model_id: str = ""
     trained_at: str = ""
     code_commit: str = ""
     config_hash: str = ""
+    # --- S01：真实模型身份链 ---
+    trained_at_source: str = ""  # artifact_created_at | unavailable
+    artifact_path: str = ""
+    artifact_content_hash: str = ""
+    artifact_created_at: str = ""
+    feature_schema_id: str = ""
+    feature_schema_hash: str = ""
+    label_policy_id: str = ""
+    label_policy_hash: str = ""
+    dataset_manifest_id: str = ""
+    score_source: str = ""
+    output_semantics: str = ""
+    identity_status: str = ""
+    identity_detail: str = ""
+    identity_verified: bool = False
+    research_fail_closed: bool = False
+    content_hash_verified: bool | None = None
+    registry_model_id: str = ""
+    registry_content_hash: str = ""
+    registry_error: str = ""
+    bootstrap_last_bootstrap_at: str = ""
 
-    def to_payload(self) -> dict[str, str]:
+    def to_payload(self) -> dict[str, object]:
         return {
             "model_id": self.model_id,
             "trained_at": self.trained_at,
             "code_commit": self.code_commit,
             "config_hash": self.config_hash,
+            "trained_at_source": self.trained_at_source,
+            "artifact_path": self.artifact_path,
+            "artifact_content_hash": self.artifact_content_hash,
+            "artifact_created_at": self.artifact_created_at,
+            "feature_schema_id": self.feature_schema_id,
+            "feature_schema_hash": self.feature_schema_hash,
+            "label_policy_id": self.label_policy_id,
+            "label_policy_hash": self.label_policy_hash,
+            "dataset_manifest_id": self.dataset_manifest_id,
+            "score_source": self.score_source,
+            "output_semantics": self.output_semantics,
+            "identity_status": self.identity_status,
+            "identity_detail": self.identity_detail,
+            "identity_verified": self.identity_verified,
+            "research_fail_closed": self.research_fail_closed,
+            "content_hash_verified": self.content_hash_verified,
+            "registry_model_id": self.registry_model_id,
+            "registry_content_hash": self.registry_content_hash,
+            "registry_error": self.registry_error,
+            "bootstrap_last_bootstrap_at": self.bootstrap_last_bootstrap_at,
         }
 
 
@@ -342,6 +405,21 @@ class Week5EngineBackend(Protocol):
     def runtime_source_mode(self) -> str: ...
 
 
+def _contract_profile(context: Week5RunContext) -> str:
+    """契约解析用的 profile：历史上下文未显式指定时按 night-equivalent 处理。
+
+    S04 的教训是"历史回测悄悄落到 legacy 目标（100/100/20）"——那会让历史与生产
+    不可比。历史 mode 的语义就是"重放生产夜扫"，因此缺省即 night-equivalent；
+    live 缺省仍为 "default"（不改变生产既有口径）。
+    """
+    profile = str(context.scan_profile or "").strip()
+    if profile:
+        return profile
+    if str(context.mode or "").strip() == "historical":
+        return "historical_night_equivalent"
+    return "default"
+
+
 class Week5SelectionEngine:
     """共享漏斗编排器：一次 run() 产出一份完整 Week5 扫描报告。"""
 
@@ -357,6 +435,10 @@ class Week5SelectionEngine:
         self._policy = policy
         self._config = context.config if context.config is not None else backend.config
         self._historical = policy.mode == "historical"
+        # S04：运行期契约在 run() 里解析；默认值只在 run() 之前被读取时兜底。
+        self._run_contract = resolve_selection_contract(
+            self._config, profile=_contract_profile(context),
+        )
 
     # ------------------------------------------------------------------
     # 主流程
@@ -366,6 +448,11 @@ class Week5SelectionEngine:
         config = self._config
         backend = self._backend
         now = ctx.now
+        # S04：一次运行绑定一个 SelectionContract（profile → 目标 + final_cap），
+        # 生产夜扫与历史 night-equivalent 必须拿到同一个 contract_id 与 300/100/50。
+        scan_profile_name = ctx.scan_profile.strip() or "default"
+        contract = resolve_selection_contract(config, profile=_contract_profile(ctx))
+        self._run_contract = contract
         quality_selection_ms = 0
         light_stage_ms = 0
         deep_stage_ms = 0
@@ -384,11 +471,13 @@ class Week5SelectionEngine:
             latest_trade_date=str(snapshot_manifest.trade_date) if snapshot_manifest else "",
         )
         gate_status = str(data_gate.get("status", "ok"))
+        # S04：deep 目标默认取本次运行契约（夜扫/night-equivalent = 50），
+        # 显式 override 仍然优先（生产夜间扫描就是把契约值当 override 传进来的）。
         deep_candidate_target = max(
             1,
             _resolve_positive_int(
                 ctx.deep_candidate_target_override,
-                fallback=_as_int(config.week5.deep_candidate_target, default=20),
+                fallback=contract.deep_target,
             ),
         )
         intraday_scheduler_mode = (
@@ -614,7 +703,6 @@ class Week5SelectionEngine:
             )
             gate_status = str(data_gate.get("status", "ok"))
 
-        scan_profile_name = ctx.scan_profile.strip() or "default"
         if scan_profile_name in ("offhours_friday_full_deep", "offhours_weekend_full_deep"):
             funnel_policy = "intentional_full_deep"
         elif should_scan_universe:
@@ -675,7 +763,7 @@ class Week5SelectionEngine:
                 return blocked_payload
             if snapshot_mode:
                 light_started = perf_counter()
-                light_target = max(1, int(config.week5.light_candidate_target))
+                light_target = max(1, int(contract.light_target))
                 allowed_exchanges_for_light = {
                     str(item).strip().upper()
                     for item in config.evolution.universe_spec.board_scope
@@ -1131,8 +1219,12 @@ class Week5SelectionEngine:
                 "level": "none",
                 "penalty": 0.0,
                 "reject_new_buy": False,
-                "reasons": [],
+                "reasons": ["insufficient_input"],
                 "metrics": {},
+                # 拿不到 bars 就是"没评估"，不是"没有风险"：默认值必须带
+                # insufficient_input，否则最终买入准入会把缺评估的候选放行。
+                "evaluation_status": EVALUATION_INSUFFICIENT_INPUT,
+                "missing_inputs": ["bars"],
             }
             board_decision: dict[str, object] = {
                 "consecutive_limit_up": 0,
@@ -1430,7 +1522,10 @@ class Week5SelectionEngine:
             },
             "funnel": {
                 **funnel_report,
-                "light_candidate_target": max(1, int(config.week5.light_candidate_target)),
+                # S04：契约块（id + 三个目标 + cap + allow_zero）必须原样落报告，
+                # 生产夜扫与历史 night-equivalent 靠它证明"同口径"。
+                "selection_contract": contract.to_payload(),
+                "light_candidate_target": max(1, int(contract.light_target)),
                 "deep_candidate_target": deep_candidate_target,
                 "final_signal_cap": max(0, int(config.week5.final_signal_cap)),
                 "allow_zero_signal": bool(config.week5.allow_zero_signal),
@@ -1653,21 +1748,46 @@ class Week5SelectionEngine:
                 if normalized
             ]
         )
-        # as-of 有效性：批量取 lookback=1 的"最近一根"（≤ as_of），只保留
-        # 截止 as_of 仍有数据、且最近数据在 staleness 窗口内的 symbol。
-        # 未来上市（as_of 前无任何数据）与 as_of 前已退市（数据早已停更）
-        # 都在这一步被剔除，不依赖当前退市名单。
+        # as-of 有效性（S03）：用 PIT resolver 生成"当时可观测"的历史股票池，
+        # 而不是拿完整 provider 索引 + 单一 staleness 阈值当股票池。
+        # 未来上市（≤ as_of 无任何 bar）在这里被硬排除；停牌（eligible 但最近
+        # 窗口无 bar）单列且不进 coverage 分母；数据源无法证明退市覆盖时
+        # survivorship_coverage 如实标 incomplete_or_unknown。
         max_staleness_days = max(
             0, _as_int(config.week5.universe_quality_max_staleness_days, default=10)
         )
+        min_history_days = max(
+            1, _as_int(config.week5.universe_quality_min_history_days, default=60)
+        )
+        lookback_days = DEFAULT_EXPECTED_ACTIVE_LOOKBACK_DAYS
+        probe_window_days = history_window_days(
+            min_history_days=min_history_days, lookback_days=lookback_days
+        )
         valid_symbols: list[str] = []
         batch_error = ""
+        universe_snapshot = None
         try:
             probe = provider.fetch_universe_quality_metrics(
                 symbols=index_symbols,
-                lookback_days=1,
+                lookback_days=probe_window_days,
                 end_date=ctx.as_of,
             )
+            pit_stats = build_pit_stats(
+                metrics=probe if isinstance(probe, pd.DataFrame) else pd.DataFrame(),
+                as_of=ctx.as_of,
+                lookback_days=lookback_days,
+                history_window_days=probe_window_days,
+            )
+            universe_snapshot = resolve_asof_universe(
+                as_of=ctx.as_of,
+                index_symbols=index_symbols,
+                stats=pit_stats,
+                min_history_days=min_history_days,
+                expected_active_lookback_days=lookback_days,
+            )
+            # 外层 staleness 门仍保留（数据停更 > N 天不得入选），与 PIT 判定叠加：
+            # 两者都过才进质量选择（fail-closed 取交集，不放宽任何一条）。
+            expected_active = set(universe_snapshot.expected_active_symbols)
             if isinstance(probe, pd.DataFrame) and not probe.empty:
                 dates = pd.to_datetime(probe["date"], errors="coerce")
                 probe = probe.assign(_date=dates).dropna(subset=["_date"])
@@ -1676,16 +1796,16 @@ class Week5SelectionEngine:
                     probe["symbol"].astype(str), probe["_date"], strict=True
                 ):
                     normalized = _normalize_a_share_symbol(symbol_value)
-                    if not normalized:
+                    if not normalized or normalized not in expected_active:
                         continue
                     if (as_of_ts - row_date).days <= max_staleness_days:
                         valid_symbols.append(normalized)
         except Exception as exc:  # noqa: BLE001 - 股票池解析失败降级为空池 + 报告
             batch_error = f"{type(exc).__name__}: {exc}"
         valid_symbols = _dedupe_preserve_order(sorted(valid_symbols))
-        quality_target = max(
-            1, _as_int(config.week5.universe_quality_target_size, default=300)
-        )
+        # S04：质量池目标取本次运行契约（夜扫/night-equivalent = 300），
+        # 不再固定读 universe_quality_target_size（历史曾经因此是 100）。
+        quality_target = max(1, int(self._run_contract.quality_target))
         quality_selection_report: dict[str, object] | None = None
         selected = valid_symbols
         selector_error = ""
@@ -1727,6 +1847,11 @@ class Week5SelectionEngine:
                 "max_staleness_days": max_staleness_days,
                 "batch_error": batch_error,
                 "quality_target": quality_target,
+                # S03：PIT 股票池快照（universe_snapshot_id / counts / coverage /
+                # 排除原因分布），供报告与研究侧核对"当时到底可选哪些票"。
+                "universe_snapshot": (
+                    universe_snapshot.to_payload() if universe_snapshot is not None else {}
+                ),
             },
         }
 
@@ -1764,7 +1889,23 @@ class Week5SelectionEngine:
         return covered / max(1, len(symbols))
 
     def _historical_market_breadth(self, *, now: datetime) -> tuple[dict[str, object], float]:
-        """从 as-of 日线现算历史市场广度（不读生产 market_breadth.json）。"""
+        """从 as-of 日线现算历史市场广度（不读生产 market_breadth.json）。
+
+        覆盖率边缘修正（2026-09-17）：``build_breadth_snapshot`` 规定
+        ``coverage_ok = coverage_ratio >= 0.95``，而 ``coverage_ratio`` 的分母是
+        ``list_symbols()`` 返回的**全索引**（含当日停牌/未上市的非交易标的），
+        因此真实覆盖率天然停在 95% 附近抖动——实测 2026-09-01 为 0.9501（通过）、
+        2026-09-16 为 0.9489（不通过），**万分之十二的差异决定整个市场能否开仓**。
+        一旦落入不通过分支，``breadth_usage_policy`` 判 ``breadth_score_unavailable``
+        并禁止新开仓，终门即把当天全部候选拒掉（历史链路 2026-09-04 起连续 9 个
+        交易日因此 0 票），这不是风控判断而是阈值噪声。
+
+        修正只作用于本历史分支：当评分被标记为不可用**但已算出正分数**时，退回
+        用同一个 ``market_breadth_disable_if_below`` 阈值对分数本身做判定——分数
+        仍然偏低时照旧禁止开仓（低分否决语义不变），只有分数达标才放行并在
+        reason 上留下 ``breadth_ok_low_coverage`` 标记。无分数（=真取不到数据）
+        与 live 路径一样按"广度不可用"处理，不阻断扫描。
+        """
         from stock_analyzer.ops.market_breadth import (
             breadth_usage_policy,
             compute_market_breadth_from_warehouse,
@@ -1786,13 +1927,24 @@ class Week5SelectionEngine:
             max_intraday_heartbeat_sec=48.0 * 3600.0,
         )
         stale_lift = float(_as_float(policy.get("trend_min_threshold_lift"), default=0.0))
+        reason = str(policy.get("reason", "breadth_ok"))
+        block_new_buy = bool(policy.get("block_new_buy", False))
+        score_value = _as_float(policy.get("score"), default=0.0)
+        if block_new_buy and reason == "breadth_score_unavailable" and score_value > 0.0:
+            disable_below = float(self._config.week5.market_breadth_disable_if_below)
+            if score_value >= disable_below:
+                block_new_buy = False
+                reason = "breadth_ok_low_coverage"
         meta: dict[str, object] = {
             "enabled": True,
-            "block_new_buy": bool(policy.get("block_new_buy", False)),
-            "reason": str(policy.get("reason", "breadth_ok")),
+            "block_new_buy": block_new_buy,
+            "reason": reason,
             "score": policy.get("score"),
             "trend_min_threshold_lift": round(stale_lift, 4),
             "source": "historical_recompute",
+            # 覆盖率进 meta 是为了让"为什么判不可用"在回测载荷里可见：此前该值
+            # 只存在于函数内部，排查时无法从产物里复核。
+            "coverage_ratio": snapshot.get("coverage_ratio"),
         }
         return meta, stale_lift
 

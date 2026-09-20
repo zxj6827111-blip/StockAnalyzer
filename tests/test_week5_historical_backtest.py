@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -486,7 +487,12 @@ class _StubBackend:
 
 
 class _FakeUniverseProvider:
-    """as-of 上下文用：索引 + 批量质量 + 日线（全部受 end_date 限制）。"""
+    """as-of 上下文用：索引 + 批量质量 + 日线（全部受 end_date 限制）。
+
+    S03 起批量探针必须给出**一段窗口**的 bar（真实 provider 的行为），否则 PIT
+    股票池会正确地判定"窗口内历史不足"而拒绝全部标的。这里按 ``lookback_days``
+    生成截止 ``end_date`` 的连续交易日 bar。
+    """
 
     def __init__(self, symbols: list[str]) -> None:
         self._symbols = list(symbols)
@@ -505,13 +511,13 @@ class _FakeUniverseProvider:
         self.batch_calls.append(
             {"symbols": list(symbols), "lookback_days": lookback_days, "end_date": end_date}
         )
+        effective_end = end_date or AS_OF
+        sessions = max(1, int(lookback_days))
+        dates = pd.bdate_range(end=pd.Timestamp(effective_end), periods=sessions)
         rows = [
-            {
-                "symbol": symbol,
-                "date": pd.Timestamp(AS_OF),
-                "close": 10.0,
-            }
+            {"symbol": symbol, "date": timestamp, "close": 10.0}
             for symbol in symbols
+            for timestamp in dates
         ]
         return pd.DataFrame(rows)
 
@@ -540,6 +546,89 @@ def _historical_config(tmp_path: Path) -> StockAnalyzerConfig:
     config.evolution.news_risk_mode = "off"
     return config
 
+
+class _InMemoryRegistry:
+    """进程内 registry 桩：只提供读接口（S06 闸门需要），**不碰共享 DuckDB**。
+
+    背景（2026-09-18 实测）：conftest 把 ``bootstrap_state_path`` 指向一个所有 xdist
+    worker 共享的临时文件，而 registry 库是它同目录的 ``learning_protocol.duckdb``。
+    若测试夹具往这个共享库里写模型，多 worker 并发时会撞 DuckDB 锁 → 闸门读不到候选
+    → 历史重放被判 unscorable → 测试**间歇性失败**。进程内桩同时消除了写竞争与
+    跨测试耦合，且仍能真实覆盖"有 PIT 合法登记"的路径。
+    """
+
+    def __init__(self, records: list[object] | None = None) -> None:
+        self._records = list(records or [])
+
+    def active_champion(self, *, suppress_read_errors: bool = False) -> object | None:
+        _ = suppress_read_errors
+        return None
+
+    def list_records(
+        self, *, limit: int | None = None, suppress_read_errors: bool = False
+    ) -> list[object]:
+        _ = (limit, suppress_read_errors)
+        return list(self._records)
+
+    def get_by_id(self, model_id: str, *, suppress_read_errors: bool = False) -> object | None:
+        _ = suppress_read_errors
+        return next(
+            (item for item in self._records if getattr(item, "model_id", "") == model_id), None
+        )
+
+    def register_artifact(self, **kwargs: object) -> object:
+        raise AssertionError("测试夹具不得写共享 registry 库")
+
+
+class _RegistryRecord:
+    def __init__(self, **kwargs: object) -> None:
+        self.__dict__.update(kwargs)
+
+
+def _register_pit_model(
+    service: object, *, tmp_path: Path, created_at: str = "2026-05-01T10:00:00"
+) -> str:
+    """给 service 注入"as_of 之前就存在"的合法模型登记（S06 时间闸门需要）。
+
+    两条硬约束（都是本轮实测教训）：
+    1. 只写进程内桩，**不写共享 DuckDB**（否则多 xdist worker 撞锁 → 间歇失败）；
+    2. 工件必须**真的可加载**（ModelTrainer 产出）：B1 起解析结果会被绑到实际加载
+       路径，手写的最小 JSON 过不了适配器反序列化 → 会被正确地判 unscorable。
+    """
+    import json as _json
+
+    from stock_analyzer.data.provider import SyntheticProvider
+    from stock_analyzer.models.bundle import compute_artifact_identity_hash
+    from stock_analyzer.models.trainer import ModelTrainer
+
+    cfg = _load_test_config()
+    cfg.training.min_samples = 40
+    nonce = uuid.uuid4().hex
+    artifact_path = tmp_path / f"pit_model_{nonce}.json"
+    bars = SyntheticProvider(seed_offset=11).fetch_daily_bars("600000", lookback_days=300)
+    ModelTrainer(training=cfg.training, labels=cfg.labels).train_and_save(
+        bars=bars, output_path=str(artifact_path)
+    )
+    payload = _json.loads(artifact_path.read_text(encoding="utf-8"))
+    payload["created_at"] = created_at  # 模拟"训练发生在 as_of 之前"
+    artifact_path.write_text(_json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    model_id = f"model_pit_{nonce[:12]}"
+    record = _RegistryRecord(
+        model_id=model_id,
+        artifact_uri=str(artifact_path),
+        artifact_content_hash=compute_artifact_identity_hash(artifact_path),
+        artifact_created_at=datetime.fromisoformat(created_at),
+        feature_schema_id=str(payload.get("feature_schema_id", "")) or "fs_pit_v1",
+        feature_schema_hash=str(payload.get("feature_schema_hash", "")),
+        label_policy_id=str(payload.get("label_policy_id", "")),
+        label_policy_hash=str(payload.get("label_policy_hash", "")),
+        dataset_manifest_id=str(payload.get("dataset_manifest_id", "")),
+        lifecycle_state="trained",
+        promoted_at=None,
+    )
+    service._model_registry = _InMemoryRegistry([record])  # noqa: SLF001 - 测试夹具注入
+    return model_id
 
 def _historical_context(
     *,
@@ -622,6 +711,14 @@ def test_engine_historical_full_market_resolves_universe_with_end_date(tmp_path:
     assert prefilter["historical_universe"]["provider_index_count"] == len(symbols)
     assert prefilter["historical_universe"]["as_of_valid_count"] == len(symbols)
     assert prefilter["historical_universe"]["selected_count"] == 3
+    # S03：报告必须带 PIT 股票池快照（可复现 id + 分母口径 + 覆盖度如实标注）
+    snapshot = prefilter["historical_universe"]["universe_snapshot"]
+    assert str(snapshot["universe_snapshot_id"]).startswith("asofuniv_")
+    assert snapshot["as_of"] == AS_OF.isoformat()
+    assert snapshot["eligible_count"] == len(symbols)
+    assert snapshot["expected_active_count"] == len(symbols)
+    assert snapshot["coverage_denominator"] == "expected_active"
+    assert snapshot["survivorship_coverage"] == "incomplete_or_unknown"
     # 质量选择收到 as_of end_date + 任务独立 selection snapshot 路径
     assert backend.quality_selection_kwargs, "quality selection should be invoked"
     kwargs = backend.quality_selection_kwargs[0]
@@ -768,6 +865,7 @@ def test_week5_historical_day_end_to_end_full_funnel_with_isolation(tmp_path: Pa
     config.evolution.news_risk_mode = "penalty"
     service = _new_service(config, provider=SyntheticProvider(seed_offset=17))
     service.state.watchlist = ["600999"]
+    _register_pit_model(service, tmp_path=tmp_path)
 
     symbols = ["600000", "000001", "600519"]
     provider = _FakeHistoricalProvider(symbols, data_end=AS_OF)
@@ -819,6 +917,7 @@ def test_week5_historical_day_explicit_pool_marks_manual_source(tmp_path: Path) 
     config.week5.auto_sync_watchlist = False
     config.week5.market_breadth_enabled = False
     service = _new_service(config, provider=SyntheticProvider(seed_offset=19))
+    _register_pit_model(service, tmp_path=tmp_path)
 
     provider = _FakeHistoricalProvider(["600000", "000001"], data_end=AS_OF)
     task_dir = tmp_path / "week5_task_explicit"
@@ -929,16 +1028,34 @@ def test_api_week5_daily_end_to_end_full_market(
             "final_signal_cap": 2,
             "market_breadth_enabled": False,
             "auto_sync_watchlist": False,
+            # B2 盲区修复：端到端必须**真的产生候选**，否则 holding 段（滑点/入场口径）
+            # 根本不会被跑到——此前该夹具 final_count=0，服务层调用签名漂移长期隐身。
+            # 放宽终门与共识门只为让合成数据走到 final（夹具口径，不动生产配置）。
+            "final_signal_min_threshold": 0.0,
         }
+    )
+    cross_review = main_module._service._config.models.cross_review.model_copy(
+        update={
+            "p_lgbm_min": 0.0,
+            "p_xgb_min": 0.0,
+            "p_meta_min": 0.0,
+            "max_diff": 1.0,
+            "dynamic_enabled": False,
+        }
+    )
+    models = main_module._service._config.models.model_copy(
+        update={"cross_review": cross_review}
     )
     patched_asof = main_module._service._config.asof_backtest.model_copy(
         update={"output_dir": str(output_dir)}
     )
     patched_config = main_module._service._config.model_copy(
-        update={"asof_backtest": patched_asof, "week5": week5}
+        update={"asof_backtest": patched_asof, "week5": week5, "models": models}
     )
     monkeypatch.setattr(main_module, "_config", patched_config)
     monkeypatch.setattr(main_module._service, "_config", patched_config)
+    # S06 时间闸门：历史重放需要 as_of 之前就存在的合法模型登记
+    _register_pit_model(main_module._service, tmp_path=tmp_path)
     monkeypatch.setattr(
         main_module._service,
         "_asof_backtest_service",
@@ -1009,7 +1126,320 @@ def test_api_week5_daily_end_to_end_full_market(
         "holding_curve",
         "historical_context",
     }
-    assert entry["holding_curve"] is not None or entry["candidate_count"] == 0
+    # B2 回归堵漏：候选非空时必须真的跑出 holding 段（此前该断言允许
+    # holding_curve=None，服务层 slippage_ratio 传参错误因此长期隐身）。
+    assert entry["funnel"]["final_count"] > 0, (
+        "端到端夹具必须产生候选，否则 holding 段断言是空的（B2 盲区）"
+    )
+    if entry["candidate_count"] > 0:
+        holding = entry["holding_curve"]
+        assert holding is not None, "有候选却没有 holding 段（服务层调用签名漂移）"
+        assert holding["results"], "holding 段为空"
+        for item in holding["results"]:
+            assert item["entry_mode"] == "next_session_open"
+            assert item["entry_slippage"] >= 0.0
+    else:
+        assert entry["holding_curve"] is None
     # latest 落盘且带算法标注
     latest = client.get("/backtest/asof-scan/latest").json()["report"]
     assert latest["algorithm"] == "week5_daily"
+
+
+# ---------------------------------------------------------------------------
+# Part E：历史广度门的覆盖率边缘（2026-09-17 修复回归）
+#
+# 实测口径：list_symbols() 返回全索引 5833，其中约 5% 是当日停牌/未上市的非交易
+# 标的，真实覆盖率天然停在 95% 门槛附近——2026-09-01 为 0.9501（通过）、
+# 2026-09-16 为 0.9489（不通过）。落入不通过分支时旧实现直接禁止新开仓，终门把
+# 当天 100 个候选全拒（2026-09-04 起连续 9 个交易日 0 票）。
+# ---------------------------------------------------------------------------
+
+_BREADTH_NOW = datetime(2026, 9, 16, 15, 30)
+
+
+def _breadth_snapshot(
+    *,
+    coverage_ratio: float,
+    advancers: int,
+    decliners: int,
+    limit_up_count: int,
+    limit_down_count: int,
+    median_return: float,
+    new_highs_20d: int,
+    new_lows_20d: int,
+    turnover_change_pct: float,
+    total_symbols: int = 5535,
+) -> dict[str, Any]:
+    from stock_analyzer.ops.market_breadth import build_breadth_snapshot
+
+    return build_breadth_snapshot(
+        advancers=advancers,
+        decliners=decliners,
+        limit_up_count=limit_up_count,
+        limit_down_count=limit_down_count,
+        median_return=median_return,
+        new_highs_20d=new_highs_20d,
+        new_lows_20d=new_lows_20d,
+        turnover_change_pct=turnover_change_pct,
+        total_symbols=total_symbols,
+        coverage_ratio=coverage_ratio,
+        as_of=_BREADTH_NOW,
+        source="warehouse_daily",
+        freshness={"date_max": "2026-09-16"},
+    )
+
+
+def _healthy_breadth(*, coverage_ratio: float) -> dict[str, Any]:
+    return _breadth_snapshot(
+        coverage_ratio=coverage_ratio,
+        advancers=3200,
+        decliners=1800,
+        limit_up_count=80,
+        limit_down_count=10,
+        median_return=0.004,
+        new_highs_20d=300,
+        new_lows_20d=80,
+        turnover_change_pct=0.05,
+    )
+
+
+def _weak_breadth(*, coverage_ratio: float) -> dict[str, Any]:
+    return _breadth_snapshot(
+        coverage_ratio=coverage_ratio,
+        advancers=300,
+        decliners=4700,
+        limit_up_count=2,
+        limit_down_count=150,
+        median_return=-0.03,
+        new_highs_20d=20,
+        new_lows_20d=900,
+        turnover_change_pct=-0.3,
+    )
+
+
+def _breadth_engine(
+    *,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    snapshot: Any,
+    symbols: list[str] | None = None,
+) -> tuple[Week5SelectionEngine, StockAnalyzerConfig]:
+    config = _historical_config(tmp_path)
+    config.week5.market_breadth_enabled = True
+    monkeypatch.setattr(
+        "stock_analyzer.ops.market_breadth.compute_market_breadth_from_warehouse",
+        lambda *args, **kwargs: snapshot,
+    )
+    backend = _StubBackend(config, symbols=list(symbols or ["600000"]))
+    context = Week5RunContext(
+        mode="historical",
+        now=_BREADTH_NOW,
+        as_of=date(2026, 9, 16),
+        config=config,
+        provider=object(),
+        run_pipeline_fn=lambda **kwargs: backend.run_pipeline(**kwargs),
+        symbols=list(symbols or ["600000"]),
+        artifact_dir=tmp_path,
+    )
+    engine = Week5SelectionEngine(
+        backend=backend,
+        context=context,
+        policy=Week5RunPolicy.historical(),
+    )
+    return engine, config
+
+
+def _breadth_meta(engine: Week5SelectionEngine) -> dict[str, Any]:
+    meta, _lift = engine._historical_market_breadth(now=_BREADTH_NOW)  # noqa: SLF001
+    return meta
+
+
+def test_breadth_coverage_knife_edge_flips_availability() -> None:
+    """覆盖率卡在 0.95 门槛两侧时 available 翻转——这是被修的噪声源本身。"""
+    passed = _healthy_breadth(coverage_ratio=0.9501)
+    failed = _healthy_breadth(coverage_ratio=0.9489)
+    assert passed["coverage_ok"] is True
+    assert passed["score"]["available"] is True
+    assert failed["coverage_ok"] is False
+    assert failed["score"]["available"] is False
+    # 两次覆盖面只差万分之十二，分数完全相同：差异不来自市场本身
+    assert failed["score"]["value"] == pytest.approx(passed["score"]["value"])
+
+
+def test_historical_breadth_low_coverage_with_healthy_score_does_not_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """覆盖率不达标但分数健康：不得据此禁止整条买入路径。"""
+    snapshot = _healthy_breadth(coverage_ratio=0.9489)
+    engine, config = _breadth_engine(tmp_path=tmp_path, monkeypatch=monkeypatch, snapshot=snapshot)
+    assert snapshot["score"]["available"] is False
+    assert snapshot["score"]["value"] >= float(config.week5.market_breadth_disable_if_below)
+
+    meta = _breadth_meta(engine)
+
+    assert meta["block_new_buy"] is False
+    assert meta["reason"] == "breadth_ok_low_coverage"
+    assert meta["coverage_ratio"] == snapshot["coverage_ratio"]
+    assert meta["trend_min_threshold_lift"] == 0.0
+
+
+def test_historical_breadth_low_coverage_with_weak_score_still_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """覆盖率不达标且分数确实偏低：低分否决语义必须保留。"""
+    snapshot = _weak_breadth(coverage_ratio=0.9489)
+    engine, config = _breadth_engine(tmp_path=tmp_path, monkeypatch=monkeypatch, snapshot=snapshot)
+    assert snapshot["coverage_ok"] is False
+    assert snapshot["score"]["value"] < float(config.week5.market_breadth_disable_if_below)
+
+    meta = _breadth_meta(engine)
+
+    assert meta["block_new_buy"] is True
+    assert meta["reason"] == "breadth_score_unavailable"
+
+
+def test_historical_breadth_healthy_coverage_weak_score_still_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """反例：覆盖率完全正常时，低分否决不得被新分支改写。"""
+    snapshot = _weak_breadth(coverage_ratio=0.99)
+    engine, _config = _breadth_engine(tmp_path=tmp_path, monkeypatch=monkeypatch, snapshot=snapshot)
+    assert snapshot["coverage_ok"] is True
+
+    meta = _breadth_meta(engine)
+
+    assert meta["block_new_buy"] is True
+    assert meta["reason"] == "breadth_below_threshold"
+
+
+def test_historical_breadth_missing_score_still_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """反例：真取不到数据（分数为 0）时仍按不可用处理，不放行。"""
+    snapshot = _breadth_snapshot(
+        coverage_ratio=0.0,
+        advancers=0,
+        decliners=0,
+        limit_up_count=0,
+        limit_down_count=0,
+        median_return=0.0,
+        new_highs_20d=0,
+        new_lows_20d=0,
+        turnover_change_pct=0.0,
+        total_symbols=0,
+    )
+    engine, _config = _breadth_engine(tmp_path=tmp_path, monkeypatch=monkeypatch, snapshot=snapshot)
+    assert snapshot["score"]["value"] == 0.0
+
+    meta = _breadth_meta(engine)
+
+    assert meta["block_new_buy"] is True
+    assert meta["reason"] == "breadth_score_unavailable"
+
+
+def test_engine_historical_low_coverage_breadth_keeps_buy_path_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """端到端接线：低覆盖率+健康分数时，终门不得再挂 market_breadth_blocked。"""
+    engine, _config = _breadth_engine(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        snapshot=_healthy_breadth(coverage_ratio=0.9489),
+        symbols=["600000", "000001"],
+    )
+
+    report = engine.run()
+
+    assert report["market_breadth"]["block_new_buy"] is False
+    assert report["market_breadth"]["reason"] == "breadth_ok_low_coverage"
+    rejected_reasons = {
+        str(reason)
+        for item in report["funnel"]["final_selection"]["rejected"]
+        for reason in item.get("reject_reasons", [])
+    }
+    assert not any(reason.startswith("data_gate:market_breadth") for reason in rejected_reasons)
+
+
+# ---------------------------------------------------------------------------
+# B1 回归（runner 级）：as_of 之后创建的在服工件不得被历史重放加载
+# ---------------------------------------------------------------------------
+
+
+def test_runner_loads_resolved_pit_artifact_not_newer_serving_artifact(tmp_path: Path) -> None:
+    """对抗场景（Codex B1 复现路径）：config 指向比 as_of 更新的在服工件，
+    registry 里只有更早创建的 PIT 合法模型。
+
+    期望：重放加载 **resolved 的那份旧工件**（报告身份 = 旧工件哈希），
+    而不是 config 指向的新工件——即"解析过门"必须等价于"加载过门"。
+    """
+    from stock_analyzer.data.provider import SyntheticProvider
+    from stock_analyzer.models.bundle import compute_artifact_identity_hash
+    from stock_analyzer.models.trainer import ModelTrainer
+    from stock_analyzer.runtime.services.week5_historical_runner import run_week5_historical_day
+
+    def _train(name: str, created_at: str) -> Path:
+        import json as _json
+
+        cfg = _load_test_config()
+        cfg.training.min_samples = 40
+        path = tmp_path / name
+        bars = SyntheticProvider(seed_offset=13).fetch_daily_bars("600000", lookback_days=300)
+        ModelTrainer(training=cfg.training, labels=cfg.labels).train_and_save(
+            bars=bars, output_path=str(path)
+        )
+        payload = _json.loads(path.read_text(encoding="utf-8"))
+        payload["created_at"] = created_at
+        path.write_text(_json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        return path
+
+    pit_artifact = _train("pit_old.json", "2026-05-01T10:00:00")
+    newer_serving = _train("serving_new.json", "2026-09-15T10:00:00")  # AS_OF=2026-07-31 之后
+    pit_hash = compute_artifact_identity_hash(pit_artifact)
+    newer_hash = compute_artifact_identity_hash(newer_serving)
+    assert pit_hash != newer_hash
+
+    config = _load_test_config()
+    _enable_universe_quality_selector(config)
+    config.week5.feature_snapshot_root = str(tmp_path / "production_features_light")
+    config.week5.auto_sync_watchlist = False
+    config.week5.market_breadth_enabled = False
+    config.training.artifact_path = str(newer_serving)  # 在服工件比 as_of 新
+
+    service = _new_service(config, provider=SyntheticProvider(seed_offset=15))
+    service._model_registry = _InMemoryRegistry(  # noqa: SLF001 - 只登记的旧 PIT 模型
+        [
+            _RegistryRecord(
+                model_id="model_pit_old",
+                artifact_uri=str(pit_artifact),
+                artifact_content_hash=pit_hash,
+                artifact_created_at=datetime(2026, 5, 1, 10, 0),
+                feature_schema_id="fs_pit_v1",
+                feature_schema_hash="fs-hash",
+                label_policy_id="label_policy_v1_e2afc1135a3f",
+                label_policy_hash="label-hash",
+                dataset_manifest_id="dataset_manifest_pit",
+                lifecycle_state="trained",
+                promoted_at=None,
+            )
+        ]
+    )
+
+    task_dir = tmp_path / "week5_task_b1"
+    task_dir.mkdir(parents=True, exist_ok=True)
+    report = run_week5_historical_day(
+        service=service,
+        as_of=AS_OF,
+        task_dir=task_dir,
+        symbols=["600000", "000001"],
+        base_provider=_FakeHistoricalProvider(["600000", "000001"], data_end=AS_OF),
+    )
+
+    # 可评分（旧模型 PIT 合法）→ 实际加载的必须是旧工件
+    assert report.get("status") != "unscorable", report.get("model_resolution")
+    resolution = report["model_resolution"]
+    assert resolution["status"] == "resolved"
+    assert resolution["artifact_uri"] == str(pit_artifact)
+    model = report["historical_context"]["model"]
+    assert model["artifact_content_hash"] == pit_hash
+    assert model["artifact_content_hash"] != newer_hash
+    assert model["trained_at"] == "2026-05-01T10:00:00"

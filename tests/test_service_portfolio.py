@@ -2895,7 +2895,11 @@ def _final_selector_candidate(
     score: float = 85.0,
     overextension_reject: bool = False,
     board_reject: bool = False,
+    evaluation_status: str | None = "evaluated",
 ) -> dict[str, object]:
+    overextension: dict[str, object] = {"reject_new_buy": overextension_reject}
+    if evaluation_status is not None:
+        overextension["evaluation_status"] = evaluation_status
     return {
         "symbol": symbol,
         "score": score,
@@ -2904,10 +2908,60 @@ def _final_selector_candidate(
             "risk_gate": {"passed": True},
             "cross_review_gate": {"passed": True},
         },
-        "overextension": {"reject_new_buy": overextension_reject},
+        "overextension": overextension,
         "board_risk": {"reject_new_buy": board_reject},
         "reasons": [],
     }
+
+
+def _stub_news_gate(service: StockAnalyzerService) -> None:
+    _patch_attr(
+        service,
+        "_apply_news_risk_gate",
+        lambda **kwargs: {"action": "skipped", "penalty_amount": 0.0, "degraded": False},
+    )
+
+
+def test_final_selector_admits_a_fully_evaluated_clean_candidate() -> None:
+    """正对照：完整评估过、没有风险项的候选必须能入选——否则"输入不足"门
+    会把整条买入路径再次堵死，重演 P0 的另一种形态。"""
+    service = StockAnalyzerService(config=_load_test_config())
+    _stub_news_gate(service)
+    out = service._final_signal_selector(
+        signals=[_final_selector_candidate()],
+        data_gate_status="ok",
+    )
+    assert out["selected_count"] == 1
+    assert out["final_signals"][0]["symbol"] == "600000"
+
+
+def test_final_selector_rejects_insufficient_input_with_its_own_reason() -> None:
+    """缺输入必须按"输入不足"拒绝，且**不得**冒用"过热"这个原因。"""
+    service = StockAnalyzerService(config=_load_test_config())
+    _stub_news_gate(service)
+    out = service._final_signal_selector(
+        signals=[_final_selector_candidate(evaluation_status="insufficient_input")],
+        data_gate_status="ok",
+    )
+    assert out["selected_count"] == 0
+    rejected = out["rejected"][0]
+    assert "overextension_insufficient_input" in rejected["reject_reasons"]
+    assert "overextension_reject_new_buy" not in rejected["reject_reasons"]
+
+
+def test_final_selector_fails_closed_when_evaluation_status_is_absent() -> None:
+    """旧产物/旧报告缺该字段时不得当作"已完整评估"放行（fail-closed）。
+
+    缺字段也可能意味着"当时根本没跑风控"，默认放行等于把未知风险当无风险。
+    """
+    service = StockAnalyzerService(config=_load_test_config())
+    _stub_news_gate(service)
+    out = service._final_signal_selector(
+        signals=[_final_selector_candidate(evaluation_status=None)],
+        data_gate_status="ok",
+    )
+    assert out["selected_count"] == 0
+    assert "overextension_insufficient_input" in out["rejected"][0]["reject_reasons"]
 
 
 def test_final_selector_rejects_overextension_alone() -> None:

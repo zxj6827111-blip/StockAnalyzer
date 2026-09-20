@@ -28,7 +28,7 @@ intraday 降级（不得污染生产 fail-closed 语义）：
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date
@@ -175,6 +175,7 @@ def run_asof_scan(
     top_n: int | None = None,
     max_workers: int = MAX_SYMBOL_WORKERS,
     model_trained_at: str = "",
+    model_identity: Mapping[str, object] | None = None,
 ) -> AsofScanReport:
     """跑一次（或多个日期的）as-of 回溯选股扫描。
 
@@ -242,6 +243,11 @@ def run_asof_scan(
         "symbols_scanned": len(normalized_symbols),
         "dates_scanned": [d.isoformat() for d in normalized_dates],
     }
+    # S01：身份块由调用方按**实际加载工件**解析后传入（事实 + 判定状态）。
+    # 这里不再自行猜测模型身份；没有传入就只保留 model_trained_at 一个字段，
+    # 保持旧调用方行为不变。
+    if model_identity:
+        caveats["model_identity"] = dict(model_identity)
     return AsofScanReport(
         as_of_dates=normalized_dates,
         symbols_requested=normalized_symbols,

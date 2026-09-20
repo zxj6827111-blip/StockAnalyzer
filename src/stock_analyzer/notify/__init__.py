@@ -1,6 +1,9 @@
 """Notification channels."""
 
 from stock_analyzer.notify.channels import (
+    OUTCOME_ACCEPTED,
+    OUTCOME_FAILED,
+    OUTCOME_UNKNOWN,
     BroadcastNotifier,
     ConsoleNotifier,
     CustomWebhookNotifier,
@@ -14,12 +17,17 @@ from stock_analyzer.notify.channels import (
     Notifier,
     PushPlusNotifier,
     RequiredSuccessBroadcastNotifier,
+    TargetDeliveryOutcome,
     TelegramNotifier,
     WeComNotifier,
+    send_explicit,
 )
 from stock_analyzer.notify.filter import NotificationFilter
 
 __all__ = [
+    "OUTCOME_ACCEPTED",
+    "OUTCOME_FAILED",
+    "OUTCOME_UNKNOWN",
     "BroadcastNotifier",
     "ConsoleNotifier",
     "CustomWebhookNotifier",
@@ -34,6 +42,8 @@ __all__ = [
     "NotificationResult",
     "PushPlusNotifier",
     "RequiredSuccessBroadcastNotifier",
+    "TargetDeliveryOutcome",
     "TelegramNotifier",
     "WeComNotifier",
+    "send_explicit",
 ]
