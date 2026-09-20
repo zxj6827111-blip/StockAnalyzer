@@ -59,9 +59,10 @@ EXIT_IDENTITY_FREEZE = 5
 # 复刻这条覆盖，否则 freeze 会（正确地）停在 execution_price_mode 硬门 exit 4。
 PRODUCTION_ENV_OVERRIDES = {"SA__EVOLUTION__EXECUTION_SPEC__PRICE_SERIES_MODE": "raw"}
 
-# 冻结模型工件的最小骨架：validation freeze 只从 manifest 取身份与 feature schema
-# （真正逐文件校验发生在 capture 的 load_frozen_model，本 smoke 不伪造 booster）。
-REHEARSAL_FEATURE_COLUMNS = ["ret_1d", "ret_5d", "ma5", "ma20", "turnover_20d"]
+# 冻结模型工件必须**真实可加载**（R4.1.1 / 审稿 P2：生产 freeze 会用
+# ``load_frozen_model`` 校验逐文件哈希 + artifact_hash 复算——"骨架工件"不再是
+# 可放行的生产形态）。工件由最小合成矩阵经真实的 fit/persist 生产链产出。
+SMOKE_FEATURE_COLUMNS = ["ret_1d", "ret_5d", "ma5", "ma20", "volume_ratio_5", "turnover_zscore20"]
 
 
 def _git_head() -> str:
@@ -117,32 +118,57 @@ def _build_sandbox(root: Path, *, commit: str, dirty: bool = False) -> Path:
 
 
 def _write_rehearsal_model_artifact(artifacts_root: Path, *, commit: str) -> Path:
-    """最小冻结模型工件（只满足 validation freeze 的身份读取，不是可推理模型）。
+    """写一份**真实可加载**的微型冻结模型工件。
 
-    R4.1 起生产 freeze 要求工件的 ``code_commit`` 可证且等于运行身份，所以排演工件
-    也必须带上"由统一 resolver 得到的构建身份"——否则 smoke 会在训练身份硬门处停下。
+    R4.1 起生产 freeze 要求工件的 ``code_commit`` 可证且等于运行身份；R4.1.1
+    （审稿 P2）起 further 要求工件**内容完整**——生产 freeze 会 ``load_frozen_model``
+    复算文件哈希。本函数用最小合成矩阵走真实的 ``fit_frozen_model`` /
+    ``persist_frozen_model`` 生产链（与本机依赖的版本同一份代码），产物自然满足
+    两道门；规模刻意小（~90 行），不影响 smoke 节奏。
     """
-    model_dir = artifacts_root / "validation" / "model" / MODEL_ID
-    model_dir.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "schema": "alpha_v2_shadow_model.v1",
-        "model_id": MODEL_ID,
-        "artifact_hash": "9" * 64,
-        "created_at": "2026-09-19T00:00:00+08:00",
-        "feature_columns": REHEARSAL_FEATURE_COLUMNS,
-        "feature_schema_hash": "unused_in_smoke",
-        "code_commit": commit,
-        "identity_source": "container_build_identity",
-        "code_commit_source": "container_build_identity",
-        "targets": [],
-        "heads": [],
-        "calibration": {},
-        "provenance": {"smoke": "no_git_container_smoke"},
-    }
-    (model_dir / "model_manifest.json").write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    import numpy as np
+    import pandas as pd
+
+    from stock_analyzer.alpha_v2.research.multi_head import HeadFitSpec
+    from stock_analyzer.alpha_v2.validation.frozen_model import (
+        fit_frozen_model,
+        persist_frozen_model,
     )
-    return model_dir
+
+    total = 90
+    rng = np.random.default_rng(11)
+    frame = pd.DataFrame(
+        {
+            "decision_date": [f"2026-07-{(i // 30) + 1:02d}" for i in range(total)],
+            "symbol": [f"6005{i % 30:02d}" for i in range(total)],
+            **{name: rng.normal(0.0, 1.0, total) for name in SMOKE_FEATURE_COLUMNS},
+        }
+    )
+    base = 0.3 * frame["ret_1d"] + 0.2 * frame["ma5"] - 0.1 * frame["volume_ratio_5"]
+    for horizon in (3, 5, 10, 15):
+        frame[f"net_return_{horizon}d"] = base * (horizon / 5.0) + rng.normal(0.0, 0.01, total)
+        frame[f"excess_return_{horizon}d"] = frame[f"net_return_{horizon}d"] - 0.001
+        frame[f"mae_{horizon}d"] = -np.abs(frame[f"net_return_{horizon}d"]) * 0.6
+        frame[f"up_net_{horizon}d"] = (frame[f"net_return_{horizon}d"] > 0).astype(float)
+        frame[f"up_excess_{horizon}d"] = (frame[f"excess_return_{horizon}d"] > 0).astype(float)
+        frame[f"mae_le_5pct_{horizon}d"] = (frame[f"mae_{horizon}d"] <= -0.05).astype(float)
+    frame["alpha_target_5d"] = frame.groupby("decision_date")["excess_return_5d"].rank(pct=True)
+    frame["is_train"] = False
+    frame["is_calibration"] = False
+    frame.loc[:59, "is_train"] = True
+    frame.loc[60:89, "is_calibration"] = True
+    model = fit_frozen_model(
+        frame=frame,
+        model_id=MODEL_ID,
+        spec=HeadFitSpec(min_train_rows=20, min_class_balance=0.05),
+        provenance={"source": "no_git_container_smoke"},
+        extra_identity={
+            "code_commit": commit,
+            "identity_source": "container_build_identity",
+            "code_commit_source": "container_build_identity",
+        },
+    )
+    return persist_frozen_model(model, artifacts_root / "validation")
 
 
 def _run_cli(
@@ -457,7 +483,7 @@ def main(argv: list[str] | None = None) -> int:
             expected_broken_exit=EXIT_IDENTITY,
             good_stderr=e_good.stderr,
             detail=(
-                "身份门放行后走到冻结模型校验即中止（排演工件不是可推理模型，预期）；"
+                "真实工件通过完整性校验后因缺市场库中止（面板缺失的预期形态）；"
                 f"破坏身份必须 exit {EXIT_IDENTITY}"
             ),
         )

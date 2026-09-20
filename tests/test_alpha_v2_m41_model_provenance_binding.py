@@ -263,6 +263,54 @@ def test_case2_freeze_cli_rejects_and_does_not_open_epoch(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# P2（独立审稿 → 本批修复）：生产 freeze 必须同时校验工件**内容完整性**，
+# 不能只读身份字段——身份可证但内容被改写的工件应当在冻结阶段就被拒。
+# ---------------------------------------------------------------------------
+
+
+def test_freeze_rejects_artifact_with_rewritten_identity_stale_hash(tmp_path: Path):
+    """工件 manifest 的身份被改写成与运行一致、但哈希留旧不自洽 → 生产 freeze FAIL。
+
+    复刻审稿 Attack Y：B 训的工件把 ``code_commit`` 改成 A 以冒充"同代代码"——
+    R4.1 训练身份门读的是身份字段（会通过），R4.1.1 内容校验必须拦下它，
+    且不落盘、不开 epoch。
+    """
+    artifact = _artifact(tmp_path, commit=B)
+    _patch_artifact_commit(artifact, A)  # 只改身份，不重算哈希 → 内容不再自洽
+    sandbox, _ = _sandbox(tmp_path, A)
+    out = tmp_path / "out_stale"
+    out.mkdir()
+    today = date.today().isoformat()
+    result = _run_freeze_cli(sandbox, model_dir=artifact, out=out, start_date=today)
+    assert result.returncode == 5, (result.returncode, result.stdout[-500:], result.stderr[-800:])
+    assert "完整性" in result.stderr
+    assert not (out / "validation" / "validation_freeze_manifest.json").exists()
+    assert not (out / "validation" / "epochs.json").exists()
+
+
+def test_freeze_rejects_artifact_with_corrupted_booster(tmp_path: Path):
+    """工件 booster 文件被改动（身份字段原样）→ 生产 freeze FAIL（逐文件 sha256）。
+
+    身份完全合法的工件，内容被剪断一个字节就能被发现——证明完整性校验看的是
+    **文件内容**，不是 manifest 自述。
+    """
+    artifact = _artifact(tmp_path, commit=A)
+    booster_files = sorted(artifact.glob("booster__*.txt"))
+    assert booster_files, f"工件里应至少有一个 booster 文件: {artifact}"
+    target = booster_files[0]
+    target.write_bytes(b"corrupted-prefix\n" + target.read_bytes())
+    sandbox, _ = _sandbox(tmp_path, A)
+    out = tmp_path / "out_corrupt"
+    out.mkdir()
+    today = date.today().isoformat()
+    result = _run_freeze_cli(sandbox, model_dir=artifact, out=out, start_date=today)
+    assert result.returncode == 5, (result.returncode, result.stdout[-500:], result.stderr[-800:])
+    assert "完整性" in result.stderr
+    assert not (out / "validation" / "validation_freeze_manifest.json").exists()
+    assert not (out / "validation" / "epochs.json").exists()
+
+
+# ---------------------------------------------------------------------------
 # Case 3/4/5：训练身份 missing / unknown / malformed
 # ---------------------------------------------------------------------------
 

@@ -71,6 +71,7 @@ from stock_analyzer.alpha_v2.validation.freeze_precheck import (  # noqa: E402
 )
 from stock_analyzer.alpha_v2.validation.frozen_model import (  # noqa: E402
     frozen_model_identity_payload,
+    load_frozen_model,
 )
 from stock_analyzer.alpha_v2.validation.runtime_identity import (  # noqa: E402
     IDENTITY_SOURCE_CONTAINER_BUILD,
@@ -158,6 +159,17 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:  # noqa: BLE001 - CLI 边界：意图明确的失败
             print(f"[freeze] 模型工件核验失败: {exc}", file=sys.stderr)
             return 2
+        # R4.1.1 / review-P2：生产 freeze 同时校验工件**内容完整性**（每个文件的 sha256 +
+        # artifact_hash 复算），不再只读身份字段——否则"改写 manifest 身份冒充合法模型"
+        # 的工件会先在 freeze 阶段被锚定、等到 capture 才被拒（身份能过、内容是假的）。
+        # 冻结阶段就把它挡下，不给不一致的工件进入 epoch 的机会。
+        # rehearsal 不做此校验：排演允许骨架工件（身份字段齐全但无可推理内容）。
+        if validation_mode == "production":
+            try:
+                load_frozen_model(args.model_dir)
+            except Exception as exc:  # noqa: BLE001 - CLI 边界：意图明确的失败
+                print(f"[freeze] 拒绝（模型工件完整性）: {exc}", file=sys.stderr)
+                return 5
     else:
         model_block = {}  # → pending_freeze（显式、可审计的空块，不假装有模型）
 
@@ -293,8 +305,11 @@ def main(argv: list[str] | None = None) -> int:
                     "config_hash": manifest["config_hash"],
                     "model_id": manifest["model"]["model_id"],
                     "model_artifact_hash": manifest["model"]["artifact_hash"],
-                    # R4.1：epoch 冻结并审计模型训练身份（不塞进 FROZEN_IDENTITY_KEYS 的
-                    # 平面 8 键——它会随 epoch 一起落账，并由 freeze_manifest_hash 锚定）
+                    # R4.1：epoch 落账并审计模型训练身份。语义边界（评审 P3-1）：
+                    # 它是**审计键**——经 freeze_manifest_hash 锚定（改清单会被
+                    # require_epoch_identity_match 拦下），且 capture/mature 各自独立
+                    # 重读清单模型块再比对；它**不在** FROZEN_IDENTITY_KEYS 的 8 键
+                    # 门禁集合里（那里是 runtime identity 平面，门禁比对保持既有语义）。
                     "model_training_code_commit": manifest["model"]["model_training_code_commit"],
                     "feature_schema_hash": manifest["feature_schema_hash"],
                     "label_policy_hash": manifest["label_policy_hash"],

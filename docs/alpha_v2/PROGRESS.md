@@ -1843,6 +1843,7 @@ Runtime Identity 定向（39）+ M3 定向（112）= 151 passed / 0 failed
 全量回归与 ruff 见下方 §17.5
 ```
 
+
 ## 17.5 状态
 
 ```text
@@ -1852,3 +1853,63 @@ FINAL_RUNTIME_HARDENING_COMMIT  = LOCKED_PENDING_MINI_RECHECK
 PRODUCTION_SHADOW_DEPLOYMENT    = LOCKED_PENDING_MINI_RECHECK
 commit / push / deploy / epoch_001 = 均未执行
 ```
+
+---
+
+# 18. R4.1.1 — 冻结清单生产门补工件内容完整性校验（2026-09-20，Codex 自审修复）
+
+## 18.1 来源
+
+Codex 在合并 `1df77e9` 前的独立 mini recheck 中判 R4.1 PASS，但给出 1 个中等
+（P2）补强点：validation freeze CLI 只读工件 manifest 的**身份字段**、不校验
+工件**内容完整性**——实测 Attack Y：把 B 训工件的 manifest `code_commit` 改写成 A
+（artifact_hash 留旧、内容不自洽），freeze 会放行并锚进 epoch，capture 才能拒。
+虽不可进入 production validation（0 行落盘），但"不一致工件被合法冻结"本身是缺口。
+
+## 18.2 修复内容（未提交，等用户授权后创建 commit）
+
+```text
+scripts/alpha_v2_validation_freeze.py
+  - 生产模式且给了 --model-dir 时，身份门之外再做 load_frozen_model 内容校验
+    （逐文件 sha256 + artifact_hash 复算；rehearsal 不做，骨架工件仍可排演）
+  - 审计注释：epoch identity 中 model_training_code_commit 声明为“审计键”
+    （经 freeze_manifest_hash 锚定 + capture/mature 独立重读），门禁键保持 8 键语义
+scripts/alpha_v2_runtime_identity_smoke.py
+  - 骨架工件（假 hash 9*64）改为真实可加载微型工件（走 fit/persist 生产链），
+    与新生产门兼容；step E 注释同步
+scripts/nas_deploy_update.sh（P3-3）
+  - 镜像身份复核结论（verdict/facts JSON）落 artifacts/alpha_v2/audit/，成败均留档
+tests/test_alpha_v2_m41_model_provenance_binding.py（+2，合计 16）
+  - 工件内容不自洽（身份改写）→ freeze rc=5 且不写清单/不开 epoch
+  - booster 文件被剪动 → freeze rc=5 且不写清单/不开 epoch
+```
+
+明确不修：冻结清单 model 块透传 `code_commit_source/identity_source`（审计便利，
+非安全增益）；`get_build_manifest` 的 `/app` 兜底（预存在且 fail-closed 方向）。
+两处都按评审结论记录保持原状。
+
+## 18.3 修复后实测（Codex 自建沙箱，同口径复跑）
+
+```text
+Case 矩阵            20/20（Case 1 正例 + 2/3/4/5/6a/6b fail-closed 全保持）
+Attack X             rc=5（构建身份双源互证仍拒人工注入）
+Attack Y             freeze rc=5「模型工件完整性」（修复前 rc=0）→ 反转成立
+正例身份链           unique_commit_count = 1（11 个 commit 字段全等），40 行捕获写入
+变异对照             M-A（门空操作→2a 翻转 5→0）/ M-B（哈希脱钩→load 翻转 FAILED→LOADED）
+no-git smoke         A–G 七步 PASS（真工件形态）
+tests                m41 16/16、runtime_identity 39/39、m3-r3 36/36、M3 定向 112/112、
+                     全量 3665 tests / failed=2 / skipped=2（两个失败均为与本次无关的
+                     负载性 flaky：market_warehouse 并发锁用例单跑即过、
+                     universe_selector 30s 性能预算用例空闲时两次连过 30.15s→<30s）
+ruff / bash -n       改动文件全部 PASS
+```
+
+## 18.4 状态边界
+
+```text
+FINAL_RUNTIME_HARDENING_COMMIT = 1df77e9（已 commit+push）+ bc7d064（clean-scope
+                                  质量门回归修复，与本批无文件重叠）
+R4.1.1                         = 未提交的工作区增量（本批 5 文件；等用户授权后创建 commit）
+NAS_BUILD_PREFLIGHT            = 未开始（本批合入后按 R4 计划执行）
+```
+

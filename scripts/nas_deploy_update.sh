@@ -606,14 +606,21 @@ if ! docker run --rm --entrypoint cat stock-analyzer:latest /app/.build_commit >
   rm -rf "${BUILD_IDENTITY_TMP}"
   exit 1
 fi
+# 复核证据归档（评审 P3-3）：把校验器的 JSON 结论（verdict + problems + 镜像内
+# 两文件的实际取值）落到 artifacts/alpha_v2/audit/——成功与失败都留档。没有这份留档，
+# "部署时复核过"只是口述；留档后可事后对账"当时镜像身份到底是什么"。
+VERIFY_LOG_DIR="${ROOT}/artifacts/alpha_v2/audit"
+mkdir -p "${VERIFY_LOG_DIR}"
+VERIFY_LOG="${VERIFY_LOG_DIR}/build_identity_verify_$(date -u +%Y%m%dT%H%M%SZ).json"
 if ! "${HOST_PYTHON}" "${ROOT}/scripts/verify_container_build_identity.py" \
     --manifest "${BUILD_IDENTITY_TMP}/build_manifest.json" \
     --build-commit-file "${BUILD_IDENTITY_TMP}/.build_commit" \
-    --expect-commit "${COMMIT}"; then
-  echo "ERROR: 镜像内构建身份复核未通过，拒绝继续部署。" >&2
+    --expect-commit "${COMMIT}" --json 2>&1 | tee "${VERIFY_LOG}"; then
+  echo "ERROR: 镜像内构建身份复核未通过，拒绝继续部署（证据留档: ${VERIFY_LOG}）。" >&2
   rm -rf "${BUILD_IDENTITY_TMP}"
   exit 1
 fi
+echo "镜像内构建身份复核通过（证据留档: ${VERIFY_LOG}）"
 rm -rf "${BUILD_IDENTITY_TMP}"
 
 # 宿主侧身份标记：**复核通过之后**才写。写在构建之前会让"构建失败但文件已更新"的
