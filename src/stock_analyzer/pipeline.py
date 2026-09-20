@@ -613,10 +613,13 @@ class AnalyzerPipeline:
 
         facts = self.model_identity_facts()
         target_registry = registry if registry is not None else self._model_registry
-        return build_model_identity_report(
-            facts,
-            registry=target_registry,
-            claimed_content_hash=facts.get("claimed_content_hash", ""),
+        return cast(
+            "dict[str, object]",
+            build_model_identity_report(
+                facts,
+                registry=target_registry,
+                claimed_content_hash=facts.get("claimed_content_hash", ""),
+            ),
         )
 
     def provider_status(self) -> dict[str, object]:

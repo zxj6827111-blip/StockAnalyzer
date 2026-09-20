@@ -125,7 +125,8 @@ class TestDailyReturnComputation:
     """构造已知价格序列，逐项核对收益/最优退出日/回撤/胜率。"""
 
     def test_best_exit_offset_and_return(self, matcher: ExecutionMatcher) -> None:
-        # bars[0]=信号日；成交 10.0（bars[1] 开盘）；持有日 +5%（10.5）、+10%（11.0，全局最优）、+2%。
+        # bars[0]=信号日；成交 10.0（bars[1] 开盘）；
+        # 持有日 +5%（10.5）、+10%（11.0，全局最优）、+2%。
         bars = _bars_from_closes(start="2026-01-05", closes=[10.0, 10.0, 10.5, 11.0, 10.2])
         result = analyze_symbol_holding(
             symbol="TEST",

@@ -25,6 +25,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from typing import Any, cast
 
 import pandas as pd
 
@@ -192,7 +193,7 @@ def _bar_datetime(bar_date: object) -> datetime:
         return bar_date.to_pydatetime()
     if isinstance(bar_date, datetime):
         return bar_date
-    return pd.Timestamp(bar_date).to_pydatetime()
+    return pd.Timestamp(cast(Any, bar_date)).to_pydatetime()
 
 
 def analyze_symbol_holding(

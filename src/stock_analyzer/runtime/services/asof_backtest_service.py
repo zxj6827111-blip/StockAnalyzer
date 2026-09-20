@@ -184,8 +184,8 @@ def _build_data_health_payload(
         latest_trade_date=_text_field(historical_universe.get("latest_trade_date"))
         or _text_field(_dict_of(date_payload.get("data_gate")).get("latest_trade_date")),
         universe_snapshot=universe_snapshot or None,
-        valid_symbol_count=_as_int_field(
-            historical_universe.get("as_of_valid_count"), fallback=None
+        valid_symbol_count=_as_optional_int_field(
+            historical_universe.get("as_of_valid_count")
         ),
         model_identity=(
             {
@@ -199,7 +199,7 @@ def _build_data_health_payload(
         price_contract=resolve_price_contract(config).to_payload(),
         breadth_artifact_present=bool(market_breadth),
     )
-    payload = report.to_payload()
+    payload = cast(dict[str, object], report.to_payload())
     payload["gate"] = combined_gate_decision(
         report=report,
         breadth_policy=_dict_of(market_breadth.get("usage_policy")) or None,
@@ -214,13 +214,16 @@ def _build_model_semantics_payload(
     """按 S09 汇总模型输出语义（只声明与守卫，不改任何输出值）。"""
     from stock_analyzer.models.semantics_guard import describe_model_semantics
 
-    return describe_model_semantics(
-        label_policy_id=model.get("label_policy_id", ""),
-        label_basis=str(getattr(config.labels, "basis", "") or ""),
-        output_semantics=model.get("output_semantics", ""),
-        # OOS 校准证据当前链路拿不到 → 不允许概率化文案（fail-closed 的是文案）
-        has_oos_calibration=None,
-    ).to_payload()
+    return cast(
+        dict[str, object],
+        describe_model_semantics(
+            label_policy_id=model.get("label_policy_id", ""),
+            label_basis=str(getattr(config.labels, "basis", "") or ""),
+            output_semantics=model.get("output_semantics", ""),
+            # OOS 校准证据当前链路拿不到 → 不允许概率化文案（fail-closed 的是文案）
+            has_oos_calibration=None,
+        ).to_payload(),
+    )
 
 
 def _text_field(value: object) -> str:
@@ -995,3 +998,11 @@ def _as_int_field(value: object, *, fallback: int = 0) -> int:
     except (TypeError, ValueError):
         return fallback
     return parsed
+
+
+def _as_optional_int_field(value: object) -> int | None:
+    """可空版本：缺失或解析失败都返回 None（"未知"），不伪装成 0。"""
+    try:
+        return int(cast(Any, value))
+    except (TypeError, ValueError):
+        return None
