@@ -53,9 +53,21 @@ PIPELINE_COLUMNS = (
 )
 
 
+def phase_a_prediction_paths(root: Path) -> list[Path]:
+    """phase A 的逐票预测。
+
+    **必须**用 ``fold_[0-9][0-9][0-9].json`` 而不是 ``fold_*.json``：后者会连
+    phase B 的 ``fold_001_b.json`` 等 29 个文件一起匹配，让分层样本翻倍。
+    该规则与 ``scripts/alpha_v2_m4h_report_data.py::phase_a_prediction_paths``
+    **逐字一致**，两处必须同步修改；由
+    ``tests/test_alpha_v2_m4h_phase_isolation.py`` 守住。
+    """
+    return sorted((root / "predictions").glob("fold_[0-9][0-9][0-9].json"))
+
+
 def load_predictions(root: Path) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
-    for path in sorted((root / "predictions").glob("fold_*.json")):
+    for path in phase_a_prediction_paths(root):
         payload = json.loads(path.read_text(encoding="utf-8"))
         records = payload.get("records") or []
         if not records:

@@ -51,6 +51,9 @@ def phase_a_prediction_paths(root: Path) -> list[Path]:
 
     刻意**不用** ``fold_*.json``：那会同时匹配 phase B 的 ``fold_001_b.json``，
     把 pooled 样本翻倍（实测 29 → 58 个文件），使报告里的 pooled 数字无法复现。
+    该规则与 ``scripts/alpha_v2_m4h_strata.py::phase_a_prediction_paths``
+    **逐字一致**，两处必须同步修改；由
+    ``tests/test_alpha_v2_m4h_phase_isolation.py`` 守住。
     """
     return sorted((root / "predictions").glob("fold_[0-9][0-9][0-9].json"))
 

@@ -40,13 +40,20 @@
 分位、按年/regime 分层、Brier/ECE 全部逐位一致），新增的键全部来自本轮新增的
 成本口径核对块与 Top1 下行口径。**未发生任何统计值漂移**。
 
-本轮改动只有四类，**均不含 `src/` 行为改动**：
+本轮改动只有五类，**均不含 `src/` 行为改动**：
 
 1. 成本表述更正（§9.1：陈旧且算术不一致的 0.13% → 权威 0.112%，并指出"超额 < 成本"
    是范畴错误；同时新增可复算的抵消检验）；
 2. `downside_metrics` 的 Top1/Top5 口径澄清（§16，补齐真正的 Top1 口径）；
 3. phase B 预测文件与 phase A 的 glob 冲突修复（§27 复算入口，避免今后复现时样本翻倍）；
-4. §25 中"概率校准尚未评估"的陈旧表述更正（Phase B 已完成，见 §14）。
+4. §25 中"概率校准尚未评估"的陈旧表述更正（Phase B 已完成，见 §14）；
+5. §19 补充 `*:unclassified` 分层说明（前 4 个决策日为滚动窗口预热，
+   146 + 260 + 25 不等于全部 435 个决策日）。
+
+**收口后追加修复（外部复核发现）**：`alpha_v2_m4h_strata.py` 此前仍在使用宽 glob，
+即第 3 类修复只落在 `alpha_v2_m4h_report_data.py`、漏了分层脚本。现已统一，
+并新增 `tests/test_alpha_v2_m4h_phase_isolation.py`；重跑分层与主指标**均为零漂移**
+（`STRATA_VALUE_DRIFT = 0`），既有工件未被双计数污染。
 
 ---
 
@@ -531,6 +538,12 @@ Regime 为**事后评估分层（EXPLORATORY_EX_POST_STRATA）**，定义见
 | `trend:bull` | 25 | 118,661 | +0.0888 | [+0.0280, +0.1503] |
 | `volatility:high_vol` | 215 | 879,066 | **+0.0835** | [+0.0637, +0.1060] |
 | `volatility:low_vol` | 216 | 903,572 | **+0.0582** | [+0.0412, +0.0768] |
+| （未列入）`*:unclassified` | 4 | 11,582 | +0.0501 | 单点，无区间 |
+
+**上表不等同于全部 435 个决策日**：前 4 个决策日没有足够的 20 日滚动历史，
+落在 `trend:unclassified` / `volatility:unclassified`（两者重合，同一批 4 天、11,582 行），
+其 CI95 退化为单点。它们不构成一个 regime，因此不单列结论，但在此明示以免读者
+误以为 146 + 260 + 25 = 435。
 
 **全部主要 regime 的 IC 均为正且 CI 不含 0**。IC 在高波动期（+0.084）高于低波动期
 （+0.058），在熊市段（+0.081）高于震荡段（+0.064）；牛市样本仅 25 个决策日，
@@ -749,6 +762,14 @@ python scripts/alpha_v2_m4h_report_data.py --root artifacts/alpha_v2/m4h
 python scripts/alpha_v2_m4h_strata.py      --root artifacts/alpha_v2/m4h
 ```
 
-> 复算脚本只消费 **phase A** 的逐票预测（`fold_[0-9][0-9][0-9].json`）。此前它用
-> `fold_*.json`，在 phase B 落盘后会同时匹配 29 个 `*_b.json` 把 pooled 样本翻倍；
-> 本轮已修复，并在 §1 的收口复算中验证改动不影响任何既有数字。
+> **两个复算脚本都只消费 phase A** 的逐票预测（`fold_[0-9][0-9][0-9].json`）：
+> `alpha_v2_m4h_report_data.py` 与 `alpha_v2_m4h_strata.py` 各自的
+> `phase_a_prediction_paths()` 使用同一条规则。此前它们用 `fold_*.json`，在 phase B
+> 落盘后会同时匹配 29 个 `*_b.json`，把 pooled / 分层样本**翻倍**（1,794,220 → 约 3.59M 行）。
+> 该缺陷已修复，并由 `tests/test_alpha_v2_m4h_phase_isolation.py` 守住（含"补丁必须真被调用"
+> 的反向守卫与源码级扫描）。
+>
+> **既有工件未受污染**：落盘的 `strata_yearly.json` / `strata_regime.json` 生成于
+> phase B 预测落盘之前，用修复后的脚本重跑与原文件**逐键零差异**
+> （yearly 297 键 + regime 3,746 键全等，`prediction rows = 1,794,220`），
+> 主指标 `report_data.json` 同样零漂移。详见 §1。

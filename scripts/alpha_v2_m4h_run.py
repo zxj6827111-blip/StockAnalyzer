@@ -1708,7 +1708,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         ic = ic_block.get("mean_ic")
         print(
-                f"folds/fold_{fold.fold_id:03d}{artifact_suffix}.json"
+            f"folds/fold_{fold.fold_id:03d}{artifact_suffix}.json "
             f"train={result.get('train_rows')} test={result.get('test_rows')} "
             f"ic5={ic if ic is None else round(float(ic), 4)} ({result['elapsed_seconds']}s)",
             flush=True,
