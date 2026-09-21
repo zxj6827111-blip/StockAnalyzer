@@ -100,9 +100,13 @@ def _artifact(tmp_path: Path, *, commit: str = A, model_id: str = "epoch_test") 
         frame=_matrix(),
         model_id=model_id,
         spec=HeadFitSpec(min_train_rows=20, min_class_balance=0.05),
-        # M4-L：训练窗进 provenance——production freeze 的 preflight 硬门要求
-        # "报告检查的窗口 == 模型实际训练窗"，没有 window 就无从绑定。
-        provenance={"source": "r41_test", "window": ["2026-05-01", "2026-06-30"]},
+        # M4-L / R1：provenance 必须带训练窗与训练数据指纹——production freeze 的
+        # preflight 硬门会与报告逐项对账（gate 做一致性比对；重算链在 preflight 测试）。
+        provenance={
+            "source": "r41_test",
+            "window": ["2026-05-01", "2026-06-30"],
+            "training_data_fingerprint": "r41-fixture-fingerprint",
+        },
         extra_identity={
             "code_commit": commit,
             "identity_source": "container_build_identity",
@@ -175,14 +179,20 @@ def test_case2_training_a_runtime_b_rejected_by_gate():
     assert "模型训练身份" in str(excinfo.value)
 
 
-def _write_preflight_report(tmp_path: Path, *, commit: str = A) -> Path:
-    """写一份与工件 provenance window 绑定的 PASS preflight（M4-L §25 硬门输入）。"""
+def _write_preflight_report(
+    tmp_path: Path, *, artifact: Path, commit: str = A
+) -> Path:
+    """写一份与工件身份/训练窗/指纹绑定的 PASS preflight（M4-L R1 硬门输入）。"""
+    from stock_analyzer.alpha_v2.validation.frozen_model import (
+        frozen_model_identity_payload,
+    )
     from stock_analyzer.alpha_v2.validation.preflight import (
         PREFLIGHT_SCHEMA,
         VERDICT_PASS,
         preflight_hash_of,
     )
 
+    model_identity = dict(frozen_model_identity_payload(artifact))
     payload: dict[str, object] = {
         "schema": PREFLIGHT_SCHEMA,
         "generated_at": __import__("datetime").datetime.now().astimezone().isoformat(),
@@ -191,6 +201,22 @@ def _write_preflight_report(tmp_path: Path, *, commit: str = A) -> Path:
         "warnings": [],
         "facts": {},
         "runtime_identity": {"code_commit": commit},
+        # R1：gate 会逐项比对 model_identity（id/artifact hash/schema/training commit/
+        # 指纹）与"即将冻结的模型块"——本夹具只证明**一致性比对**本身有效；
+        # "重算指纹并比对数据"由 preflight 自身测试与 R1 端到端测试覆盖。
+        "model_identity": {
+            "model_id": str(model_identity.get("model_id", "")),
+            "model_artifact_hash": str(model_identity.get("artifact_hash", "")),
+            "feature_schema_hash": str(model_identity.get("feature_schema_hash", "")),
+            "model_training_code_commit": str(
+                model_identity.get("model_training_code_commit", "")
+            ),
+            "training_data_fingerprint": str(
+                dict(model_identity.get("provenance", {}) or {}).get(
+                    "training_data_fingerprint", ""
+                )
+            ),
+        },
         "data_identity": {"market_db": "synthetic"},
         "training_window": {"start": "2026-05-01", "end": "2026-06-30"},
         "checks": [],
@@ -284,7 +310,7 @@ def test_case2_freeze_cli_rejects_and_does_not_open_epoch(tmp_path: Path):
     sandbox, set_identity = _sandbox(tmp_path, A)
     today = date.today().isoformat()
 
-    preflight = _write_preflight_report(tmp_path, commit=A)
+    preflight = _write_preflight_report(tmp_path, artifact=artifact, commit=A)
     ok_out = tmp_path / "out_ok"
     ok_out.mkdir()
     good = _run_freeze_cli(

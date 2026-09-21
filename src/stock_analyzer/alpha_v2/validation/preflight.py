@@ -1,34 +1,31 @@
-"""Alpha V2 M4-L：Production Data Preflight（NAS 上线前只读数据体检）。
+"""Alpha V2 M4-L / R1：Production Data Preflight（NAS 上线前只读数据体检）。
 
-**为什么存在**：M4-H 已经证明历史证据是 MIXED、且 volume 单位在 2025-09 后
-发生混合。正式 ``alpha_v2_epoch_001`` 开启前必须回答"当下这份生产数据配不配
-训练出可用的冻结影子模型"，并把结论钉成可审计工件；``BLOCKED`` 时**不允许**
-开 epoch、也不允许"先开再查"。
+**为什么存在**：M4-H 已证明历史证据是 MIXED、volume 单位在 2025-09 后混合。
+正式 ``alpha_v2_epoch_001`` 开启前必须回答"当下这份生产数据配不配训练出可用的
+冻结影子模型"，并把结论钉成可审计工件；``BLOCKED`` 时**不允许**开 epoch。
 
-本模块**只读**：检查 market.duckdb、配置安全开关、运行身份、特征 schema 可算性、
-volume 单位一致性；不写数据库、不改特征、不修数据（数据治理是独立动作）。
+本模块**只读**：不写数据库、不改特征、不修数据（数据治理是独立动作）。
 
-判定分级（``verdict``）：
+R1 相对首轮新增（外部复核 BLOCKER 2-6）：
 
-- ``PASS``：全部检查通过；
-- ``WARN``：有非致命问题（例如训练窗外的最新交易日尾部不完整）；
-- ``BLOCKED``：任一**致命**检查失败（mixed volume units / 缺特征 /
-  身份不可证 / 安全开关被打开 / 数据源缺失或不可读 / 训练窗内重复主键等）。
-  ``BLOCKED`` 必须带非零 exit code（CLI 层 1），且 validation freeze 的生产硬门
-  会拒绝开启 epoch。
+- **精确模型绑定**：``--model-dir`` 时记录完整 ``model_identity``（model_id /
+  artifact_hash / feature_schema_hash / model_training_code_commit /
+  provenance.window / artifact_verified）；validation freeze 逐项对账，
+  杜绝"Preflight 验 Model A、Freeze 冻 Model B"。
+- **训练数据内容指纹**：重算 ``training_data_fingerprint`` 并与冻结模型 provenance
+  比对（同窗同数据才算同一次检查）。
+- **特征 fill-zero 假健康**：复用 ``feature_diagnosis`` 的四类分类
+  （UPSTREAM_NOT_POPULATED / FILL_ZERO_ARTIFACT / DATA_MISSINGNESS / REAL_CONSTANT），
+  required 特征命中前三类 = BLOCKED，REAL_CONSTANT = WARN；诊断窗口取多日截面。
+- **生产链前置**：``production_pipeline_prerequisites`` 检查 week5 / nightly /
+  alpha_v2 开关与时间窗可达性（nightly.enabled=false ⇒ funnel 不会被链接 ⇒ 每天都
+  missing，必须 BLOCKED 而不是只写在风险清单里）。
+- **volume 判别价格归一化**：``unit_scale = turnover / (volume × close)``，
+  ≈1 为股、≈100 为手；旧的绝对阈值 ``turnover/volume > 100`` 对高价股/低价股
+  都会误判（外部复核 BLOCKER 6）。affected 计数同时给 distinct symbols 与
+  symbol-month pairs，语义不再混用。
 
-训练窗绑定（防止"检查 A 窗口、实际训练 B 窗口"）：报告里记录
-``training_window``（含 ``training_window_hash`` 与 ``data_identity``），
-validation freeze 会拿它与冻结模型工件的 provenance window 逐字对账。
-
-volume 单位正式定义（train 窗内逐自然月统计 ``turnover / volume``）：
-
-- 比值 ≈ 当日均价（几元~几十元）→ volume 以**股**计（share-like）；
-- 比值 ≈ 100 × 均价 → volume 以**手**计（lot-like），判定阈值 100（与
-  M4-H inventory 的 ``_unit_regime_probe`` 同源，便于跨阶段对照）。
-
-``BLOCKED`` 判据：任一自然月 share-like 比例落在 (0.2, 0.8) 开区间（月内混合）；
-或窗口内同时存在 share-like ≥ 0.8 的月份与 ≤ 0.2 的月份（窗口内单位切换）。
+判定分级：``PASS`` / ``WARN`` / ``BLOCKED``（BLOCKED 必须带非零 exit code）。
 """
 
 from __future__ import annotations
@@ -37,7 +34,7 @@ import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from stock_analyzer.alpha_v2.artifacts import write_json_atomic
@@ -48,13 +45,21 @@ VERDICT_WARN = "WARN"
 VERDICT_BLOCKED = "BLOCKED"
 _VERDICT_ORDER = {VERDICT_PASS: 0, VERDICT_WARN: 1, VERDICT_BLOCKED: 2}
 
-# volume 单位判别阈值：turnover/volume > 100 ⇔ 手（同 M4-H inventory）。
-_LOT_LIKE_RATIO_THRESHOLD = 100.0
+# ── volume 单位（R1：价格归一化）──────────────────────────────────────────────
+# unit_scale = turnover / (volume * reference_price)：以股计量 ≈ 1，以手 ≈ 100。
+# 判别阈值取 10（2 与 50 的几何中点），两侧都留出宽裕区间；
+# 参考价用 close（数据契约里最可信的当日价），缺失时退回 OHLC 代表价。
+_UNIT_SCALE_SPLIT = 10.0
+_UNIT_SCALE_REFERENCE_FALLBACK = "coalesce(close, (open + high + low) / 3.0)"
 # 月内混合判定开区间（share-like 比例落在此区间 = 当月两种单位并存）。
 _MIXED_MONTH_LOW = 0.2
 _MIXED_MONTH_HIGH = 0.8
 # 尾段残缺：最新交易日的行数低于近 20 日中位数的该比例即判"尾段不完整"。
 _TAIL_FRAGMENT_RATIO = 0.5
+# 特征诊断窗口：训练窗末端回溯的交易日数与抽样上限（外部复核 §3.2：
+# 不能只用单日样本判断 constant）。
+_FEATURE_DIAGNOSIS_TRADING_DAYS = 40
+_FEATURE_DIAGNOSIS_MAX_SYMBOLS = 300
 
 
 @dataclass
@@ -79,11 +84,7 @@ def canonical_hash(payload: Mapping[str, object]) -> str:
 
 
 def preflight_hash_of(payload: Mapping[str, object]) -> str:
-    """除 ``preflight_hash`` 字段本身外的 canonical JSON sha256（自锚定哈希）。
-
-    与 freeze manifest / funnel snapshot 同一约定：哈希字段不能参与自身计算，
-    否则"写进去再读出来"永不自洽（首轮实现即踩此坑）。
-    """
+    """除 ``preflight_hash`` 字段本身外的 canonical JSON sha256（自锚定哈希）。"""
     body = {key: value for key, value in payload.items() if key != "preflight_hash"}
     return canonical_hash(body)
 
@@ -97,12 +98,12 @@ def file_sha256(path: str | Path) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 单项检查
+# A. Runtime / Build 身份
 # ---------------------------------------------------------------------------
 
 
 def check_runtime_identity(repo_root: str | Path) -> CheckResult:
-    """A. Runtime / Build —— 复用 R4/R4.1 的唯一身份实现，不复制第二套逻辑。"""
+    """复用 R4/R4.1 的唯一身份实现，不复制第二套逻辑。"""
     from stock_analyzer.alpha_v2.validation.runtime_identity import (
         resolve_runtime_code_identity,
     )
@@ -126,8 +127,13 @@ def check_runtime_identity(repo_root: str | Path) -> CheckResult:
     )
 
 
+# ---------------------------------------------------------------------------
+# B. 安全开关
+# ---------------------------------------------------------------------------
+
+
 def check_safety_flags(config: object) -> CheckResult:
-    """B. Safety flags —— 必须保持 shadow 安全组合。"""
+    """必须保持 shadow 安全组合（含 alpha_v2 自己的两个开关）。"""
     facts: dict[str, object] = {}
     findings: list[str] = []
     alpha = getattr(config, "alpha_v2", None)
@@ -173,6 +179,94 @@ def check_safety_flags(config: object) -> CheckResult:
     return CheckResult("safety_flags", verdict, facts, findings)
 
 
+# ---------------------------------------------------------------------------
+# B2. 生产链前置与时间窗可达性（R1 BLOCKER 5）
+# ---------------------------------------------------------------------------
+
+
+def check_production_prerequisites(config: object) -> CheckResult:
+    """live clean OOS 的**实际生产依赖**是否启用，以及窗口能不能接上。
+
+    funnel → link 链条要求：Week5 全市场自动化夜扫 + 正式晚报发布。任一关闭时
+    funnel 不会被链接 ⇒ capture 每天 fail-closed 记 missing ⇒ clean OOS 永远 0。
+    这不能只写在风险清单里（外部复核 BLOCKER 5），必须在开 epoch 前 BLOCKED。
+    """
+    week5 = getattr(config, "week5", None)
+    nightly = getattr(config, "nightly", None)
+    scheduler = getattr(config, "scheduler", None)
+    alpha = getattr(config, "alpha_v2", None)
+    facts: dict[str, object] = {
+        "week5_enabled": bool(getattr(week5, "enabled", False)),
+        "week5_auto_run": bool(getattr(week5, "auto_run", False)),
+        "full_market_automation_enabled": bool(
+            getattr(week5, "full_market_automation_enabled", False)
+        ),
+        "nightly_enabled": bool(getattr(nightly, "enabled", False)),
+        "alpha_v2_enabled": bool(getattr(alpha, "enabled", False)),
+        "alpha_v2_shadow_only": bool(getattr(alpha, "shadow_only", False)),
+        "alpha_v2_enforce_final_selection": bool(
+            getattr(alpha, "enforce_final_selection", True)
+        ),
+        "night_scan_start_time": str(getattr(scheduler, "week5_night_scan_time", "")),
+        "nightly_last_scan_start_time": str(getattr(nightly, "last_scan_start_time", "")),
+        "alpha_live_cycle_start_time": str(getattr(alpha, "live_cycle_start_time", "")),
+        "alpha_live_cycle_latest_time": str(getattr(alpha, "live_cycle_latest_time", "")),
+    }
+    findings: list[str] = []
+    if not facts["week5_enabled"]:
+        findings.append("prerequisite:week5_enabled_must_be_true")
+    if not facts["week5_auto_run"]:
+        findings.append("prerequisite:week5_auto_run_must_be_true")
+    if not facts["full_market_automation_enabled"]:
+        findings.append("prerequisite:full_market_automation_enabled_must_be_true")
+    if not facts["nightly_enabled"]:
+        findings.append("prerequisite:nightly_enabled_must_be_true")
+    # alpha_v2.enabled：config_hash 覆盖它；开 epoch 时关、之后打开会造成 runtime
+    # identity 漂移（capture 每天 exit 3）。所以生产冻结/开 epoch 前就必须为 true。
+    if not facts["alpha_v2_enabled"]:
+        findings.append("prerequisite:alpha_v2_enabled_must_be_true")
+    if not facts["alpha_v2_shadow_only"]:
+        findings.append("prerequisite:alpha_v2_shadow_only_must_be_true")
+    if facts["alpha_v2_enforce_final_selection"]:
+        findings.append("prerequisite:alpha_v2_enforce_final_selection_must_be_false")
+    # 时间窗可达性：alpha 循环最晚必须晚于夜扫最晚起跑（否则晚跑的夜扫永远赶不上
+    # 当天的捕获窗口；跨零点即 backfill，当天永失 clean）。
+    latest = _parse_hhmm_int(facts["alpha_live_cycle_latest_time"])
+    last_scan = _parse_hhmm_int(facts["nightly_last_scan_start_time"]) or _parse_hhmm_int(
+        facts["night_scan_start_time"]
+    )
+    if latest is None:
+        findings.append("prerequisite:alpha_live_cycle_latest_time_unparsable")
+    elif last_scan is not None and latest <= last_scan:
+        findings.append(
+            "prerequisite:alpha_cycle_window_unreachable"
+            f"({facts['alpha_live_cycle_latest_time']}<={facts['nightly_last_scan_start_time']})"
+        )
+    facts["window_reachable"] = not any(
+        finding.startswith("prerequisite:alpha_cycle_window_unreachable")
+        or finding.endswith("latest_time_unparsable")
+        for finding in findings
+    )
+    verdict = VERDICT_BLOCKED if findings else VERDICT_PASS
+    return CheckResult("production_pipeline_prerequisites", verdict, facts, findings)
+
+
+def _parse_hhmm_int(value: object) -> int | None:
+    text = str(value or "").strip()
+    if not text or ":" not in text:
+        return None
+    try:
+        hour, minute = text.split(":")[:2]
+        return int(hour) * 60 + int(minute)
+    except (TypeError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# C. Market DB
+# ---------------------------------------------------------------------------
+
+
 def _connect_market_db(market_db: str | Path):
     import duckdb
 
@@ -182,7 +276,7 @@ def _connect_market_db(market_db: str | Path):
 def check_market_db(
     market_db: str | Path, *, training_start: date | None, training_end: date | None
 ) -> CheckResult:
-    """C. Market DB —— 存在/可读/最新完整交易日/广度/重复主键/尾段残缺。"""
+    """存在/可读/最新完整交易日/广度/重复主键/尾段残缺。"""
     path = Path(market_db)
     if not path.exists() or not path.is_file():
         return CheckResult(
@@ -230,7 +324,6 @@ def check_market_db(
         )
     finally:
         connection.close()
-    # 半分位及以下 = 最新交易日的覆盖明显塌陷（含"只剩一半"这种典型残缺）。
     tail_fragment = bool(
         median_rows > 0 and latest_rows <= median_rows * _TAIL_FRAGMENT_RATIO
     )
@@ -249,8 +342,6 @@ def check_market_db(
     if duplicates > 0:
         findings.append(f"duplicate_logical_keys:{duplicates}")
     if tail_fragment:
-        # 分级：残缺日落在**训练窗内** = 训练会吃到残缺数据（BLOCKED）；
-        # 落在窗外（窗口早已结束，残缺只属"最新一天"） = 仅 WARN。
         latest_iso = str(latest_date) if latest_date else ""
         in_window = bool(
             latest_iso
@@ -270,10 +361,22 @@ def check_market_db(
     return CheckResult("market_db", verdict, facts, findings)
 
 
+# ---------------------------------------------------------------------------
+# E. Volume unit gate（R1：价格归一化）
+# ---------------------------------------------------------------------------
+
+
 def check_volume_units(
     market_db: str | Path, *, training_start: date, training_end: date
 ) -> CheckResult:
-    """E. Volume unit gate（§22）——窗口内是否存在两种单位。"""
+    """窗口内是否存在两种 volume 单位（价格归一化判别）。
+
+    ``unit_scale = turnover / (volume × reference_price)``：以股计 ≈ 1、以手 ≈ 100。
+    逐自然月统计 share-like 比例（``unit_scale < 10`` 的行占比）：
+
+    - 月内比例落 (0.2, 0.8) → 当月两种单位并存（BLOCKED）；
+    - 窗口内同时存在 ≥0.8 与 ≤0.2 的月份 → 单位切换（BLOCKED）。
+    """
     path = Path(market_db)
     if not path.exists():
         return CheckResult(
@@ -288,12 +391,14 @@ def check_volume_units(
             {"path": str(path)},
             [f"data_source_unreadable:{exc.__class__.__name__}:{exc}"],
         )
+    reference = _UNIT_SCALE_REFERENCE_FALLBACK
+    scale_expr = f"(turnover / NULLIF(volume * ({reference}), 0))"
+    share_like_expr = f"avg(CASE WHEN {scale_expr} < ? THEN 1.0 ELSE 0.0 END)"
     try:
         columns = {
-            str(row[0])
-            for row in connection.execute("DESCRIBE daily_bars").fetchall()
+            str(row[0]) for row in connection.execute("DESCRIBE daily_bars").fetchall()
         }
-        for required in ("volume", "turnover", "date", "symbol"):
+        for required in ("volume", "turnover", "date", "symbol", "close"):
             if required not in columns:
                 return CheckResult(
                     "volume_units",
@@ -306,69 +411,68 @@ def check_volume_units(
                 "month": str(row[0]),
                 "rows": int(row[1]),
                 "symbols": int(row[2]),
-                "lot_like_ratio": round(float(row[3]), 6),
-                "share_like_ratio": round(1.0 - float(row[3]), 6),
+                "share_like_ratio": round(float(row[3]), 6),
+                "lot_like_ratio": round(1.0 - float(row[3]), 6),
+                "unit_scale_median": (
+                    round(float(row[4]), 4) if row[4] is not None else None
+                ),
             }
             for row in connection.execute(
-                "SELECT strftime(date, '%Y-%m') AS month, count(*) AS rows, "
-                "count(DISTINCT symbol) AS symbols, "
-                "avg(CASE WHEN turnover / NULLIF(volume, 0) > ? THEN 1.0 ELSE 0.0 END) "
-                "AS lot_like_ratio "
+                f"SELECT strftime(date, '%Y-%m') AS month, count(*) AS rows, "
+                f"count(DISTINCT symbol) AS symbols, {share_like_expr} AS share_like_ratio, "
+                f"median({scale_expr}) AS unit_scale_median "
                 "FROM daily_bars WHERE volume IS NOT NULL AND volume > 0 "
                 "AND turnover IS NOT NULL AND date BETWEEN ? AND ? "
                 "GROUP BY 1 ORDER BY 1",
                 [
-                    _LOT_LIKE_RATIO_THRESHOLD,
+                    _UNIT_SCALE_SPLIT,
                     training_start.isoformat(),
                     training_end.isoformat(),
                 ],
             ).fetchall()
         ]
+        for item in monthly:
+            ratio = float(item["share_like_ratio"])
+            if ratio >= _MIXED_MONTH_HIGH:
+                item["unit_status"] = "share"
+            elif ratio <= _MIXED_MONTH_LOW:
+                item["unit_status"] = "lot"
+            else:
+                item["unit_status"] = "mixed"
+        intra_month_mixed = [
+            item["month"] for item in monthly if item["unit_status"] == "mixed"
+        ]
+        share_months = [item["month"] for item in monthly if item["unit_status"] == "share"]
+        lot_months = [item["month"] for item in monthly if item["unit_status"] == "lot"]
+        affected_symbols = 0
+        affected_pairs = 0
+        if intra_month_mixed:
+            row = connection.execute(
+                "SELECT count(DISTINCT symbol), count(*) FROM ("
+                f"SELECT symbol, strftime(date, '%Y-%m') AS month, "
+                f"count(DISTINCT CASE WHEN {scale_expr} < ? THEN 'share' ELSE 'lot' END) "
+                "AS kinds "
+                "FROM daily_bars WHERE volume IS NOT NULL AND volume > 0 "
+                "AND turnover IS NOT NULL AND date BETWEEN ? AND ? "
+                "GROUP BY 1, 2 HAVING kinds > 1)",
+                [
+                    _UNIT_SCALE_SPLIT,
+                    training_start.isoformat(),
+                    training_end.isoformat(),
+                ],
+            ).fetchone()
+            affected_symbols = int(row[0] or 0)
+            affected_pairs = int(row[1] or 0)
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult(
+            "volume_units",
+            VERDICT_BLOCKED,
+            {"path": str(path)},
+            [f"volume_unit_check_failed:{exc.__class__.__name__}:{exc}"],
+        )
     finally:
         connection.close()
     zero_rows = [item["month"] for item in monthly if item["rows"] == 0]
-    for item in monthly:
-        # 每月一个显式状态标签（§22 要求的 "mixed-unit status"）
-        ratio = item["share_like_ratio"]
-        if ratio >= _MIXED_MONTH_HIGH:
-            item["unit_status"] = "share"
-        elif ratio <= _MIXED_MONTH_LOW:
-            item["unit_status"] = "lot"
-        else:
-            item["unit_status"] = "mixed"
-    intra_month_mixed = [
-        item["month"] for item in monthly if item["unit_status"] == "mixed"
-    ]
-    share_months = [item["month"] for item in monthly if item["unit_status"] == "share"]
-    lot_months = [item["month"] for item in monthly if item["unit_status"] == "lot"]
-    # 受影响范围：混合月里"同一个 symbol 同时出现两种单位"的只数（§22 要求）。
-    affected_symbol_count = 0
-    if intra_month_mixed:
-        try:
-            connection = _connect_market_db(path)
-            try:
-                affected_symbol_count = int(
-                    connection.execute(
-                        "SELECT count(*) FROM ("
-                        "SELECT symbol, strftime(date, '%Y-%m') AS month, "
-                        "count(DISTINCT CASE WHEN turnover / NULLIF(volume, 0) > ? "
-                        "THEN 'lot' ELSE 'share' END) AS kinds "
-                        "FROM daily_bars WHERE volume IS NOT NULL AND volume > 0 "
-                        "AND turnover IS NOT NULL AND date BETWEEN ? AND ? "
-                        "GROUP BY 1, 2 HAVING kinds > 1)"
-                        ,
-                        [
-                            _LOT_LIKE_RATIO_THRESHOLD,
-                            training_start.isoformat(),
-                            training_end.isoformat(),
-                        ],
-                    ).fetchone()[0]
-                    or 0
-                )
-            finally:
-                connection.close()
-        except Exception:  # noqa: BLE001 - 诊断字段尽力而为，不改变 verdict
-            affected_symbol_count = 0
     regime_switch = bool(share_months and lot_months)
     findings: list[str] = []
     if not monthly:
@@ -388,10 +492,12 @@ def check_volume_units(
         "volume_units",
         verdict,
         {
+            "formula": "turnover / (volume * reference_price)",
+            "reference_price": reference,
+            "unit_scale_split": _UNIT_SCALE_SPLIT,
+            "mixed_month_bounds": [_MIXED_MONTH_LOW, _MIXED_MONTH_HIGH],
             "training_start": training_start.isoformat(),
             "training_end": training_end.isoformat(),
-            "lot_like_threshold": _LOT_LIKE_RATIO_THRESHOLD,
-            "mixed_month_bounds": [_MIXED_MONTH_LOW, _MIXED_MONTH_HIGH],
             "monthly": monthly,
             "share_like_months": share_months,
             "lot_like_months": lot_months,
@@ -399,14 +505,19 @@ def check_volume_units(
             "unit_status_by_month": {
                 item["month"]: item["unit_status"] for item in monthly
             },
-            "affected_symbol_count": affected_symbol_count,
+            "affected_symbol_count": affected_symbols,
+            "affected_symbol_month_count": affected_pairs,
             "affected_date_range": (
                 [intra_month_mixed[0], intra_month_mixed[-1]] if intra_month_mixed else []
             ),
-            "affected_month_count": len(intra_month_mixed) + len(lot_months) + len(share_months),
         },
         findings,
     )
+
+
+# ---------------------------------------------------------------------------
+# D. Feature inputs（R1：接入 feature_diagnosis 四类分类）
+# ---------------------------------------------------------------------------
 
 
 def check_feature_inputs(
@@ -419,16 +530,21 @@ def check_feature_inputs(
     warmup_days: int = 260,
     skip_reason: str = "",
     coverage_warn_below: float = 0.5,
+    diagnosis_days: int = _FEATURE_DIAGNOSIS_TRADING_DAYS,
 ) -> CheckResult:
-    """D. Feature inputs —— 冻结 schema 的每一列当天能不能算出来。
+    """冻结 schema 的每一列当天能不能算出来（含 fill-zero 假健康诊断）。
 
-    ``skip_reason`` 非空 = 显式跳过探针（测试/离线环境），如实记 WARN，
-    绝不把"没检查"写成 PASS。
+    分层判据（R1）：
+
+    - 列完全算不出来 / 全空 → **BLOCKED**（原有）；
+    - ``UPSTREAM_NOT_POPULATED`` / ``FILL_ZERO_ARTIFACT`` / ``DATA_MISSINGNESS``
+      命中 **required 模型特征** → **BLOCKED**（fill-zero 会把 ``notna()`` 刷成
+      100%，只看覆盖率必假 PASS）；
+    - ``REAL_CONSTANT`` → **WARN**（按项目现有治理口径不判死，但要可见）；
+    - 非 required 列的同名分类 → WARN（如实记录，不阻断）。
     """
     if not feature_columns:
-        return CheckResult(
-            "feature_inputs", VERDICT_BLOCKED, {}, ["feature_schema_missing"]
-        )
+        return CheckResult("feature_inputs", VERDICT_BLOCKED, {}, ["feature_schema_missing"])
     if skip_reason:
         return CheckResult(
             "feature_inputs",
@@ -438,15 +554,28 @@ def check_feature_inputs(
         )
     from stock_analyzer.alpha_v2.research.outcomes import DecisionPoint
     from stock_analyzer.alpha_v2.research.panel import load_daily_panel
+    from stock_analyzer.alpha_v2.validation.feature_diagnosis import (
+        CLASS_DATA_MISSINGNESS,
+        CLASS_FILL_ZERO_ARTIFACT,
+        CLASS_REAL_CONSTANT,
+        CLASS_UPSTREAM_NOT_POPULATED,
+        diagnose_features,
+        probe_market_duckdb_sources,
+    )
     from stock_analyzer.alpha_v2.validation.feature_frame import daily_feature_frame
 
     market_path = Path(str(market_db))
     if not market_path.is_absolute():
         market_path = Path(repo_root) / market_path
+    diagnosis_days = max(1, int(diagnosis_days))
+    diagnosis_dates: list[date] = []
+    # 诊断窗是多日截面（外部复核 §3.2：单日样本会把"当天刚好相同"误判成长期
+    # constant）。面板窗口必须覆盖整段诊断窗，否则 calendar 只有一天。
+    window_start = as_of - timedelta(days=int(diagnosis_days * 1.6) + 5)
     try:
         panel = load_daily_panel(
             market_db=market_path,
-            window_start=as_of,
+            window_start=window_start,
             window_end=as_of,
             warmup_days=int(warmup_days),
             max_symbols=int(max_symbols),
@@ -466,7 +595,12 @@ def check_feature_inputs(
                 {"as_of": as_of.isoformat()},
                 ["feature_probe_universe_empty"],
             )
-        decisions = [DecisionPoint(symbol, as_of) for symbol in eligible]
+        calendar_index = panel.calendar_index(as_of)
+        start_index = max(0, calendar_index - diagnosis_days + 1)
+        diagnosis_dates = list(panel.calendar[start_index : calendar_index + 1])
+        decisions = [
+            DecisionPoint(symbol, day) for day in diagnosis_dates for symbol in eligible
+        ]
         frame = daily_feature_frame(panel, decisions)
     except Exception as exc:  # noqa: BLE001
         return CheckResult(
@@ -493,9 +627,43 @@ def check_feature_inputs(
         findings.append(f"feature_columns_all_null:{empty_columns[0]} (共 {len(empty_columns)} 列)")
     if low_columns:
         findings.append(f"feature_columns_low_coverage:{low_columns[0]} (共 {len(low_columns)} 列)")
-    if missing or empty_columns:
+
+    # ── fill-zero 假健康诊断（多日截面）────────────────────────────────────
+    diagnosis_payload: dict[str, object] = {}
+    diagnosis_blocked: list[str] = []
+    diagnosis_warned: list[str] = []
+    try:
+        upstream_probe = probe_market_duckdb_sources(market_path)
+        report = diagnose_features(
+            frame, columns=list(feature_columns), upstream_probe=upstream_probe
+        )
+        diagnosis_payload = report.to_payload()
+        required = set(feature_columns)
+        for row in report.rows:
+            classification = row.classification
+            target = diagnosis_blocked if row.column in required else diagnosis_warned
+            if classification in (
+                CLASS_UPSTREAM_NOT_POPULATED,
+                CLASS_FILL_ZERO_ARTIFACT,
+                CLASS_DATA_MISSINGNESS,
+            ):
+                target.append(f"{row.column}:{classification}")
+            elif classification == CLASS_REAL_CONSTANT:
+                diagnosis_warned.append(f"{row.column}:{CLASS_REAL_CONSTANT}")
+    except Exception as exc:  # noqa: BLE001 - 诊断不可用本身按 WARN（覆盖率门仍在）
+        diagnosis_warned.append(f"feature_diagnosis_failed:{exc.__class__.__name__}:{exc}")
+    if diagnosis_blocked:
+        findings.append(
+            f"feature_health_blocked:{diagnosis_blocked[0]} (共 {len(diagnosis_blocked)} 列)"
+        )
+    if diagnosis_warned:
+        findings.append(
+            f"feature_health_warn:{diagnosis_warned[0]} (共 {len(diagnosis_warned)} 列)"
+        )
+
+    if missing or empty_columns or diagnosis_blocked:
         verdict = VERDICT_BLOCKED
-    elif low_columns:
+    elif low_columns or diagnosis_warned:
         verdict = VERDICT_WARN
     else:
         verdict = VERDICT_PASS
@@ -506,6 +674,7 @@ def check_feature_inputs(
             "as_of": as_of.isoformat(),
             "feature_column_count": len(feature_columns),
             "probed_rows": int(len(frame)),
+            "diagnosis_days": len(diagnosis_dates),
             "missing_columns": missing,
             "all_null_columns": empty_columns,
             "low_coverage_columns": low_columns,
@@ -513,9 +682,128 @@ def check_feature_inputs(
             "coverage_median": (
                 round(sorted(coverage.values())[len(coverage) // 2], 6) if coverage else None
             ),
+            "diagnosis": diagnosis_payload,
+            "diagnosis_blocked_columns": diagnosis_blocked,
+            "diagnosis_warned_columns": diagnosis_warned,
         },
         findings,
     )
+
+
+# ---------------------------------------------------------------------------
+# F. 模型身份与训练数据指纹（R1 BLOCKER 2/4）
+# ---------------------------------------------------------------------------
+
+
+def check_model_identity(model_dir: str | Path) -> CheckResult:
+    """``--model-dir`` 的完整身份（含内容完整性验证），供 freeze 逐项绑定。"""
+    from stock_analyzer.alpha_v2.validation.frozen_model import (
+        frozen_model_identity_payload,
+        load_frozen_model,
+    )
+
+    path = Path(model_dir)
+    identity: dict[str, object] = {"model_dir": str(path)}
+    try:
+        payload = frozen_model_identity_payload(path)
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult(
+            "model_identity",
+            VERDICT_BLOCKED,
+            identity,
+            [f"model_artifact_unreadable:{exc.__class__.__name__}:{exc}"],
+        )
+    provenance = dict(payload.get("provenance", {}) or {})
+    window = provenance.get("window")
+    identity.update(
+        {
+            "model_id": str(payload.get("model_id", "")),
+            "model_artifact_hash": str(payload.get("artifact_hash", "")),
+            "feature_schema_hash": str(payload.get("feature_schema_hash", "")),
+            "model_training_code_commit": str(payload.get("model_training_code_commit", "")),
+            "provenance_window": (
+                [str(window[0]), str(window[1])]
+                if isinstance(window, (list, tuple)) and len(window) == 2
+                else None
+            ),
+            "training_data_fingerprint": str(
+                provenance.get("training_data_fingerprint", "") or ""
+            ),
+            "training_data_rows": provenance.get("training_data_rows"),
+        }
+    )
+    findings: list[str] = []
+    if not identity["model_id"] or not identity["model_artifact_hash"]:
+        findings.append("model_identity_incomplete:model_id_or_artifact_hash_missing")
+    if not identity["feature_schema_hash"]:
+        findings.append("model_identity_incomplete:feature_schema_hash_missing")
+    if not identity["model_training_code_commit"]:
+        findings.append("model_identity_incomplete:model_training_code_commit_missing")
+    if identity["provenance_window"] is None:
+        findings.append("model_identity_incomplete:provenance_window_missing")
+    verified = False
+    try:
+        load_frozen_model(path)  # 逐文件哈希 + artifact_hash 复算
+        verified = True
+    except Exception as exc:  # noqa: BLE001
+        findings.append(f"model_artifact_integrity_failed:{exc.__class__.__name__}:{exc}")
+    identity["artifact_verified"] = verified
+    verdict = VERDICT_BLOCKED if findings else VERDICT_PASS
+    return CheckResult("model_identity", verdict, identity, findings)
+
+
+def check_training_data_fingerprint(
+    *,
+    market_db: str | Path,
+    model_identity: Mapping[str, object],
+    training_start: date,
+    training_end: date,
+) -> CheckResult:
+    """重算训练窗内容指纹并与冻结模型 provenance 比对（同窗同数据）。"""
+    from stock_analyzer.alpha_v2.validation.training_data_fingerprint import (
+        TrainingDataFingerprintError,
+        compute_training_data_fingerprint,
+    )
+
+    model_fingerprint = str(model_identity.get("training_data_fingerprint", "") or "")
+    facts: dict[str, object] = {"model_training_data_fingerprint": model_fingerprint}
+    if not model_fingerprint:
+        return CheckResult(
+            "training_data_fingerprint",
+            VERDICT_BLOCKED,
+            facts,
+            ["model_provenance_missing_training_data_fingerprint"],
+        )
+    try:
+        recomputed = compute_training_data_fingerprint(
+            market_db, training_start=training_start, training_end=training_end
+        )
+    except TrainingDataFingerprintError as exc:
+        facts["error"] = str(exc)
+        return CheckResult(
+            "training_data_fingerprint",
+            VERDICT_BLOCKED,
+            facts,
+            [f"training_data_fingerprint_uncomputable:{exc.__class__.__name__}"],
+        )
+    facts.update(
+        {
+            "recomputed_fingerprint": recomputed["fingerprint"],
+            "recomputed_rows": recomputed["rows"],
+            "columns": recomputed["columns"],
+        }
+    )
+    if str(recomputed["fingerprint"]) != model_fingerprint:
+        return CheckResult(
+            "training_data_fingerprint",
+            VERDICT_BLOCKED,
+            facts,
+            [
+                "training_data_fingerprint_mismatch:"
+                f"model={model_fingerprint[:16]}… preflight={str(recomputed['fingerprint'])[:16]}…"
+            ],
+        )
+    return CheckResult("training_data_fingerprint", VERDICT_PASS, facts, [])
 
 
 # ---------------------------------------------------------------------------
@@ -533,7 +821,7 @@ def run_production_preflight(
     feature_columns: Sequence[str],
     model_dir: str | Path | None = None,
     feature_probe_skipped_reason: str = "",
-    max_feature_probe_symbols: int = 300,
+    max_feature_probe_symbols: int = _FEATURE_DIAGNOSIS_MAX_SYMBOLS,
     now: datetime | None = None,
 ) -> dict[str, object]:
     """执行全部检查并组装审计载荷（纯计算 + 只读 IO，不落盘）。"""
@@ -545,12 +833,38 @@ def run_production_preflight(
     checks: list[CheckResult] = [
         check_runtime_identity(repo_root),
         check_safety_flags(config),
+        check_production_prerequisites(config),
         check_market_db(
             market_db, training_start=training_start, training_end=training_end
         ),
-        check_volume_units(market_db, training_start=training_start, training_end=training_end),
+        check_volume_units(
+            market_db, training_start=training_start, training_end=training_end
+        ),
     ]
-    market_check = checks[2]
+    model_identity: dict[str, object] = {}
+    if model_dir:
+        model_check = check_model_identity(model_dir)
+        model_identity = dict(model_check.facts)
+        checks.append(model_check)
+        checks.append(
+            check_training_data_fingerprint(
+                market_db=market_db,
+                model_identity=model_identity,
+                training_start=training_start,
+                training_end=training_end,
+            )
+        )
+    else:
+        checks.append(
+            CheckResult(
+                "model_identity",
+                VERDICT_BLOCKED,
+                {},
+                ["model_dir_required:生产 preflight 必须绑定 --model-dir"],
+            )
+        )
+
+    market_check = next(item for item in checks if item.name == "market_db")
     latest_date_text = str(market_check.facts.get("latest_trade_date", "") or "")
     probe_as_of: date | None = None
     if latest_date_text:
@@ -563,10 +877,7 @@ def run_production_preflight(
     if probe_as_of is None:
         checks.append(
             CheckResult(
-                "feature_inputs",
-                VERDICT_BLOCKED,
-                {},
-                ["feature_probe_as_of_unresolvable"],
+                "feature_inputs", VERDICT_BLOCKED, {}, ["feature_probe_as_of_unresolvable"]
             )
         )
     else:
@@ -585,17 +896,26 @@ def run_production_preflight(
     for check in checks:
         if _VERDICT_ORDER[check.verdict] > _VERDICT_ORDER[verdict]:
             verdict = check.verdict
-    blocking = [f"{c.name}:{f}" for c in checks if c.verdict == VERDICT_BLOCKED for f in c.findings]
+    blocking = [
+        f"{c.name}:{f}" for c in checks if c.verdict == VERDICT_BLOCKED for f in c.findings
+    ]
     warnings = [f"{c.name}:{f}" for c in checks if c.verdict == VERDICT_WARN for f in c.findings]
-    training_window = {
-        "start": training_start.isoformat(),
-        "end": training_end.isoformat(),
-    }
+    training_window = {"start": training_start.isoformat(), "end": training_end.isoformat()}
+    volume_facts = next((item.facts for item in checks if item.name == "volume_units"), {})
+    fingerprint_facts = next(
+        (item.facts for item in checks if item.name == "training_data_fingerprint"), {}
+    )
     data_identity = {
         "market_db": str(market_db),
         "latest_trade_date": latest_date_text,
         "total_rows": market_check.facts.get("total_rows"),
         "training_window_hash": canonical_hash(training_window),
+        "training_data_fingerprint": (
+            fingerprint_facts.get("recomputed_fingerprint")
+            or model_identity.get("training_data_fingerprint")
+        ),
+        "volume_affected_symbol_count": volume_facts.get("affected_symbol_count"),
+        "volume_affected_symbol_month_count": volume_facts.get("affected_symbol_month_count"),
     }
     payload: dict[str, object] = {
         "schema": PREFLIGHT_SCHEMA,
@@ -605,6 +925,7 @@ def run_production_preflight(
         "warnings": warnings,
         "facts": {check.name: check.facts for check in checks},
         "runtime_identity": checks[0].facts.get("identity", {}),
+        "model_identity": model_identity,
         "data_identity": data_identity,
         "training_window": training_window,
         "checks": [
@@ -627,7 +948,7 @@ def write_preflight_audit(payload: Mapping[str, object], *, audit_root: str | Pa
 
 
 # ---------------------------------------------------------------------------
-# Validation freeze 硬门（§25：唯一可开 epoch 的入口做 gate）
+# Validation freeze 硬门（§25 + R1 §2.2：逐项绑定实际冻结对象）
 # ---------------------------------------------------------------------------
 
 
@@ -655,15 +976,17 @@ def assert_preflight_gate(
     *,
     report_path: str | Path,
     runtime_code_commit: str,
-    training_window: Sequence[str] | None,
+    model_block: Mapping[str, object] | None,
     max_age_hours: float,
     accept_warn: bool = False,
     now: datetime | None = None,
 ) -> dict[str, object]:
-    """校验 preflight 报告满足开 epoch 的三要素：同代码、同训练窗、新鲜且未 BLOCKED。
+    """校验 preflight 报告与"即将冻结的模型"逐项一致，满足才允许开 epoch。
 
-    返回用于写入 freeze manifest 的 ``production_preflight`` 块。
-    失败抛 :class:`PreflightError`（CLI 层翻译成 exit 7）。
+    R1（BLOCKER 2）：不只比 verdict/年龄/commit/窗口，还要比
+    ``model_id / model_artifact_hash / feature_schema_hash /
+    model_training_code_commit / provenance.window / training_data_fingerprint``
+    ——检查对象必须就是冻结对象。
     """
     payload = load_preflight_report(report_path)
     verdict = str(payload.get("verdict", "") or "")
@@ -701,17 +1024,61 @@ def assert_preflight_gate(
             f"preflight 报告与当前运行代码不一致: preflight={report_identity!r} "
             f"runtime={runtime_code_commit!r}——换代码必须重跑 preflight"
         )
-    reported_window = payload.get("training_window") or {}
-    reported_pair = [str(reported_window.get("start", "")), str(reported_window.get("end", ""))]
-    if training_window is None:
+    if model_block is None:
+        raise PreflightError("冻结模型块缺失，无法证明 preflight 检查的就是这个模型")
+    reported = dict(payload.get("model_identity") or {})
+    if not reported:
         raise PreflightError(
-            "冻结模型工件缺少 provenance.window，无法证明 preflight 检查的就是训练窗"
+            "preflight 报告没有 model_identity（必须用 --model-dir 绑定实际冻结模型）"
         )
-    expected_pair = [str(training_window[0]), str(training_window[1])]
-    if reported_pair != expected_pair:
+    comparisons = {
+        "model_id": (reported.get("model_id"), model_block.get("model_id")),
+        "artifact_hash": (
+            reported.get("model_artifact_hash"),
+            model_block.get("artifact_hash"),
+        ),
+        "feature_schema_hash": (
+            reported.get("feature_schema_hash"),
+            model_block.get("feature_schema_hash"),
+        ),
+        "model_training_code_commit": (
+            reported.get("model_training_code_commit"),
+            model_block.get("model_training_code_commit"),
+        ),
+    }
+    mismatches = [
+        f"{key}:{left!r}!={right!r}"
+        for key, (left, right) in comparisons.items()
+        if str(left or "").strip() != str(right or "").strip()
+    ]
+    model_provenance = dict(model_block.get("provenance", {}) or {})
+    model_window = model_provenance.get("window")
+    expected_window = (
+        [str(model_window[0]), str(model_window[1])]
+        if isinstance(model_window, (list, tuple)) and len(model_window) == 2
+        else None
+    )
+    reported_window = payload.get("training_window") or {}
+    reported_pair = [
+        str(reported_window.get("start", "")),
+        str(reported_window.get("end", "")),
+    ]
+    if expected_window is None:
+        mismatches.append("provenance_window_missing_in_model_block")
+    elif reported_pair != expected_window:
+        mismatches.append(f"training_window:{reported_pair}!={expected_window}")
+    model_fingerprint = str(model_provenance.get("training_data_fingerprint", "") or "")
+    reported_fingerprint = str(reported.get("training_data_fingerprint", "") or "")
+    if not model_fingerprint:
+        mismatches.append("training_data_fingerprint_missing_in_model_block")
+    elif model_fingerprint != reported_fingerprint:
+        mismatches.append(
+            f"training_data_fingerprint:{reported_fingerprint[:16]}…!={model_fingerprint[:16]}…"
+        )
+    if mismatches:
         raise PreflightError(
-            f"preflight 训练窗与冻结模型不一致: preflight={reported_pair} model={expected_pair}"
-            "（检查 A 窗口、训练 B 窗口 = §23 明令禁止）"
+            "preflight 与本次冻结模型不一致（检查对象必须等于冻结对象）："
+            + "; ".join(mismatches[:6])
         )
     return {
         "report_path": str(report_path),
@@ -720,6 +1087,13 @@ def assert_preflight_gate(
         "verdict": verdict,
         "generated_at": generated_at,
         "training_window": reported_pair,
+        "model_identity": {
+            "model_id": reported.get("model_id"),
+            "artifact_hash": reported.get("model_artifact_hash"),
+            "feature_schema_hash": reported.get("feature_schema_hash"),
+            "model_training_code_commit": reported.get("model_training_code_commit"),
+        },
+        "training_data_fingerprint": reported_fingerprint,
         "data_identity": payload.get("data_identity", {}),
         "warnings": list(payload.get("warnings") or []),
     }
@@ -736,8 +1110,11 @@ __all__ = [
     "canonical_hash",
     "check_feature_inputs",
     "check_market_db",
+    "check_model_identity",
+    "check_production_prerequisites",
     "check_runtime_identity",
     "check_safety_flags",
+    "check_training_data_fingerprint",
     "check_volume_units",
     "file_sha256",
     "load_preflight_report",

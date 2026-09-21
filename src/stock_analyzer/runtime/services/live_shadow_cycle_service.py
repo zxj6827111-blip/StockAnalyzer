@@ -35,12 +35,15 @@ from typing import Any
 
 from stock_analyzer.alpha_v2.validation.production_funnel import (
     FunnelNotFoundError,
+    _published_report_id,
+    build_source_evidence,
     emit_funnel_snapshot,
-    extract_funnel_from_scan_report,
-    funnel_snapshot_hash,
+    extract_funnel_from_source_evidence,
+    file_sha256,
     funnel_snapshot_path,
     link_funnel_to_report,
     load_funnel_snapshot,
+    write_source_evidence,
 )
 
 JOB_NAME = "alpha_v2_shadow_cycle"
@@ -86,7 +89,17 @@ class LiveShadowCycleService:
         return not bool(getattr(alpha_cfg, "enforce_final_selection", False))
 
     def repo_root(self) -> Path:
-        return Path(__file__).resolve().parents[3]
+        """仓库根：向上找同时含 ``scripts/`` 与 ``src/`` 的目录。
+
+        不能写死 ``parents[N]``——本模块在 ``runtime/services/`` 下（比
+        ``runtime/service.py`` 深一层），写死层级会把 scripts 路径指到 ``src/scripts``
+        （外部复核 R1 实测：data_health 子进程直接 FileNotFoundError）。
+        """
+        here = Path(__file__).resolve()
+        for parent in here.parents:
+            if (parent / "scripts").is_dir() and (parent / "src").is_dir():
+                return parent
+        return here.parents[4]
 
     def funnel_root(self) -> Path:
         alpha_cfg = self._alpha_config()
@@ -96,6 +109,22 @@ class LiveShadowCycleService:
     def artifact_root(self) -> Path:
         alpha_cfg = self._alpha_config()
         return Path(str(getattr(alpha_cfg, "artifact_root", "artifacts/alpha_v2")))
+
+    def market_db_path(self) -> str:
+        """行情库路径：取 ``config.market_warehouse.db_path``（生产 NAS 是 delta 库，
+        不是仓库默认的 artifacts/warehouse/market.duckdb——写死会让整个循环读错库）。
+        """
+        config = self._service._config
+        return str(getattr(config.market_warehouse, "db_path", "artifacts/warehouse/market.duckdb"))
+
+    def data_health_out(self) -> Path:
+        """data_health 落点：``<alpha_root>/runtime/data_health.json``。
+
+        放 alpha 根下（而不是 artifacts/runtime）有两个理由：① capture 的工件查找
+        候选里就有 ``<root>/runtime/data_health.json``（root=alpha 根），写这里必然
+        被读到；② 影子证据全部留在 shadow 树内，不和生产目录混。
+        """
+        return self.artifact_root() / "runtime" / "data_health.json"
 
     # ------------------------------------------------------------------
     # 1) 调度注册
@@ -137,16 +166,27 @@ class LiveShadowCycleService:
         if not bool(funnel_block.get("deep_stage_ran", False)):
             return
         try:
-            payload = extract_funnel_from_scan_report(
+            day = trade_date.date().isoformat()
+            # R1（BLOCKER 7）：先把成员**原文**落成不可变 source evidence，
+            # 再从它抽取 funnel——source_night_scan_artifact_sha256 因此真的指向
+            # "成员从哪来"，而不是指向只存 counts 的正式晚报。
+            evidence = build_source_evidence(
                 source_report=report,
+                trade_date=day,
                 trace_id=trace_id,
-                scan_status="night_scan_completed",
                 created_at=trade_date.isoformat(),
             )
-            day = trade_date.date().isoformat()
-            payload["signal_date"] = day
-            payload["trade_date"] = day
-            payload["funnel_snapshot_hash"] = funnel_snapshot_hash(payload)
+            evidence_path = write_source_evidence(
+                funnel_root=self.funnel_root(), payload=evidence
+            )
+            payload = extract_funnel_from_source_evidence(
+                evidence,
+                source_artifact_path=str(evidence_path),
+                # 用**文件字节哈希**而不是字典规范化哈希：读侧重算文件哈希对账。
+                source_artifact_sha256=file_sha256(evidence_path),
+                signal_date=day,
+                trade_date=day,
+            )
             path = emit_funnel_snapshot(funnel_root=self.funnel_root(), payload=payload)
             self._audit(
                 event_type="alpha_v2_production_funnel_emitted",
@@ -232,11 +272,18 @@ class LiveShadowCycleService:
 
         纪律（M4-L §14-§19）：
 
-        - **依赖驱动**：必须"当天晚报已发布（funnel 已链接）"才起捕获；未就绪时
-          快速返回 waiting（不计失败），窗口内每个槽位重试；
+        - **依赖驱动**：三个前置全部满足才起捕获——
+          (a) nightly data ready、(b) 当天 funnel 已链接正式晚报、
+          (c) **当天 data_health 生成并通过 gate（status=ok 且 as_of 同日）**；
+          未就绪时快速返回 waiting（不计失败），窗口内每个槽位重试。
+          R1 起 data_health 由本循环自己派生（``--derive-inputs``）并**读取验证**——
+          绝不在 degraded 上写 immutable 快照（那样即使数据随后变齐，当天也永远
+          不可能成为 clean OOS）；
         - **无 active epoch = safe skip**：Alpha V2 尚未启动阶段不破坏生产调度；
         - active epoch + 交易日 + 到窗口末尾仍未就绪 = 明确 failure/audit，并落
-          missing 台账（该日永不计 clean OOS，绝不静默成功）；
+          missing 台账（该日永不计 clean OOS，绝不静默成功）；此时**仍然推进
+          历史日的 mature 与 KPI**（missing day 只影响它自己，不阻断既有权重日
+          的 3/5/10/15D 成熟）；
         - **幂等**：当天已有快照 + KPI 报告 → already_completed，重复调度不重复写。
         """
         current = self._job_now()
@@ -268,16 +315,34 @@ class LiveShadowCycleService:
 
         readiness = self._service._week5_automation_service.probe_nightly_readiness()
         funnel_ready, funnel_reason = self._funnel_ready(trade_date=trade_date)
-        if not bool(state["captured"]) and not (
-            bool(readiness.get("allowed", False)) and funnel_ready
-        ):
-            reason = funnel_reason or str(readiness.get("reason", "") or "readiness_blocked")
+        health_ready = True
+        health_reason = ""
+        health_summary: dict[str, object] = {}
+        if not bool(state["captured"]):
+            # R1（BLOCKER 2）：先生成当天 data_health，再**读取验证**——
+            # CLI 的 returncode==0 不代表健康（degraded 也是 0）。
+            health_ready, health_reason, health_summary = self._ensure_data_health(
+                trade_date=trade_date
+            )
+        prerequisites_ok = bool(
+            bool(readiness.get("allowed", False)) and funnel_ready and health_ready
+        )
+        if not bool(state["captured"]) and not prerequisites_ok:
+            if not health_ready:
+                reason = health_reason or "data_health_not_healthy"
+            else:
+                reason = funnel_reason or str(readiness.get("reason", "") or "readiness_blocked")
             if current.time() >= self._deadline():
+                # 到窗口末尾仍未就绪：不写当日快照，落 missing 台账 + 审计；
+                # 但**继续推进历史日的成熟与 KPI**（§9：missing 只约束它自己）。
+                tail = self._run_history_tail(
+                    root=root, epoch_id=epoch.epoch_id, trade_date=trade_date
+                )
                 self._record_missing_day(
                     root=root,
                     epoch_id=epoch.epoch_id,
                     trade_date=trade_date,
-                    reason=f"production_funnel_unavailable:{reason}",
+                    reason=f"production_prerequisites_unavailable:{reason}",
                 )
                 self._audit(
                     event_type="alpha_v2_cycle_blocked_day",
@@ -286,6 +351,9 @@ class LiveShadowCycleService:
                         "trade_date": trade_date.isoformat(),
                         "reason": reason,
                         "readiness": dict(readiness),
+                        "funnel_ready": funnel_ready,
+                        "data_health": health_summary,
+                        "history_tail": tail,
                     },
                 )
                 return {
@@ -293,25 +361,18 @@ class LiveShadowCycleService:
                         True, f"alpha_v2_blocked_recorded_missing:{reason}", trade_date
                     ),
                     "missing_recorded": True,
+                    "history_tail": tail,
                 }
-            return self._result(True, f"alpha_v2_waiting:{reason}", trade_date)
+            return {
+                **self._result(True, f"alpha_v2_waiting:{reason}", trade_date),
+                # 等待态也带出 data_health 证据（排障不必再去翻工件）
+                "data_health": health_summary,
+            }
 
         steps: list[tuple[str, list[str], int]] = []
         if not bool(state["captured"]):
             steps.extend(
                 [
-                    (
-                        "data_health",
-                        [
-                            "--as-of",
-                            trade_date.isoformat(),
-                            "--market-db",
-                            "artifacts/warehouse/market.duckdb",
-                            "--out",
-                            "artifacts/runtime/data_health.json",
-                        ],
-                        300,
-                    ),
                     (
                         "capture",
                         [
@@ -320,7 +381,7 @@ class LiveShadowCycleService:
                             "--signal-date",
                             trade_date.isoformat(),
                             "--market-db",
-                            "artifacts/warehouse/market.duckdb",
+                            self.market_db_path(),
                             "--out",
                             str(root),
                             "--cohort-source",
@@ -342,7 +403,7 @@ class LiveShadowCycleService:
                         "--evaluation-date",
                         trade_date.isoformat(),
                         "--market-db",
-                        "artifacts/warehouse/market.duckdb",
+                        self.market_db_path(),
                         "--out",
                         str(root),
                     ],
@@ -397,6 +458,119 @@ class LiveShadowCycleService:
             "validation_epoch_id": epoch.epoch_id,
             "steps": results,
         }
+
+
+    # ------------------------------------------------------------------
+    # data_health：生成 + 读取验证（R1 BLOCKER 1/2）
+    # ------------------------------------------------------------------
+
+    def _ensure_data_health(
+        self, *, trade_date: date
+    ) -> tuple[bool, str, dict[str, object]]:
+        """生成当天 data_health 工件并**读取验证**它真的可用于 clean OOS。
+
+        顺序（外部复核 §1.2 要求）：
+
+        ```text
+        派生并写 data_health  ->  读回工件  ->  capture gate（status=ok 且 as_of 同日）
+        ```
+
+        只有 gate 通过才返回 True。CLI ``returncode==0`` 不作为证据：degraded 也返回 0。
+        """
+        from stock_analyzer.alpha_v2.validation.data_health_capture import (
+            capture_data_health_block,
+            data_health_gate_ok,
+            load_data_health_artifact,
+        )
+
+        returncode, tail = -1, ""
+        try:
+            returncode, tail = self._run_cli(
+                "alpha_v2_data_health_snapshot.py",
+                [
+                    "--as-of",
+                    trade_date.isoformat(),
+                    "--market-db",
+                    self.market_db_path(),
+                    "--out",
+                    str(self.data_health_out()),
+                    "--alpha-v2-root",
+                    str(self.artifact_root()),
+                    "--derive-inputs",
+                ],
+                timeout_sec=300,
+            )
+        except Exception as exc:  # noqa: BLE001 - 超时/启动失败都算"未就绪"
+            tail = f"{exc.__class__.__name__}: {exc}"
+        summary: dict[str, object] = {
+            "cli_returncode": returncode,
+            "cli_tail": tail[-500:],
+        }
+        payload, source = load_data_health_artifact(
+            path=self.data_health_out(), root=self.artifact_root()
+        )
+        block = capture_data_health_block(
+            signal_date=trade_date, payload=payload, source=source
+        )
+        summary["block"] = {
+            "status": block.get("status"),
+            "source_status": block.get("source_status"),
+            "as_of": block.get("as_of"),
+            "source": block.get("source"),
+        }
+        if payload:
+            summary["broken_checks"] = list(payload.get("broken_checks", []) or [])
+            summary["degraded_checks"] = list(payload.get("degraded_checks", []) or [])
+            summary["missing_artifacts"] = list(payload.get("missing_artifacts", []) or [])
+        gate_ok, reason = data_health_gate_ok(block, trade_date)
+        if not gate_ok:
+            return False, f"data_health_not_healthy:{reason or 'unknown'}", summary
+        return True, "", summary
+
+    def _run_history_tail(
+        self, *, root: Path, epoch_id: str, trade_date: date
+    ) -> list[dict[str, object]]:
+        """当天无法捕获时，仍推进历史日的 mature 与 KPI（§9）。
+
+        missing day 只约束它自己：既有权重日的 3/5/10/15D 成熟不能被当天失败拖停。
+        失败只记审计（tail 结果原样返回供审批示）。
+        """
+        results: list[dict[str, object]] = []
+        for step_name in ("mature", "report"):
+            script = {name: script for name, script, _ in _CYCLE_STEPS}[step_name]
+            argv = (
+                [
+                    "--epoch-id",
+                    epoch_id,
+                    "--evaluation-date",
+                    trade_date.isoformat(),
+                    "--market-db",
+                    self.market_db_path(),
+                    "--out",
+                    str(root),
+                ]
+                if step_name == "mature"
+                else ["--epoch-id", epoch_id, "--out", str(root)]
+            )
+            timeout_sec = {name: timeout for name, _, timeout in _CYCLE_STEPS}[step_name]
+            try:
+                returncode, tail = self._run_cli(script, argv, timeout_sec=timeout_sec)
+            except Exception as exc:  # noqa: BLE001
+                returncode, tail = -1, f"{exc.__class__.__name__}: {exc}"
+            results.append(
+                {"step": step_name, "returncode": returncode, "tail": tail[-400:]}
+            )
+            if returncode != 0:
+                self._audit(
+                    event_type="alpha_v2_history_tail_step_failed",
+                    level="warn",
+                    payload={
+                        "trade_date": trade_date.isoformat(),
+                        "step": step_name,
+                        "returncode": returncode,
+                    },
+                )
+        return results
 
     # ------------------------------------------------------------------
     # 内部工具
@@ -479,7 +653,7 @@ class LiveShadowCycleService:
             payload = load_funnel_snapshot(path)
         except Exception as exc:  # noqa: BLE001 - 细粒度原因交给 capture 报
             return False, f"production_funnel_unreadable:{exc.__class__.__name__}"
-        if not str(payload.get("night_scan_report_id", "") or "").strip():
+        if not _published_report_id(payload):
             return False, "production_funnel_not_linked_to_report"
         return True, ""
 

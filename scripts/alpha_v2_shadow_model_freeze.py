@@ -67,6 +67,10 @@ from stock_analyzer.alpha_v2.validation.runtime_identity import (  # noqa: E402
     price_contract_block,
     resolve_runtime_code_identity,
 )
+from stock_analyzer.alpha_v2.validation.training_data_fingerprint import (  # noqa: E402
+    TrainingDataFingerprintError,
+    compute_training_data_fingerprint,
+)
 from stock_analyzer.backtest.matcher import ExecutionMatcher  # noqa: E402
 from stock_analyzer.config import load_config  # noqa: E402
 
@@ -169,6 +173,23 @@ def main(argv: list[str] | None = None) -> int:
     frame["is_calibration"] = frame["decision_date"].astype(str).isin(calibration_days)
     frame["is_train"] = ~frame["is_calibration"]
 
+    # M4-L R1（BLOCKER 4）：训练数据**内容**指纹——只含窗口内行，确定性。
+    # 与 panel_fingerprint（只描述形状）不同：任何窗口内价格/量/额被改写都会改变它，
+    # 而窗口外新增交易日不会。preflight 会用同一函数重算并逐字对账。
+    try:
+        data_fingerprint = compute_training_data_fingerprint(
+            REPO_ROOT / args.market_db,
+            training_start=window_start,
+            training_end=window_end,
+        )
+    except TrainingDataFingerprintError as exc:
+        print(f"[freeze-model] 训练数据指纹不可计算（拒绝冻结）: {exc}", file=sys.stderr)
+        return 5
+    print(
+        f"[freeze-model] training_data_fingerprint="
+        f"{str(data_fingerprint['fingerprint'])[:16]}… rows={data_fingerprint['rows']}"
+    )
+
     model = fit_frozen_model(
         frame=frame,
         model_id=str(args.model_id),
@@ -176,6 +197,9 @@ def main(argv: list[str] | None = None) -> int:
         provenance={
             "market_db": str(args.market_db),
             "window": [window_start.isoformat(), window_end.isoformat()],
+            "training_data_fingerprint": str(data_fingerprint["fingerprint"]),
+            "training_data_rows": int(data_fingerprint["rows"]),
+            "training_data_columns": list(data_fingerprint["columns"]),
             "panel_fingerprint": panel_fingerprint(panel),
             "decision_rows": int(len(frame)),
             "quality_pool_source": str(suite.report.get("quality_pool_source", "research_proxy")),

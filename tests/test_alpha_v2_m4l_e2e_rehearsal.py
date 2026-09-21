@@ -36,9 +36,12 @@ from stock_analyzer.alpha_v2.validation.frozen_model import (
     persist_frozen_model,
 )
 from stock_analyzer.alpha_v2.validation.production_funnel import (
+    build_source_evidence,
     emit_funnel_snapshot,
-    extract_funnel_from_scan_report,
+    extract_funnel_from_source_evidence,
+    file_sha256,
     funnel_snapshot_hash,
+    write_source_evidence,
 )
 from stock_analyzer.alpha_v2.validation.runtime_identity import (
     config_hash_of,
@@ -219,11 +222,18 @@ def rehearsal_env(tmp_path, monkeypatch):
 
 
 def _emit_funnel(env, deep_order: list[str]) -> dict[str, object]:
-    payload = extract_funnel_from_scan_report(
+    """R1：先落成员来源证据，再从它抽取 funnel（源指针指向证据文件字节哈希）。"""
+    evidence = build_source_evidence(
         source_report=_funnel_report(deep_order),
+        trade_date=SIGNAL_DAY.isoformat(),
         trace_id="week5-night-scan-20260312000000",
-        scan_status="night_scan_completed",
         created_at=f"{SIGNAL_DAY.isoformat()}T22:00:00+08:00",
+    )
+    evidence_path = write_source_evidence(funnel_root=env["funnel_root"], payload=evidence)
+    payload = extract_funnel_from_source_evidence(
+        evidence,
+        source_artifact_path=str(evidence_path),
+        source_artifact_sha256=file_sha256(evidence_path),
     )
     payload["signal_date"] = SIGNAL_DAY.isoformat()
     payload["trade_date"] = SIGNAL_DAY.isoformat()
@@ -286,6 +296,7 @@ def test_rehearsal_end_to_end_production_cohort(rehearsal_env):
     assert manifest["cohort_source"] == "production_funnel"
     assert manifest["funnel"]["funnel_snapshot_hash"]
     assert [m["symbol"] for m in manifest["funnel"]["deep_members"]] == deep_order
+    assert manifest["funnel"]["source_night_scan_artifact_sha256"]
     assert manifest["counts"]["production_deep"] == 3
 
 

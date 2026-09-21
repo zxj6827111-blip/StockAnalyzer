@@ -1,4 +1,10 @@
-"""Alpha V2 M3：生成**当天**的 data_health 工件（S08 契约，供 shadow capture 读取）。
+"""Alpha V2 M3 + M4-L R1：生成**当天**的 data_health 工件（S08 契约，供 shadow capture 读取）。
+
+R1 起支持 ``--derive-inputs``：S08 七项输入全部由**当天真实数据/工件**派生
+（PIT universe / valid 分子 / 板块覆盖 / feature snapshot / Alpha V2 冻结模型身份 /
+广度证据），不再要求调用方逐个传文件路径——生产调度循环此前一个都没传，导致
+status 恒为 degraded、clean OOS 永远 0（外部复核 BLOCKER 1）。派生实现见
+``alpha_v2.validation.live_data_health_inputs``。
 
 为什么需要它（N-R2-1 的另一半）：治理层只认"同日且 ok"的 data_health，而生产侧
 从来没有产出过这个工件——结果是 capture 每天都写 ``not_available``，clean OOS
@@ -34,6 +40,10 @@ from stock_analyzer.alpha_v2.validation.data_health_capture import (  # noqa: E4
     build_data_health_artifact,
     write_data_health_artifact,
 )
+from stock_analyzer.alpha_v2.validation.live_data_health_inputs import (  # noqa: E402
+    DEFAULT_BREADTH_EVIDENCE_RELATIVE,
+    derive_all_data_health_inputs,
+)
 from stock_analyzer.alpha_v2.validation.runtime_identity import (  # noqa: E402
     price_contract_block,
 )
@@ -53,6 +63,24 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--config", default="config/default.yaml")
     parser.add_argument("--out", default=str(DEFAULT_OUT))
     parser.add_argument("--breadth-artifact", default=str(DEFAULT_BREADTH))
+    parser.add_argument(
+        "--derive-inputs",
+        action="store_true",
+        help=(
+            "从当天真实数据/工件派生 S08 六项输入（PIT universe/valid/board/feature/model/"
+            "breadth）；未显式给出的路径参数被派生结果取代，派生失败保持缺失（不得当健康）"
+        ),
+    )
+    parser.add_argument(
+        "--alpha-v2-root",
+        default="artifacts/alpha_v2",
+        help="Alpha V2 工件根（--derive-inputs 时用于读 active epoch 的冻结模型身份）",
+    )
+    parser.add_argument(
+        "--breadth-evidence",
+        default=str(DEFAULT_BREADTH_EVIDENCE_RELATIVE),
+        help="派生模式下的广度证据落点（影子路径，不写生产 market_breadth.json）",
+    )
     parser.add_argument("--universe-snapshot", default="", help="S03 股票池快照 JSON")
     parser.add_argument("--board-coverage", default="", help="板块覆盖 JSON")
     parser.add_argument("--feature-snapshot", default="", help="特征快照清单 JSON")
@@ -127,9 +155,34 @@ def main(argv: list[str] | None = None) -> int:
         "max_freshness_days": int(args.max_freshness_days),
         "min_expected_active_coverage": float(args.min_expected_active_coverage),
     }
+    derived_evidence: dict[str, object] = {}
+    if args.derive_inputs:
+        derived = derive_all_data_health_inputs(
+            config=config,
+            market_db=market_db,
+            as_of=as_of,
+            alpha_v2_root=REPO_ROOT / args.alpha_v2_root,
+            breadth_evidence_path=REPO_ROOT / args.breadth_evidence,
+            max_freshness_days=int(args.max_freshness_days),
+            min_expected_active_coverage=float(args.min_expected_active_coverage),
+        )
+        derived_evidence = dict(derived.evidence)
+        # 显式给出的路径参数优先（人工审计可覆盖单个输入），其余用派生值。
+        for key, value in derived.as_inputs().items():
+            explicit = {
+                "universe_snapshot": args.universe_snapshot,
+                "board_coverage": args.board_coverage,
+                "feature_snapshot": args.feature_snapshot,
+                "model_identity": args.model_identity,
+            }.get(key)
+            if explicit:
+                continue
+            inputs[key] = value
     payload = build_data_health_artifact(as_of=as_of, **inputs)
     payload["market_db"] = str(args.market_db)
     payload["breadth_artifact"] = str(breadth_path)
+    if derived_evidence:
+        payload["derived_inputs"] = derived_evidence
     payload["inputs_provided"] = sorted(
         key
         for key, value in inputs.items()

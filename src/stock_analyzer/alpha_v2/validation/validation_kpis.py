@@ -239,11 +239,16 @@ def _day_funnel_ok(
     selector_mode = str(funnel.get("selector_mode", "") or "").strip()
     if selector_mode not in AUTHORITATIVE_SELECTOR_MODES:
         return False, "funnel_selector_mode_not_authoritative"
+    published_report_id = str(
+        funnel.get("published_report_id", "") or funnel.get("night_scan_report_id", "") or ""
+    ).strip()
     if (
         str(freeze.get("validation_mode", "production")).strip().lower() == "production"
-        and not str(funnel.get("night_scan_report_id", "") or "").strip()
+        and not published_report_id
     ):
         return False, "funnel_report_not_linked"
+    if not str(funnel.get("source_night_scan_artifact_sha256", "") or "").strip():
+        return False, "funnel_source_evidence_missing"
     deep_members = funnel.get("deep_members")
     if not isinstance(deep_members, list) or not deep_members:
         return False, "funnel_cohort_empty"

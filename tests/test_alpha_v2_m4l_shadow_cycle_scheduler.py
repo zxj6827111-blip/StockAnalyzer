@@ -1,21 +1,28 @@
-"""M4-L §28：alpha_v2_shadow_cycle 调度专项测试。
+"""M4-L R1 §28 + §10(DH)：alpha_v2_shadow_cycle 调度专项测试。
 
-覆盖：注册条件（enabled 才注册、不影响既有 job）、无 epoch safe skip、前置未就绪
-快速返回（不重复计算）、窗口末尾明确落账、顺序（data_health → capture → mature →
-report）、失败审计、幂等（重复 tick 不重复写）。
+覆盖：注册条件、无 epoch safe skip、**data_health 健康门（degraded 不 capture）**、
+funnel/readiness 前置、窗口末尾落账（并继续推进历史成熟）、顺序、失败审计、幂等，
+以及 DH-2..DH-7（缺任一 S08 输入 → 不 capture；degraded→healthy 跨槽位恢复）。
+
+DH-1（真实 clean_oos_days=1）在 ``test_alpha_v2_m4l_e2e_rehearsal.py`` 里用真实 CLI
++ 合成数据端到端验证。
 """
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, time
 from pathlib import Path
 
 from _alpha_v2_m3_fixtures import open_epoch_for_manifest, write_freeze_manifest
 
 from stock_analyzer.alpha_v2.validation.production_funnel import (
+    build_source_evidence,
     emit_funnel_snapshot,
-    extract_funnel_from_scan_report,
+    extract_funnel_from_source_evidence,
+    file_sha256,
     funnel_snapshot_hash,
+    write_source_evidence,
 )
 from stock_analyzer.config import load_config
 from stock_analyzer.runtime.scheduler_supervisor import scheduler_group_for_job
@@ -43,10 +50,8 @@ class _CaptureScheduler:
 def _config(*, alpha_enabled: bool):
     config = load_config(REPO_ROOT / "config" / "default.yaml")
     config.alpha_v2.enabled = alpha_enabled
-    # 保留 week5 夜扫族与 theme 族（证明 Alpha V2 不改动既有注册面）
     config.week5.full_market_automation_enabled = True
     config.theme.enabled = True
-    # 关掉无关任务族，避免注册清单噪声
     config.market_warehouse.enabled = False
     config.market_warehouse.auto_run = False
     config.tdx_sync.enabled = False
@@ -78,7 +83,6 @@ def test_cycle_job_registered_only_when_alpha_v2_enabled():
     assert "alpha_v2_shadow_cycle" not in disabled
     enabled = _register_jobs(_config(alpha_enabled=True))
     assert "alpha_v2_shadow_cycle" in enabled
-    # 既有调度族一个不少（Alpha V2 disabled 时行为与当前 main 完全一致）
     expected_families = {
         "week5_night_scan",
         "close_reconcile",
@@ -87,7 +91,6 @@ def test_cycle_job_registered_only_when_alpha_v2_enabled():
     }
     assert expected_families <= disabled
     assert expected_families <= enabled
-    # heavy 组（与夜扫同组串行；绝不挤占 critical）
     assert scheduler_group_for_job("alpha_v2_shadow_cycle") == "heavy"
 
 
@@ -104,7 +107,60 @@ class _StubAutomation:
         }
 
 
-def _service(monkeypatch, tmp_path, *, now: datetime, readiness_allowed: bool, epoch_root: Path):
+class _FakeRunner:
+    """替身子进程：模拟各 CLI 的真实副作用（data_health 工件 / 快照 / KPI 报告）。"""
+
+    def __init__(
+        self,
+        *,
+        epoch_root: Path,
+        data_health_status: str = "healthy",
+        capture_returncode: int = 0,
+    ) -> None:
+        self.epoch_root = epoch_root
+        self.data_health_status = data_health_status
+        self.capture_returncode = capture_returncode
+        self.calls: list[tuple[str, list[str]]] = []
+        self.data_health_runs = 0
+
+    def __call__(self, script: str, argv: list[str], *, timeout_sec: int):
+        self.calls.append((script, list(argv)))
+        if script == "alpha_v2_data_health_snapshot.py":
+            self.data_health_runs += 1
+            out = Path(argv[argv.index("--out") + 1])
+            out.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "schema": "alpha_v2_data_health.v1",
+                "as_of": DAY.isoformat(),
+                "status": self.data_health_status,
+                "checks": [],
+                "missing_artifacts": [],
+                "generated_at": datetime.combine(DAY, time(22, 30)).isoformat(),
+            }
+            out.write_text(json.dumps(payload), encoding="utf-8")
+            return 0, "ok"
+        if script == "alpha_v2_shadow_capture.py":
+            if self.capture_returncode != 0:
+                return self.capture_returncode, "生产漏斗硬门未通过"
+            shadow_dir = (
+                self.epoch_root / "validation" / "alpha_v2_epoch_001" / "shadow"
+                / f"{DAY.year:04d}" / f"{DAY.month:02d}"
+            )
+            shadow_dir.mkdir(parents=True, exist_ok=True)
+            (shadow_dir / f"shadow_{DAY.strftime('%Y%m%d')}.jsonl").write_text(
+                '{"symbol":"600001"}\n', encoding="utf-8"
+            )
+        if script == "alpha_v2_validation_report.py":
+            reports = self.epoch_root / "validation" / "alpha_v2_epoch_001" / "reports"
+            reports.mkdir(parents=True, exist_ok=True)
+            report_file = reports / (
+                f"validation_kpi_alpha_v2_epoch_001_{DAY.strftime('%Y%m%d')}.json"
+            )
+            report_file.write_text("{}", encoding="utf-8")
+        return 0, "ok"
+
+
+def _service(tmp_path, *, now: datetime, readiness_allowed: bool, epoch_root: Path):
     config = _config(alpha_enabled=True)
     config.alpha_v2.artifact_root = str(epoch_root)
     config.alpha_v2.production_funnel_root = str(tmp_path / "runtime" / "production_funnel")
@@ -114,35 +170,9 @@ def _service(monkeypatch, tmp_path, *, now: datetime, readiness_allowed: bool, e
     service._record_audit_event = lambda **kwargs: audits.append(kwargs)
     service._job_now = lambda: now
     service._week5_automation_service = _StubAutomation(allowed=readiness_allowed)
-    calls: list[tuple[str, list[str]]] = []
-
-    def _fake_run(script: str, argv: list[str], *, timeout_sec: int):
-        calls.append((script, list(argv)))
-        # 模拟真实副作用：capture 写快照、report 写 KPI（供后续幂等判定）
-        if script == "alpha_v2_shadow_capture.py":
-            shadow_dir = (
-                epoch_root / "validation" / "alpha_v2_epoch_001" / "shadow"
-                / f"{DAY.year:04d}" / f"{DAY.month:02d}"
-            )
-            shadow_dir.mkdir(parents=True, exist_ok=True)
-            (shadow_dir / f"shadow_{DAY.strftime('%Y%m%d')}.jsonl").write_text(
-                '{"symbol":"600001"}\n', encoding="utf-8"
-            )
-        if script == "alpha_v2_validation_report.py":
-            reports = epoch_root / "validation" / "alpha_v2_epoch_001" / "reports"
-            reports.mkdir(parents=True, exist_ok=True)
-            report_file = reports / (
-                f"validation_kpi_alpha_v2_epoch_001_{DAY.strftime('%Y%m%d')}.json"
-            )
-            report_file.write_text(
-                "{}", encoding="utf-8"
-            )
-        return 0, "ok"
-
     cycle = LiveShadowCycleService(service)
-    cycle._run_cli = _fake_run  # noqa: SLF001 - 测试注入子进程替身
     service._live_shadow_cycle = cycle
-    return service, calls, audits
+    return service, cycle, audits
 
 
 def _write_epoch(root: Path):
@@ -150,7 +180,9 @@ def _write_epoch(root: Path):
     return open_epoch_for_manifest(root, manifest, opened_on_date="2026-09-18")
 
 
-def _funnel_payload(*, deep: list[str]) -> dict[str, object]:
+def _funnel_payload(
+    funnel_root: Path, *, deep: list[str], linked: bool = True
+) -> dict[str, object]:
     report = {
         "funnel": {
             "policy": "snapshot_funnel",
@@ -167,183 +199,252 @@ def _funnel_payload(*, deep: list[str]) -> dict[str, object]:
             "pinned_symbols": [],
         },
     }
-    payload = extract_funnel_from_scan_report(
-        source_report=report, trace_id="t", scan_status="night_scan_completed", created_at="t"
+    evidence = build_source_evidence(
+        source_report=report,
+        trade_date=DAY.isoformat(),
+        trace_id="t",
+        created_at="t",
     )
-    payload["signal_date"] = DAY.isoformat()
-    payload["trade_date"] = DAY.isoformat()
-    payload["night_scan_report_id"] = "nr-20260921-01"  # 已链接
+    evidence_path = write_source_evidence(funnel_root=funnel_root, payload=evidence)
+    payload = extract_funnel_from_source_evidence(
+        evidence,
+        source_artifact_path=str(evidence_path),
+        source_artifact_sha256=file_sha256(evidence_path),
+        signal_date=DAY.isoformat(),
+        trade_date=DAY.isoformat(),
+    )
+    payload["published_report_id"] = "nr-20260921-01" if linked else ""
     payload["funnel_snapshot_hash"] = funnel_snapshot_hash(payload)
     return payload
 
 
-def test_no_active_epoch_is_safe_skip(monkeypatch, tmp_path):
+def _emit(env_tmp: Path, *, deep: list[str], linked: bool = True) -> None:
+    funnel_root = env_tmp / "runtime" / "production_funnel"
+    emit_funnel_snapshot(
+        funnel_root=funnel_root,
+        payload=_funnel_payload(funnel_root, deep=deep, linked=linked),
+    )
+
+
+def test_no_active_epoch_is_safe_skip(tmp_path):
     root = tmp_path / "alpha_v2"
-    service, calls, audits = _service(
-        monkeypatch,
+    service, cycle, audits = _service(
         tmp_path,
         now=datetime.combine(DAY, time(22, 30)),
         readiness_allowed=True,
         epoch_root=root,
     )
-    result = service._live_shadow_cycle.run_daily_cycle()
+    result = cycle.run_daily_cycle()
     assert result["_scheduler_success"] is True
     assert result["_scheduler_detail"] == "alpha_v2_no_active_epoch"
-    assert calls == [] and audits == []
-
-
-def test_waiting_before_deadline_when_funnel_missing(monkeypatch, tmp_path):
-    root = tmp_path / "alpha_v2"
-    _write_epoch(root)
-    service, calls, audits = _service(
-        monkeypatch,
-        tmp_path,
-        now=datetime.combine(DAY, time(22, 30)),
-        readiness_allowed=True,
-        epoch_root=root,
-    )
-    result = service._live_shadow_cycle.run_daily_cycle()
-    assert result["_scheduler_detail"].startswith("alpha_v2_waiting:")
-    assert calls == []  # 未就绪时不起重活
     assert audits == []
 
 
-def test_blocked_day_records_missing_after_deadline(monkeypatch, tmp_path):
+def test_degraded_data_health_does_not_capture_before_deadline(tmp_path):
+    """DH-2..DH-6 共性：任一 S08 输入缺失 → data_health=degraded → 不 capture。"""
     root = tmp_path / "alpha_v2"
-    epoch = _write_epoch(root)
-    service, calls, audits = _service(
-        monkeypatch,
+    _write_epoch(root)
+    _emit(tmp_path, deep=["600001"])
+    service, cycle, audits = _service(
         tmp_path,
-        now=datetime.combine(DAY, time(23, 56)),
+        now=datetime.combine(DAY, time(22, 30)),
         readiness_allowed=True,
         epoch_root=root,
     )
-    result = service._live_shadow_cycle.run_daily_cycle()
-    assert result["missing_recorded"] is True
-    assert result["_scheduler_detail"].startswith("alpha_v2_blocked_recorded_missing")
-    assert calls == []
-    from stock_analyzer.alpha_v2.validation.shadow_capture import list_missing_days
-
-    missing = list_missing_days(root, epoch.epoch_id)
-    assert [item["signal_date"] for item in missing] == [DAY.isoformat()]
-    assert "production_funnel_unavailable" in missing[0]["reason"]
-    assert any(item.get("event_type") == "alpha_v2_cycle_blocked_day" for item in audits)
+    runner = _FakeRunner(epoch_root=root, data_health_status="degraded")
+    cycle._run_cli = runner  # noqa: SLF001 - 测试注入
+    result = cycle.run_daily_cycle()
+    assert result["_scheduler_detail"].startswith("alpha_v2_waiting:data_health_not_healthy")
+    assert runner.data_health_runs == 1  # 先生成、再验证
+    assert not any(script == "alpha_v2_shadow_capture.py" for script, _ in runner.calls)
+    assert list(root.rglob("shadow_*.jsonl")) == []
+    assert audits == []
 
 
-def test_ready_funnel_runs_steps_in_order(monkeypatch, tmp_path):
+def test_degraded_then_healthy_recovers_in_same_day(tmp_path):
+    """DH-7：第一次 degraded 不 capture，数据随后变齐 → 第二次 capture。"""
     root = tmp_path / "alpha_v2"
     _write_epoch(root)
-    funnel_root = tmp_path / "runtime" / "production_funnel"
-    emit_funnel_snapshot(funnel_root=funnel_root, payload=_funnel_payload(deep=["600001"]))
-    service, calls, audits = _service(
-        monkeypatch,
+    _emit(tmp_path, deep=["600001"])
+    service, cycle, audits = _service(
+        tmp_path,
+        now=datetime.combine(DAY, time(22, 30)),
+        readiness_allowed=True,
+        epoch_root=root,
+    )
+    runner = _FakeRunner(epoch_root=root, data_health_status="degraded")
+    cycle._run_cli = runner  # noqa: SLF001
+    first = cycle.run_daily_cycle()
+    assert first["_scheduler_detail"].startswith("alpha_v2_waiting:")
+    assert list(root.rglob("shadow_*.jsonl")) == []
+    runner.data_health_status = "healthy"
+    second = cycle.run_daily_cycle()
+    assert second["_scheduler_detail"] == "alpha_v2_cycle_completed"
+    assert list(root.rglob("shadow_*.jsonl"))
+    assert any(item.get("event_type") == "alpha_v2_cycle_completed" for item in audits)
+    reports = root / "validation" / "alpha_v2_epoch_001" / "reports"
+    assert list(reports.glob("*.json"))
+
+
+def test_funnel_missing_waits_without_capture(tmp_path):
+    root = tmp_path / "alpha_v2"
+    _write_epoch(root)
+    service, cycle, _ = _service(
+        tmp_path,
+        now=datetime.combine(DAY, time(22, 30)),
+        readiness_allowed=True,
+        epoch_root=root,
+    )
+    runner = _FakeRunner(epoch_root=root)
+    cycle._run_cli = runner  # noqa: SLF001
+    result = cycle.run_daily_cycle()
+    assert result["_scheduler_detail"].startswith("alpha_v2_waiting:")
+    assert not any(script == "alpha_v2_shadow_capture.py" for script, _ in runner.calls)
+
+
+def test_unlinked_funnel_is_not_ready(tmp_path):
+    root = tmp_path / "alpha_v2"
+    _write_epoch(root)
+    _emit(tmp_path, deep=["600001"], linked=False)
+    service, cycle, _ = _service(
+        tmp_path,
+        now=datetime.combine(DAY, time(22, 30)),
+        readiness_allowed=True,
+        epoch_root=root,
+    )
+    runner = _FakeRunner(epoch_root=root)
+    cycle._run_cli = runner  # noqa: SLF001
+    result = cycle.run_daily_cycle()
+    assert result["_scheduler_detail"] == "alpha_v2_waiting:production_funnel_not_linked_to_report"
+    assert not any(script == "alpha_v2_shadow_capture.py" for script, _ in runner.calls)
+
+
+def test_readiness_blocked_waits_without_capture(tmp_path):
+    root = tmp_path / "alpha_v2"
+    _write_epoch(root)
+    _emit(tmp_path, deep=["600001"])
+    service, cycle, _ = _service(
+        tmp_path,
+        now=datetime.combine(DAY, time(22, 30)),
+        readiness_allowed=False,
+        epoch_root=root,
+    )
+    runner = _FakeRunner(epoch_root=root)
+    cycle._run_cli = runner  # noqa: SLF001
+    result = cycle.run_daily_cycle()
+    assert result["_scheduler_detail"].startswith("alpha_v2_waiting:")
+    assert not any(script == "alpha_v2_shadow_capture.py" for script, _ in runner.calls)
+
+
+def test_ready_prerequisites_run_capture_then_history_tail(tmp_path):
+    root = tmp_path / "alpha_v2"
+    _write_epoch(root)
+    _emit(tmp_path, deep=["600001"])
+    service, cycle, audits = _service(
         tmp_path,
         now=datetime.combine(DAY, time(22, 40)),
         readiness_allowed=True,
         epoch_root=root,
     )
-    result = service._live_shadow_cycle.run_daily_cycle()
+    runner = _FakeRunner(epoch_root=root)
+    cycle._run_cli = runner  # noqa: SLF001
+    result = cycle.run_daily_cycle()
     assert result["_scheduler_success"] is True
-    assert [item["step"] for item in result["steps"]] == [
-        "data_health",
-        "capture",
-        "mature",
-        "report",
-    ]
-    assert [script for script, _ in calls] == [
+    assert [item["step"] for item in result["steps"]] == ["capture", "mature", "report"]
+    scripts = [script for script, _ in runner.calls]
+    assert scripts == [
         "alpha_v2_data_health_snapshot.py",
         "alpha_v2_shadow_capture.py",
         "alpha_v2_shadow_mature.py",
         "alpha_v2_validation_report.py",
     ]
-    capture_argv = calls[1][1]
-    assert "--cohort-source" in capture_argv
+    capture_argv = runner.calls[1][1]
     assert capture_argv[capture_argv.index("--cohort-source") + 1] == "production_funnel"
     assert any(item.get("event_type") == "alpha_v2_cycle_completed" for item in audits)
 
 
-def test_rerun_is_idempotent(monkeypatch, tmp_path):
+def test_blocked_day_records_missing_and_still_runs_history_tail(tmp_path):
+    """§9：到 deadline 仍不健康 → 落 missing，但历史日 mature/KPI 必须继续推进。"""
+    root = tmp_path / "alpha_v2"
+    epoch = _write_epoch(root)
+    _emit(tmp_path, deep=["600001"])
+    service, cycle, audits = _service(
+        tmp_path,
+        now=datetime.combine(DAY, time(23, 56)),
+        readiness_allowed=True,
+        epoch_root=root,
+    )
+    runner = _FakeRunner(epoch_root=root, data_health_status="degraded")
+    cycle._run_cli = runner  # noqa: SLF001
+    result = cycle.run_daily_cycle()
+    assert result["missing_recorded"] is True
+    assert result["_scheduler_detail"].startswith("alpha_v2_blocked_recorded_missing")
+    assert [item["step"] for item in result["history_tail"]] == ["mature", "report"]
+    assert not any(script == "alpha_v2_shadow_capture.py" for script, _ in runner.calls)
+    from stock_analyzer.alpha_v2.validation.shadow_capture import list_missing_days
+
+    missing = list_missing_days(root, epoch.epoch_id)
+    assert [item["signal_date"] for item in missing] == [DAY.isoformat()]
+    assert "production_prerequisites_unavailable" in missing[0]["reason"]
+    assert any(item.get("event_type") == "alpha_v2_cycle_blocked_day" for item in audits)
+    assert (root / "validation" / "alpha_v2_epoch_001" / "reports").exists()
+
+
+def test_rerun_is_idempotent(tmp_path):
     """Attack E：同一天跑两次，第二次直接幂等返回、不再起任何重活。"""
     root = tmp_path / "alpha_v2"
     _write_epoch(root)
-    funnel_root = tmp_path / "runtime" / "production_funnel"
-    emit_funnel_snapshot(funnel_root=funnel_root, payload=_funnel_payload(deep=["600001"]))
-    service, calls, _ = _service(
-        monkeypatch,
+    _emit(tmp_path, deep=["600001"])
+    service, cycle, _ = _service(
         tmp_path,
         now=datetime.combine(DAY, time(22, 40)),
         readiness_allowed=True,
         epoch_root=root,
     )
-    first = service._live_shadow_cycle.run_daily_cycle()
+    runner = _FakeRunner(epoch_root=root)
+    cycle._run_cli = runner  # noqa: SLF001
+    first = cycle.run_daily_cycle()
     assert first["_scheduler_detail"] == "alpha_v2_cycle_completed"
-    calls.clear()
-    second = service._live_shadow_cycle.run_daily_cycle()
+    runner.calls.clear()
+    second = cycle.run_daily_cycle()
     assert second["_scheduler_detail"] == "alpha_v2_already_completed"
-    assert calls == []
+    assert runner.calls == []
 
 
-def test_step_failure_returns_failure_with_audit(monkeypatch, tmp_path):
+def test_capture_step_failure_returns_failure_with_audit(tmp_path):
     root = tmp_path / "alpha_v2"
     _write_epoch(root)
-    funnel_root = tmp_path / "runtime" / "production_funnel"
-    emit_funnel_snapshot(funnel_root=funnel_root, payload=_funnel_payload(deep=["600001"]))
-    service, calls, audits = _service(
-        monkeypatch,
+    _emit(tmp_path, deep=["600001"])
+    service, cycle, audits = _service(
         tmp_path,
         now=datetime.combine(DAY, time(22, 40)),
         readiness_allowed=True,
         epoch_root=root,
     )
-
-    def _failing_run(script: str, argv: list[str], *, timeout_sec: int):
-        calls.append((script, list(argv)))
-        if script == "alpha_v2_shadow_capture.py":
-            return 10, "生产漏斗硬门未通过"
-        return 0, "ok"
-
-    service._live_shadow_cycle._run_cli = _failing_run  # noqa: SLF001
-    result = service._live_shadow_cycle.run_daily_cycle()
+    runner = _FakeRunner(epoch_root=root, capture_returncode=10)
+    cycle._run_cli = runner  # noqa: SLF001
+    result = cycle.run_daily_cycle()
     assert result["_scheduler_success"] is False
     assert result["_scheduler_detail"].startswith("alpha_v2_step_failed:capture")
     assert any(item.get("event_type") == "alpha_v2_cycle_step_failed" for item in audits)
-    # 失败后没有 KPI 报告产物
-    reports = root / "validation" / "alpha_v2_epoch_001" / "reports"
-    assert not list(reports.glob("*.json")) if reports.exists() else True
 
 
-def test_research_proxy_funnel_artifact_is_rejected_as_not_ready(monkeypatch, tmp_path):
-    """未链接（无 report_id）的 funnel 不构成"生产就绪"，调度层不起捕获。"""
+def test_missing_day_record_is_idempotent_across_ticks(tmp_path):
+    """窗口末尾落账后再次 tick：不重复写 missing、不重复起重活。"""
     root = tmp_path / "alpha_v2"
-    _write_epoch(root)
-    payload = _funnel_payload(deep=["600001"])
-    payload["night_scan_report_id"] = ""
-    payload["funnel_snapshot_hash"] = funnel_snapshot_hash(payload)
-    emit_funnel_snapshot(funnel_root=tmp_path / "runtime" / "production_funnel", payload=payload)
-    service, calls, _ = _service(
-        monkeypatch,
+    epoch = _write_epoch(root)
+    service, cycle, _ = _service(
         tmp_path,
-        now=datetime.combine(DAY, time(22, 40)),
+        now=datetime.combine(DAY, time(23, 56)),
         readiness_allowed=True,
         epoch_root=root,
     )
-    result = service._live_shadow_cycle.run_daily_cycle()
-    assert result["_scheduler_detail"] == "alpha_v2_waiting:production_funnel_not_linked_to_report"
-    assert calls == []
+    runner = _FakeRunner(epoch_root=root, data_health_status="degraded")
+    cycle._run_cli = runner  # noqa: SLF001
+    cycle.run_daily_cycle()
+    runner.calls.clear()
+    cycle.run_daily_cycle()
+    from stock_analyzer.alpha_v2.validation.shadow_capture import list_missing_days
 
-
-def test_readiness_blocked_waits_without_heavy_work(monkeypatch, tmp_path):
-    root = tmp_path / "alpha_v2"
-    _write_epoch(root)
-    funnel_root = tmp_path / "runtime" / "production_funnel"
-    emit_funnel_snapshot(funnel_root=funnel_root, payload=_funnel_payload(deep=["600001"]))
-    service, calls, _ = _service(
-        monkeypatch,
-        tmp_path,
-        now=datetime.combine(DAY, time(22, 40)),
-        readiness_allowed=False,
-        epoch_root=root,
-    )
-    result = service._live_shadow_cycle.run_daily_cycle()
-    assert result["_scheduler_detail"].startswith("alpha_v2_waiting:")
-    assert calls == []
+    missing = list_missing_days(root, epoch.epoch_id)
+    assert len(missing) == 1

@@ -9,8 +9,7 @@ from __future__ import annotations
 
 import json
 from datetime import date
-
-import pytest
+from pathlib import Path
 
 from _alpha_v2_m3_fixtures import (
     capture_at,
@@ -22,8 +21,11 @@ from _alpha_v2_m3_fixtures import (
 from stock_analyzer.alpha_v2.validation.production_funnel import (
     FUNNEL_SCHEMA,
     FUNNEL_SOURCE,
-    extract_funnel_from_scan_report,
+    build_source_evidence,
+    extract_funnel_from_source_evidence,
+    file_sha256,
     funnel_snapshot_hash,
+    write_source_evidence,
 )
 from stock_analyzer.alpha_v2.validation.shadow_capture import (
     build_shadow_rows,
@@ -36,7 +38,7 @@ DAY = date(2026, 9, 18)
 DEEP = ["600004", "600002", "600001"]
 
 
-def _funnel_payload() -> dict[str, object]:
+def _funnel_payload(tmp_path: Path) -> dict[str, object]:
     report = {
         "funnel": {
             "policy": "snapshot_funnel",
@@ -53,15 +55,21 @@ def _funnel_payload() -> dict[str, object]:
             "pinned_symbols": ["999999"],
         },
     }
-    payload = extract_funnel_from_scan_report(
+    evidence = build_source_evidence(
         source_report=report,
+        trade_date=DAY.isoformat(),
         trace_id="t",
-        scan_status="night_scan_completed",
         created_at=f"{DAY.isoformat()}T22:00:00+08:00",
+    )
+    evidence_path = write_source_evidence(funnel_root=tmp_path, payload=evidence)
+    payload = extract_funnel_from_source_evidence(
+        evidence,
+        source_artifact_path=str(evidence_path),
+        source_artifact_sha256=file_sha256(evidence_path),
     )
     payload["signal_date"] = DAY.isoformat()
     payload["trade_date"] = DAY.isoformat()
-    payload["night_scan_report_id"] = "nr-20260918-01"
+    payload["published_report_id"] = "nr-20260918-01"
     payload["funnel_snapshot_hash"] = funnel_snapshot_hash(payload)
     return payload
 
@@ -136,7 +144,7 @@ def _governance(tmp_path, epoch) -> dict[str, object]:
 
 
 def test_wellformed_funnel_evidence_makes_the_day_clean(tmp_path):
-    epoch = _build_epoch(tmp_path, require_funnel=True, funnel=_funnel_payload())
+    epoch = _build_epoch(tmp_path, require_funnel=True, funnel=_funnel_payload(tmp_path))
     governance = _governance(tmp_path, epoch)
     assert governance["captured_days"] == 1
     assert governance["clean_oos_days"] == 1, governance["by_date"]
@@ -152,7 +160,7 @@ def test_missing_funnel_evidence_excludes_the_day(tmp_path):
 
 def test_tampered_funnel_members_are_caught(tmp_path):
     """Attack C 的 KPI 侧备份闸：写时蒙混过关，写后复核照样抓到。"""
-    funnel = _funnel_payload()
+    funnel = _funnel_payload(tmp_path)
     funnel["deep_members"] = funnel["deep_members"][:2]  # 改成员但不重算 hash
     epoch = _build_epoch(tmp_path, require_funnel=True, funnel=funnel)
     day = _governance(tmp_path, epoch)["by_date"][0]
@@ -161,7 +169,7 @@ def test_tampered_funnel_members_are_caught(tmp_path):
 
 
 def test_cohort_mismatch_excludes_the_day(tmp_path):
-    funnel = _funnel_payload()
+    funnel = _funnel_payload(tmp_path)
     funnel["deep_members"] = funnel["deep_members"][:2]
     funnel["deep_count"] = 2
     funnel["funnel_snapshot_hash"] = funnel_snapshot_hash(funnel)
@@ -172,7 +180,7 @@ def test_cohort_mismatch_excludes_the_day(tmp_path):
 
 
 def test_rank_mismatch_excludes_the_day(tmp_path):
-    funnel = _funnel_payload()
+    funnel = _funnel_payload(tmp_path)
     funnel["deep_members"] = [
         {**member, "rank": 9} for member in funnel["deep_members"]
     ]
@@ -184,7 +192,7 @@ def test_rank_mismatch_excludes_the_day(tmp_path):
 
 
 def test_non_authoritative_selector_mode_excludes_the_day(tmp_path):
-    funnel = _funnel_payload()
+    funnel = _funnel_payload(tmp_path)
     funnel["selector_mode"] = "snapshot_fallback"
     funnel["funnel_snapshot_hash"] = funnel_snapshot_hash(funnel)
     epoch = _build_epoch(tmp_path, require_funnel=True, funnel=funnel)
@@ -202,7 +210,7 @@ def test_legacy_manifest_without_funnel_requirement_keeps_m3_semantics(tmp_path)
 
 def test_manifest_funnel_block_is_the_complete_artifact(tmp_path):
     """内嵌证据必须是 funnel 工件原文（含 hash 字段本身与 degraded 块）。"""
-    epoch = _build_epoch(tmp_path, require_funnel=True, funnel=_funnel_payload())
+    epoch = _build_epoch(tmp_path, require_funnel=True, funnel=_funnel_payload(tmp_path))
     manifest_path = (
         tmp_path / "validation" / epoch.epoch_id / "manifests"
         / f"shadow_day_{DAY.strftime('%Y%m%d')}.json"

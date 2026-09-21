@@ -15,6 +15,8 @@ from _alpha_v2_m3_fixtures import open_epoch_for_manifest, write_freeze_manifest
 from stock_analyzer.alpha_v2.validation.production_funnel import (
     funnel_snapshot_path,
     load_funnel_snapshot,
+    load_source_evidence,
+    source_evidence_path,
 )
 from stock_analyzer.config import load_config
 from stock_analyzer.runtime.services.live_shadow_cycle_service import (
@@ -79,7 +81,14 @@ def test_emit_writes_funnel_when_enabled(tmp_path):
     assert payload["signal_date"] == DAY.isoformat()
     assert payload["deep_count"] == 2
     assert payload["pinned_override_members"] == [{"symbol": "999999"}]
-    assert payload["night_scan_report_id"] == ""  # 尚未链接
+    assert payload["published_report_id"] == ""  # 尚未链接
+    # R1：成员来源证据与 funnel 同日落盘，且 funnel 的源指针指向它
+    evidence_path = source_evidence_path(tmp_path / "runtime" / "production_funnel", DAY)
+    assert evidence_path.exists()
+    evidence = load_source_evidence(evidence_path)
+    assert len(evidence["deep_selected"]) == 2
+    assert payload["source_night_scan_artifact_path"] == str(evidence_path)
+    assert payload["source_night_scan_artifact_sha256"]
     assert any(
         item.get("event_type") == "alpha_v2_production_funnel_emitted"
         for item in stub.audits
@@ -113,7 +122,9 @@ def test_emit_conflict_is_audited_not_raised(tmp_path):
         report=_scan_report(), trade_date=NOW, trace_id="t1"
     )
     conflicting = _scan_report()
-    conflicting["prefilter"]["deep_stage"]["selected"] = [{"symbol": "q0", "funnel_score": 1.0}]
+    conflicting["prefilter"]["deep_stage"]["selected"] = [
+        {"symbol": "q0", "funnel_score": 1.0}
+    ]
     cycle.emit_funnel_from_scan_report(
         report=conflicting, trade_date=NOW, trace_id="t2"
     )
@@ -136,7 +147,17 @@ def test_link_after_publish_sets_report_identity(tmp_path):
     report_dir = tmp_path / "nightly_reports" / DAY.isoformat()
     report_dir.mkdir(parents=True)
     report_file = report_dir / "nr-20260921-01.json"
-    report_file.write_text(json.dumps({"report_id": "nr-20260921-01"}), encoding="utf-8")
+    report_file.write_text(
+        json.dumps(
+            {
+                "report_id": "nr-20260921-01",
+                "report_kind": "formal",
+                "trade_date": DAY.isoformat(),
+                "scan_status": "completed",
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class _ReportService:
         @staticmethod
@@ -151,9 +172,9 @@ def test_link_after_publish_sets_report_identity(tmp_path):
     payload = load_funnel_snapshot(
         funnel_snapshot_path(tmp_path / "runtime" / "production_funnel", DAY)
     )
-    assert payload["night_scan_report_id"] == "nr-20260921-01"
-    assert payload["source_artifact_sha256"]
-    assert payload["source_artifact_path"].endswith("nr-20260921-01.json")
+    assert payload["published_report_id"] == "nr-20260921-01"
+    assert payload["published_report_sha256"]
+    assert payload["published_report_path"].endswith("nr-20260921-01.json")
     assert any(
         item.get("event_type") == "alpha_v2_production_funnel_linked"
         for item in stub.audits
@@ -187,7 +208,17 @@ def test_linked_funnel_blocks_further_emit(tmp_path):
     )
     report_dir = tmp_path / "nightly_reports" / DAY.isoformat()
     report_dir.mkdir(parents=True)
-    (report_dir / "nr-20260921-01.json").write_text("{}", encoding="utf-8")
+    (report_dir / "nr-20260921-01.json").write_text(
+        json.dumps(
+            {
+                "report_id": "nr-20260921-01",
+                "report_kind": "formal",
+                "trade_date": DAY.isoformat(),
+                "scan_status": "completed",
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class _ReportService:
         @staticmethod
@@ -206,7 +237,7 @@ def test_linked_funnel_blocks_further_emit(tmp_path):
     payload = load_funnel_snapshot(
         funnel_snapshot_path(tmp_path / "runtime" / "production_funnel", DAY)
     )
-    assert payload["night_scan_report_id"] == "nr-20260921-01"
+    assert payload["published_report_id"] == "nr-20260921-01"
 
 
 def test_shared_epoch_fixture_still_constructs_epoch(tmp_path):

@@ -241,17 +241,14 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 7
-        model_provenance = dict(model_block.get("provenance", {}) or {})
-        window = model_provenance.get("window")
         try:
+            # R1：把**即将冻结的模型块**整体交给 gate——逐项比对 model_id /
+            # artifact_hash / feature_schema_hash / training commit / 训练窗 /
+            # training_data_fingerprint，杜绝"验 A 冻 B"。
             preflight_block = assert_preflight_gate(
                 report_path=args.preflight_report,
                 runtime_code_commit=code_commit,
-                training_window=(
-                    [str(window[0]), str(window[1])]
-                    if isinstance(window, (list, tuple)) and len(window) == 2
-                    else None
-                ),
+                model_block=model_block,
                 max_age_hours=float(
                     getattr(config.alpha_v2, "preflight_max_age_hours", 48.0)
                 ),
@@ -267,7 +264,9 @@ def main(argv: list[str] | None = None) -> int:
         # NO_GIT_CONTAINER_SMOKE 直接 json.loads(stdout)）。
         print(
             f"[freeze] Production Data Preflight: verdict={preflight_block['verdict']} "
-            f"training_window={preflight_block['training_window']} "
+            f"model={preflight_block['model_identity']['model_id']} "
+            f"window={preflight_block['training_window']} "
+            f"data_fingerprint={str(preflight_block['training_data_fingerprint'])[:12]}… "
             f"hash={str(preflight_block['preflight_hash'])[:12]}…",
             file=sys.stderr,
         )

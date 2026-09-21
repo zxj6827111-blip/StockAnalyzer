@@ -441,6 +441,7 @@ def main(argv: list[str] | None = None) -> int:
                 # rehearsal/test 允许未链接工件（排演环境没有真实发布流程）。
                 require_linked_report=(validation_mode == "production"),
                 report_root=report_root,
+                funnel_root=funnel_root,
             )
         except FunnelError as exc:
             print(f"[shadow] 生产漏斗硬门未通过: {exc}", file=sys.stderr)
