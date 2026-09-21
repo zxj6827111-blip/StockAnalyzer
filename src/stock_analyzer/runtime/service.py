@@ -153,6 +153,9 @@ from stock_analyzer.runtime.services.idle_queue_service import RuntimeIdleQueueS
 from stock_analyzer.runtime.services.learning_governance_service import (
     RuntimeLearningGovernanceService,
 )
+from stock_analyzer.runtime.services.live_shadow_cycle_service import (
+    LiveShadowCycleService,
+)
 from stock_analyzer.runtime.services.market_sync_service import RuntimeMarketSyncService
 from stock_analyzer.runtime.services.news_service import RuntimeNewsService
 from stock_analyzer.runtime.services.nightly_delivery_service import NightlyDeliveryService
@@ -551,6 +554,8 @@ class StockAnalyzerService:
             self._config.command_channel.state_persist_path
         )
         self._week5_automation_service = RuntimeWeek5AutomationService(self)
+        # M4-L 影子循环胶水（runtime 侧唯一消费 V2 flag 的模块；见其 docstring）
+        self._live_shadow_cycle = LiveShadowCycleService(self)
         # 正式晚报链路的两个窄职责服务：报告（构造/冻结/渲染）与交付（逐目标
         # 状态/重试/恢复）。开关关闭时不注册调度、也不参与夜扫回调。
         self._nightly_report_service = NightlyReportService(self)
@@ -18376,6 +18381,21 @@ class StockAnalyzerService:
                 weekdays=trading_weekdays,
                 date_predicate=trading_day_filter,
             )
+        # M4-L：影子日常循环（data_health → capture → mature → KPI）。注册条件、
+        # 窗口与回调全部由中性委托提供（本文件不消费任何 V2 配置；见
+        # live_shadow_cycle_service 的模块说明与架构守卫白名单）。
+        live_shadow = getattr(self, "_live_shadow_cycle", None)
+        cycle_spec = live_shadow.registration() if live_shadow is not None else None
+        if cycle_spec is not None:
+            self._scheduler.register_interval(
+                name=str(cycle_spec["name"]),
+                window_start_hhmm=str(cycle_spec["start"]),
+                window_end_hhmm=str(cycle_spec["latest"]),
+                interval_minutes=max(1, int(cycle_spec["interval"])),  # type: ignore[arg-type]
+                callback=cycle_spec["callback"],  # type: ignore[arg-type]
+                weekdays=trading_weekdays,
+                date_predicate=trading_day_filter,
+            )
 
     def _job_premarket_scan(self) -> dict[str, object]:
         global_snapshot_report = self._collect_global_market_snapshot(source_trace_id="premarket")
@@ -20480,6 +20500,10 @@ class StockAnalyzerService:
         frozen = _coerce_object_mapping(published.get("report"))
         report_id = str(published.get("report_id", "")).strip()
         scan_status = str(frozen.get("scan_status", "")).strip()
+        # M4-L：晚报发布后由影子循环服务完成生产漏斗→报告的链接（无 V2 引用）。
+        self._live_shadow_cycle.link_published_report(
+            trade_date=trade_date, report_id=report_id, report_service=report_service
+        )
         records = self._nightly_delivery_service.ensure_records(frozen)
         report_service.update_date_state(
             trade_date,

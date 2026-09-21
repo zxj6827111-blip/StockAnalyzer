@@ -100,7 +100,20 @@ def _artifact(tmp_path: Path, *, commit: str = A, model_id: str = "epoch_test") 
         frame=_matrix(),
         model_id=model_id,
         spec=HeadFitSpec(min_train_rows=20, min_class_balance=0.05),
-        provenance={"source": "r41_test"},
+        # M4-L / R1：provenance 必须带训练窗与训练数据指纹——production freeze 的
+        # preflight 硬门会与报告逐项对账（gate 做一致性比对；重算链在 preflight 测试）。
+        # R1.1：还必须**封存**完整训练输入身份（warmup / source_window / 指纹版本 /
+        # 行数 / 列清单）——生产 freeze 会用 require_sealed_provenance=True 加载。
+        provenance={
+            "source": "r41_test",
+            "window": ["2026-05-01", "2026-06-30"],
+            "warmup_days": 200,
+            "source_window": ["2025-10-13", "2026-06-30"],
+            "training_data_fingerprint": "r41-fixture-fingerprint",
+            "training_data_fingerprint_version": "v2",
+            "training_data_rows": 4321,
+            "training_data_columns": ["symbol", "date", "close"],
+        },
         extra_identity={
             "code_commit": commit,
             "identity_source": "container_build_identity",
@@ -156,9 +169,9 @@ def test_case1_same_training_and_runtime_commit_passes(tmp_path: Path):
     manifest = _manifest_for(artifact, commit=A)
     assert manifest["model"]["model_training_code_commit"] == A
     assert verify_freeze_integrity(manifest) is True
-    assert verify_freeze_against_runtime(
-        manifest, code_commit=A, model_training_code_commit=A
-    ) == []
+    assert (
+        verify_freeze_against_runtime(manifest, code_commit=A, model_training_code_commit=A) == []
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +186,75 @@ def test_case2_training_a_runtime_b_rejected_by_gate():
     assert "模型训练身份" in str(excinfo.value)
 
 
-def _run_freeze_cli(sandbox: Path, *, model_dir: Path, out: Path, start_date: str) -> object:
+def _write_preflight_report(tmp_path: Path, *, artifact: Path, commit: str = A) -> Path:
+    """写一份与工件身份/训练窗/指纹绑定的 PASS preflight（M4-L R1 硬门输入）。"""
+    from stock_analyzer.alpha_v2.validation.frozen_model import (
+        frozen_model_identity_payload,
+    )
+    from stock_analyzer.alpha_v2.validation.preflight import (
+        PREFLIGHT_SCHEMA,
+        VERDICT_PASS,
+        preflight_hash_of,
+    )
+
+    model_identity = dict(frozen_model_identity_payload(artifact))
+    payload: dict[str, object] = {
+        "schema": PREFLIGHT_SCHEMA,
+        "generated_at": __import__("datetime").datetime.now().astimezone().isoformat(),
+        "verdict": VERDICT_PASS,
+        "blocking_findings": [],
+        "warnings": [],
+        "facts": {},
+        "runtime_identity": {"code_commit": commit},
+        # R1：gate 会逐项比对 model_identity（id/artifact hash/schema/training commit/
+        # 指纹）与"即将冻结的模型块"——本夹具只证明**一致性比对**本身有效；
+        # "重算指纹并比对数据"由 preflight 自身测试与 R1 端到端测试覆盖。
+        # R1.1：再加指纹契约身份（版本 / warmup / source_window）三项。
+        "model_identity": {
+            "model_id": str(model_identity.get("model_id", "")),
+            "model_artifact_hash": str(model_identity.get("artifact_hash", "")),
+            "feature_schema_hash": str(model_identity.get("feature_schema_hash", "")),
+            "model_training_code_commit": str(model_identity.get("model_training_code_commit", "")),
+            "training_data_fingerprint": str(
+                dict(model_identity.get("provenance", {}) or {}).get(
+                    "training_data_fingerprint", ""
+                )
+            ),
+            "training_data_fingerprint_version": str(
+                dict(model_identity.get("provenance", {}) or {}).get(
+                    "training_data_fingerprint_version", ""
+                )
+            ),
+            "provenance_warmup_days": dict(model_identity.get("provenance", {}) or {}).get(
+                "warmup_days"
+            ),
+            "provenance_source_window": list(
+                dict(model_identity.get("provenance", {}) or {}).get("source_window") or []
+            ),
+        },
+        "data_identity": {
+            "market_db": "synthetic",
+            "training_data_fingerprint_version": "v2",
+            "warmup_days": 200,
+            "source_window": ["2025-10-13", "2026-06-30"],
+        },
+        "training_window": {"start": "2026-05-01", "end": "2026-06-30"},
+        "checks": [],
+    }
+    payload["preflight_hash"] = preflight_hash_of(payload)
+    path = tmp_path / "preflight.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _run_freeze_cli(
+    sandbox: Path,
+    *,
+    model_dir: Path,
+    out: Path,
+    start_date: str,
+    preflight_report: Path | None = None,
+) -> object:
     keep = [
         part
         for part in os.environ.get("PATH", "").split(os.pathsep)
@@ -195,6 +276,11 @@ def _run_freeze_cli(sandbox: Path, *, model_dir: Path, out: Path, start_date: st
             "--start-date",
             start_date,
             "--open-epoch",
+            *(
+                ["--preflight-report", str(preflight_report)]
+                if preflight_report is not None
+                else []
+            ),
         ],
         cwd=str(sandbox),
         capture_output=True,
@@ -244,9 +330,12 @@ def test_case2_freeze_cli_rejects_and_does_not_open_epoch(tmp_path: Path):
     sandbox, set_identity = _sandbox(tmp_path, A)
     today = date.today().isoformat()
 
+    preflight = _write_preflight_report(tmp_path, artifact=artifact, commit=A)
     ok_out = tmp_path / "out_ok"
     ok_out.mkdir()
-    good = _run_freeze_cli(sandbox, model_dir=artifact, out=ok_out, start_date=today)
+    good = _run_freeze_cli(
+        sandbox, model_dir=artifact, out=ok_out, start_date=today, preflight_report=preflight
+    )
     assert good.returncode == 0, good.stderr[-800:]
     assert (ok_out / "validation" / "validation_freeze_manifest.json").exists()
     epochs_ok = json.loads((ok_out / "validation" / "epochs.json").read_text(encoding="utf-8"))
@@ -255,7 +344,9 @@ def test_case2_freeze_cli_rejects_and_does_not_open_epoch(tmp_path: Path):
     set_identity(B)
     bad_out = tmp_path / "out_bad"
     bad_out.mkdir()
-    bad = _run_freeze_cli(sandbox, model_dir=artifact, out=bad_out, start_date=today)
+    bad = _run_freeze_cli(
+        sandbox, model_dir=artifact, out=bad_out, start_date=today, preflight_report=preflight
+    )
     assert bad.returncode == 5, (bad.returncode, bad.stdout[-500:], bad.stderr[-800:])
     assert "模型训练身份" in bad.stderr
     assert not (bad_out / "validation" / "validation_freeze_manifest.json").exists()
@@ -397,13 +488,15 @@ def test_case6b_artifact_reload_after_retrain_is_consistent(tmp_path: Path):
     """反向对照：重新训练（同一身份）产出的工件必须可加载——哈希覆盖不会误伤正常产物。"""
     first = _artifact(tmp_path / "one", commit=A)
     second = _artifact(tmp_path / "two", commit=A)
-    assert load_frozen_model(first).manifest["artifact_hash"] == load_frozen_model(
-        second
-    ).manifest["artifact_hash"]
+    assert (
+        load_frozen_model(first).manifest["artifact_hash"]
+        == load_frozen_model(second).manifest["artifact_hash"]
+    )
     differing = _artifact(tmp_path / "three", commit=B)
-    assert load_frozen_model(differing).manifest["artifact_hash"] != load_frozen_model(
-        first
-    ).manifest["artifact_hash"]
+    assert (
+        load_frozen_model(differing).manifest["artifact_hash"]
+        != load_frozen_model(first).manifest["artifact_hash"]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -457,9 +550,9 @@ def test_positive_identity_chain_all_equal(tmp_path: Path):
     assert set(chain.values()) == {A}, chain
     assert epoch_identity_matches(epoch, {"code_commit": A}, keys=("code_commit",)) == []
     assert_model_training_commit(model_training_code_commit=A, runtime_code_commit=A)
-    assert verify_freeze_against_runtime(
-        manifest, code_commit=A, model_training_code_commit=A
-    ) == []
+    assert (
+        verify_freeze_against_runtime(manifest, code_commit=A, model_training_code_commit=A) == []
+    )
 
 
 def test_binding_gate_skips_non_production_modes(tmp_path: Path):

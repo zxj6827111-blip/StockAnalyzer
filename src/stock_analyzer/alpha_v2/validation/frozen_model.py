@@ -54,6 +54,54 @@ FROZEN_MODEL_SCHEMA = "alpha_v2_shadow_model.v1"
 MODEL_MANIFEST_FILENAME = "model_manifest.json"
 MODEL_INDEX_FILENAME = "model_index.json"
 
+# ── 工件哈希版本（M4-L R1.1：训练 provenance 封存）───────────────────────────
+# 复用既有 manifest schema（``alpha_v2_shadow_model.v1``）做**字段级**演进，
+# 不另造平行版本体系：manifest 多一个 ``artifact_hash_version`` 字段，加载时按
+# 记录值复算，因此历史工件不会被误判。
+#
+#   v1 = R4.1 算法：只有 model_id / 特征列 / 参数 / 目标 / 校准 / 文件哈希 /
+#        code_commit。**训练 provenance 不在受保护身份内**——事后改写
+#        ``provenance.training_data_fingerprint`` 或 ``provenance.window``
+#        不会破坏工件完整性（外部复核 R1.1 的核心缺口）。
+#   v2 = 追加 ``config_hash`` 与规范化 ``training_provenance`` 块。
+#
+# 生产（``validation_mode=production``）只接受 v2；v1 仅用于 historical /
+# rehearsal 兼容（旧工件仍可加载、仍可被历史解析器按内容哈希对齐）。
+ARTIFACT_HASH_VERSION_FIELD = "artifact_hash_version"
+ARTIFACT_HASH_VERSION_V1 = "v1"
+ARTIFACT_HASH_VERSION_V2 = "v2"
+CURRENT_ARTIFACT_HASH_VERSION = ARTIFACT_HASH_VERSION_V2
+
+# 进入受保护身份的 provenance 键（**固定清单**：新增字段不会悄悄改变旧工件的
+# 哈希语义，需要进身份的字段必须显式登记在这里）。
+SEALED_PROVENANCE_KEYS: tuple[str, ...] = (
+    "market_db",
+    "window",
+    "warmup_days",
+    "source_window",
+    "training_data_fingerprint",
+    "training_data_fingerprint_version",
+    "training_data_rows",
+    "training_data_columns",
+    "training_symbols_limit",
+    "panel_fingerprint",
+    "decision_rows",
+    "price_mode",
+    "price_mode_certified",
+    "slippage_ratio",
+)
+
+# 生产形态**必须**存在的封存项：少了任何一项，artifact_hash 就没有真正保护
+# "这份模型用什么数据、在哪个窗口、含多少 warmup 训出来的"。
+SEALED_PROVENANCE_REQUIRED_KEYS: tuple[str, ...] = (
+    "window",
+    "warmup_days",
+    "source_window",
+    "training_data_fingerprint",
+    "training_data_rows",
+    "training_data_columns",
+)
+
 ALPHA_TARGET_5D = "alpha_target_5d"
 
 DIRECTION_OUTPUTS: tuple[str, ...] = tuple(
@@ -349,9 +397,7 @@ def predict_frozen_model_matrix(model: FrozenModel, frame: pd.DataFrame) -> pd.D
                 calibrated[finite] = np.asarray(calibrator.predict(raw[finite]), dtype=float)
             out[f"{target.output_column}_calibrated"] = calibrated
     # 校准状态自述：让下游明确知道"哪些方向列能叫概率"
-    out["direction_calibration"] = (
-        "isotonic_oos" if "p_up_net_5d" in model.calibrators else "none"
-    )
+    out["direction_calibration"] = "isotonic_oos" if "p_up_net_5d" in model.calibrators else "none"
     return out
 
 
@@ -370,6 +416,9 @@ def frozen_model_identity_payload(model_dir: str | Path) -> dict[str, object]:
     return {
         "model_id": manifest.get("model_id", ""),
         "artifact_hash": manifest.get("artifact_hash", ""),
+        # R1.1：工件哈希版本（v1 = 训练 provenance 不受保护，v2 = 已封存）。
+        # 生产门禁据此拒绝 unsealed 工件；如实透出，不做任何回退猜测。
+        "artifact_hash_version": artifact_hash_version_of(manifest),
         "artifact_created_at": manifest.get("created_at", ""),
         "artifact_path": str(Path(model_dir)),
         "heads": manifest.get("heads", []),
@@ -414,6 +463,9 @@ def persist_frozen_model(model: FrozenModel, root: str | Path) -> Path:
 
     manifest = dict(model.manifest)
     manifest["files"] = files
+    # R1.1：写入工件哈希版本（新工件恒为 v2），加载期按记录值复算——
+    # 老工件（无该字段）仍按 v1 复算，历史兼容不靠"猜"。
+    manifest[ARTIFACT_HASH_VERSION_FIELD] = CURRENT_ARTIFACT_HASH_VERSION
     manifest["artifact_hash"] = _artifact_hash(model, files)
     manifest_path = model_dir / MODEL_MANIFEST_FILENAME
     write_json_atomic(manifest_path, manifest)
@@ -436,11 +488,31 @@ def persist_frozen_model(model: FrozenModel, root: str | Path) -> Path:
 
 
 def load_frozen_model(
-    model_dir: str | Path, *, expected_artifact_hash: str | None = None
+    model_dir: str | Path,
+    *,
+    expected_artifact_hash: str | None = None,
+    require_sealed_provenance: bool = False,
 ) -> FrozenModel:
-    """按 manifest 校验后加载；任一文件哈希不符 / 身份不符直接抛错。"""
+    """按 manifest 校验后加载；任一文件哈希不符 / 身份不符直接抛错。
+
+    ``require_sealed_provenance=True``（生产路径）额外要求工件是 v2 哈希形态且
+    训练 provenance 封存完整——v1 工件（provenance 不受哈希保护）在生产一律拒绝，
+    但在 historical / rehearsal 路径仍可加载（§6 版本兼容）。
+    """
     model_path = Path(model_dir)
     manifest = _read_manifest(model_path)
+    if require_sealed_provenance:
+        version = artifact_hash_version_of(manifest)
+        if version != ARTIFACT_HASH_VERSION_V2:
+            raise FrozenModelError(
+                f"冻结模型工件未封存训练 provenance（artifact_hash_version={version}，"
+                f"生产要求 {ARTIFACT_HASH_VERSION_V2}）：{model_path}"
+            )
+        missing = missing_sealed_provenance_keys(manifest)
+        if missing:
+            raise FrozenModelError(
+                f"冻结模型工件 provenance 封存不完整（缺 {missing}）：{model_path}"
+            )
     files = manifest.get("files")
     if not isinstance(files, Mapping) or not files:
         raise FrozenModelError(f"冻结模型 manifest 缺 files 段: {model_path}")
@@ -542,8 +614,15 @@ def _build_manifest(
         "training": {
             key: value
             for key, value in diagnostics.items()
-            if key in {"train_rows_total", "calibration_rows_total", "train_date_min",
-                       "train_date_max", "calibration_date_min", "calibration_date_max"}
+            if key
+            in {
+                "train_rows_total",
+                "calibration_rows_total",
+                "train_date_min",
+                "train_date_max",
+                "calibration_date_min",
+                "calibration_date_max",
+            }
         },
         "target_diagnostics": diagnostics.get("targets", {}),
         "calibration_skipped": diagnostics.get("calibration_skipped", []),
@@ -554,37 +633,110 @@ def _build_manifest(
 
 
 def _artifact_hash(model: FrozenModel, files: Mapping[str, str]) -> str:
-    """工件内容哈希（R4.1 起包含训练身份）。
+    """工件内容哈希（R4.1 起包含训练身份，R1.1 起包含训练 provenance）。
 
     ``code_commit`` 必须进哈希：它是"这份模型由哪份代码训练出来"的唯一权威表达，
     若不在哈希覆盖内，事后改写 manifest 里的该字段不会被任何完整性检查发现
     （独立复核 Case 6b：改训练身份后 capture 仍然 rc=0）。
+
+    R1.1 起同一理由适用于**训练数据身份**：只保护 code_commit 而放任
+    ``provenance.window`` / ``warmup_days`` / ``training_data_fingerprint`` 可改，
+    等于允许"换一份数据再贴上原指纹"。新工件一律 v2（见模块常量注释）。
     """
-    body = {
-        "model_id": model.model_id,
-        "feature_columns": list(model.feature_columns),
-        "params": model.manifest.get("params", {}),
-        "targets": model.manifest.get("targets", []),
-        "calibration": model.manifest.get("calibration", {}),
-        "files": dict(sorted(files.items())),
-        "code_commit": str(model.manifest.get("code_commit", "") or ""),
-    }
+    body = _artifact_hash_body(model.manifest, files, version=CURRENT_ARTIFACT_HASH_VERSION)
     return stable_payload_hash(body)
 
 
 def _artifact_hash_from_manifest(manifest: Mapping[str, object]) -> str:
     files = manifest.get("files")
-    body = {
+    body = _artifact_hash_body(
+        manifest,
+        dict(files) if isinstance(files, Mapping) else {},
+        version=artifact_hash_version_of(manifest),
+    )
+    return stable_payload_hash(body)
+
+
+def _artifact_hash_body(
+    manifest: Mapping[str, object],
+    files: Mapping[str, object],
+    *,
+    version: str,
+) -> dict[str, object]:
+    """工件哈希正文；版本决定哪些身份字段进入受保护集合。
+
+    **v1 正文必须与 R4.1 算法逐字节一致**（只有下面那 7 个键）：否则历史工件
+    （早期 ``alpha_v2_shadow_model_freeze.py`` 产出、磁盘上仍有归档）会因为
+    "复算公式变了"而全部加载失败——那是把兼容性换成假安全。
+    """
+    body: dict[str, object] = {
         "model_id": manifest.get("model_id", ""),
         "feature_columns": list(manifest.get("feature_columns", []) or []),
         "params": manifest.get("params", {}),
         "targets": manifest.get("targets", []),
         "calibration": manifest.get("calibration", {}),
-        "files": dict(sorted(dict(files).items())) if isinstance(files, Mapping) else {},
-        # 与 _artifact_hash 必须逐字段一致，否则加载期复算会与写入期不符
+        "files": dict(sorted(files.items())),
+        # 与写入期必须逐字段一致，否则加载期复算会与记录值不符
         "code_commit": str(manifest.get("code_commit", "") or ""),
     }
-    return stable_payload_hash(body)
+    if version == ARTIFACT_HASH_VERSION_V2:
+        # v2：训练身份（代码 + 配置 + 训练数据 provenance）整体进受保护集合。
+        body["artifact_hash_version"] = version
+        body["config_hash"] = str(manifest.get("config_hash", "") or "")
+        body["training_provenance"] = sealed_training_provenance(manifest.get("provenance"))
+    return body
+
+
+def sealed_training_provenance(provenance: object) -> dict[str, object]:
+    """从 provenance 取出受保护的规范化块（固定键序 + JSON 安全化）。
+
+    只取 :data:`SEALED_PROVENANCE_KEYS` 里登记的键：provenance 是自由字典，
+    整个哈希会让"加一个审计字段"变成"换一份工件身份"；而漏哈希又会让身份链
+    出现可改字段。故用显式白名单。
+    """
+    source = provenance if isinstance(provenance, Mapping) else {}
+    return {key: _json_safe(source.get(key)) for key in SEALED_PROVENANCE_KEYS}
+
+
+def _json_safe(value: object) -> object:
+    """把任意值规范化成 JSON 往返稳定的形态（写入期与加载期必须同值）。"""
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, (str, bool, int, float)) or value is None:
+        return value
+    return str(value)
+
+
+def artifact_hash_version_of(manifest: Mapping[str, object]) -> str:
+    """读 manifest 的工件哈希版本；缺字段 = v1（历史工件），未知值直接拒绝。"""
+    raw = manifest.get(ARTIFACT_HASH_VERSION_FIELD)
+    text = str(raw).strip() if raw is not None else ""
+    if not text:
+        return ARTIFACT_HASH_VERSION_V1
+    if text not in (ARTIFACT_HASH_VERSION_V1, ARTIFACT_HASH_VERSION_V2):
+        raise FrozenModelError(
+            f"冻结模型 manifest 的 {ARTIFACT_HASH_VERSION_FIELD} 非法: {text!r}"
+            "（只认 v1/v2；不猜、不回退）"
+        )
+    return text
+
+
+def missing_sealed_provenance_keys(manifest: Mapping[str, object]) -> list[str]:
+    """列出生产形态下缺失/为空的封存项（空列表 = 封存完整）。"""
+    provenance = manifest.get("provenance")
+    source = provenance if isinstance(provenance, Mapping) else {}
+    missing: list[str] = []
+    for key in SEALED_PROVENANCE_REQUIRED_KEYS:
+        if key not in source:
+            missing.append(key)
+            continue
+        value = source.get(key)
+        # 行数 0 是合法值；空串/空列表不算封存（那等于没记）。
+        if value is None or (isinstance(value, (str, list, tuple, dict)) and not value):
+            missing.append(key)
+    return missing
 
 
 def _safe_name(column: str) -> str:
@@ -662,18 +814,27 @@ _NON_FEATURE_COLUMNS: frozenset[str] = frozenset(
 
 __all__ = [
     "ALPHA_TARGET_5D",
+    "ARTIFACT_HASH_VERSION_FIELD",
+    "ARTIFACT_HASH_VERSION_V1",
+    "ARTIFACT_HASH_VERSION_V2",
+    "CURRENT_ARTIFACT_HASH_VERSION",
     "DEFAULT_MIN_CALIBRATION_ROWS",
     "DIRECTION_OUTPUTS",
     "FROZEN_MODEL_SCHEMA",
+    "SEALED_PROVENANCE_KEYS",
+    "SEALED_PROVENANCE_REQUIRED_KEYS",
     "FrozenModel",
     "FrozenModelError",
     "FrozenTarget",
     "MODEL_INDEX_FILENAME",
     "MODEL_MANIFEST_FILENAME",
+    "artifact_hash_version_of",
     "fit_frozen_model",
     "frozen_model_identity_payload",
     "frozen_targets",
     "load_frozen_model",
+    "missing_sealed_provenance_keys",
     "persist_frozen_model",
     "predict_frozen_model_matrix",
+    "sealed_training_provenance",
 ]

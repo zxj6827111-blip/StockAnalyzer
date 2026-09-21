@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from pathlib import Path
@@ -56,6 +57,12 @@ from stock_analyzer.alpha_v2.validation.freeze import (
     load_validation_freeze,
 )
 from stock_analyzer.alpha_v2.validation.outcome_maturation import outcome_path
+from stock_analyzer.alpha_v2.validation.production_funnel import (
+    AUTHORITATIVE_SELECTOR_MODES,
+    FUNNEL_SCHEMA,
+    FUNNEL_SOURCE,
+    funnel_snapshot_hash,
+)
 from stock_analyzer.alpha_v2.validation.shadow_capture import (
     list_missing_days,
     list_shadow_dates,
@@ -179,12 +186,128 @@ def _day_data_health_ok(
     return True, ""
 
 
+def _load_day_manifest(root: str | Path, epoch_id: str, signal_date: date) -> dict[str, object]:
+    """读当日 shadow day manifest（capture 原子写；不存在返回空 dict）。"""
+    path = (
+        epoch_subdirs(root, epoch_id)["manifests"]
+        / f"shadow_day_{signal_date.strftime('%Y%m%d')}.json"
+    )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _day_funnel_ok(
+    group: pd.DataFrame,
+    *,
+    root: str | Path,
+    epoch_id: str,
+    signal_date: date,
+    freeze: Mapping[str, object],
+) -> tuple[bool, str]:
+    """M4-L 第二道闸：clean 日的 cohort 必须能被"当日内嵌生产漏斗证据"证明。
+
+    只在冻结清单显式 ``require_production_funnel=true`` 时生效（生产 freeze CLI
+    恒写 true；旧清单缺键即保持 M3 语义——向后兼容，不改历史口径）。
+
+    逐日复核（全部对账 epoch 内的不可变 manifest，不依赖 runtime 目录）：
+
+    - manifest 存在且带 funnel 块，``funnel_snapshot_hash`` 复算一致（写时伪造
+      在写后同样会被抓到）；
+    - schema / source / signal_date / selector_mode 全部是生产权威值；
+    - 生产模式下 funnel 必须已链接正式晚报（``night_scan_report_id`` 非空）；
+    - 当日 shadow 行集合 == funnel.deep_members 集合，逐行 ``deep_rank`` /
+      ``quality_rank`` / ``light_rank`` 与漏斗名次一致，行来源标记为生产。
+    """
+    if not bool(freeze.get("require_production_funnel", False)):
+        return True, ""
+    manifest = _load_day_manifest(root, epoch_id, signal_date)
+    funnel = manifest.get("funnel")
+    if not isinstance(funnel, Mapping):
+        return False, "funnel_evidence_missing"
+    recorded = str(funnel.get("funnel_snapshot_hash", "") or "")
+    if not recorded or funnel_snapshot_hash(funnel) != recorded:
+        return False, "funnel_hash_mismatch"
+    if str(funnel.get("schema", "")) != FUNNEL_SCHEMA:
+        return False, "funnel_schema_mismatch"
+    if str(funnel.get("signal_date", "")) != signal_date.isoformat():
+        return False, "funnel_date_mismatch"
+    if str(funnel.get("source", "")) != FUNNEL_SOURCE:
+        return False, "funnel_source_not_production"
+    selector_mode = str(funnel.get("selector_mode", "") or "").strip()
+    if selector_mode not in AUTHORITATIVE_SELECTOR_MODES:
+        return False, "funnel_selector_mode_not_authoritative"
+    published_report_id = str(
+        funnel.get("published_report_id", "") or funnel.get("night_scan_report_id", "") or ""
+    ).strip()
+    if (
+        str(freeze.get("validation_mode", "production")).strip().lower() == "production"
+        and not published_report_id
+    ):
+        return False, "funnel_report_not_linked"
+    if not str(funnel.get("source_night_scan_artifact_sha256", "") or "").strip():
+        return False, "funnel_source_evidence_missing"
+    deep_members = funnel.get("deep_members")
+    if not isinstance(deep_members, list) or not deep_members:
+        return False, "funnel_cohort_empty"
+    deep_rank_by_symbol: dict[str, int] = {}
+    quality_rank_by_symbol: dict[str, object] = {}
+    light_rank_by_symbol: dict[str, object] = {}
+    for item in deep_members:
+        if not isinstance(item, Mapping):
+            return False, "funnel_member_malformed"
+        symbol = str(item.get("symbol", "") or "").strip()
+        rank = item.get("rank")
+        if not symbol or not isinstance(rank, int):
+            return False, "funnel_member_malformed"
+        deep_rank_by_symbol[symbol] = rank
+    for key, target in (
+        ("quality_members", quality_rank_by_symbol),
+        ("light_members", light_rank_by_symbol),
+    ):
+        rows = funnel.get(key)
+        if not isinstance(rows, list):
+            return False, "funnel_member_malformed"
+        for item in rows:
+            if isinstance(item, Mapping):
+                target[str(item.get("symbol", "") or "").strip()] = item.get("rank")
+    row_symbols = {str(value) for value in group.get("symbol", pd.Series(dtype=object))}
+    if row_symbols != set(deep_rank_by_symbol):
+        return False, "funnel_cohort_mismatch"
+    for _index, row in group.iterrows():
+        symbol = str(row.get("symbol", "") or "")
+        if str(row.get("quality_pool_source", "") or "") != FUNNEL_SOURCE:
+            return False, "funnel_source_not_production"
+        try:
+            if int(row.get("deep_rank")) != deep_rank_by_symbol.get(symbol):
+                return False, "funnel_rank_mismatch"
+        except (TypeError, ValueError):
+            return False, "funnel_rank_mismatch"
+        for field, table in (
+            ("quality_rank", quality_rank_by_symbol),
+            ("light_rank", light_rank_by_symbol),
+        ):
+            prior = row.get(field)
+            expected = table.get(symbol)
+            if expected is None:
+                continue
+            try:
+                if int(prior) != int(expected):  # type: ignore[arg-type]
+                    return False, "funnel_rank_mismatch"
+            except (TypeError, ValueError):
+                return False, "funnel_rank_mismatch"
+    return True, ""
+
+
 def _day_governance(
     joined: pd.DataFrame,
     *,
     missing_days: Sequence[Mapping[str, object]],
     epoch: EpochRecord,
     freeze: Mapping[str, object],
+    root: str | Path,
 ) -> pd.DataFrame:
     """逐日的 clean OOS 资格表（B6/F6 的实现核心；R3 追加时间兜底）。
 
@@ -229,6 +352,13 @@ def _day_governance(
         backfilled = bool(_bool_series(group, "backfilled").any())
         health_ok, health_reason = _day_data_health_ok(group, signal_date=day_date)
         recorded_ok, recorded_reason = _day_recorded_at_ok(group, signal_date=day_date)
+        funnel_ok, funnel_reason = _day_funnel_ok(
+            group,
+            root=root,
+            epoch_id=epoch.epoch_id,
+            signal_date=day_date,
+            freeze=freeze,
+        )
         identity_ok = True
         identity_reasons: list[str] = []
         for _, row in group.iterrows():
@@ -249,6 +379,8 @@ def _day_governance(
             reasons.append(recorded_reason or "late_recorded_at")
         if not identity_ok:
             reasons.append("identity_mismatch")
+        if not funnel_ok:
+            reasons.append(funnel_reason or "funnel_evidence_invalid")
         if not execution_ok:
             reasons.append("execution_or_mode_not_production_raw")
         eligible = not reasons
@@ -286,7 +418,7 @@ def build_validation_kpi(
     joined = _join_shadow_outcomes(shadow, outcomes)
     missing_days = list_missing_days(root, epoch.epoch_id)
     governance = _day_governance(
-        joined, missing_days=missing_days, epoch=epoch, freeze=freeze
+        joined, missing_days=missing_days, epoch=epoch, freeze=freeze, root=root
     )
     eligible_dates = (
         set(governance.loc[governance["eligible"], "signal_date"].astype(str))

@@ -38,7 +38,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from datetime import date
+from collections.abc import Mapping
+from datetime import date, datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -63,6 +64,10 @@ PRODUCTION_ENV_OVERRIDES = {"SA__EVOLUTION__EXECUTION_SPEC__PRICE_SERIES_MODE": 
 # ``load_frozen_model`` 校验逐文件哈希 + artifact_hash 复算——"骨架工件"不再是
 # 可放行的生产形态）。工件由最小合成矩阵经真实的 fit/persist 生产链产出。
 SMOKE_FEATURE_COLUMNS = ["ret_1d", "ret_5d", "ma5", "ma20", "volume_ratio_5", "turnover_zscore20"]
+# M4-L：preflight 硬门要求报告的训练窗与冻结模型 provenance.window 逐字一致。
+SMOKE_TRAINING_WINDOW = ["2026-05-01", "2026-06-30"]
+# M4-L R1.1：warmup 身份必须与决策窗一起进 provenance（指纹覆盖 source_window）。
+SMOKE_WARMUP_DAYS = 30
 
 
 def _git_head() -> str:
@@ -117,14 +122,64 @@ def _build_sandbox(root: Path, *, commit: str, dirty: bool = False) -> Path:
     return root
 
 
-def _write_rehearsal_model_artifact(artifacts_root: Path, *, commit: str) -> Path:
+def _write_smoke_market_db(path: Path) -> dict[str, object]:
+    """微型合成行情库 + 训练数据指纹（供模型 provenance 与 preflight 报告共用）。
+
+    R1.1：返回**完整**指纹载荷——模型 provenance 与 preflight 报告都要记录
+    fingerprint_version / source_window / warmup_days / rows / columns，冻结清单的
+    逐项对账门会拿它们互相比对。
+    """
+    import duckdb
+    import pandas as pd
+
+    from stock_analyzer.alpha_v2.validation.training_data_fingerprint import (
+        compute_training_data_fingerprint,
+    )
+
+    days = [date.fromisoformat(day) for day in ("2026-05-04", "2026-05-05", "2026-05-06")]
+    rows = [
+        {
+            "symbol": f"6005{index:02d}",
+            "date": day,
+            "open": 10.0 + index,
+            "high": 10.5 + index,
+            "low": 9.5 + index,
+            "close": 10.2 + index,
+            "volume": 1_000_000.0 + index,
+            "turnover": (1_000_000.0 + index) * (10.2 + index),
+        }
+        for index in range(3)
+        for day in days
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = duckdb.connect(str(path))
+    try:
+        connection.register("frame", pd.DataFrame(rows))
+        connection.execute("CREATE OR REPLACE TABLE daily_bars AS SELECT * FROM frame")
+    finally:
+        connection.close()
+    return compute_training_data_fingerprint(
+        path,
+        training_start=date.fromisoformat(SMOKE_TRAINING_WINDOW[0]),
+        training_end=date.fromisoformat(SMOKE_TRAINING_WINDOW[1]),
+        warmup_days=SMOKE_WARMUP_DAYS,
+    )
+
+
+def _write_rehearsal_model_artifact(
+    artifacts_root: Path,
+    *,
+    commit: str,
+    fingerprint: Mapping[str, object],
+) -> Path:
     """写一份**真实可加载**的微型冻结模型工件。
 
     R4.1 起生产 freeze 要求工件的 ``code_commit`` 可证且等于运行身份；R4.1.1
     （审稿 P2）起 further 要求工件**内容完整**——生产 freeze 会 ``load_frozen_model``
-    复算文件哈希。本函数用最小合成矩阵走真实的 ``fit_frozen_model`` /
-    ``persist_frozen_model`` 生产链（与本机依赖的版本同一份代码），产物自然满足
-    两道门；规模刻意小（~90 行），不影响 smoke 节奏。
+    复算文件哈希。R1.1 起还要求**训练 provenance 已封存**（v2 哈希 + 窗口/warmup/
+    source_window/指纹/行数/列齐备）。本函数用最小合成矩阵走真实的
+    ``fit_frozen_model`` / ``persist_frozen_model`` 生产链（与本机依赖的版本同一份
+    代码），产物自然满足全部门；规模刻意小（~90 行），不影响 smoke 节奏。
     """
     import numpy as np
     import pandas as pd
@@ -161,7 +216,22 @@ def _write_rehearsal_model_artifact(artifacts_root: Path, *, commit: str) -> Pat
         frame=frame,
         model_id=MODEL_ID,
         spec=HeadFitSpec(min_train_rows=20, min_class_balance=0.05),
-        provenance={"source": "no_git_container_smoke"},
+        # M4-L / R1：production freeze 的 preflight 硬门要求
+        #   ① 报告训练窗 == 模型训练窗；② 报告 model_identity（id/hash/schema/commit）
+        #      == 冻结模型块；③ 双方 training_data_fingerprint 一致。
+        # R1.1 起再加 ④ 指纹契约身份（version/warmup_days/source_window）逐项一致，
+        # 且工件哈希必须封存 provenance。
+        # 烟雾夹具用**真实训练数据指纹实现**对一个微型合成库算一遍，保证是同一套链。
+        provenance={
+            "source": "no_git_container_smoke",
+            "window": SMOKE_TRAINING_WINDOW,
+            "warmup_days": int(fingerprint["warmup_days"]),
+            "source_window": list(fingerprint["source_window"]),
+            "training_data_fingerprint": str(fingerprint["fingerprint"]),
+            "training_data_fingerprint_version": str(fingerprint["fingerprint_version"]),
+            "training_data_rows": int(fingerprint["rows"]),
+            "training_data_columns": list(fingerprint["columns"]),
+        },
         extra_identity={
             "code_commit": commit,
             "identity_source": "container_build_identity",
@@ -169,6 +239,72 @@ def _write_rehearsal_model_artifact(artifacts_root: Path, *, commit: str) -> Pat
         },
     )
     return persist_frozen_model(model, artifacts_root / "validation")
+
+
+def _write_production_preflight(
+    artifacts_root: Path,
+    *,
+    commit: str,
+    model_identity: Mapping[str, object],
+    fingerprint: Mapping[str, object],
+) -> Path:
+    """写一份与沙箱身份/训练窗绑定的 PASS preflight（M4-L §25 硬门的合法输入）。
+
+    用**真实**哈希约定（``preflight_hash_of``）生成，确保 smoke 检查的是门本身
+    而不是一个伪造不了的负载。R1.1 起 gate 还会逐项比对指纹契约身份
+    （version / warmup_days / source_window）——报告里必须如实落这些字段，否则
+    夹具本身就过不了它要验证的那道门。
+    """
+    from stock_analyzer.alpha_v2.validation.preflight import (
+        PREFLIGHT_SCHEMA,
+        VERDICT_PASS,
+        preflight_hash_of,
+    )
+
+    payload: dict[str, object] = {
+        "schema": PREFLIGHT_SCHEMA,
+        "generated_at": datetime.now().astimezone().isoformat(),
+        "verdict": VERDICT_PASS,
+        "blocking_findings": [],
+        "warnings": [],
+        "facts": {},
+        "runtime_identity": {"code_commit": commit},
+        # 字段名与 preflight.check_model_identity 的输出对齐（gate 逐项比对）
+        "model_identity": {
+            "model_id": str(model_identity.get("model_id", "")),
+            "model_artifact_hash": str(model_identity.get("artifact_hash", "")),
+            "artifact_hash_version": str(model_identity.get("artifact_hash_version", "")),
+            "feature_schema_hash": str(model_identity.get("feature_schema_hash", "")),
+            "model_training_code_commit": str(model_identity.get("model_training_code_commit", "")),
+            "provenance_window": list(
+                dict(model_identity.get("provenance", {}) or {}).get("window") or []
+            )
+            or None,
+            "provenance_warmup_days": int(fingerprint["warmup_days"]),
+            "provenance_source_window": list(fingerprint["source_window"]),
+            "training_data_fingerprint": str(fingerprint["fingerprint"]),
+            "training_data_fingerprint_version": str(fingerprint["fingerprint_version"]),
+            "training_data_rows": int(fingerprint["rows"]),
+            "training_data_columns": list(fingerprint["columns"]),
+        },
+        "data_identity": {
+            "market_db": "smoke_synthetic",
+            "training_data_fingerprint": str(fingerprint["fingerprint"]),
+            "training_data_fingerprint_version": str(fingerprint["fingerprint_version"]),
+            "warmup_days": int(fingerprint["warmup_days"]),
+            "source_window": list(fingerprint["source_window"]),
+        },
+        "training_window": {
+            "start": SMOKE_TRAINING_WINDOW[0],
+            "end": SMOKE_TRAINING_WINDOW[1],
+        },
+        "checks": [],
+    }
+    payload["preflight_hash"] = preflight_hash_of(payload)
+    path = artifacts_root / "preflight.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
 
 
 def _run_cli(
@@ -288,7 +424,18 @@ def main(argv: list[str] | None = None) -> int:
     (bare / "build_manifest.json").unlink()
 
     artifacts = work_dir / "artifacts" / "alpha_v2"
-    model_dir = _write_rehearsal_model_artifact(artifacts, commit=commit)
+    smoke_market_db = work_dir / "smoke_market.duckdb"
+    data_fingerprint = _write_smoke_market_db(smoke_market_db)
+    model_dir = _write_rehearsal_model_artifact(
+        artifacts,
+        commit=commit,
+        fingerprint=data_fingerprint,
+    )
+    from stock_analyzer.alpha_v2.validation.frozen_model import (
+        frozen_model_identity_payload,
+    )
+
+    model_identity = dict(frozen_model_identity_payload(model_dir))
     start_date = date.today().isoformat()
 
     print("=" * 78)
@@ -327,6 +474,12 @@ def main(argv: list[str] | None = None) -> int:
         }
     )
 
+    preflight_path = _write_production_preflight(
+        artifacts,
+        commit=commit,
+        model_identity=model_identity,
+        fingerprint=data_fingerprint,
+    )
     freeze_args = [
         "--epoch-id",
         EPOCH_ID,
@@ -337,6 +490,9 @@ def main(argv: list[str] | None = None) -> int:
         "--start-date",
         start_date,
         "--open-epoch",
+        # M4-L §25：生产 freeze 的 preflight 硬门（PASS/WARN 才允许开 epoch）。
+        "--preflight-report",
+        str(preflight_path),
     ]
 
     # ── B. shadow model freeze identity（身份门，不跑训练）─────────────────────
@@ -474,16 +630,19 @@ def main(argv: list[str] | None = None) -> int:
     e_bad = _run_cli(
         sandbox=broken, script="alpha_v2_shadow_capture.py", args=e_args, env_path=env_path
     )
+    # M4-L 起捕获多了一道"当天生产漏斗必须存在"的 fail-closed 门（exit 10），
+    # 位置在身份门之后：身份完好 → 10（漏斗缺失），身份破坏 → 仍是 3。
     results.append(
         _step(
             name="E shadow capture identity",
             good_rc=e_good.returncode,
             broken_rc=e_bad.returncode,
-            good_ok=e_good.returncode != EXIT_IDENTITY,
+            good_ok=e_good.returncode in (10,),
             expected_broken_exit=EXIT_IDENTITY,
             good_stderr=e_good.stderr,
             detail=(
-                "真实工件通过完整性校验后因缺市场库中止（面板缺失的预期形态）；"
+                "身份完好时停在 M4-L 生产漏斗硬门（exit 10：当天无 funnel 工件，"
+                "fail-closed，不再退化成研究代理）；"
                 f"破坏身份必须 exit {EXIT_IDENTITY}"
             ),
         )

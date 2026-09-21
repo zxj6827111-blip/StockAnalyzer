@@ -176,6 +176,13 @@ def test_alpha_v2_config_round_trip(monkeypatch: MonkeyPatch) -> None:
         "entry_mode": "next_session_open",
         "primary_horizon_days": 5,
         "candidate_output_top_k": 5,
+        # M4-L：生产漏斗工件根 + 影子日常循环窗口 + preflight 新鲜度上限。
+        # 全部是"安全默认"：enabled 仍为 False ⇒ 不注册任何调度、不写任何工件。
+        "production_funnel_root": "artifacts/runtime/production_funnel",
+        "live_cycle_start_time": "22:00",
+        "live_cycle_latest_time": "23:55",
+        "live_cycle_interval_minutes": 5,
+        "preflight_max_age_hours": 48.0,
     }
     # 反序列化只对 alpha_v2 子块断言：整份配置的 dump->validate 在本仓库
     # 本就不等价（limit_rule 用 alias "from" 建字段，裸 model_dump 输出
