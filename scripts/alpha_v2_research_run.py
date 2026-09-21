@@ -236,6 +236,11 @@ def main() -> int:
             price_mode=certification.mode,
             price_mode_certified=certification.certified,
             source_meta={"panel_fingerprint": panel_meta["panel_fingerprint"]},
+            # 研究跑批（非生产）：面板可能不是 raw，此时**显式**关掉 execution 价格
+            # 序列守卫并留下理由——产物如实标 execution_uncertain，绝不伪装成可成交。
+            # 生产入口（freeze / mature）没有任何等价开关。
+            enforce_execution_price_series=False,
+            research_replay_reason="alpha_v2_research_run:execution_uncertain_marked",
         )
         outcomes = run.frame
         _write(

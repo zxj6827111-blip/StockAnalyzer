@@ -31,6 +31,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from stock_analyzer.alpha_v2.dual_price_series import (
+    certification_from_declaration,
+    require_certified_execution_series,
+)
 from stock_analyzer.alpha_v2.research.benchmarks import (
     BENCHMARK_ELIGIBLE,
     BENCHMARK_QUALITY_POOL,
@@ -95,6 +99,7 @@ def mature_epoch_outcomes(
     root: str | Path,
     epoch: EpochRecord,
     panel: DailyPanel,
+    style_panel: DailyPanel | None,
     evaluation_date: date,
     matcher: Any,
     slippage_ratio: float,
@@ -102,15 +107,33 @@ def mature_epoch_outcomes(
     price_mode_certified: bool,
     spec: OutcomeSpec | None = None,
     runtime_identity: Mapping[str, object] | None = None,
+    execution_data_identity: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """对 epoch 内所有快照日做一**幂等**成熟扫描；返回本次运行的审计摘要。
 
-    先过三道门才允许动手（F2/F3 修复）：
+    ``panel`` 是 **execution 面板**（必须 raw），``style_panel`` 是风格维度来源
+    （取冻结的 feature 侧契约；``None`` = 退化成 execution 面板，并在摘要里如实标注
+    ``style_features_source=execution_panel_fallback``）。二者分开是 P0 的一部分：
+    风格维度是**分组**用的、不是收益来源，用 qfq 算动量/波动更干净。
 
+    先过四道门才允许动手（F2/F3 修复 + P0 双价格源）：
+
+    0. **P0 execution 价格序列硬门**（第一道，在任何计算/写入之前）：``price_mode``
+       必须是 ``raw`` 且 ``price_mode_certified`` 为真，否则抛
+       :class:`~stock_analyzer.alpha_v2.dual_price_series.PriceSeriesContractError`
+       ——**一行 outcome 都不写**。复权价算出来的"未来收益"是研究口径，进不了 KPI；
     1. epoch `require_open_epoch`（注册表为准）——closed epoch 不写不更；
     2. 磁盘冻结清单仍锚定 epoch（``freeze_manifest_hash`` 逐位一致）；
     3. ``runtime_identity``（如提供）与 epoch 冻结身份按所给键严格核对。
     """
+    # 门 0：execution 价格序列（P0）。放在最前面是有意的：口径错了就没有"先写了几行
+    # 再说"的余地；exit code 由调用方按 exc.exit_code 呈现。
+    require_certified_execution_series(
+        certification_from_declaration(
+            price_mode=price_mode, certified=price_mode_certified
+        ),
+        context="mature_epoch_outcomes(execution panel)",
+    )
     record = require_epoch_identity_match(
         root=root,
         epoch_id=epoch.epoch_id,
@@ -122,6 +145,8 @@ def mature_epoch_outcomes(
     # 物理截断：只用 evaluation_date 当天及以前的 bar——"还差几天才成熟的 horizon
     # 不提前写"靠的不该是函数内的日期判断，而是"未来的数据根本不进场"。
     clip = _clip_panel(panel, evaluation_date)
+    style_clip = _clip_panel(style_panel, evaluation_date) if style_panel is not None else clip
+    style_source = "feature_panel" if style_panel is not None else "execution_panel_fallback"
     calendar = [day for day in clip.calendar if day <= evaluation_date]
     calendar_index = {day: index for index, day in enumerate(calendar)}
     horizons = tuple(int(h) for h in resolved_spec.horizons)
@@ -133,6 +158,10 @@ def mature_epoch_outcomes(
         "run_at": datetime.now().astimezone().isoformat(),
         "price_mode": str(price_mode),
         "price_mode_certified": bool(price_mode_certified),
+        # P0：成熟用的 execution 数据身份（库 / 口径 / 指纹）随摘要落盘——KPI 与
+        # 事后审计据此确认"这批 outcome 是从哪份 raw 序列算出来的"。
+        "execution_data_identity": dict(execution_data_identity or {}),
+        "style_features_source": style_source,
         "horizons": list(horizons),
         "benchmarks": {
             "layers": [BENCHMARK_ELIGIBLE, BENCHMARK_QUALITY_POOL, "style_matched"],
@@ -240,8 +269,9 @@ def mature_epoch_outcomes(
         frame["benchmark_name"] = BENCHMARK_QUALITY_POOL
         frame["quality_pool_source"] = quality_source
         # 基准 3：style_matched（同板块 kNN 对照，残差 = 净收益 - 对照）。
+        # 风格维度取 ``style_panel``（冻结的 feature 侧契约）；收益仍来自 execution 侧。
         try:
-            styles = compute_style_features(panel=clip, decisions=decisions)
+            styles = compute_style_features(panel=style_clip, decisions=decisions)
             enriched = frame.merge(styles, on=["decision_date", "symbol"], how="left")
             style = style_matched_control(enriched, horizons=list(horizons))
             if not style.empty:

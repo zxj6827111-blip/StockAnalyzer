@@ -33,6 +33,7 @@ from _alpha_v2_research_helpers import (
     walk as _walk,
 )
 
+from stock_analyzer.alpha_v2.dual_price_series import PriceSeriesContractError
 from stock_analyzer.alpha_v2.research.outcomes import (
     DecisionPoint,
     OutcomeSpec,
@@ -422,8 +423,9 @@ def test_attach_excess_without_benchmark_is_not_available() -> None:
 
 
 def test_uncertified_price_mode_blocks_main_sample() -> None:
+    """未认证口径在**样本账**上如实留痕（``compute_outcomes`` 层）。"""
     panel = _two_symbol_panel()
-    run = build_label_v2(
+    run = compute_outcomes(
         panel=panel,
         decisions=[DecisionPoint("600100", DAYS[0]), DecisionPoint("600101", DAYS[0])],
         matcher=_matcher(),
@@ -431,10 +433,61 @@ def test_uncertified_price_mode_blocks_main_sample() -> None:
         price_mode_certified=False,
     )
     assert bool(run.frame["execution_uncertain"].all())
-    assert run.diagnostics["main_sample_status"] == "execution_price_mode_unverified"
+    assert run.diagnostics["price_mode"] == "unknown"
+    assert run.diagnostics["price_mode_certified"] is False
     diagnostics = sample_diagnostics(run.frame)
+    assert diagnostics["main_sample_status"] == "execution_price_mode_unverified"
     assert diagnostics["main_sample_rows"] == 0
     assert diagnostics["execution_uncertain_rows"] == 2
+
+
+def test_build_label_v2_fails_closed_on_uncertified_execution() -> None:
+    """P0：``build_label_v2`` 不再"仅告警"——不是 raw+certified 就直接抛错。
+
+    它是训练目标的入口：复权价一旦进来，``net_return_*`` / ``excess_return_*``
+    本身就失真，所以研究口径那种"标 execution_uncertain 继续跑"不适用于它。
+    """
+    panel = _two_symbol_panel()
+    with pytest.raises(PriceSeriesContractError):
+        build_label_v2(
+            panel=panel,
+            decisions=[DecisionPoint("600100", DAYS[0])],
+            matcher=_matcher(),
+            price_mode="unknown",
+            price_mode_certified=False,
+        )
+    with pytest.raises(PriceSeriesContractError):
+        build_label_v2(
+            panel=panel,
+            decisions=[DecisionPoint("600100", DAYS[0])],
+            matcher=_matcher(),
+        )
+
+
+def test_build_label_v2_research_opt_out_requires_reason() -> None:
+    """研究回放可以关掉守卫，但必须留下理由（禁止静默降级）。"""
+    panel = _two_symbol_panel()
+    with pytest.raises(PriceSeriesContractError):
+        build_label_v2(
+            panel=panel,
+            decisions=[DecisionPoint("600100", DAYS[0])],
+            matcher=_matcher(),
+            price_mode="unknown",
+            price_mode_certified=False,
+            enforce_execution_price_series=False,
+        )
+    run = build_label_v2(
+        panel=panel,
+        decisions=[DecisionPoint("600100", DAYS[0])],
+        matcher=_matcher(),
+        price_mode="unknown",
+        price_mode_certified=False,
+        enforce_execution_price_series=False,
+        research_replay_reason="s11_test:research_replay",
+    )
+    assert run.diagnostics["execution_price_series_enforced"] is False
+    assert run.diagnostics["research_replay_reason"] == "s11_test:research_replay"
+    assert bool(run.frame["execution_uncertain"].all())
 
 
 def test_round_trip_cost_rate_matches_matcher_schedule() -> None:

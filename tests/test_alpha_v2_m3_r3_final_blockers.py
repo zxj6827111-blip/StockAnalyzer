@@ -96,6 +96,9 @@ def _write_outcome(root: Path, epoch_id: str, day: date, symbol: str = "600000")
                 "signal_date": day.isoformat(),
                 "symbol": symbol,
                 "executable": True,
+                # 夹具与生产同形：真实 outcome 行恒带这两列（KPI 第二道闸按行判）。
+                "price_mode": "raw",
+                "price_mode_certified": True,
                 "matured_5d": True,
                 "net_return_5d": 0.05,
                 "excess_return_5d": 0.02,

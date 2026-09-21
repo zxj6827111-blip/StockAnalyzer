@@ -45,6 +45,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from stock_analyzer.alpha_v2.dual_price_series import (
+    PriceSeriesContractError,
+    certification_from_declaration,
+    require_certified_execution_series,
+)
 from stock_analyzer.alpha_v2.research.panel import DailyPanel, bar_view
 from stock_analyzer.backtest.matcher import ExecutionMatcher
 from stock_analyzer.config import LimitRuleConfig
@@ -686,13 +691,40 @@ def build_label_v2(
     price_mode_certified: bool = False,
     benchmark_name: str = "eligible_ew",
     source_meta: Mapping[str, object] | None = None,
+    enforce_execution_price_series: bool = True,
+    research_replay_reason: str = "",
 ) -> OutcomeRun:
     """一站式：算 outcome + 以全体决策（默认 = eligible 池）等权收益为基准补超额。
 
     ``decisions`` 的构造方式决定了基准是谁：研究链路把"当日的 PIT eligible 截面"
     作为决策集合传入，于是默认基准就是 **Eligible Universe EW**；S12 会用不同的
     池子重新调用 :func:`attach_excess_returns` 得到 Quality Pool / Style-Matched 层。
+
+    **P0 双价格序列契约（2026-09-21）**：``panel`` 是 **execution 面板**，因此默认
+    ``enforce_execution_price_series=True``——``price_mode`` 必须是 ``raw`` 且
+    ``price_mode_certified=True``，否则直接抛
+    :class:`~stock_analyzer.alpha_v2.dual_price_series.PriceSeriesContractError`。
+    训练目标（净收益/超额/MAE/MFE）全部由这一份 outcome 派生，复权价一旦进来，
+    训练目标本身就失真——所以这里没有"仅告警"的分支。
+
+    历史研究回放（M4-H 等，口径自述为 raw 的研究工件）需要显式关闭这道守卫：
+    ``enforce_execution_price_series=False`` **且**给出非空
+    ``research_replay_reason``（关掉守卫必须留下理由，且理由进入 diagnostics）。
+    生产入口（freeze / mature）从不使用这个开关——它只为研究回放存在。
     """
+    resolved_reason = str(research_replay_reason or "").strip()
+    if enforce_execution_price_series:
+        require_certified_execution_series(
+            certification_from_declaration(
+                price_mode=price_mode, certified=price_mode_certified
+            ),
+            context="build_label_v2(execution panel)",
+        )
+    elif not resolved_reason:
+        raise PriceSeriesContractError(
+            "build_label_v2: 关闭 execution 价格序列守卫时必须给出 research_replay_reason"
+            "（禁止静默降级成'未认证也能算 label'）",
+        )
     run = compute_outcomes(
         panel=panel,
         decisions=decisions,
@@ -726,6 +758,9 @@ def build_label_v2(
         ),
         "date_horizon_rows": int(len(benchmark)),
     }
+    # 守卫是否启用本身也是审计事实：研究回放的工件必须能自证"这里关过守卫"。
+    diagnostics["execution_price_series_enforced"] = bool(enforce_execution_price_series)
+    diagnostics["research_replay_reason"] = resolved_reason
     diagnostics.update(sample_diagnostics(frame, spec=resolved_spec))
     return OutcomeRun(frame=frame, spec=resolved_spec, diagnostics=diagnostics)
 

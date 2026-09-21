@@ -44,9 +44,13 @@ import pytest
 
 from stock_analyzer.alpha_v2.research.multi_head import HeadFitSpec
 from stock_analyzer.alpha_v2.validation import preflight as pf
+from stock_analyzer.alpha_v2.dual_price_series import (
+    certification_from_declaration,
+    price_series_identity_block,
+)
 from stock_analyzer.alpha_v2.validation.frozen_model import (
     ARTIFACT_HASH_VERSION_V1,
-    ARTIFACT_HASH_VERSION_V2,
+    ARTIFACT_HASH_VERSION_V3,
     SEALED_PROVENANCE_REQUIRED_KEYS,
     FrozenModelError,
     fit_frozen_model,
@@ -374,15 +378,35 @@ def _matrix(rows_train: int = 140, rows_cal: int = 60) -> pd.DataFrame:
     return frame
 
 
+def _identity_block(payload: dict[str, object], *, role: str, mode: str) -> dict[str, object]:
+    """按 ``price_series_identity_block`` 的真实形态造一条数据身份（P0 双价格源）。"""
+    return price_series_identity_block(
+        role=role,
+        db=str(payload["db"]),
+        certification=certification_from_declaration(
+            price_mode=mode, certified=mode == "raw"
+        ),
+        fingerprint=payload,
+        context=f"r11_sealing_test:{role}",
+    )
+
+
 def _sealed_model(tmp_path: Path, *, db: Path, model_id: str = MODEL_ID) -> Path:
-    """按真实指纹落一份**封存完整**的冻结模型工件（v2）。"""
-    payload = _fp(db)
+    """按真实指纹落一份**封存完整**的冻结模型工件（v3 = 双价格源身份已封存）。"""
+    payload = dict(_fp(db))
+    payload["db"] = str(db)
     model = fit_frozen_model(
         frame=_matrix(),
         model_id=model_id,
         spec=HeadFitSpec(min_train_rows=20, min_class_balance=0.05),
         provenance={
             "source": "r11_sealing_test",
+            "validation_mode": "production",
+            "feature_price_mode": "qfq",
+            "execution_price_mode": "raw",
+            "execution_price_mode_certified": True,
+            "feature_data_identity": _identity_block(payload, role="feature", mode="qfq"),
+            "execution_data_identity": _identity_block(payload, role="execution", mode="raw"),
             "window": [WINDOW_START.isoformat(), WINDOW_END.isoformat()],
             "warmup_days": int(payload["warmup_days"]),
             "source_window": list(payload["source_window"]),
@@ -418,11 +442,11 @@ def _tamper_top_level(artifact: Path, key: str, value: object) -> None:
 
 
 def test_sealed_artifact_loads_with_production_gate(tmp_path):
-    """正例：v2 封存工件在生产加载门下通过（封存门不误伤正常产物）。"""
+    """正例：v3 封存工件（双价格源身份）在生产加载门下通过。"""
     db = _fp_db(tmp_path / "m.duckdb")
     artifact = _sealed_model(tmp_path, db=db)
     manifest = json.loads((artifact / "model_manifest.json").read_text(encoding="utf-8"))
-    assert manifest["artifact_hash_version"] == ARTIFACT_HASH_VERSION_V2
+    assert manifest["artifact_hash_version"] == ARTIFACT_HASH_VERSION_V3
     assert missing_sealed_provenance_keys(manifest) == []
     model = load_frozen_model(artifact, require_sealed_provenance=True)
     assert model.manifest["artifact_hash"] == manifest["artifact_hash"]
@@ -494,7 +518,8 @@ def test_legacy_v1_artifact_still_loads_but_is_rejected_in_production(tmp_path):
     manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     assert load_frozen_model(artifact).manifest["artifact_hash"] == payload["artifact_hash"]
     # production：拒绝（provenance 未封存）
-    with pytest.raises(FrozenModelError, match="未封存训练 provenance"):
+    # P0：生产要求 v3（双价格源身份）；v1/v2 一律以"未封存"拒绝。
+    with pytest.raises(FrozenModelError, match="未封存"):
         load_frozen_model(artifact, require_sealed_provenance=True)
     check = pf.check_model_identity(artifact)
     assert check.verdict == pf.VERDICT_BLOCKED
@@ -557,7 +582,7 @@ def test_fp6_legacy_v1_artifact_rejected_by_real_freeze_cli(tmp_path):
         timeout=1200,
     )
     assert result.returncode == 5, (result.returncode, result.stderr[-600:])
-    assert "未封存训练 provenance" in result.stderr
+    assert "未封存" in result.stderr
     assert not (out / "validation" / "epochs.json").exists()
 
 
@@ -636,6 +661,10 @@ def _preflight_report_with_mismatched_fingerprint(tmp_path: Path, *, artifact: P
             "warmup_days": WARMUP_DAYS,
             "source_window": [SOURCE_START.isoformat(), WINDOW_END.isoformat()],
             "training_data_fingerprint_version": "v2",
+            # P0：两条数据身份按模型封存值照抄——本用例要测的**唯一**不一致项是
+            # 指纹本身（其余字段全对齐，否则测不出"拒绝是针对指纹的"）。
+            "feature_data_identity": dict(identity.get("feature_data_identity") or {}),
+            "execution_data_identity": dict(identity.get("execution_data_identity") or {}),
         },
         "training_window": {"start": WINDOW_START.isoformat(), "end": WINDOW_END.isoformat()},
         "checks": [],
@@ -775,4 +804,4 @@ def test_fp10_validation_freeze_exit_7_on_fingerprint_mismatch(tmp_path):
     assert binding["training_data_fingerprint_version"] == "v2"
     assert binding["warmup_days"] == WARMUP_DAYS
     assert binding["source_window"] == [SOURCE_START.isoformat(), WINDOW_END.isoformat()]
-    assert manifest["model"]["artifact_hash_version"] == ARTIFACT_HASH_VERSION_V2
+    assert manifest["model"]["artifact_hash_version"] == ARTIFACT_HASH_VERSION_V3

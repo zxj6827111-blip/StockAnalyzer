@@ -36,6 +36,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from stock_analyzer.alpha_v2.dual_price_series import resolve_market_dbs  # noqa: E402
 from stock_analyzer.alpha_v2.validation.preflight import (  # noqa: E402
     VERDICT_BLOCKED,
     PreflightError,
@@ -47,7 +48,16 @@ from stock_analyzer.config import load_config  # noqa: E402
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Alpha V2 M4-L：Production Data Preflight")
-    parser.add_argument("--market-db", default="artifacts/warehouse/market.duckdb")
+    parser.add_argument(
+        "--market-db",
+        default="",
+        help="**feature 侧**行情库（qfq 是设计内口径）；留空取 alpha_v2.feature_market_db",
+    )
+    parser.add_argument(
+        "--execution-market-db",
+        default="",
+        help="**execution 侧**行情库（必须 raw）；留空取 alpha_v2.execution_market_db",
+    )
     parser.add_argument("--config", default=str(REPO_ROOT / "config" / "default.yaml"))
     parser.add_argument("--training-start", default="")
     parser.add_argument("--training-end", default="")
@@ -140,11 +150,24 @@ def main(argv: list[str] | None = None) -> int:
             or []
         )
 
+    # P0 双价格源：两个角色的库各取自"CLI > 配置"，任一未配置都会在 preflight 里
+    # 变成 BLOCKED（feature 回退 market_warehouse.db_path，execution 不留回退）。
+    mapping = resolve_market_dbs(
+        config, feature_db=args.market_db, execution_db=args.execution_market_db
+    )
+    print(
+        f"[preflight] feature_market_db={mapping.feature_db}"
+        f"（{mapping.feature_source}）\n"
+        f"[preflight] execution_market_db={mapping.execution_db or '(未配置 → BLOCKED)'}"
+        f"（{mapping.execution_source}）"
+    )
+
     try:
         payload = run_production_preflight(
             config=config,
             repo_root=REPO_ROOT,
-            market_db=args.market_db,
+            market_db=mapping.feature_db,
+            execution_market_db=mapping.execution_db,
             training_start=training_start,
             training_end=training_end,
             feature_columns=feature_columns,

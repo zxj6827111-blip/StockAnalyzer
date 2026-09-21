@@ -197,6 +197,10 @@ def clean_day_env(tmp_path, monkeypatch):
     """一套"生产前置全齐"的合成环境（真实 CLI 全程使用）。"""
     symbols = [f"6001{index:02d}" for index in range(6)]
     market_db = _write_market_db(tmp_path / "warehouse" / "market.duckdb", symbols=symbols)
+    # P0 双价格序列：execution 侧是**另一份**库（这里内容同源，但角色必须分开给）。
+    execution_db = _write_market_db(
+        tmp_path / "warehouse_raw" / "market_raw.duckdb", symbols=symbols
+    )
     features_root = tmp_path / "features_light"
     _write_feature_snapshot(features_root, trade_date=TODAY)
 
@@ -204,6 +208,7 @@ def clean_day_env(tmp_path, monkeypatch):
     # 所有测试侧改动都必须走环境变量，parent 侧配置再镜像一份。
     monkeypatch.setenv("SA__EVOLUTION__EXECUTION_SPEC__PRICE_SERIES_MODE", "raw")
     monkeypatch.setenv("SA__WEEK5__FEATURE_SNAPSHOT_ROOT", str(features_root))
+    monkeypatch.setenv("SA__ALPHA_V2__EXECUTION_MARKET_DB", str(execution_db))
     funnel_root = tmp_path / "runtime" / "production_funnel"
     monkeypatch.setenv("SA__ALPHA_V2__PRODUCTION_FUNNEL_ROOT", str(funnel_root))
 
@@ -292,6 +297,7 @@ def clean_day_env(tmp_path, monkeypatch):
     config.alpha_v2.production_funnel_root = str(funnel_root)
     config.week5.feature_snapshot_root = str(features_root)
     config.market_warehouse.db_path = str(market_db)
+    config.alpha_v2.execution_market_db = str(execution_db)
     audits: list[dict[str, object]] = []
     service._record_audit_event = lambda **kwargs: audits.append(kwargs)
     service._job_now = lambda: datetime.combine(TODAY, datetime.min.time()).replace(
@@ -308,6 +314,7 @@ def clean_day_env(tmp_path, monkeypatch):
         "cycle": cycle,
         "audits": audits,
         "market_db": market_db,
+        "execution_market_db": execution_db,
         "features_root": features_root,
         "funnel_root": funnel_root,
         "symbols": symbols,

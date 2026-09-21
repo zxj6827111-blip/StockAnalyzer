@@ -275,7 +275,8 @@ def test_closed_epoch_blocks_mature_and_keeps_files(tmp_path):
     with capture_at(DAYS[5]):
         write_shadow_snapshot(root=tmp_path, epoch=epoch, signal_date=DAYS[5], rows=rows)
     mature_epoch_outcomes(
-        root=tmp_path, epoch=epoch, panel=panel, evaluation_date=DAYS[30],
+        root=tmp_path, epoch=epoch, panel=panel, style_panel=panel,
+        evaluation_date=DAYS[30],
         matcher=matcher(), slippage_ratio=0.0015, price_mode="raw",
         price_mode_certified=True,
     )
@@ -284,7 +285,8 @@ def test_closed_epoch_blocks_mature_and_keeps_files(tmp_path):
     close_epoch(root=tmp_path, epoch_id=epoch.epoch_id, reason="closed for test")
     with pytest.raises(EpochRegistryError):
         mature_epoch_outcomes(
-            root=tmp_path, epoch=epoch, panel=panel, evaluation_date=DAYS[35],
+            root=tmp_path, epoch=epoch, panel=panel, style_panel=panel,
+            evaluation_date=DAYS[35],
             matcher=matcher(), slippage_ratio=0.0015, price_mode="raw",
             price_mode_certified=True,
         )
@@ -449,6 +451,8 @@ def _two_days_with_kpis(tmp_path, *, day2_data_health: str):
         # 写手工 outcome：让两天都真正"成熟"（5D 成熟数据用来测门）
         outcome = {
             "signal_date": day.isoformat(), "symbol": "600000", "executable": True,
+            # 夹具与生产同形：真实 outcome 行恒带这两列（KPI 第二道闸按行判）。
+            "price_mode": "raw", "price_mode_certified": True,
             "matured_5d": True, "net_return_5d": 0.05, "excess_return_5d": 0.02,
         }
         path = outcome_path(tmp_path, epoch.epoch_id, day)
@@ -587,7 +591,8 @@ def test_quality_pool_source_roundtrip_keeps_production(tmp_path):
     with capture_at(DAYS[5]):
         write_shadow_snapshot(root=tmp_path, epoch=epoch, signal_date=DAYS[5], rows=rows)
     mature_epoch_outcomes(
-        root=tmp_path, epoch=epoch, panel=panel, evaluation_date=DAYS[30],
+        root=tmp_path, epoch=epoch, panel=panel, style_panel=panel,
+        evaluation_date=DAYS[30],
         matcher=matcher(), slippage_ratio=0.0015, price_mode="raw",
         price_mode_certified=True,
     )

@@ -186,6 +186,106 @@ def _day_data_health_ok(
     return True, ""
 
 
+# ---------------------------------------------------------------------------
+# P0 第二道闸：outcome 行自述的执行价格口径
+# ---------------------------------------------------------------------------
+
+# outcome 行与 shadow 行合并后可能带 ``__dup`` 后缀（merge 的 suffixes 约定）。
+_PRICE_MODE_COLUMNS: tuple[str, ...] = ("price_mode", "price_mode__dup")
+_PRICE_MODE_CERTIFIED_COLUMNS: tuple[str, ...] = (
+    "price_mode_certified",
+    "price_mode_certified__dup",
+)
+
+
+def _outcome_price_series_columns(
+    frame: pd.DataFrame,
+) -> tuple[pd.Series, pd.Series] | None:
+    """取 outcome 侧的 ``price_mode`` / ``price_mode_certified`` 两列（缺 = None）。"""
+    mode_column = next((name for name in _PRICE_MODE_COLUMNS if name in frame.columns), "")
+    certified_column = next(
+        (name for name in _PRICE_MODE_CERTIFIED_COLUMNS if name in frame.columns), ""
+    )
+    if not mode_column or not certified_column:
+        return None
+    return frame[mode_column], frame[certified_column]
+
+
+def _matured_any_mask(frame: pd.DataFrame) -> pd.Series:
+    mask = pd.Series(False, index=frame.index)
+    for horizon in DEFAULT_HORIZONS:
+        mask = mask | _matured_mask(frame, int(horizon))
+    return mask
+
+
+def _truthy(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"true", "1", "yes"}
+
+
+def _certified_raw_mask(frame: pd.DataFrame) -> pd.Series:
+    """逐行判"这条 outcome 的成交价来自 raw 且已认证"。缺列 = 全 False（fail-closed）。"""
+    columns = _outcome_price_series_columns(frame)
+    if columns is None:
+        return pd.Series(False, index=frame.index)
+    modes, certified = columns
+    raw = modes.astype(str).str.strip().str.lower() == "raw"
+    ok = certified.map(_truthy)
+    return (raw & ok).fillna(False)
+
+
+def _day_outcome_price_series_ok(group: pd.DataFrame) -> tuple[bool, str]:
+    """P0 第二道闸（§8）：**逐行**复核 outcome 自述的 ``raw + certified``。
+
+    为什么不只看冻结清单里的 ``execution_price_mode`` 字符串：那是**自述**，而
+    outcome 行上的 ``price_mode`` / ``price_mode_certified`` 是**成熟那一刻实际
+    用的那份面板**的结论。口径错了的 outcome 必须在这里被拦下，而不是靠上游
+    配置字符串"看起来对"。
+
+    只对"至少有一个 horizon 已成熟"的行判——未成熟行还没进任何证据。
+    """
+    matured = _matured_any_mask(group)
+    if not bool(matured.any()):
+        return True, ""
+    columns = _outcome_price_series_columns(group)
+    if columns is None:
+        return False, "outcome_price_mode_unavailable"
+    modes, certified = columns
+    for mode, ok in zip(modes[matured], certified[matured], strict=True):
+        if str(mode).strip().lower() != "raw" or not _truthy(ok):
+            return False, "outcome_price_mode_not_certified_raw"
+    return True, ""
+
+
+def _price_series_block(frame: pd.DataFrame) -> dict[str, object]:
+    """KPI 报告里的执行口径证据块（§8：正式证据必须能证明 outcome 是 raw）。"""
+    if frame.empty:
+        return {"rows": 0, "certified_raw_rows": 0, "non_certified_rows": 0}
+    certified = _certified_raw_mask(frame)
+    matured = _matured_any_mask(frame)
+    columns = _outcome_price_series_columns(frame)
+    modes = (
+        sorted({str(value).strip().lower() for value in columns[0] if str(value).strip()})
+        if columns is not None
+        else []
+    )
+    return {
+        "rows": int(len(frame)),
+        "certified_raw_rows": int(certified.sum()),
+        "non_certified_rows": int((~certified).sum()),
+        "matured_rows": int(matured.sum()),
+        "matured_non_certified_rows": int((matured & ~certified).sum()),
+        "observed_price_modes": modes,
+        "definition": (
+            "outcome.price_mode == raw 且 outcome.price_mode_certified == true 才进入"
+            "成熟证据；两者都来自成熟那一刻对 execution 面板的实测认证，不读清单自述"
+        ),
+    }
+
+
 def _load_day_manifest(root: str | Path, epoch_id: str, signal_date: date) -> dict[str, object]:
     """读当日 shadow day manifest（capture 原子写；不存在返回空 dict）。"""
     path = (
@@ -324,7 +424,9 @@ def _day_governance(
     - **``recorded_at``（及 ``actual_capture_date``）与 signal_date 同日**
       ——R3 的 late-write 兜底闸；
     - 快照行身份与 epoch 冻结身份逐项一致（缺失 = 不匹配）；
-    - 清单 execution_price_mode == raw 且 validation_mode ∈ {production, test}。
+    - 清单 execution_price_mode == raw 且 validation_mode ∈ {production, test}；
+    - **outcome 行自述的 ``price_mode == raw`` 且 ``price_mode_certified == true``**
+      ——P0 第二道闸：不读清单自述，读成熟那一刻实际用的那份 execution 面板的结论。
     """
     missing_set = {str(item.get("signal_date", "")) for item in missing_days}
     execution_ok = (
@@ -341,6 +443,7 @@ def _day_governance(
         "recorded_at_ok",
         "identity_ok",
         "execution_ok",
+        "outcome_price_series_ok",
         "eligible",
         "reasons",
     ]
@@ -352,6 +455,7 @@ def _day_governance(
         backfilled = bool(_bool_series(group, "backfilled").any())
         health_ok, health_reason = _day_data_health_ok(group, signal_date=day_date)
         recorded_ok, recorded_reason = _day_recorded_at_ok(group, signal_date=day_date)
+        outcome_price_ok, outcome_price_reason = _day_outcome_price_series_ok(group)
         funnel_ok, funnel_reason = _day_funnel_ok(
             group,
             root=root,
@@ -383,6 +487,8 @@ def _day_governance(
             reasons.append(funnel_reason or "funnel_evidence_invalid")
         if not execution_ok:
             reasons.append("execution_or_mode_not_production_raw")
+        if not outcome_price_ok:
+            reasons.append(outcome_price_reason or "outcome_price_mode_not_certified_raw")
         eligible = not reasons
         if not identity_ok and identity_reasons:
             reasons.extend(identity_reasons)
@@ -396,6 +502,7 @@ def _day_governance(
                 "recorded_at_ok": recorded_ok,
                 "identity_ok": identity_ok,
                 "execution_ok": bool(execution_ok),
+                "outcome_price_series_ok": bool(outcome_price_ok),
                 "eligible": bool(eligible),
                 "reasons": reasons,
             }
@@ -462,6 +569,7 @@ def build_validation_kpi(
         payload["maturity"] = _maturity_block(joined)
         payload["clean_maturity"] = _maturity_block(clean_joined)
         payload["governance"] = _governance_block(governance, missing_days)
+        payload["price_series"] = _price_series_block(joined)
         payload["sample_gate_status"] = _sample_gate_block(payload["clean_maturity"])
         return payload
 
@@ -470,6 +578,11 @@ def build_validation_kpi(
     payload["maturity"] = _maturity_block(joined)
     payload["clean_maturity"] = _maturity_block(clean_joined)
     payload["governance"] = _governance_block(governance, missing_days)
+    # P0 第二道闸的证据：全部快照 vs clean 子集各自的执行口径计数（§8）。
+    payload["price_series"] = {
+        "all_captured": _price_series_block(joined),
+        "clean_only": _price_series_block(clean_joined),
+    }
     payload["hit_rate"] = _hit_rate_block(clean_joined)
     payload["returns"] = _returns_block(clean_joined)
     payload["excess_vs_benchmarks"] = _excess_block(clean_joined)
@@ -564,12 +677,17 @@ def _matured_mask(frame: pd.DataFrame, horizon: int) -> pd.Series:
 
 
 def _main_sample(frame: pd.DataFrame, horizon: int) -> pd.DataFrame:
-    """主口径样本：可成交 + 已成熟（M3 §8 复用 M1/S11 不成交不计收益）。"""
+    """主口径样本：可成交 + 已成熟 + 执行价格口径已认证 raw（M3 §8 + P0 第二道闸）。
+
+    最后一项是 P0 加的：即便某天因治理层疏漏进了 clean 集合，**逐行**的
+    ``price_mode/price_mode_certified`` 也会把它挡在任何一个 KPI 数字之外——
+    复权价算出来的收益不是收益。
+    """
     executable = _bool_series(frame, "executable")
     matured = _matured_mask(frame, horizon)
     column = f"net_return_{int(horizon)}d"
     has_value = _num(frame, column).notna()
-    return frame[executable & matured & has_value]
+    return frame[executable & matured & has_value & _certified_raw_mask(frame)]
 
 
 # ---------------------------------------------------------------------------
@@ -620,6 +738,9 @@ def _governance_block(
     execution_invalid = (
         int((~governance["execution_ok"]).sum()) if not governance.empty else 0
     )
+    outcome_price_invalid = (
+        int((~governance["outcome_price_series_ok"]).sum()) if not governance.empty else 0
+    )
     missing_captured = (
         int(governance.loc[governance["missing"], "signal_date"].nunique())
         if not governance.empty and "signal_date" in governance.columns
@@ -634,6 +755,7 @@ def _governance_block(
         "excluded_data_health_days": excluded_health,
         "identity_invalid_days": identity_invalid,
         "execution_or_mode_invalid_days": execution_invalid,
+        "outcome_price_series_invalid_days": outcome_price_invalid,
         "late_recorded_days": late_recorded,
         "coverage_rate": (clean / captured) if captured else 0.0,
         "by_date": (
@@ -643,7 +765,8 @@ def _governance_block(
             "eligible=该日的行全量通过 backfilled=false 且不在 missing 台账、"
             "data_health 同日且 ok（缺失/陈旧/降级一律不算）、"
             "recorded_at（与 actual_capture_date）与 signal_date 同日、"
-            "行身份与冻结身份一致、文件侧 execution=raw 且 validation_mode ∈ {production, test}。"
+            "行身份与冻结身份一致、文件侧 execution=raw 且 validation_mode ∈ {production, test}、"
+            "**outcome 行自述 price_mode=raw 且 price_mode_certified=true**。"
             "不通过的日子如实列出原因、绝不混入证据。"
         ),
     }
@@ -1044,6 +1167,7 @@ def render_kpi_markdown(payload: Mapping[str, object]) -> str:
         "winner_recall",
         "downside",
         "execution",
+        "price_series",
         "baseline_pairing",
         "cohort_counts",
     ):

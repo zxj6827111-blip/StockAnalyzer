@@ -183,6 +183,10 @@ def test_alpha_v2_config_round_trip(monkeypatch: MonkeyPatch) -> None:
         "live_cycle_latest_time": "23:55",
         "live_cycle_interval_minutes": 5,
         "preflight_max_age_hours": 48.0,
+        # P0 双价格序列：feature / execution 两个角色的行情库默认留空
+        # （feature 回退 market_warehouse.db_path；execution 留空即 fail closed）。
+        "feature_market_db": "",
+        "execution_market_db": "",
     }
     # 反序列化只对 alpha_v2 子块断言：整份配置的 dump->validate 在本仓库
     # 本就不等价（limit_rule 用 alias "from" 建字段，裸 model_dump 输出

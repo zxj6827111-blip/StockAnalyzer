@@ -54,7 +54,7 @@ FROZEN_MODEL_SCHEMA = "alpha_v2_shadow_model.v1"
 MODEL_MANIFEST_FILENAME = "model_manifest.json"
 MODEL_INDEX_FILENAME = "model_index.json"
 
-# ── 工件哈希版本（M4-L R1.1：训练 provenance 封存）───────────────────────────
+# ── 工件哈希版本（M4-L R1.1：训练 provenance 封存；P0：双价格源身份）───────────
 # 复用既有 manifest schema（``alpha_v2_shadow_model.v1``）做**字段级**演进，
 # 不另造平行版本体系：manifest 多一个 ``artifact_hash_version`` 字段，加载时按
 # 记录值复算，因此历史工件不会被误判。
@@ -64,17 +64,23 @@ MODEL_INDEX_FILENAME = "model_index.json"
 #        ``provenance.training_data_fingerprint`` 或 ``provenance.window``
 #        不会破坏工件完整性（外部复核 R1.1 的核心缺口）。
 #   v2 = 追加 ``config_hash`` 与规范化 ``training_provenance`` 块。
+#   v3 = 追加**双价格源身份**（``feature_data_identity`` / ``execution_data_identity``
+#        + feature/execution 两个 price mode + ``validation_mode``）——v2 工件里的
+#        价格口径是**单库自述**，无法证明"训练目标来自 raw"，生产一律拒绝。
 #
-# 生产（``validation_mode=production``）只接受 v2；v1 仅用于 historical /
-# rehearsal 兼容（旧工件仍可加载、仍可被历史解析器按内容哈希对齐）。
+# 版本轴的意义就在这里：v2 仍能按 v2 语义复算并加载（历史/rehearsal 兼容），
+# 但**生产只接受 v3**（``validation_mode=production`` 的调用点）。
 ARTIFACT_HASH_VERSION_FIELD = "artifact_hash_version"
 ARTIFACT_HASH_VERSION_V1 = "v1"
 ARTIFACT_HASH_VERSION_V2 = "v2"
-CURRENT_ARTIFACT_HASH_VERSION = ARTIFACT_HASH_VERSION_V2
+ARTIFACT_HASH_VERSION_V3 = "v3"
+CURRENT_ARTIFACT_HASH_VERSION = ARTIFACT_HASH_VERSION_V3
 
 # 进入受保护身份的 provenance 键（**固定清单**：新增字段不会悄悄改变旧工件的
-# 哈希语义，需要进身份的字段必须显式登记在这里）。
-SEALED_PROVENANCE_KEYS: tuple[str, ...] = (
+# 哈希语义，需要进身份的字段必须显式登记在这里）。v2 的清单**冻结**为
+# ``SEALED_PROVENANCE_KEYS_V2``——改它就是"复算公式变了 → 历史 v2 工件全部加载
+# 失败"，这正是版本轴要避免的事。
+SEALED_PROVENANCE_KEYS_V2: tuple[str, ...] = (
     "market_db",
     "window",
     "warmup_days",
@@ -91,9 +97,26 @@ SEALED_PROVENANCE_KEYS: tuple[str, ...] = (
     "slippage_ratio",
 )
 
+# v3 追加：双价格源身份与两个角色的口径声明。这些都是"训练目标来自哪份数据"的
+# 直接证据，必须受哈希保护（否则事后把 execution_data_identity 改成 raw 谁也看不见）。
+SEALED_PROVENANCE_KEYS_V3_EXTRA: tuple[str, ...] = (
+    "validation_mode",
+    "db_role_binding",
+    "feature_price_mode",
+    "execution_price_mode",
+    "execution_price_mode_certified",
+    "feature_data_identity",
+    "execution_data_identity",
+)
+
+SEALED_PROVENANCE_KEYS: tuple[str, ...] = (
+    *SEALED_PROVENANCE_KEYS_V2,
+    *SEALED_PROVENANCE_KEYS_V3_EXTRA,
+)
+
 # 生产形态**必须**存在的封存项：少了任何一项，artifact_hash 就没有真正保护
-# "这份模型用什么数据、在哪个窗口、含多少 warmup 训出来的"。
-SEALED_PROVENANCE_REQUIRED_KEYS: tuple[str, ...] = (
+# "这份模型用什么数据、在哪个窗口、含多少 warmup 训出来的、目标是不是 raw 算的"。
+SEALED_PROVENANCE_REQUIRED_KEYS_V2: tuple[str, ...] = (
     "window",
     "warmup_days",
     "source_window",
@@ -101,6 +124,23 @@ SEALED_PROVENANCE_REQUIRED_KEYS: tuple[str, ...] = (
     "training_data_rows",
     "training_data_columns",
 )
+
+SEALED_PROVENANCE_REQUIRED_KEYS_V3_EXTRA: tuple[str, ...] = (
+    "validation_mode",
+    "feature_price_mode",
+    "execution_price_mode",
+    "feature_data_identity",
+    "execution_data_identity",
+)
+
+SEALED_PROVENANCE_REQUIRED_KEYS: tuple[str, ...] = (
+    *SEALED_PROVENANCE_REQUIRED_KEYS_V2,
+    *SEALED_PROVENANCE_REQUIRED_KEYS_V3_EXTRA,
+)
+
+# 生产只接受的训练模式：rehearsal 工件（弱口径下的排演产物）不得进入生产 epoch。
+VALIDATION_MODE_PRODUCTION = "production"
+VALIDATION_MODE_REHEARSAL = "rehearsal"
 
 ALPHA_TARGET_5D = "alpha_target_5d"
 
@@ -413,18 +453,24 @@ def frozen_model_identity_payload(model_dir: str | Path) -> dict[str, object]:
     由调用方的生产门禁拒绝。
     """
     manifest = _read_manifest(model_dir)
+    provenance = manifest.get("provenance", {})
+    source = provenance if isinstance(provenance, Mapping) else {}
     return {
         "model_id": manifest.get("model_id", ""),
         "artifact_hash": manifest.get("artifact_hash", ""),
-        # R1.1：工件哈希版本（v1 = 训练 provenance 不受保护，v2 = 已封存）。
-        # 生产门禁据此拒绝 unsealed 工件；如实透出，不做任何回退猜测。
+        # R1.1：工件哈希版本（v1 = 训练 provenance 不受保护，v2 = 已封存，
+        # v3 = 双价格源身份已封存）。生产门禁据此拒绝未封存工件；如实透出，
+        # 不做任何回退猜测。
         "artifact_hash_version": artifact_hash_version_of(manifest),
         "artifact_created_at": manifest.get("created_at", ""),
         "artifact_path": str(Path(model_dir)),
         "heads": manifest.get("heads", []),
         "calibration": manifest.get("calibration", {}),
         "status": "frozen" if manifest.get("artifact_hash") else "pending_freeze",
-        "provenance": manifest.get("provenance", {}),
+        "provenance": provenance,
+        # P0：两条数据身份各自成块（preflight / freeze 逐项对账用同一形态）。
+        "feature_data_identity": dict(source.get("feature_data_identity") or {}),
+        "execution_data_identity": dict(source.get("execution_data_identity") or {}),
         "feature_columns": list(manifest.get("feature_columns", []) or []),
         "feature_schema_hash": manifest.get("feature_schema_hash", ""),
         "model_training_code_commit": str(manifest.get("code_commit", "") or ""),
@@ -495,20 +541,21 @@ def load_frozen_model(
 ) -> FrozenModel:
     """按 manifest 校验后加载；任一文件哈希不符 / 身份不符直接抛错。
 
-    ``require_sealed_provenance=True``（生产路径）额外要求工件是 v2 哈希形态且
-    训练 provenance 封存完整——v1 工件（provenance 不受哈希保护）在生产一律拒绝，
-    但在 historical / rehearsal 路径仍可加载（§6 版本兼容）。
+    ``require_sealed_provenance=True``（生产路径）额外要求工件是 **v3** 哈希形态且
+    双价格源身份封存完整——v2 工件的价格口径只有"单库自述"，无法证明训练目标来自
+    raw；v1 工件（provenance 不受哈希保护）在生产同样一律拒绝。二者在 historical /
+    rehearsal 路径仍可加载（§6 版本兼容）。
     """
     model_path = Path(model_dir)
     manifest = _read_manifest(model_path)
     if require_sealed_provenance:
         version = artifact_hash_version_of(manifest)
-        if version != ARTIFACT_HASH_VERSION_V2:
+        if version != ARTIFACT_HASH_VERSION_V3:
             raise FrozenModelError(
-                f"冻结模型工件未封存训练 provenance（artifact_hash_version={version}，"
-                f"生产要求 {ARTIFACT_HASH_VERSION_V2}）：{model_path}"
+                f"冻结模型工件未封存双价格源身份（artifact_hash_version={version}，"
+                f"生产要求 {ARTIFACT_HASH_VERSION_V3}）：{model_path}"
             )
-        missing = missing_sealed_provenance_keys(manifest)
+        missing = missing_sealed_provenance_keys(manifest, version=version)
         if missing:
             raise FrozenModelError(
                 f"冻结模型工件 provenance 封存不完整（缺 {missing}）：{model_path}"
@@ -665,9 +712,11 @@ def _artifact_hash_body(
 ) -> dict[str, object]:
     """工件哈希正文；版本决定哪些身份字段进入受保护集合。
 
-    **v1 正文必须与 R4.1 算法逐字节一致**（只有下面那 7 个键）：否则历史工件
+    **v1 正文必须与 R4.1 算法逐字节一致、v2 正文必须与 R1.1 算法逐字节一致**
+    （只有下面那 7 个键 + v2 的 config_hash/training_provenance）：否则历史工件
     （早期 ``alpha_v2_shadow_model_freeze.py`` 产出、磁盘上仍有归档）会因为
     "复算公式变了"而全部加载失败——那是把兼容性换成假安全。
+    因此封存清单按版本选取（v1 无、v2 用 V2 清单、v3 用完整清单）。
     """
     body: dict[str, object] = {
         "model_id": manifest.get("model_id", ""),
@@ -679,23 +728,28 @@ def _artifact_hash_body(
         # 与写入期必须逐字段一致，否则加载期复算会与记录值不符
         "code_commit": str(manifest.get("code_commit", "") or ""),
     }
-    if version == ARTIFACT_HASH_VERSION_V2:
-        # v2：训练身份（代码 + 配置 + 训练数据 provenance）整体进受保护集合。
+    if version in (ARTIFACT_HASH_VERSION_V2, ARTIFACT_HASH_VERSION_V3):
+        # v2+：训练身份（代码 + 配置 + 训练数据 provenance）整体进受保护集合。
         body["artifact_hash_version"] = version
         body["config_hash"] = str(manifest.get("config_hash", "") or "")
-        body["training_provenance"] = sealed_training_provenance(manifest.get("provenance"))
+        body["training_provenance"] = sealed_training_provenance(
+            manifest.get("provenance"), version=version
+        )
     return body
 
 
-def sealed_training_provenance(provenance: object) -> dict[str, object]:
+def sealed_training_provenance(
+    provenance: object, *, version: str = CURRENT_ARTIFACT_HASH_VERSION
+) -> dict[str, object]:
     """从 provenance 取出受保护的规范化块（固定键序 + JSON 安全化）。
 
-    只取 :data:`SEALED_PROVENANCE_KEYS` 里登记的键：provenance 是自由字典，
-    整个哈希会让"加一个审计字段"变成"换一份工件身份"；而漏哈希又会让身份链
-    出现可改字段。故用显式白名单。
+    只取该**版本**登记的键：provenance 是自由字典，整个哈希会让"加一个审计字段"
+    变成"换一份工件身份"；而漏哈希又会让身份链出现可改字段。故用显式白名单
+    ——且白名单按版本冻结，v3 新增字段不会改变 v2 工件的复算结果。
     """
     source = provenance if isinstance(provenance, Mapping) else {}
-    return {key: _json_safe(source.get(key)) for key in SEALED_PROVENANCE_KEYS}
+    keys = SEALED_PROVENANCE_KEYS_V2 if version == ARTIFACT_HASH_VERSION_V2 else SEALED_PROVENANCE_KEYS
+    return {key: _json_safe(source.get(key)) for key in keys}
 
 
 def _json_safe(value: object) -> object:
@@ -715,20 +769,34 @@ def artifact_hash_version_of(manifest: Mapping[str, object]) -> str:
     text = str(raw).strip() if raw is not None else ""
     if not text:
         return ARTIFACT_HASH_VERSION_V1
-    if text not in (ARTIFACT_HASH_VERSION_V1, ARTIFACT_HASH_VERSION_V2):
+    if text not in (ARTIFACT_HASH_VERSION_V1, ARTIFACT_HASH_VERSION_V2, ARTIFACT_HASH_VERSION_V3):
         raise FrozenModelError(
             f"冻结模型 manifest 的 {ARTIFACT_HASH_VERSION_FIELD} 非法: {text!r}"
-            "（只认 v1/v2；不猜、不回退）"
+            "（只认 v1/v2/v3；不猜、不回退）"
         )
     return text
 
 
-def missing_sealed_provenance_keys(manifest: Mapping[str, object]) -> list[str]:
-    """列出生产形态下缺失/为空的封存项（空列表 = 封存完整）。"""
+def sealed_required_keys_for(version: str) -> tuple[str, ...]:
+    """该版本下"必须存在"的封存项清单（v3 = 双价格源身份 + v2 全套）。"""
+    if version == ARTIFACT_HASH_VERSION_V3:
+        return SEALED_PROVENANCE_REQUIRED_KEYS
+    return SEALED_PROVENANCE_REQUIRED_KEYS_V2
+
+
+def missing_sealed_provenance_keys(
+    manifest: Mapping[str, object], *, version: str | None = None
+) -> list[str]:
+    """列出**该版本**生产形态下缺失/为空的封存项（空列表 = 封存完整）。
+
+    版本按 manifest 记录值取（调用方不需要也不应该自己传），v3 工件比 v2 多要求
+    "双价格源身份 + 两个 price mode + validation_mode"这几项。
+    """
     provenance = manifest.get("provenance")
     source = provenance if isinstance(provenance, Mapping) else {}
+    resolved = str(version or artifact_hash_version_of(manifest)).strip()
     missing: list[str] = []
-    for key in SEALED_PROVENANCE_REQUIRED_KEYS:
+    for key in sealed_required_keys_for(resolved):
         if key not in source:
             missing.append(key)
             continue
@@ -817,12 +885,19 @@ __all__ = [
     "ARTIFACT_HASH_VERSION_FIELD",
     "ARTIFACT_HASH_VERSION_V1",
     "ARTIFACT_HASH_VERSION_V2",
+    "ARTIFACT_HASH_VERSION_V3",
     "CURRENT_ARTIFACT_HASH_VERSION",
     "DEFAULT_MIN_CALIBRATION_ROWS",
     "DIRECTION_OUTPUTS",
     "FROZEN_MODEL_SCHEMA",
     "SEALED_PROVENANCE_KEYS",
+    "SEALED_PROVENANCE_KEYS_V2",
     "SEALED_PROVENANCE_REQUIRED_KEYS",
+    "SEALED_PROVENANCE_REQUIRED_KEYS_V2",
+    "SEALED_PROVENANCE_REQUIRED_KEYS_V3_EXTRA",
+    "SEALED_PROVENANCE_KEYS_V3_EXTRA",
+    "VALIDATION_MODE_PRODUCTION",
+    "VALIDATION_MODE_REHEARSAL",
     "FrozenModel",
     "FrozenModelError",
     "FrozenTarget",
@@ -836,5 +911,6 @@ __all__ = [
     "missing_sealed_provenance_keys",
     "persist_frozen_model",
     "predict_frozen_model_matrix",
+    "sealed_required_keys_for",
     "sealed_training_provenance",
 ]

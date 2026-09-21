@@ -1892,6 +1892,15 @@ class AlphaV2Config(_StrictModel):
     # Preflight 报告新鲜度上限（小时）：validation freeze 硬门要求 preflight
     # 必须是近期产物，防止"上周 PASS 的报告被拿来开今天的 epoch"。
     preflight_max_age_hours: float = 48.0
+    # ── P0 双价格序列契约：feature / execution 两个角色的行情库 ────────────────
+    # feature 侧（qfq 是设计内口径）供 FeatureEngineer 与风格维度；execution 侧
+    # **必须 raw**，供 label / 成交价 / 净收益 / 超额 / MAE/MFE。两者绝不共用一份
+    # 序列——生产 NAS 的正式库是 qfq，拿它当成交价会把除权跳变写成真实亏损。
+    # 留空 = 未配置：feature 回退 market_warehouse.db_path，execution 则一律
+    # fail closed（没有可证的 raw 库就不存在合法的训练目标）。
+    # NAS 上按既有约定用环境变量覆盖：SA__ALPHA_V2__EXECUTION_MARKET_DB。
+    feature_market_db: str = ""
+    execution_market_db: str = ""
 
     @field_validator("artifact_root", "selection_contract")
     @classmethod

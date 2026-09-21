@@ -1225,3 +1225,10 @@ alpha_v2:
   entry_mode: next_session_open       # next_session_open | next_tradable_open
   primary_horizon_days: 5
   candidate_output_top_k: 5
+  # P0 双价格序列契约：feature / execution 两个角色的行情库，绝不共用一份序列。
+  # feature 侧 qfq 是设计内口径（特征 + 风格维度）；execution 侧**必须 raw**
+  # （label / 成交价 / 净收益 / 超额 / MAE/MFE）。留空 = 未配置：
+  # feature 回退 market_warehouse.db_path，execution 一律 fail closed。
+  # NAS 上按既有约定用环境变量覆盖：SA__ALPHA_V2__EXECUTION_MARKET_DB
+  feature_market_db: ""
+  execution_market_db: ""

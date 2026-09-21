@@ -113,9 +113,27 @@ class LiveShadowCycleService:
     def market_db_path(self) -> str:
         """行情库路径：取 ``config.market_warehouse.db_path``（生产 NAS 是 delta 库，
         不是仓库默认的 artifacts/warehouse/market.duckdb——写死会让整个循环读错库）。
+
+        这是 **feature 侧**（qfq）行情库：capture 产特征、跑模型，用的就是它。
         """
         config = self._service._config
         return str(getattr(config.market_warehouse, "db_path", "artifacts/warehouse/market.duckdb"))
+
+    def feature_market_db_path(self) -> str:
+        """feature 侧行情库：``alpha_v2.feature_market_db`` 为空时回退 market_warehouse。"""
+        configured = str(
+            getattr(self._alpha_config(), "feature_market_db", "") or ""
+        ).strip()
+        return configured or self.market_db_path()
+
+    def execution_market_db_path(self) -> str:
+        """execution 侧行情库（**必须 raw**）。
+
+        留空表示未配置：mature 会 fail closed（exit 4）而不是拿 qfq 当成交价
+        ——P0 双价格序列契约里，这条路径宁可不产出 outcome，也不产出错口径的 outcome。
+        """
+        alpha_cfg = self._alpha_config()
+        return str(getattr(alpha_cfg, "execution_market_db", "") or "").strip()
 
     def data_health_out(self) -> Path:
         """data_health 落点：``<alpha_root>/runtime/data_health.json``。
@@ -397,13 +415,17 @@ class LiveShadowCycleService:
             [
                 (
                     "mature",
+                    # P0 双价格序列：mature 的两个角色**分开**给——execution 必须 raw，
+                    # feature 只供风格维度。一个 --market-db 走到底正是本 P0 的成因。
                     [
                         "--epoch-id",
                         epoch.epoch_id,
                         "--evaluation-date",
                         trade_date.isoformat(),
-                        "--market-db",
-                        self.market_db_path(),
+                        "--execution-market-db",
+                        self.execution_market_db_path(),
+                        "--feature-market-db",
+                        self.feature_market_db_path(),
                         "--out",
                         str(root),
                     ],
@@ -544,8 +566,10 @@ class LiveShadowCycleService:
                     epoch_id,
                     "--evaluation-date",
                     trade_date.isoformat(),
-                    "--market-db",
-                    self.market_db_path(),
+                    "--execution-market-db",
+                    self.execution_market_db_path(),
+                    "--feature-market-db",
+                    self.feature_market_db_path(),
                     "--out",
                     str(root),
                 ]
