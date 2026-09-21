@@ -62,6 +62,30 @@ DB_ROLE_BINDING_DUAL = "dual_source"
 
 DEFAULT_MARKET_DB = "artifacts/warehouse/market.duckdb"
 
+#: 需要"冻结口径 = 当天实测口径"严格成立的 validation_mode 集合。
+#: ``test`` 与 ``production`` 同语义（本仓库既有约定：test 只为确定性时钟存在，
+#: 且它在 KPI 层是 clean-OOS 合格模式）。**只有 rehearsal 允许带标注降级**——
+#: 放 test 走降级会产生"clean 证据 + 变了语义的 style 基准"，所以这里比
+#: "production 一档"更严：能进 clean 证据的模式一律不许静默降级。
+LIVE_STRICT_VALIDATION_MODES: tuple[str, ...] = ("production", "test")
+
+#: rehearsal 降级时 style 来源的标注（执行侧面板冒充 feature 面板）
+STYLE_SOURCE_FEATURE_PANEL = "feature_panel"
+STYLE_SOURCE_EXECUTION_FALLBACK = "execution_panel_fallback_rehearsal"
+
+#: 当天 feature 价格口径证据的 schema（capture 日清单与 scheduler 前置门共用一份）。
+FEATURE_PRICE_SERIES_EVIDENCE_SCHEMA = "alpha_v2_live_feature_price_series.v1"
+
+
+def is_live_strict_mode(validation_mode: object) -> bool:
+    """该 validation_mode 是否要求"冻结 feature mode == 当天实测 feature mode"。
+
+    ``production`` / ``test`` → True；``rehearsal`` / 其它（未知值）→ False。
+    未知值回退成**非严格**是有意的：严格集合是白名单，新增的未知模式不该悄悄
+    获得 clean 资格（KPI 层另有 execution/身份门把它挡在 clean 之外）。
+    """
+    return str(validation_mode or "").strip().lower() in LIVE_STRICT_VALIDATION_MODES
+
 # 认证证据里进审计的身份字段（固定顺序 + 白名单）：provenance 是自由字典，整块塞进去
 # 会让"探针多打一个统计量"变成"换一份工件身份"。
 CERT_EVIDENCE_AUDIT_KEYS: tuple[str, ...] = (
@@ -237,6 +261,47 @@ def price_series_identity_block(
             }
         )
     return block
+
+
+def _feature_mode_from_provenance(provenance: object) -> str:
+    """从冻结 provenance 的 ``feature_data_identity.price_series_mode`` 取口径。
+
+    只认这一条路径：``config.data_source.vendor_zip_price_series_mode`` 是**当前配置**，
+    不是"这份模型训练时用的口径"——拿配置猜会让"训练 qfq / 线上被改成 raw"静默通过。
+    """
+    if not isinstance(provenance, Mapping):
+        return ""
+    identity = provenance.get("feature_data_identity")
+    if not isinstance(identity, Mapping):
+        return ""
+    return str(identity.get("price_series_mode", "") or "").strip().lower()
+
+
+def feature_mode_of_frozen_model(model_manifest: Mapping[str, object] | None) -> str:
+    """冻结模型 manifest → 训练时冻结的 feature 口径（缺失 = 空串，由调用方 fail closed）。"""
+    manifest = model_manifest if isinstance(model_manifest, Mapping) else {}
+    return _feature_mode_from_provenance(manifest.get("provenance"))
+
+
+def feature_mode_of_freeze_manifest(freeze_manifest: Mapping[str, object] | None) -> str:
+    """validation freeze manifest → 同一字段（路径 ``model.provenance.feature_data_identity``）。
+
+    freeze 清单里的模型块由 ``frozen_model_identity_payload`` 派生且受
+    ``freeze_manifest_hash`` 锚定，所以它是"本 epoch 用的那份模型"的权威副本；
+    但**身份仍以工件为准**——capture 直接读工件，mature/scheduler 读清单副本。
+    """
+    freeze = freeze_manifest if isinstance(freeze_manifest, Mapping) else {}
+    model = freeze.get("model")
+    if not isinstance(model, Mapping):
+        return ""
+    mode = _feature_mode_from_provenance(model.get("provenance"))
+    if mode:
+        return mode
+    # 兼容：frozen_model_identity_payload 同时把身份块放在顶层。
+    identity = model.get("feature_data_identity")
+    if isinstance(identity, Mapping):
+        return str(identity.get("price_series_mode", "") or "").strip().lower()
+    return ""
 
 
 def compare_price_series_identity(
@@ -473,6 +538,10 @@ def resolve_db_path(repo_root: str | Path, db: str) -> Path:
 
 __all__ = [
     "CERT_EVIDENCE_AUDIT_KEYS",
+    "LIVE_STRICT_VALIDATION_MODES",
+    "STYLE_SOURCE_EXECUTION_FALLBACK",
+    "FEATURE_PRICE_SERIES_EVIDENCE_SCHEMA",
+    "STYLE_SOURCE_FEATURE_PANEL",
     "DB_ROLE_BINDING_DUAL",
     "DB_ROLE_BINDING_LEGACY",
     "DEFAULT_MARKET_DB",
@@ -492,6 +561,9 @@ __all__ = [
     "certification_from_declaration",
     "compare_price_series_identity",
     "decision_alignment",
+    "feature_mode_of_freeze_manifest",
+    "feature_mode_of_frozen_model",
+    "is_live_strict_mode",
     "price_series_identity_block",
     "require_certified_execution_series",
     "require_declared_feature_series",

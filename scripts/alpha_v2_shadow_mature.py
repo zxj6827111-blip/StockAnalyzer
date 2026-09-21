@@ -47,6 +47,8 @@ if str(REPO_ROOT / "src") not in sys.path:
 from stock_analyzer.alpha_v2.dual_price_series import (  # noqa: E402
     DB_ROLE_BINDING_LEGACY,
     PriceSeriesContractError,
+    feature_mode_of_freeze_manifest,
+    is_live_strict_mode,
     price_series_identity_block,
     require_certified_execution_series,
     require_declared_feature_series,
@@ -240,8 +242,27 @@ def main(argv: list[str] | None = None) -> int:
         }
         - {""}
     )
+    if not shadow_symbols:
+        print("[mature] 影子日为 0 行；无需运行", flush=True)
+        return 0
+    # P0 Final R1（BLOCKER 3）：期望的 feature 口径只能来自**冻结身份**
+    # （freeze.model.provenance.feature_data_identity），不能读 config 猜。
+    live_strict = is_live_strict_mode(validation_mode)
+    expected_feature_mode = feature_mode_of_freeze_manifest(freeze)
+    if live_strict and not expected_feature_mode:
+        print(
+            "[mature] 拒绝（exit_code=11）：冻结清单的模型块未声明 feature 价格口径"
+            "（model.provenance.feature_data_identity.price_series_mode）——"
+            "无法证明 style 维度与训练同口径",
+            file=sys.stderr,
+        )
+        return 11
+
     style_panel = None
-    if mapping.feature_db and shadow_symbols:
+    feature_problem = ""
+    if not mapping.feature_db:
+        feature_problem = "feature_market_db_not_configured:未配置 feature 行情库"
+    else:
         try:
             style_panel = load_daily_panel(
                 market_db=REPO_ROOT / mapping.feature_db,
@@ -252,21 +273,39 @@ def main(argv: list[str] | None = None) -> int:
                 source=str(mapping.feature_db),
             )
             feature_certification = style_panel.certify_price_mode(min_sample=1000)
+            # 判据唯一实现：口径必须可证，且等于冻结模型声明的 feature mode。
             require_declared_feature_series(
                 feature_certification,
                 context="mature:feature_panel",
+                expected_mode=expected_feature_mode,
                 db=mapping.feature_db,
             )
+            if not expected_feature_mode:
+                feature_problem = (
+                    "expected_feature_mode_missing:冻结清单未声明 feature 口径"
+                )
         except PriceSeriesContractError as exc:
-            print(f"[mature] 拒绝（exit_code={exc.exit_code}）: {exc}", file=sys.stderr)
-            return exc.exit_code
-        except Exception as exc:  # noqa: BLE001 - feature 面板缺失不阻断成熟（风格层降级）
+            feature_problem = f"feature_price_series_contract:{exc}"
+            style_panel = None
+        except Exception as exc:  # noqa: BLE001 - 库不可读同样是"面板不可用"
+            feature_problem = f"feature_panel_unreadable:{exc.__class__.__name__}:{exc}"
+            style_panel = None
+
+    if style_panel is None:
+        if live_strict:
+            # P0 Final R1（BLOCKER 4）：生产/测试**禁止**退回 execution 面板算风格——
+            # 那会改变 style_matched 基准的冻结语义。宁可 0 行 outcome。
             print(
-                f"[mature] 警告：feature 面板不可用（{exc.__class__.__name__}: {exc}）；"
-                "风格维度退回 execution 面板（摘要会标 style_features_source）",
+                f"[mature] 拒绝（exit_code=11）：style 面板不可用（{feature_problem}）；"
+                "production/test 不允许退回 execution 面板算 style（0 行 outcome 写出）",
                 file=sys.stderr,
             )
-            style_panel = None
+            return 11
+        print(
+            f"[mature] 警告：{feature_problem}；validation_mode={validation_mode} → "
+            "style 退回 execution 面板（摘要会标 execution_panel_fallback_rehearsal）",
+            file=sys.stderr,
+        )
 
     execution_identity = price_series_identity_block(
         role="execution",
@@ -287,6 +326,7 @@ def main(argv: list[str] | None = None) -> int:
         price_mode_certified=certification.certified,
         runtime_identity=runtime_identity,
         execution_data_identity=execution_identity,
+        validation_mode=validation_mode,
     )
     print(
         f"[mature] {summary['status']}: 写入 {summary['rows_written']} 行; "

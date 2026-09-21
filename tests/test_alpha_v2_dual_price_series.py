@@ -26,10 +26,11 @@ DP-10                   execution 库陈旧 → preflight BLOCKED
 
 from __future__ import annotations
 
+import functools
 import json
 import subprocess
 import sys
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import duckdb
@@ -37,6 +38,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from _alpha_v2_m3_fixtures import (
+    M3_MODEL_BLOCK,
     capture_at,
     open_epoch_for_manifest,
     shadow_row_identity,
@@ -59,6 +61,7 @@ from stock_analyzer.alpha_v2.research.panel import load_daily_panel
 from stock_analyzer.alpha_v2.validation import dual_price_freeze as dpf
 from stock_analyzer.alpha_v2.validation import preflight as pf
 from stock_analyzer.alpha_v2.validation.outcome_maturation import (
+    OutcomeMaturationError,
     mature_epoch_outcomes,
     outcome_path,
 )
@@ -318,7 +321,12 @@ def test_dp4_feature_from_qfq_label_from_raw(dual_panels, dual_dbs):
 
 
 def _epoch_with_shadow(
-    tmp_path, *, config, day: date, candidates: list[dict[str, object]] | None = None
+    tmp_path,
+    *,
+    config,
+    day: date,
+    candidates: list[dict[str, object]] | None = None,
+    model: dict[str, object] | None = None,
 ) -> tuple[object, list[date]]:
     """开一个 epoch 并写一天的 shadow 快照（成熟链路的真实输入）。"""
     from stock_analyzer.alpha_v2.validation.runtime_identity import (
@@ -333,6 +341,7 @@ def _epoch_with_shadow(
         code_commit=git_head(REPO_ROOT),
         config_hash=config_hash_of(config),
         execution_price_mode="raw",
+        **({"model": model} if model is not None else {}),
     )
     epoch = open_epoch_for_manifest(tmp_path, manifest, opened_on_date=day.isoformat())
     rows = build_shadow_rows(
@@ -875,3 +884,523 @@ def test_preflight_report_binds_both_identities_to_the_model(tmp_path, monkeypat
     assert block["execution_data_identity"]["price_series_certified"] is True
     assert block["execution_data_identity"]["fingerprint"] == execution_fp["fingerprint"]
     assert block["feature_data_identity"]["price_series_mode"] == "qfq"
+
+# ---------------------------------------------------------------------------
+# LIVE-F1..F3：capture 侧的每日 feature 口径门（P0 Final R1 / BLOCKER 1）
+# ---------------------------------------------------------------------------
+
+
+def _weekdays(count: int, *, end: date = DAYS[19]) -> list[date]:
+    """从 ``end`` 往前取 ``count`` 个工作日（升序）——PIT 池需要 ≥60 根历史 bar。"""
+    days: list[date] = []
+    cursor = end
+    while len(days) < count:
+        if cursor.weekday() < 5:
+            days.append(cursor)
+        cursor -= timedelta(days=1)
+    return sorted(days)
+
+
+#: capture 侧用的长历史日历（≥60 交易日历史才可能选出 PIT 合格票）
+LIVE_CALENDAR: list[date] = _weekdays(160)
+LIVE_SIGNAL_DAY: date = LIVE_CALENDAR[-1]
+
+
+@functools.lru_cache(maxsize=4)
+def _script_module(name: str):
+    """按文件路径加载 ``scripts/<name>.py``（便于 monkeypatch 其模块级符号）。"""
+    import importlib.util
+
+    path = REPO_ROOT / "scripts" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"_script_{name}", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _write_live_model(root: Path, *, feature_mode: str, db_label: str):
+    """造一份**真实可加载**的冻结模型工件，provenance 声明冻结 feature 口径。"""
+    from stock_analyzer.alpha_v2.research.multi_head import HeadFitSpec
+    from stock_analyzer.alpha_v2.validation.frozen_model import (
+        fit_frozen_model,
+        frozen_model_identity_payload,
+        persist_frozen_model,
+    )
+    from stock_analyzer.alpha_v2.validation.runtime_identity import git_head
+
+    rng = np.random.default_rng(23)
+    total = 60
+    frame = pd.DataFrame(
+        {
+            "decision_date": [DAYS[i % 20].isoformat() for i in range(total)],
+            "symbol": [f"6000{i % 4:02d}" for i in range(total)],
+            **{name: rng.normal(0.0, 1.0, total) for name in ("ret_1d", "ma5")},
+        }
+    )
+    frame["net_return_5d"] = rng.normal(0.0, 0.02, total)
+    frame["excess_return_5d"] = frame["net_return_5d"] - 0.001
+    # alpha_target_5d 必须有：否则没有 alpha booster，predict 不会产出 alpha_rank_score，
+    # 而 cohort 构造（deep50_position_records）依赖它。
+    frame["alpha_target_5d"] = frame.groupby("decision_date")["excess_return_5d"].rank(pct=True)
+    frame["is_train"] = [i < 40 for i in range(total)]
+    frame["is_calibration"] = [i >= 40 for i in range(total)]
+    provenance: dict[str, object] = {"window": [DAYS[0].isoformat(), DAYS[19].isoformat()]}
+    if feature_mode:
+        provenance["feature_data_identity"] = {
+            "role": "feature",
+            "db": db_label,
+            "price_series_mode": feature_mode,
+        }
+    model = fit_frozen_model(
+        frame=frame,
+        model_id="live_feature_model",
+        spec=HeadFitSpec(min_train_rows=20, min_class_balance=0.05),
+        provenance=provenance,
+        extra_identity={"code_commit": git_head(REPO_ROOT)},
+    )
+    model_dir = persist_frozen_model(model, root)
+    return model_dir, dict(frozen_model_identity_payload(model_dir))
+
+
+def _capture_epoch(tmp_path: Path, *, day: date, feature_db: Path, feature_mode: str):
+    """test-mode epoch + 模型工件 + 与 epoch 锚定一致的冻结清单。"""
+    from stock_analyzer.alpha_v2.validation.runtime_identity import (
+        config_hash_of,
+        git_head,
+    )
+
+    model_dir, model_block = _write_live_model(
+        tmp_path, feature_mode=feature_mode, db_label=str(feature_db)
+    )
+    config = load_config(REPO_ROOT / "config" / "default.yaml")
+    manifest = write_freeze_manifest(
+        tmp_path,
+        validation_mode="test",
+        validation_start_date=day.isoformat(),
+        code_commit=git_head(REPO_ROOT),
+        config_hash=config_hash_of(config),
+        execution_price_mode="raw",
+        model=model_block,
+    )
+    epoch = open_epoch_for_manifest(tmp_path, manifest, opened_on_date=day.isoformat())
+    return epoch, model_dir
+
+
+def _capture_argv(*, tmp_path: Path, epoch, model_dir: Path, day: date, market_db: Path):
+    return [
+        "--epoch-id",
+        epoch.epoch_id,
+        "--signal-date",
+        day.isoformat(),
+        "--capture-date",
+        day.isoformat(),
+        "--market-db",
+        str(market_db),
+        "--model-dir",
+        str(model_dir),
+        "--out",
+        str(tmp_path),
+        "--warmup-days",
+        "120",
+        "--cohort-source",
+        "research_proxy",
+    ]
+
+
+def _capture_day_manifest(tmp_path: Path, epoch_id: str, day: date) -> dict[str, object]:
+    path = (
+        tmp_path
+        / "validation"
+        / epoch_id
+        / "manifests"
+        / f"shadow_day_{day.strftime('%Y%m%d')}.json"
+    )
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_live_f1_frozen_qfq_with_qfq_feature_db_passes(tmp_path, monkeypatch):
+    """LIVE-F1：冻结 qfq + 当天 feature 库 qfq → capture 放行且落日证据。"""
+    monkeypatch.setenv("SA__EVOLUTION__EXECUTION_SPEC__PRICE_SERIES_MODE", "raw")
+    day = LIVE_SIGNAL_DAY
+    feature_db = _write_db(tmp_path / "feature_qfq.duckdb", mode="qfq", days=LIVE_CALENDAR)
+    epoch, model_dir = _capture_epoch(
+        tmp_path, day=day, feature_db=feature_db, feature_mode="qfq"
+    )
+    module = _script_module("alpha_v2_shadow_capture")
+    rc = module.main(
+        _capture_argv(
+            tmp_path=tmp_path, epoch=epoch, model_dir=model_dir, day=day, market_db=feature_db
+        )
+    )
+    assert rc == 0
+    evidence = _capture_day_manifest(tmp_path, epoch.epoch_id, day)["feature_price_series"]
+    assert evidence["expected_mode"] == "qfq"
+    assert evidence["observed_mode"] == "qfq"
+    assert evidence["contract_ok"] is True
+    assert evidence["mode_match"] is True
+    assert evidence["enforced"] is True
+    assert evidence["source_db"] == str(feature_db)
+    assert list((tmp_path / "validation").rglob("shadow_*.jsonl"))
+
+
+def test_live_f2_frozen_qfq_with_raw_feature_db_is_rejected_before_features(
+    tmp_path, monkeypatch
+):
+    """LIVE-F2：冻结 qfq + 当天 feature 库 raw → 在特征/预测/写盘之前拒绝。
+
+    证明方式：把 ``daily_feature_frame`` / ``predict_frozen_model_matrix`` 换成会爆炸的
+    探针——若它们被调到，测试会以 AssertionError 失败，而不是以契约错误退出。
+    """
+    monkeypatch.setenv("SA__EVOLUTION__EXECUTION_SPEC__PRICE_SERIES_MODE", "raw")
+    day = LIVE_SIGNAL_DAY
+    feature_db = _write_db(tmp_path / "feature_raw.duckdb", mode="raw", days=LIVE_CALENDAR)
+    epoch, model_dir = _capture_epoch(
+        tmp_path, day=day, feature_db=feature_db, feature_mode="qfq"
+    )
+    module = _script_module("alpha_v2_shadow_capture")
+    touched: list[str] = []
+
+    def _explode(name: str):
+        def _inner(*args, **kwargs):  # pragma: no cover - 被调用即测试失败
+            touched.append(name)
+            raise AssertionError(f"{name} 在 feature 口径硬门之前就被调用了")
+
+        return _inner
+
+    monkeypatch.setattr(module, "daily_feature_frame", _explode("daily_feature_frame"))
+    monkeypatch.setattr(
+        module, "predict_frozen_model_matrix", _explode("predict_frozen_model_matrix")
+    )
+    rc = module.main(
+        _capture_argv(
+            tmp_path=tmp_path, epoch=epoch, model_dir=model_dir, day=day, market_db=feature_db
+        )
+    )
+    assert rc == 11
+    assert touched == []
+    assert list((tmp_path / "validation").rglob("shadow_*.jsonl")) == []
+    assert not list((tmp_path / "validation").rglob("shadow_day_*.json"))
+
+
+def test_live_f3_unprovable_feature_mode_is_rejected(tmp_path, monkeypatch):
+    """LIVE-F3：feature 库口径不可证（无声明 + 探针样本不足）→ 拒绝且不写快照。"""
+    monkeypatch.setenv("SA__EVOLUTION__EXECUTION_SPEC__PRICE_SERIES_MODE", "raw")
+    day = LIVE_SIGNAL_DAY
+    bare_db = _write_db(tmp_path / "feature_bare.duckdb", mode=None, days=LIVE_CALENDAR)
+    epoch, model_dir = _capture_epoch(
+        tmp_path, day=day, feature_db=bare_db, feature_mode="qfq"
+    )
+    module = _script_module("alpha_v2_shadow_capture")
+    rc = module.main(
+        _capture_argv(
+            tmp_path=tmp_path, epoch=epoch, model_dir=model_dir, day=day, market_db=bare_db
+        )
+    )
+    assert rc == 11
+    assert list((tmp_path / "validation").rglob("shadow_*.jsonl")) == []
+
+
+def test_live_f1b_frozen_mode_missing_fails_closed(tmp_path, monkeypatch):
+    """LIVE-F1b：冻结模型未声明 feature 口径（v2/未封存形态）→ 拒绝。"""
+    monkeypatch.setenv("SA__EVOLUTION__EXECUTION_SPEC__PRICE_SERIES_MODE", "raw")
+    day = LIVE_SIGNAL_DAY
+    feature_db = _write_db(tmp_path / "feature_qfq.duckdb", mode="qfq", days=LIVE_CALENDAR)
+    epoch, model_dir = _capture_epoch(
+        tmp_path, day=day, feature_db=feature_db, feature_mode=""
+    )
+    module = _script_module("alpha_v2_shadow_capture")
+    rc = module.main(
+        _capture_argv(
+            tmp_path=tmp_path, epoch=epoch, model_dir=model_dir, day=day, market_db=feature_db
+        )
+    )
+    assert rc == 11
+    assert list((tmp_path / "validation").rglob("shadow_*.jsonl")) == []
+
+
+class _LiveCaptureStub:
+    """最小 service 替身：只驱动 run_daily_cycle 到 capture argv 构造。"""
+
+    def __init__(self, *, config, now: datetime, root: Path):
+        self.config = config
+        self.calls: list[tuple[str, list[str]]] = []
+        self.now = now
+        self.root = root
+
+        class _Automation:
+            @staticmethod
+            def probe_nightly_readiness() -> dict[str, object]:
+                return {"allowed": True, "status": "ready", "reason": ""}
+
+        self.automation = _Automation()
+
+
+def _live_capture_cycle(*, config, now: datetime, calls: list[tuple[str, list[str]]]):
+    """构造一个 capture argv 可观察、其余步骤全打桩的 cycle。"""
+    from stock_analyzer.runtime.services.live_shadow_cycle_service import (
+        LiveShadowCycleService,
+    )
+
+    service = type("Svc", (), {})()
+    service._config = config
+    service._record_audit_event = lambda **kwargs: None
+    service._job_now = lambda: now
+    service._week5_automation_service = _LiveCaptureStub(
+        config=config, now=now, root=Path(".")
+    ).automation
+    cycle = LiveShadowCycleService(service)
+    service._live_shadow_cycle = cycle
+    cycle._run_cli = lambda script, argv, timeout_sec: (
+        calls.append((script, list(argv))) or (0, "stub")
+    )
+    cycle._funnel_ready = lambda *, trade_date: (True, "")
+    cycle._ensure_data_health = lambda *, trade_date: (True, "", {})
+    cycle._ensure_feature_price_series = lambda **kwargs: (True, "", {"stub": True})
+    cycle._run_history_tail = lambda **kwargs: []
+    return cycle
+
+
+def test_live_f4_scheduler_capture_uses_feature_market_db_path(tmp_path):
+    """LIVE-F4：capture 必须收到 ``alpha_v2.feature_market_db``（而不是 db_path）。"""
+    from stock_analyzer.alpha_v2.validation.epoch import active_epoch
+    from stock_analyzer.alpha_v2.validation.runtime_identity import (
+        config_hash_of,
+        git_head,
+    )
+
+    config = load_config(REPO_ROOT / "config" / "default.yaml")
+    config.alpha_v2.enabled = True
+    config.alpha_v2.shadow_only = True
+    config.alpha_v2.enforce_final_selection = False
+    config.alpha_v2.artifact_root = str(tmp_path)
+    config.alpha_v2.feature_market_db = str(tmp_path / "feature_A.duckdb")
+    config.market_warehouse.db_path = str(tmp_path / "warehouse_B.duckdb")
+    day = DAYS[12]
+    manifest = write_freeze_manifest(
+        tmp_path,
+        validation_mode="rehearsal",
+        validation_start_date=day.isoformat(),
+        code_commit=git_head(REPO_ROOT),
+        config_hash=config_hash_of(config),
+    )
+    open_epoch_for_manifest(tmp_path, manifest, opened_on_date=day.isoformat())
+    assert active_epoch(tmp_path) is not None
+
+    calls: list[tuple[str, list[str]]] = []
+    cycle = _live_capture_cycle(
+        config=config, now=datetime.combine(day, datetime.min.time()), calls=calls
+    )
+    result = cycle.run_daily_cycle()
+    assert result["_scheduler_detail"] == "alpha_v2_cycle_completed", result
+    capture = [argv for script, argv in calls if script == "alpha_v2_shadow_capture.py"]
+    assert capture, calls
+    market_db_arg = capture[0][capture[0].index("--market-db") + 1]
+    assert market_db_arg == str(tmp_path / "feature_A.duckdb")
+    assert market_db_arg != str(tmp_path / "warehouse_B.duckdb")
+
+
+# ---------------------------------------------------------------------------
+# LIVE-M1..M5：mature 侧的冻结 feature 口径门（P0 Final R1 / BLOCKER 3+4）
+# ---------------------------------------------------------------------------
+
+
+#: 生产同形的模型块：模型块 provenance 声明冻结 feature 口径（mature/scheduler 从它取）。
+LIVE_FEATURE_MODEL_BLOCK: dict[str, object] = {
+    **M3_MODEL_BLOCK,
+    "provenance": {
+        "window": ["2026-01-05", "2026-02-02"],
+        "feature_data_identity": {"role": "feature", "price_series_mode": "qfq"},
+    },
+}
+
+
+def _mature_cli(
+    tmp_path: Path,
+    *,
+    epoch,
+    evaluation_date: date,
+    feature_db: Path | None,
+    execution_db: Path,
+):
+    argv = [
+        sys.executable,
+        str(REPO_ROOT / "scripts" / "alpha_v2_shadow_mature.py"),
+        "--epoch-id",
+        epoch.epoch_id,
+        "--evaluation-date",
+        evaluation_date.isoformat(),
+        "--execution-market-db",
+        str(execution_db),
+        "--out",
+        str(tmp_path),
+    ]
+    if feature_db is not None:
+        argv += ["--feature-market-db", str(feature_db)]
+    return subprocess.run(  # noqa: S603 - 固定脚本 + 列表参数
+        argv,
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+
+
+def _live_mature_epoch(tmp_path, *, config, day: date):
+    return _epoch_with_shadow(
+        tmp_path, config=config, day=day, model=dict(LIVE_FEATURE_MODEL_BLOCK)
+    )
+
+
+def test_live_m1_mature_with_matching_feature_mode_passes(tmp_path, monkeypatch):
+    """LIVE-M1：冻结 qfq + mature feature 库 qfq + execution raw/certified → 放行。"""
+    monkeypatch.setenv("SA__EVOLUTION__EXECUTION_SPEC__PRICE_SERIES_MODE", "raw")
+    config = load_config(REPO_ROOT / "config" / "default.yaml")
+    days = list(DAYS[:35])
+    signal_day = DAYS[5]
+    epoch, _ = _live_mature_epoch(tmp_path, config=config, day=signal_day)
+    feature_db = _write_db(tmp_path / "m_feature_qfq.duckdb", mode="qfq", days=days)
+    execution_db = _write_db(tmp_path / "m_execution_raw.duckdb", mode="raw", days=days)
+
+    completed = _mature_cli(
+        tmp_path,
+        epoch=epoch,
+        evaluation_date=days[30],
+        feature_db=feature_db,
+        execution_db=execution_db,
+    )
+    assert completed.returncode == 0, completed.stderr[-1200:]
+    rows = [
+        json.loads(line)
+        for line in outcome_path(tmp_path, epoch.epoch_id, signal_day)
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert len(rows) == len(SYMBOLS)
+    assert {row["price_mode"] for row in rows} == {"raw"}
+    assert all(row["price_mode_certified"] is True for row in rows)
+
+
+def test_live_m2_mature_with_drifted_feature_mode_fails_closed(tmp_path, monkeypatch):
+    """LIVE-M2：冻结 qfq + mature feature 库 raw → 拒绝且 0 行新 outcome。"""
+    monkeypatch.setenv("SA__EVOLUTION__EXECUTION_SPEC__PRICE_SERIES_MODE", "raw")
+    config = load_config(REPO_ROOT / "config" / "default.yaml")
+    days = list(DAYS[:35])
+    signal_day = DAYS[5]
+    epoch, _ = _live_mature_epoch(tmp_path, config=config, day=signal_day)
+    feature_db = _write_db(tmp_path / "m_feature_raw.duckdb", mode="raw", days=days)
+    execution_db = _write_db(tmp_path / "m_execution_raw.duckdb", mode="raw", days=days)
+
+    completed = _mature_cli(
+        tmp_path,
+        epoch=epoch,
+        evaluation_date=days[30],
+        feature_db=feature_db,
+        execution_db=execution_db,
+    )
+    assert completed.returncode == 11, (completed.returncode, completed.stderr[-1200:])
+    assert "不接受退回 execution 面板" in completed.stderr or "口径" in completed.stderr
+    assert not outcome_path(tmp_path, epoch.epoch_id, signal_day).exists()
+
+
+def test_live_m3_mature_without_feature_db_fails_closed(tmp_path, monkeypatch):
+    """LIVE-M3：feature 库缺失/不可读 → 拒绝（**不得**退回 execution 面板算 style）。"""
+    monkeypatch.setenv("SA__EVOLUTION__EXECUTION_SPEC__PRICE_SERIES_MODE", "raw")
+    config = load_config(REPO_ROOT / "config" / "default.yaml")
+    days = list(DAYS[:35])
+    signal_day = DAYS[5]
+    epoch, _ = _live_mature_epoch(tmp_path, config=config, day=signal_day)
+    execution_db = _write_db(tmp_path / "m_execution_raw.duckdb", mode="raw", days=days)
+
+    missing = _mature_cli(
+        tmp_path,
+        epoch=epoch,
+        evaluation_date=days[30],
+        feature_db=tmp_path / "does_not_exist.duckdb",
+        execution_db=execution_db,
+    )
+    assert missing.returncode == 11, (missing.returncode, missing.stderr[-1200:])
+    assert not outcome_path(tmp_path, epoch.epoch_id, signal_day).exists()
+
+    unset = _mature_cli(
+        tmp_path,
+        epoch=epoch,
+        evaluation_date=days[30],
+        feature_db=None,
+        execution_db=execution_db,
+    )
+    assert unset.returncode == 11, (unset.returncode, unset.stderr[-1200:])
+    assert not outcome_path(tmp_path, epoch.epoch_id, signal_day).exists()
+
+
+def test_live_m4_function_level_production_rejects_style_fallback(tmp_path, monkeypatch):
+    """LIVE-M4：绕开 CLI 直接调用函数，production/test 下 style_panel=None 同样拒绝。"""
+    monkeypatch.setenv("SA__EVOLUTION__EXECUTION_SPEC__PRICE_SERIES_MODE", "raw")
+    config = load_config(REPO_ROOT / "config" / "default.yaml")
+    days = list(DAYS[:35])
+    signal_day = DAYS[5]
+    epoch, _ = _live_mature_epoch(tmp_path, config=config, day=signal_day)
+    execution_db = _write_db(tmp_path / "m_execution_raw.duckdb", mode="raw", days=days)
+    raw_panel = _load_panel(execution_db, start=days[0], end=days[30], warmup=5)
+    cert = raw_panel.certify_price_mode(min_sample=1)
+    assert cert.mode == "raw" and cert.certified is True
+
+    for mode in ("production", "test"):
+        with pytest.raises(OutcomeMaturationError):
+            mature_epoch_outcomes(
+                root=tmp_path,
+                epoch=epoch,
+                panel=raw_panel,
+                style_panel=None,
+                evaluation_date=days[30],
+                matcher=_matcher(),
+                slippage_ratio=0.0015,
+                price_mode=cert.mode,
+                price_mode_certified=cert.certified,
+                validation_mode=mode,
+            )
+    # 默认值就是 production（忘传也不会拿到宽松行为）
+    with pytest.raises(OutcomeMaturationError):
+        mature_epoch_outcomes(
+            root=tmp_path,
+            epoch=epoch,
+            panel=raw_panel,
+            style_panel=None,
+            evaluation_date=days[30],
+            matcher=_matcher(),
+            slippage_ratio=0.0015,
+            price_mode=cert.mode,
+            price_mode_certified=cert.certified,
+        )
+    assert not outcome_path(tmp_path, epoch.epoch_id, signal_day).exists()
+
+
+def test_live_m5_rehearsal_style_fallback_is_labeled(tmp_path, monkeypatch):
+    """LIVE-M5：rehearsal + style_panel=None → 允许，但摘要必须自曝降级来源。"""
+    monkeypatch.setenv("SA__EVOLUTION__EXECUTION_SPEC__PRICE_SERIES_MODE", "raw")
+    config = load_config(REPO_ROOT / "config" / "default.yaml")
+    days = list(DAYS[:35])
+    signal_day = DAYS[5]
+    epoch, _ = _live_mature_epoch(tmp_path, config=config, day=signal_day)
+    execution_db = _write_db(tmp_path / "m_execution_raw.duckdb", mode="raw", days=days)
+    raw_panel = _load_panel(execution_db, start=days[0], end=days[30], warmup=5)
+    cert = raw_panel.certify_price_mode(min_sample=1)
+
+    summary = mature_epoch_outcomes(
+        root=tmp_path,
+        epoch=epoch,
+        panel=raw_panel,
+        style_panel=None,
+        evaluation_date=days[30],
+        matcher=_matcher(),
+        slippage_ratio=0.0015,
+        price_mode=cert.mode,
+        price_mode_certified=cert.certified,
+        validation_mode="rehearsal",
+    )
+    assert summary["style_features_source"] == "execution_panel_fallback_rehearsal"
+    assert summary["validation_mode"] == "rehearsal"
+    assert summary["rows_written"] == len(SYMBOLS)
+    assert outcome_path(tmp_path, epoch.epoch_id, signal_day).exists()

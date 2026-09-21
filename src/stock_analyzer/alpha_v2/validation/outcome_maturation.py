@@ -32,7 +32,10 @@ import numpy as np
 import pandas as pd
 
 from stock_analyzer.alpha_v2.dual_price_series import (
+    STYLE_SOURCE_EXECUTION_FALLBACK,
+    STYLE_SOURCE_FEATURE_PANEL,
     certification_from_declaration,
+    is_live_strict_mode,
     require_certified_execution_series,
 )
 from stock_analyzer.alpha_v2.research.benchmarks import (
@@ -108,20 +111,28 @@ def mature_epoch_outcomes(
     spec: OutcomeSpec | None = None,
     runtime_identity: Mapping[str, object] | None = None,
     execution_data_identity: Mapping[str, object] | None = None,
+    validation_mode: str = "production",
 ) -> dict[str, object]:
     """对 epoch 内所有快照日做一**幂等**成熟扫描；返回本次运行的审计摘要。
 
     ``panel`` 是 **execution 面板**（必须 raw），``style_panel`` 是风格维度来源
-    （取冻结的 feature 侧契约；``None`` = 退化成 execution 面板，并在摘要里如实标注
-    ``style_features_source=execution_panel_fallback``）。二者分开是 P0 的一部分：
-    风格维度是**分组**用的、不是收益来源，用 qfq 算动量/波动更干净。
+    （取冻结的 feature 侧契约）。二者分开是 P0 的一部分：风格维度是**分组**用的、
+    不是收益来源，用 qfq 算动量/波动更干净。
 
-    先过四道门才允许动手（F2/F3 修复 + P0 双价格源）：
+    默认 ``validation_mode="production"``（**fail-closed 默认**：绕开 CLI 直接调用
+    本函数的人不会因为"忘了传"而拿到宽松行为）。
+
+    先过四道门才允许动手（F2/F3 修复 + P0 双价格源 + Final R1）：
 
     0. **P0 execution 价格序列硬门**（第一道，在任何计算/写入之前）：``price_mode``
        必须是 ``raw`` 且 ``price_mode_certified`` 为真，否则抛
        :class:`~stock_analyzer.alpha_v2.dual_price_series.PriceSeriesContractError`
        ——**一行 outcome 都不写**。复权价算出来的"未来收益"是研究口径，进不了 KPI；
+    0b. **P0 Final R1 风格面板硬门**：``production`` / ``test`` 下 ``style_panel=None``
+       意味着"拿 execution 面板冒充 feature 面板算风格基准"——那会改变
+       ``style_matched`` 基准的冻结语义，因此直接拒绝（不是 warning、不是 fallback）。
+        只有 ``rehearsal`` 允许带标注降级（``style_features_source=
+        execution_panel_fallback_rehearsal``）；
     1. epoch `require_open_epoch`（注册表为准）——closed epoch 不写不更；
     2. 磁盘冻结清单仍锚定 epoch（``freeze_manifest_hash`` 逐位一致）；
     3. ``runtime_identity``（如提供）与 epoch 冻结身份按所给键严格核对。
@@ -134,6 +145,14 @@ def mature_epoch_outcomes(
         ),
         context="mature_epoch_outcomes(execution panel)",
     )
+    # 门 0b：风格面板来源（P0 Final R1 / BLOCKER 4）。
+    if style_panel is None and is_live_strict_mode(validation_mode):
+        raise OutcomeMaturationError(
+            "production/test 不允许把风格来源退回 execution 面板"
+            f"（validation_mode={validation_mode}）：训练时 style features 取的是冻结"
+            "feature 契约，live 换成 raw execution 面板会改变 style_matched 基准的语义。"
+            "请提供可读且口径与冻结模型一致的 feature 面板；只有 rehearsal 允许带标注降级"
+        )
     record = require_epoch_identity_match(
         root=root,
         epoch_id=epoch.epoch_id,
@@ -146,7 +165,11 @@ def mature_epoch_outcomes(
     # 不提前写"靠的不该是函数内的日期判断，而是"未来的数据根本不进场"。
     clip = _clip_panel(panel, evaluation_date)
     style_clip = _clip_panel(style_panel, evaluation_date) if style_panel is not None else clip
-    style_source = "feature_panel" if style_panel is not None else "execution_panel_fallback"
+    style_source = (
+        STYLE_SOURCE_FEATURE_PANEL
+        if style_panel is not None
+        else STYLE_SOURCE_EXECUTION_FALLBACK
+    )
     calendar = [day for day in clip.calendar if day <= evaluation_date]
     calendar_index = {day: index for index, day in enumerate(calendar)}
     horizons = tuple(int(h) for h in resolved_spec.horizons)
@@ -161,6 +184,7 @@ def mature_epoch_outcomes(
         # P0：成熟用的 execution 数据身份（库 / 口径 / 指纹）随摘要落盘——KPI 与
         # 事后审计据此确认"这批 outcome 是从哪份 raw 序列算出来的"。
         "execution_data_identity": dict(execution_data_identity or {}),
+        "validation_mode": str(validation_mode),
         "style_features_source": style_source,
         "horizons": list(horizons),
         "benchmarks": {
