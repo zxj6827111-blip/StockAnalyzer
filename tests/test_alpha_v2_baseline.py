@@ -82,6 +82,12 @@ _ALPHA_V2_FLAG_CONSUMERS = {
     "src/stock_analyzer/runtime/services/week5_historical_runner.py": (
         "读取 alpha_v2.model_resolver_mode（历史重放的 PIT 解析模式）"
     ),
+    # M4-L：runtime 侧唯一的影子循环胶水。生产入口（service.py / automation
+    # service）只做**中性委托**、字面零提及 V2；全部 flag 判定、工件读写与
+    # 子进程编排集中在此模块，因此这里必须显式登记（新增消费者=可审查动作）。
+    "src/stock_analyzer/runtime/services/live_shadow_cycle_service.py": (
+        "M4-L 影子日常循环：注册/夜扫 emit/发布链接/每日 cycle（flag-gated）"
+    ),
 }
 _FLAG_CONSUMPTION_MARKERS = ("config.alpha_v2", "SA__ALPHA_V2")
 

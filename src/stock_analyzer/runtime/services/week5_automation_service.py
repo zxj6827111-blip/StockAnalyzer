@@ -46,6 +46,12 @@ class RuntimeWeek5AutomationService:
         # 连续 ≥5 天才能生效——重置会静默清零预热（2026-09-16 实测只剩 2 天）。
         self._auction_baseline_path = self._candidate_state.path.parent / ("auction_baseline.json")
         self._market_snapshots = Week5MarketSnapshotService(service)
+        # M4-L 影子胶水（夜扫完成后落生产漏斗工件；未启用时是 no-op）
+        from stock_analyzer.runtime.services.live_shadow_cycle_service import (
+            LiveShadowCycleService,
+        )
+
+        self._live_shadow_cycle = LiveShadowCycleService(service)
         self._market_radar_lock = Lock()
         self._market_radar_active = False
         self._market_radar_worker: Thread | None = None
@@ -206,6 +212,12 @@ class RuntimeWeek5AutomationService:
                 "pinned_symbols": list(theme_pinned),
                 "active_themes": theme_injection.get("active_themes", []),
             }
+        # M4-L：生产夜扫完成 snapshot_funnel 后，把真实 Quality300/Light100/Deep50
+        # 成员快照落盘（影子链路的唯一权威 cohort 来源）。只读报告、不回写；
+        # 具体 flag 判定与工件写入由 live_shadow_cycle_service 承担。
+        self._live_shadow_cycle.emit_funnel_from_scan_report(
+            report=report, trade_date=now, trace_id=trace_id
+        )
         rows = self._night_candidate_rows(report)
         rows = self._select_night_pool(rows)
         candidate_gate = self._candidate_gate_from_report(report, rows)
