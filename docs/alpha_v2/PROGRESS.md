@@ -1913,3 +1913,61 @@ R4.1.1                         = 未提交的工作区增量（本批 5 文件�
 NAS_BUILD_PREFLIGHT            = 未开始（本批合入后按 R4 计划执行）
 ```
 
+
+---
+
+# 19. P0 双价格序列契约（2026-09-21，hotfix 分支，待外部复核）
+
+> 只追加，不重写上文。本章对应 `docs/alpha_v2/P0_Dual_Price_Series_Contract.md`。
+
+## 19.1 问题
+
+Alpha V2 的冻结 / 成熟链路此前只有一个 `--market-db`，而生产 NAS 的正式库是
+`vendor_delta/market_delta.duckdb`（`price_series_mode=qfq`）——于是**同一份 qfq 序列
+同时喂给了特征、label、成交价、MAE/MFE 与全部基准**；`shadow_model_freeze.py` 在
+`price_mode_certified=false` 时只打 warning 不 fail。训练目标因此建立在复权价之上。
+
+## 19.2 实现（工程层）
+
+```text
+新增  src/stock_analyzer/alpha_v2/dual_price_series.py        契约 + 守卫 + 两条数据身份 + 库解析
+新增  src/stock_analyzer/alpha_v2/validation/dual_price_freeze.py  双源训练帧构造（守卫先于重活）
+新增  tests/test_alpha_v2_dual_price_series.py                DP-1..DP-10 + 端到端 gate 绑定
+新增  docs/alpha_v2/P0_Dual_Price_Series_Contract.md          契约 / 落点 / RAW delta 设计
+改    scripts/alpha_v2_shadow_model_freeze.py                 双库参数 + 两条指纹 + v3 provenance
+改    scripts/alpha_v2_shadow_mature.py                       双库参数 + 每日重新 certify
+改    scripts/alpha_v2_production_preflight.py                双库参数
+改    src/.../validation/{preflight,outcome_maturation,validation_kpis,frozen_model}.py
+改    src/.../runtime/services/live_shadow_cycle_service.py    capture 不变；mature 两库分开
+```
+
+关键语义：
+
+- execution 面板必须 `price_mode == raw` 且 `certified == true`，否则 FAIL CLOSED
+  （freeze exit 4 / mature exit 4 且 0 行 outcome / KPI 该日不 clean / preflight BLOCKED）；
+- 工件哈希升 **v3**（两条数据身份 + `validation_mode` 进受保护集合）；v1/v2 仍可加载，
+  生产只接受 v3；
+- `--market-db` 在 freeze / mature 上降级为**仅 `--rehearsal` 可用**的旧参数；
+- `build_label_v2` 默认严格；研究回放需显式 `enforce_execution_price_series=False` +
+  `research_replay_reason`（生产两个入口由结构测试钉住"无此开关"）。
+
+## 19.3 测试与门禁
+
+```text
+定向  tests/test_alpha_v2_dual_price_series.py                 16 passed（DP-1..DP-10 + gate 端到端绑定）
+      alpha_v2 相关套件（-k "alpha_v2 or price_contract"）      全绿
+质量门 clean-scope（ruff + mypy blocking）                      PASS
+```
+
+## 19.4 状态边界
+
+```text
+P0_DUAL_PRICE_ENGINEERING_STATUS = PASS（工程层，见 PR 报告）
+PR                               = READY FOR EXTERNAL REVIEW（未 merge）
+NAS                              = 未操作（未建 raw delta、未部署、未开 epoch）
+PRODUCTION_PROMOTION             = LOCKED（不变）
+Legacy / Week5 / 生产漏斗 / Cross Review / 阈值 = 未改动
+```
+
+> 数据侧动作（建 `/app/artifacts/vendor_delta_raw/market_delta_raw.duckdb`、接通日更、
+> 重训与 preflight）**待用户授权**，步骤见 `P0_Dual_Price_Series_Contract.md` §6.4。
