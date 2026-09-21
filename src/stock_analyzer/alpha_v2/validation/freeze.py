@@ -175,6 +175,8 @@ def build_validation_freeze(
     feature_schema_source: str = "cli_provided",
     deterministic_clock: bool = False,
     deterministic_clock_source: str = "",
+    require_production_funnel: bool = False,
+    production_preflight: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """构造冻结清单（纯计算，不落盘；缺失的模型信息以显式状态表达）。
 
@@ -230,6 +232,17 @@ def build_validation_freeze(
         "deterministic_clock": bool(deterministic_clock),
         "deterministic_clock_source": str(deterministic_clock_source),
         "created_at": str(created_at),
+        # M4-L（可选键，不在 REQUIRED_TOP_LEVEL_FIELDS；旧清单保持兼容）：
+        # - require_production_funnel=true 时，KPI 治理层逐日复核"shadow 行 cohort ==
+        #   当日 manifest 内嵌的真实生产 funnel"，把"成员资格造假"从写入层闸门升级
+        #   为写后第二道闸；
+        # - production_preflight 记录本次 freeze 通过的 Production Data Preflight
+        #   工件指纹（verdict/hash/训练窗绑定），供审计回答"开启 epoch 时数据状态
+        #   凭什么被认为可接受"。
+        "require_production_funnel": bool(require_production_funnel),
+        "production_preflight": (
+            dict(production_preflight) if production_preflight is not None else None
+        ),
         "policy_freeze": {
             # M3 §13：OOS 窗口内这些一律不得调整（蓝图 §18 的禁止清单原样引用）。
             "no_threshold_changes": [

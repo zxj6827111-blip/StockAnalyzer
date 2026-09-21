@@ -1880,6 +1880,18 @@ class AlphaV2Config(_StrictModel):
     entry_mode: str = "next_session_open"
     primary_horizon_days: int = 5
     candidate_output_top_k: int = 5
+    # M4-L：生产漏斗工件根目录（夜扫写、capture 读；按日分目录、linked 后不可变）。
+    production_funnel_root: str = "artifacts/runtime/production_funnel"
+    # M4-L：正式 alpha_v2_shadow_cycle 调度窗口（每日漏斗发布后轮询捕获）。
+    # 必须在自然日内完成捕获（跨零点即 backfill、当天永远失去 clean 资格），
+    # 所以 latest 不能跨过 00:00；默认窗口参照 nightly.last_scan_start_time(23:00)
+    # 之后的发布时段 22:00-23:55。
+    live_cycle_start_time: str = "22:00"
+    live_cycle_latest_time: str = "23:55"
+    live_cycle_interval_minutes: int = 5
+    # Preflight 报告新鲜度上限（小时）：validation freeze 硬门要求 preflight
+    # 必须是近期产物，防止"上周 PASS 的报告被拿来开今天的 epoch"。
+    preflight_max_age_hours: float = 48.0
 
     @field_validator("artifact_root", "selection_contract")
     @classmethod
@@ -1914,12 +1926,37 @@ class AlphaV2Config(_StrictModel):
             raise ValueError(f"unsupported alpha_v2.entry_mode: {value} (supported: {supported})")
         return normalized
 
-    @field_validator("primary_horizon_days", "candidate_output_top_k")
+    @field_validator(
+        "primary_horizon_days", "candidate_output_top_k", "live_cycle_interval_minutes"
+    )
     @classmethod
     def _validate_alpha_v2_positive_int(cls, value: int) -> int:
         if value <= 0:
-            raise ValueError(f"alpha_v2 primary_horizon_days/top_k must be > 0, got {value}")
+            raise ValueError(
+                "alpha_v2 primary_horizon_days/top_k/live_cycle_interval_minutes "
+                f"must be > 0, got {value}"
+            )
         return value
+
+    @field_validator("live_cycle_start_time", "live_cycle_latest_time")
+    @classmethod
+    def _validate_alpha_v2_hhmm(cls, value: str) -> str:
+        text = str(value).strip()
+        parts = text.split(":")
+        if len(parts) != 2:
+            raise ValueError(f"alpha_v2 live cycle 时间必须是 HH:MM: {value!r}")
+        hour, minute = int(parts[0]), int(parts[1])
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError(f"alpha_v2 live cycle 时间必须是 HH:MM: {value!r}")
+        return text
+
+    @field_validator("production_funnel_root")
+    @classmethod
+    def _validate_alpha_v2_funnel_root(cls, value: str) -> str:
+        normalized = str(value).strip()
+        if not normalized:
+            raise ValueError("alpha_v2.production_funnel_root must not be empty")
+        return normalized
 
     @model_validator(mode="after")
     def _validate_alpha_v2_switches(self) -> AlphaV2Config:

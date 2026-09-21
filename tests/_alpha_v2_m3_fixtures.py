@@ -54,6 +54,8 @@ def write_freeze_manifest(
     validation_mode: str = "test",
     validation_start_date: str | None = "2026-09-01",
     deterministic_clock: bool = True,
+    model: dict[str, object] | None = None,
+    feature_columns: list[str] | None = None,
     **overrides: object,
 ) -> dict[str, object]:
     """写一份非空 schema 的生产 profile 清单（默认值对应"可开 clean OOS"）。
@@ -69,8 +71,8 @@ def write_freeze_manifest(
         git_branch="test",
         config_hash=str(overrides.get("config_hash", "cfg")),
         config_hash_scope="test",
-        model=M3_MODEL_BLOCK,
-        feature_columns=M3_FEATURE_COLUMNS,
+        model=dict(model) if model is not None else M3_MODEL_BLOCK,
+        feature_columns=list(feature_columns) if feature_columns is not None else M3_FEATURE_COLUMNS,
         feature_group_ids=["price_volume_technical"],
         selection_contract={"selection_contract_id": "night_alpha_v2_v1"},
         execution_price_mode=str(overrides.get("execution_price_mode", execution_price_mode)),
