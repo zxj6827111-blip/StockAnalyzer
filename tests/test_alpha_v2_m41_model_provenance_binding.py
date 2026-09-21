@@ -100,7 +100,9 @@ def _artifact(tmp_path: Path, *, commit: str = A, model_id: str = "epoch_test") 
         frame=_matrix(),
         model_id=model_id,
         spec=HeadFitSpec(min_train_rows=20, min_class_balance=0.05),
-        provenance={"source": "r41_test"},
+        # M4-L：训练窗进 provenance——production freeze 的 preflight 硬门要求
+        # "报告检查的窗口 == 模型实际训练窗"，没有 window 就无从绑定。
+        provenance={"source": "r41_test", "window": ["2026-05-01", "2026-06-30"]},
         extra_identity={
             "code_commit": commit,
             "identity_source": "container_build_identity",
@@ -173,7 +175,40 @@ def test_case2_training_a_runtime_b_rejected_by_gate():
     assert "模型训练身份" in str(excinfo.value)
 
 
-def _run_freeze_cli(sandbox: Path, *, model_dir: Path, out: Path, start_date: str) -> object:
+def _write_preflight_report(tmp_path: Path, *, commit: str = A) -> Path:
+    """写一份与工件 provenance window 绑定的 PASS preflight（M4-L §25 硬门输入）。"""
+    from stock_analyzer.alpha_v2.validation.preflight import (
+        PREFLIGHT_SCHEMA,
+        VERDICT_PASS,
+        preflight_hash_of,
+    )
+
+    payload: dict[str, object] = {
+        "schema": PREFLIGHT_SCHEMA,
+        "generated_at": __import__("datetime").datetime.now().astimezone().isoformat(),
+        "verdict": VERDICT_PASS,
+        "blocking_findings": [],
+        "warnings": [],
+        "facts": {},
+        "runtime_identity": {"code_commit": commit},
+        "data_identity": {"market_db": "synthetic"},
+        "training_window": {"start": "2026-05-01", "end": "2026-06-30"},
+        "checks": [],
+    }
+    payload["preflight_hash"] = preflight_hash_of(payload)
+    path = tmp_path / "preflight.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _run_freeze_cli(
+    sandbox: Path,
+    *,
+    model_dir: Path,
+    out: Path,
+    start_date: str,
+    preflight_report: Path | None = None,
+) -> object:
     keep = [
         part
         for part in os.environ.get("PATH", "").split(os.pathsep)
@@ -195,6 +230,11 @@ def _run_freeze_cli(sandbox: Path, *, model_dir: Path, out: Path, start_date: st
             "--start-date",
             start_date,
             "--open-epoch",
+            *(
+                ["--preflight-report", str(preflight_report)]
+                if preflight_report is not None
+                else []
+            ),
         ],
         cwd=str(sandbox),
         capture_output=True,
@@ -244,9 +284,12 @@ def test_case2_freeze_cli_rejects_and_does_not_open_epoch(tmp_path: Path):
     sandbox, set_identity = _sandbox(tmp_path, A)
     today = date.today().isoformat()
 
+    preflight = _write_preflight_report(tmp_path, commit=A)
     ok_out = tmp_path / "out_ok"
     ok_out.mkdir()
-    good = _run_freeze_cli(sandbox, model_dir=artifact, out=ok_out, start_date=today)
+    good = _run_freeze_cli(
+        sandbox, model_dir=artifact, out=ok_out, start_date=today, preflight_report=preflight
+    )
     assert good.returncode == 0, good.stderr[-800:]
     assert (ok_out / "validation" / "validation_freeze_manifest.json").exists()
     epochs_ok = json.loads((ok_out / "validation" / "epochs.json").read_text(encoding="utf-8"))
@@ -255,7 +298,9 @@ def test_case2_freeze_cli_rejects_and_does_not_open_epoch(tmp_path: Path):
     set_identity(B)
     bad_out = tmp_path / "out_bad"
     bad_out.mkdir()
-    bad = _run_freeze_cli(sandbox, model_dir=artifact, out=bad_out, start_date=today)
+    bad = _run_freeze_cli(
+        sandbox, model_dir=artifact, out=bad_out, start_date=today, preflight_report=preflight
+    )
     assert bad.returncode == 5, (bad.returncode, bad.stdout[-500:], bad.stderr[-800:])
     assert "模型训练身份" in bad.stderr
     assert not (bad_out / "validation" / "validation_freeze_manifest.json").exists()

@@ -73,6 +73,10 @@ from stock_analyzer.alpha_v2.validation.frozen_model import (  # noqa: E402
     frozen_model_identity_payload,
     load_frozen_model,
 )
+from stock_analyzer.alpha_v2.validation.preflight import (  # noqa: E402
+    PreflightError,
+    assert_preflight_gate,
+)
 from stock_analyzer.alpha_v2.validation.runtime_identity import (  # noqa: E402
     IDENTITY_SOURCE_CONTAINER_BUILD,
     config_hash_of,
@@ -107,6 +111,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--code-commit",
         default="",
         help="显式指定 code_commit（必须与 git HEAD 一致；容器里 git 不可用时用）",
+    )
+    parser.add_argument(
+        "--preflight-report",
+        default="",
+        help=(
+            "M4-L Production Data Preflight 审计工件路径。**生产模式必填**："
+            "PASS/WARN 才允许开 epoch，BLOCKED 一律拒绝（exit 7）"
+        ),
+    )
+    parser.add_argument(
+        "--accept-preflight-warn",
+        action="store_true",
+        help="允许 verdict=WARN 的 preflight 继续（BLOCKED 无此选项）",
     )
     return parser.parse_args(argv)
 
@@ -209,6 +226,52 @@ def main(argv: list[str] | None = None) -> int:
         )
         return exc.exit_code
 
+    # ── M4-L §25：Production Data Preflight 硬门（生产模式必过）─────────────────
+    # 位置选择：放在 validation freeze（唯一开 epoch 入口）而不是 model freeze——
+    # preflight 的输入是"训练窗 + 当前运行身份 + 当前数据状态"，与模型训练动作
+    # 没有依赖关系；放在这里既避免与训练流程形成循环依赖，又保证"检查过的那份
+    # 数据/那个身份"就是开 epoch 时生效的那一份。rehearsal 不做此门（排演允许
+    # 骨架数据），但会把清单的 require_production_funnel 记为 false。
+    preflight_block: dict[str, object] | None = None
+    if validation_mode == "production":
+        if not str(args.preflight_report).strip():
+            print(
+                "[freeze] 拒绝（exit_code=7）：生产模式必须给出 --preflight-report"
+                "（先跑 scripts/alpha_v2_production_preflight.py；§25）",
+                file=sys.stderr,
+            )
+            return 7
+        model_provenance = dict(model_block.get("provenance", {}) or {})
+        window = model_provenance.get("window")
+        try:
+            preflight_block = assert_preflight_gate(
+                report_path=args.preflight_report,
+                runtime_code_commit=code_commit,
+                training_window=(
+                    [str(window[0]), str(window[1])]
+                    if isinstance(window, (list, tuple)) and len(window) == 2
+                    else None
+                ),
+                max_age_hours=float(
+                    getattr(config.alpha_v2, "preflight_max_age_hours", 48.0)
+                ),
+                accept_warn=bool(args.accept_preflight_warn),
+            )
+        except PreflightError as exc:
+            print(
+                f"[freeze] 拒绝（Production Data Preflight 硬门 exit_code=7）: {exc}",
+                file=sys.stderr,
+            )
+            return 7
+        # 诊断行走 stderr：--print-only 的 stdout 必须是**纯 JSON**（机器消费，如
+        # NO_GIT_CONTAINER_SMOKE 直接 json.loads(stdout)）。
+        print(
+            f"[freeze] Production Data Preflight: verdict={preflight_block['verdict']} "
+            f"training_window={preflight_block['training_window']} "
+            f"hash={str(preflight_block['preflight_hash'])[:12]}…",
+            file=sys.stderr,
+        )
+
     contract = resolve_selection_contract(config, profile="night_scan")
     manifest = build_validation_freeze(
         validation_epoch_id=str(args.epoch_id),
@@ -240,6 +303,10 @@ def main(argv: list[str] | None = None) -> int:
             if validation_mode != "production"
             else "freeze_cli_production_path"
         ),
+        # M4-L：生产 epoch 的 shadow 行 cohort 必须能被当日真实生产 funnel 证明
+        # （KPI 治理层逐日复核）；rehearsal 保持旧语义（research_proxy 允许）。
+        require_production_funnel=bool(validation_mode == "production"),
+        production_preflight=preflight_block,
     )
     manifest["code_commit_source"] = code_commit_source
     # R3：把构建身份与工作区状态写进清单（纳入 freeze_manifest_hash 覆盖）。

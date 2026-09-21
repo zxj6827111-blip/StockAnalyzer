@@ -38,7 +38,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -63,6 +63,8 @@ PRODUCTION_ENV_OVERRIDES = {"SA__EVOLUTION__EXECUTION_SPEC__PRICE_SERIES_MODE": 
 # ``load_frozen_model`` 校验逐文件哈希 + artifact_hash 复算——"骨架工件"不再是
 # 可放行的生产形态）。工件由最小合成矩阵经真实的 fit/persist 生产链产出。
 SMOKE_FEATURE_COLUMNS = ["ret_1d", "ret_5d", "ma5", "ma20", "volume_ratio_5", "turnover_zscore20"]
+# M4-L：preflight 硬门要求报告的训练窗与冻结模型 provenance.window 逐字一致。
+SMOKE_TRAINING_WINDOW = ["2026-05-01", "2026-06-30"]
 
 
 def _git_head() -> str:
@@ -161,7 +163,9 @@ def _write_rehearsal_model_artifact(artifacts_root: Path, *, commit: str) -> Pat
         frame=frame,
         model_id=MODEL_ID,
         spec=HeadFitSpec(min_train_rows=20, min_class_balance=0.05),
-        provenance={"source": "no_git_container_smoke"},
+        # M4-L：production freeze 的 preflight 硬门要求报告训练窗 == 模型训练窗，
+        # 所以烟雾夹具必须带 window（否则"无从绑定"本身就是一次拒绝）。
+        provenance={"source": "no_git_container_smoke", "window": SMOKE_TRAINING_WINDOW},
         extra_identity={
             "code_commit": commit,
             "identity_source": "container_build_identity",
@@ -169,6 +173,40 @@ def _write_rehearsal_model_artifact(artifacts_root: Path, *, commit: str) -> Pat
         },
     )
     return persist_frozen_model(model, artifacts_root / "validation")
+
+
+def _write_production_preflight(artifacts_root: Path, *, commit: str) -> Path:
+    """写一份与沙箱身份/训练窗绑定的 PASS preflight（M4-L §25 硬门的合法输入）。
+
+    用**真实**哈希约定（``preflight_hash_of``）生成，确保 smoke 检查的是门本身
+    而不是一个伪造不了的负载。
+    """
+    from stock_analyzer.alpha_v2.validation.preflight import (
+        PREFLIGHT_SCHEMA,
+        VERDICT_PASS,
+        preflight_hash_of,
+    )
+
+    payload: dict[str, object] = {
+        "schema": PREFLIGHT_SCHEMA,
+        "generated_at": datetime.now().astimezone().isoformat(),
+        "verdict": VERDICT_PASS,
+        "blocking_findings": [],
+        "warnings": [],
+        "facts": {},
+        "runtime_identity": {"code_commit": commit},
+        "data_identity": {"market_db": "smoke_synthetic"},
+        "training_window": {
+            "start": SMOKE_TRAINING_WINDOW[0],
+            "end": SMOKE_TRAINING_WINDOW[1],
+        },
+        "checks": [],
+    }
+    payload["preflight_hash"] = preflight_hash_of(payload)
+    path = artifacts_root / "preflight.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
 
 
 def _run_cli(
@@ -327,6 +365,7 @@ def main(argv: list[str] | None = None) -> int:
         }
     )
 
+    preflight_path = _write_production_preflight(artifacts, commit=commit)
     freeze_args = [
         "--epoch-id",
         EPOCH_ID,
@@ -337,6 +376,9 @@ def main(argv: list[str] | None = None) -> int:
         "--start-date",
         start_date,
         "--open-epoch",
+        # M4-L §25：生产 freeze 的 preflight 硬门（PASS/WARN 才允许开 epoch）。
+        "--preflight-report",
+        str(preflight_path),
     ]
 
     # ── B. shadow model freeze identity（身份门，不跑训练）─────────────────────
@@ -474,16 +516,19 @@ def main(argv: list[str] | None = None) -> int:
     e_bad = _run_cli(
         sandbox=broken, script="alpha_v2_shadow_capture.py", args=e_args, env_path=env_path
     )
+    # M4-L 起捕获多了一道"当天生产漏斗必须存在"的 fail-closed 门（exit 10），
+    # 位置在身份门之后：身份完好 → 10（漏斗缺失），身份破坏 → 仍是 3。
     results.append(
         _step(
             name="E shadow capture identity",
             good_rc=e_good.returncode,
             broken_rc=e_bad.returncode,
-            good_ok=e_good.returncode != EXIT_IDENTITY,
+            good_ok=e_good.returncode in (10,),
             expected_broken_exit=EXIT_IDENTITY,
             good_stderr=e_good.stderr,
             detail=(
-                "真实工件通过完整性校验后因缺市场库中止（面板缺失的预期形态）；"
+                "身份完好时停在 M4-L 生产漏斗硬门（exit 10：当天无 funnel 工件，"
+                "fail-closed，不再退化成研究代理）；"
                 f"破坏身份必须 exit {EXIT_IDENTITY}"
             ),
         )
