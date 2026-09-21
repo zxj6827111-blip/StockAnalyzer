@@ -444,3 +444,214 @@ DH-2/4/5/6：分别缺 universe / feature / model / breadth → deadline 前 wai
 3. 复核 21:45 夜扫 → 22:00–23:55 循环窗口在实际运行时长下是否足够（重活 heavy 组串行）；
 4. 首日观察：`alpha_v2_production_funnel_emitted → linked → cycle_completed` 审计事件链完整；
 5. 环境变量启用（不写进受跟踪默认配置）：`SA__ALPHA_V2__ENABLED=true`。
+
+---
+
+# R1.1 修复轮（Training Provenance Sealing）
+
+外部复核（2026-09-21）在 R1 之上指出**最后一个证据完整性缺口**：训练数据指纹只覆盖
+OHLCV/turnover 与"决策窗"，而**真正被训练读取的输入**比这更宽；且这些身份字段
+（窗口、warmup、指纹）不在工件哈希的受保护集合里——等于允许"换一份数据、贴上原指纹"。
+本轮只做这一件事：把训练 provenance 变成**不可事后改写**的身份。
+
+## 旧（R1）
+
+```text
+training_data_fingerprint = sha256(v1 | symbol,date,open,high,low,close,volume,turnover
+                                   | window_start..window_end)
+artifact_hash             = sha256(model_id, 特征列, 参数, 目标, 校准, 文件哈希, code_commit)
+```
+
+两个洞：
+
+1. **列不全**：`float_market_cap`（→ S12 风格维度 → 基准成分 → `excess_return_*` **目标**）、
+   `board`/`is_st`/`is_delisting_risk`/`suspended`（涨跌停与可成交语义）、
+   `pre_close`/`up_limit`/`down_limit`（`limit_rule` + `ExecutionMatcher`）、
+   `price_series_mode`（价格口径认证）都不在指纹里；
+2. **窗口不全**：`load_daily_panel(warmup_days=N)` 实际读取
+   `window_start - N 自然日` 起的数据，warmup 段参与 rolling/MA/EMA/return/波动/量比等
+   **全部技术特征**的构造，却完全在指纹覆盖之外；
+3. **provenance 不受保护**：`artifact_hash` 只保护 `code_commit`；改写
+   `provenance.window` / `warmup_days` / `training_data_fingerprint` **不会**破坏工件完整性。
+
+## 新（R1.1）
+
+```text
+fingerprint v2 = sha256( canonical_json(header) ‖ 逐行 17 列 )
+  header = {fingerprint_version, decision_window, source_window, warmup_days,
+            requested_source_columns, available_source_columns,
+            missing_optional_source_columns, row_count}
+artifact_hash v2 = sha256(v1 正文 … ‖ artifact_hash_version, config_hash,
+                          training_provenance{window, warmup_days, source_window,
+                            training_data_fingerprint(+version), rows, columns, …})
+```
+
+## 训练输入依赖审计（先看代码，不照抄清单）
+
+| 环节 | 实际消费的源列 | 影响 |
+|---|---|---|
+| `load_daily_panel` | **`PANEL_BAR_COLUMNS` 全 17 列**（`trade_date`←`date`），行范围 `window_start - warmup_days 自然日 .. window_end` | 决定训练帧本身 |
+| `panel.pit_universe` | `symbol` + `trade_date`（`build_pit_stats`） | 决定**哪些决策行存在** |
+| `FeatureEngineer`（经 `daily_feature_frame`） | 面板 bars 的 OHLCV/成交额等 | 特征值 |
+| `build_label_v2` + `ExecutionMatcher`/`bar_view`/`limit_rule` | `open/high/low/close/volume/turnover/board/is_st/up_limit/down_limit/pre_close/suspended` | **可成交语义与标签** |
+| `compute_style_features`（S12） | `float_market_cap`、`board`、`close`、`turnover`（20 日窗） | 风格维度 → 基准成分 → `excess_return_*` **目标** |
+| `certify_price_mode` | `close`、`board`、`is_st`、`price_series_mode` | 价格口径认证 → provenance |
+
+派生列（`prev_close_raw` / `pre_close_source` / `listing_days_lower_bound`）**不要求**
+数据库存在：它们由上述源列确定性派生；但**会影响派生路径的源列存在性**必须进身份。
+清单本身不再手写——`MODEL_TRAINING_SOURCE_COLUMNS` 从 `PANEL_BAR_COLUMNS` 派生
+（面板读什么就 hash 什么），必需列（symbol/date/OHLC/volume/turnover）缺失直接报错。
+
+## Schema presence 进 header
+
+"`pre_close` 列不存在"与"列存在但全空"会走**不同**的派生路径（前者退回上一根 raw 收盘，
+语义不同：除权日不对等），因此两者必须能区分——header 记录
+`available_source_columns` / `missing_optional_source_columns`，指纹因此不同。
+
+## 工件哈希版本（§6 兼容）
+
+复用既有 manifest schema 做**字段级**演进（不另造平行体系）：manifest 多一个
+`artifact_hash_version`，加载时按记录值复算。
+
+| 版本 | 正文 | 用途 |
+|---|---|---|
+| v1 | 7 键（R4.1 原样，**逐字节不变**） | 历史归档工件仍可加载（磁盘上仍有 v1 模型） |
+| v2 | v1 + 版本 + `config_hash` + `training_provenance` | 生产新工件；生产路径拒绝 v1 |
+
+生产拒绝点（`require_sealed_provenance=True`）：preflight `check_model_identity`、
+validation freeze 生产分支、capture（production epoch）、S08 `model_identity` 派生
+（按 `validation_mode=production` 判定）。**安全方向**：删掉 v2 工件的版本字段并不会
+"降级成 v1"——哈希复算会失败（版本进正文）。
+
+## FP-1..FP-10（§10）
+
+`tests/test_alpha_v2_m41_training_provenance_sealing.py`（28 例）：
+
+| 用例 | 断言 |
+|---|---|
+| FP-0 | `source_window` **等于** `load_daily_panel` 实际装载的最早 bar（窗口声明与真实读取对齐） |
+| FP-1 | 决策窗内改 `close` → 指纹变 |
+| FP-2 | 改 `float_market_cap` → 指纹变；**反证**：R1 的 8 列口径对这种改动是盲的（前后指纹相同） |
+| FP-3 | 改 `board` / `is_st` / `is_delisting_risk` / `suspended` / `pre_close` / `price_series_mode` → 指纹变；列**存在但全空 vs 不存在**必须不同；必需列缺失 → 报错 |
+| FP-4 | 改 warmup 段（`window_start` 之前、`source_window` 之内）→ 指纹变；R1 口径（warmup=0）不变 |
+| FP-5 | 改 `source_window` 之前的数据 → 指纹不变 |
+| FP-6 | 只在 `window_end` 之后追加交易日 → 指纹不变 |
+| FP-7/8/9 | 篡改 `provenance.training_data_fingerprint` / `window` / `warmup_days`（不重算哈希）→ `load_frozen_model` 拒绝 |
+| FP-7 家族 | 篡改 `config_hash` 同样被拒（"不要只保护 code_commit"）；v2 版本号但封存项缺失 → 生产加载拒绝 |
+| FP-10 | 当前 DB 复算与模型指纹不符 → preflight BLOCKED；真实 freeze CLI **exit 7 且不落盘**；同环境同工件的**一致**报告 → rc=0 并落 `production_preflight` 绑定块 |
+
+## 本机真实数据证据（§11 不重跑研究）
+
+对 `artifacts/warehouse/market.duckdb`、窗口 `2025-06-02..2026-03-31`、`warmup_days=200`：
+
+```text
+fingerprint_version          = v2
+decision_window              = 2025-06-02 .. 2026-03-31
+source_window                = 2024-11-14 .. 2026-03-31      ← R1 完全没覆盖的那一段
+warmup_days                  = 200
+requested_source_columns     = 17（全部面板源列，派生自 PANEL_BAR_COLUMNS）
+available_source_columns     = 16
+missing_optional_source_columns = ["pre_close"]              ← 本机库没有交易所前收列
+row_count（source_window）    = 1,708,240
+row_count（R1 口径：决策窗）   = 1,040,786                    ← 64% 的输入行此前不在覆盖内
+fingerprint                  = dbd9c5f685fb765d…
+两次独立运行结果一致           = True（确定性）
+耗时                          = 12.2 s（1.7M 行 × 17 列，流式）
+```
+
+`pre_close` 缺失是**新发现的事实**（此前没有任何工件记录它）：本机 `daily_bars` 没有
+交易所前收列，`load_daily_panel` 对每一行都走 `derived_previous_close` 回退——除权日
+与真实前收不等。指纹 header 现在把这个事实钉成身份的一部分；是否需要补列属**数据治理**
+（M4-L 只发现/记录/阻断，不改数据）。
+
+## 版本兼容实测（磁盘上的真实归档工件）
+
+不是"照公式推导"，而是拿磁盘上实际存在的归档工件分别用两代代码加载：
+
+```text
+工件：artifacts/alpha_v2_rehearsal/model/alpha_v2_shadow_epoch_001/model_manifest.json
+     created_at = 2026-09-19（早于 R4.1）
+
+R1 基线（8eea663 worktree）      → FAIL: 冻结模型 artifact_hash 与内容不符（5978ef5d… != 468c12a2…）
+R1.1（本轮）                     → FAIL: 同一对哈希值，同一结论
+独立复算该工件正文（6 键，无 code_commit）→ 5978ef5d… == 记录值（公式可解释）
+```
+
+结论：这份工件在**两代代码上都不可加载**，原因是 R4.1 把 `code_commit` 加进哈希正文
+（那是 R4.1 已接受的契约变更），**与 R1.1 无关**。R1.1 的作用恰恰相反——它给哈希加了
+版本轴，使得 v2 的新增内容**不会**连带废掉 v1 时代工件；能被 R1 加载的工件，R1.1 一律
+照旧加载（生产路径则一律要求 v2，见上表）。
+
+## 本机 preflight 重跑：R1（已提交）vs R1.1（§12）
+
+同一份数据、同一组参数（`--market-db artifacts/warehouse/market.duckdb`、
+`--training-start 2025-06-02 --training-end 2026-03-31`、`execution_price_mode=raw`、
+5 列 feature schema、**不带** `--model-dir`）：
+
+```text
+OLD（R1 已提交代码 8eea663，git worktree 检出运行）
+    artifacts/alpha_v2/audit/production_preflight_2026-09-21T141011.830782_0800.json
+NEW（R1.1 工作区）
+    artifacts/alpha_v2/audit/production_preflight_2026-09-21T140841.852539_0800.json
+
+verdict            : BLOCKED == BLOCKED
+blocking_findings  : 完全一致（prerequisites ×3 / volume_units / model_identity / feature_inputs）
+warnings           : 完全一致（market_db:tail_fragment_after_window）
+volume_units 事实   : 逐字段一致
+feature_inputs 事实 : 逐字段一致（probed_rows=11,387 / 40 个诊断日）
+data_identity 差异  : 新增 5 个键（training_data_fingerprint_version / warmup_days /
+                      source_window / training_data_rows / training_data_columns）
+```
+
+即：R1.1 **不改变任何判定**，只是把训练输入身份写进报告（无 `--model-dir` 时指纹
+照旧不参与，`model_dir_required` 仍 BLOCKED）。
+
+> 说明（诚实记录）：R1 报告 §R1 引用的更早工件
+> `production_preflight_2026-09-21T103054…json` 里 `feature_inputs` 是 BLOCKED
+> （`feature_probe_as_of_not_trading_day`）。那是**修复过程中的中间态代码**产出的
+> （10:30，早于 R1 提交 11:18；多日诊断窗 `diagnosis_days * 1.6` 是 a59429c 才引入的），
+> 不是 R1 最终代码的行为——上面用已提交代码重跑得到的就是 PASS。该工件对
+> **volume 判据对比**这部分结论仍然有效（那部分当时已是最终实现）。
+
+## NO_GIT_CONTAINER_SMOKE（R1.1 工作区，7/7 PASS）
+
+```text
+A runtime identity      PASS（container_build_identity / git_available=false）
+B model freeze identity PASS（身份放行后因缺市场库中止；破坏身份 exit 3）
+C validation freeze     PASS（rc=0：**封存工件** + R1.1 preflight 报告逐项对账通过；
+                               缺 --model-dir 时 exit 6 = schema 硬门）
+D open epoch            PASS
+E shadow capture        PASS（身份完好停在 M4-L 生产漏斗硬门 exit 10；破坏身份 exit 3）
+F mature                PASS
+G no-git no-identity    PASS（rehearsal 干净 exit 5，不落盘、无 traceback）
+verdict = PASS
+```
+
+步 C 是本轮的关键回归：生产 freeze 现在要求工件 `artifact_hash_version=v2` 且封存项
+齐备，同时 preflight 报告必须携带指纹契约身份——这条链在无 git 容器形态下走通。
+
+## R1.1 测试与门禁
+
+```text
+pytest tests/ -k "alpha_v2 or m4l"（junit m4l_r11_targeted.xml）   : 637 passed / 0 failed / 0 skipped
+   · 新增 test_alpha_v2_m41_training_provenance_sealing.py（29 例：FP-0..FP-10 + 版本兼容 + CLI 拒绝）
+run_quality_gate --stage clean-scope --fail-on-error                : exit 0（ruff + mypy blocking 通过）
+run_quality_gate --stage full --fail-on-error                       : exit 0（812.6 s，coverage 80.72% ≥ 75 门槛）
+NO_GIT_CONTAINER_SMOKE                                              : verdict PASS（7/7）
+pytest tests/（全量串行，junit m4l_r11_full.xml）                   : 3806 passed / 0 failed / 0 errors / 2 skipped（31.5 min，exit 0）
+GitHub CI（PR #85 追加提交）                                        : 待本轮 push 后
+```
+
+计数可核对：3806 = R1 基线 3772 + 新增封存套件 29 例 + preflight 新增 5 例
+（`test_model_identity_rejects_unsealed_v1_artifact` 1 + `test_fp4_warmup_…` 1 +
+`test_gate_rejects_missing_fingerprint_contract_identity` 参数化 3）。2 skipped 与基线
+一致（Windows 环境跳过 bash 语法用例）。
+
+### 本轮自查发现并修掉的两个真实缺陷（写进来，不藏）
+
+1. **v1 正文被我改成 8 键 → 历史工件全部失效**：初版 `_artifact_hash_body` 把
+   `artifact_hash_version` 无条件放进正文，等于把 v1 的字节级公式改掉。用磁盘上
+   真实归档工件对拍才发现（见上节"版本兼容实测"），已改为 v1 正文保持 R4.1 原样 7 键。
+2. **冻结清单把 `artifact_hash_version` 静默丢掉**：`freeze._normalize_model_block`
+   是白名单式规范化，未登记的键会被丢弃——R4.1 已经在 `model_training_code_commit`
+   上踩过同一个坑。FP-10 的端到端用例（真实 CLI）把它抓出来，已登记该键。

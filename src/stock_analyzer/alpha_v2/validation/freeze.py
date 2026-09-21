@@ -278,6 +278,9 @@ def _normalize_model_block(model: Mapping[str, object] | None) -> dict[str, obje
         "provenance": dict(block.get("provenance", {}) or {}),
         # R4.1：规范化必须**保留**训练身份，否则 CLI 传进来的值会在写入前被静默丢掉
         "model_training_code_commit": str(block.get("model_training_code_commit", "") or ""),
+        # R1.1：工件哈希版本（v1/v2）同上——生产冻结只可能是 v2，写进清单才可审计
+        # （KPI/历史解析器据此判断"训练 provenance 是否受哈希保护"）。
+        "artifact_hash_version": str(block.get("artifact_hash_version", "") or ""),
     }
 
 
@@ -300,9 +303,7 @@ def freeze_manifest_path(root: str | Path) -> Path:
     return Path(root) / VALIDATION_DIRNAME / FREEZE_MANIFEST_FILENAME
 
 
-def write_validation_freeze(
-    payload: Mapping[str, object], *, root: str | Path
-) -> Path:
+def write_validation_freeze(payload: Mapping[str, object], *, root: str | Path) -> Path:
     """原子落盘；写前强制完整性检查——不完整的冻结清单不允许落盘。"""
     assert_freeze_complete(payload)
     recorded = str(payload.get("freeze_manifest_hash", "") or "")

@@ -16,6 +16,11 @@ python scripts/alpha_v2_shadow_model_freeze.py \
 - 特征=Base V2 安全列（S14 断言）；标签=S11 可执行 outcome + S12 主基准超额；
 - 决策边界为 PIT 合格股票池（``panel.pit_universe``）；
 - 工件 = ``validation/model/<model_id>/``（boosters + calibrators + manifest）。
+
+R1.1（训练 provenance 封存）：provenance 记录**完整**训练输入身份——决策窗
+``window``、``warmup_days``、由二者推出的 ``source_window``，以及覆盖该 source
+窗口全部面板源列的 ``training_data_fingerprint``（含版本）。这些字段由
+``frozen_model`` 的 v2 工件哈希保护，改动它们必然破坏工件完整性。
 """
 
 from __future__ import annotations
@@ -176,18 +181,42 @@ def main(argv: list[str] | None = None) -> int:
     # M4-L R1（BLOCKER 4）：训练数据**内容**指纹——只含窗口内行，确定性。
     # 与 panel_fingerprint（只描述形状）不同：任何窗口内价格/量/额被改写都会改变它，
     # 而窗口外新增交易日不会。preflight 会用同一函数重算并逐字对账。
+    #
+    # R1.1：指纹窗口 = **source_window**（决策窗起点向前 warmup_days 自然日），
+    # 与上面 ``load_daily_panel(warmup_days=...)`` 实际读取的行范围一致；列清单
+    # 也从 ``PANEL_BAR_COLUMNS`` 派生（面板读什么就 hash 什么）。绝不能出现
+    # "panel warmup=200 / fingerprint warmup=0" 这种身份与输入脱节。
     try:
         data_fingerprint = compute_training_data_fingerprint(
             REPO_ROOT / args.market_db,
             training_start=window_start,
             training_end=window_end,
+            warmup_days=int(args.warmup_days),
         )
     except TrainingDataFingerprintError as exc:
         print(f"[freeze-model] 训练数据指纹不可计算（拒绝冻结）: {exc}", file=sys.stderr)
         return 5
+    source_window = [str(item) for item in data_fingerprint["source_window"]]
+    # 证据（而非复述公式）：面板实际装载的最早 bar 不得早于指纹声明的 source_window
+    # 起点。若早于，说明指纹窗口比训练输入窄——那正是 R1.1 要关掉的缺口。
+    panel_earliest = panel.bars["trade_date"].min() if not panel.bars.empty else None
+    if panel_earliest is not None:
+        panel_earliest_date = panel_earliest.date()
+        if panel_earliest_date < date.fromisoformat(source_window[0]):
+            print(
+                f"[freeze-model] 拒绝：面板装载的最早 bar {panel_earliest_date} 早于训练数据"
+                f"指纹的 source_window 起点 {source_window[0]}——指纹窗口比训练输入窄",
+                file=sys.stderr,
+            )
+            return 5
     print(
         f"[freeze-model] training_data_fingerprint="
-        f"{str(data_fingerprint['fingerprint'])[:16]}… rows={data_fingerprint['rows']}"
+        f"{str(data_fingerprint['fingerprint'])[:16]}… rows={data_fingerprint['rows']} "
+        f"(version={data_fingerprint['fingerprint_version']}, "
+        f"source_window={source_window[0]}..{source_window[1]}, "
+        f"warmup_days={data_fingerprint['warmup_days']}, "
+        f"columns={len(data_fingerprint['columns'])}, "
+        f"missing_optional={data_fingerprint['missing_optional_source_columns']})"
     )
 
     model = fit_frozen_model(
@@ -197,9 +226,19 @@ def main(argv: list[str] | None = None) -> int:
         provenance={
             "market_db": str(args.market_db),
             "window": [window_start.isoformat(), window_end.isoformat()],
+            # R1.1：warmup 身份与 source_window 必须进 provenance——它们决定指纹
+            # 覆盖的行范围，preflight 要按同一组参数复算（§8）。
+            "warmup_days": int(args.warmup_days),
+            "source_window": list(source_window),
             "training_data_fingerprint": str(data_fingerprint["fingerprint"]),
+            "training_data_fingerprint_version": str(data_fingerprint["fingerprint_version"]),
             "training_data_rows": int(data_fingerprint["rows"]),
             "training_data_columns": list(data_fingerprint["columns"]),
+            "training_data_available_columns": list(data_fingerprint["available_source_columns"]),
+            "training_data_missing_optional_columns": list(
+                data_fingerprint["missing_optional_source_columns"]
+            ),
+            "training_symbols_limit": int(args.max_symbols),
             "panel_fingerprint": panel_fingerprint(panel),
             "decision_rows": int(len(frame)),
             "quality_pool_source": str(suite.report.get("quality_pool_source", "research_proxy")),
@@ -218,7 +257,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     out_dir = persist_frozen_model(model, Path(args.out))
     print(f"[freeze-model] 工件已冻结: {out_dir}")
-    print(f"[freeze-model] artifact_hash={model.manifest.get('artifact_hash', '')}")
+    print(
+        f"[freeze-model] artifact_hash={model.manifest.get('artifact_hash', '')}"
+        f"（version={model.manifest.get('artifact_hash_version', '')}；"
+        "v2 = 训练 provenance 已纳入受保护身份）"
+    )
     trained = {
         key: value
         for key, value in model.diagnostics["targets"].items()

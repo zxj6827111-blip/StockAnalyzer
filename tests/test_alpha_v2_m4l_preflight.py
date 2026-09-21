@@ -65,11 +65,7 @@ def _market_db(
                 )
     if tail_fragment and rows:
         last_date = max(row["date"] for row in rows)  # type: ignore[type-var]
-        rows = [
-            row
-            for row in rows
-            if not (row["date"] == last_date and row["symbol"] == "600002")
-        ]
+        rows = [row for row in rows if not (row["date"] == last_date and row["symbol"] == "600002")]
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = duckdb.connect(str(path))
     try:
@@ -83,8 +79,15 @@ def _market_db(
             "turnover, board, is_st) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 (
-                    row["symbol"], row["date"], row["open"], row["high"], row["low"],
-                    row["close"], row["volume"], row["turnover"], row["board"],
+                    row["symbol"],
+                    row["date"],
+                    row["open"],
+                    row["high"],
+                    row["low"],
+                    row["close"],
+                    row["volume"],
+                    row["turnover"],
+                    row["board"],
                     row["is_st"],
                 )
                 for row in rows
@@ -128,8 +131,15 @@ def _price_db(path: Path, *, price: float, unit: str, days: int = 5) -> Path:
             "turnover, board, is_st) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 (
-                    row["symbol"], row["date"], row["open"], row["high"], row["low"],
-                    row["close"], row["volume"], row["turnover"], row["board"],
+                    row["symbol"],
+                    row["date"],
+                    row["open"],
+                    row["high"],
+                    row["low"],
+                    row["close"],
+                    row["volume"],
+                    row["turnover"],
+                    row["board"],
                     row["is_st"],
                 )
                 for row in rows
@@ -246,9 +256,7 @@ def test_missing_data_source_is_blocked(tmp_path):
 
 def test_tail_fragment_in_window_is_blocked(tmp_path):
     db = _market_db(tmp_path / "m.duckdb", months=[("2026-03", 20, "share")], tail_fragment=True)
-    result = pf.check_market_db(
-        db, training_start=date(2026, 3, 1), training_end=date(2026, 3, 31)
-    )
+    result = pf.check_market_db(db, training_start=date(2026, 3, 1), training_end=date(2026, 3, 31))
     assert result.facts["tail_fragment"] is True
     assert result.verdict == pf.VERDICT_BLOCKED
     assert "tail_fragment_in_training_window" in result.findings
@@ -256,9 +264,7 @@ def test_tail_fragment_in_window_is_blocked(tmp_path):
 
 def test_tail_fragment_after_window_is_warn(tmp_path):
     db = _market_db(tmp_path / "m.duckdb", months=[("2026-03", 20, "share")], tail_fragment=True)
-    result = pf.check_market_db(
-        db, training_start=date(2026, 2, 1), training_end=date(2026, 2, 27)
-    )
+    result = pf.check_market_db(db, training_start=date(2026, 2, 1), training_end=date(2026, 2, 27))
     assert result.verdict == pf.VERDICT_WARN
     assert "tail_fragment_after_window" in result.findings
 
@@ -270,9 +276,7 @@ def test_duplicate_logical_keys_blocked(tmp_path):
         "INSERT INTO daily_bars SELECT * FROM daily_bars WHERE date = DATE '2026-03-01'"
     )
     connection.close()
-    result = pf.check_market_db(
-        db, training_start=date(2026, 3, 1), training_end=date(2026, 3, 31)
-    )
+    result = pf.check_market_db(db, training_start=date(2026, 3, 1), training_end=date(2026, 3, 31))
     assert result.verdict == pf.VERDICT_BLOCKED
     assert result.facts["duplicate_logical_keys"] == 2
 
@@ -532,7 +536,14 @@ def _fake_model_dir(tmp_path: Path, *, model_id: str = "m1") -> Path:
         spec=HeadFitSpec(min_train_rows=20, min_class_balance=0.05),
         provenance={
             "window": ["2026-03-01", "2026-03-31"],
+            # R1.1：生产 preflight 只接受**封存**训练 provenance 的工件——封存项必须
+            # 齐备（window / warmup_days / source_window / 指纹+版本 / 行数 / 列清单）。
+            "warmup_days": 30,
+            "source_window": ["2026-01-30", "2026-03-31"],
             "training_data_fingerprint": "fingerprint-abc",
+            "training_data_fingerprint_version": "v2",
+            "training_data_rows": 1234,
+            "training_data_columns": ["symbol", "date", "close"],
         },
         extra_identity={"code_commit": "a" * 40},
     )
@@ -549,6 +560,30 @@ def test_model_identity_check_records_full_binding_block(tmp_path):
     assert result.facts["model_training_code_commit"] == "a" * 40
     assert result.facts["provenance_window"] == ["2026-03-01", "2026-03-31"]
     assert result.facts["training_data_fingerprint"] == "fingerprint-abc"
+    # R1.1：封存身份（版本 / warmup / source_window / 指纹版本）逐项可见
+    assert result.facts["artifact_hash_version"] == "v2"
+    assert result.facts["provenance_warmup_days"] == 30
+    assert result.facts["provenance_source_window"] == ["2026-01-30", "2026-03-31"]
+    assert result.facts["training_data_fingerprint_version"] == "v2"
+
+
+def test_model_identity_rejects_unsealed_v1_artifact(tmp_path):
+    """R1.1：v1 工件（训练 provenance 不受哈希保护）在生产 preflight = BLOCKED。
+
+    构造方式：删掉 manifest 的 ``artifact_hash_version`` 字段 → 复算按 v1 走
+    （工件仍自洽、仍可加载），封存门必须把它拦下——否则"改 provenance 不改哈希"
+    这条路径在生产上就是敞开的。
+    """
+    model_dir = _fake_model_dir(tmp_path)
+    manifest_path = model_dir / "model_manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload.pop("artifact_hash_version")
+    manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    result = pf.check_model_identity(model_dir)
+    assert result.verdict == pf.VERDICT_BLOCKED
+    assert any("unsealed_training_provenance" in finding for finding in result.findings), (
+        result.findings
+    )
 
 
 def test_model_identity_missing_artifact_is_blocked(tmp_path):
@@ -561,20 +596,44 @@ def test_training_data_fingerprint_check_compares_model_provenance(tmp_path):
     real = compute_training_data_fingerprint(
         db, training_start=date(2026, 3, 1), training_end=date(2026, 3, 31)
     )
+    # R1.1：复算参数（warmup / 版本 / 列 / source_window）全部取模型记录值
+    binding = {
+        "training_data_fingerprint": real["fingerprint"],
+        "training_data_fingerprint_version": real["fingerprint_version"],
+        "provenance_warmup_days": real["warmup_days"],
+        "provenance_source_window": real["source_window"],
+        "training_data_columns": real["columns"],
+        "training_data_rows": real["rows"],
+    }
     ok = pf.check_training_data_fingerprint(
         market_db=db,
-        model_identity={"training_data_fingerprint": real["fingerprint"]},
+        model_identity=dict(binding),
         training_start=date(2026, 3, 1),
         training_end=date(2026, 3, 31),
     )
     assert ok.verdict == pf.VERDICT_PASS, ok.findings
     bad = pf.check_training_data_fingerprint(
         market_db=db,
-        model_identity={"training_data_fingerprint": "different"},
+        model_identity={**binding, "training_data_fingerprint": "different"},
         training_start=date(2026, 3, 1),
         training_end=date(2026, 3, 31),
     )
     assert bad.verdict == pf.VERDICT_BLOCKED
+    # 契约身份不符（版本 / source_window / 列清单 / 行数）也必须 BLOCKED
+    for override, finding in (
+        ({"training_data_fingerprint_version": "v1"}, "fingerprint_version"),
+        ({"provenance_source_window": ["2026-01-01", "2026-03-31"]}, "source_window"),
+        ({"training_data_columns": ["symbol", "date", "close"]}, "training_data_columns"),
+        ({"training_data_rows": 1}, "training_data_rows"),
+    ):
+        mismatch = pf.check_training_data_fingerprint(
+            market_db=db,
+            model_identity={**binding, **override},
+            training_start=date(2026, 3, 1),
+            training_end=date(2026, 3, 31),
+        )
+        assert mismatch.verdict == pf.VERDICT_BLOCKED, override
+        assert any(finding in item for item in mismatch.findings), mismatch.findings
     missing = pf.check_training_data_fingerprint(
         market_db=db,
         model_identity={},
@@ -583,6 +642,53 @@ def test_training_data_fingerprint_check_compares_model_provenance(tmp_path):
     )
     assert missing.verdict == pf.VERDICT_BLOCKED
     assert "model_provenance_missing_training_data_fingerprint" in missing.findings
+    # 有指纹但没有 warmup 身份（v1 工件形态）→ 无法复算同一指纹 = BLOCKED
+    no_warmup = pf.check_training_data_fingerprint(
+        market_db=db,
+        model_identity={"training_data_fingerprint": real["fingerprint"]},
+        training_start=date(2026, 3, 1),
+        training_end=date(2026, 3, 31),
+    )
+    assert no_warmup.verdict == pf.VERDICT_BLOCKED
+    assert any("warmup_days" in item for item in no_warmup.findings)
+
+
+def test_fp4_warmup_window_participates_in_preflight_recompute(tmp_path):
+    """FP-4（preflight 侧）：改 warmup 段内一行 → 模型指纹与重算不一致 = BLOCKED。
+
+    注意构造：被改的 2026-02-05 必须在 ``[window_start - warmup, window_start)``
+    区间内**且真实存在**（R1 的指纹只覆盖决策窗，这种改动它看不见）。
+    """
+    db = _market_db(
+        tmp_path / "m.duckdb",
+        months=[("2026-01", 31, "share"), ("2026-02", 28, "share"), ("2026-03", 10, "share")],
+    )
+    trained = compute_training_data_fingerprint(
+        db,
+        training_start=date(2026, 3, 1),
+        training_end=date(2026, 3, 31),
+        warmup_days=30,
+    )
+    binding = {
+        "training_data_fingerprint": trained["fingerprint"],
+        "training_data_fingerprint_version": trained["fingerprint_version"],
+        "provenance_warmup_days": trained["warmup_days"],
+        "provenance_source_window": trained["source_window"],
+        "training_data_columns": trained["columns"],
+        "training_data_rows": trained["rows"],
+    }
+    assert trained["source_window"][0] == "2026-01-30"
+    connection = duckdb.connect(str(db))
+    connection.execute("UPDATE daily_bars SET close = close * 1.05 WHERE date = DATE '2026-02-05'")
+    connection.close()
+    result = pf.check_training_data_fingerprint(
+        market_db=db,
+        model_identity=dict(binding),
+        training_start=date(2026, 3, 1),
+        training_end=date(2026, 3, 31),
+    )
+    assert result.verdict == pf.VERDICT_BLOCKED
+    assert any("mismatch" in item for item in result.findings), result.findings
 
 
 def test_pf1_gate_rejects_same_commit_and_window_but_different_model(tmp_path):
@@ -595,6 +701,9 @@ def test_pf1_gate_rejects_same_commit_and_window_but_different_model(tmp_path):
             "feature_schema_hash": "schema-a",
             "model_training_code_commit": "a" * 40,
             "training_data_fingerprint": "fp-a",
+            "training_data_fingerprint_version": "v2",
+            "provenance_warmup_days": 200,
+            "provenance_source_window": ["2025-02-13", "2026-03-01"],
         },
     )
     model_b = {
@@ -604,7 +713,10 @@ def test_pf1_gate_rejects_same_commit_and_window_but_different_model(tmp_path):
         "model_training_code_commit": "a" * 40,
         "provenance": {
             "window": ["2025-09-01", "2026-03-01"],
+            "warmup_days": 200,
+            "source_window": ["2025-02-13", "2026-03-01"],
             "training_data_fingerprint": "fp-a",
+            "training_data_fingerprint_version": "v2",
         },
     }
     with pytest.raises(pf.PreflightError, match="不一致"):
@@ -621,7 +733,10 @@ def test_pf1_gate_rejects_same_commit_and_window_but_different_model(tmp_path):
     model_c["feature_schema_hash"] = "schema-a"
     model_c["provenance"] = {
         "window": ["2025-09-01", "2026-03-01"],
+        "warmup_days": 200,
+        "source_window": ["2025-02-13", "2026-03-01"],
         "training_data_fingerprint": "fp-b",
+        "training_data_fingerprint_version": "v2",
     }
     with pytest.raises(pf.PreflightError, match="training_data_fingerprint"):
         pf.assert_preflight_gate(
@@ -647,8 +762,20 @@ def _preflight_report(tmp_path: Path, **overrides: object) -> Path:
             "feature_schema_hash": "schema-a",
             "model_training_code_commit": "a" * 40,
             "training_data_fingerprint": "fp-a",
+            # R1.1：契约身份（版本 / warmup / source_window）与模型 provenance 对账
+            "training_data_fingerprint_version": "v2",
+            "provenance_warmup_days": 200,
+            "provenance_source_window": ["2025-02-13", "2026-03-01"],
         },
-        "data_identity": {"market_db": "m.duckdb", "latest_trade_date": "2026-03-31"},
+        "data_identity": {
+            "market_db": "m.duckdb",
+            "latest_trade_date": "2026-03-31",
+            # R1.1：gate 会拿 data_identity 的 warmup / source_window 与模型
+            # provenance 对账，夹具必须如实落这三项。
+            "training_data_fingerprint_version": "v2",
+            "warmup_days": 200,
+            "source_window": ["2025-02-13", "2026-03-01"],
+        },
         "training_window": {"start": "2025-09-01", "end": "2026-03-01"},
         "checks": [],
     }
@@ -662,11 +789,17 @@ def _preflight_report(tmp_path: Path, **overrides: object) -> Path:
 _MODEL_BLOCK = {
     "model_id": "model_a",
     "artifact_hash": "hash-a",
+    "artifact_hash_version": "v2",
     "feature_schema_hash": "schema-a",
     "model_training_code_commit": "a" * 40,
     "provenance": {
         "window": ["2025-09-01", "2026-03-01"],
+        "warmup_days": 200,
+        "source_window": ["2025-02-13", "2026-03-01"],
         "training_data_fingerprint": "fp-a",
+        "training_data_fingerprint_version": "v2",
+        "training_data_rows": 1000,
+        "training_data_columns": ["symbol", "date", "close"],
     },
 }
 
@@ -682,6 +815,49 @@ def test_gate_accepts_matching_pass_report(tmp_path):
     assert block["verdict"] == pf.VERDICT_PASS
     assert block["report_sha256"] == pf.file_sha256(path)
     assert block["training_data_fingerprint"] == "fp-a"
+    # R1.1：指纹契约身份进 production_preflight 块（受 freeze_manifest_hash 保护）
+    assert block["training_data_fingerprint_version"] == "v2"
+    assert block["warmup_days"] == 200
+    assert block["source_window"] == ["2025-02-13", "2026-03-01"]
+
+
+@pytest.mark.parametrize(
+    ("override_key", "override_value", "expected"),
+    [
+        ("provenance_warmup_days", None, "warmup_days"),
+        ("provenance_source_window", None, "source_window"),
+        ("training_data_fingerprint_version", None, "fingerprint_version"),
+    ],
+)
+def test_gate_rejects_missing_fingerprint_contract_identity(
+    tmp_path, override_key, override_value, expected
+):
+    """R1.1：模型块缺契约身份（warmup / source_window / 指纹版本）→ 拒绝。
+
+    "只比 digest"会漏掉"同一个 digest、不同的契约声明"这种自述与实现脱节；
+    缺字段更必须 fail-closed，而不是默认放过。
+    """
+    report = json.loads(_preflight_report(tmp_path).read_text(encoding="utf-8"))
+    report["model_identity"].pop(override_key, None)
+    report["preflight_hash"] = pf.preflight_hash_of(report)
+    path = tmp_path / "preflight_missing.json"
+    path.write_text(json.dumps(report), encoding="utf-8")
+    model_block = json.loads(json.dumps(_MODEL_BLOCK))
+    model_block["provenance"].pop(
+        {
+            "provenance_warmup_days": "warmup_days",
+            "provenance_source_window": "source_window",
+            "training_data_fingerprint_version": "training_data_fingerprint_version",
+        }[override_key],
+        None,
+    )
+    with pytest.raises(pf.PreflightError, match=expected):
+        pf.assert_preflight_gate(
+            report_path=path,
+            runtime_code_commit="a" * 40,
+            model_block=model_block,
+            max_age_hours=48.0,
+        )
 
 
 def test_gate_rejects_blocked_report(tmp_path):

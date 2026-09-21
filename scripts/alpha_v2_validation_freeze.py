@@ -32,6 +32,14 @@ python scripts/alpha_v2_validation_freeze.py --epoch-id alpha_v2_epoch_900 \
    且等于本次运行 identity 的 code_commit（缺 / unknown / 非法 / 不一致都 exit 5）。
    也就是说 train=A 而 runtime=B 的模型，在**开 epoch 之前**就被拒——
    不允许"先开 epoch、等 capture 才发现"。
+6. **训练 provenance 封存（R1.1）**：``--model-dir`` 工件必须是
+   ``artifact_hash_version=v2`` 且 provenance 里 window / warmup_days /
+   source_window / training_data_fingerprint(+version) / rows / columns 齐备
+   （否则 exit 5）。v1 工件不受哈希保护的训练输入身份在生产不可放行。
+7. **Production Data Preflight（M4-L §25）**：``--preflight-report`` 必填，
+   verdict=PASS/WARN 且与本次冻结模型逐项一致（模型 id/哈希/schema/训练 commit、
+   训练窗、``training_data_fingerprint`` 及其版本/warmup/source_window），
+   否则 exit 7。
 
 > 生产形状：`--model-dir` 指向**已经冻结**的 shadow 模型工件（`alpha_v2_shadow_model_freeze.py`
 > 的产物），feature schema、model 身份与训练身份都从它派生——所以模型冻结必须先于本步骤执行。
@@ -180,10 +188,13 @@ def main(argv: list[str] | None = None) -> int:
         # artifact_hash 复算），不再只读身份字段——否则"改写 manifest 身份冒充合法模型"
         # 的工件会先在 freeze 阶段被锚定、等到 capture 才被拒（身份能过、内容是假的）。
         # 冻结阶段就把它挡下，不给不一致的工件进入 epoch 的机会。
+        # R1.1：还要求**训练 provenance 已封存**（artifact_hash_version=v2 且
+        # window/warmup_days/source_window/指纹/行数/列清单齐备）——v1 工件的这些
+        # 字段不在哈希覆盖内，等于"训练输入身份可事后改写"，生产不接受。
         # rehearsal 不做此校验：排演允许骨架工件（身份字段齐全但无可推理内容）。
         if validation_mode == "production":
             try:
-                load_frozen_model(args.model_dir)
+                load_frozen_model(args.model_dir, require_sealed_provenance=True)
             except Exception as exc:  # noqa: BLE001 - CLI 边界：意图明确的失败
                 print(f"[freeze] 拒绝（模型工件完整性）: {exc}", file=sys.stderr)
                 return 5
@@ -205,9 +216,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[freeze] 拒绝（特征 schema 硬门）: {exc}", file=sys.stderr)
         return 6
     safe_features = list(safe_feature_columns(schema.feature_columns))
-    feature_group_ids = [
-        spec.group_id for spec in FEATURE_GROUPS if spec.in_base_v2
-    ]
+    feature_group_ids = [spec.group_id for spec in FEATURE_GROUPS if spec.in_base_v2]
 
     # ── R4.1：模型训练身份绑定（生产强不变量）──────────────────────────────────
     # runtime code_commit 必须等于冻结模型工件的训练 code_commit。放在 schema 门之后、
@@ -249,9 +258,7 @@ def main(argv: list[str] | None = None) -> int:
                 report_path=args.preflight_report,
                 runtime_code_commit=code_commit,
                 model_block=model_block,
-                max_age_hours=float(
-                    getattr(config.alpha_v2, "preflight_max_age_hours", 48.0)
-                ),
+                max_age_hours=float(getattr(config.alpha_v2, "preflight_max_age_hours", 48.0)),
                 accept_warn=bool(args.accept_preflight_warn),
             )
         except PreflightError as exc:
@@ -266,7 +273,10 @@ def main(argv: list[str] | None = None) -> int:
             f"[freeze] Production Data Preflight: verdict={preflight_block['verdict']} "
             f"model={preflight_block['model_identity']['model_id']} "
             f"window={preflight_block['training_window']} "
+            f"warmup={preflight_block.get('warmup_days')}d "
+            f"source_window={preflight_block.get('source_window')} "
             f"data_fingerprint={str(preflight_block['training_data_fingerprint'])[:12]}… "
+            f"(v={preflight_block.get('training_data_fingerprint_version')}) "
             f"hash={str(preflight_block['preflight_hash'])[:12]}…",
             file=sys.stderr,
         )

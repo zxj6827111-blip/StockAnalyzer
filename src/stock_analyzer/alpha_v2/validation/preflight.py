@@ -25,6 +25,14 @@ R1 相对首轮新增（外部复核 BLOCKER 2-6）：
   都会误判（外部复核 BLOCKER 6）。affected 计数同时给 distinct symbols 与
   symbol-month pairs，语义不再混用。
 
+R1.1 相对 R1 新增（训练 provenance 封存）：
+
+- **工件哈希版本门**：生产 preflight 只接受 ``artifact_hash_version=v2``
+  （训练 provenance 进入受保护身份）且封存项齐备的工件；v1 一律 BLOCKED；
+- **指纹契约逐项对账**：重算指纹时用**模型记录**的
+  ``window / warmup_days / source_window / columns / fingerprint_version``，
+  五项任一不符即 BLOCKED（不是只比 digest）。
+
 判定分级：``PASS`` / ``WARN`` / ``BLOCKED``（BLOCKED 必须带非零 exit code）。
 """
 
@@ -204,9 +212,7 @@ def check_production_prerequisites(config: object) -> CheckResult:
         "nightly_enabled": bool(getattr(nightly, "enabled", False)),
         "alpha_v2_enabled": bool(getattr(alpha, "enabled", False)),
         "alpha_v2_shadow_only": bool(getattr(alpha, "shadow_only", False)),
-        "alpha_v2_enforce_final_selection": bool(
-            getattr(alpha, "enforce_final_selection", True)
-        ),
+        "alpha_v2_enforce_final_selection": bool(getattr(alpha, "enforce_final_selection", True)),
         "night_scan_start_time": str(getattr(scheduler, "week5_night_scan_time", "")),
         "nightly_last_scan_start_time": str(getattr(nightly, "last_scan_start_time", "")),
         "alpha_live_cycle_start_time": str(getattr(alpha, "live_cycle_start_time", "")),
@@ -294,9 +300,7 @@ def check_market_db(
     try:
         latest = connection.execute("SELECT max(date) FROM daily_bars").fetchone()
         latest_date = latest[0] if latest else None
-        total_rows = int(
-            connection.execute("SELECT count(*) FROM daily_bars").fetchone()[0] or 0
-        )
+        total_rows = int(connection.execute("SELECT count(*) FROM daily_bars").fetchone()[0] or 0)
         duplicates = int(
             connection.execute(
                 "SELECT count(*) - count(DISTINCT (symbol, date)) FROM daily_bars"
@@ -306,8 +310,7 @@ def check_market_db(
         trailing = [
             {"date": str(row[0]), "rows": int(row[1])}
             for row in connection.execute(
-                "SELECT date, count(*) AS rows FROM daily_bars "
-                "GROUP BY 1 ORDER BY 1 DESC LIMIT 20"
+                "SELECT date, count(*) AS rows FROM daily_bars GROUP BY 1 ORDER BY 1 DESC LIMIT 20"
             ).fetchall()
         ]
         latest_rows = trailing[0]["rows"] if trailing else 0
@@ -324,9 +327,7 @@ def check_market_db(
         )
     finally:
         connection.close()
-    tail_fragment = bool(
-        median_rows > 0 and latest_rows <= median_rows * _TAIL_FRAGMENT_RATIO
-    )
+    tail_fragment = bool(median_rows > 0 and latest_rows <= median_rows * _TAIL_FRAGMENT_RATIO)
     facts: dict[str, object] = {
         "path": str(path),
         "exists": True,
@@ -395,9 +396,7 @@ def check_volume_units(
     scale_expr = f"(turnover / NULLIF(volume * ({reference}), 0))"
     share_like_expr = f"avg(CASE WHEN {scale_expr} < ? THEN 1.0 ELSE 0.0 END)"
     try:
-        columns = {
-            str(row[0]) for row in connection.execute("DESCRIBE daily_bars").fetchall()
-        }
+        columns = {str(row[0]) for row in connection.execute("DESCRIBE daily_bars").fetchall()}
         for required in ("volume", "turnover", "date", "symbol", "close"):
             if required not in columns:
                 return CheckResult(
@@ -413,9 +412,7 @@ def check_volume_units(
                 "symbols": int(row[2]),
                 "share_like_ratio": round(float(row[3]), 6),
                 "lot_like_ratio": round(1.0 - float(row[3]), 6),
-                "unit_scale_median": (
-                    round(float(row[4]), 4) if row[4] is not None else None
-                ),
+                "unit_scale_median": (round(float(row[4]), 4) if row[4] is not None else None),
             }
             for row in connection.execute(
                 f"SELECT strftime(date, '%Y-%m') AS month, count(*) AS rows, "
@@ -439,9 +436,7 @@ def check_volume_units(
                 item["unit_status"] = "lot"
             else:
                 item["unit_status"] = "mixed"
-        intra_month_mixed = [
-            item["month"] for item in monthly if item["unit_status"] == "mixed"
-        ]
+        intra_month_mixed = [item["month"] for item in monthly if item["unit_status"] == "mixed"]
         share_months = [item["month"] for item in monthly if item["unit_status"] == "share"]
         lot_months = [item["month"] for item in monthly if item["unit_status"] == "lot"]
         affected_symbols = 0
@@ -480,14 +475,10 @@ def check_volume_units(
     if intra_month_mixed:
         findings.append(f"mixed_volume_units_month:{intra_month_mixed[0]}")
     if regime_switch:
-        findings.append(
-            f"mixed_volume_units_regime_switch:{lot_months[0]}..{share_months[0]}"
-        )
+        findings.append(f"mixed_volume_units_regime_switch:{lot_months[0]}..{share_months[0]}")
     if zero_rows:
         findings.append(f"empty_months_in_window:{zero_rows[0]}")
-    verdict = (
-        VERDICT_BLOCKED if not monthly or intra_month_mixed or regime_switch else VERDICT_PASS
-    )
+    verdict = VERDICT_BLOCKED if not monthly or intra_month_mixed or regime_switch else VERDICT_PASS
     return CheckResult(
         "volume_units",
         verdict,
@@ -502,9 +493,7 @@ def check_volume_units(
             "share_like_months": share_months,
             "lot_like_months": lot_months,
             "mixed_months": intra_month_mixed,
-            "unit_status_by_month": {
-                item["month"]: item["unit_status"] for item in monthly
-            },
+            "unit_status_by_month": {item["month"]: item["unit_status"] for item in monthly},
             "affected_symbol_count": affected_symbols,
             "affected_symbol_month_count": affected_pairs,
             "affected_date_range": (
@@ -598,9 +587,7 @@ def check_feature_inputs(
         calendar_index = panel.calendar_index(as_of)
         start_index = max(0, calendar_index - diagnosis_days + 1)
         diagnosis_dates = list(panel.calendar[start_index : calendar_index + 1])
-        decisions = [
-            DecisionPoint(symbol, day) for day in diagnosis_dates for symbol in eligible
-        ]
+        decisions = [DecisionPoint(symbol, day) for day in diagnosis_dates for symbol in eligible]
         frame = daily_feature_frame(panel, decisions)
     except Exception as exc:  # noqa: BLE001
         return CheckResult(
@@ -696,10 +683,18 @@ def check_feature_inputs(
 
 
 def check_model_identity(model_dir: str | Path) -> CheckResult:
-    """``--model-dir`` 的完整身份（含内容完整性验证），供 freeze 逐项绑定。"""
+    """``--model-dir`` 的完整身份（含内容完整性 + 训练 provenance 封存验证）。
+
+    R1.1：生产 preflight 只接受**封存训练 provenance**的工件（``artifact_hash_version
+    = v2`` 且 window / warmup_days / source_window / training_data_fingerprint /
+    rows / columns 齐备）。v1 工件（这些字段不受工件哈希保护，可事后改写）在这里
+    就是 BLOCKED——"检查的数据"与"训练的数据"之间必须有一条不可篡改的链。
+    """
     from stock_analyzer.alpha_v2.validation.frozen_model import (
+        ARTIFACT_HASH_VERSION_V2,
         frozen_model_identity_payload,
         load_frozen_model,
+        missing_sealed_provenance_keys,
     )
 
     path = Path(model_dir)
@@ -715,10 +710,14 @@ def check_model_identity(model_dir: str | Path) -> CheckResult:
         )
     provenance = dict(payload.get("provenance", {}) or {})
     window = provenance.get("window")
+    source_window = provenance.get("source_window")
+    warmup_days = provenance.get("warmup_days")
+    artifact_hash_version = str(payload.get("artifact_hash_version", "") or "")
     identity.update(
         {
             "model_id": str(payload.get("model_id", "")),
             "model_artifact_hash": str(payload.get("artifact_hash", "")),
+            "artifact_hash_version": artifact_hash_version,
             "feature_schema_hash": str(payload.get("feature_schema_hash", "")),
             "model_training_code_commit": str(payload.get("model_training_code_commit", "")),
             "provenance_window": (
@@ -726,10 +725,20 @@ def check_model_identity(model_dir: str | Path) -> CheckResult:
                 if isinstance(window, (list, tuple)) and len(window) == 2
                 else None
             ),
-            "training_data_fingerprint": str(
-                provenance.get("training_data_fingerprint", "") or ""
+            "provenance_warmup_days": (
+                int(warmup_days) if isinstance(warmup_days, (int, float)) else None
+            ),
+            "provenance_source_window": (
+                [str(source_window[0]), str(source_window[1])]
+                if isinstance(source_window, (list, tuple)) and len(source_window) == 2
+                else None
+            ),
+            "training_data_fingerprint": str(provenance.get("training_data_fingerprint", "") or ""),
+            "training_data_fingerprint_version": str(
+                provenance.get("training_data_fingerprint_version", "") or ""
             ),
             "training_data_rows": provenance.get("training_data_rows"),
+            "training_data_columns": list(provenance.get("training_data_columns", []) or []),
         }
     )
     findings: list[str] = []
@@ -741,9 +750,22 @@ def check_model_identity(model_dir: str | Path) -> CheckResult:
         findings.append("model_identity_incomplete:model_training_code_commit_missing")
     if identity["provenance_window"] is None:
         findings.append("model_identity_incomplete:provenance_window_missing")
+    # R1.1 封存门：版本 + 封存项齐备（缺一即是"训练输入身份不可证"）。
+    if artifact_hash_version != ARTIFACT_HASH_VERSION_V2:
+        findings.append(
+            "model_artifact_unsealed_training_provenance:"
+            f"artifact_hash_version={artifact_hash_version or '(缺失)'}"
+            f"(要求 {ARTIFACT_HASH_VERSION_V2})"
+        )
+    sealed_missing = missing_sealed_provenance_keys(payload)
+    if sealed_missing:
+        findings.append(
+            f"model_provenance_seal_incomplete:{sealed_missing[0]} (共 {len(sealed_missing)} 项)"
+        )
     verified = False
     try:
-        load_frozen_model(path)  # 逐文件哈希 + artifact_hash 复算
+        # 逐文件哈希 + 按记录版本复算 artifact_hash + 封存完整性
+        load_frozen_model(path, require_sealed_provenance=True)
         verified = True
     except Exception as exc:  # noqa: BLE001
         findings.append(f"model_artifact_integrity_failed:{exc.__class__.__name__}:{exc}")
@@ -759,14 +781,31 @@ def check_training_data_fingerprint(
     training_start: date,
     training_end: date,
 ) -> CheckResult:
-    """重算训练窗内容指纹并与冻结模型 provenance 比对（同窗同数据）。"""
+    """按**冻结模型记录的同一组参数**重算指纹并逐项比对（§8）。
+
+    比对项：``training_data_fingerprint`` / ``fingerprint_version`` /
+    ``source_window`` / 列清单 / 行数。任一不一致 = BLOCKED——"preflight 验过的
+    数据"必须与"模型训练时读到的数据"是同一份，且是同一套契约算出来的。
+    """
     from stock_analyzer.alpha_v2.validation.training_data_fingerprint import (
         TrainingDataFingerprintError,
         compute_training_data_fingerprint,
     )
 
     model_fingerprint = str(model_identity.get("training_data_fingerprint", "") or "")
-    facts: dict[str, object] = {"model_training_data_fingerprint": model_fingerprint}
+    model_version = str(model_identity.get("training_data_fingerprint_version", "") or "")
+    model_columns = [str(item) for item in (model_identity.get("training_data_columns") or [])]
+    model_source_window = model_identity.get("provenance_source_window")
+    model_warmup = model_identity.get("provenance_warmup_days")
+    model_rows = model_identity.get("training_data_rows")
+    facts: dict[str, object] = {
+        "model_training_data_fingerprint": model_fingerprint,
+        "model_fingerprint_version": model_version,
+        "model_source_window": model_source_window,
+        "model_warmup_days": model_warmup,
+        "model_training_data_columns": model_columns,
+        "model_training_data_rows": model_rows,
+    }
     if not model_fingerprint:
         return CheckResult(
             "training_data_fingerprint",
@@ -774,9 +813,27 @@ def check_training_data_fingerprint(
             facts,
             ["model_provenance_missing_training_data_fingerprint"],
         )
+    if model_warmup is None:
+        # v1 工件（或手改 provenance）没有 warmup 身份 → 无法复算同一指纹。
+        return CheckResult(
+            "training_data_fingerprint",
+            VERDICT_BLOCKED,
+            facts,
+            ["model_provenance_missing_warmup_days:无法复算训练输入指纹（v1/未封存工件）"],
+        )
+    if not model_columns:
+        return CheckResult(
+            "training_data_fingerprint",
+            VERDICT_BLOCKED,
+            facts,
+            ["model_provenance_missing_training_data_columns"],
+        )
     try:
         recomputed = compute_training_data_fingerprint(
-            market_db, training_start=training_start, training_end=training_end
+            market_db,
+            training_start=training_start,
+            training_end=training_end,
+            warmup_days=int(model_warmup),
         )
     except TrainingDataFingerprintError as exc:
         facts["error"] = str(exc)
@@ -789,20 +846,36 @@ def check_training_data_fingerprint(
     facts.update(
         {
             "recomputed_fingerprint": recomputed["fingerprint"],
+            "recomputed_fingerprint_version": recomputed["fingerprint_version"],
+            "recomputed_source_window": recomputed["source_window"],
             "recomputed_rows": recomputed["rows"],
+            "recomputed_columns": recomputed["columns"],
+            "recomputed_missing_optional_columns": recomputed["missing_optional_source_columns"],
             "columns": recomputed["columns"],
         }
     )
+    mismatches: list[str] = []
     if str(recomputed["fingerprint"]) != model_fingerprint:
-        return CheckResult(
-            "training_data_fingerprint",
-            VERDICT_BLOCKED,
-            facts,
-            [
-                "training_data_fingerprint_mismatch:"
-                f"model={model_fingerprint[:16]}… preflight={str(recomputed['fingerprint'])[:16]}…"
-            ],
+        mismatches.append(
+            "training_data_fingerprint_mismatch:"
+            f"model={model_fingerprint[:16]}… preflight={str(recomputed['fingerprint'])[:16]}…"
         )
+    if model_version and str(recomputed["fingerprint_version"]) != model_version:
+        mismatches.append(
+            f"fingerprint_version:{model_version}!={recomputed['fingerprint_version']}"
+        )
+    if model_source_window is not None:
+        recorded = [str(item) for item in model_source_window]
+        if recorded != [str(item) for item in recomputed["source_window"]]:
+            mismatches.append(f"source_window:{recorded}!={recomputed['source_window']}")
+    if model_columns != [str(item) for item in recomputed["columns"]]:
+        mismatches.append(
+            f"training_data_columns:{len(model_columns)} 列 != {len(recomputed['columns'])} 列"
+        )
+    if model_rows is not None and int(model_rows) != int(recomputed["rows"]):
+        mismatches.append(f"training_data_rows:{model_rows}!={recomputed['rows']}")
+    if mismatches:
+        return CheckResult("training_data_fingerprint", VERDICT_BLOCKED, facts, mismatches)
     return CheckResult("training_data_fingerprint", VERDICT_PASS, facts, [])
 
 
@@ -826,20 +899,14 @@ def run_production_preflight(
 ) -> dict[str, object]:
     """执行全部检查并组装审计载荷（纯计算 + 只读 IO，不落盘）。"""
     if training_end < training_start:
-        raise PreflightError(
-            f"training_end({training_end}) 早于 training_start({training_start})"
-        )
+        raise PreflightError(f"training_end({training_end}) 早于 training_start({training_start})")
     generated_at = (now or datetime.now().astimezone()).isoformat()
     checks: list[CheckResult] = [
         check_runtime_identity(repo_root),
         check_safety_flags(config),
         check_production_prerequisites(config),
-        check_market_db(
-            market_db, training_start=training_start, training_end=training_end
-        ),
-        check_volume_units(
-            market_db, training_start=training_start, training_end=training_end
-        ),
+        check_market_db(market_db, training_start=training_start, training_end=training_end),
+        check_volume_units(market_db, training_start=training_start, training_end=training_end),
     ]
     model_identity: dict[str, object] = {}
     if model_dir:
@@ -876,9 +943,7 @@ def run_production_preflight(
         probe_as_of = training_end
     if probe_as_of is None:
         checks.append(
-            CheckResult(
-                "feature_inputs", VERDICT_BLOCKED, {}, ["feature_probe_as_of_unresolvable"]
-            )
+            CheckResult("feature_inputs", VERDICT_BLOCKED, {}, ["feature_probe_as_of_unresolvable"])
         )
     else:
         checks.append(
@@ -896,9 +961,7 @@ def run_production_preflight(
     for check in checks:
         if _VERDICT_ORDER[check.verdict] > _VERDICT_ORDER[verdict]:
             verdict = check.verdict
-    blocking = [
-        f"{c.name}:{f}" for c in checks if c.verdict == VERDICT_BLOCKED for f in c.findings
-    ]
+    blocking = [f"{c.name}:{f}" for c in checks if c.verdict == VERDICT_BLOCKED for f in c.findings]
     warnings = [f"{c.name}:{f}" for c in checks if c.verdict == VERDICT_WARN for f in c.findings]
     training_window = {"start": training_start.isoformat(), "end": training_end.isoformat()}
     volume_facts = next((item.facts for item in checks if item.name == "volume_units"), {})
@@ -914,6 +977,23 @@ def run_production_preflight(
             fingerprint_facts.get("recomputed_fingerprint")
             or model_identity.get("training_data_fingerprint")
         ),
+        # R1.1：指纹契约身份（版本 / warmup / source 窗口）随报告落盘，供
+        # validation freeze 与模型 provenance 逐项对账（§9）。优先取**本次复算**
+        # 得到的值（那是 preflight 自己算出来的证据），没有复算时退回模型的声明值。
+        "training_data_fingerprint_version": (
+            fingerprint_facts.get("recomputed_fingerprint_version")
+            or model_identity.get("training_data_fingerprint_version")
+        ),
+        "warmup_days": (
+            fingerprint_facts.get("model_warmup_days")
+            or model_identity.get("provenance_warmup_days")
+        ),
+        "source_window": (
+            fingerprint_facts.get("recomputed_source_window")
+            or model_identity.get("provenance_source_window")
+        ),
+        "training_data_rows": fingerprint_facts.get("recomputed_rows"),
+        "training_data_columns": fingerprint_facts.get("recomputed_columns"),
         "volume_affected_symbol_count": volume_facts.get("affected_symbol_count"),
         "volume_affected_symbol_month_count": volume_facts.get("affected_symbol_month_count"),
     }
@@ -928,9 +1008,7 @@ def run_production_preflight(
         "model_identity": model_identity,
         "data_identity": data_identity,
         "training_window": training_window,
-        "checks": [
-            {"name": c.name, "verdict": c.verdict, "findings": c.findings} for c in checks
-        ],
+        "checks": [{"name": c.name, "verdict": c.verdict, "findings": c.findings} for c in checks],
         "model_dir": str(model_dir or ""),
         "feature_schema_identity": {
             "feature_column_count": len(feature_columns),
@@ -1075,6 +1153,38 @@ def assert_preflight_gate(
         mismatches.append(
             f"training_data_fingerprint:{reported_fingerprint[:16]}…!={model_fingerprint[:16]}…"
         )
+    # R1.1：指纹契约身份（版本 / warmup / source 窗口）也逐项对账——只比 digest
+    # 会漏掉"同一个 digest、不同的契约声明"这种自述与实现脱节。
+    fingerprint_version = str(model_provenance.get("training_data_fingerprint_version", "") or "")
+    reported_version = str(reported.get("training_data_fingerprint_version", "") or "")
+    if not fingerprint_version:
+        mismatches.append("training_data_fingerprint_version_missing_in_model_block")
+    elif fingerprint_version != reported_version:
+        mismatches.append(
+            f"training_data_fingerprint_version:{reported_version!r}!={fingerprint_version!r}"
+        )
+    warmup_days = model_provenance.get("warmup_days")
+    reported_warmup = (payload.get("data_identity") or {}).get("warmup_days")
+    if warmup_days is None:
+        mismatches.append("warmup_days_missing_in_model_block")
+    elif reported_warmup is None or int(reported_warmup) != int(warmup_days):
+        mismatches.append(f"warmup_days:{reported_warmup!r}!={warmup_days!r}")
+    model_source_window = model_provenance.get("source_window")
+    reported_source_window = (payload.get("data_identity") or {}).get("source_window")
+    expected_source = (
+        [str(model_source_window[0]), str(model_source_window[1])]
+        if isinstance(model_source_window, (list, tuple)) and len(model_source_window) == 2
+        else None
+    )
+    reported_source = (
+        [str(reported_source_window[0]), str(reported_source_window[1])]
+        if isinstance(reported_source_window, (list, tuple)) and len(reported_source_window) == 2
+        else None
+    )
+    if expected_source is None:
+        mismatches.append("source_window_missing_in_model_block")
+    elif reported_source != expected_source:
+        mismatches.append(f"source_window:{reported_source}!={expected_source}")
     if mismatches:
         raise PreflightError(
             "preflight 与本次冻结模型不一致（检查对象必须等于冻结对象）："
@@ -1092,8 +1202,13 @@ def assert_preflight_gate(
             "artifact_hash": reported.get("model_artifact_hash"),
             "feature_schema_hash": reported.get("feature_schema_hash"),
             "model_training_code_commit": reported.get("model_training_code_commit"),
+            "artifact_hash_version": reported.get("artifact_hash_version"),
         },
         "training_data_fingerprint": reported_fingerprint,
+        # R1.1：指纹契约身份进 production_preflight 块 → 受 freeze_manifest_hash 保护
+        "training_data_fingerprint_version": fingerprint_version,
+        "warmup_days": int(warmup_days) if warmup_days is not None else None,
+        "source_window": expected_source,
         "data_identity": payload.get("data_identity", {}),
         "warnings": list(payload.get("warnings") or []),
     }

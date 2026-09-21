@@ -120,9 +120,7 @@ def derive_universe_facts(
         lookback_days=int(expected_active_lookback_days),
     )
     history_cutoff = as_of - pd.Timedelta(days=int(probe_window_days)).to_pytimedelta()
-    lookback_cutoff = as_of - pd.Timedelta(
-        days=int(expected_active_lookback_days)
-    ).to_pytimedelta()
+    lookback_cutoff = as_of - pd.Timedelta(days=int(expected_active_lookback_days)).to_pytimedelta()
     evidence: dict[str, object] = {
         "probe_window_days": int(probe_window_days),
         "history_cutoff": history_cutoff.isoformat(),
@@ -138,9 +136,7 @@ def derive_universe_facts(
     try:
         symbols = [
             str(row[0]).strip()
-            for row in connection.execute(
-                "SELECT DISTINCT symbol FROM daily_bars"
-            ).fetchall()
+            for row in connection.execute("SELECT DISTINCT symbol FROM daily_bars").fetchall()
             if str(row[0]).strip()
         ]
         rows = connection.execute(
@@ -410,8 +406,18 @@ def derive_alpha_v2_model_identity(
         evidence["error"] = "model_artifact_missing"
         payload["research_fail_closed"] = True
         return payload, evidence
+    # 生产 epoch（validation_mode=production）额外要求工件已封存训练 provenance
+    # （R1.1）：S08 的 model_identity 是"今天能不能用这份模型"的证据，若工件的
+    # 训练输入身份可事后改写，这个"verified"就没有意义。test/rehearsal 保持宽松
+    # （排演夹具允许只登记窗口的工件）。
+    require_sealed = str(freeze.get("validation_mode", "")) == "production"
+    evidence["require_sealed_provenance"] = require_sealed
     try:
-        model = load_frozen_model(model_dir, expected_artifact_hash=expected_hash)
+        model = load_frozen_model(
+            model_dir,
+            expected_artifact_hash=expected_hash,
+            require_sealed_provenance=require_sealed,
+        )
     except FrozenModelError as exc:
         evidence["error"] = f"model_artifact_invalid:{exc}"
         payload["research_fail_closed"] = True
@@ -553,9 +559,7 @@ def derive_all_data_health_inputs(
     result.board_coverage = board_coverage
     evidence["universe"] = universe_evidence
 
-    feature_input, feature_evidence = derive_feature_snapshot_input(
-        config=config, as_of=as_of
-    )
+    feature_input, feature_evidence = derive_feature_snapshot_input(config=config, as_of=as_of)
     result.feature_snapshot = feature_input
     evidence["feature_snapshot"] = feature_evidence
 

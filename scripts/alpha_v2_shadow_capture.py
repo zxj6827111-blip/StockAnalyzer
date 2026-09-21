@@ -165,13 +165,10 @@ def _production_cohort_records(
     预测帧里多出的 symbol（理论不该有）被丢弃，缺的 symbol 直接缺行
     （特征链路问题如实暴露，不让影子行数凑数）。
     """
-    by_symbol = {
-        str(row.get("symbol")): row for row in work.to_dict(orient="records")
-    }
+    by_symbol = {str(row.get("symbol")): row for row in work.to_dict(orient="records")}
     deep_members = list(cohort_view.get("deep_members", []))
     quality_ranks = {
-        str(m.get("symbol")): m.get("rank")
-        for m in cohort_view.get("quality_members", [])
+        str(m.get("symbol")): m.get("rank") for m in cohort_view.get("quality_members", [])
     }
     light_ranks = {
         str(m.get("symbol")): m.get("rank") for m in cohort_view.get("light_members", [])
@@ -203,9 +200,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--capture-date",
         default="",
-        help=(
-            "确定性写入日（**仅 rehearsal/CI**；生产模式一律拒绝——生产写入日 = 系统真实日期）"
-        ),
+        help=("确定性写入日（**仅 rehearsal/CI**；生产模式一律拒绝——生产写入日 = 系统真实日期）"),
     )
     parser.add_argument(
         "--data-health",
@@ -398,6 +393,10 @@ def main(argv: list[str] | None = None) -> int:
         model = load_frozen_model(
             model_dir,
             expected_artifact_hash=str(epoch.identity.get("model_artifact_hash", "")) or None,
+            # R1.1：生产 epoch 的模型必须已封存训练 provenance（v2）。freeze 阶段
+            # 已挡过一次，这里是每日写入路径上的复查——保证 epoch 存活期内这份模型
+            # 不会被换成"训练输入身份可事后改写"的形态。
+            require_sealed_provenance=(validation_mode == "production"),
         )
     except FrozenModelError as exc:
         print(f"[shadow] 冻结模型校验失败: {exc}", file=sys.stderr)
@@ -483,9 +482,7 @@ def main(argv: list[str] | None = None) -> int:
         print("[shadow] 特征帧为空", file=sys.stderr)
         return 7
     safe = list(
-        safe_feature_columns(
-            [c for c in raw.columns if c not in {"decision_date", "symbol"}]
-        )
+        safe_feature_columns([c for c in raw.columns if c not in {"decision_date", "symbol"}])
     )
     matrix_frame = raw[["decision_date", "symbol", *safe]].copy()
     if matrix_frame.empty:

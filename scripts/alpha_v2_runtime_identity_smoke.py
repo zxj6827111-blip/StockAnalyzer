@@ -66,6 +66,8 @@ PRODUCTION_ENV_OVERRIDES = {"SA__EVOLUTION__EXECUTION_SPEC__PRICE_SERIES_MODE": 
 SMOKE_FEATURE_COLUMNS = ["ret_1d", "ret_5d", "ma5", "ma20", "volume_ratio_5", "turnover_zscore20"]
 # M4-L：preflight 硬门要求报告的训练窗与冻结模型 provenance.window 逐字一致。
 SMOKE_TRAINING_WINDOW = ["2026-05-01", "2026-06-30"]
+# M4-L R1.1：warmup 身份必须与决策窗一起进 provenance（指纹覆盖 source_window）。
+SMOKE_WARMUP_DAYS = 30
 
 
 def _git_head() -> str:
@@ -120,8 +122,13 @@ def _build_sandbox(root: Path, *, commit: str, dirty: bool = False) -> Path:
     return root
 
 
-def _write_smoke_market_db(path: Path) -> tuple[str, int]:
-    """微型合成行情库 + 训练数据指纹（供模型 provenance 与 preflight 报告共用）。"""
+def _write_smoke_market_db(path: Path) -> dict[str, object]:
+    """微型合成行情库 + 训练数据指纹（供模型 provenance 与 preflight 报告共用）。
+
+    R1.1：返回**完整**指纹载荷——模型 provenance 与 preflight 报告都要记录
+    fingerprint_version / source_window / warmup_days / rows / columns，冻结清单的
+    逐项对账门会拿它们互相比对。
+    """
     import duckdb
     import pandas as pd
 
@@ -151,28 +158,28 @@ def _write_smoke_market_db(path: Path) -> tuple[str, int]:
         connection.execute("CREATE OR REPLACE TABLE daily_bars AS SELECT * FROM frame")
     finally:
         connection.close()
-    payload = compute_training_data_fingerprint(
+    return compute_training_data_fingerprint(
         path,
         training_start=date.fromisoformat(SMOKE_TRAINING_WINDOW[0]),
         training_end=date.fromisoformat(SMOKE_TRAINING_WINDOW[1]),
+        warmup_days=SMOKE_WARMUP_DAYS,
     )
-    return str(payload["fingerprint"]), int(payload["rows"])
 
 
 def _write_rehearsal_model_artifact(
     artifacts_root: Path,
     *,
     commit: str,
-    training_data_fingerprint: str,
-    training_data_rows: int,
+    fingerprint: Mapping[str, object],
 ) -> Path:
     """写一份**真实可加载**的微型冻结模型工件。
 
     R4.1 起生产 freeze 要求工件的 ``code_commit`` 可证且等于运行身份；R4.1.1
     （审稿 P2）起 further 要求工件**内容完整**——生产 freeze 会 ``load_frozen_model``
-    复算文件哈希。本函数用最小合成矩阵走真实的 ``fit_frozen_model`` /
-    ``persist_frozen_model`` 生产链（与本机依赖的版本同一份代码），产物自然满足
-    两道门；规模刻意小（~90 行），不影响 smoke 节奏。
+    复算文件哈希。R1.1 起还要求**训练 provenance 已封存**（v2 哈希 + 窗口/warmup/
+    source_window/指纹/行数/列齐备）。本函数用最小合成矩阵走真实的
+    ``fit_frozen_model`` / ``persist_frozen_model`` 生产链（与本机依赖的版本同一份
+    代码），产物自然满足全部门；规模刻意小（~90 行），不影响 smoke 节奏。
     """
     import numpy as np
     import pandas as pd
@@ -212,12 +219,18 @@ def _write_rehearsal_model_artifact(
         # M4-L / R1：production freeze 的 preflight 硬门要求
         #   ① 报告训练窗 == 模型训练窗；② 报告 model_identity（id/hash/schema/commit）
         #      == 冻结模型块；③ 双方 training_data_fingerprint 一致。
+        # R1.1 起再加 ④ 指纹契约身份（version/warmup_days/source_window）逐项一致，
+        # 且工件哈希必须封存 provenance。
         # 烟雾夹具用**真实训练数据指纹实现**对一个微型合成库算一遍，保证是同一套链。
         provenance={
             "source": "no_git_container_smoke",
             "window": SMOKE_TRAINING_WINDOW,
-            "training_data_fingerprint": training_data_fingerprint,
-            "training_data_rows": training_data_rows,
+            "warmup_days": int(fingerprint["warmup_days"]),
+            "source_window": list(fingerprint["source_window"]),
+            "training_data_fingerprint": str(fingerprint["fingerprint"]),
+            "training_data_fingerprint_version": str(fingerprint["fingerprint_version"]),
+            "training_data_rows": int(fingerprint["rows"]),
+            "training_data_columns": list(fingerprint["columns"]),
         },
         extra_identity={
             "code_commit": commit,
@@ -233,12 +246,14 @@ def _write_production_preflight(
     *,
     commit: str,
     model_identity: Mapping[str, object],
-    training_data_fingerprint: str,
+    fingerprint: Mapping[str, object],
 ) -> Path:
     """写一份与沙箱身份/训练窗绑定的 PASS preflight（M4-L §25 硬门的合法输入）。
 
     用**真实**哈希约定（``preflight_hash_of``）生成，确保 smoke 检查的是门本身
-    而不是一个伪造不了的负载。
+    而不是一个伪造不了的负载。R1.1 起 gate 还会逐项比对指纹契约身份
+    （version / warmup_days / source_window）——报告里必须如实落这些字段，否则
+    夹具本身就过不了它要验证的那道门。
     """
     from stock_analyzer.alpha_v2.validation.preflight import (
         PREFLIGHT_SCHEMA,
@@ -258,19 +273,26 @@ def _write_production_preflight(
         "model_identity": {
             "model_id": str(model_identity.get("model_id", "")),
             "model_artifact_hash": str(model_identity.get("artifact_hash", "")),
+            "artifact_hash_version": str(model_identity.get("artifact_hash_version", "")),
             "feature_schema_hash": str(model_identity.get("feature_schema_hash", "")),
-            "model_training_code_commit": str(
-                model_identity.get("model_training_code_commit", "")
-            ),
+            "model_training_code_commit": str(model_identity.get("model_training_code_commit", "")),
             "provenance_window": list(
                 dict(model_identity.get("provenance", {}) or {}).get("window") or []
             )
             or None,
-            "training_data_fingerprint": training_data_fingerprint,
+            "provenance_warmup_days": int(fingerprint["warmup_days"]),
+            "provenance_source_window": list(fingerprint["source_window"]),
+            "training_data_fingerprint": str(fingerprint["fingerprint"]),
+            "training_data_fingerprint_version": str(fingerprint["fingerprint_version"]),
+            "training_data_rows": int(fingerprint["rows"]),
+            "training_data_columns": list(fingerprint["columns"]),
         },
         "data_identity": {
             "market_db": "smoke_synthetic",
-            "training_data_fingerprint": training_data_fingerprint,
+            "training_data_fingerprint": str(fingerprint["fingerprint"]),
+            "training_data_fingerprint_version": str(fingerprint["fingerprint_version"]),
+            "warmup_days": int(fingerprint["warmup_days"]),
+            "source_window": list(fingerprint["source_window"]),
         },
         "training_window": {
             "start": SMOKE_TRAINING_WINDOW[0],
@@ -403,12 +425,11 @@ def main(argv: list[str] | None = None) -> int:
 
     artifacts = work_dir / "artifacts" / "alpha_v2"
     smoke_market_db = work_dir / "smoke_market.duckdb"
-    data_fingerprint, data_rows = _write_smoke_market_db(smoke_market_db)
+    data_fingerprint = _write_smoke_market_db(smoke_market_db)
     model_dir = _write_rehearsal_model_artifact(
         artifacts,
         commit=commit,
-        training_data_fingerprint=data_fingerprint,
-        training_data_rows=data_rows,
+        fingerprint=data_fingerprint,
     )
     from stock_analyzer.alpha_v2.validation.frozen_model import (
         frozen_model_identity_payload,
@@ -457,7 +478,7 @@ def main(argv: list[str] | None = None) -> int:
         artifacts,
         commit=commit,
         model_identity=model_identity,
-        training_data_fingerprint=data_fingerprint,
+        fingerprint=data_fingerprint,
     )
     freeze_args = [
         "--epoch-id",
