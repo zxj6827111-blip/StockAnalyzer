@@ -443,7 +443,14 @@ DH-2/4/5/6：分别缺 universe / feature / model / breadth → deadline 前 wai
    `alpha_v2.production_funnel_root` 落在 artifacts 持久卷；
 3. 复核 21:45 夜扫 → 22:00–23:55 循环窗口在实际运行时长下是否足够（重活 heavy 组串行）；
 4. 首日观察：`alpha_v2_production_funnel_emitted → linked → cycle_completed` 审计事件链完整；
-5. 环境变量启用（不写进受跟踪默认配置）：`SA__ALPHA_V2__ENABLED=true`。
+5. 环境变量启用（不写进受跟踪默认配置）：`SA__ALPHA_V2__ENABLED=true`；
+6. **生产模型必须用升级后的 `alpha_v2_shadow_model_freeze.py` 重新冻结**：新工件
+   `artifact_hash_version=v2`（训练 provenance 入哈希）；旧方法的工件会被生产门禁
+   以 exit 5 拒绝（`artifact_hash_version=v1` 或封存项缺失）；
+7. 复核 NAS `daily_bars` 是否具备全部面板源列——preflight 的
+   `training_data_identity` 会如实列出 `missing_optional_source_columns`（本机缺
+   `pre_close`，走 `derived_previous_close` 回退）。此项**信息性**，不单独阻断上线，
+   但缺失会改变除权日的涨跌停推导语义，属数据治理范围。
 
 ---
 
@@ -639,7 +646,7 @@ run_quality_gate --stage clean-scope --fail-on-error                : exit 0（r
 run_quality_gate --stage full --fail-on-error                       : exit 0（812.6 s，coverage 80.72% ≥ 75 门槛）
 NO_GIT_CONTAINER_SMOKE                                              : verdict PASS（7/7）
 pytest tests/（全量串行，junit m4l_r11_full.xml）                   : 3806 passed / 0 failed / 0 errors / 2 skipped（31.5 min，exit 0）
-GitHub CI（PR #85 追加提交）                                        : 待本轮 push 后
+GitHub CI（PR #85，commit 92e65df）                                 : 双 run 绿（push 19m45s / pull_request 18m48s）
 ```
 
 计数可核对：3806 = R1 基线 3772 + 新增封存套件 29 例 + preflight 新增 5 例
