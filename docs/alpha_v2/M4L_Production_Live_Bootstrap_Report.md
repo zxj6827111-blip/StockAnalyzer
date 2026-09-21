@@ -3,7 +3,7 @@
 阶段：M4-L（Alpha V2 Production Live Bootstrap）
 分支：`feat/alpha-v2-m4l-live-bootstrap`
 基线：`origin/main` @ `29ece32`（包含 M4-H PR #84 合并 `0278d84`）
-状态：`M4L_ENGINEERING_STATUS = PASS`｜`PRODUCTION_DATA_PREFLIGHT = NOT_RUN`（本机无生产数据，见 §7）｜`ALPHA_V2_EPOCH_001 = NOT_STARTED`｜`LIVE_CLEAN_OOS_DAYS = 0`｜`PRODUCTION_PROMOTION = LOCKED`
+状态（R1 修复后）：`M4L_ENGINEERING_STATUS = PASS`｜`M4L_BLOCKERS_REMAINING = 0`｜`PRODUCTION_DATA_PREFLIGHT = NOT_RUN`（本机无生产数据，见 §7）｜`ALPHA_V2_EPOCH_001 = NOT_STARTED`｜`LIVE_CLEAN_OOS_DAYS = 0`｜`PRODUCTION_PROMOTION = LOCKED`
 
 本阶段冻结边界保持不变：`M4H_STATUS = COMPLETE`、`Historical Evidence = MIXED`、
 `RANKING_ABILITY = SUPPORTED_HISTORICALLY`、`ABSOLUTE_DIRECTIONAL_PROBABILITY = NOT_SUPPORTED`、
@@ -256,6 +256,182 @@ NAS 上线前必须用 `--model-dir` 绑定真实训练窗再跑一次 preflight
 补充守卫：`NO_GIT_CONTAINER_SMOKE`（无 git 容器形态，真实 CLI）E 步期望已按 M4-L 更新为
 "身份完好 → 生产漏斗硬门 exit 10（fail-closed）；身份破坏 → 仍 exit 3"，证明新门没有改变
 "身份问题必须表现为身份退出码"的既有契约。
+
+---
+
+# R1 修复轮（M4-L Final Blocking Fix R1）
+
+外部复核（2026-09-21）确认首轮总体方向正确，但列出 7 项 Production Blocking。
+以下**保留首轮全部发现历史**，逐条记录：发现 → 修复 → 证据。
+
+## B1 调度层 data_health 输入未接齐 → Live Clean OOS 永远 0（已修）
+
+**发现**：首轮 daily cycle 调 ``alpha_v2_data_health_snapshot.py`` 时只给
+``--as-of/--market-db/--out``，S08 七项输入（universe/board/feature/model/breadth）
+一个都没传 → 全部 degraded → ``status != healthy`` → 每天 immutable 落
+``clean_oos_eligible=false``，**样本门永不推进**。
+
+**修复**：新增 ``alpha_v2/validation/live_data_health_inputs.py``，为 S08 七项各建权威派生：
+
+| S08 输入 | 权威来源（只读） |
+|---|---|
+| latest_trade_date | ``market.duckdb`` ``max(date)`` |
+| universe_snapshot | ``resolve_asof_universe``（S03 唯一实现）；候选名单 = 库内全集，**不用 Quality300 冒充分母** |
+| valid_symbol_count | expected_active ∩（as_of 当日有 bar）——分子分母同集合 |
+| board_coverage | 同一天同一 expected_active 集合按 board 分组 |
+| feature_snapshot | ``features_light/current.json`` + ``snapshot_is_current`` + 交易日均值对齐 |
+| model_identity | **active epoch 的 frozen shadow model**：逐文件重算 artifact_hash + 比对 epoch/清单 identity（不是 legacy champion） |
+| breadth_artifact | ``compute_market_breadth_from_warehouse``（唯一 builders）现算 → 落**影子证据路径**（``artifacts/alpha_v2/runtime/market_breadth_evidence.json``） |
+
+**广度为什么落影子路径**：生产 ``artifacts/runtime/market_breadth.json`` 缺失使 live
+广度门处于 fail-open；直接补写会让"低广度禁买"从静默失效变为生效——那是
+**选股语义变更**，M4-L 明令禁止（observer 角色）。因此用同一 builder（同数据/同代码/
+同 as_of）把证据写到影子路径，既满足 S08"缺失不得当健康"，又不动生产门；生产
+breadth 接线属另一个授权项。
+
+CLI 新增 ``--derive-inputs``（显式路径参数仍优先，便于人工审计单个输入）。
+
+## B2 degraded 的 data_health 仍会触发 immutable capture（已修）
+
+**修复**：``run_daily_cycle`` 改为"生成 → **读回验证** → 才 capture"：
+
+```text
+data_health CLI（--derive-inputs）
+    ↓ 读回工件并过 data_health_gate_ok（status=ok 且 as_of 同日）
+healthy ? capture（本槽位）
+        : deadline 前 waiting（不 capture、不落任何快照，下一个 5min 槽位重试）
+        : deadline 后 record missing + audit（当日永不 clean）
+```
+
+``returncode==0`` 不再作为健康证据（degraded 也返回 0）。等待态返回里带
+``data_health`` 诊断块（排障不必翻工件）。
+
+## B3 生产链 prerequisite 未进硬门（已修）
+
+新增 ``check_production_prerequisites``：``week5.enabled`` / ``week5.auto_run`` /
+``full_market_automation_enabled`` / ``nightly.enabled`` / ``alpha_v2.enabled`` /
+``shadow_only`` / ``enforce=false``，外加**时间窗可达性**（alpha 循环 latest 必须晚于
+夜扫最晚起跑，否则晚跑夜扫永远赶不上当天窗口 ⇒ 天天 backfill）。任一不满足 → BLOCKED。
+
+``alpha_v2.enabled`` 的语义（§5.2）：``config_hash`` 覆盖该字段 ⇒ 开 epoch 时关、
+之后打开会造成 runtime identity 漂移（capture 每天 exit 3）；因此**生产冻结/开 epoch
+前必须 enabled=true**，硬门强制。
+
+本机实测（tracked 默认配置）即命中该门：``nightly_enabled`` / ``alpha_v2_enabled`` /
+``full_market_automation_enabled`` 全为 false → BLOCKED（正是外部复核担心的形态）。
+
+## B4 Preflight 未绑定"实际冻结模型"（已修）
+
+- preflight ``--model-dir`` 现在记录完整 ``model_identity``（model_id / artifact_hash /
+  feature_schema_hash / model_training_code_commit / provenance.window /
+  training_data_fingerprint / artifact_verified），且**不带 ``--model-dir`` 直接 BLOCKED**；
+- ``assert_preflight_gate`` 新增 ``model_block`` 参数，**逐项比对**上述字段与训练窗；
+  任一不一致 exit 7、不开 epoch（PF-1：同 code 同窗但不同 artifact/schema/指纹全部被拒）。
+
+## B5 特征 fill-zero 假健康（已修）
+
+``check_feature_inputs`` 接入 ``feature_diagnosis`` 四类分类，诊断窗取
+**40 个交易日 × ≤300 symbols** 的多日截面（不再单日样本）：
+
+- required 模型特征命中 ``UPSTREAM_NOT_POPULATED`` / ``FILL_ZERO_ARTIFACT`` /
+  ``DATA_MISSINGNESS`` → **BLOCKED**（fill-zero 会把 ``notna()`` 刷成 100%，只看覆盖率必假 PASS）；
+- ``REAL_CONSTANT`` → **WARN**（按项目现有治理口径不判死，但必须可见）；
+- 非 required 列的同名分类 → WARN（如实记录）。
+
+## B6 训练数据无内容身份（已修）
+
+新增 ``training_data_fingerprint``（确定性、内容级）：
+
+```text
+sha256(canonical_header(列清单+窗口) || 逐行 canonical(symbol,date,OHLC,volume,turnover))
+```
+
+性质（有测试钉住）：同数据同 hash；窗口内改任意价格/量/额 → hash 变；
+**窗口外追加交易日 → hash 不变**。链条：
+``alpha_v2_shadow_model_freeze.py`` 训练时写入 model provenance →
+preflight 对同窗重算并比对（不一致 BLOCKED）→ validation freeze 再核对两处一致。
+
+## B7 volume 判别有价格依赖 + affected 语义错（已修）
+
+- 判别公式改为**价格归一化**：``unit_scale = turnover / (volume × close)``，
+  ``< 10`` 判 share（≈1）、否则 lot（≈100）；旧的绝对阈值
+  ``turnover/volume > 100`` 会把高价股误判成手、低价股误判成股（VOL-1/VOL-2 钉住）；
+- ``affected_symbol_count`` 改回**真正 distinct symbols**，另立
+  ``affected_symbol_month_count`` 记 (symbol, month) 对，两个语义不再混用。
+
+## B8 漏斗来源证据名实不符（已修）
+
+- 新增**night-scan source evidence** 工件（``<date>/night_scan_source_evidence.json``，
+  当日不可变）：含 Quality/Light/Deep 成员原文 + contract + trace + selector_mode +
+  pinned；funnel 快照**从它抽取**；
+- 字段名实分离：``source_night_scan_artifact_path/sha256``（成员来源）与
+  ``published_report_id/path/sha256``（晚报正式报告）；
+- 捕获时复算源证据文件 sha256 并**逐成员对账**；link 时除哈希外做**语义校验**
+  （report_id / trade_date / report_kind=formal / scan_status ∈ {completed, empty}）。
+
+## §8 契约补强 / §9 deadline 行为（已做）
+
+- 契约新增：三级成员**不得重复 symbol**；``rank`` 必须为正整数、唯一、与 stage order
+  自洽（1..N）；``Deep ⊆ Light ⊆ Quality`` 保持；
+- 当天无法捕获（deadline 仍未就绪）时：落 missing 台账 + 审计，但**继续推进历史日的
+  mature 与 KPI**（missing 只约束它自己，不阻断既有权重日的 3/5/10/15D 成熟）。
+
+## R1 本机真实数据重跑（§13）
+
+```text
+OLD PREFLIGHT VERDICT = BLOCKED（首轮 artifact
+    artifacts/alpha_v2/audit/production_preflight_2026-09-21T074101.916001_0800.json）
+NEW PREFLIGHT VERDICT = BLOCKED（本轮 artifact
+    artifacts/alpha_v2/audit/production_preflight_2026-09-21T103054.189598_0800.json）
+
+old volume detector = turnover / volume > 100（绝对阈值）
+new normalized detector = turnover / (volume * close) < 10 → share
+
+month      old share_like   new share_like   new unit_scale_median   new status
+2025-06        0.9840           1.0000              0.9999              share
+2025-07        0.9821           1.0000              0.9996              share
+2025-08        0.9760           0.9994              0.9990              share
+2025-09        0.8090           0.8355              1.0020              share
+2025-10        0.2893           0.3070             100.0000             mixed
+2025-11        0.2916           0.3078             100.0000             mixed
+2025-12        0.2912           0.3086             100.0000             mixed
+2026-01        0.2860           0.3089             100.0000             mixed
+2026-02        0.2858           0.3095             100.0000             mixed
+2026-03        0.2604           0.2816             100.0000             mixed
+
+affected distinct symbols      = 5170   （旧字段实为 symbol-month 对：5379）
+affected symbol-month pairs    = 5170
+mixed months                   = 2025-10 … 2026-03
+affected_date_range            = [2025-10, 2026-03]
+training_data_fingerprint      = 需 --model-dir 才能计算（本轮无生产冻结模型 → 未计算）
+```
+
+**解读（不是"为了保持 BLOCKED"）**：归一化后 share 月份的 ``unit_scale`` 中位数
+收敛到 **1.0000**（理论值），切换后月份收敛到 **100.0**（理论值），说明新判据测的是
+真正的单位语义；而"切换月内两种单位并存"的结论**同时被新旧两种判据独立得出**
+（旧 0.289 vs 新 0.307 的比例几乎相同）——混合单位不是绝对阈值造成的假象。
+按 §13 要求：若新判据给 PASS 会如实报告，实际仍为 BLOCKED，故如实报告。
+
+## R1 测试证据
+
+```text
+pytest tests/ -k "alpha_v2 or m4l"                    : 603 passed / 0 failed（junit）
+  · 新增 DH-1 / DH-7 / DH-2,4,5,6 端到端（真实 CLI + 合成库）
+  · 新增 PF-1..PF-4、VOL-1/2、FUNNEL-1/2
+  · 新增 §8 契约补强（重复成员 / rank 自洽）
+pytest tests/（全量，junit）                           : 见下方最终计数
+run_quality_gate --stage clean-scope --fail-on-error  : exit 0
+run_quality_gate --stage full --fail-on-error         : exit 0
+GitHub CI（PR #85 追加提交）                          : 双 run 绿
+```
+
+DH-1（核心目的验证）：production prerequisites 就绪 + S08 七项全 healthy +
+funnel linked + active epoch → ``alpha_v2_shadow_cycle`` 跑完后
+**shadow snapshot exists / data_health.status == ok / clean_oos_eligible == true /
+KPI ``clean_oos_days == 1``**。
+DH-7（核心回归）：先缺 feature snapshot → 不 capture；同一晚补齐 → clean +1。
+DH-2/4/5/6：分别缺 universe / feature / model / breadth → deadline 前 waiting 且
+**不写任何快照**，并断言降级项就是那一项。
 
 ## 12. NAS Deployment Prerequisites
 
