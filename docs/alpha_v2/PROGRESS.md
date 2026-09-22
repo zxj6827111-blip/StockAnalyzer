@@ -2092,7 +2092,7 @@ QFQ feature delta 与 RAW execution delta 从同一批 ZIP/index 推进，并且
 ```text
 不做：Alpha tuning / 特征 / label / 训练窗口 / 模型冻结 / epoch / Production Promotion
 不改：Legacy 选股 / Week5 选择语义 / 生产漏斗 / 交叉复核 / 任何阈值
-未做：NAS 部署、真实 RAW 基线构建（合入 ≠ 上线，见 §21.5）
+未做：NAS 部署、真实 RAW 基线构建（合入 ≠ 上线，见 §21.6）
 ```
 
 ## 21.2 落地内容
@@ -2144,12 +2144,44 @@ DuckDB 每晚重算全文件摘要纯属开销。marker 里的取证快照（行
 两条都由 `test_retry_after_execution_failure_converges_without_duplicates` 与
 `test_tx1_both_roles_ok_writes_v3_readiness` 钉住。
 
-## 21.5 状态边界
+## 21.5 本轮验证（本地实测 + CI）
+
+```text
+分支 / HEAD            feat/alpha-v2-raw-execution-delta @ deb08c5
+PR                     #87（base=main；#86 合并后 diff 收敛为 P1 自身 7 文件）
+
+定向（spec §26 指定三文件） 58 passed / 1 skipped
+  tests/test_update_vendor_daily_from_tushare.py
+  tests/test_nightly_readiness_authoritative.py
+  tests/test_nas_stock_updater_script.py
+关键字选择（-k "vendor_delta or nightly_readiness or alpha_v2"）
+                      707 passed / 3177 deselected
+
+新增用例（48）        test_raw_delta_baseline_identity.py      22
+                     test_alpha_v2_raw_execution_delta_wiring.py 24
+                     test_nas_stock_updater_script.py          +2
+
+tests/ 裸跑（干净串行） 3884 collected / 0 failed / 0 error / 2 skipped / exit 0
+                     基线（P0 head 725e943）= 3836 → 3836 + 48 = 3884，数字自洽
+                     2 skipped = test_nas_*_script 的 Windows bash 语法用例（既有）
+
+clean-scope 质量门     ruff + mypy blocking rc=0，blocking_failures=[]
+full 质量门            pytest rc=0；coverage 80.87%（下限 75%）；blocking_failures=[]
+GitHub CI              PR #87 两个 quality job 均 pass（headSha=deb08c5）
+
+一次并发踩坑           同时跑两份全量时 test_alpha_v2_m4l_cycle_clean_day_e2e.py::
+                     test_dh7_degraded_first_then_healthy_recovers 因 600s 子进程
+                     超时失败；该文件单独跑 10/10 全过，串行重跑全量 0 failed。
+                     结论：并发负载所致的超时，非代码缺陷——但"全量测试必须串行跑"
+                     这条要记住。
+```
+
+## 21.6 状态边界
 
 ```text
 P0_DUAL_PRICE_CONTAINED  = 代码层生效（分支基于 PR #86 的 HEAD 725e943）
-PR #86                   = 仍未 merge（本阶段被明确禁止执行 merge）
-P1 PR                    = 待创建（base=main；#86 合并后 diff 自动收敛为 P1 自身 7 文件）
+PR #86                   = 仍未 merge（本阶段被明确禁止执行 merge；已核实与 P1 无文件重叠）
+P1 PR                    = #87（base=main；#86 合并后 diff 自动收敛为 P1 自身 7 文件）
 
 RAW_DELTA_PIPELINE_ENGINEERING_STATUS = PASS
 RAW_DELTA_NAS_CUTOVER_READY           = READY_FOR_BASELINE_BOOTSTRAP
