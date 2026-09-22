@@ -46,6 +46,10 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from stock_analyzer.alpha_v2.artifacts import write_json_atomic
+from stock_analyzer.alpha_v2.dual_price_series import (
+    FEATURE_PRICE_MODE_ALLOWED,
+    certification_evidence_block,
+)
 
 PREFLIGHT_SCHEMA = "alpha_v2_production_preflight.v1"
 VERDICT_PASS = "PASS"
@@ -691,7 +695,8 @@ def check_model_identity(model_dir: str | Path) -> CheckResult:
     就是 BLOCKED——"检查的数据"与"训练的数据"之间必须有一条不可篡改的链。
     """
     from stock_analyzer.alpha_v2.validation.frozen_model import (
-        ARTIFACT_HASH_VERSION_V2,
+        ARTIFACT_HASH_VERSION_V3,
+        VALIDATION_MODE_PRODUCTION,
         frozen_model_identity_payload,
         load_frozen_model,
         missing_sealed_provenance_keys,
@@ -739,6 +744,12 @@ def check_model_identity(model_dir: str | Path) -> CheckResult:
             ),
             "training_data_rows": provenance.get("training_data_rows"),
             "training_data_columns": list(provenance.get("training_data_columns", []) or []),
+            # P0：双价格源身份（两条独立）+ 训练模式（生产只接受 production 工件）。
+            "validation_mode": str(provenance.get("validation_mode", "") or ""),
+            "feature_price_mode": str(provenance.get("feature_price_mode", "") or ""),
+            "execution_price_mode": str(provenance.get("execution_price_mode", "") or ""),
+            "feature_data_identity": dict(provenance.get("feature_data_identity") or {}),
+            "execution_data_identity": dict(provenance.get("execution_data_identity") or {}),
         }
     )
     findings: list[str] = []
@@ -751,11 +762,19 @@ def check_model_identity(model_dir: str | Path) -> CheckResult:
     if identity["provenance_window"] is None:
         findings.append("model_identity_incomplete:provenance_window_missing")
     # R1.1 封存门：版本 + 封存项齐备（缺一即是"训练输入身份不可证"）。
-    if artifact_hash_version != ARTIFACT_HASH_VERSION_V2:
+    # P0 起生产要求 v3（双价格源身份）——v2 工件的价格口径只有单库自述，
+    # 无法证明训练目标来自 raw。
+    if artifact_hash_version != ARTIFACT_HASH_VERSION_V3:
         findings.append(
             "model_artifact_unsealed_training_provenance:"
             f"artifact_hash_version={artifact_hash_version or '(缺失)'}"
-            f"(要求 {ARTIFACT_HASH_VERSION_V2})"
+            f"(要求 {ARTIFACT_HASH_VERSION_V3})"
+        )
+    # rehearsal 工件（弱口径排演产物）不得进入生产：它的价格/数据身份本就是标定用途。
+    if str(identity["validation_mode"]).strip().lower() != VALIDATION_MODE_PRODUCTION:
+        findings.append(
+            "model_validation_mode_not_production:"
+            f"{identity['validation_mode'] or '(缺失)'}"
         )
     sealed_missing = missing_sealed_provenance_keys(payload)
     if sealed_missing:
@@ -843,6 +862,21 @@ def check_training_data_fingerprint(
             facts,
             [f"training_data_fingerprint_uncomputable:{exc.__class__.__name__}"],
         )
+    # P0：若模型封存了 feature 数据身份，就按同一套逐项比较（口径/窗口/行数/列）；
+    # 只比 digest 会漏掉"同一个 digest、不同的契约声明"。
+    feature_identity = dict(model_identity.get("feature_data_identity") or {})
+    identity_mismatches: list[str] = []
+    if feature_identity:
+        from stock_analyzer.alpha_v2.dual_price_series import (
+            IDENTITY_CONTENT_KEYS,
+            compare_price_series_identity,
+        )
+
+        # 只对内容键：口径（price_series_mode）由 check_feature_price_series 的
+        # certify 探针单独给证据，指纹载荷本身不含口径。
+        identity_mismatches = compare_price_series_identity(
+            feature_identity, recomputed, role="feature", keys=IDENTITY_CONTENT_KEYS
+        )
     facts.update(
         {
             "recomputed_fingerprint": recomputed["fingerprint"],
@@ -874,9 +908,313 @@ def check_training_data_fingerprint(
         )
     if model_rows is not None and int(model_rows) != int(recomputed["rows"]):
         mismatches.append(f"training_data_rows:{model_rows}!={recomputed['rows']}")
+    mismatches.extend(identity_mismatches)
     if mismatches:
         return CheckResult("training_data_fingerprint", VERDICT_BLOCKED, facts, mismatches)
     return CheckResult("training_data_fingerprint", VERDICT_PASS, facts, [])
+
+
+# ---------------------------------------------------------------------------
+# F2. 双价格源（P0：feature 可以 qfq，execution 必须 raw）
+# ---------------------------------------------------------------------------
+
+# execution 相对 feature 允许落后的自然日上限：两份库由同一条日更链驱动，落后超过
+# 这个数就说明 raw 链断供——训练目标会缺尾部而不是"近似正确"。
+EXECUTION_MAX_LAG_DAYS = 3
+# 口径认证探针的规模（只读、小窗口）：口径是**列级声明 + 实测一致性**两个证据，
+# 不需要全量；40 个交易日 × 300 只足以覆盖各板块与除权日。
+_PRICE_MODE_PROBE_DAYS = 40
+_PRICE_MODE_PROBE_SYMBOLS = 300
+_PRICE_MODE_PROBE_WARMUP_DAYS = 60
+
+
+def latest_trade_date_of(market_db: str | Path) -> str:
+    """库内最新交易日（读不到返回空串——调用方据此判"不可读"）。"""
+    connection = _connect_market_db(market_db)
+    try:
+        row = connection.execute("SELECT max(date) FROM daily_bars").fetchone()
+    finally:
+        connection.close()
+    return str(row[0]) if row and row[0] is not None else ""
+
+
+def probe_price_series_mode(
+    market_db: str | Path,
+    *,
+    as_of: date,
+    days: int = _PRICE_MODE_PROBE_DAYS,
+    symbols: int = _PRICE_MODE_PROBE_SYMBOLS,
+    warmup_days: int = _PRICE_MODE_PROBE_WARMUP_DAYS,
+) -> dict[str, object]:
+    """载一小段面板做价格口径认证（复用 ``DailyPanel.certify_price_mode`` 唯一实现）。"""
+    from stock_analyzer.alpha_v2.research.panel import load_daily_panel
+
+    window_start = as_of - timedelta(days=int(days) * 2 + 10)
+    panel = load_daily_panel(
+        market_db=Path(market_db),
+        window_start=window_start,
+        window_end=as_of,
+        warmup_days=int(warmup_days),
+        max_symbols=int(symbols),
+        source=str(market_db),
+    )
+    certification = panel.certify_price_mode(min_sample=1000)
+    return {
+        "price_series_mode": str(certification.mode),
+        "price_series_certified": bool(certification.certified),
+        "certification_source": str(certification.source),
+        "certification_evidence": certification_evidence_block(certification),
+        "panel": panel.public_payload(),
+    }
+
+
+def check_feature_price_series(
+    *,
+    feature_market_db: str | Path,
+    model_identity: Mapping[str, object],
+    as_of: date,
+) -> CheckResult:
+    """feature 侧（§5 前半）：口径必须可证，且与冻结模型声明的 feature mode 一致。
+
+    feature 用 qfq 是设计内；**调用方换了一份口径不同的库**才是问题——那等于换特征，
+    必须重新冻结，不能在 preflight 里"差不多先过"。
+    """
+    declared_block = dict(model_identity.get("feature_data_identity") or {})
+    declared_mode = str(declared_block.get("price_series_mode", "") or "").strip().lower()
+    facts: dict[str, object] = {
+        "feature_market_db": str(feature_market_db),
+        "model_declared_feature_price_mode": declared_mode,
+        "model_declared_feature_fingerprint": str(declared_block.get("fingerprint", "") or ""),
+    }
+    if not str(feature_market_db or "").strip():
+        return CheckResult(
+            "feature_price_series", VERDICT_BLOCKED, facts, ["feature_market_db_not_configured"]
+        )
+    if not declared_mode:
+        return CheckResult(
+            "feature_price_series",
+            VERDICT_BLOCKED,
+            facts,
+            ["model_feature_data_identity_missing:冻结模型未记录 feature 价格口径"],
+        )
+    if declared_mode not in FEATURE_PRICE_MODE_ALLOWED:
+        return CheckResult(
+            "feature_price_series",
+            VERDICT_BLOCKED,
+            facts,
+            [f"model_feature_price_mode_invalid:{declared_mode}"],
+        )
+    try:
+        probe = probe_price_series_mode(Path(feature_market_db), as_of=as_of)
+    except Exception as exc:  # noqa: BLE001 - 探测失败本身就是 BLOCKED 证据
+        facts["probe_error"] = f"{exc.__class__.__name__}: {exc}"
+        return CheckResult(
+            "feature_price_series", VERDICT_BLOCKED, facts, ["feature_price_mode_unprovable"]
+        )
+    facts.update(
+        {
+            "probed_price_mode": probe["price_series_mode"],
+            "probed_certified": probe["price_series_certified"],
+            "probe_source": probe["certification_source"],
+            "probe_evidence": probe["certification_evidence"],
+        }
+    )
+    findings: list[str] = []
+    if str(probe["price_series_mode"]) not in FEATURE_PRICE_MODE_ALLOWED:
+        findings.append(f"feature_price_mode_unprovable:{probe['price_series_mode']}")
+    elif str(probe["price_series_mode"]) != declared_mode:
+        findings.append(
+            f"feature_price_mode_drift:{probe['price_series_mode']}!={declared_mode}"
+            "（换口径等于换特征，必须重新冻结）"
+        )
+    verdict = VERDICT_BLOCKED if findings else VERDICT_PASS
+    return CheckResult("feature_price_series", verdict, facts, findings)
+
+
+def check_execution_price_series(
+    *,
+    execution_market_db: str | Path,
+    feature_market_db: str | Path,
+    model_identity: Mapping[str, object],
+    training_end: date,
+    max_lag_days: int = EXECUTION_MAX_LAG_DAYS,
+) -> CheckResult:
+    """execution 侧（§5 后半）：raw + certified + 不陈旧 + 与 feature 库不是同一份。
+
+    ``qfq / unknown / uncertified`` 一律 BLOCKED；冻结模型自己声明的 execution 口径
+    同样要过这道门（v3 之前训练出来的模型在这里就会被挡下）。
+    """
+    declared_block = dict(model_identity.get("execution_data_identity") or {})
+    facts: dict[str, object] = {
+        "execution_market_db": str(execution_market_db),
+        "feature_market_db": str(feature_market_db),
+        "model_declared_execution_price_mode": str(
+            declared_block.get("price_series_mode", "") or ""
+        ),
+        "model_declared_execution_certified": bool(
+            declared_block.get("price_series_certified", False)
+        ),
+        "model_declared_execution_fingerprint": str(
+            declared_block.get("fingerprint", "") or ""
+        ),
+        "max_lag_days": int(max_lag_days),
+    }
+    findings: list[str] = []
+    path_text = str(execution_market_db or "").strip()
+    if not path_text:
+        return CheckResult(
+            "execution_price_series",
+            VERDICT_BLOCKED,
+            facts,
+            ["execution_market_db_not_configured:必须显式给出 raw 的 execution 行情库"],
+        )
+    execution_path = Path(path_text)
+    feature_path = Path(str(feature_market_db or "").strip() or path_text)
+    try:
+        if execution_path.resolve() == feature_path.resolve():
+            findings.append(
+                "execution_market_db_equals_feature_market_db:同一份序列不能既当特征又当成交价"
+            )
+    except OSError:  # pragma: no cover - 路径解析失败不阻断后续证据
+        pass
+    if not execution_path.exists():
+        findings.append("execution_market_db_missing")
+    # 冻结模型声明的 execution 口径必须先自证——v2 及更早的工件没有这条身份。
+    if not declared_block:
+        findings.append("model_execution_data_identity_missing:冻结模型未封存 execution 数据身份")
+    elif str(declared_block.get("price_series_mode", "")).strip().lower() != "raw" or not bool(
+        declared_block.get("price_series_certified", False)
+    ):
+        findings.append(
+            "model_execution_price_mode_not_certified_raw:"
+            f"{declared_block.get('price_series_mode')!r}"
+            f"/certified={declared_block.get('price_series_certified')!r}"
+        )
+    if findings:
+        return CheckResult("execution_price_series", VERDICT_BLOCKED, facts, findings)
+
+    try:
+        certification = probe_price_series_mode(execution_path, as_of=training_end)
+        execution_latest = latest_trade_date_of(execution_path)
+    except Exception as exc:  # noqa: BLE001
+        facts["probe_error"] = f"{exc.__class__.__name__}: {exc}"
+        return CheckResult(
+            "execution_price_series", VERDICT_BLOCKED, facts, ["execution_market_db_unreadable"]
+        )
+    facts.update(
+        {
+            "probed_price_mode": certification["price_series_mode"],
+            "probed_certified": certification["price_series_certified"],
+            "probe_source": certification["certification_source"],
+            "probe_evidence": certification["certification_evidence"],
+            "execution_latest_trade_date": execution_latest,
+        }
+    )
+    if str(certification["price_series_mode"]).strip().lower() != "raw":
+        findings.append(f"execution_price_mode_not_raw:{certification['price_series_mode']}")
+    elif not bool(certification["price_series_certified"]):
+        findings.append("execution_price_series_not_certified")
+    # 陈旧判定：两份库由同一条日更链驱动，raw 落后超过 max_lag_days 即断供。
+    try:
+        feature_latest = latest_trade_date_of(feature_path) if feature_path.exists() else ""
+    except Exception as exc:  # noqa: BLE001 - feature 侧另有 market_db 检查，这里只降级
+        feature_latest = ""
+        facts["feature_latest_error"] = f"{exc.__class__.__name__}: {exc}"
+    facts["feature_latest_trade_date"] = feature_latest
+    if execution_latest and feature_latest:
+        lag_days = (date.fromisoformat(feature_latest) - date.fromisoformat(execution_latest)).days
+        facts["execution_lag_days"] = int(lag_days)
+        if lag_days > int(max_lag_days):
+            findings.append(
+                f"execution_market_db_stale:lag={lag_days}d>{int(max_lag_days)}d"
+                f"（raw 链断供；训练目标会缺尾部）"
+            )
+    elif not execution_latest:
+        findings.append("execution_market_db_empty")
+    if execution_latest and date.fromisoformat(execution_latest) < training_end:
+        findings.append(
+            f"execution_market_db_does_not_cover_training_window:"
+            f"latest={execution_latest}<training_end={training_end.isoformat()}"
+        )
+    verdict = VERDICT_BLOCKED if findings else VERDICT_PASS
+    return CheckResult("execution_price_series", verdict, facts, findings)
+
+
+def check_execution_data_fingerprint(
+    *,
+    execution_market_db: str | Path,
+    model_identity: Mapping[str, object],
+    training_start: date,
+    training_end: date,
+) -> CheckResult:
+    """execution 数据**内容**指纹逐项对账（§5：fingerprint match）。
+
+    与 feature 侧同一套 ``compute_training_data_fingerprint`` + 同一套逐项比较；
+    只比 digest 会漏掉"同一个 digest、不同的窗口/口径声明"。
+    """
+    from stock_analyzer.alpha_v2.dual_price_series import (
+        IDENTITY_CONTENT_KEYS,
+        compare_price_series_identity,
+    )
+    from stock_analyzer.alpha_v2.validation.training_data_fingerprint import (
+        TrainingDataFingerprintError,
+        compute_training_data_fingerprint,
+    )
+
+    recorded = dict(model_identity.get("execution_data_identity") or {})
+    warmup = model_identity.get("provenance_warmup_days")
+    facts: dict[str, object] = {
+        "execution_market_db": str(execution_market_db),
+        "model_execution_data_identity": recorded,
+        "model_warmup_days": warmup,
+    }
+    if not recorded:
+        return CheckResult(
+            "execution_data_fingerprint",
+            VERDICT_BLOCKED,
+            facts,
+            ["model_execution_data_identity_missing"],
+        )
+    if warmup is None:
+        return CheckResult(
+            "execution_data_fingerprint",
+            VERDICT_BLOCKED,
+            facts,
+            ["model_provenance_missing_warmup_days:无法复算 execution 指纹"],
+        )
+    if not str(execution_market_db or "").strip():
+        return CheckResult(
+            "execution_data_fingerprint",
+            VERDICT_BLOCKED,
+            facts,
+            ["execution_market_db_not_configured"],
+        )
+    try:
+        recomputed = compute_training_data_fingerprint(
+            execution_market_db,
+            training_start=training_start,
+            training_end=training_end,
+            warmup_days=int(warmup),
+        )
+    except TrainingDataFingerprintError as exc:
+        facts["error"] = str(exc)
+        return CheckResult(
+            "execution_data_fingerprint",
+            VERDICT_BLOCKED,
+            facts,
+            [f"execution_data_fingerprint_uncomputable:{exc.__class__.__name__}"],
+        )
+    facts["recomputed_fingerprint"] = recomputed["fingerprint"]
+    facts["recomputed_fingerprint_version"] = recomputed["fingerprint_version"]
+    facts["recomputed_rows"] = recomputed["rows"]
+    facts["recomputed_source_window"] = recomputed["source_window"]
+    facts["recomputed_columns"] = recomputed["columns"]
+    facts["recomputed_missing_optional_columns"] = recomputed["missing_optional_source_columns"]
+    mismatches = compare_price_series_identity(
+        recorded, recomputed, role="execution", keys=IDENTITY_CONTENT_KEYS
+    )
+    verdict = VERDICT_BLOCKED if mismatches else VERDICT_PASS
+    return CheckResult("execution_data_fingerprint", verdict, facts, mismatches)
 
 
 # ---------------------------------------------------------------------------
@@ -893,11 +1231,17 @@ def run_production_preflight(
     training_end: date,
     feature_columns: Sequence[str],
     model_dir: str | Path | None = None,
+    execution_market_db: str | Path = "",
     feature_probe_skipped_reason: str = "",
     max_feature_probe_symbols: int = _FEATURE_DIAGNOSIS_MAX_SYMBOLS,
     now: datetime | None = None,
 ) -> dict[str, object]:
-    """执行全部检查并组装审计载荷（纯计算 + 只读 IO，不落盘）。"""
+    """执行全部检查并组装审计载荷（纯计算 + 只读 IO，不落盘）。
+
+    ``market_db`` 是 **feature 侧**行情库（qfq 是设计内口径）；``execution_market_db``
+    是 **execution 侧**（必须 raw）。两者都必需：feature 决定特征、execution 决定
+    label/成交/超额——任一不可证都 BLOCKED（P0 双价格序列契约）。
+    """
     if training_end < training_start:
         raise PreflightError(f"training_end({training_end}) 早于 training_start({training_start})")
     generated_at = (now or datetime.now().astimezone()).isoformat()
@@ -913,9 +1257,34 @@ def run_production_preflight(
         model_check = check_model_identity(model_dir)
         model_identity = dict(model_check.facts)
         checks.append(model_check)
+        probe_as_of_for_mode = training_end
+        # ── P0：双价格源（feature / execution 两条独立证据）────────────────────
+        checks.append(
+            check_feature_price_series(
+                feature_market_db=market_db,
+                model_identity=model_identity,
+                as_of=probe_as_of_for_mode,
+            )
+        )
+        checks.append(
+            check_execution_price_series(
+                execution_market_db=execution_market_db,
+                feature_market_db=market_db,
+                model_identity=model_identity,
+                training_end=training_end,
+            )
+        )
         checks.append(
             check_training_data_fingerprint(
                 market_db=market_db,
+                model_identity=model_identity,
+                training_start=training_start,
+                training_end=training_end,
+            )
+        )
+        checks.append(
+            check_execution_data_fingerprint(
+                execution_market_db=execution_market_db,
                 model_identity=model_identity,
                 training_start=training_start,
                 training_end=training_end,
@@ -968,11 +1337,101 @@ def run_production_preflight(
     fingerprint_facts = next(
         (item.facts for item in checks if item.name == "training_data_fingerprint"), {}
     )
+    execution_price_facts = next(
+        (item.facts for item in checks if item.name == "execution_price_series"), {}
+    )
+    execution_fingerprint_facts = next(
+        (item.facts for item in checks if item.name == "execution_data_fingerprint"), {}
+    )
+    feature_price_facts = next(
+        (item.facts for item in checks if item.name == "feature_price_series"), {}
+    )
+    feature_warmup = (
+        fingerprint_facts.get("model_warmup_days")
+        or model_identity.get("provenance_warmup_days")
+    )
+    feature_identity = {
+        "role": "feature",
+        "db": str(market_db),
+        "price_series_mode": str(
+            feature_price_facts.get("probed_price_mode")
+            or model_identity.get("feature_price_mode")
+            or ""
+        ),
+        "declared_price_series_mode": str(
+            (model_identity.get("feature_data_identity") or {}).get("price_series_mode", "") or ""
+        ),
+        "fingerprint": (
+            fingerprint_facts.get("recomputed_fingerprint")
+            or model_identity.get("training_data_fingerprint")
+        ),
+        "fingerprint_version": (
+            fingerprint_facts.get("recomputed_fingerprint_version")
+            or model_identity.get("training_data_fingerprint_version")
+        ),
+        "source_window": (
+            fingerprint_facts.get("recomputed_source_window")
+            or model_identity.get("provenance_source_window")
+        ),
+        "warmup_days": feature_warmup,
+        "rows": fingerprint_facts.get("recomputed_rows"),
+        "columns": fingerprint_facts.get("recomputed_columns"),
+        "latest_trade_date": latest_date_text,
+    }
+    execution_identity = {
+        "role": "execution",
+        "db": str(execution_market_db),
+        "price_series_mode": str(
+            execution_price_facts.get("probed_price_mode")
+            or (model_identity.get("execution_data_identity") or {}).get("price_series_mode", "")
+            or ""
+        ),
+        "price_series_certified": bool(
+            execution_price_facts.get("probed_certified")
+            if execution_price_facts
+            else (model_identity.get("execution_data_identity") or {}).get(
+                "price_series_certified", False
+            )
+        ),
+        "declared_price_series_mode": str(
+            (model_identity.get("execution_data_identity") or {}).get("price_series_mode", "") or ""
+        ),
+        "declared_price_series_certified": bool(
+            (model_identity.get("execution_data_identity") or {}).get(
+                "price_series_certified", False
+            )
+        ),
+        "fingerprint": (
+            execution_fingerprint_facts.get("recomputed_fingerprint")
+            or (model_identity.get("execution_data_identity") or {}).get("fingerprint")
+        ),
+        "fingerprint_version": str(
+            execution_fingerprint_facts.get("recomputed_fingerprint_version")
+            or (model_identity.get("execution_data_identity") or {}).get(
+                "fingerprint_version", ""
+            )
+            or ""
+        ),
+        "source_window": (
+            execution_fingerprint_facts.get("recomputed_source_window")
+            or (model_identity.get("execution_data_identity") or {}).get("source_window")
+        ),
+        "warmup_days": feature_warmup,
+        "rows": execution_fingerprint_facts.get("recomputed_rows"),
+        "columns": execution_fingerprint_facts.get("recomputed_columns"),
+        "latest_trade_date": str(execution_price_facts.get("execution_latest_trade_date", "") or ""),
+        "lag_days_vs_feature": execution_price_facts.get("execution_lag_days"),
+    }
     data_identity = {
         "market_db": str(market_db),
+        "execution_market_db": str(execution_market_db),
         "latest_trade_date": latest_date_text,
         "total_rows": market_check.facts.get("total_rows"),
         "training_window_hash": canonical_hash(training_window),
+        # P0：两条数据身份各自成块（与冻结模型 provenance 的封存形态一致，
+        # validation freeze 的 gate 逐项对账的就是这两块）。
+        "feature_data_identity": feature_identity,
+        "execution_data_identity": execution_identity,
         "training_data_fingerprint": (
             fingerprint_facts.get("recomputed_fingerprint")
             or model_identity.get("training_data_fingerprint")
@@ -984,10 +1443,7 @@ def run_production_preflight(
             fingerprint_facts.get("recomputed_fingerprint_version")
             or model_identity.get("training_data_fingerprint_version")
         ),
-        "warmup_days": (
-            fingerprint_facts.get("model_warmup_days")
-            or model_identity.get("provenance_warmup_days")
-        ),
+        "warmup_days": feature_warmup,
         "source_window": (
             fingerprint_facts.get("recomputed_source_window")
             or model_identity.get("provenance_source_window")
@@ -1065,7 +1521,14 @@ def assert_preflight_gate(
     ``model_id / model_artifact_hash / feature_schema_hash /
     model_training_code_commit / provenance.window / training_data_fingerprint``
     ——检查对象必须就是冻结对象。
+
+    P0：还要比 **两条数据身份**（``feature_data_identity`` /
+    ``execution_data_identity``）的 口径 / 指纹版本 / source_window / warmup /
+    行数 / 列，并确认 execution 那条是 ``raw + certified``——报告里那句自述不够，
+    必须与冻结模型的封存值逐项相等。
     """
+    from stock_analyzer.alpha_v2.dual_price_series import compare_price_series_identity
+
     payload = load_preflight_report(report_path)
     verdict = str(payload.get("verdict", "") or "")
     if verdict == VERDICT_BLOCKED:
@@ -1185,6 +1648,24 @@ def assert_preflight_gate(
         mismatches.append("source_window_missing_in_model_block")
     elif reported_source != expected_source:
         mismatches.append(f"source_window:{reported_source}!={expected_source}")
+    # ── P0：两条数据身份逐项对账（feature + execution 各一条）──────────────────
+    # 生产模型必须封存两条身份；缺任何一条 = 无法证明"检查的正是训练时用的那两份数据"。
+    for role, key in (("feature", "feature_data_identity"), ("execution", "execution_data_identity")):
+        declared = dict(model_provenance.get(key) or {})
+        reported_block = dict((payload.get("data_identity") or {}).get(key) or {})
+        role_mismatches = compare_price_series_identity(declared, reported_block, role=role)
+        mismatches.extend(role_mismatches)
+        if not role_mismatches and role == "execution":
+            # execution 是"能不能拿来当成交价"的那一份：光比对身份还不够，
+            # 报告里必须明写 raw + certified（否则 qfq 也能"对上身份"）。
+            if str(reported_block.get("price_series_mode", "")).strip().lower() != "raw" or not bool(
+                reported_block.get("price_series_certified")
+            ):
+                mismatches.append(
+                    "execution_price_series_not_certified_raw:"
+                    f"{reported_block.get('price_series_mode')!r}"
+                    f"/certified={reported_block.get('price_series_certified')!r}"
+                )
     if mismatches:
         raise PreflightError(
             "preflight 与本次冻结模型不一致（检查对象必须等于冻结对象）："
@@ -1209,12 +1690,21 @@ def assert_preflight_gate(
         "training_data_fingerprint_version": fingerprint_version,
         "warmup_days": int(warmup_days) if warmup_days is not None else None,
         "source_window": expected_source,
+        # P0：两条数据身份进 production_preflight 块 → 受 freeze_manifest_hash 保护
+        # （epoch 因此同时锚定了"特征用哪份 qfq、成交用哪份 raw"）。
+        "feature_data_identity": (payload.get("data_identity") or {}).get(
+            "feature_data_identity", {}
+        ),
+        "execution_data_identity": (payload.get("data_identity") or {}).get(
+            "execution_data_identity", {}
+        ),
         "data_identity": payload.get("data_identity", {}),
         "warnings": list(payload.get("warnings") or []),
     }
 
 
 __all__ = [
+    "EXECUTION_MAX_LAG_DAYS",
     "PREFLIGHT_SCHEMA",
     "VERDICT_BLOCKED",
     "VERDICT_PASS",
@@ -1223,7 +1713,10 @@ __all__ = [
     "PreflightError",
     "assert_preflight_gate",
     "canonical_hash",
+    "check_execution_data_fingerprint",
+    "check_execution_price_series",
     "check_feature_inputs",
+    "check_feature_price_series",
     "check_market_db",
     "check_model_identity",
     "check_production_prerequisites",
@@ -1232,8 +1725,10 @@ __all__ = [
     "check_training_data_fingerprint",
     "check_volume_units",
     "file_sha256",
+    "latest_trade_date_of",
     "load_preflight_report",
     "preflight_hash_of",
+    "probe_price_series_mode",
     "run_production_preflight",
     "write_preflight_audit",
 ]

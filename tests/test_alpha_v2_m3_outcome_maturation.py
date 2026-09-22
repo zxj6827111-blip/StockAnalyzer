@@ -70,6 +70,9 @@ def _mature(tmp_path, epoch, panel, evaluation_date):
         root=tmp_path,
         epoch=epoch,
         panel=panel,
+        # P0：execution 面板（收益来源）与 style 面板（风格维度）分开给；本夹具里
+        # 两者同源，但签名不再允许"一个面板走到底"这种省略。
+        style_panel=panel,
         evaluation_date=evaluation_date,
         matcher=matcher(),
         slippage_ratio=0.0015,

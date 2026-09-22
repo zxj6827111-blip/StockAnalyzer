@@ -544,6 +544,33 @@ def _fake_model_dir(tmp_path: Path, *, model_id: str = "m1") -> Path:
             "training_data_fingerprint_version": "v2",
             "training_data_rows": 1234,
             "training_data_columns": ["symbol", "date", "close"],
+            # P0：v3 还要求训练模式 + 双价格源身份（缺一即"训练目标来自哪份数据不可证"）。
+            "validation_mode": "production",
+            "feature_price_mode": "qfq",
+            "execution_price_mode": "raw",
+            "feature_data_identity": {
+                "role": "feature",
+                "db": "feature.duckdb",
+                "price_series_mode": "qfq",
+                "fingerprint": "fingerprint-abc",
+                "fingerprint_version": "v2",
+                "source_window": ["2026-01-30", "2026-03-31"],
+                "warmup_days": 30,
+                "rows": 1234,
+                "columns": ["symbol", "date", "close"],
+            },
+            "execution_data_identity": {
+                "role": "execution",
+                "db": "execution_raw.duckdb",
+                "price_series_mode": "raw",
+                "price_series_certified": True,
+                "fingerprint": "fingerprint-exec-abc",
+                "fingerprint_version": "v2",
+                "source_window": ["2026-01-30", "2026-03-31"],
+                "warmup_days": 30,
+                "rows": 1234,
+                "columns": ["symbol", "date", "close"],
+            },
         },
         extra_identity={"code_commit": "a" * 40},
     )
@@ -561,7 +588,7 @@ def test_model_identity_check_records_full_binding_block(tmp_path):
     assert result.facts["provenance_window"] == ["2026-03-01", "2026-03-31"]
     assert result.facts["training_data_fingerprint"] == "fingerprint-abc"
     # R1.1：封存身份（版本 / warmup / source_window / 指纹版本）逐项可见
-    assert result.facts["artifact_hash_version"] == "v2"
+    assert result.facts["artifact_hash_version"] == "v3"
     assert result.facts["provenance_warmup_days"] == 30
     assert result.facts["provenance_source_window"] == ["2026-01-30", "2026-03-31"]
     assert result.facts["training_data_fingerprint_version"] == "v2"
@@ -775,6 +802,9 @@ def _preflight_report(tmp_path: Path, **overrides: object) -> Path:
             "training_data_fingerprint_version": "v2",
             "warmup_days": 200,
             "source_window": ["2025-02-13", "2026-03-01"],
+            # P0：两条数据身份（与 _MODEL_BLOCK 的封存值逐项一致）。
+            "feature_data_identity": dict(_FEATURE_IDENTITY),
+            "execution_data_identity": dict(_EXECUTION_IDENTITY),
         },
         "training_window": {"start": "2025-09-01", "end": "2026-03-01"},
         "checks": [],
@@ -786,10 +816,37 @@ def _preflight_report(tmp_path: Path, **overrides: object) -> Path:
     return path
 
 
+# P0：两条数据身份（feature qfq / execution raw）。gate 逐项对账的就是这两块，
+# 所以报告夹具与模型块必须给出**同一组值**，测试才能证明"不一致项只有被改的那个"。
+_FEATURE_IDENTITY = {
+    "role": "feature",
+    "db": "m.duckdb",
+    "price_series_mode": "qfq",
+    "fingerprint": "fp-a",
+    "fingerprint_version": "v2",
+    "source_window": ["2025-02-13", "2026-03-01"],
+    "warmup_days": 200,
+    "rows": 1000,
+    "columns": ["symbol", "date", "close"],
+}
+
+_EXECUTION_IDENTITY = {
+    "role": "execution",
+    "db": "m_raw.duckdb",
+    "price_series_mode": "raw",
+    "price_series_certified": True,
+    "fingerprint": "fp-exec",
+    "fingerprint_version": "v2",
+    "source_window": ["2025-02-13", "2026-03-01"],
+    "warmup_days": 200,
+    "rows": 1000,
+    "columns": ["symbol", "date", "close"],
+}
+
 _MODEL_BLOCK = {
     "model_id": "model_a",
     "artifact_hash": "hash-a",
-    "artifact_hash_version": "v2",
+    "artifact_hash_version": "v3",
     "feature_schema_hash": "schema-a",
     "model_training_code_commit": "a" * 40,
     "provenance": {
@@ -798,6 +855,11 @@ _MODEL_BLOCK = {
         "source_window": ["2025-02-13", "2026-03-01"],
         "training_data_fingerprint": "fp-a",
         "training_data_fingerprint_version": "v2",
+        "validation_mode": "production",
+        "feature_price_mode": "qfq",
+        "execution_price_mode": "raw",
+        "feature_data_identity": dict(_FEATURE_IDENTITY),
+        "execution_data_identity": dict(_EXECUTION_IDENTITY),
         "training_data_rows": 1000,
         "training_data_columns": ["symbol", "date", "close"],
     },

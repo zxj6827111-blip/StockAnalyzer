@@ -643,6 +643,11 @@ def prepare_dataset(args: argparse.Namespace, protocol: M4HProtocol) -> Prepared
             decisions=decisions,
             spec=OutcomeSpec(),
             slippage_ratio=float(args.slippage_ratio),
+            # M4-H 是历史锁定 OOS 的**研究回放**（协议自述 execution_price_mode=raw，
+            # 但工具本身不承担生产认证职责）。守卫在此显式关闭并留下理由；生产
+            # freeze / mature 没有这条路。
+            enforce_execution_price_series=False,
+            research_replay_reason="alpha_v2_m4h_run:historical_locked_oos_replay",
         )
         outcomes = run.frame
         outcome_diagnostics = dict(run.diagnostics)

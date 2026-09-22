@@ -113,9 +113,27 @@ class LiveShadowCycleService:
     def market_db_path(self) -> str:
         """行情库路径：取 ``config.market_warehouse.db_path``（生产 NAS 是 delta 库，
         不是仓库默认的 artifacts/warehouse/market.duckdb——写死会让整个循环读错库）。
+
+        这是 **feature 侧**（qfq）行情库：capture 产特征、跑模型，用的就是它。
         """
         config = self._service._config
         return str(getattr(config.market_warehouse, "db_path", "artifacts/warehouse/market.duckdb"))
+
+    def feature_market_db_path(self) -> str:
+        """feature 侧行情库：``alpha_v2.feature_market_db`` 为空时回退 market_warehouse。"""
+        configured = str(
+            getattr(self._alpha_config(), "feature_market_db", "") or ""
+        ).strip()
+        return configured or self.market_db_path()
+
+    def execution_market_db_path(self) -> str:
+        """execution 侧行情库（**必须 raw**）。
+
+        留空表示未配置：mature 会 fail closed（exit 4）而不是拿 qfq 当成交价
+        ——P0 双价格序列契约里，这条路径宁可不产出 outcome，也不产出错口径的 outcome。
+        """
+        alpha_cfg = self._alpha_config()
+        return str(getattr(alpha_cfg, "execution_market_db", "") or "").strip()
 
     def data_health_out(self) -> Path:
         """data_health 落点：``<alpha_root>/runtime/data_health.json``。
@@ -324,12 +342,27 @@ class LiveShadowCycleService:
             health_ready, health_reason, health_summary = self._ensure_data_health(
                 trade_date=trade_date
             )
+        # P0 Final R1（BLOCKER 2）：**捕获前**复核 feature 价格口径是否仍等于冻结值。
+        # 没有这道前置，口径漂移只会在 capture 里以 exit 11 出现，调度器便一路
+        # alpha_v2_step_failed:capture:11 —— 到 23:55 也不会记 missing day。
+        feature_mode_ready = True
+        feature_mode_reason = ""
+        feature_mode_summary: dict[str, object] = {}
+        if not bool(state["captured"]):
+            feature_mode_ready, feature_mode_reason, feature_mode_summary = (
+                self._ensure_feature_price_series(root=root, trade_date=trade_date)
+            )
         prerequisites_ok = bool(
-            bool(readiness.get("allowed", False)) and funnel_ready and health_ready
+            bool(readiness.get("allowed", False))
+            and funnel_ready
+            and health_ready
+            and feature_mode_ready
         )
         if not bool(state["captured"]) and not prerequisites_ok:
             if not health_ready:
                 reason = health_reason or "data_health_not_healthy"
+            elif not feature_mode_ready:
+                reason = feature_mode_reason or "feature_price_mode_not_ready"
             else:
                 reason = funnel_reason or str(readiness.get("reason", "") or "readiness_blocked")
             if current.time() >= self._deadline():
@@ -353,6 +386,7 @@ class LiveShadowCycleService:
                         "readiness": dict(readiness),
                         "funnel_ready": funnel_ready,
                         "data_health": health_summary,
+                        "feature_price_series": feature_mode_summary,
                         "history_tail": tail,
                     },
                 )
@@ -365,8 +399,9 @@ class LiveShadowCycleService:
                 }
             return {
                 **self._result(True, f"alpha_v2_waiting:{reason}", trade_date),
-                # 等待态也带出 data_health 证据（排障不必再去翻工件）
+                # 等待态也带出证据（排障不必再去翻工件）
                 "data_health": health_summary,
+                "feature_price_series": feature_mode_summary,
             }
 
         steps: list[tuple[str, list[str], int]] = []
@@ -380,8 +415,11 @@ class LiveShadowCycleService:
                             epoch.epoch_id,
                             "--signal-date",
                             trade_date.isoformat(),
+                            # P0 Final R1：capture 读的是 feature 侧权威配置
+                            # （alpha_v2.feature_market_db 为空时回退 market_warehouse），
+                            # 不再直接用 db_path——两者可以是不同的库。
                             "--market-db",
-                            self.market_db_path(),
+                            self.feature_market_db_path(),
                             "--out",
                             str(root),
                             "--cohort-source",
@@ -397,13 +435,17 @@ class LiveShadowCycleService:
             [
                 (
                     "mature",
+                    # P0 双价格序列：mature 的两个角色**分开**给——execution 必须 raw，
+                    # feature 只供风格维度。一个 --market-db 走到底正是本 P0 的成因。
                     [
                         "--epoch-id",
                         epoch.epoch_id,
                         "--evaluation-date",
                         trade_date.isoformat(),
-                        "--market-db",
-                        self.market_db_path(),
+                        "--execution-market-db",
+                        self.execution_market_db_path(),
+                        "--feature-market-db",
+                        self.feature_market_db_path(),
                         "--out",
                         str(root),
                     ],
@@ -544,8 +586,10 @@ class LiveShadowCycleService:
                     epoch_id,
                     "--evaluation-date",
                     trade_date.isoformat(),
-                    "--market-db",
-                    self.market_db_path(),
+                    "--execution-market-db",
+                    self.execution_market_db_path(),
+                    "--feature-market-db",
+                    self.feature_market_db_path(),
                     "--out",
                     str(root),
                 ]
@@ -571,6 +615,79 @@ class LiveShadowCycleService:
                     },
                 )
         return results
+
+    def _ensure_feature_price_series(
+        self, *, root: Path, trade_date: date
+    ) -> tuple[bool, str, dict[str, object]]:
+        """捕获前的 feature 价格口径前置门（P0 Final R1 / BLOCKER 2）。
+
+        期望值只能来自**冻结身份**：``freeze.model.provenance.feature_data_identity.
+        price_series_mode``（受 ``freeze_manifest_hash`` 锚定）——不读当前 config 的
+        ``vendor_zip_price_series_mode`` 猜，那样"训练 qfq、线上被改成 raw"会静默通过。
+
+        判据复用唯一实现：``live_data_health_inputs.derive_feature_price_series_input``
+        → ``preflight.probe_price_series_mode`` + ``require_declared_feature_series``。
+
+        返回 ``(ok, reason, evidence)``：未就绪时调用方按 waiting / missing 处理——
+        绝不让 capture 以 exit 11 反复失败到窗口结束。
+        """
+        from stock_analyzer.alpha_v2.dual_price_series import (
+            feature_mode_of_freeze_manifest,
+            is_live_strict_mode,
+        )
+        from stock_analyzer.alpha_v2.validation.freeze import load_validation_freeze
+        from stock_analyzer.alpha_v2.validation.live_data_health_inputs import (
+            derive_feature_price_series_input,
+        )
+
+        try:
+            freeze = load_validation_freeze(root) or {}
+        except Exception as exc:  # noqa: BLE001 - 清单损坏按"未就绪"，不炸调度
+            return False, f"freeze_manifest_unreadable:{exc.__class__.__name__}", {}
+        validation_mode = str(freeze.get("validation_mode", "production"))
+        strict = bool(is_live_strict_mode(validation_mode))
+        expected_mode = feature_mode_of_freeze_manifest(freeze)
+        market_db = self.feature_market_db_path()
+        evidence: dict[str, object] = {
+            "validation_mode": validation_mode,
+            "enforced": strict,
+            "expected_mode": expected_mode,
+            "feature_market_db": market_db,
+        }
+        if not market_db:
+            evidence["status"] = "feature_market_db_not_configured"
+            evidence["reason"] = "未配置 feature 行情库（alpha_v2.feature_market_db）"
+            return False, "feature_market_db_not_configured", evidence
+        if not expected_mode:
+            evidence["status"] = "expected_feature_mode_missing"
+            evidence["reason"] = (
+                "冻结清单的模型块未声明 feature 数据身份"
+                "（model.provenance.feature_data_identity.price_series_mode）"
+            )
+            if strict:
+                return False, "frozen_feature_mode_missing", evidence
+            # 非严格模式（rehearsal）：没有可比的冻结口径就不做这层探测——
+            # 该 epoch 的行恒 clean_oos_eligible=false，证据已如实标未声明/未强制。
+            evidence["contract_ok"] = False
+            return True, "", evidence
+        probe = derive_feature_price_series_input(
+            market_db=market_db,
+            expected_mode=expected_mode,
+            as_of=trade_date,
+        )
+        evidence.update(probe)
+        evidence["enforced"] = strict
+        if bool(probe.get("contract_ok", False)):
+            return True, "", evidence
+        status = str(probe.get("status", "") or "unprovable")
+        evidence["reason"] = str(probe.get("reason", "") or status)
+        if not strict:
+            # rehearsal：口径漂移照样记证据/审计，但不阻断排演（永不进 clean）。
+            return True, "", evidence
+        reason = (
+            "feature_price_mode_mismatch" if status == "mismatch" else f"feature_price_{status}"
+        )
+        return False, reason, evidence
 
     # ------------------------------------------------------------------
     # 内部工具

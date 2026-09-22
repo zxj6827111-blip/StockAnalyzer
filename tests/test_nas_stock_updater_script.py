@@ -126,7 +126,7 @@ def test_managed_updater_empty_classifier_preserves_real_retries(
 ) -> None:
     """无 per-symbol failures 的 index/delta/readiness 故障不能冒充 empty-only。"""
     script = _script()
-    marker = '  python3 - "$1" <<\'PY\'\n'
+    marker = "  python3 - \"$1\" <<'PY'\n"
     marker_at = script.find(marker)
     assert marker_at >= 0
     start = marker_at + len(marker)
@@ -167,3 +167,32 @@ def test_managed_updater_empty_classifier_preserves_real_retries(
         == 0
     )
     assert _classify({"ok": False, "failures": ["Tushare timeout"]}) == 1
+
+
+def test_managed_updater_passes_both_delta_roles_in_one_call() -> None:
+    """P1 §15：两个 delta 角色必须在**同一次**调用里，不得另开 cron / 独立 raw updater。
+
+    独立入口会重新产生"QFQ ready / RAW 未 ready / selector 已 release"的竞态，正是
+    双 delta 事务要消除的东西。
+    """
+    script = _script()
+
+    assert (
+        "--sync-vendor-delta-raw /app/artifacts/vendor_delta_raw/market_delta_raw.duckdb" in script
+    )
+    run_block = script[script.index("run_update()") : script.index('END="${UPDATER_END_DATE')]
+    assert run_block.count("docker run") == 1
+    assert run_block.count("python3 /app/scripts/update_vendor_daily_from_tushare.py") == 1
+    assert "--sync-vendor-delta-raw" in run_block
+    assert "--sync-vendor-delta " in run_block
+    # 没有"第二个 raw 更新步骤"这种东西。
+    assert "import_vendor_zip_to_delta.py" not in script
+
+
+def test_managed_updater_verify_fails_when_dual_role_did_not_advance() -> None:
+    """双 delta 模式下 execution 角色没推进时，verify 必须判为不可发布。"""
+    script = _script()
+
+    assert 'd.get("dual_delta_enabled")' in script
+    assert 'd.get("execution_delta_sync")' in script
+    assert "dual delta enabled but execution role" in script

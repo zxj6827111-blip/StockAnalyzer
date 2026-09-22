@@ -17,7 +17,11 @@ Modes:
   baseline yet are imported in full. qfq symbols whose factor file drifted
   since the delta anchor (a corporate action re-anchors ALL history) are
   detected via the anchor-day factor value and refreshed from the ZIPs with
-  ``overwrite_existing=True``.
+  ``overwrite_existing=True``. **That drift channel is qfq-only**: a raw
+  target has no factors to drift, so ``--price-series-mode raw`` skips the
+  whole detection/rewrite path (reported as
+  ``factor_drift_detection=disabled_non_qfq_mode``) and advances purely by
+  newly appended bars.
 
 The read path reuses the production normalization pipeline
 (``VendorZipOverlayProvider._load_vendor_daily_batch`` +
@@ -336,6 +340,7 @@ def _filter_fresh_rows(
 def _build_report(
     *,
     mode: str,
+    price_series_mode: str,
     requested_symbols: int,
     loaded_symbols: list[str],
     skipped_symbols: list[str],
@@ -345,17 +350,25 @@ def _build_report(
     dry_run: bool,
     elapsed_sec: float,
 ) -> dict[str, object]:
+    drift_enabled = str(price_series_mode).strip().lower() == "qfq"
     return {
         "script": "import_vendor_zip_to_delta",
         "mode": mode,
+        "price_series_mode": str(price_series_mode).strip().lower(),
         "dry_run": dry_run,
         "requested_symbols": requested_symbols,
         "loaded_symbols": len(loaded_symbols),
         "skipped_symbols": skipped_symbols,
         "skipped_symbol_count": len(skipped_symbols),
         "incremental_new_rows": fresh_rows,
+        # 因子漂移重写只对 qfq 有意义（除权重标定的是复权序列的整段历史）。raw 序列没有
+        # 因子，这条通道对它必须**关闭**——把它写成显式字段是让夜间审计能一眼看出"这次
+        # 运行到底有没有走历史重写"，而不是靠读代码推断。
+        "factor_drift_detection": "enabled" if drift_enabled else "disabled_non_qfq_mode",
         "drift_refreshed_symbols": drift_symbols,
         "drift_refreshed_symbol_count": len(drift_symbols),
+        "baseline_missing_symbols": len(full_import_symbols),
+        "baseline_missing_examples": sorted(full_import_symbols)[:20],
         "full_import_symbol_count": len(full_import_symbols),
         "elapsed_sec": round(elapsed_sec, 3),
     }
@@ -450,10 +463,16 @@ def _main(argv: list[str] | None = None) -> int:
             fresh_symbols: list[str] = []
             full_import_symbols: list[str] = []
             drift_symbols: list[str] = []
+            # 因子漂移检测只对 qfq 开放：raw 序列没有因子可漂移，逐符号读取复权因子
+            # 归档在这里是纯开销，且一旦误开就会把"未经因子换算的 raw 行"当作
+            # overwrite_existing 的历史重写写回（把真实价格覆盖掉）。
+            drift_detection_enabled = bool(
+                provider.price_series_mode == "qfq" and factor_archive.exists()
+            )
             # 因子归档只打开一次（建索引 + 逐符号漂移检测共用）：逐符号重建
             # ZipFile 会反复解析 ~8 万条中央目录，是全市场增量运行的主要耗时。
             archive_context: object
-            if provider.price_series_mode == "qfq" and factor_archive.exists():
+            if drift_detection_enabled:
                 archive_context = zipfile.ZipFile(factor_archive)
             else:
                 archive_context = nullcontext()
@@ -471,7 +490,7 @@ def _main(argv: list[str] | None = None) -> int:
                     # 因子漂移检测覆盖所有已有 delta 基线的符号：即使当日无新
                     # 数据（停牌），除权也会重标定全部历史，需要整段重算。
                     anchor_date = anchors.get(symbol)
-                    if anchor_date is not None and entry_index:
+                    if drift_detection_enabled and anchor_date is not None and entry_index:
                         assert factor_zip is not None
                         factor_value = _factor_value_on_anchor(
                             factor_zip,
@@ -490,6 +509,15 @@ def _main(argv: list[str] | None = None) -> int:
                     if zip_date is None or zip_date <= delta_date:
                         continue
                     fresh_symbols.append(symbol)
+
+            # 不变量（与 _build_report 的 factor_drift_detection 字段同义）：
+            # 非 qfq 角色永远不该产出 drift 符号。真发生了说明上面的门被绕过，
+            # 此时继续走 overwrite_existing 会把历史行覆盖成半截数据——直接拒绝。
+            if drift_symbols and provider.price_series_mode != "qfq":
+                raise DataSourceError(
+                    "factor drift refresh must never run for price_series_mode="
+                    f"{provider.price_series_mode!r} (symbols={drift_symbols[:5]})"
+                )
 
             fresh_frames: list[pd.DataFrame] = []
             fresh_rows = 0
@@ -522,6 +550,7 @@ def _main(argv: list[str] | None = None) -> int:
 
             report = _build_report(
                 mode="incremental",
+                price_series_mode=provider.price_series_mode,
                 requested_symbols=len(symbols),
                 loaded_symbols=loaded_symbols,
                 skipped_symbols=skipped_symbols,
@@ -563,6 +592,7 @@ def _main(argv: list[str] | None = None) -> int:
             rows = sum(len(frame) for frame in frames)
             report = _build_report(
                 mode="full",
+                price_series_mode=provider.price_series_mode,
                 requested_symbols=len(symbols),
                 loaded_symbols=loaded_symbols,
                 skipped_symbols=skipped_symbols,

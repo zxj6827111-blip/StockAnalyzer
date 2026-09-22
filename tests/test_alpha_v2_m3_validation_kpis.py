@@ -91,6 +91,8 @@ def epoch_data(tmp_path):
             )
             write_shadow_snapshot(root=tmp_path, epoch=epoch, signal_date=day, rows=rows)
         # 手工写 outcome（真实生产由成熟任务产生；这里验证 KPI 读取与统计口径）
+        # 夹具必须与生产同形：真实 outcome 行恒带 price_mode / price_mode_certified
+        # （成熟任务在 _base_row 里逐行写）；缺了它们 KPI 的第二道闸会全拒。
         outcomes = [
             {
                 "signal_date": day.isoformat(),
@@ -99,6 +101,8 @@ def epoch_data(tmp_path):
                 "entry_price_raw": 10.1,
                 "entry_price_net": 10.2,
                 "entry_delay_sessions": 1,
+                "price_mode": "raw",
+                "price_mode_certified": True,
                 "matured_3d": True,
                 "matured_5d": True,
                 "net_return_3d": 0.020,
@@ -117,6 +121,8 @@ def epoch_data(tmp_path):
                 "entry_price_raw": 20.1,
                 "entry_price_net": 20.3,
                 "entry_delay_sessions": 1,
+                "price_mode": "raw",
+                "price_mode_certified": True,
                 "matured_3d": True,
                 "matured_5d": True,
                 "net_return_3d": 0.010,
@@ -132,6 +138,8 @@ def epoch_data(tmp_path):
                 "signal_date": day.isoformat(),
                 "symbol": "600002",
                 "executable": True,
+                "price_mode": "raw",
+                "price_mode_certified": True,
                 "matured_3d": True,
                 "matured_5d": True,
                 "net_return_3d": -0.010,

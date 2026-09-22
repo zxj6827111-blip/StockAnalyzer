@@ -45,6 +45,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from stock_analyzer.alpha_v2.dual_price_series import (  # noqa: E402
+    FEATURE_PRICE_SERIES_EVIDENCE_SCHEMA,
+    PriceSeriesContractError,
+    certification_evidence_block,
+    feature_mode_of_frozen_model,
+    is_live_strict_mode,
+    require_declared_feature_series,
+)
 from stock_analyzer.alpha_v2.research.feature_audit import safe_feature_columns  # noqa: E402
 from stock_analyzer.alpha_v2.research.outcomes import DecisionPoint, OutcomeSpec  # noqa: E402
 from stock_analyzer.alpha_v2.research.panel import (  # noqa: E402
@@ -191,7 +199,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Alpha V2 M3：每日 Shadow 快照采集")
     parser.add_argument("--epoch-id", default="")
     parser.add_argument("--signal-date", required=True)
-    parser.add_argument("--market-db", default="artifacts/warehouse/market.duckdb")
+    parser.add_argument(
+        "--market-db",
+        default="artifacts/warehouse/market.duckdb",
+        help=(
+            "**feature 侧**行情库（capture 只用它算特征；生产走 "
+            "alpha_v2.feature_market_db，为空时回退 market_warehouse.db_path）。"
+            "当天会校验它的价格口径 == 冻结模型声明的 feature 口径，不一致即 exit 11"
+        ),
+    )
     parser.add_argument("--warmup-days", type=int, default=260)
     parser.add_argument("--model-dir", default="")
     parser.add_argument("--out", default=str(REPO_ROOT / "artifacts" / "alpha_v2"))
@@ -402,6 +418,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[shadow] 冻结模型校验失败: {exc}", file=sys.stderr)
         return 5
 
+    # ── 冻结 feature 价格口径（P0 Final R1 / BLOCKER 1）：权威来源 = 模型工件本身 ────
+    # train feature=qfq 而当天 feature 库变成 raw/unknown 时，特征语义已换——但旧实现
+    # 会照常预测并写快照。这里先取"训练时冻结的口径"，稍后在面板加载后逐日复核。
+    live_strict = is_live_strict_mode(validation_mode)
+    expected_feature_mode = feature_mode_of_frozen_model(model.manifest)
+    if live_strict and not expected_feature_mode:
+        print(
+            "[shadow] 拒绝：冻结模型未声明 feature 价格口径"
+            "（provenance.feature_data_identity.price_series_mode 缺失）——"
+            "无法证明当天特征与训练同口径；生产/测试模式一律 fail closed",
+            file=sys.stderr,
+        )
+        return 11
+
     # 第二道闸的第二步：运行身份全键核验（8 键严格缺失判违例）——需要 model 已载入
     contract = resolve_selection_contract(config, profile="night_scan")
     price = price_contract_block(config)
@@ -465,6 +495,57 @@ def main(argv: list[str] | None = None) -> int:
     if signal_date not in panel.calendar:
         print(f"[shadow] {signal_date} 不是面板交易日（或行情未到位）", file=sys.stderr)
         return 6
+
+    # ── 当天 feature 面板口径复核（必须在 pit_universe / 特征 / 预测 / 写盘之前）────
+    # 判据复用唯一实现 require_declared_feature_series：口径必须**可证**且等于冻结值。
+    # 注意 feature 侧不要求 certified（qfq 的 certified 本来就是 False）——那是
+    # execution 侧的标准，混用会把正确的 qfq 误判成失败。
+    feature_certification = panel.certify_price_mode(min_sample=1000)
+    feature_contract_ok = False
+    feature_contract_reason = ""
+    try:
+        require_declared_feature_series(
+            feature_certification,
+            context=f"capture(signal_date={signal_date.isoformat()})",
+            expected_mode=expected_feature_mode,
+            db=str(args.market_db),
+        )
+        feature_contract_ok = bool(expected_feature_mode)
+        if not expected_feature_mode:
+            feature_contract_reason = (
+                "expected_feature_mode_missing:冻结模型未声明 feature 口径（rehearsal 未强制）"
+            )
+    except PriceSeriesContractError as exc:
+        feature_contract_reason = str(exc)
+        if live_strict:
+            print(f"[shadow] 拒绝：feature 价格口径契约未通过: {exc}", file=sys.stderr)
+            return 11
+        print(
+            f"[shadow] 警告：{exc}（validation_mode={validation_mode}，"
+            "本 epoch 永不进 clean OOS；证据已落当日清单）",
+            file=sys.stderr,
+        )
+    feature_price_series_evidence = {
+        "schema": FEATURE_PRICE_SERIES_EVIDENCE_SCHEMA,
+        "expected_mode": expected_feature_mode,
+        "expected_mode_declared": bool(expected_feature_mode),
+        "observed_mode": str(feature_certification.mode),
+        "mode_match": bool(expected_feature_mode)
+        and str(feature_certification.mode) == expected_feature_mode,
+        "certification_source": str(feature_certification.source),
+        "certification_evidence": certification_evidence_block(feature_certification),
+        "source_db": str(args.market_db),
+        "contract_ok": bool(feature_contract_ok),
+        "enforced": bool(live_strict),
+        "reason": feature_contract_reason,
+        "validation_mode": validation_mode,
+        "checked_at": pd.Timestamp.now(tz="Asia/Shanghai").isoformat(),
+    }
+    print(
+        f"[shadow] feature 价格口径: expected={expected_feature_mode or '(未声明)'} "
+        f"observed={feature_certification.mode} contract_ok={feature_contract_ok} "
+        f"(enforced={live_strict})"
+    )
 
     snapshot = panel.pit_universe(as_of=signal_date)
     eligible = list(snapshot.eligible_symbols)
@@ -669,6 +750,9 @@ def main(argv: list[str] | None = None) -> int:
                 "backfilled": bool(is_backfill),
             },
             "data_health": dict(data_health_block),
+            # P0 Final R1：当天 feature 价格口径证据——以后任何一个 L20/L60/L120/L250
+            # 日都能直接回答"当天模型看到的 feature price mode 是什么、是否等于冻结值"。
+            "feature_price_series": dict(feature_price_series_evidence),
             # M4-L §11：当日清单必须一眼回答"这一天凭什么被算成（或不算成）Clean OOS"
             "selection_contract_id": identity["selection_contract_id"],
             "code_commit": identity["code_commit"],

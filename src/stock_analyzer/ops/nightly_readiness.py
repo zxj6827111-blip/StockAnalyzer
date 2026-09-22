@@ -17,7 +17,7 @@ updater, the scheduler and tests can all call the same helpers.
 
 Schema
 ------
-``nightly_data_ready.json`` example ::
+``nightly_data_ready.json`` example (legacy single-delta, ``schema_version`` 2) ::
 
     {
         "schema_version": 2,
@@ -30,10 +30,48 @@ Schema
         "source": "stock_updater.sh"
     }
 
+Production dual-delta (``schema_version`` 3, written whenever the updater is given
+``--sync-vendor-delta-raw``) adds the execution role and the membership lock-step ::
+
+    {
+        "schema_version": 3,
+        "target_trade_date": "2026-08-19",
+        "daily":  {"ok": true},
+        "index":  {"ok": true, "symbol_set_hash": "..."},
+        "delta":  {"ok": true, "role": "feature",   "price_series_mode": "qfq",
+                   "symbol_set_hash": "..."},
+        "execution_delta": {"ok": true, "role": "execution", "price_series_mode": "raw",
+                            "symbol_set_hash": "..."},
+        "symbol_membership": {
+            "symbols_expected": 5541, "symbols_feature": 5541, "symbols_execution": 5541,
+            "symbol_set_hash_expected": "...", "symbol_set_hash_feature": "...",
+            "symbol_set_hash_execution": "...",
+            "missing_feature": [], "missing_execution": [], "feature_not_in_execution": []
+        }
+    }
+
+为什么 v3 不只比**数量**：``{A,B}`` 与 ``{A,C}`` 计数相同、成员不同。旧口径只看
+``symbols_on_target_date`` 的计数，这类"数量对得上、成员对不上"的故障会静默放行。
+v3 用符号集合摘要（排序后 sha256）把成员锁死。
+
+v3 的三方关系是**包含链** ``index_expected ⊆ feature ⊆ execution``，不是三方全等：
+
+- ``index_expected`` 是"当天应该有的票"（去掉 entries 为空的新股占位）；
+- feature 缺一只 → 那天少一个决策样本，必须拦；
+- execution 缺 feature 有的 → label 算不出来，必须拦；
+- **execution 多出来的不算错**：raw 侧不需要复权因子，所以 qfq 侧因因子缺失被跳过的
+  symbol 在 raw 侧照样有行。要求三方全等会把这条正常路径判成故障，每晚误杀。
+
 Only the fields inspected by the gate are ``schema_version``,
-``target_trade_date``, ``daily``/``index``/``delta`` and
-``created_at``.  ``target_trade_date`` is the latest daily index date,
+``target_trade_date``, ``daily``/``index``/``delta`` (+ ``execution_delta`` on v3)
+and ``created_at``.  ``target_trade_date`` is the latest daily index date,
 not the shell calendar date.
+
+Readiness 自己开库验证，不信 updater 自述
+------------------------------------------
+``write_nightly_readiness`` 不接受"``execution_delta_ok=true``"这类结论入参：两个 delta
+库都由本模块**只读打开**，逐项核对最新交易日、目标日成员集合、行内价格口径。updater 的
+自述只进 summary 供人看，release 判定完全来自这里的实测。
 
 Consumption
 -----------
@@ -64,15 +102,35 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from stock_analyzer.ops.raw_delta_baseline import (
+    FEATURE_DELTA_PRICE_MODE,
+    RAW_DELTA_PRICE_MODE,
+    ROLE_EXECUTION,
+    ROLE_FEATURE,
+    RawDeltaBaselineError,
+    normalize_symbols,
+    symbol_set_hash,
+    verify_bootstrap_marker,
+)
+
 READINESS_FILENAME = "nightly_data_ready.json"
 CONSUMED_FILENAME = "nightly_data_ready.consumed.json"
+#: 单 delta（feature/qfq）写入版本；没有 execution 库时的默认值，历史文件也仍是它。
 READINESS_SCHEMA_VERSION = 2
+#: 双 delta（feature/qfq + execution/raw）写入版本。只有显式传入 execution 库时才写。
+READINESS_SCHEMA_VERSION_DUAL = 3
+#: 读侧接受的版本集合。v1 及未知版本一律不 ready（fail closed）。
+SUPPORTED_READINESS_SCHEMA_VERSIONS: tuple[int, ...] = (
+    READINESS_SCHEMA_VERSION,
+    READINESS_SCHEMA_VERSION_DUAL,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +169,18 @@ def _coerce_date(value: object) -> date | None:
         except ValueError:
             continue
     return None
+
+
+def _same_path(left: object, right: object) -> bool:
+    """两个库路径是否指向同一份文件（解析失败时退化成字符串比较）。"""
+    left_text = str(left or "").strip()
+    right_text = str(right or "").strip()
+    if not left_text or not right_text:
+        return False
+    try:
+        return Path(left_text).expanduser().resolve() == Path(right_text).expanduser().resolve()
+    except OSError:  # pragma: no cover - resolve 失败只在异常文件系统上
+        return left_text == right_text
 
 
 def authoritative_readiness_path() -> Path:
@@ -208,7 +278,12 @@ def _validate_daily_index(
     *,
     index_path: str | Path | None,
     target_trade_date: date,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], list[str]]:
+    """校验日索引，返回 (审计载荷, 目标日应出现的符号集合)。
+
+    第二个返回值**不进 JSON**（5500 个符号塞进 readiness 文件只会让人不去读它），
+    只用于 v3 的三方成员锁步；载荷里留摘要与计数。
+    """
     path = _required_artifact_path(index_path, label="index_path")
     payload = _read_json(path)
     if payload is None:
@@ -225,6 +300,7 @@ def _validate_daily_index(
     # 索引项可能不带 entries 字段，视作有数据（向后兼容）。
     latest_dates: list[date] = []
     hollow_symbols: list[str] = []
+    target_symbols: list[str] = []
     for key, item in symbols.items():
         if not isinstance(item, dict):
             continue
@@ -236,6 +312,8 @@ def _validate_daily_index(
             hollow_symbols.append(str(key))
             continue
         latest_dates.append(parsed)
+        if parsed == target_trade_date:
+            target_symbols.append(str(key))
     if not latest_dates:
         raise ValueError(f"index_path has no latest_date values: {path}")
 
@@ -248,14 +326,49 @@ def _validate_daily_index(
         )
     if symbols_on_target <= 0:
         raise ValueError(f"daily index has no symbols on {target_trade_date.isoformat()}")
-    return {
+    normalized_target = normalize_symbols(target_symbols)
+    payload_out = {
         "ok": True,
         "path": str(path),
         "latest_trade_date": index_latest.isoformat(),
         "symbols_total": len(symbols),
         "symbols_on_target_date": symbols_on_target,
+        "symbol_set_hash": symbol_set_hash(normalized_target),
         "hollow_symbols": hollow_symbols,
     }
+    return payload_out, normalized_target
+
+
+def _declared_price_series_modes(connection: Any, *, table: str = "daily_bars") -> dict[str, int]:
+    """**全表**行内价格口径 → 行数（``""`` = 未声明）。
+
+    有意不按目标日过滤：一份库里混进一行另一种口径，就意味着按这份序列算出来的
+    特征/label 在跨越那一行时不连续。要拦的是"这份库能不能当那个角色的序列"，
+    而不是"今天新增的行对不对"——写入口（``market_warehouse`` 的逐 symbol 口径
+    门禁）负责不让新的污染进来，这里负责不让已有的污染被 release。
+    """
+    columns = {
+        str(item[0]) for item in connection.execute(f"DESCRIBE {table}").fetchall()
+    }
+    if "price_series_mode" not in columns:
+        return {}
+    rows = connection.execute(
+        f"""
+        SELECT COALESCE(TRIM(CAST(price_series_mode AS VARCHAR)), '') AS mode, COUNT(*)
+        FROM {table}
+        GROUP BY 1
+        """
+    ).fetchall()
+    return {str(row[0]).strip().lower(): int(row[1] or 0) for row in rows}
+
+
+def _format_mode_histogram(histogram: dict[str, int]) -> str:
+    """口径分布的人读形式——口径门失败时诊断价值全在这里。"""
+    if not histogram:
+        return "(no price_series_mode column / no rows)"
+    return ", ".join(
+        f"{mode or 'undeclared'}={count}" for mode, count in sorted(histogram.items())
+    )
 
 
 def _validate_delta_db(
@@ -263,13 +376,26 @@ def _validate_delta_db(
     db_path: str | Path | None,
     target_trade_date: date,
     expected_symbols_on_target: int,
-) -> dict[str, Any]:
-    path = _required_artifact_path(db_path, label="delta_db_path")
+    role: str = ROLE_FEATURE,
+    expected_price_series_mode: str = "",
+    expected_symbols: Sequence[str] | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    """只读打开一份 delta 库并核对最新交易日 / 目标日覆盖 / 行内价格口径。
+
+    ``expected_price_series_mode`` 非空时启用口径硬门（v3 双 delta 模式）：
+    声明集合必须**恰好**是 ``{期望口径}``。``qfq`` / ``mixed`` / 完全无声明
+    （``unknown``）都不通过——执行侧拿复权价当成交价正是 P0 要封的缺口。
+
+    ``expected_symbols`` 非空时额外做成员锁步：给定集合必须被本库目标日的符号
+    集合**包含**，返回缺失样例。缺少的就是"那天没有这份数据的票"。
+    """
+    path = _required_artifact_path(db_path, label=f"{role}_db_path")
     try:
         import duckdb
     except ImportError as exc:  # pragma: no cover - production dependency
         raise RuntimeError("duckdb is required to validate nightly readiness") from exc
 
+    expected_symbol_set = set(normalize_symbols(expected_symbols or []))
     try:
         with duckdb.connect(str(path), read_only=True) as connection:
             table_exists = connection.execute(
@@ -280,7 +406,7 @@ def _validate_delta_db(
                 """
             ).fetchone()
             if not table_exists or int(table_exists[0] or 0) <= 0:
-                raise ValueError(f"delta DB has no daily_bars table: {path}")
+                raise ValueError(f"{role} delta DB has no daily_bars table: {path}")
             row = connection.execute(
                 """
                 SELECT
@@ -291,10 +417,17 @@ def _validate_delta_db(
                 """,
                 [target_trade_date.isoformat()],
             ).fetchone()
+            target_rows = connection.execute(
+                "SELECT DISTINCT symbol FROM daily_bars WHERE date = ?",
+                [target_trade_date.isoformat()],
+            ).fetchall()
+            declared_modes = _declared_price_series_modes(connection)
     except ValueError:
         raise
     except Exception as exc:
-        raise ValueError(f"cannot validate delta DB {path}: {type(exc).__name__}:{exc}") from exc
+        raise ValueError(
+            f"cannot validate {role} delta DB {path}: {type(exc).__name__}:{exc}"
+        ) from exc
 
     delta_latest = _coerce_date(row[0] if row else None)
     symbols_total = int(row[1] or 0) if row else 0
@@ -302,28 +435,112 @@ def _validate_delta_db(
     if delta_latest != target_trade_date:
         actual = delta_latest.isoformat() if delta_latest is not None else ""
         raise ValueError(
-            "delta DB latest date mismatch: "
+            f"{role} delta DB latest date mismatch: "
             f"expected {target_trade_date.isoformat()}, got {actual or 'missing'}"
         )
     if symbols_on_target < expected_symbols_on_target:
         raise ValueError(
-            "delta DB target-date coverage is incomplete: "
+            f"{role} delta DB target-date coverage is incomplete: "
             f"{symbols_on_target}<{expected_symbols_on_target}"
         )
+    target_symbols = normalize_symbols(item[0] for item in target_rows)
+    missing_examples: list[str] = []
+    if expected_symbol_set:
+        missing_examples = sorted(expected_symbol_set - set(target_symbols))
+        if missing_examples:
+            raise ValueError(
+                f"{role} delta DB is missing {len(missing_examples)} symbol(s) that the "
+                f"target date requires (examples: {missing_examples[:10]})"
+            )
+    observed_mode = ""
+    if expected_price_series_mode:
+        wanted = str(expected_price_series_mode).strip().lower()
+        declared = {mode: count for mode, count in declared_modes.items() if mode and count > 0}
+        if not declared:
+            raise ValueError(
+                f"{role} delta DB declares no price_series_mode (unknown); expected {wanted}"
+                f" [table histogram: {_format_mode_histogram(declared_modes)}]: {path}"
+            )
+        if set(declared) != {wanted}:
+            raise ValueError(
+                f"{role} delta DB price_series_mode mismatch: expected {wanted}, got "
+                f"[{_format_mode_histogram(declared_modes)}]: {path}"
+            )
+        observed_mode = wanted
     coverage_ratio = (
         round(symbols_on_target / expected_symbols_on_target, 6)
         if expected_symbols_on_target > 0
         else 0.0
     )
-    return {
+    payload_out = {
         "ok": True,
+        "role": role,
         "path": str(path),
         "latest_trade_date": delta_latest.isoformat(),
         "symbols_total": symbols_total,
         "symbols_on_target_date": symbols_on_target,
         "expected_symbols_on_target_date": expected_symbols_on_target,
+        "symbol_set_hash": symbol_set_hash(target_symbols),
         "coverage_ratio": coverage_ratio,
     }
+    if observed_mode:
+        payload_out["price_series_mode"] = observed_mode
+        payload_out["declared_price_series_modes"] = sorted(declared_modes)
+    return payload_out, target_symbols
+
+
+def _lock_step_symbol_membership(
+    *,
+    expected_symbols: list[str],
+    feature_symbols: list[str],
+    execution_symbols: list[str],
+    max_examples: int = 20,
+) -> tuple[dict[str, Any], list[str]]:
+    """v3 三方成员锁步：``expected ⊆ feature ⊆ execution``；返回 (审计块, 违规说明)。
+
+    包含链而不是全等，理由见模块 docstring：raw 侧不依赖复权因子，因因子缺失被
+    qfq 侧跳过的 symbol 在 raw 侧**天然存在**。要求全等会把这条正常路径每晚误杀。
+    """
+    expected = set(expected_symbols)
+    feature = set(feature_symbols)
+    execution = set(execution_symbols)
+    missing_feature = sorted(expected - feature)
+    missing_execution = sorted(expected - execution)
+    feature_not_in_execution = sorted(feature - execution)
+    problems: list[str] = []
+    if missing_feature:
+        problems.append(
+            f"feature delta is missing {len(missing_feature)} expected symbol(s) "
+            f"(examples: {missing_feature[:max_examples]})"
+        )
+    if missing_execution:
+        problems.append(
+            f"execution delta is missing {len(missing_execution)} expected symbol(s) "
+            f"(examples: {missing_execution[:max_examples]})"
+        )
+    if feature_not_in_execution:
+        problems.append(
+            f"execution delta is missing {len(feature_not_in_execution)} symbol(s) present "
+            f"in feature (examples: {feature_not_in_execution[:max_examples]})"
+        )
+    audit = {
+        "symbols_expected": len(expected_symbols),
+        "symbols_feature": len(feature_symbols),
+        "symbols_execution": len(execution_symbols),
+        "symbol_set_hash_expected": symbol_set_hash(expected_symbols),
+        "symbol_set_hash_feature": symbol_set_hash(feature_symbols),
+        "symbol_set_hash_execution": symbol_set_hash(execution_symbols),
+        "missing_feature": missing_feature[:max_examples],
+        "missing_feature_count": len(missing_feature),
+        "missing_execution": missing_execution[:max_examples],
+        "missing_execution_count": len(missing_execution),
+        "feature_not_in_execution": feature_not_in_execution[:max_examples],
+        "feature_not_in_execution_count": len(feature_not_in_execution),
+        "extra_execution_vs_expected": sorted(execution - expected)[:max_examples],
+        "extra_execution_vs_expected_count": len(execution - expected),
+        "membership_locked": not problems,
+    }
+    return audit, problems
 
 
 def read_nightly_readiness(path: str | Path | None = None) -> dict[str, Any] | None:
@@ -354,9 +571,12 @@ def write_nightly_readiness(
     target_trade_date: date | str,
     db_path: str | Path | None = None,
     index_path: str | Path | None = None,
+    execution_db_path: str | Path | None = None,
     updater_commit: str = "",
     extra: dict[str, Any] | None = None,
     path: str | Path | None = None,
+    verify_raw_baseline: bool = True,
+    raw_baseline_marker_path: str | Path | None = None,
 ) -> Path:
     """Atomically write ``nightly_data_ready.json`` to the authoritative path.
 
@@ -364,9 +584,16 @@ def write_nightly_readiness(
         target_trade_date: latest daily index date (not shell calendar date).
         db_path / index_path: required artifacts. Both are opened and checked
             against `target_trade_date` before readiness is published.
+        execution_db_path: 第二份 delta（execution/raw）。给了它才写 v3 并校验：
+        目标日成员必须覆盖 feature 侧与索引侧，行内口径必须恰好是 raw，且
+        bootstrap marker 必须证明它是一份**经过覆盖认证的基线**（见
+        :func:`verify_bootstrap_marker`）。不给 = 保持 v2 单 delta 语义不变。
         updater_commit: the updater git commit (from ``.build_commit``).
         extra: additional keys merged into the payload.
         path: override output path; when omitted the authoritative path is used.
+        verify_raw_baseline: v3 下是否校验 raw 基线身份（生产恒为真；只有构造
+        夹具的测试会关掉它）。
+        raw_baseline_marker_path: marker 路径覆盖（默认与 raw 库同目录）。
 
     Returns:
         The path that was written.
@@ -374,19 +601,78 @@ def write_nightly_readiness(
     coerced = _coerce_date(target_trade_date)
     if coerced is None:
         raise ValueError(f"invalid target_trade_date: {target_trade_date!r}")
-    index_validation = _validate_daily_index(
+    index_validation, expected_symbols = _validate_daily_index(
         index_path=index_path,
         target_trade_date=coerced,
     )
-    delta_validation = _validate_delta_db(
+    dual = bool(str(execution_db_path or "").strip())
+    execution_db = str(execution_db_path or "")
+    if dual and _same_path(execution_db, db_path):
+        # 同一份文件承担两个角色时，成员锁步与口径门都会退化成恒真（自己比自己），
+        # readiness 看起来通过但什么都没证明。生产形态是两份物理独立的库。
+        raise ValueError(
+            "feature and execution delta must be physically separate DuckDB files: "
+            f"{execution_db}"
+        )
+    expected_price_mode = FEATURE_DELTA_PRICE_MODE if dual else ""
+    delta_validation, feature_symbols = _validate_delta_db(
         db_path=db_path,
         target_trade_date=coerced,
         expected_symbols_on_target=int(index_validation["symbols_on_target_date"]),
+        role=ROLE_FEATURE,
+        expected_price_series_mode=expected_price_mode,
+        expected_symbols=expected_symbols if dual else None,
     )
+    execution_validation: dict[str, Any] | None = None
+    symbol_membership: dict[str, Any] | None = None
+    raw_baseline_block: dict[str, Any] | None = None
+    if dual:
+        execution_validation, execution_symbols = _validate_delta_db(
+            db_path=execution_db,
+            target_trade_date=coerced,
+            expected_symbols_on_target=int(index_validation["symbols_on_target_date"]),
+            role=ROLE_EXECUTION,
+            expected_price_series_mode=RAW_DELTA_PRICE_MODE,
+            expected_symbols=expected_symbols,
+        )
+        symbol_membership, membership_problems = _lock_step_symbol_membership(
+            expected_symbols=expected_symbols,
+            feature_symbols=feature_symbols,
+            execution_symbols=execution_symbols,
+        )
+        if membership_problems:
+            raise ValueError(
+                "dual-delta symbol membership lock-step failed: "
+                + " | ".join(membership_problems)
+            )
+        if verify_raw_baseline:
+            try:
+                marker = verify_bootstrap_marker(
+                    raw_db_path=execution_db,
+                    marker_path=raw_baseline_marker_path,
+                )
+            except RawDeltaBaselineError as exc:
+                raise ValueError(
+                    f"execution delta is not a certified RAW baseline ({exc.reason}): {exc}"
+                ) from exc
+            raw_baseline_block = {
+                "ok": True,
+                "reason": "ok",
+                "schema": marker.get("schema", ""),
+                "coverage_status": marker.get("coverage_status", ""),
+                "price_series_mode": marker.get("price_series_mode", ""),
+                "required_source_window": marker.get("required_source_window", {}),
+                "symbols_expected": marker.get("symbols_expected"),
+                "symbols_covered": marker.get("symbols_covered"),
+                "baseline_rows": (marker.get("db_content_identity") or {}).get("rows"),
+            }
+        else:
+            raw_baseline_block = {"ok": True, "reason": "verification_disabled_by_caller"}
+
     target = Path(path) if path is not None else authoritative_readiness_path()
     target.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {
-        "schema_version": READINESS_SCHEMA_VERSION,
+        "schema_version": READINESS_SCHEMA_VERSION_DUAL if dual else READINESS_SCHEMA_VERSION,
         "target_trade_date": coerced.isoformat(),
         "daily": {
             "ok": True,
@@ -401,6 +687,11 @@ def write_nightly_readiness(
         "delta_db_path": str(db_path),
         "index_path": str(index_path),
     }
+    if dual:
+        payload["execution_delta"] = execution_validation
+        payload["symbol_membership"] = symbol_membership
+        payload["raw_delta_baseline"] = raw_baseline_block
+        payload["execution_delta_db_path"] = execution_db
     if extra:
         reserved = {
             "schema_version",
@@ -408,8 +699,12 @@ def write_nightly_readiness(
             "daily",
             "index",
             "delta",
+            "execution_delta",
+            "symbol_membership",
+            "raw_delta_baseline",
             "created_at",
             "delta_db_path",
+            "execution_delta_db_path",
             "index_path",
         }
         payload.update({key: value for key, value in extra.items() if key not in reserved})
@@ -453,7 +748,7 @@ def check_nightly_readiness(
         version = int(schema_version)  # type: ignore[arg-type]
     except Exception:
         version = -1
-    if version != READINESS_SCHEMA_VERSION:
+    if version not in SUPPORTED_READINESS_SCHEMA_VERSIONS:
         return ReadinessGate(
             ready=False,
             reason="nightly_data_not_ready",
@@ -464,6 +759,39 @@ def check_nightly_readiness(
     for key in ("daily", "index", "delta"):
         slot = payload.get(key)
         if not isinstance(slot, dict) or not bool(slot.get("ok", False)):
+            return ReadinessGate(
+                ready=False,
+                reason="nightly_data_not_ready",
+                payload=payload,
+                expected_trade_date=str(
+                    expected_trade_date or payload.get("target_trade_date", "")
+                ),
+            )
+    if version >= READINESS_SCHEMA_VERSION_DUAL:
+        # v3 是"双 delta 已启用"的自证：execution 块必须存在且通过。缺块直接不 ready
+        # ——不允许"声明 v3 却按 v2 放行"这种前后不一致的降级。
+        execution = payload.get("execution_delta")
+        if not isinstance(execution, dict) or not bool(execution.get("ok", False)):
+            return ReadinessGate(
+                ready=False,
+                reason="nightly_data_not_ready",
+                payload=payload,
+                expected_trade_date=str(
+                    expected_trade_date or payload.get("target_trade_date", "")
+                ),
+            )
+        membership = payload.get("symbol_membership")
+        if not isinstance(membership, dict) or not bool(membership.get("membership_locked")):
+            return ReadinessGate(
+                ready=False,
+                reason="nightly_data_not_ready",
+                payload=payload,
+                expected_trade_date=str(
+                    expected_trade_date or payload.get("target_trade_date", "")
+                ),
+            )
+        baseline = payload.get("raw_delta_baseline")
+        if not isinstance(baseline, dict) or not bool(baseline.get("ok", False)):
             return ReadinessGate(
                 ready=False,
                 reason="nightly_data_not_ready",

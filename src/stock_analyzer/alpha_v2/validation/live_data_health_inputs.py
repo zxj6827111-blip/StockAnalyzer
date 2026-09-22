@@ -43,6 +43,10 @@ from pathlib import Path
 
 import pandas as pd
 
+from stock_analyzer.alpha_v2.dual_price_series import (
+    FEATURE_PRICE_MODE_ALLOWED,
+    FEATURE_PRICE_SERIES_EVIDENCE_SCHEMA,
+)
 from stock_analyzer.alpha_v2.research.panel import normalize_board
 from stock_analyzer.data.asof_universe import (
     DEFAULT_EXPECTED_ACTIVE_LOOKBACK_DAYS,
@@ -519,9 +523,125 @@ def derive_breadth_evidence(
 
 
 # ---------------------------------------------------------------------------
-# 一步到位：派生全部 S08 输入
+# Live feature 价格口径（P0 Final R1：捕获前的 prerequisite 门）
 # ---------------------------------------------------------------------------
 
+# 轻量认证窗口：与 preflight 的 probe 同一套参数（40 交易日 × ≤300 只），
+# 不为检查口径装载全市场完整窗口。
+FEATURE_PRICE_PROBE_DAYS = 40
+FEATURE_PRICE_PROBE_SYMBOLS = 300
+FEATURE_PRICE_PROBE_WARMUP_DAYS = 60
+
+STATUS_OK = "ok"
+STATUS_MISMATCH = "mismatch"
+STATUS_EXPECTED_MODE_MISSING = "expected_feature_mode_missing"
+STATUS_UNPROVABLE = "unprovable"
+STATUS_UNAVAILABLE = "unavailable"
+
+
+def derive_feature_price_series_input(
+    *,
+    market_db: str | Path,
+    expected_mode: str,
+    as_of: date,
+    probe_days: int = FEATURE_PRICE_PROBE_DAYS,
+    probe_symbols: int = FEATURE_PRICE_PROBE_SYMBOLS,
+    probe_warmup_days: int = FEATURE_PRICE_PROBE_WARMUP_DAYS,
+) -> dict[str, object]:
+    """当天 feature 行情库的价格口径证据（**判据只有一套**）。
+
+    复用 ``preflight.probe_price_series_mode``（轻量 certify）与
+    ``dual_price_series.require_declared_feature_series``（唯一契约判据）——本函数
+    只负责把"抛异常"翻译成"可审计的三态证据"，不另立第二套比较逻辑：
+
+    ```text
+    ok                     expected 可证且与当天实测一致
+    expected_feature_mode_missing  冻结模型没声明 feature 口径（生产 fail closed）
+    mismatch               实测口径 != 冻结口径（train=qfq / live=raw 这类漂移）
+    unprovable             当天库读得出，但口径不可证（unknown / 探针无样本）
+    unavailable            库不可读 / 探针失败（数据未到位、库被锁等）
+    ```
+
+    只读；任何失败都不构造假 payload。
+    """
+    from stock_analyzer.alpha_v2.dual_price_series import (
+        ROLE_FEATURE,
+        PriceSeriesContractError,
+        require_declared_feature_series,
+    )
+    from stock_analyzer.alpha_v2.research.panel import PriceModeCertification
+    from stock_analyzer.alpha_v2.validation.preflight import probe_price_series_mode
+
+    resolved_expected = str(expected_mode or "").strip().lower()
+    evidence: dict[str, object] = {
+        "schema": FEATURE_PRICE_SERIES_EVIDENCE_SCHEMA,
+        "source_db": str(market_db),
+        "expected_mode": resolved_expected,
+        "observed_mode": "",
+        "contract_ok": False,
+        "status": STATUS_UNPROVABLE,
+        "reason": "",
+        "as_of": as_of.isoformat(),
+    }
+    if not resolved_expected:
+        evidence["status"] = STATUS_EXPECTED_MODE_MISSING
+        evidence["reason"] = (
+            "冻结模型未声明 feature 数据身份（provenance.feature_data_identity."
+            "price_series_mode 缺失）——无法证明当天特征与训练同口径"
+        )
+        return evidence
+    try:
+        probe = probe_price_series_mode(
+            Path(str(market_db)),
+            as_of=as_of,
+            days=int(probe_days),
+            symbols=int(probe_symbols),
+            warmup_days=int(probe_warmup_days),
+        )
+    except Exception as exc:  # noqa: BLE001 - 库不可读/探针失败都按"未就绪"处理
+        evidence["status"] = STATUS_UNAVAILABLE
+        evidence["reason"] = f"feature_price_probe_failed:{exc.__class__.__name__}:{exc}"
+        return evidence
+    observed = str(probe.get("price_series_mode", "") or "").strip().lower()
+    certification = PriceModeCertification(
+        mode=observed,
+        source=str(probe.get("certification_source", "") or ""),
+        certified=bool(probe.get("price_series_certified", False)),
+        evidence=dict(probe.get("certification_evidence") or {}),
+    )
+    evidence.update(
+        {
+            "observed_mode": observed,
+            "certification_source": certification.source,
+            "certification_evidence": dict(certification.evidence),
+            "probe_panel": dict(probe.get("panel") or {}),
+        }
+    )
+    try:
+        require_declared_feature_series(
+            certification,
+            context=f"live_feature_price_series(as_of={as_of.isoformat()})",
+            expected_mode=resolved_expected,
+            db=str(market_db),
+        )
+    except PriceSeriesContractError as exc:
+        evidence["status"] = (
+            STATUS_MISMATCH
+            if observed in FEATURE_PRICE_MODE_ALLOWED
+            else STATUS_UNPROVABLE
+        )
+        evidence["reason"] = str(exc)
+        evidence["role"] = ROLE_FEATURE
+        return evidence
+    evidence["contract_ok"] = True
+    evidence["status"] = STATUS_OK
+    evidence["reason"] = ""
+    return evidence
+
+
+# ---------------------------------------------------------------------------
+# 一步到位：派生全部 S08 输入
+# ---------------------------------------------------------------------------
 
 def derive_all_data_health_inputs(
     *,
@@ -590,10 +710,12 @@ __all__ = [
     "BREADTH_EVIDENCE_SCHEMA",
     "DEFAULT_BREADTH_EVIDENCE_RELATIVE",
     "DerivedDataHealthInputs",
+    "FEATURE_PRICE_SERIES_EVIDENCE_SCHEMA",
     "LiveInputError",
     "derive_all_data_health_inputs",
     "derive_alpha_v2_model_identity",
     "derive_breadth_evidence",
+    "derive_feature_price_series_input",
     "derive_feature_snapshot_input",
     "derive_universe_facts",
     "latest_trade_date",

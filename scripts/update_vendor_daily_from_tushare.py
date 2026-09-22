@@ -96,6 +96,15 @@ from stock_analyzer.ops.nightly_readiness import (  # noqa: E402
     write_nightly_readiness,
 )
 
+#: 两个 delta 角色 → 该角色**必须**显式使用的价格口径。生产角色由编排决定，
+#: 绝不由 config/default.yaml 的默认值替它决定"这份库是 qfq 还是 raw"。
+DELTA_ROLE_FEATURE = "feature"
+DELTA_ROLE_EXECUTION = "execution"
+DELTA_ROLE_PRICE_SERIES_MODE = {
+    DELTA_ROLE_FEATURE: "qfq",
+    DELTA_ROLE_EXECUTION: "raw",
+}
+
 EARLIEST_DATE = date(1990, 1, 1)
 DAILY_ARCHIVE_RE = re.compile(r"^(?P<year>\d{4})(?:\((?P<copy>\d+)\))?\.zip$", re.I)
 DAILY_ENTRY_RE = re.compile(r"(?P<code>\d{6})\.(?:SH|SZ|BJ)\.csv$", re.I)
@@ -1454,6 +1463,145 @@ def _latest_index_date(index_path: str | Path) -> date | None:
     return max(latest_dates, default=None)
 
 
+def _load_delta_importer() -> object:
+    """按路径加载同目录的 importer（不依赖 scripts/ 恰好在 sys.path 上）。
+
+    ``python -m`` 方式运行本脚本时 sys.path[0] 是 CWD，裸 import 会
+    ModuleNotFoundError（虽然会被降级，但钩子将永远不生效）。
+    """
+    import importlib.util
+
+    delta_script = Path(__file__).resolve().parent / "import_vendor_zip_to_delta.py"
+    spec = importlib.util.spec_from_file_location("import_vendor_zip_to_delta", delta_script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _raw_baseline_gate(
+    *,
+    raw_delta_path: str,
+    marker_path: str = "",
+) -> dict[str, object]:
+    """生产增量前校验"这份 RAW 库是一份经过覆盖认证的基线"。
+
+    为什么必须在**导入之前**：``import_vendor_zip_to_delta.py --incremental`` 对目标库里
+    还没有基线的 symbol 会走 ``full_import_symbols`` 并用 ``--limit-days`` 补导。空路径上
+    的第一次生产运行因此会"成功"造出一份只有默认浅深度的 raw 基线——它看起来是 raw，
+    却覆盖不到候选模型要求的 source window。这里 fail closed，绝不用增量偷偷初始化。
+    """
+    try:
+        from stock_analyzer.ops.raw_delta_baseline import (
+            RawDeltaBaselineError,
+            verify_bootstrap_marker,
+        )
+    except Exception as exc:  # pragma: no cover - 只会在安装损坏时触发
+        return {
+            "ok": False,
+            "reason": "raw_delta_baseline_guard_unavailable",
+            "error": f"{type(exc).__name__}:{exc}",
+        }
+    try:
+        marker = verify_bootstrap_marker(
+            raw_db_path=raw_delta_path,
+            marker_path=marker_path or None,
+        )
+    except RawDeltaBaselineError as exc:
+        return {"ok": False, "reason": exc.reason, "error": str(exc)}
+    except Exception as exc:
+        return {
+            "ok": False,
+            "reason": "raw_delta_baseline_missing",
+            "error": f"{type(exc).__name__}:{exc}",
+        }
+    return {
+        "ok": True,
+        "reason": "ok",
+        "schema": str(marker.get("schema", "")),
+        "coverage_status": str(marker.get("coverage_status", "")),
+        "price_series_mode": str(marker.get("price_series_mode", "")),
+        "required_source_window": marker.get("required_source_window", {}),
+        "symbols_expected": marker.get("symbols_expected"),
+        "symbols_covered": marker.get("symbols_covered"),
+    }
+
+
+def _sync_vendor_delta_role(
+    *,
+    role: str,
+    delta_db_path: str,
+    index_path: str,
+    vendor_root: Path,
+    importer: object,
+) -> dict[str, object]:
+    """以一个**显式价格口径角色**跑一次 delta 增量导入。
+
+    返回的是**历史形状**的结果字典（``updated`` / ``exit_code`` / ``reason`` /
+    ``import_report``），与旧单角色实现逐键一致——``delta_sync`` 字段的既有消费者
+    按原样继续工作。角色元数据（role / price_series_mode / db）由调用方包一层
+    ``feature_delta_sync`` / ``execution_delta_sync`` 表达。
+
+    两个角色走同一条代码路径，唯一差别就是 ``--price-series-mode``；把角色与口径写死
+    成一张表（:data:`DELTA_ROLE_PRICE_SERIES_MODE`），就不会出现"某天 raw 目标被
+    config 默认值悄悄喂成 qfq"这种口径漂移。
+    """
+    price_series_mode = DELTA_ROLE_PRICE_SERIES_MODE[role]
+    result: dict[str, object] = {"updated": False}
+    try:
+        import contextlib
+        import io
+
+        # import 脚本的 JSON 报告走自己的 stdout：不重定向会污染本脚本的
+        # summary 输出（下游解析会失败），把它收进角色报告。
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            sync_rc = importer._main(  # noqa: SLF001
+                [
+                    "--data-root",
+                    str(vendor_root),
+                    "--index-path",
+                    index_path,
+                    "--delta-db-path",
+                    delta_db_path,
+                    "--incremental",
+                    # 显式口径：角色来自编排，不来自 config 默认值。
+                    "--price-series-mode",
+                    price_series_mode,
+                ]
+            )
+        result["updated"] = sync_rc == 0
+        result["exit_code"] = sync_rc
+        if sync_rc != 0:
+            result["reason"] = "nonzero_exit"
+        output = captured.getvalue().strip()
+        if output:
+            try:
+                result["import_report"] = json.loads(output)
+            except json.JSONDecodeError:
+                result["import_output"] = output
+    except Exception as exc:
+        result["updated"] = False
+        result["exit_code"] = 1
+        result["reason"] = f"{type(exc).__name__}:{exc}"
+    return result
+
+
+def _delta_role_report(
+    *,
+    role: str,
+    delta_db_path: str,
+    result: dict[str, object],
+) -> dict[str, object]:
+    """给角色结果加上"我是谁、我该是什么口径、我写的是哪个库"的自述。"""
+    return {
+        "role": role,
+        "price_series_mode": DELTA_ROLE_PRICE_SERIES_MODE[role],
+        "db": str(delta_db_path),
+        **result,
+    }
+
+
 def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1552,7 +1700,17 @@ def _main(argv: list[str] | None = None) -> int:
         default="",
         help="Delta DuckDB path to incrementally sync after a successful run "
         "(import_vendor_zip_to_delta.py --incremental); requires --index-path. "
-        "Example: /app/artifacts/vendor_delta/market_delta.duckdb",
+        "Role: feature/qfq. Example: /app/artifacts/vendor_delta/market_delta.duckdb",
+    )
+    parser.add_argument(
+        "--sync-vendor-delta-raw",
+        default="",
+        help="Second delta DuckDB path for the Alpha V2 execution role (raw prices), "
+        "synced in the SAME transaction as --sync-vendor-delta. Requires --index-path "
+        "and --sync-vendor-delta. The target must already be a certified RAW baseline "
+        "(raw_delta_bootstrap.json next to it); this flag never bootstraps one, and a "
+        "missing/invalid baseline fails the whole run closed. "
+        "Example: /app/artifacts/vendor_delta_raw/market_delta_raw.duckdb",
     )
     parser.add_argument(
         "--require-readiness",
@@ -1560,6 +1718,12 @@ def _main(argv: list[str] | None = None) -> int:
         help="Production mode: the run may only exit 0 when nightly "
         "readiness is actually published. Requires --index-path and "
         "--sync-vendor-delta; missing either exits 2.",
+    )
+    parser.add_argument(
+        "--raw-baseline-marker",
+        default="",
+        help="Override the RAW bootstrap marker path (default: raw_delta_bootstrap.json "
+        "next to --sync-vendor-delta-raw, or SA__ALPHA_V2__RAW_DELTA_BOOTSTRAP_MARKER).",
     )
     # Legacy intraday summary args: kept for backwards-compat with old
     # stock_updater.sh / crontab invocations that still pass them.  They
@@ -1584,6 +1748,18 @@ def _main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.sync_vendor_delta.strip() and not args.index_path.strip():
         print("--sync-vendor-delta requires --index-path", file=sys.stderr)
+        return 2
+    if args.sync_vendor_delta_raw.strip() and not args.index_path.strip():
+        print("--sync-vendor-delta-raw requires --index-path", file=sys.stderr)
+        return 2
+    # 第二份 delta 是"同一事务里的第二个角色"，不是独立任务：没有 feature 角色就没有
+    # 可以锁步的对照，v3 readiness 也不成立。缺它就退出 2，而不是让它单独跑。
+    if args.sync_vendor_delta_raw.strip() and not args.sync_vendor_delta.strip():
+        print(
+            "--sync-vendor-delta-raw requires --sync-vendor-delta "
+            "(the raw role is the second half of one nightly transaction)",
+            file=sys.stderr,
+        )
         return 2
     if args.require_readiness and (
         not args.index_path.strip() or not args.sync_vendor_delta.strip()
@@ -1867,15 +2043,24 @@ def _main(argv: list[str] | None = None) -> int:
                 rebuild_latest_dates=rebuild_latest_dates,
             )
 
-    # Delta baseline incremental sync: after the ZIPs and the last-date index
-    # are updated, mirror the new rows into the delta DuckDB so the Week5
-    # batch keeps reading the fast DuckDB path.
-    # NOTE: batch mode has no per-symbol ok_results; gate on failures instead.
+    # ---------------------------------------------------------------------
+    # Delta 增量同步（release atomicity）：feature/qfq 与 execution/raw 在**同一
+    # 事务**里推进。两份库是不同的文件，因而不共享数据库事务；"原子"指的是
+    # readiness 的发布条件——任一角色失败就整晚不放行，第二次重试幂等收敛。
+    # 顺序固定为 feature → execution：execution 的基线门要在真正动手前就能否掉
+    # 整晚，把它放在后面可以让"feature 已成功"这件事在可观测性上如实保留下来。
+    # ---------------------------------------------------------------------
     delta_should_sync = bool(batch_payload is not None and batch_ok and not failures)
     if not delta_should_sync:
         delta_should_sync = bool(ok_results)
     delta_requested = bool(
         not args.dry_run and args.sync_vendor_delta.strip() and args.index_path.strip()
+    )
+    raw_delta_requested = bool(
+        not args.dry_run
+        and args.sync_vendor_delta_raw.strip()
+        and args.sync_vendor_delta.strip()
+        and args.index_path.strip()
     )
     # Resolve index success before delta import.  Importing with a stale or
     # failed index would silently copy the wrong incremental window.
@@ -1887,63 +2072,97 @@ def _main(argv: list[str] | None = None) -> int:
     )
     index_should_update = bool(not args.dry_run and args.index_path.strip() and delta_should_sync)
     index_ok = not index_should_update or bool(_effective_index_report.get("updated", False))
+    # 两个 delta 角色只要**索引进度可信**就要跑，不以"本次 ZIP 有没有新行"为条件。
+    # 理由是 §20 的重试语义：第一晚 raw 失败、第二晚 ZIP 已经追平，"没有新行"并不等于
+    # "没有事要做"——落后的那个角色必须能在这条路径上收敛。无事可做时 importer 自己
+    # 是廉价的空转（逐符号日期比较后直接跳过），代价远小于"落后的库永远追不上"。
+    feature_role_required = bool(delta_requested and index_ok)
+    execution_role_required = bool(raw_delta_requested and index_ok)
 
+    # ``delta_sync`` 保持历史形状（旧消费者按契约读它）；角色自述走新键。
     delta_sync_report: dict[str, object] = {"updated": False, "reason": "not_enabled"}
-    if delta_requested and delta_should_sync and not index_ok:
+    feature_delta_report: dict[str, object] = _delta_role_report(
+        role=DELTA_ROLE_FEATURE,
+        delta_db_path=args.sync_vendor_delta,
+        result=delta_sync_report,
+    )
+    execution_delta_report: dict[str, object] = _delta_role_report(
+        role=DELTA_ROLE_EXECUTION,
+        delta_db_path=args.sync_vendor_delta_raw,
+        result={"updated": False, "reason": "not_enabled"},
+    )
+    raw_baseline_report: dict[str, object] = {"ok": False, "reason": "not_enabled"}
+    if delta_requested and not index_ok:
         delta_sync_report = {"updated": False, "reason": "index_update_failed"}
-    elif delta_requested and delta_should_sync:
-        try:
-            # 显式按路径加载同目录脚本，不依赖 sys.path 恰好包含 scripts/：
-            # ``python -m`` 方式运行本脚本时 sys.path[0] 是 CWD，裸 import
-            # 会 ModuleNotFoundError（虽然被降级，但钩子将永远不生效）。
-            import contextlib
-            import importlib.util
-            import io
-
-            _delta_script = Path(__file__).resolve().parent / "import_vendor_zip_to_delta.py"
-            _spec = importlib.util.spec_from_file_location(
-                "import_vendor_zip_to_delta", _delta_script
+        feature_delta_report = _delta_role_report(
+            role=DELTA_ROLE_FEATURE,
+            delta_db_path=args.sync_vendor_delta,
+            result=delta_sync_report,
+        )
+    elif feature_role_required:
+        importer = _load_delta_importer()
+        delta_sync_report = _sync_vendor_delta_role(
+            role=DELTA_ROLE_FEATURE,
+            delta_db_path=args.sync_vendor_delta,
+            index_path=args.index_path,
+            vendor_root=vendor_root,
+            importer=importer,
+        )
+        feature_delta_report = _delta_role_report(
+            role=DELTA_ROLE_FEATURE,
+            delta_db_path=args.sync_vendor_delta,
+            result=delta_sync_report,
+        )
+        if execution_role_required:
+            # 基线门先于导入：未经覆盖认证的 RAW 库一律 fail closed，绝不让
+            # --incremental 用默认 --limit-days 偷偷初始化一份"半基线"。
+            raw_baseline_report = _raw_baseline_gate(
+                raw_delta_path=args.sync_vendor_delta_raw,
+                marker_path=args.raw_baseline_marker,
             )
-            assert _spec is not None and _spec.loader is not None
-            _delta_module = importlib.util.module_from_spec(_spec)
-            _spec.loader.exec_module(_delta_module)
-
-            # import 脚本的 JSON 报告走自己的 stdout：不重定向会污染本脚本
-            # 的 summary 输出（下游解析会失败），把它收进 delta_sync 报告。
-            _captured = io.StringIO()
-            with contextlib.redirect_stdout(_captured):
-                sync_rc = _delta_module._main(  # noqa: SLF001
-                    [
-                        "--data-root",
-                        str(vendor_root),
-                        "--index-path",
-                        args.index_path,
-                        "--delta-db-path",
-                        args.sync_vendor_delta,
-                        "--incremental",
-                    ]
+            if not raw_baseline_report.get("ok", False):
+                execution_delta_report = _delta_role_report(
+                    role=DELTA_ROLE_EXECUTION,
+                    delta_db_path=args.sync_vendor_delta_raw,
+                    result={
+                        "updated": False,
+                        "exit_code": 1,
+                        "reason": str(
+                            raw_baseline_report.get("reason", "raw_delta_baseline_missing")
+                        ),
+                        "baseline_gate": raw_baseline_report,
+                    },
                 )
-            delta_sync_report = {"updated": sync_rc == 0, "exit_code": sync_rc}
-            if sync_rc != 0:
-                delta_sync_report["reason"] = "nonzero_exit"
-            _delta_output = _captured.getvalue().strip()
-            if _delta_output:
-                try:
-                    delta_sync_report["import_report"] = json.loads(_delta_output)
-                except json.JSONDecodeError:
-                    delta_sync_report["import_output"] = _delta_output
-        except Exception as exc:
-            delta_sync_report = {
-                "updated": False,
-                "reason": f"{type(exc).__name__}:{exc}",
-            }
+            else:
+                execution_delta_report = _delta_role_report(
+                    role=DELTA_ROLE_EXECUTION,
+                    delta_db_path=args.sync_vendor_delta_raw,
+                    result=_sync_vendor_delta_role(
+                        role=DELTA_ROLE_EXECUTION,
+                        delta_db_path=args.sync_vendor_delta_raw,
+                        index_path=args.index_path,
+                        vendor_root=vendor_root,
+                        importer=importer,
+                    ),
+                )
+                execution_delta_report["baseline_gate"] = raw_baseline_report
 
-    delta_exit_code = int(delta_sync_report.get("exit_code", 1))
-    delta_ok = not (delta_requested and delta_should_sync) or bool(
-        delta_sync_report.get("updated", False) and delta_exit_code == 0
+    feature_delta_exit_code = int(feature_delta_report.get("exit_code", 1))
+    feature_delta_ok = not feature_role_required or bool(
+        feature_delta_report.get("updated", False) and feature_delta_exit_code == 0
+    )
+    execution_delta_exit_code = int(execution_delta_report.get("exit_code", 1))
+    execution_delta_ok = not execution_role_required or bool(
+        execution_delta_report.get("updated", False) and execution_delta_exit_code == 0
     )
     batch_execution_ok = batch_payload is None or batch_ok
-    full_run_ok = bool(not failures and batch_execution_ok and index_ok and delta_ok)
+    full_run_ok = bool(
+        not failures
+        and batch_execution_ok
+        and index_ok
+        and feature_delta_ok
+        and execution_delta_ok
+    )
     readiness_written = False
     readiness_error = ""
     readiness_requested = bool(args.index_path.strip() and args.sync_vendor_delta.strip())
@@ -1966,6 +2185,10 @@ def _main(argv: list[str] | None = None) -> int:
                 target_trade_date=readiness_target_date,
                 db_path=args.sync_vendor_delta,
                 index_path=args.index_path,
+                # 给了 raw 目标就写 v3：readiness 自己开两份库核对最新交易日、
+                # 目标日成员锁步、行内口径与 RAW 基线身份，不看上面的自述字段。
+                execution_db_path=args.sync_vendor_delta_raw.strip() or None,
+                raw_baseline_marker_path=args.raw_baseline_marker.strip() or None,
                 extra={
                     "source": "batch_update" if batch_payload is not None else "per_symbol_update"
                 },
@@ -2011,6 +2234,11 @@ def _main(argv: list[str] | None = None) -> int:
         if batch_payload is None
         else list(batch_payload.get("zip_rebuilds", []) or []),  # type: ignore[arg-type]
         "index": index_report,
+        # 两个 delta 角色分别自述（口径 / 库 / 退出码 / importer 报告）。旧字段
+        # ``delta_sync`` 保留为 feature 角色的别名，既有消费者不受影响。
+        "feature_delta_sync": feature_delta_report,
+        "execution_delta_sync": execution_delta_report,
+        "raw_delta_baseline": raw_baseline_report,
         "delta_sync": delta_sync_report,
         "readiness": {
             "required": require_readiness,
@@ -2021,6 +2249,7 @@ def _main(argv: list[str] | None = None) -> int:
             "error": readiness_error,
         },
         "mode": "batch" if batch_payload is not None else "per_symbol",
+        "dual_delta_enabled": raw_delta_requested,
     }
     # Back-compat: also spread batch_payload keys for callers parsing symbols_fetched etc.
     if batch_payload is not None:

@@ -1913,3 +1913,287 @@ R4.1.1                         = 未提交的工作区增量（本批 5 文件�
 NAS_BUILD_PREFLIGHT            = 未开始（本批合入后按 R4 计划执行）
 ```
 
+
+---
+
+# 19. P0 双价格序列契约（2026-09-21，hotfix 分支，待外部复核）
+
+> 只追加，不重写上文。本章对应 `docs/alpha_v2/P0_Dual_Price_Series_Contract.md`。
+
+## 19.1 问题
+
+Alpha V2 的冻结 / 成熟链路此前只有一个 `--market-db`，而生产 NAS 的正式库是
+`vendor_delta/market_delta.duckdb`（`price_series_mode=qfq`）——于是**同一份 qfq 序列
+同时喂给了特征、label、成交价、MAE/MFE 与全部基准**；`shadow_model_freeze.py` 在
+`price_mode_certified=false` 时只打 warning 不 fail。训练目标因此建立在复权价之上。
+
+## 19.2 实现（工程层）
+
+```text
+新增  src/stock_analyzer/alpha_v2/dual_price_series.py        契约 + 守卫 + 两条数据身份 + 库解析
+新增  src/stock_analyzer/alpha_v2/validation/dual_price_freeze.py  双源训练帧构造（守卫先于重活）
+新增  tests/test_alpha_v2_dual_price_series.py                DP-1..DP-10 + 端到端 gate 绑定
+新增  docs/alpha_v2/P0_Dual_Price_Series_Contract.md          契约 / 落点 / RAW delta 设计
+改    scripts/alpha_v2_shadow_model_freeze.py                 双库参数 + 两条指纹 + v3 provenance
+改    scripts/alpha_v2_shadow_mature.py                       双库参数 + 每日重新 certify
+改    scripts/alpha_v2_production_preflight.py                双库参数
+改    src/.../validation/{preflight,outcome_maturation,validation_kpis,frozen_model}.py
+改    src/.../runtime/services/live_shadow_cycle_service.py    capture 不变；mature 两库分开
+```
+
+关键语义：
+
+- execution 面板必须 `price_mode == raw` 且 `certified == true`，否则 FAIL CLOSED
+  （freeze exit 4 / mature exit 4 且 0 行 outcome / KPI 该日不 clean / preflight BLOCKED）；
+- 工件哈希升 **v3**（两条数据身份 + `validation_mode` 进受保护集合）；v1/v2 仍可加载，
+  生产只接受 v3；
+- `--market-db` 在 freeze / mature 上降级为**仅 `--rehearsal` 可用**的旧参数；
+- `build_label_v2` 默认严格；研究回放需显式 `enforce_execution_price_series=False` +
+  `research_replay_reason`（生产两个入口由结构测试钉住"无此开关"）。
+
+## 19.3 测试与门禁
+
+```text
+定向  tests/test_alpha_v2_dual_price_series.py                 16 passed（DP-1..DP-10 + gate 端到端绑定）
+      alpha_v2 相关套件（-k "alpha_v2 or price_contract"）      全绿
+质量门 clean-scope（ruff + mypy blocking）                      PASS
+```
+
+## 19.4 状态边界
+
+```text
+P0_DUAL_PRICE_ENGINEERING_STATUS = PASS（工程层，见 PR 报告）
+PR                               = READY FOR EXTERNAL REVIEW（未 merge）
+NAS                              = 未操作（未建 raw delta、未部署、未开 epoch）
+PRODUCTION_PROMOTION             = LOCKED（不变）
+Legacy / Week5 / 生产漏斗 / Cross Review / 阈值 = 未改动
+```
+
+> 数据侧动作（建 `/app/artifacts/vendor_delta_raw/market_delta_raw.duckdb`、接通日更、
+> 重训与 preflight）**待用户授权**，步骤见 `P0_Dual_Price_Series_Contract.md` §6.4。
+
+---
+
+# 20. P0 Final Live Runtime Hardening R1（2026-09-22，PR #86 追加，待最终复核）
+
+> 只追加，不重写上文。承接第 19 章：本轮关闭外部最终复核提出的 **两个 Live Runtime
+> 漏接线**，并把 RAW baseline 的深度口径与测试计数证据一并修正。
+
+## 20.1 两个 blocker
+
+上下文：第 19 章把"训练 / execution / preflight"三处口径固化了，但**运行期**没有复核：
+冻结模型声明了 `feature_data_identity.price_series_mode=qfq`，而 capture 加载面板后直接
+`pit_universe → 特征 → 预测 → 写盘`，从未验证当天 feature 面板仍是 qfq；且 mature 的
+style 面板在不可用时**静默退回 execution 面板**。
+
+```text
+BLOCKER 1  Live Capture 没有冻结 Feature Price Mode
+BLOCKER 2  口径漂移只会在 capture 内以 exit 11 出现 → 调度器一路 step_failed，
+           到 23:55 也不会走 "prerequisites unavailable → record missing day"
+BLOCKER 3  Mature 的 feature/style 面板没有与冻结 feature mode 比对
+BLOCKER 4  Production Mature 允许退回 execution 面板算 style（改变基准语义）
+```
+
+## 20.2 实现落点
+
+| 落点 | 行为 |
+| --- | --- |
+| `scripts/alpha_v2_shadow_capture.py` | 从**模型工件**取 expected feature mode（production/test 缺失即 exit 11）；面板加载后、`pit_universe`/特征/预测/写盘**之前** `certify_price_mode()` + `require_declared_feature_series(expected_mode=...)`；日清单新增 `feature_price_series` 证据块 |
+| `live_shadow_cycle_service._ensure_feature_price_series` | 捕获**前**前置门：`derive_feature_price_series_input()`（复用 preflight 轻量 probe `40d × ≤300 只` + 统一守卫）；窗口内 → `alpha_v2_waiting:feature_price_mode_mismatch`；到 deadline → `recorded_missing:feature_price_mode_mismatch` + 继续推进历史尾部 |
+| `live_shadow_cycle_service` capture argv | `--market-db` 改用 `feature_market_db_path()`（`alpha_v2.feature_market_db`，空则回退 `market_warehouse.db_path`） |
+| `scripts/alpha_v2_shadow_mature.py` | expected feature mode 取 `freeze.model.provenance.feature_data_identity.price_series_mode`（**不读 config 猜**）；面板缺失/不可读/口径漂移在 production/test 一律 exit 11、0 行 outcome |
+| `outcome_maturation.mature_epoch_outcomes` | 新增 `validation_mode`（默认 `production` = fail-closed 默认）；strict + `style_panel=None` → 抛 `OutcomeMaturationError`；rehearsal 允许带标注降级 `style_features_source=execution_panel_fallback_rehearsal` |
+| `dual_price_series` | 新增 `feature_mode_of_frozen_model` / `feature_mode_of_freeze_manifest` / `is_live_strict_mode` / `LIVE_STRICT_VALIDATION_MODES` / `FEATURE_PRICE_SERIES_EVIDENCE_SCHEMA` |
+
+**一处有意偏离提示词**：提示词写"rehearsal/test 可保留带标注 fallback"，本实现把严格集合
+取为 `{production, test}`，只有 `rehearsal` 允许降级。理由：`test` 在本仓库是 **clean-OOS
+合格模式**（`clean_oos_row_eligible` / `_day_governance` 都认它，它只为确定性时钟存在），
+放它降级会产生"clean 证据 + 变了语义的 style 基准"。这比要求更严，且已由 LIVE-M4 钉住。
+
+## 20.3 文档与证据修正
+
+- **RAW baseline 改为 coverage-driven**：删除 `--limit-days 400` 作为生产推荐（它只是
+  Week5 常规 lookback 的示例，`--limit-days` 是 per-symbol **行数**、不是自然日）；
+  新增 §6.1.1 覆盖判据：按 `source_window = 决策窗起点 - warmup 自然日`
+  （candidate model 为 `2024-11-14 .. 2026-08-31`）计算所需深度，导入后必须验证
+  required symbols 覆盖 / `min(date) <= source_window_start` / 行覆盖，并归档
+  `source_window coverage PASS` 证据；不以任何固定整数为准。
+- **测试计数纠正**：第 19 章 PR 正文里的 "full = 3705 collected" 是**错的**（由日志里
+  数进度点得到，把 warnings/durations 里的点也算进去了）。同环境同命令实测：
+
+  ```text
+  BASE 47571c1 : tests/ 裸收集 3806（与 #85 报告的 3806 同量级）
+                 full stage 选择（--ignore 12 个慢测文件）3683
+  HEAD f5b4dc3 : tests/ 裸收集 3836
+                 full stage 选择 3713
+  DELTA        : +30（纯新增，未删任何测试文件/测试函数）
+  ```
+
+  逐文件差异：新增 `tests/test_alpha_v2_dual_price_series.py`（+26）、
+  `test_alpha_v2_m4l_cycle_clean_day_e2e.py` 8→10（LIVE-F5/F6）、
+  `test_alpha_v2_s11_outcomes.py` 34→36（拆出 fail-closed 与 research opt-out 两例）。
+  `git diff 47571c1..HEAD -- tests/` 中 `-def test_` 与删除文件均为空。
+
+## 20.4 夹具审计（应答"是否给旧 outcome 补 raw/certified 把测试强行变绿"）
+
+做法：对 6 处被 P0 改动过的夹具做**反向变异**（改回缺失/不认证/口径漂移），要求用例
+失败；变异后恢复文件、基线复跑通过。
+
+```text
+M1 test_alpha_v2_m3_validation_kpis.py      certified True→False      mutated=FAIL baseline=PASS
+M2 test_alpha_v2_m3_enforcement.py          certified True→False      mutated=FAIL baseline=PASS
+M3 test_alpha_v2_m3_outcome_maturation.py   price_mode_certified→False mutated=FAIL baseline=PASS
+M4 test_alpha_v2_m3_r3_final_blockers.py    certified True→False      mutated=FAIL baseline=PASS
+M5 clean_day e2e 模型块 feature 身份删掉                                mutated=FAIL baseline=PASS
+M6 clean_day e2e 模型块 feature 身份 qfq→raw                            mutated=FAIL baseline=PASS
+```
+
+结论：新加的 `price_mode/price_mode_certified` 与 `feature_data_identity` 都是**承重**字段
+（缺了/变了用例就红），不是"为了变绿而补的装饰"；negative case（qfq / uncertified /
+missing / 漂移）在 LIVE-F3、LIVE-F6、LIVE-M2/M3/M4、DP-3/DP-7 里各自永久保留。
+
+## 20.5 本轮验证（本地实测）
+
+```text
+dual-price 定向       26 tests / 0 failed / 0 error / 0 skipped   (junit live_r1_dual_price.xml)
+alpha_v2 选择         682 tests / 0 failed / 0 error / 0 skipped  (-k "alpha_v2 or price_contract")
+clean-scope 质量门    ruff + mypy blocking rc=0，blocking_failures=[]
+tests/ 裸跑           3836 tests / 0 failed / 0 error / 2 skipped  (junit live_r1_bare_tests.xml)
+                      （2 skipped = test_nas_*_script 的 Windows bash 语法用例，非本轮引入）
+full stage 选择       3713 collected；pytest rc=0；coverage 80.88%（下限 75%）；
+                      blocking_failures=[]
+GitHub CI            本轮提交的结果见 PR #86 的 checks（同一 commit）。
+```
+
+## 20.6 状态边界
+
+```text
+P0_LIVE_RUNTIME_BLOCKERS = 0（本轮的 4 项全部关闭并有专项用例）
+PR #86                   = 未 merge（等最终复核）
+NAS                      = 未操作（未建 raw delta、未部署、未开 epoch）
+ALPHA_V2_EPOCH_001       = NOT_STARTED
+LIVE_CLEAN_OOS_DAYS      = 0
+ALPHA_VERIFIED           = FALSE
+PRODUCTION_PROMOTION     = LOCKED
+Legacy / Week5 / 生产漏斗 / Alpha final selection / 阈值 = 未改动
+```
+
+
+---
+
+# 21. P1 — RAW Execution Delta 生产接线（2026-09-22，独立 PR，未部署）
+
+## 21.1 目标与边界
+
+把 Alpha V2 所需的 **RAW execution 行情库**正式接进现有 NAS 夜间统一数据事务：每天的
+QFQ feature delta 与 RAW execution delta 从同一批 ZIP/index 推进，并且**只有两者都完整、
+同日、口径正确时** nightly readiness 才允许发布。
+
+```text
+不做：Alpha tuning / 特征 / label / 训练窗口 / 模型冻结 / epoch / Production Promotion
+不改：Legacy 选股 / Week5 选择语义 / 生产漏斗 / 交叉复核 / 任何阈值
+未做：NAS 部署、真实 RAW 基线构建（合入 ≠ 上线，见 §21.6）
+```
+
+## 21.2 落地内容
+
+| # | 落点 | 内容 |
+| --- | --- | --- |
+| 1 | `update_vendor_daily_from_tushare.py` | 新增 `--sync-vendor-delta-raw`；两个角色走同一条路径，口径由编排写死（`feature→qfq` / `execution→raw`），不再依赖 `config/default.yaml` 默认值 |
+| 2 | 同上 | 导入前先验 RAW 基线身份（`_raw_baseline_gate`），不通过则 `raw_delta_baseline_missing` 等四类原因码 fail closed，**绝不用 `--incremental` 偷偷初始化** |
+| 3 | 同上 | summary 拆角色：`feature_delta_sync` / `execution_delta_sync` / `raw_delta_baseline`；`delta_sync` 保持历史形状不动；`full_run_ok` 含两个角色 |
+| 4 | `import_vendor_zip_to_delta.py` | RAW 口径下因子漂移重写通道**显式关闭**并上报 `factor_drift_detection=disabled_non_qfq_mode`；非 qfq 若产出 drift symbol 直接抛错 |
+| 5 | `src/stock_analyzer/ops/raw_delta_baseline.py`（新） | bootstrap marker 身份模型 + 符号集合摘要 + 库事实实测（单调不变量，无阈值） |
+| 6 | `scripts/alpha_v2_raw_delta_coverage.py`（新） | 只读覆盖校验器（8.1 DB / 8.2 口径 / 8.3 窗口 / 8.4 符号 / 8.5 行）+ `--write-marker` / `--verify-marker` |
+| 7 | `src/stock_analyzer/ops/nightly_readiness.py` | schema v3：新增 `execution_delta` / `symbol_membership` / `raw_delta_baseline`；v2 语义不变；`check_nightly_readiness` 接受 v2+v3，v3 缺 execution 块即不 ready |
+| 8 | `scripts/nas_stock_updater.sh` | 同一次调用传两个 delta 目标；verify 段在双 delta 模式下额外要求 execution 角色 updated |
+
+## 21.3 三个判据上的关键选择
+
+**(a) 覆盖判据不用整数、也不引入交易日历。** `--limit-days` 是每 symbol 的行数，
+"400 比 240 大"不是覆盖证明。行覆盖用 `(symbol,date)` 逐对比较（引擎内 `EXCEPT`）：
+
+```text
+feature 有、raw 没有  → 数据缺口（BLOCKED）
+两边都没有            → 停牌 / 未上市（正常）
+raw 有、feature 没有  → 正常：qfq 侧因子缺失会被跳过，raw 不需要因子
+```
+
+**(b) v3 成员锁步是包含链 `index_expected ⊆ feature ⊆ execution`，不是三方全等。**
+raw 侧不依赖复权因子，因因子缺失被 qfq 侧跳过的 symbol 在 raw 侧天然存在；要求全等会把
+这条**正常**路径判成故障、每晚误杀。包含链同时封住了旧口径的漏洞：旧判据只比
+`symbols_on_target_date` 的**计数**，`{A,B}` 与 `{A,C}` 计数相同、成员不同会被静默放行。
+
+**(c) 基线身份用内容事实 + 单调不变量，不用整库 SHA256。** 库每晚都在长，对数百 MB 的
+DuckDB 每晚重算全文件摘要纯属开销。marker 里的取证快照（行数 / 日期区间 / 符号摘要）如实
+记录建基线当刻状态但**不参与每日校验**；每日只看不变量：`daily_bars` 在、行数与符号数
+**不少于**建基线记录值、当前行内口径仍是 raw。
+
+## 21.4 施工中发现并修掉的两个真实缺陷
+
+都不是"测试写错了"，是实现本身在正常运维场景下会误伤：
+
+1. **无事可做的夜晚会被自己判成败。** 无新增行可推进时 execution 角色被记为
+   `not_enabled`，而 `execution_delta_ok` 只按"是否请求"判定 → 整晚不放行。假期、
+   重跑、以及任何 ZIP 已追平的夜晚都会中招。
+2. **重试无法收敛。** 第一晚 raw 失败、第二晚 ZIP 已追平 → `delta_should_sync` 为假 →
+   落后的 raw 角色被整个跳过，永远追不上。修法：两个角色只要**索引进度可信**就跑
+   （无事可做时 importer 本身是廉价空转），`index_should_update` 仍只看"本次是否真的
+   抓到新行"以保持既有行为。
+
+两条都由 `test_retry_after_execution_failure_converges_without_duplicates` 与
+`test_tx1_both_roles_ok_writes_v3_readiness` 钉住。
+
+## 21.5 本轮验证（本地实测 + CI）
+
+```text
+分支 / HEAD            feat/alpha-v2-raw-execution-delta @ deb08c5
+PR                     #87（base=main；#86 合并后 diff 收敛为 P1 自身 7 文件）
+
+定向（spec §26 指定三文件） 58 passed / 1 skipped
+  tests/test_update_vendor_daily_from_tushare.py
+  tests/test_nightly_readiness_authoritative.py
+  tests/test_nas_stock_updater_script.py
+关键字选择（-k "vendor_delta or nightly_readiness or alpha_v2"）
+                      707 passed / 3177 deselected
+
+新增用例（48）        test_raw_delta_baseline_identity.py      22
+                     test_alpha_v2_raw_execution_delta_wiring.py 24
+                     test_nas_stock_updater_script.py          +2
+
+tests/ 裸跑（干净串行） 3884 collected / 0 failed / 0 error / 2 skipped / exit 0
+                     基线（P0 head 725e943）= 3836 → 3836 + 48 = 3884，数字自洽
+                     2 skipped = test_nas_*_script 的 Windows bash 语法用例（既有）
+
+clean-scope 质量门     ruff + mypy blocking rc=0，blocking_failures=[]
+full 质量门            pytest rc=0；coverage 80.87%（下限 75%）；blocking_failures=[]
+GitHub CI              PR #87 两个 quality job 均 pass（headSha=deb08c5）
+
+一次并发踩坑           同时跑两份全量时 test_alpha_v2_m4l_cycle_clean_day_e2e.py::
+                     test_dh7_degraded_first_then_healthy_recovers 因 600s 子进程
+                     超时失败；该文件单独跑 10/10 全过，串行重跑全量 0 failed。
+                     结论：并发负载所致的超时，非代码缺陷——但"全量测试必须串行跑"
+                     这条要记住。
+```
+
+## 21.6 状态边界
+
+```text
+P0_DUAL_PRICE_CONTAINED  = 代码层生效（分支基于 PR #86 的 HEAD 725e943）
+PR #86                   = 仍未 merge（本阶段被明确禁止执行 merge；已核实与 P1 无文件重叠）
+P1 PR                    = #87（base=main；#86 合并后 diff 自动收敛为 P1 自身 7 文件）
+
+RAW_DELTA_PIPELINE_ENGINEERING_STATUS = PASS
+RAW_DELTA_NAS_CUTOVER_READY           = READY_FOR_BASELINE_BOOTSTRAP
+
+RAW_PRODUCTION_BASELINE  = NOT_CREATED（NAS 未操作）
+ALPHA_V2_EPOCH_001       = NOT_STARTED
+LIVE_CLEAN_OOS_DAYS      = 0
+ALPHA_VERIFIED           = FALSE
+PRODUCTION_PROMOTION     = LOCKED
+```
+
+**合入 ≠ 上线**：`nas_stock_updater.sh` 已经是 dual delta，但 NAS 上直接跑会整晚 fail
+closed（`raw_delta_baseline_missing`）——这是设计行为。上线顺序（先建基线 → 覆盖 PASS →
+再切受管 updater）与回滚路径见
+`docs/alpha_v2/RAW_Execution_Delta_Production_Wiring.md` §6/§7。

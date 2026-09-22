@@ -80,7 +80,8 @@ CALENDAR = _trading_days_ending(TODAY, 90)
 
 
 def _write_market_db(path: Path, *, symbols: list[str], last_day: date = TODAY,
-                     null_close: bool = False, omit_board: bool = False) -> Path:
+                     null_close: bool = False, omit_board: bool = False,
+                     price_series_mode: str = "raw") -> Path:
     rng = np.random.default_rng(17)
     rows: list[dict[str, object]] = []
     calendar = _trading_days_ending(last_day, 90)
@@ -106,7 +107,7 @@ def _write_market_db(path: Path, *, symbols: list[str], last_day: date = TODAY,
                 "pre_close": open_,
                 "up_limit": round(open_ * 1.1, 4),
                 "down_limit": round(open_ * 0.9, 4),
-                "price_series_mode": "raw",
+                "price_series_mode": str(price_series_mode),
             }
             if not omit_board:
                 row["board"] = "main"
@@ -150,7 +151,17 @@ def _train_model(root: Path, *, code_commit: str, model_id: str = MODEL_ID) -> d
         frame=frame,
         model_id=model_id,
         spec=HeadFitSpec(min_train_rows=20, min_class_balance=0.05),
-        provenance={"window": ["2025-09-01", "2026-03-01"], "source": "clean_day_e2e"},
+        provenance={
+            "window": ["2025-09-01", "2026-03-01"],
+            "source": "clean_day_e2e",
+            # P0 Final R1：Live 运行期要拿它复核"当天 feature 库口径 == 训练口径"，
+            # 因此夹具必须与生产同形地声明 feature 数据身份。
+            "feature_data_identity": {
+                "role": "feature",
+                "db": "clean_day_e2e_feature",
+                "price_series_mode": "qfq",
+            },
+        },
         extra_identity={"code_commit": code_commit},
     )
     persist_frozen_model(model, root)
@@ -160,7 +171,10 @@ def _train_model(root: Path, *, code_commit: str, model_id: str = MODEL_ID) -> d
         "artifact_created_at": "2026-03-01T12:00:00+08:00",
         "artifact_path": str(root / "model" / model_id),
         "status": "frozen",
-        "provenance": {"window": ["2025-09-01", "2026-03-01"]},
+        "provenance": {
+            "window": ["2025-09-01", "2026-03-01"],
+            "feature_data_identity": {"role": "feature", "price_series_mode": "qfq"},
+        },
         "model_training_code_commit": code_commit,
     }
 
@@ -196,7 +210,17 @@ class _StubAutomation:
 def clean_day_env(tmp_path, monkeypatch):
     """一套"生产前置全齐"的合成环境（真实 CLI 全程使用）。"""
     symbols = [f"6001{index:02d}" for index in range(6)]
-    market_db = _write_market_db(tmp_path / "warehouse" / "market.duckdb", symbols=symbols)
+    # 生产同形：feature 库声明 qfq（特征口径），execution 库声明 raw（成交/label 口径）。
+    market_db = _write_market_db(
+        tmp_path / "warehouse" / "market.duckdb",
+        symbols=symbols,
+        price_series_mode="qfq",
+    )
+    execution_db = _write_market_db(
+        tmp_path / "warehouse_raw" / "market_raw.duckdb",
+        symbols=symbols,
+        price_series_mode="raw",
+    )
     features_root = tmp_path / "features_light"
     _write_feature_snapshot(features_root, trade_date=TODAY)
 
@@ -204,6 +228,7 @@ def clean_day_env(tmp_path, monkeypatch):
     # 所有测试侧改动都必须走环境变量，parent 侧配置再镜像一份。
     monkeypatch.setenv("SA__EVOLUTION__EXECUTION_SPEC__PRICE_SERIES_MODE", "raw")
     monkeypatch.setenv("SA__WEEK5__FEATURE_SNAPSHOT_ROOT", str(features_root))
+    monkeypatch.setenv("SA__ALPHA_V2__EXECUTION_MARKET_DB", str(execution_db))
     funnel_root = tmp_path / "runtime" / "production_funnel"
     monkeypatch.setenv("SA__ALPHA_V2__PRODUCTION_FUNNEL_ROOT", str(funnel_root))
 
@@ -292,6 +317,7 @@ def clean_day_env(tmp_path, monkeypatch):
     config.alpha_v2.production_funnel_root = str(funnel_root)
     config.week5.feature_snapshot_root = str(features_root)
     config.market_warehouse.db_path = str(market_db)
+    config.alpha_v2.execution_market_db = str(execution_db)
     audits: list[dict[str, object]] = []
     service._record_audit_event = lambda **kwargs: audits.append(kwargs)
     service._job_now = lambda: datetime.combine(TODAY, datetime.min.time()).replace(
@@ -308,6 +334,7 @@ def clean_day_env(tmp_path, monkeypatch):
         "cycle": cycle,
         "audits": audits,
         "market_db": market_db,
+        "execution_market_db": execution_db,
         "features_root": features_root,
         "funnel_root": funnel_root,
         "symbols": symbols,
@@ -383,14 +410,19 @@ def test_degraded_variants_do_not_capture(
     env = clean_day_env
     if sabotage == "truncate_market_db":
         _write_market_db(
-            env["market_db"], symbols=env["symbols"], last_day=TODAY - timedelta(days=1)
+            env["market_db"],
+            symbols=env["symbols"],
+            last_day=TODAY - timedelta(days=1),
+            price_series_mode="qfq",
         )
     elif sabotage == "remove_feature_manifest":
         (env["features_root"] / "current.json").unlink()
     elif sabotage == "remove_model_artifact":
         shutil.rmtree(env["root"] / "model" / MODEL_ID)
     elif sabotage == "null_close_market_db":
-        _write_market_db(env["market_db"], symbols=env["symbols"], null_close=True)
+        _write_market_db(
+            env["market_db"], symbols=env["symbols"], null_close=True, price_series_mode="qfq"
+        )
     else:  # pragma: no cover - 参数表写错才会到这里
         raise AssertionError(variant)
     result = env["cycle"].run_daily_cycle()
@@ -409,7 +441,10 @@ def test_dh2_at_deadline_records_missing_and_zero_clean_days(clean_day_env):
     """deadline 仍 degraded：落 missing 台账 + 不产生任何 clean 日 + 仍推进历史尾部。"""
     env = clean_day_env
     _write_market_db(
-        env["market_db"], symbols=env["symbols"], last_day=TODAY - timedelta(days=1)
+        env["market_db"],
+        symbols=env["symbols"],
+        last_day=TODAY - timedelta(days=1),
+        price_series_mode="qfq",
     )
     env["service"]._job_now = lambda: datetime.combine(
         TODAY, datetime.min.time()
@@ -467,3 +502,71 @@ def test_dh3_board_coverage_degradation_is_detected(tmp_path, monkeypatch):
     )
     assert report.status != "healthy"
     assert "board_coverage" in report.degraded_checks
+
+
+# ---------------------------------------------------------------------------
+# LIVE-F5 / LIVE-F6：feature 口径漂移进入**捕获前 prerequisite**（P0 Final R1 / BLOCKER 2）
+# ---------------------------------------------------------------------------
+
+
+def test_live_f5_feature_mode_mismatch_waits_then_recovers_same_night(clean_day_env):
+    """LIVE-F5：当晚 feature 库口径漂移 → waiting 且不 capture；修好后同晚即可 capture。
+
+    这是本轮最重要的 scheduler regression：旧实现在 capture 里才抛错，调度器只会一路
+    ``alpha_v2_step_failed:capture``，到 23:55 也不会走 missing 台账。
+    """
+    env = clean_day_env
+    # 漂移：feature 库被换成 raw（模型冻结的是 qfq）
+    _write_market_db(
+        env["market_db"],
+        symbols=env["symbols"],
+        price_series_mode="raw",
+    )
+    first = env["cycle"].run_daily_cycle()
+    assert first["_scheduler_detail"] == "alpha_v2_waiting:feature_price_mode_mismatch", first
+    assert first["_scheduler_success"] is True
+    assert "steps" not in first  # 等待态：capture/mature/report 一步都没开始
+    assert list(env["root"].rglob("shadow_*.jsonl")) == []
+    evidence = first["feature_price_series"]
+    assert evidence["expected_mode"] == "qfq"
+    assert evidence["observed_mode"] == "raw"
+    assert evidence["contract_ok"] is False
+    assert evidence["enforced"] is True
+
+    # 同一晚修回 qfq → 下一次槽位直接捕获 + clean 日成立
+    _write_market_db(
+        env["market_db"],
+        symbols=env["symbols"],
+        price_series_mode="qfq",
+    )
+    second = env["cycle"].run_daily_cycle()
+    assert second["_scheduler_detail"] == "alpha_v2_cycle_completed", second
+    assert list(env["root"].rglob("shadow_*.jsonl"))
+    governance = _kpi_governance(env["root"], env["epoch"].epoch_id)
+    assert governance["clean_oos_days"] == 1, governance
+
+
+def test_live_f6_feature_mode_mismatch_until_deadline_records_missing(clean_day_env):
+    """LIVE-F6：口径一直漂到 deadline → 记 missing 台账、不产生 capture。"""
+    from stock_analyzer.alpha_v2.validation.shadow_capture import list_missing_days
+
+    env = clean_day_env
+    _write_market_db(
+        env["market_db"],
+        symbols=env["symbols"],
+        price_series_mode="raw",
+    )
+    env["service"]._job_now = lambda: datetime.combine(
+        TODAY, datetime.min.time()
+    ).replace(hour=23, minute=56)
+    result = env["cycle"].run_daily_cycle()
+    assert result["missing_recorded"] is True, result
+    assert result["_scheduler_detail"].startswith(
+        "alpha_v2_blocked_recorded_missing:feature_price_mode_mismatch"
+    ), result
+    assert list(env["root"].rglob("shadow_*.jsonl")) == []
+    missing = list_missing_days(env["root"], env["epoch"].epoch_id)
+    assert [item["signal_date"] for item in missing] == [TODAY.isoformat()]
+    assert "feature_price_mode_mismatch" in str(missing[0]["reason"])
+    governance = _kpi_governance(env["root"], env["epoch"].epoch_id)
+    assert governance["clean_oos_days"] == 0, governance

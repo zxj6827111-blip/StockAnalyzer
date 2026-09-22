@@ -166,6 +166,26 @@ def _write_smoke_market_db(path: Path) -> dict[str, object]:
     )
 
 
+def _smoke_identity_block(
+    fingerprint: Mapping[str, object], *, role: str, mode: str
+) -> dict[str, object]:
+    """按 ``price_series_identity_block`` 的真实形态造一条 smoke 数据身份。"""
+    from stock_analyzer.alpha_v2.dual_price_series import (
+        certification_from_declaration,
+        price_series_identity_block,
+    )
+
+    return price_series_identity_block(
+        role=role,
+        db="smoke_synthetic",
+        certification=certification_from_declaration(
+            price_mode=mode, certified=mode == "raw"
+        ),
+        fingerprint=fingerprint,
+        context=f"no_git_container_smoke:{role}",
+    )
+
+
 def _write_rehearsal_model_artifact(
     artifacts_root: Path,
     *,
@@ -231,6 +251,14 @@ def _write_rehearsal_model_artifact(
             "training_data_fingerprint_version": str(fingerprint["fingerprint_version"]),
             "training_data_rows": int(fingerprint["rows"]),
             "training_data_columns": list(fingerprint["columns"]),
+            # P0：v3 追加训练模式 + 两条数据身份（feature qfq / execution raw）。
+            "validation_mode": "production",
+            "feature_price_mode": "qfq",
+            "execution_price_mode": "raw",
+            "feature_data_identity": _smoke_identity_block(fingerprint, role="feature", mode="qfq"),
+            "execution_data_identity": _smoke_identity_block(
+                fingerprint, role="execution", mode="raw"
+            ),
         },
         extra_identity={
             "code_commit": commit,
@@ -293,6 +321,11 @@ def _write_production_preflight(
             "training_data_fingerprint_version": str(fingerprint["fingerprint_version"]),
             "warmup_days": int(fingerprint["warmup_days"]),
             "source_window": list(fingerprint["source_window"]),
+            # P0：gate 逐项对账两条数据身份（与工件封存值一致）。
+            "feature_data_identity": _smoke_identity_block(fingerprint, role="feature", mode="qfq"),
+            "execution_data_identity": _smoke_identity_block(
+                fingerprint, role="execution", mode="raw"
+            ),
         },
         "training_window": {
             "start": SMOKE_TRAINING_WINDOW[0],
