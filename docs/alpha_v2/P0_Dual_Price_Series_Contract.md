@@ -114,12 +114,50 @@ SA__ALPHA_V2__EXECUTION_MARKET_DB=/app/artifacts/vendor_delta_raw/market_delta_r
 
 | 步骤 | feature DB | execution DB |
 | --- | --- | --- |
-| capture（特征 + 模型推理，**不变**） | `--market-db`（qfq） | — |
+| capture（特征 + 模型推理） | `--market-db` = `feature_market_db_path()`（qfq） | — |
 | mature（outcome / 基准） | `--feature-market-db`（仅风格维度，按 epoch 内 symbol 过滤加载） | `--execution-market-db`（raw，每天重新 certify） |
 
 `--market-db` 在 freeze / mature 上成为**已废弃参数**：只在 `--rehearsal` 下被接受
 （两角色绑同一份库，provenance 如实标 `db_role_binding=legacy_single_db`）；生产形态
 给出它会直接 exit 4。
+
+## 5.1 Live 运行期不变量（Final R1）
+
+冻结时的口径只证明"训练那一刻是对的"；**运行期必须每天重新证明**：
+
+```text
+TRAIN          feature mode = qfq        execution mode = raw + certified
+LIVE CAPTURE   feature mode == 冻结模型声明的 feature mode（每天复核）
+LIVE MATURE    style feature mode == 冻结 feature mode；execution = raw + certified
+KPI            matured outcome == raw + certified
+```
+
+任何一项不成立 → 该日 **NO CLEAN EVIDENCE**。
+
+| 环节 | 期望值来源（唯一权威） | 实测判别 | 不成立时 |
+| --- | --- | --- | --- |
+| capture（`alpha_v2_shadow_capture.py`） | 工件 `model.manifest.provenance.feature_data_identity.price_series_mode` | 当天面板 `certify_price_mode()` | production/test：exit 11，**在 `pit_universe` / 特征 / 预测 / 写盘之前**；rehearsal：警告 + 日清单标 `contract_ok=false` |
+| scheduler 前置（`_ensure_feature_price_series`） | freeze 清单 `model.provenance.feature_data_identity.price_series_mode` | `derive_feature_price_series_input()`（轻量 probe 40d × ≤300 只） | production/test：`alpha_v2_waiting:feature_price_mode_mismatch`（窗口末尾 → 记 missing day）；**不再**反复 `step_failed:capture` |
+| mature（`alpha_v2_shadow_mature.py`） | freeze 清单同一字段 | feature 面板 `certify_price_mode()` | production/test：exit 11 且 0 行 outcome；**禁止**退回 execution 面板算 style |
+| mature 函数层（`mature_epoch_outcomes`） | `validation_mode` 形参（默认 production） | `style_panel is None` | production/test：抛 `OutcomeMaturationError`；rehearsal：`style_features_source=execution_panel_fallback_rehearsal` |
+| KPI（`validation_kpis`） | 冻结清单 + 行级自述 | 逐行 `price_mode/price_mode_certified` | 该日不 clean、主口径样本为空 |
+
+补充：
+
+- **feature 侧不要求 `certified=true`**：qfq 的 `certified` 本来就是 false，误用 execution
+  标准会把正确的 qfq 判成失败；feature 只要求"模式可证 + 等于冻结声明"。
+- 严格集合是 `{production, test}`（`LIVE_STRICT_VALIDATION_MODES`）。比"只挡 production"更严
+  一格是有意的：`test` 在本仓库是 **clean-OOS 合格模式**（只为确定性时钟存在），放它降级
+  会产生"clean 证据 + 变了语义的 style 基准"。只有 `rehearsal` 允许带标注降级。
+- capture 的当日清单新增 `feature_price_series` 证据块（`expected_mode` / `observed_mode` /
+  `certification_source` / `certification_evidence` / `source_db` / `contract_ok` /
+  `enforced` / `reason`），因此任何一个 L20/L60/L120/L250 日都能直接回答
+  "当天模型看到的 feature price mode 是什么"。
+
+> 已知遗留（不在本轮范围）：``signal_close_raw`` 仍取 feature 面板的当日 close，
+> 而它在 KPI 里被用作执行质量诊断（`entry_gap_mean`）。它是**诊断字段、不是证据**，
+> 且 capture 一旦改用 raw 库就跨越了"capture 只依赖 feature 库"的边界，故本轮不动；
+> 建议后续以独立变更改为读 execution 侧（或在字段名上显式标注 feature 口径）。
 
 ## 6. RAW delta 数据源设计（本 PR 不改 NAS 数据）
 
@@ -138,7 +176,7 @@ SA__ALPHA_V2__EXECUTION_MARKET_DB=/app/artifacts/vendor_delta_raw/market_delta_r
 - `scripts/shadow_rebuild_price_series.py --target-mode raw`：以复权因子归档对 qfq 序列
   做**逆变换**得到 raw（一次性基线备选路径；缺因子的 symbol 跳过而不是贴假标签）。
 
-### 6.1 基线导入
+### 6.1 基线导入（**coverage-driven**，不接受固定深度推荐）
 
 ```bash
 # 容器内（只读 ZIP + 写新 delta 路径）
@@ -147,8 +185,50 @@ python scripts/import_vendor_zip_to_delta.py \
   --index-path /app/artifacts/vendor_overlay/daily_index.json \
   --delta-db-path /app/artifacts/vendor_delta_raw/market_delta_raw.duckdb \
   --price-series-mode raw \
-  --limit-days 400            # 与 Week5 240 日 lookback 留出余量
+  --limit-days <按 §6.1.1 算出来的深度>
 ```
+
+> ⚠️ **`--limit-days` 是 per-symbol 的"行数"，不是自然日**，因此"400 看起来比 Week5 的
+> 240 大"**不构成** Alpha V2 生产冻结的覆盖证明。**400 只是 Week5 常规 lookback 的示例值，
+> 不是生产冻结的充分条件**；不要为了方便拍一个 500/600。
+
+#### 6.1.1 覆盖判据（正式上线的唯一标准）
+
+正式 candidate model 的口径：
+
+```text
+decision window : 2025-06-02 .. 2026-08-31
+warmup          : 200 natural days
+source window   : 2024-11-14 .. 2026-08-31        ← RAW baseline 必须覆盖到这里
+```
+
+`source_window` = 决策窗起点向前 `warmup_days` **自然日**（不是交易日、不是行数）：
+
+```text
+source_window_start = 2025-06-02 - 200d = 2024-11-14
+```
+
+上线流程（**以覆盖证明为准，不以某个整数为准**）：
+
+```text
+1) 按 source_window 计算所需历史深度：
+   required_days = (decision_window_end - source_window_start).days
+2) 用 feature 侧同一窗口的 symbol 集合作为 required symbols
+   （即训练/打标签真正会读到的那些票）
+3) RAW baseline 导入后实际验证：
+   - required symbols 覆盖率（分母 = required symbols，分子 = 在 source_window
+     内有 bar 的 symbol；任何缺失列出 symbol 明细）
+   - raw 的 min(date) <= source_window_start（且逐 symbol 检查，不只看全库 min）
+   - source_window 内 symbols × trading days 的行覆盖是否完整
+4) 覆盖不足 → 扩大 --limit-days 并**重建**（不是打补丁式追加）
+5) 记录并归档一条 `source_window coverage PASS` 证据（symbol 级明细 + 窗口 + 行数），
+   它才是"baseline 可用"的凭据
+```
+
+可用现成读取口径做核对（与训练链同一套）：`compute_training_data_fingerprint(...,
+training_start=2025-06-02, training_end=2026-08-31, warmup_days=200)` 返回
+`source_window` / `rows` / `columns`，预检会把这三项与冻结模型封存值逐项对账
+（§5）——所以 baseline 的深度**先被这条对账间接证明，再由 §6.1.1 的符号级明细直接证明**。
 
 ### 6.2 每日增量同步
 
@@ -205,6 +285,8 @@ B) 独立 cron 步骤
 
 ## 8. 验收映射
 
+### 8.1 训练 / 执行 / 预检（P0 主体）
+
 | 用例 | 证明 |
 | --- | --- |
 | DP-1 | QFQ feature + RAW execution → freeze 放行，两条证据分开 |
@@ -218,4 +300,22 @@ B) 独立 cron 步骤
 | DP-9 | execution 指纹变化 → preflight BLOCKED |
 | DP-10 | execution 库落后 feature 库（raw 链断供）→ preflight BLOCKED |
 
-测试文件：`tests/test_alpha_v2_dual_price_series.py`。
+### 8.2 Live 运行期（Final R1）
+
+| 用例 | 位置 | 证明 |
+| --- | --- | --- |
+| LIVE-F1 | `test_alpha_v2_dual_price_series.py` | 冻结 qfq + 当天 qfq → capture 放行，日清单 `contract_ok=true` |
+| LIVE-F1b | 同上 | 冻结模型未声明 feature 口径 → capture exit 11（fail closed） |
+| LIVE-F2 | 同上 | 冻结 qfq + 当天 raw → exit 11，且 `daily_feature_frame` / `predict_frozen_model_matrix` 探针**从未被调用**、无快照、无日清单 |
+| LIVE-F3 | 同上 | feature 库口径不可证（无声明 + 样本不足）→ exit 11 |
+| LIVE-F4 | 同上 | scheduler 的 capture argv 必须是 `alpha_v2.feature_market_db`（不是 `market_warehouse.db_path`） |
+| LIVE-F5 | `test_alpha_v2_m4l_cycle_clean_day_e2e.py` | 口径漂移 → 当晚 `waiting:feature_price_mode_mismatch` 且不 capture；同晚修回 → 立即 capture + `clean_oos_days=1` |
+| LIVE-F6 | 同上 | 漂移到 deadline → `recorded_missing:feature_price_mode_mismatch`、无 capture、`clean_oos_days=0` |
+| LIVE-M1 | `test_alpha_v2_dual_price_series.py` | 冻结 qfq + mature feature 库 qfq + execution raw → 放行，行上 raw+certified |
+| LIVE-M2 | 同上 | mature feature 库 raw → exit 11 且 0 行新 outcome |
+| LIVE-M3 | 同上 | feature 库缺失 / 未配置 → exit 11（**禁止**退回 execution 面板） |
+| LIVE-M4 | 同上 | 绕开 CLI 直接调用函数：production/test（含默认值）下 `style_panel=None` → 抛 `OutcomeMaturationError` |
+| LIVE-M5 | 同上 | rehearsal + `style_panel=None` → 允许，摘要标 `execution_panel_fallback_rehearsal` |
+
+结构守卫：`test_production_entrypoints_have_no_escape_hatch` 钉住 freeze/mature 两个生产
+入口不得出现关闭 execution 守卫的开关。

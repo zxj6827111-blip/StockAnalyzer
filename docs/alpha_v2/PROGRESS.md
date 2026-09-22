@@ -1971,3 +1971,110 @@ Legacy / Week5 / 生产漏斗 / Cross Review / 阈值 = 未改动
 
 > 数据侧动作（建 `/app/artifacts/vendor_delta_raw/market_delta_raw.duckdb`、接通日更、
 > 重训与 preflight）**待用户授权**，步骤见 `P0_Dual_Price_Series_Contract.md` §6.4。
+
+---
+
+# 20. P0 Final Live Runtime Hardening R1（2026-09-22，PR #86 追加，待最终复核）
+
+> 只追加，不重写上文。承接第 19 章：本轮关闭外部最终复核提出的 **两个 Live Runtime
+> 漏接线**，并把 RAW baseline 的深度口径与测试计数证据一并修正。
+
+## 20.1 两个 blocker
+
+上下文：第 19 章把"训练 / execution / preflight"三处口径固化了，但**运行期**没有复核：
+冻结模型声明了 `feature_data_identity.price_series_mode=qfq`，而 capture 加载面板后直接
+`pit_universe → 特征 → 预测 → 写盘`，从未验证当天 feature 面板仍是 qfq；且 mature 的
+style 面板在不可用时**静默退回 execution 面板**。
+
+```text
+BLOCKER 1  Live Capture 没有冻结 Feature Price Mode
+BLOCKER 2  口径漂移只会在 capture 内以 exit 11 出现 → 调度器一路 step_failed，
+           到 23:55 也不会走 "prerequisites unavailable → record missing day"
+BLOCKER 3  Mature 的 feature/style 面板没有与冻结 feature mode 比对
+BLOCKER 4  Production Mature 允许退回 execution 面板算 style（改变基准语义）
+```
+
+## 20.2 实现落点
+
+| 落点 | 行为 |
+| --- | --- |
+| `scripts/alpha_v2_shadow_capture.py` | 从**模型工件**取 expected feature mode（production/test 缺失即 exit 11）；面板加载后、`pit_universe`/特征/预测/写盘**之前** `certify_price_mode()` + `require_declared_feature_series(expected_mode=...)`；日清单新增 `feature_price_series` 证据块 |
+| `live_shadow_cycle_service._ensure_feature_price_series` | 捕获**前**前置门：`derive_feature_price_series_input()`（复用 preflight 轻量 probe `40d × ≤300 只` + 统一守卫）；窗口内 → `alpha_v2_waiting:feature_price_mode_mismatch`；到 deadline → `recorded_missing:feature_price_mode_mismatch` + 继续推进历史尾部 |
+| `live_shadow_cycle_service` capture argv | `--market-db` 改用 `feature_market_db_path()`（`alpha_v2.feature_market_db`，空则回退 `market_warehouse.db_path`） |
+| `scripts/alpha_v2_shadow_mature.py` | expected feature mode 取 `freeze.model.provenance.feature_data_identity.price_series_mode`（**不读 config 猜**）；面板缺失/不可读/口径漂移在 production/test 一律 exit 11、0 行 outcome |
+| `outcome_maturation.mature_epoch_outcomes` | 新增 `validation_mode`（默认 `production` = fail-closed 默认）；strict + `style_panel=None` → 抛 `OutcomeMaturationError`；rehearsal 允许带标注降级 `style_features_source=execution_panel_fallback_rehearsal` |
+| `dual_price_series` | 新增 `feature_mode_of_frozen_model` / `feature_mode_of_freeze_manifest` / `is_live_strict_mode` / `LIVE_STRICT_VALIDATION_MODES` / `FEATURE_PRICE_SERIES_EVIDENCE_SCHEMA` |
+
+**一处有意偏离提示词**：提示词写"rehearsal/test 可保留带标注 fallback"，本实现把严格集合
+取为 `{production, test}`，只有 `rehearsal` 允许降级。理由：`test` 在本仓库是 **clean-OOS
+合格模式**（`clean_oos_row_eligible` / `_day_governance` 都认它，它只为确定性时钟存在），
+放它降级会产生"clean 证据 + 变了语义的 style 基准"。这比要求更严，且已由 LIVE-M4 钉住。
+
+## 20.3 文档与证据修正
+
+- **RAW baseline 改为 coverage-driven**：删除 `--limit-days 400` 作为生产推荐（它只是
+  Week5 常规 lookback 的示例，`--limit-days` 是 per-symbol **行数**、不是自然日）；
+  新增 §6.1.1 覆盖判据：按 `source_window = 决策窗起点 - warmup 自然日`
+  （candidate model 为 `2024-11-14 .. 2026-08-31`）计算所需深度，导入后必须验证
+  required symbols 覆盖 / `min(date) <= source_window_start` / 行覆盖，并归档
+  `source_window coverage PASS` 证据；不以任何固定整数为准。
+- **测试计数纠正**：第 19 章 PR 正文里的 "full = 3705 collected" 是**错的**（由日志里
+  数进度点得到，把 warnings/durations 里的点也算进去了）。同环境同命令实测：
+
+  ```text
+  BASE 47571c1 : tests/ 裸收集 3806（与 #85 报告的 3806 同量级）
+                 full stage 选择（--ignore 12 个慢测文件）3683
+  HEAD f5b4dc3 : tests/ 裸收集 3836
+                 full stage 选择 3713
+  DELTA        : +30（纯新增，未删任何测试文件/测试函数）
+  ```
+
+  逐文件差异：新增 `tests/test_alpha_v2_dual_price_series.py`（+26）、
+  `test_alpha_v2_m4l_cycle_clean_day_e2e.py` 8→10（LIVE-F5/F6）、
+  `test_alpha_v2_s11_outcomes.py` 34→36（拆出 fail-closed 与 research opt-out 两例）。
+  `git diff 47571c1..HEAD -- tests/` 中 `-def test_` 与删除文件均为空。
+
+## 20.4 夹具审计（应答"是否给旧 outcome 补 raw/certified 把测试强行变绿"）
+
+做法：对 6 处被 P0 改动过的夹具做**反向变异**（改回缺失/不认证/口径漂移），要求用例
+失败；变异后恢复文件、基线复跑通过。
+
+```text
+M1 test_alpha_v2_m3_validation_kpis.py      certified True→False      mutated=FAIL baseline=PASS
+M2 test_alpha_v2_m3_enforcement.py          certified True→False      mutated=FAIL baseline=PASS
+M3 test_alpha_v2_m3_outcome_maturation.py   price_mode_certified→False mutated=FAIL baseline=PASS
+M4 test_alpha_v2_m3_r3_final_blockers.py    certified True→False      mutated=FAIL baseline=PASS
+M5 clean_day e2e 模型块 feature 身份删掉                                mutated=FAIL baseline=PASS
+M6 clean_day e2e 模型块 feature 身份 qfq→raw                            mutated=FAIL baseline=PASS
+```
+
+结论：新加的 `price_mode/price_mode_certified` 与 `feature_data_identity` 都是**承重**字段
+（缺了/变了用例就红），不是"为了变绿而补的装饰"；negative case（qfq / uncertified /
+missing / 漂移）在 LIVE-F3、LIVE-F6、LIVE-M2/M3/M4、DP-3/DP-7 里各自永久保留。
+
+## 20.5 本轮验证（本地实测）
+
+```text
+dual-price 定向       26 tests / 0 failed / 0 error / 0 skipped   (junit live_r1_dual_price.xml)
+alpha_v2 选择         682 tests / 0 failed / 0 error / 0 skipped  (-k "alpha_v2 or price_contract")
+clean-scope 质量门    ruff + mypy blocking rc=0，blocking_failures=[]
+tests/ 裸跑           3836 tests / 0 failed / 0 error / 2 skipped  (junit live_r1_bare_tests.xml)
+                      （2 skipped = test_nas_*_script 的 Windows bash 语法用例，非本轮引入）
+full stage 选择       3713 collected；pytest rc=0；coverage 80.88%（下限 75%）；
+                      blocking_failures=[]
+GitHub CI            本轮提交的结果见 PR #86 的 checks（同一 commit）。
+```
+
+## 20.6 状态边界
+
+```text
+P0_LIVE_RUNTIME_BLOCKERS = 0（本轮的 4 项全部关闭并有专项用例）
+PR #86                   = 未 merge（等最终复核）
+NAS                      = 未操作（未建 raw delta、未部署、未开 epoch）
+ALPHA_V2_EPOCH_001       = NOT_STARTED
+LIVE_CLEAN_OOS_DAYS      = 0
+ALPHA_VERIFIED           = FALSE
+PRODUCTION_PROMOTION     = LOCKED
+Legacy / Week5 / 生产漏斗 / Alpha final selection / 阈值 = 未改动
+```
+
