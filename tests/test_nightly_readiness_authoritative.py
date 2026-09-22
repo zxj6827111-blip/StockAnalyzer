@@ -374,3 +374,136 @@ def test_invalidate_reports_replace_failure(
     with pytest.raises(OSError, match="failed to invalidate"):
         mod.invalidate_nightly_readiness(stamp="20260822T000000Z")
     assert path.exists()
+
+
+# ---------------------------------------------------------------------------
+# P1 R1：双 delta 消费分档（RDY-1..7）
+#
+# 同一份 readiness 文件，两个消费者要得到**不同**结论：
+#   Week5 / 夜扫 / Legacy final selection  → 只要 feature 数据就绪（v2 或 v3）
+#   active Alpha epoch 的 capture          → 必须有执行侧证据（只有 v3）
+# 这不是"两套判据"，而是同一个函数的一个显式参数；默认档保证既有语义不变。
+# ---------------------------------------------------------------------------
+
+_DUAL_TARGET = "2026-08-19"
+
+
+def _v2_payload() -> dict[str, object]:
+    return {
+        "schema_version": 2,
+        "target_trade_date": _DUAL_TARGET,
+        "daily": {"ok": True},
+        "index": {"ok": True},
+        "delta": {"ok": True},
+    }
+
+
+def _v3_payload() -> dict[str, object]:
+    payload = _v2_payload()
+    payload["schema_version"] = 3
+    payload["execution_delta"] = {
+        "ok": True,
+        "role": "execution",
+        "price_series_mode": "raw",
+    }
+    payload["symbol_membership"] = {"membership_locked": True}
+    payload["raw_delta_baseline"] = {"ok": True}
+    return payload
+
+
+def _write_payload(path: Path, payload: dict[str, object]) -> Path:
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def test_rdy1_v2_readiness_still_ready_for_week5(tmp_path: Path) -> None:
+    """RDY-1：默认档（Week5 / Legacy）在 v2 上必须仍然 ready。
+
+    这是"Alpha V2 的引入不得收紧 Legacy release 契约"的直接证明。
+    """
+    path = _write_payload(tmp_path / "ready.json", _v2_payload())
+    gate = check_nightly_readiness(expected_trade_date=_DUAL_TARGET, path=path)
+    assert gate.ready is True
+    assert gate.reason == "ok"
+
+
+def test_rdy2_same_v2_file_is_not_ready_for_dual_delta_consumer(tmp_path: Path) -> None:
+    """RDY-2：**同一个文件**在严格档下必须不 ready，且原因码可辨。"""
+    path = _write_payload(tmp_path / "ready.json", _v2_payload())
+    gate = check_nightly_readiness(
+        expected_trade_date=_DUAL_TARGET, path=path, require_dual_delta=True
+    )
+    assert gate.ready is False
+    assert gate.reason == "nightly_dual_delta_not_ready"
+
+
+def test_rdy3_full_v3_readiness_passes_strict_consumer(tmp_path: Path) -> None:
+    """RDY-3：完整 v3 在严格档下 PASS。"""
+    path = _write_payload(tmp_path / "ready.json", _v3_payload())
+    gate = check_nightly_readiness(
+        expected_trade_date=_DUAL_TARGET, path=path, require_dual_delta=True
+    )
+    assert gate.ready is True
+    assert gate.reason == "ok"
+
+
+def test_rdy4_v3_without_execution_block_fails_strict_consumer(tmp_path: Path) -> None:
+    """RDY-4：v3 声明了双 delta 却没有 execution 块 → 不 ready（不许按 v2 降级）。"""
+    payload = _v3_payload()
+    payload.pop("execution_delta")
+    path = _write_payload(tmp_path / "ready.json", payload)
+    gate = check_nightly_readiness(
+        expected_trade_date=_DUAL_TARGET, path=path, require_dual_delta=True
+    )
+    assert gate.ready is False
+    assert gate.reason == "nightly_dual_delta_not_ready"
+
+
+def test_rdy5_v3_with_unhealthy_execution_delta_fails(tmp_path: Path) -> None:
+    """RDY-5：execution_delta.ok=false → 不 ready。"""
+    payload = _v3_payload()
+    payload["execution_delta"] = {"ok": False, "role": "execution"}
+    path = _write_payload(tmp_path / "ready.json", payload)
+    gate = check_nightly_readiness(
+        expected_trade_date=_DUAL_TARGET, path=path, require_dual_delta=True
+    )
+    assert gate.ready is False
+    assert gate.reason == "nightly_dual_delta_not_ready"
+
+
+def test_rdy6_v3_with_unlocked_membership_fails(tmp_path: Path) -> None:
+    """RDY-6：成员锁步未成立 → 不 ready（计数相同但成员不同的最后一公里）。"""
+    payload = _v3_payload()
+    payload["symbol_membership"] = {"membership_locked": False}
+    path = _write_payload(tmp_path / "ready.json", payload)
+    gate = check_nightly_readiness(
+        expected_trade_date=_DUAL_TARGET, path=path, require_dual_delta=True
+    )
+    assert gate.ready is False
+    assert gate.reason == "nightly_dual_delta_not_ready"
+
+
+def test_rdy7_v3_without_certified_baseline_fails(tmp_path: Path) -> None:
+    """RDY-7：raw_delta_baseline.ok=false → 不 ready（执行侧来路不明）。"""
+    payload = _v3_payload()
+    payload["raw_delta_baseline"] = {"ok": False}
+    path = _write_payload(tmp_path / "ready.json", payload)
+    gate = check_nightly_readiness(
+        expected_trade_date=_DUAL_TARGET, path=path, require_dual_delta=True
+    )
+    assert gate.ready is False
+    assert gate.reason == "nightly_dual_delta_not_ready"
+
+
+def test_rdy_broken_v3_still_reports_data_not_ready_for_week5(tmp_path: Path) -> None:
+    """默认档看到坏 v3 时报的仍是数据原因码，不是双 delta 原因码。
+
+    原因码是给调度器分流用的：把"数据没好"和"形状不对"混成一个码，会让 Week5
+    的重试决策失去依据。
+    """
+    payload = _v3_payload()
+    payload["daily"] = {"ok": False}
+    path = _write_payload(tmp_path / "ready.json", payload)
+    gate = check_nightly_readiness(expected_trade_date=_DUAL_TARGET, path=path)
+    assert gate.ready is False
+    assert gate.reason == "nightly_data_not_ready"

@@ -228,7 +228,7 @@ def test_quick_probe_does_not_call_sleep(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(
         automation_module,
         "check_nightly_readiness",
-        lambda *, expected_trade_date: ReadinessGate(
+        lambda *, expected_trade_date, require_dual_delta=False: ReadinessGate(
             ready=False,
             reason="nightly_data_not_ready",
             payload={},

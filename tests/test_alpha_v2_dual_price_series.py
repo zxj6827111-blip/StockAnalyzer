@@ -1130,7 +1130,11 @@ class _LiveCaptureStub:
 
         class _Automation:
             @staticmethod
-            def probe_nightly_readiness() -> dict[str, object]:
+            def probe_nightly_readiness(
+                *, require_dual_delta: bool = False
+            ) -> dict[str, object]:
+                # active epoch 下 capture 走严格档（P1 R1）；本夹具恒就绪，声明收到即可。
+                _ = require_dual_delta
                 return {"allowed": True, "status": "ready", "reason": ""}
 
         self.automation = _Automation()

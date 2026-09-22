@@ -79,9 +79,15 @@ def _trading_days_ending(end: date, count: int) -> list[date]:
 CALENDAR = _trading_days_ending(TODAY, 90)
 
 
-def _write_market_db(path: Path, *, symbols: list[str], last_day: date = TODAY,
-                     null_close: bool = False, omit_board: bool = False,
-                     price_series_mode: str = "raw") -> Path:
+def _write_market_db(
+    path: Path,
+    *,
+    symbols: list[str],
+    last_day: date = TODAY,
+    null_close: bool = False,
+    omit_board: bool = False,
+    price_series_mode: str = "raw",
+) -> Path:
     rng = np.random.default_rng(17)
     rows: list[dict[str, object]] = []
     calendar = _trading_days_ending(last_day, 90)
@@ -202,8 +208,36 @@ def _write_feature_snapshot(directory: Path, *, trade_date: date) -> Path:
 
 
 class _StubAutomation:
-    def probe_nightly_readiness(self) -> dict[str, object]:
-        return {"status": "ready", "allowed": True, "reason": ""}
+    """readiness 替身。
+
+    ``readiness_path`` 为空 = 既有测试的"恒就绪"（那些用例考察的是 data_health /
+    漏斗 / capture，不是 readiness 本身）。给了路径就**走真实 gate**，于是
+    "active epoch 必须要求双 delta readiness" 这条判据在这条真实 CLI 链路上也成立，
+    不会被替身绕过。
+    """
+
+    def __init__(self, *, readiness_path: Path | None = None) -> None:
+        self.readiness_path = readiness_path
+        self.require_dual_delta_seen: list[bool] = []
+
+    def probe_nightly_readiness(self, *, require_dual_delta: bool = False) -> dict[str, object]:
+        self.require_dual_delta_seen.append(bool(require_dual_delta))
+        if self.readiness_path is None:
+            return {"status": "ready", "allowed": True, "reason": ""}
+        from stock_analyzer.ops.nightly_readiness import check_nightly_readiness
+
+        gate = check_nightly_readiness(
+            expected_trade_date=TODAY,
+            path=self.readiness_path,
+            require_dual_delta=require_dual_delta,
+        )
+        return {
+            "status": "ready" if gate.ready else "blocked",
+            "allowed": bool(gate.ready),
+            "reason": gate.reason,
+            "expected_trade_date": gate.expected_trade_date,
+            "payload": gate.payload,
+        }
 
 
 @pytest.fixture
@@ -282,9 +316,7 @@ def clean_day_env(tmp_path, monkeypatch):
                     "selected": [{"symbol": s, "score": 1.0} for s in symbols],
                 },
                 "shortlisted": [{"symbol": s, "baseline_score": 1.0} for s in symbols],
-                "deep_stage": {
-                    "selected": [{"symbol": s, "funnel_score": 1.0} for s in symbols]
-                },
+                "deep_stage": {"selected": [{"symbol": s, "funnel_score": 1.0} for s in symbols]},
                 "pinned_symbols": [],
             },
         },
@@ -363,9 +395,7 @@ def test_dh1_healthy_day_yields_one_clean_oos_day(clean_day_env):
     assert {row["clean_oos_eligible"] for row in rows} == {True}
     assert {row["quality_pool_source"] for row in rows} == {"production_selection_engine"}
     assert {row["symbol"] for row in rows} == set(env["symbols"])
-    health = json.loads(
-        (env["root"] / "runtime" / "data_health.json").read_text(encoding="utf-8")
-    )
+    health = json.loads((env["root"] / "runtime" / "data_health.json").read_text(encoding="utf-8"))
     assert health["status"] == "healthy", health
     assert health["as_of"] == TODAY.isoformat()
     governance = _kpi_governance(env["root"], env["epoch"].epoch_id)
@@ -430,9 +460,7 @@ def test_degraded_variants_do_not_capture(
     assert result["_scheduler_detail"].endswith("data_health_not_healthy:data_health_not_available")
     assert "steps" not in result  # 等待态：连 capture/mature/report 步骤都没开始
     assert list(env["root"].rglob("shadow_*.jsonl")) == []
-    health = json.loads(
-        (env["root"] / "runtime" / "data_health.json").read_text(encoding="utf-8")
-    )
+    health = json.loads((env["root"] / "runtime" / "data_health.json").read_text(encoding="utf-8"))
     assert health["status"] != "healthy", health
     assert expected_check in health[f"{expected_bucket}_checks"], health
 
@@ -446,9 +474,9 @@ def test_dh2_at_deadline_records_missing_and_zero_clean_days(clean_day_env):
         last_day=TODAY - timedelta(days=1),
         price_series_mode="qfq",
     )
-    env["service"]._job_now = lambda: datetime.combine(
-        TODAY, datetime.min.time()
-    ).replace(hour=23, minute=56)
+    env["service"]._job_now = lambda: datetime.combine(TODAY, datetime.min.time()).replace(
+        hour=23, minute=56
+    )
     result = env["cycle"].run_daily_cycle()
     assert result["missing_recorded"] is True
     assert [item["step"] for item in result["history_tail"]] == ["mature", "report"]
@@ -556,9 +584,9 @@ def test_live_f6_feature_mode_mismatch_until_deadline_records_missing(clean_day_
         symbols=env["symbols"],
         price_series_mode="raw",
     )
-    env["service"]._job_now = lambda: datetime.combine(
-        TODAY, datetime.min.time()
-    ).replace(hour=23, minute=56)
+    env["service"]._job_now = lambda: datetime.combine(TODAY, datetime.min.time()).replace(
+        hour=23, minute=56
+    )
     result = env["cycle"].run_daily_cycle()
     assert result["missing_recorded"] is True, result
     assert result["_scheduler_detail"].startswith(
@@ -570,3 +598,59 @@ def test_live_f6_feature_mode_mismatch_until_deadline_records_missing(clean_day_
     assert "feature_price_mode_mismatch" in str(missing[0]["reason"])
     governance = _kpi_governance(env["root"], env["epoch"].epoch_id)
     assert governance["clean_oos_days"] == 0, governance
+
+
+def _dual_readiness_payload(*, schema_version: int) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": schema_version,
+        "target_trade_date": TODAY.isoformat(),
+        "daily": {"ok": True},
+        "index": {"ok": True},
+        "delta": {"ok": True},
+    }
+    if schema_version >= 3:
+        payload["execution_delta"] = {"ok": True, "role": "execution"}
+        payload["symbol_membership"] = {"membership_locked": True}
+        payload["raw_delta_baseline"] = {"ok": True}
+    return payload
+
+
+def test_alpha_rdy2_v2_then_v3_same_night_recovers_to_clean_day(clean_day_env):
+    """ALPHA-RDY-2：同一晚 v2 → waiting；unified updater 补出 v3 → capture，clean +1。
+
+    这条用例的真实价值在"v2 那一半"：如果没有严格档，第一次调用就会直接 capture 并
+    记一个 clean day——而那天没有任何执行侧（raw）证据。等到 23:55 也一样记不到
+    missing，因为根本没人拦它。
+    """
+    env = clean_day_env
+    readiness_path = env["tmp"] / "runtime" / "nightly_data_ready.json"
+    readiness_path.parent.mkdir(parents=True, exist_ok=True)
+    automation = _StubAutomation(readiness_path=readiness_path)
+    env["service"]._week5_automation_service = automation
+
+    readiness_path.write_text(
+        json.dumps(_dual_readiness_payload(schema_version=2)), encoding="utf-8"
+    )
+    first = env["cycle"].run_daily_cycle()
+    assert first["_scheduler_detail"] == ("alpha_v2_waiting:nightly_dual_delta_not_ready"), first
+    assert automation.require_dual_delta_seen == [True]
+    assert list(env["root"].rglob("shadow_*.jsonl")) == []
+
+    # 同一晚稍后：unified updater 写出 v3（双 delta 就绪）。
+    readiness_path.write_text(
+        json.dumps(_dual_readiness_payload(schema_version=3)), encoding="utf-8"
+    )
+    second = env["cycle"].run_daily_cycle()
+
+    assert second["_scheduler_detail"] == "alpha_v2_cycle_completed", second
+    epoch_dir = env["root"] / "validation" / env["epoch"].epoch_id
+    shadow_files = list(epoch_dir.rglob("shadow_*.jsonl"))
+    assert shadow_files, "影子快照未落盘"
+    rows = [
+        json.loads(line)
+        for line in shadow_files[0].read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert {row["clean_oos_eligible"] for row in rows} == {True}
+    governance = _kpi_governance(env["root"], env["epoch"].epoch_id)
+    assert governance["clean_oos_days"] == 1, governance

@@ -1664,12 +1664,17 @@ class RuntimeWeek5AutomationService:
             return [], expires.isoformat()
         return pool, expires.isoformat()
 
-    def probe_nightly_readiness(self) -> dict[str, object]:
+    def probe_nightly_readiness(self, *, require_dual_delta: bool = False) -> dict[str, object]:
         """单次就绪探测，**不等待**。
 
         晚报链路的等待策略是"由调度器每 5 分钟再来一次"，而不是让重型 worker 在
         里面 sleep 900 秒——后者会把 1800 秒的扫描预算挤掉 15 分钟（21:45 起等，
         23:00 才轮到真正扫描，然后 23:30 撞截止），并在等待期间白占 heavy 单槽。
+
+        ``require_dual_delta`` 默认 ``False``：Week5 / 夜扫 / Legacy final selection
+        的 release 契约是"feature 数据就绪即可"，v2 与 v3 都放行。只有 active Alpha
+        epoch 的 capture 需要 ``True``（执行侧必须是 raw，见 P1）——严格档由**调用方**
+        显式声明，不在这里按调用者身份猜测。
         """
         resolver = getattr(self._service, "_resolve_nightly_expected_trade_date", None)
         if not callable(resolver):
@@ -1691,7 +1696,10 @@ class RuntimeWeek5AutomationService:
                 "expected_trade_date": expected_text,
                 "waited_sec": 0.0,
             }
-        gate = check_nightly_readiness(expected_trade_date=expected)
+        gate = check_nightly_readiness(
+            expected_trade_date=expected,
+            require_dual_delta=require_dual_delta,
+        )
         return {
             "status": "ready" if gate.ready else "blocked",
             "allowed": bool(gate.ready),

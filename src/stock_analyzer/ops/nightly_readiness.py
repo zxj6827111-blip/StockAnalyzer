@@ -131,6 +131,11 @@ SUPPORTED_READINESS_SCHEMA_VERSIONS: tuple[int, ...] = (
     READINESS_SCHEMA_VERSION,
     READINESS_SCHEMA_VERSION_DUAL,
 )
+#: ``require_dual_delta=True`` 且 readiness 不满足双 delta 时的稳定原因码。
+#: 单独一个码而不是复用 ``nightly_data_not_ready``：调度器要靠它区分"今天数据没好"
+#: （重试即可）与"今天的 release 里根本没有执行侧证据"（重试也不会变，必须等到
+#: unified updater 写出 v3）。Alpha 的 waiting/missing 台账直接记这一条。
+READINESS_REASON_DUAL_DELTA = "nightly_dual_delta_not_ready"
 
 logger = logging.getLogger(__name__)
 
@@ -722,6 +727,7 @@ def check_nightly_readiness(
     *,
     expected_trade_date: str | date | datetime | None = None,
     path: str | Path | None = None,
+    require_dual_delta: bool = False,
 ) -> ReadinessGate:
     """Evaluate the nightly readiness gate.
 
@@ -729,6 +735,16 @@ def check_nightly_readiness(
     payload's ``target_trade_date`` (i.e. the gate checks internal
     consistency only).  Callers that know the true expected date (from the
     daily index's latest date) should pass it.
+
+    ``require_dual_delta``（默认 ``False``）区分**两种消费者**：
+
+    - ``False``：单 delta 语义。v2 与 v3 都算就绪——Legacy / Week5 的夜扫与
+      历史 release 契约不变，Alpha V2 的引入不得收紧它们；
+    - ``True``：要求 ``schema_version >= 3`` 且执行侧证据齐全。**active Alpha
+      epoch 的 capture 必须走这一档**：epoch 的 label / 成交价 / 超额都取自
+      execution/raw 库，拿 v2（只有 feature delta）去 capture 等于在没有执行侧
+      证据的晚上照记 clean day。此时 v2 一律不 ready，原因码
+      ``nightly_dual_delta_not_ready``（而不是笼统的 ``nightly_data_not_ready``）。
 
     Returns a :class:`ReadinessGate` whose ``scheduler_triple`` satisfies the
     scheduler contract: missing or date-mismatched readiness yields
@@ -755,6 +771,15 @@ def check_nightly_readiness(
             payload=payload,
             expected_trade_date=str(expected_trade_date or payload.get("target_trade_date", "")),
         )
+    if require_dual_delta and version < READINESS_SCHEMA_VERSION_DUAL:
+        # 放在"槽位检查"之前：这份文件的**形状**就不满足消费者要求，先报这一条比
+        # 先报某个 slot 更准确（v2 文件再健康也不含执行侧证据）。
+        return ReadinessGate(
+            ready=False,
+            reason=READINESS_REASON_DUAL_DELTA,
+            payload=payload,
+            expected_trade_date=str(expected_trade_date or payload.get("target_trade_date", "")),
+        )
     # Require daily/index/delta success.
     for key in ("daily", "index", "delta"):
         slot = payload.get(key)
@@ -768,38 +793,33 @@ def check_nightly_readiness(
                 ),
             )
     if version >= READINESS_SCHEMA_VERSION_DUAL:
-        # v3 是"双 delta 已启用"的自证：execution 块必须存在且通过。缺块直接不 ready
+        # v3 是"双 delta 已启用"的自证：执行侧证据必须齐全，缺一块都不 ready
         # ——不允许"声明 v3 却按 v2 放行"这种前后不一致的降级。
+        # 原因码随消费者变化：Alpha（require_dual_delta=True）要的是"今晚没有执行侧
+        # 证据"这一类结论，用同一个码；Week5 / Legacy 保持既有 nightly_data_not_ready。
+        dual_reason = (
+            READINESS_REASON_DUAL_DELTA if require_dual_delta else "nightly_data_not_ready"
+        )
+
+        def _dual_blocked() -> ReadinessGate:
+            return ReadinessGate(
+                ready=False,
+                reason=dual_reason,
+                payload=payload,
+                expected_trade_date=str(
+                    expected_trade_date or payload.get("target_trade_date", "")
+                ),
+            )
+
         execution = payload.get("execution_delta")
         if not isinstance(execution, dict) or not bool(execution.get("ok", False)):
-            return ReadinessGate(
-                ready=False,
-                reason="nightly_data_not_ready",
-                payload=payload,
-                expected_trade_date=str(
-                    expected_trade_date or payload.get("target_trade_date", "")
-                ),
-            )
+            return _dual_blocked()
         membership = payload.get("symbol_membership")
         if not isinstance(membership, dict) or not bool(membership.get("membership_locked")):
-            return ReadinessGate(
-                ready=False,
-                reason="nightly_data_not_ready",
-                payload=payload,
-                expected_trade_date=str(
-                    expected_trade_date or payload.get("target_trade_date", "")
-                ),
-            )
+            return _dual_blocked()
         baseline = payload.get("raw_delta_baseline")
         if not isinstance(baseline, dict) or not bool(baseline.get("ok", False)):
-            return ReadinessGate(
-                ready=False,
-                reason="nightly_data_not_ready",
-                payload=payload,
-                expected_trade_date=str(
-                    expected_trade_date or payload.get("target_trade_date", "")
-                ),
-            )
+            return _dual_blocked()
     readiness_date = _coerce_date(payload.get("target_trade_date"))
     if readiness_date is None:
         return ReadinessGate(
