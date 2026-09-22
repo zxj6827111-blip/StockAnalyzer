@@ -199,7 +199,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Alpha V2 M3：每日 Shadow 快照采集")
     parser.add_argument("--epoch-id", default="")
     parser.add_argument("--signal-date", required=True)
-    parser.add_argument("--market-db", default="artifacts/warehouse/market.duckdb")
+    parser.add_argument(
+        "--market-db",
+        default="artifacts/warehouse/market.duckdb",
+        help=(
+            "**feature 侧**行情库（capture 只用它算特征；生产走 "
+            "alpha_v2.feature_market_db，为空时回退 market_warehouse.db_path）。"
+            "当天会校验它的价格口径 == 冻结模型声明的 feature 口径，不一致即 exit 11"
+        ),
+    )
     parser.add_argument("--warmup-days", type=int, default=260)
     parser.add_argument("--model-dir", default="")
     parser.add_argument("--out", default=str(REPO_ROOT / "artifacts" / "alpha_v2"))
