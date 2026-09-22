@@ -190,6 +190,22 @@ def build_bootstrap_marker(
             f"({price_mode.get('observed')!r})",
             reason=REASON_PRICE_MODE,
         )
+    # 口径**认证**（而不只是"行内自称 raw"）必须是 marker 的前置条件。写在函数里而不是
+    # 只写在 CLI 里，是为了让将来任何新调用方也造不出"跳过认证"的 marker：
+    # 生产信任的凭据只能由一次真的跑过 certify 的校验产出。
+    if str(price_mode.get("expected", "") or "").strip().lower() != RAW_DELTA_PRICE_MODE:
+        raise RawDeltaBaselineError(
+            "refusing to write a RAW bootstrap marker: price_mode_check.expected is not raw "
+            f"({price_mode.get('expected')!r})",
+            reason=REASON_PRICE_MODE,
+        )
+    if price_mode.get("certified") is not True:
+        raise RawDeltaBaselineError(
+            "refusing to write a RAW bootstrap marker: price_mode_check.certified is not true "
+            f"({price_mode.get('certified')!r})——未经 certify 的运行（例如 "
+            "--skip-price-mode-certification）不得产出生产信任的 marker",
+            reason=REASON_PRICE_MODE,
+        )
     return {
         "schema": RAW_BOOTSTRAP_MARKER_SCHEMA,
         "created_at": created_at or datetime.now(UTC).isoformat(),

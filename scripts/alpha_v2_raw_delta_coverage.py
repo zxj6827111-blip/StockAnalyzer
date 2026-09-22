@@ -650,6 +650,18 @@ def _main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    # 生产信任的 marker 只能由**跑过口径认证**的那次校验产出。跳过认证是只读诊断手段
+    # （离线排查、异构环境），拿它写 marker 等于把"未经认证的 raw"变成一条生产凭据。
+    # 两道门：这里挡住 CLI，build_bootstrap_marker 里再挡一次（防将来别的调用方）。
+    if args.write_marker and args.skip_price_mode_certification:
+        print(
+            "--write-marker requires price-mode certification: "
+            "--skip-price-mode-certification is a read-only diagnostic and never produces a "
+            "production-trust bootstrap marker",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+
     if args.verify_marker:
         if not args.raw_db.strip():
             print("--verify-marker requires --raw-db", file=sys.stderr)

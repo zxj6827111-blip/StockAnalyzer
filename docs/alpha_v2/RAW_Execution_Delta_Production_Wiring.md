@@ -97,6 +97,16 @@ python scripts/alpha_v2_raw_delta_coverage.py \
 第 2 步必须 PASS 才落 marker。**覆盖不足 → 扩大 `--limit-days` 并重建**，不要打补丁式
 追加（半截历史 + 新历史拼出来的序列没有任何一层能证明它完整）。
 
+落 marker 还需要**口径认证真的跑过**（`price_mode_check.certified == true`）。两道门：
+
+```text
+CLI   ：--write-marker 与 --skip-price-mode-certification 互斥（同时给 = usage error，退出 2）
+函数  ：build_bootstrap_marker() 直接要求 expected==raw / observed==raw / certified==true
+```
+
+`--skip-price-mode-certification` 本身仍然可用（只读诊断、异构环境排查），只是**不能产出
+生产信任的 marker**。函数里那道门是真正的边界——CLI 之外将来可能有别的调用方。
+
 ### 2.2 marker 是什么
 
 `artifacts/vendor_delta_raw/raw_delta_bootstrap.json`（与库同目录，两者必须一起搬）：
@@ -277,6 +287,7 @@ index_expected ⊆ feature ⊆ execution
 | 任一角色导入失败 | 不发布 | updater（`full_run_ok` 含两个角色） |
 | raw 基线缺失 / marker 缺失 | 非零退出，不发布 | updater（导入之前） |
 | v3 文件缺 `execution_delta` 块或块不 ok | gate 不 ready | `check_nightly_readiness`（不许按 v2 降级放行） |
+| v2 文件被 active Alpha epoch 消费 | 不 ready，Alpha waiting/missing | `require_dual_delta=True`（§5.5） |
 
 口径门读的是**全表**分布，不按目标日过滤：一份库里混进一行另一种口径，意味着按这份序列
 算出来的特征/label 在跨越那一行时不连续。门要回答的是"这份库能不能当那个角色的序列"，
@@ -297,6 +308,42 @@ index_expected ⊆ feature ⊆ execution
 - 两个角色都会被尝试（不短路），重试是一次完整重跑；
 - 增量导入按 `(symbol,date)` 幂等：重试不会写出重复行（`coverage validator` 也把
   `duplicate (symbol,date) != 0` 列为 BLOCKED）。
+
+### 5.5 两个消费档：Week5 宽松、Alpha 严格
+
+同一个 `check_nightly_readiness()`，一个显式参数决定档位——**不是两套判据**：
+
+```python
+check_nightly_readiness(expected_trade_date=..., require_dual_delta=False)  # 默认
+```
+
+| 消费者 | 档位 | v2 | v3 |
+| --- | --- | --- | --- |
+| Week5 夜扫 / Legacy final selection | `require_dual_delta=False` | ready | ready |
+| **active Alpha epoch 的 capture** | `require_dual_delta=True` | **不 ready** | 需执行侧证据齐全才 ready |
+
+严格档要求：`schema_version >= 3` 且 `daily.ok` / `index.ok` / `delta.ok` /
+`execution_delta.ok` / `symbol_membership.membership_locked` / `raw_delta_baseline.ok`
+全部成立、`target_trade_date` 匹配。v2 一律不 ready，原因码
+**`nightly_dual_delta_not_ready`**（不复用 `nightly_data_not_ready`：调度器要靠它区分
+"今天数据没好（重试即可）"与"今天的 release 里根本没有执行侧证据（重试也不会变）"）。
+
+**为什么必须分档**：readiness 的默认档为了 Legacy/Week5 的 release 契约向后兼容而接受
+v2，而 Alpha epoch 的 label / 成交价 / 净收益 / 超额 / MAE-MFE 全部取自 execution/raw 库。
+沿用默认档就等于"在没有执行侧证据的晚上照记 clean day"——而 clean OOS 天数正是 epoch 的
+验收凭据。`LiveShadowCycleService` 在 active epoch 分支显式走严格档，判据本身没有第四套
+实现（那是 P0 一轮明确禁止的）。
+
+Alpha 侧的后果是 M4-L 既有的 **waiting → retry → deadline missing** 纪律：
+
+```text
+v2 且未到 deadline   → alpha_v2_waiting:nightly_dual_delta_not_ready（capture 不跑）
+同一晚补出 v3        → 下一个 slot 直接 capture
+到 deadline 仍只有 v2 → alpha_v2_blocked_recorded_missing:production_prerequisites_unavailable:nightly_dual_delta_not_ready
+                       clean_oos_days 不增长
+```
+
+不是 `alpha_v2_step_failed` 循环：readiness 不属于"步骤失败"，它是"前提未就绪"。
 
 ---
 
@@ -340,11 +387,43 @@ marker 路径**故意没有**环境变量覆盖：默认与 raw 库同目录，�
 
 ## 7. 回滚
 
+**回滚到单 delta 的后果取决于有没有 active Alpha epoch。** 这两件事必须分开说，因为
+readiness 有两个消费档（§5.5）：
+
+```text
+没有 active Alpha epoch：
+  去掉 --sync-vendor-delta-raw → readiness 回到 v2
+  Week5 / 夜扫 / Legacy final selection    照常（默认档接受 v2）
+  Alpha shadow cycle                       因 no_active_epoch 直接 safe skip
+  → 单 delta 回滚是安全的
+
+有 active Alpha epoch：
+  去掉 --sync-vendor-delta-raw → readiness 回到 v2
+  Week5 / 夜扫 / Legacy final selection    照常（默认档接受 v2）
+  Alpha shadow cycle                       **拒绝**（严格档要求 v3）
+                                           → alpha_v2_waiting:nightly_dual_delta_not_ready
+                                           → 到 deadline 仍无 v3 → 落 missing 台账
+                                           → clean_oos_days **不增长**
+  → 单 delta 回滚是"Alpha 停摆"，不是"Alpha 不受影响"
+```
+
+关键点：**Alpha 绝不会在 v2 readiness 上继续积累 clean day**。这不是"优雅降级"，而是
+有意让 epoch 停摆并留痕——clean OOS 天数是 epoch 的验收凭据，靠没有执行侧证据的夜晚
+凑出来的天数比没有天数更危险。
+
+所以 active epoch 期间若确实要长期回滚到单 delta，必须**二选一**：
+
+```text
+close / suspend 该 Alpha epoch（把"这段时间没有有效 OOS"记在明面上）
+或
+恢复 dual updater（--sync-vendor-delta-raw 加回来）
+```
+
 按代价从低到高：
 
-1. **只想停用 raw 角色**（回退到单 delta）：把 `scripts/nas_stock_updater.sh` 里的
-   `--sync-vendor-delta-raw` 一行去掉并重新安装。readiness 回到 v2，Week5 / 夜扫 /
-   Alpha V2 capture 全部不受影响（它们读的是 `nightly_data_ready` 是否 ready）。
+1. **停用 raw 角色**：把 `scripts/nas_stock_updater.sh` 里的 `--sync-vendor-delta-raw`
+   一行去掉并重新安装。readiness 回到 v2。**若此时有 active epoch，必须同时按上面的
+   二选一处理**，否则 Alpha 每晚会 waiting、到 deadline 记 missing，`clean_oos_days` 冻结。
    raw 库与 marker 留在卷里，不影响任何消费者。
 2. **回到旧镜像**：`scripts/nas_deploy_update.sh --branch <旧 ref>`（或部署脚本提供的
    回滚点）。artifacts 卷里的 raw 库/marker 是新增文件，不参与旧代码路径。
@@ -353,6 +432,7 @@ marker 路径**故意没有**环境变量覆盖：默认与 raw 库同目录，�
 
 任何回滚都**不改变** feature/qfq delta 的路径与语义，也不改 Week5 选股 / 生产漏斗 /
 cross review / 任何阈值。
+
 
 ---
 

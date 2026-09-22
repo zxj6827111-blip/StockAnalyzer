@@ -328,12 +328,24 @@ def test_coverage_reuses_alpha_v2_price_mode_certification(
 
 
 def _pass_report(coverage_module: object, tmp_path: Path) -> dict[str, object]:
+    """生产同形的 PASS 报告：口径认证**真的跑过**（certified=true）。
+
+    不用 ``skip_price_mode_certification``：marker 的前置条件包含"认证过"，所以夹具
+    必须走真实 certify 路径——否则测出来的是"未经认证也能写 marker"，而不是生产形态。
+    """
     rows = {"600000": DATES}
     raw_db = _make_delta_db(tmp_path / "raw.duckdb", rows=rows, mode="raw")
     feature_db = _make_delta_db(tmp_path / "feature.duckdb", rows=rows, mode="qfq")
     index_path = _make_index(tmp_path / "index.json", latest_date=WINDOW_END, symbols=("600000",))
-    report = _evaluate(coverage_module, raw_db=raw_db, feature_db=feature_db, index_path=index_path)
-    assert report["coverage_status"] == "PASS"
+    report = coverage_module.evaluate_coverage(
+        raw_db=raw_db,
+        feature_db=feature_db,
+        index_path=index_path,
+        source_window_start=WINDOW_START,
+        source_window_end=WINDOW_END,
+    )
+    assert report["coverage_status"] == "PASS", report.get("blockers")
+    assert report["price_mode_check"]["certified"] is True
     report["_paths"] = {"raw": raw_db, "feature": feature_db, "index": index_path}
     return report
 
@@ -488,7 +500,14 @@ def test_coverage_records_feature_price_mode_evidence(
     feature_db = _make_delta_db(tmp_path / "feature.duckdb", rows=rows, mode="qfq")
     index_path = _make_index(tmp_path / "index.json", latest_date=WINDOW_END, symbols=("600000",))
 
-    report = _evaluate(coverage_module, raw_db=raw_db, feature_db=feature_db, index_path=index_path)
+    # 走真实认证：marker 的前置条件含 certified=true，跳过认证的报告写不出 marker。
+    report = coverage_module.evaluate_coverage(
+        raw_db=raw_db,
+        feature_db=feature_db,
+        index_path=index_path,
+        source_window_start=WINDOW_START,
+        source_window_end=WINDOW_END,
+    )
 
     assert report["coverage_status"] == "PASS"
     assert report["feature_price_mode_check"]["observed"] == "qfq"
@@ -519,3 +538,98 @@ def test_coverage_warns_when_feature_side_is_not_qfq(
     assert report["coverage_status"] == "PASS"
     assert report["feature_price_mode_check"]["matches_expected"] is False
     assert report["warnings"] == ["feature_db_price_mode_not_qfq:raw"]
+
+
+# ---------------------------------------------------------------------------
+# P1 R1 §11/§12：marker certification 旁路（MARK-1..3）
+#
+# 生产信任的 marker 只能由**跑过口径认证**的那次校验产出。两道门：CLI 挡住
+# `--write-marker --skip-price-mode-certification`，`build_bootstrap_marker` 再挡一次
+# ——后者才是真正的边界，因为 CLI 之外还可能有别的调用方。
+# ---------------------------------------------------------------------------
+
+
+def test_mark1_certified_raw_pass_report_yields_marker(
+    coverage_module: object, tmp_path: Path
+) -> None:
+    """MARK-1：observed=raw + certified=true + coverage=PASS → marker 允许。"""
+    report = _pass_report(coverage_module, tmp_path)
+    assert report["price_mode_check"]["certified"] is True
+    payload = build_bootstrap_marker(
+        db_path=report["_paths"]["raw"],
+        coverage_report=report,
+        source_index_path=report["_paths"]["index"],
+        source_index_hash="x",
+        source_index_latest_date=WINDOW_END,
+    )
+    assert payload["price_mode_check"]["certified"] is True
+    assert payload["coverage_status"] == "PASS"
+
+
+def test_mark2_uncertified_raw_report_is_rejected(coverage_module: object, tmp_path: Path) -> None:
+    """MARK-2：observed=raw 但 certified=false → 拒绝写 marker。
+
+    "行内自称 raw"与"认证过是 raw"不是一回事；后者才是生产凭据。
+    """
+    report = _pass_report(coverage_module, tmp_path)
+    report["price_mode_check"]["certified"] = False
+    with pytest.raises(RawDeltaBaselineError) as excinfo:
+        build_bootstrap_marker(
+            db_path=report["_paths"]["raw"],
+            coverage_report=report,
+            source_index_path=report["_paths"]["index"],
+            source_index_hash="x",
+            source_index_latest_date=WINDOW_END,
+        )
+    assert excinfo.value.reason == REASON_PRICE_MODE
+
+
+def test_mark3_cli_refuses_write_marker_without_certification(
+    coverage_module: object, tmp_path: Path
+) -> None:
+    """MARK-3：CLI 上 `--skip-price-mode-certification --write-marker` 必须非零且不落 marker。
+
+    `--skip-price-mode-certification` 本身仍然可用（只读诊断），只是不能产出 marker。
+    """
+    rows = {"600000": DATES}
+    raw_db = _make_delta_db(tmp_path / "raw.duckdb", rows=rows, mode="raw")
+    feature_db = _make_delta_db(tmp_path / "feature.duckdb", rows=rows, mode="qfq")
+    index_path = _make_index(tmp_path / "index.json", latest_date=WINDOW_END, symbols=("600000",))
+
+    exit_code = coverage_module._main(
+        [
+            "--raw-db",
+            str(raw_db),
+            "--feature-db",
+            str(feature_db),
+            "--index-path",
+            str(index_path),
+            "--source-window-start",
+            WINDOW_START,
+            "--source-window-end",
+            WINDOW_END,
+            "--skip-price-mode-certification",
+            "--write-marker",
+        ]
+    )
+
+    assert exit_code != 0
+    assert not bootstrap_marker_path(raw_db).exists()
+    # 只读诊断路径必须仍然可用——跳过认证本身不是错误，写 marker 才是。
+    read_only = coverage_module._main(
+        [
+            "--raw-db",
+            str(raw_db),
+            "--feature-db",
+            str(feature_db),
+            "--index-path",
+            str(index_path),
+            "--source-window-start",
+            WINDOW_START,
+            "--source-window-end",
+            WINDOW_END,
+            "--skip-price-mode-certification",
+        ]
+    )
+    assert read_only == 0
+    assert not bootstrap_marker_path(raw_db).exists()

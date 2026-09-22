@@ -2148,7 +2148,13 @@ DuckDB 每晚重算全文件摘要纯属开销。marker 里的取证快照（行
 
 ```text
 分支 / HEAD            feat/alpha-v2-raw-execution-delta @ deb08c5
-PR                     #87（base=main；#86 合并后 diff 收敛为 P1 自身 7 文件）
+PR                     #87（base=main）
+栈叠关系               **stacked PR**：分支直接派生自 #86 final HEAD 725e943。
+                       P1 增量 = 11 个文件（`git diff --name-only 725e943 52ea8f7`）。
+                       与 P0 **重叠 1 个文件**：docs/alpha_v2/PROGRESS.md（两阶段都改）。
+                       因 P1 commit 建立在 P0 commit 之后，不存在并行冲突；
+                       但必须按 #86 → #87 顺序合并。
+                       （GitHub 侧 #87 曾显示 41 个文件，正是因为 #86 当时还没进 main。）
 
 定向（spec §26 指定三文件） 58 passed / 1 skipped
   tests/test_update_vendor_daily_from_tushare.py
@@ -2180,8 +2186,9 @@ GitHub CI              PR #87 两个 quality job 均 pass（headSha=deb08c5）
 
 ```text
 P0_DUAL_PRICE_CONTAINED  = 代码层生效（分支基于 PR #86 的 HEAD 725e943）
-PR #86                   = 仍未 merge（本阶段被明确禁止执行 merge；已核实与 P1 无文件重叠）
-P1 PR                    = #87（base=main；#86 合并后 diff 自动收敛为 P1 自身 7 文件）
+PR #86                   = 已被用户 merge（2026-09-22T05:46:19Z，快进式，main 得 725e943）
+P1 PR                    = #87（#86 合入后由用户 merge，mergeCommit 0754faa，2026-09-22T05:46:17Z）
+                           两者与 P1 增量的重叠文件 = docs/alpha_v2/PROGRESS.md（仅文档）
 
 RAW_DELTA_PIPELINE_ENGINEERING_STATUS = PASS
 RAW_DELTA_NAS_CUTOVER_READY           = READY_FOR_BASELINE_BOOTSTRAP
@@ -2197,3 +2204,143 @@ PRODUCTION_PROMOTION     = LOCKED
 closed（`raw_delta_baseline_missing`）——这是设计行为。上线顺序（先建基线 → 覆盖 PASS →
 再切受管 updater）与回滚路径见
 `docs/alpha_v2/RAW_Execution_Delta_Production_Wiring.md` §6/§7。
+
+---
+
+# 22. P1 Final Readiness Hardening R1（2026-09-22，R1 分支，未部署）
+
+## 22.1 前置事实（与指令前提不同，先如实记）
+
+```text
+PR #86  = MERGED  2026-09-22T05:46:19Z  mergeCommit 725e943（快进式）
+PR #87  = MERGED  2026-09-22T05:46:17Z  mergeCommit 0754faa（base=main）
+          → **由用户自行 merge**，不是本轮施工动作；#87 的合并把 P0 的 5 个
+            commit 与 P1 的 3 个 commit 一并带进 main。
+
+git merge-base --is-ancestor 725e943 origin/main  →  TRUE（P0_IN_MAIN = TRUE）
+
+因此 R1 指令的两条前提已失效：
+  - `git diff --name-only origin/main...HEAD` 现在恒为空（HEAD 已是 main 的祖先）；
+  - "继续原 branch / 不要新建 PR"：merged PR 无法再接收 commit。
+处置：R1 在新分支 feat/alpha-v2-raw-execution-delta-r1（base=main）上施工。
+```
+
+## 22.2 修掉的 P0 blocker：active epoch 会接受 v2 readiness
+
+`check_nightly_readiness()` 为了 Legacy/Week5 向后兼容接受 v2 与 v3 —— 这是对的。
+但 `LiveShadowCycleService` 在 active epoch 下复用了同一个**宽松档**，于是"只有 feature
+delta 的晚上"照样能进 capture 并记一个 clean day，而 epoch 的 label / 成交价 / 净收益 /
+超额 / MAE-MFE 全部取自 execution/raw 库。
+
+修法（不新增第四套判据，只给同一个函数加一个显式参数）：
+
+```python
+check_nightly_readiness(..., require_dual_delta: bool = False)   # 默认档不变
+Week5AutomationService.probe_nightly_readiness(require_dual_delta=False)  # 透传
+LiveShadowCycleService  →  probe_nightly_readiness(require_dual_delta=True)
+```
+
+严格档要求 `schema_version >= 3` 且执行侧证据齐全；v2 一律不 ready，原因码
+**`nightly_dual_delta_not_ready`**（与 `nightly_data_not_ready` 分开——调度器要靠它区分
+"数据没好，重试即可"与"release 里根本没有执行侧证据，重试也不会变"）。
+
+Alpha 侧行为沿用 M4-L 既有纪律，不是新机制：
+
+```text
+v2 未到 deadline    → alpha_v2_waiting:nightly_dual_delta_not_ready（不 capture）
+同一晚补出 v3       → 下一 slot capture
+到 deadline 仍 v2   → alpha_v2_blocked_recorded_missing:...:nightly_dual_delta_not_ready
+                      clean_oos_days 不增长
+```
+
+## 22.3 封掉 marker certification 旁路
+
+`--write-marker` 与 `--skip-price-mode-certification` 曾经可以同时给 —— 等于让"跳过认证"
+的运行产出生产信任凭据。两道门：
+
+```text
+CLI  ：两者互斥 → usage error（退出 2），marker 不落盘
+函数 ：build_bootstrap_marker() 要求 expected==raw / observed==raw / certified==true
+       —— 真正的边界；CLI 之外将来若有别的调用方，也造不出未经认证的 marker
+```
+
+`--skip-price-mode-certification` 仍可用于只读诊断。
+
+## 22.4 文档修正（原有三处表述是错的）
+
+```text
+错：P0 与 P1 "无文件重叠"
+对：重叠 1 个文件 —— docs/alpha_v2/PROGRESS.md（两阶段都改）；因 P1 commit 建立在
+    P0 commit 之后，不存在并行冲突，但必须按 #86 → #87 顺序合并。
+
+错：P1 diff "收敛为 7 个文件"
+对：P1 增量 = 11 个文件（git diff --name-only 725e943 52ea8f7）。
+    GitHub 侧 #87 曾显示 41 个文件，正是 #86 当时还没进 main 所致。
+
+错：回滚到单 delta "Alpha V2 capture 不受影响"
+对：只在**没有 active epoch**时成立。有 active epoch 时 v2 对 Week5 仍有效，但 Alpha
+    一律拒绝 → waiting/missing → clean_oos_days 不增长；长期回滚必须 close/suspend
+    epoch 或恢复 dual updater。已写入 RAW wiring 文档 §7。
+```
+
+## 22.5 本轮验证（本地实测 + CI）
+
+```text
+分支 / HEAD            feat/alpha-v2-raw-execution-delta-r1 @ 378abc9
+PR                     #88（base=main）
+
+定向（spec §16 五文件 + 关键字选择）
+  tests/test_alpha_v2_raw_execution_delta_wiring.py
+  tests/test_raw_delta_baseline_identity.py
+  tests/test_nightly_readiness_authoritative.py
+  tests/test_nas_stock_updater_script.py
+                      80 passed / 1 skipped
+  tests/test_alpha_v2_m4l_cycle_clean_day_e2e.py
+                      11 passed（含 ALPHA-RDY-2 真实 CLI：clean_oos_days=1）
+  tests/test_alpha_v2_m4l_shadow_cycle_scheduler.py
+                      14 passed（含 ALPHA-RDY-1/3）
+  关键字 -k "nightly_readiness or raw_delta or alpha_v2"
+                      全绿（0 failed）
+
+tests/ 裸跑（干净串行） 3898 collected / 0 failed / 0 error / exit 0
+                     基线（#87 合并后）= 3884 → 新增 14 例，数字自洽
+
+clean-scope 质量门     ruff + mypy blocking rc=0，blocking_failures=[]
+full 质量门            pytest rc=0；coverage 80.87%（下限 75%）；blocking_failures=[]
+GitHub CI              PR #88 checks 全绿（见 PR）
+
+CI 一次 flake 与排除过程（留证，不要当成"影响不大"的推断）
+  现象    test_week5_scan_funnel_policy.py::test_week5_offhours_forced_profile_runs_snapshot_funnel
+          deep 选出 5 只而非 6（缺 601318）；--reruns 2 用尽
+  取证一  同一 commit 378abc9 三次判定：run 35693132201 attempt1 **pass**；
+          run 35693154338 attempt1 fail / attempt2 **pass** → 非确定性，同一棵树
+  取证二  本地同一棵树：裸全量 0 failed、full 质量门 rc=0、失败文件连续 3 次 24 passed
+  取证三  把 check_nightly_readiness / read_nightly_readiness 整体替换为**抛错函数**后
+          再跑该用例 —— 仍然通过 ⇒ 该路径根本不触及本次 readiness 改动（直接运行时检验，
+          不是"影响不大"的推断）。临时取证用例跑完即删。
+  定性    与项目既有记录同型（PROGRESS §18.3「负载性 flaky：单跑即过」）
+  处置    不改被测代码；flake 归入既有 backlog，不通过放宽断言掩盖
+```
+新增用例清单（14）：RDY-1..7 与 `test_rdy_broken_v3_still_reports_data_not_ready_for_week5`
+（8）、MARK-1..3（3）、ALPHA-RDY-1/3（2）、ALPHA-RDY-2（1）。
+
+## 22.6 状态边界
+
+```text
+P0_IN_MAIN                        = TRUE（725e943）
+PR #87                            = 已被用户 merge（0754faa）
+R1 分支                           = feat/alpha-v2-raw-execution-delta-r1（base=main）
+
+Alpha active epoch 接受 v2 readiness = NO（本轮修复）
+Alpha active epoch 要求 v3          = YES
+Week5 v2 readiness 行为变化         = NO
+
+RAW_PRODUCTION_BASELINE  = NOT_CREATED
+ALPHA_V2_EPOCH_001       = NOT_STARTED
+LIVE_CLEAN_OOS_DAYS      = 0
+ALPHA_VERIFIED           = FALSE
+PRODUCTION_PROMOTION     = LOCKED
+```
+
+遗留 backlog（非本轮范围）：`MEMORY.md` 索引超限（40KB > 24.4KB 预算）——属 agent/tooling
+hygiene，与生产管线无关。

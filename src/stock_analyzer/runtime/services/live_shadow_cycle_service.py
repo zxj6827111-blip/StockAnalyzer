@@ -331,7 +331,15 @@ class LiveShadowCycleService:
                 "validation_epoch_id": epoch.epoch_id,
             }
 
-        readiness = self._service._week5_automation_service.probe_nightly_readiness()
+        # P1 R1（BLOCKER）：**active epoch 下必须要求双 delta readiness**。
+        # epoch 的 label / 成交价 / 净收益 / 超额 / MAE-MFE 全部取自 execution/raw 库，
+        # 而 readiness 的默认档为了 Legacy/Week5 向后兼容允许 v2（只有 feature delta）。
+        # 沿用默认档就等于"在没有执行侧证据的晚上照记 clean day"，而 clean OOS 天数正是
+        # epoch 的验收凭据——所以这里显式升到严格档；v2 一律不 ready，原因码
+        # nightly_dual_delta_not_ready，走既有的 waiting → deadline missing 纪律。
+        readiness = self._service._week5_automation_service.probe_nightly_readiness(
+            require_dual_delta=True
+        )
         funnel_ready, funnel_reason = self._funnel_ready(trade_date=trade_date)
         health_ready = True
         health_reason = ""
