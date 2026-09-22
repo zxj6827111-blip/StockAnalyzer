@@ -473,3 +473,49 @@ def test_symbol_set_hash_distinguishes_membership() -> None:
     """同数量不同成员必须给出不同摘要——这是"计数一样"能漏掉的唯一信号。"""
     assert symbol_set_hash(["600000", "000001"]) == symbol_set_hash(["000001", "600000"])
     assert symbol_set_hash(["600000", "000001"]) != symbol_set_hash(["600000", "600001"])
+
+
+def test_coverage_records_feature_price_mode_evidence(
+    coverage_module: object, tmp_path: Path
+) -> None:
+    """建基线时顺手记录 feature 侧口径分布（v3 readiness 要求它是 qfq）。
+
+    不是新增判据（§8.2 只管 raw 侧），而是把"两侧口径都对"这个结论提前到上线前可见，
+    免得它只在第一晚以 fail closed 的形式冒出来。
+    """
+    rows = {"600000": DATES}
+    raw_db = _make_delta_db(tmp_path / "raw.duckdb", rows=rows, mode="raw")
+    feature_db = _make_delta_db(tmp_path / "feature.duckdb", rows=rows, mode="qfq")
+    index_path = _make_index(tmp_path / "index.json", latest_date=WINDOW_END, symbols=("600000",))
+
+    report = _evaluate(coverage_module, raw_db=raw_db, feature_db=feature_db, index_path=index_path)
+
+    assert report["coverage_status"] == "PASS"
+    assert report["feature_price_mode_check"]["observed"] == "qfq"
+    assert report["feature_price_mode_check"]["matches_expected"] is True
+    assert "warnings" not in report
+
+    payload = build_bootstrap_marker(
+        db_path=raw_db,
+        coverage_report=report,
+        source_index_path=index_path,
+        source_index_hash="x",
+        source_index_latest_date=WINDOW_END,
+    )
+    assert payload["feature_price_mode_check"]["observed"] == "qfq"
+
+
+def test_coverage_warns_when_feature_side_is_not_qfq(
+    coverage_module: object, tmp_path: Path
+) -> None:
+    """feature 侧不是 qfq 时给警告但不 BLOCKED（判据边界在 §8.2 的 raw 侧）。"""
+    rows = {"600000": DATES}
+    raw_db = _make_delta_db(tmp_path / "raw.duckdb", rows=rows, mode="raw")
+    feature_db = _make_delta_db(tmp_path / "feature.duckdb", rows=rows, mode="raw")
+    index_path = _make_index(tmp_path / "index.json", latest_date=WINDOW_END, symbols=("600000",))
+
+    report = _evaluate(coverage_module, raw_db=raw_db, feature_db=feature_db, index_path=index_path)
+
+    assert report["coverage_status"] == "PASS"
+    assert report["feature_price_mode_check"]["matches_expected"] is False
+    assert report["warnings"] == ["feature_db_price_mode_not_qfq:raw"]

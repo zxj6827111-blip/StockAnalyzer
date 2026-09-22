@@ -220,6 +220,9 @@ def build_bootstrap_marker(
             "decision_rule": price_mode.get("decision_rule", ""),
             "evidence": price_mode.get("evidence", {}),
         },
+        # feature 侧口径的取证副本（v3 readiness 会要求它是 qfq）。建基线时一并记下，
+        # 是为了让"两侧口径都对"这个结论在上线前就可见，而不是留给第一晚去发现。
+        "feature_price_mode_check": dict(coverage_report.get("feature_price_mode_check", {}) or {}),
         "coverage_status": COVERAGE_STATUS_PASS,
         "row_coverage": {
             "feature_rows_in_window": rows.get("feature_rows_in_window"),

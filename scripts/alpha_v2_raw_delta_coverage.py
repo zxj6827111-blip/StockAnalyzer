@@ -63,6 +63,7 @@ if str(SRC) not in sys.path:
 from stock_analyzer.ops.raw_delta_baseline import (  # noqa: E402
     COVERAGE_STATUS_BLOCKED,
     COVERAGE_STATUS_PASS,
+    FEATURE_DELTA_PRICE_MODE,
     RAW_BOOTSTRAP_MARKER_FILENAME,
     RAW_BOOTSTRAP_MARKER_SCHEMA,
     RAW_DELTA_PRICE_MODE,
@@ -486,6 +487,31 @@ def evaluate_coverage(
                     f"raw_price_mode_declaration_conflicts_with_probe:{observed}!={certified_mode}"
                 )
         report["price_mode_check"] = price_mode
+
+        # feature 侧口径**取证**（不是判据）：v3 readiness 会要求 feature delta 自述
+        # qfq，所以建基线这一步顺手把 feature 库的口径分布也记下来——上线前一条命令
+        # 就能同时看到两侧口径，不必等到第一晚 release 才撞门。
+        feature_histogram = _declared_mode_histogram(
+            connection,
+            qualified="feature_db.main.daily_bars",
+            window_start=start,
+            window_end=end,
+        )
+        feature_observed = _observed_mode(feature_histogram)
+        feature_price_mode = {
+            "expected": FEATURE_DELTA_PRICE_MODE,
+            "observed": feature_observed,
+            "declared_mode_histogram": feature_histogram,
+            "matches_expected": feature_observed == FEATURE_DELTA_PRICE_MODE,
+        }
+        report["feature_price_mode_check"] = feature_price_mode
+        if feature_observed != FEATURE_DELTA_PRICE_MODE:
+            # 不 BLOCKED：feature 侧口径不属于本校验器的判定范围（§8.2 只管 raw 侧），
+            # 但必须显式记成警告——否则它会在第一晚 readiness 上才以 fail closed 形式出现。
+            report.setdefault("warnings", []).append(
+                f"feature_db_price_mode_not_{FEATURE_DELTA_PRICE_MODE}:"
+                f"{feature_observed or 'unknown'}"
+            )
 
         # 8.4 Symbol coverage：required = feature 库在同一窗口内的符号集合。
         expected_symbols = _target_symbol_set(
