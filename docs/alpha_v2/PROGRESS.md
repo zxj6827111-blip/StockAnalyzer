@@ -2078,3 +2078,90 @@ PRODUCTION_PROMOTION     = LOCKED
 Legacy / Week5 / 生产漏斗 / Alpha final selection / 阈值 = 未改动
 ```
 
+
+---
+
+# 21. P1 — RAW Execution Delta 生产接线（2026-09-22，独立 PR，未部署）
+
+## 21.1 目标与边界
+
+把 Alpha V2 所需的 **RAW execution 行情库**正式接进现有 NAS 夜间统一数据事务：每天的
+QFQ feature delta 与 RAW execution delta 从同一批 ZIP/index 推进，并且**只有两者都完整、
+同日、口径正确时** nightly readiness 才允许发布。
+
+```text
+不做：Alpha tuning / 特征 / label / 训练窗口 / 模型冻结 / epoch / Production Promotion
+不改：Legacy 选股 / Week5 选择语义 / 生产漏斗 / 交叉复核 / 任何阈值
+未做：NAS 部署、真实 RAW 基线构建（合入 ≠ 上线，见 §21.5）
+```
+
+## 21.2 落地内容
+
+| # | 落点 | 内容 |
+| --- | --- | --- |
+| 1 | `update_vendor_daily_from_tushare.py` | 新增 `--sync-vendor-delta-raw`；两个角色走同一条路径，口径由编排写死（`feature→qfq` / `execution→raw`），不再依赖 `config/default.yaml` 默认值 |
+| 2 | 同上 | 导入前先验 RAW 基线身份（`_raw_baseline_gate`），不通过则 `raw_delta_baseline_missing` 等四类原因码 fail closed，**绝不用 `--incremental` 偷偷初始化** |
+| 3 | 同上 | summary 拆角色：`feature_delta_sync` / `execution_delta_sync` / `raw_delta_baseline`；`delta_sync` 保持历史形状不动；`full_run_ok` 含两个角色 |
+| 4 | `import_vendor_zip_to_delta.py` | RAW 口径下因子漂移重写通道**显式关闭**并上报 `factor_drift_detection=disabled_non_qfq_mode`；非 qfq 若产出 drift symbol 直接抛错 |
+| 5 | `src/stock_analyzer/ops/raw_delta_baseline.py`（新） | bootstrap marker 身份模型 + 符号集合摘要 + 库事实实测（单调不变量，无阈值） |
+| 6 | `scripts/alpha_v2_raw_delta_coverage.py`（新） | 只读覆盖校验器（8.1 DB / 8.2 口径 / 8.3 窗口 / 8.4 符号 / 8.5 行）+ `--write-marker` / `--verify-marker` |
+| 7 | `src/stock_analyzer/ops/nightly_readiness.py` | schema v3：新增 `execution_delta` / `symbol_membership` / `raw_delta_baseline`；v2 语义不变；`check_nightly_readiness` 接受 v2+v3，v3 缺 execution 块即不 ready |
+| 8 | `scripts/nas_stock_updater.sh` | 同一次调用传两个 delta 目标；verify 段在双 delta 模式下额外要求 execution 角色 updated |
+
+## 21.3 三个判据上的关键选择
+
+**(a) 覆盖判据不用整数、也不引入交易日历。** `--limit-days` 是每 symbol 的行数，
+"400 比 240 大"不是覆盖证明。行覆盖用 `(symbol,date)` 逐对比较（引擎内 `EXCEPT`）：
+
+```text
+feature 有、raw 没有  → 数据缺口（BLOCKED）
+两边都没有            → 停牌 / 未上市（正常）
+raw 有、feature 没有  → 正常：qfq 侧因子缺失会被跳过，raw 不需要因子
+```
+
+**(b) v3 成员锁步是包含链 `index_expected ⊆ feature ⊆ execution`，不是三方全等。**
+raw 侧不依赖复权因子，因因子缺失被 qfq 侧跳过的 symbol 在 raw 侧天然存在；要求全等会把
+这条**正常**路径判成故障、每晚误杀。包含链同时封住了旧口径的漏洞：旧判据只比
+`symbols_on_target_date` 的**计数**，`{A,B}` 与 `{A,C}` 计数相同、成员不同会被静默放行。
+
+**(c) 基线身份用内容事实 + 单调不变量，不用整库 SHA256。** 库每晚都在长，对数百 MB 的
+DuckDB 每晚重算全文件摘要纯属开销。marker 里的取证快照（行数 / 日期区间 / 符号摘要）如实
+记录建基线当刻状态但**不参与每日校验**；每日只看不变量：`daily_bars` 在、行数与符号数
+**不少于**建基线记录值、当前行内口径仍是 raw。
+
+## 21.4 施工中发现并修掉的两个真实缺陷
+
+都不是"测试写错了"，是实现本身在正常运维场景下会误伤：
+
+1. **无事可做的夜晚会被自己判成败。** 无新增行可推进时 execution 角色被记为
+   `not_enabled`，而 `execution_delta_ok` 只按"是否请求"判定 → 整晚不放行。假期、
+   重跑、以及任何 ZIP 已追平的夜晚都会中招。
+2. **重试无法收敛。** 第一晚 raw 失败、第二晚 ZIP 已追平 → `delta_should_sync` 为假 →
+   落后的 raw 角色被整个跳过，永远追不上。修法：两个角色只要**索引进度可信**就跑
+   （无事可做时 importer 本身是廉价空转），`index_should_update` 仍只看"本次是否真的
+   抓到新行"以保持既有行为。
+
+两条都由 `test_retry_after_execution_failure_converges_without_duplicates` 与
+`test_tx1_both_roles_ok_writes_v3_readiness` 钉住。
+
+## 21.5 状态边界
+
+```text
+P0_DUAL_PRICE_CONTAINED  = 代码层生效（分支基于 PR #86 的 HEAD 725e943）
+PR #86                   = 仍未 merge（本阶段被明确禁止执行 merge）
+P1 PR                    = 待创建（base=main；#86 合并后 diff 自动收敛为 P1 自身 7 文件）
+
+RAW_DELTA_PIPELINE_ENGINEERING_STATUS = PASS
+RAW_DELTA_NAS_CUTOVER_READY           = READY_FOR_BASELINE_BOOTSTRAP
+
+RAW_PRODUCTION_BASELINE  = NOT_CREATED（NAS 未操作）
+ALPHA_V2_EPOCH_001       = NOT_STARTED
+LIVE_CLEAN_OOS_DAYS      = 0
+ALPHA_VERIFIED           = FALSE
+PRODUCTION_PROMOTION     = LOCKED
+```
+
+**合入 ≠ 上线**：`nas_stock_updater.sh` 已经是 dual delta，但 NAS 上直接跑会整晚 fail
+closed（`raw_delta_baseline_missing`）——这是设计行为。上线顺序（先建基线 → 覆盖 PASS →
+再切受管 updater）与回滚路径见
+`docs/alpha_v2/RAW_Execution_Delta_Production_Wiring.md` §6/§7。

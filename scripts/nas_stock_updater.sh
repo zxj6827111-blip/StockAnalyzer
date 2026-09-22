@@ -4,10 +4,27 @@
 # Migrated from /vol1/docker/tools/stock_updater.sh and now version-controlled
 # in the repository; installed atomically by scripts/nas_deploy_update.sh.
 #
-# One updater call performs ZIP batch update + daily index rebuild + delta
-# DuckDB sync + nightly readiness publication in the SAME transaction, so a
-# successful run always releases the 21:45 off-hours selector and a failed
-# run never does (fail-closed via --require-readiness).
+# One updater call performs ZIP batch update + daily index rebuild + BOTH delta
+# DuckDB syncs (feature/qfq + execution/raw) + nightly readiness publication in
+# the SAME transaction, so a successful run always releases the 21:45 off-hours
+# selector and a failed run never does (fail-closed via --require-readiness).
+#
+# Two delta roles, two physically separate DBs:
+#   feature/qfq  : /app/artifacts/vendor_delta/market_delta.duckdb
+#   execution/raw: /app/artifacts/vendor_delta_raw/market_delta_raw.duckdb
+# They must never be the same file, and readiness publishes (schema v3) only
+# when both are at the target trade date with locked symbol membership.
+#
+# NOTE: the raw role refuses to run unless its target is an already-certified
+# baseline. Build one first, in the new image, with:
+#   python3 scripts/alpha_v2_raw_delta_coverage.py \
+#     --raw-db /app/artifacts/vendor_delta_raw/market_delta_raw.duckdb \
+#     --feature-db /app/artifacts/vendor_delta/market_delta.duckdb \
+#     --index-path /app/artifacts/vendor_overlay/daily_index.json \
+#     --source-window-start 2024-11-14 --source-window-end 2026-08-31 \
+#     --write-marker
+# Without that marker every night fails closed with raw_delta_baseline_missing:
+# correct, and deliberately NOT auto-bootstrapped here.
 #
 # Failure policy:
 #   - "empty" failures (delisted / legacy BSE old codes) are expected, so a
@@ -73,6 +90,7 @@ run_update() {
       --batch \
       --index-path /app/artifacts/vendor_overlay/daily_index.json \
       --sync-vendor-delta /app/artifacts/vendor_delta/market_delta.duckdb \
+      --sync-vendor-delta-raw /app/artifacts/vendor_delta_raw/market_delta_raw.duckdb \
       --require-readiness \
     > "$TMP" 2>&1
   return $?
@@ -114,6 +132,17 @@ if not d.get("ok") or not readiness.get("written"):
           f"readiness.written={readiness.get('written')} "
           f"readiness.error={readiness.get('error')}")
     sys.exit(1)
+dual = bool(d.get("dual_delta_enabled"))
+# 双 delta 模式下两个角色都必须 reported updated；ok 已经涵盖这一点，这里再显式
+# 打一遍是为了让日志自己就能回答"今晚 raw 到底推没推进"，不必回读 summary。
+if dual:
+    execution = d.get("execution_delta_sync") or {}
+    if not execution.get("updated"):
+        print(f"[verify] NOT releasable: dual delta enabled but execution role "
+              f"updated={execution.get('updated')} reason={execution.get('reason')}")
+        sys.exit(1)
+    print(f"[verify] dual delta ok: execution={execution.get('db')} "
+          f"mode={execution.get('price_series_mode')}")
 print(f"[verify] ok=true, target={d.get('target_trade_date', '')}, readiness published")
 PY
   then
