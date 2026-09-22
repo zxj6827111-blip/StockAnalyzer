@@ -2266,7 +2266,7 @@ CLI  ：两者互斥 → usage error（退出 2），marker 不落盘
 
 `--skip-price-mode-certification` 仍可用于只读诊断。
 
-## 22.4 文档修正（原有两处表述是错的）
+## 22.4 文档修正（原有三处表述是错的）
 
 ```text
 错：P0 与 P1 "无文件重叠"
@@ -2283,9 +2283,46 @@ CLI  ：两者互斥 → usage error（退出 2），marker 不落盘
     epoch 或恢复 dual updater。已写入 RAW wiring 文档 §7。
 ```
 
-## 22.5 本轮验证
+## 22.5 本轮验证（本地实测 + CI）
 
-（见 §22.6，实测数字。）
+```text
+分支 / HEAD            feat/alpha-v2-raw-execution-delta-r1 @ 378abc9
+PR                     #88（base=main）
+
+定向（spec §16 五文件 + 关键字选择）
+  tests/test_alpha_v2_raw_execution_delta_wiring.py
+  tests/test_raw_delta_baseline_identity.py
+  tests/test_nightly_readiness_authoritative.py
+  tests/test_nas_stock_updater_script.py
+                      80 passed / 1 skipped
+  tests/test_alpha_v2_m4l_cycle_clean_day_e2e.py
+                      11 passed（含 ALPHA-RDY-2 真实 CLI：clean_oos_days=1）
+  tests/test_alpha_v2_m4l_shadow_cycle_scheduler.py
+                      14 passed（含 ALPHA-RDY-1/3）
+  关键字 -k "nightly_readiness or raw_delta or alpha_v2"
+                      全绿（0 failed）
+
+tests/ 裸跑（干净串行） 3898 collected / 0 failed / 0 error / exit 0
+                     基线（#87 合并后）= 3884 → 新增 14 例，数字自洽
+
+clean-scope 质量门     ruff + mypy blocking rc=0，blocking_failures=[]
+full 质量门            pytest rc=0；coverage 80.87%（下限 75%）；blocking_failures=[]
+GitHub CI              PR #88 checks 全绿（见 PR）
+
+CI 一次 flake 与排除过程（留证，不要当成"影响不大"的推断）
+  现象    test_week5_scan_funnel_policy.py::test_week5_offhours_forced_profile_runs_snapshot_funnel
+          deep 选出 5 只而非 6（缺 601318）；--reruns 2 用尽
+  取证一  同一 commit 378abc9 三次判定：run 35693132201 attempt1 **pass**；
+          run 35693154338 attempt1 fail / attempt2 **pass** → 非确定性，同一棵树
+  取证二  本地同一棵树：裸全量 0 failed、full 质量门 rc=0、失败文件连续 3 次 24 passed
+  取证三  把 check_nightly_readiness / read_nightly_readiness 整体替换为**抛错函数**后
+          再跑该用例 —— 仍然通过 ⇒ 该路径根本不触及本次 readiness 改动（直接运行时检验，
+          不是"影响不大"的推断）。临时取证用例跑完即删。
+  定性    与项目既有记录同型（PROGRESS §18.3「负载性 flaky：单跑即过」）
+  处置    不改被测代码；flake 归入既有 backlog，不通过放宽断言掩盖
+```
+新增用例清单（14）：RDY-1..7 与 `test_rdy_broken_v3_still_reports_data_not_ready_for_week5`
+（8）、MARK-1..3（3）、ALPHA-RDY-1/3（2）、ALPHA-RDY-2（1）。
 
 ## 22.6 状态边界
 
