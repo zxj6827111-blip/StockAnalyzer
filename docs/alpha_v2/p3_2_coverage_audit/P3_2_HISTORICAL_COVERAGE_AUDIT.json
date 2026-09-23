@@ -1,0 +1,173 @@
+{
+  "schema": "p3_2_historical_coverage_audit.v1",
+  "compiled_at_local": "2026-09-23T23:30+08:00",
+  "scope": {
+    "question": "Where did the bars that are missing on 2025-11-17 (and same-shape dates) disappear, and can the coverage guard be decided on evidence?",
+    "source_window": ["2024-11-14", "2026-08-31"],
+    "decision_window": ["2025-06-02", "2026-08-31"],
+    "warmup_days": 200,
+    "feature_panel": {
+      "db": "/app/artifacts/vendor_delta/market_delta.duckdb",
+      "price_series_mode": "qfq",
+      "rows_loaded": 2259889,
+      "symbols": 5818,
+      "sessions_in_window": 306,
+      "range": ["2024-11-14", "2026-08-31"]
+    },
+    "execution_panel": {
+      "db": "/app/artifacts/vendor_delta_raw/market_delta_raw.duckdb",
+      "price_series_mode": "raw",
+      "rows_loaded": 2372392,
+      "symbols": 5818,
+      "range": ["2024-11-14", "2026-08-31"]
+    },
+    "vendor_source": {
+      "root": "/data/vendor_history (host: /vol1/1000/股票历史数据)",
+      "daily_archives": "全A日K/YYYY.zip, one directory per symbol (YYYY/CODE.EX.csv), 5,718 entries for 2025",
+      "2025_zip_internal_timestamp": "2026-05-04 15:42 (archive entries)",
+      "2025_zip_mtime": "2026-07-25 00:15",
+      "2026_zip": "updated nightly by the project updater (mtime 2026-09-23 19:57)"
+    }
+  },
+  "method": {
+    "layers_probed": ["vendor ZIP", "daily_index.json", "RAW delta DB", "QFQ delta DB", "freeze panels (pit_universe)", "independent vendor (Tushare daily API)"],
+    "zip_vs_db": "single pass over 2025.zip reading every symbol CSV; per-date symbol sets compared with both delta DBs",
+    "pit_replication": "asof_universe rule replicated (history_window_days = (60+5)*1.6+5 = 109 natural days, bars_in_window >= 60) and validated against the official P3 dry-run per-day series",
+    "daily_metrics": {
+      "hole_both": "symbols present on previous session AND next session but absent on the day (single-day hole, both panels)",
+      "gap_10sess": "symbols with a bar within +/-10 sessions but absent on the day (robust to multi-day holes)",
+      "max_run": "longest contiguous numeric code run inside the absent/filtered set (structural signature of batch/chunk loss)",
+      "breadth_ratio": "day bar count / median of the preceding 20 sessions (the working-tree revision's day gate metric)"
+    },
+    "independent_source_cross_check": "Tushare daily(trade_date=...) for 2025-10-09/10-10/10-13/11-14/11-17/11-18 + cluster dates (2025-04-28..30, 2025-11-11..13, 2025-12-24, 2026-04-28..30)"
+  },
+  "findings": {
+    "vendor_zip_equals_delta_per_date": {
+      "result": "For every trading day of 2025 the ZIP's (symbol,date) set is exactly equal to the qfq delta and the raw delta (0 differences on all 243 dates).",
+      "consequence": "No download / ingest / dedup / upsert / date-parse / merge defect exists for 2025. The bars that are missing from the delta DBs are missing from the vendor package itself."
+    },
+    "layer_of_first_disappearance": {
+      "2025-11-17": "vendor_source (全A日K/2025.zip) - the row is absent inside each affected symbol's CSV",
+      "2025-11-18": "vendor_source (全A日K/2025.zip)",
+      "2025-11-11/12/13": "vendor_source (small holes; Tushare has the bars)",
+      "2025-12-24": "vendor_source (small hole; Tushare has the bars)",
+      "2025-04-28..30, 2026-04-27..30": "market - no trading in either source (Tushare also lacks the symbols)",
+      "2025-10-09..2025-10-24 elevated filtering": "market symbol-identity migration (BSE code segment 430/83/87xxx -> 920xxx), not a coverage gap",
+      "2024-11-13..2024-12-16": "qfq build / factor coverage onset (feature side only; raw is complete)",
+      "2026-07-17..2026-07-31": "qfq build / factor coverage (feature side only; 27 symbols per session)"
+    },
+    "daily_distribution": {
+      "sessions_with_pit_data": 435,
+      "filtered_ratio_percentiles": {"p50": 0.001485, "p90": 0.002978, "p95": 0.005085, "p99": 0.046615, "max": 0.122512},
+      "filtered_ratio_percentiles_excluding_11-17_11-18": {"p99": 0.046421, "max": 0.047346},
+      "source_window_totals": {"candidates": 1917875, "filtered": 7219, "ratio": 0.003764},
+      "decision_window_totals": {"candidates": 1650654, "filtered": 6602, "ratio": 0.004000,
+                                 "note": "identical to the P3/P3.1 official numbers (per-day table drops the last session 2026-08-31 = 5510 candidates / 6 filtered, which closes the sum exactly)"},
+      "bracket_missing_ratio_percentiles": {"p50": 0.0, "p90": 0.000547, "p95": 0.000908, "p99": 0.006608, "max": 0.140229}
+    },
+    "structural_signature": {
+      "production_window_run_histogram": {"0": 24, "1": 358, "2": 16, "3": 2, "23": 1, "57": 1},
+      "production_window_days_with_run_ge_4": ["2025-11-17 (run 57, 634 filtered)", "2025-11-18 (run 23, 281 filtered)"],
+      "production_window_days_with_run_eq_3": ["2025-11-11 (26)", "2025-11-12 (34)"],
+      "bse_migration_days_max_run": 2,
+      "ten_year_local_panel": {"db": "artifacts/warehouse/market.duckdb", "sessions": 2489, "judged": 2429,
+                               "max_run_legitimate": 3,
+                               "run_histogram": {"0": 54, "1": 2110, "2": 247, "3": 16, "580": 2},
+                               "days_with_run_ge_4": ["2026-04-02 (run 580, truncated DB tail)", "2026-04-03 (run 580)"],
+                               "missing_ratio_percentiles": {"p50": 0.001779, "p90": 0.016866, "p99": 0.028572, "max_legitimate": 0.046901}},
+      "conclusion": "Long contiguous numeric code runs are a defect signature: legitimate days never exceed run 3 in either panel over ten years; the two defective days are 23 and 57."
+    },
+    "breadth_gate_calibration": {
+      "metric": "day bar count / median(preceding 20 sessions)",
+      "production_window": {"2025-11-17": 0.8677, "2025-11-18": 0.9517, "2025-11-12": 0.9963, "2025-12-24": 0.9988,
+                            "2025-10-09..10-24_bse_migration": "0.996-0.999", "2025-04-29": 0.9942, "2026-04-29": 0.9942},
+      "ten_year_local_panel": {"p01": 0.9953, "p05": 0.9997, "min": 0.0083,
+                               "days_below_0.95": ["2026-04-01 (0.9211, partial truncation)", "2026-04-02 (0.0095)", "2026-04-03 (0.0083)"],
+                               "days_below_0.90": ["2026-04-02", "2026-04-03"],
+                               "lowest_legitimate_non_truncation": 0.9698},
+      "conclusion": "The 0.90 day-breadth gate has no false positive in ten years and does catch 2025-11-17 (0.8677). It does NOT catch 2025-11-18 (0.9517) - neither at 0.95."
+    },
+    "cross_panel_asymmetry": {
+      "feature_has_bar_execution_has_not": {"measured": "0 keys on the decision window (P3.1 evidence, independently reproduced: filtered_with_feature_bar = 0 on 435/435 sessions)", "guard": "fail closed (DEFECT_REASON_CROSS_PANEL_DIVERGENCE)"},
+      "execution_has_bar_feature_has_not": {
+        "measured": "2026-07-17..2026-07-31: 27 symbols per session (raw_only), 0 on all other sessions of the window",
+        "symbols_sample": ["000001", "600000", "000539", "002648", "300166"],
+        "end_to_end_row_loss": {"2026-07-16": {"pit_candidates": 5486, "feature_frame_rows": 5481, "silently_lost": 5, "ratio": 0.00091},
+                                "2026-07-20": {"pit_candidates": 5489, "feature_frame_rows": 5458, "silently_lost": 31, "ratio": 0.00565},
+                                "2026-07-27": {"pit_candidates": 5494, "feature_frame_rows": 5457, "silently_lost": 37, "ratio": 0.00673},
+                                "2026-08-03": {"pit_candidates": 5498, "feature_frame_rows": 5492, "silently_lost": 6, "ratio": 0.00109},
+                                "note": "07-16 and 08-03 are controls outside the 07-17..07-30 gap; the defect period loses 25-31 extra rows per session (~300 rows over 11 sessions)"},
+        "effect": "daily_feature_frame returns no row for those (symbol,date) keys, and build_dual_price_training_frame merges features with 'how=inner', so those decision rows are silently dropped from the training frame; training only masks on labels.notna(), not on feature presence",
+        "guard": "NONE in be2e4ef and NONE in the current working-tree revision (the day-breadth comparison sees 5495/5522 = 0.995 and passes)"
+      }
+    },
+    "official_number_reconciliation": {
+      "pit_eligible_replication_vs_official": {"days": 306, "mismatches": 0},
+      "decision_window_candidates": {"audit": 1645144, "official": 1650654, "delta": 5510, "explanation": "the audit per-day table skips the final session (no next day); adding 2026-08-31 (5510) closes the gap exactly"},
+      "decision_window_filtered": {"audit": 6596, "official": 6602, "delta": 6, "explanation": "same single session"}
+    }
+  },
+  "classification_legend": ["NORMAL_SUSPENSION", "UPSTREAM_SOURCE_GAP", "INGESTION_DEFECT", "DELTA_MERGE_DEFECT", "PANEL_BUILD_DEFECT", "SYMBOL_IDENTITY_MIGRATION", "PANEL_COVERAGE_ONSET", "UNKNOWN"],
+  "anomalous_dates": [
+    {"date": "2025-11-17", "missing_both": 724, "missing_ratio": 0.140229, "filtered": 634, "max_run": 57,
+     "vendor_zip_has_bars": false, "tushare_has_bars": true, "source_has_data": false,
+     "first_missing_stage": "vendor_source", "root_cause": "UPSTREAM_SOURCE_GAP",
+     "repairable": true, "breadth_ratio": 0.8677, "caught_by_breadth_gate_0.90": true},
+    {"date": "2025-11-18", "missing_both": 271, "missing_ratio": 0.057549, "filtered": 281, "max_run": 23,
+     "vendor_zip_has_bars": false, "tushare_has_bars": true, "source_has_data": false,
+     "first_missing_stage": "vendor_source", "root_cause": "UPSTREAM_SOURCE_GAP",
+     "repairable": true, "breadth_ratio": 0.9517, "caught_by_breadth_gate_0.90": false},
+    {"date": "2025-11-11", "missing_both": 23, "missing_ratio": 0.004254, "filtered": 26, "max_run": 3,
+     "vendor_zip_has_bars": false, "tushare_has_bars": true, "source_has_data": false,
+     "first_missing_stage": "vendor_source", "root_cause": "UPSTREAM_SOURCE_GAP", "repairable": true},
+    {"date": "2025-11-12", "missing_both": 29, "missing_ratio": 0.005373, "filtered": 34, "max_run": 3,
+     "vendor_zip_has_bars": false, "tushare_has_bars": true, "source_has_data": false,
+     "first_missing_stage": "vendor_source", "root_cause": "UPSTREAM_SOURCE_GAP", "repairable": true},
+    {"date": "2025-11-13", "missing_both": 17, "missing_ratio": 0.003143, "filtered": 24, "max_run": 2,
+     "vendor_zip_has_bars": false, "tushare_has_bars": true, "source_has_data": false,
+     "first_missing_stage": "vendor_source", "root_cause": "UPSTREAM_SOURCE_GAP", "repairable": true},
+    {"date": "2025-12-24", "missing_both": 17, "missing_ratio": 0.003122, "filtered": 13, "max_run": 2,
+     "vendor_zip_has_bars": false, "tushare_has_bars": true, "source_has_data": false,
+     "first_missing_stage": "vendor_source", "root_cause": "UPSTREAM_SOURCE_GAP", "repairable": true},
+    {"date": "2025-10-09..2025-10-24", "missing_both": "0-1", "filtered": "246-256/day (4.55%-4.74%)", "max_run": 2,
+     "vendor_zip_has_bars": true, "tushare_has_bars": true, "source_has_data": true,
+     "first_missing_stage": "market", "root_cause": "SYMBOL_IDENTITY_MIGRATION", "repairable": "n/a"},
+    {"date": "2025-04-28..30 / 2026-04-27..30", "missing_both": "34-41", "missing_ratio": "0.0064-0.0077",
+     "filtered": "39-51/day", "max_run": 2, "vendor_zip_has_bars": false, "tushare_has_bars": false,
+     "source_has_data": false, "first_missing_stage": "market", "root_cause": "NORMAL_SUSPENSION", "repairable": "n/a"},
+    {"date": "2026-07-17..2026-07-31", "missing_both": 0, "filtered": "4-10/day", "max_run": 1,
+     "vendor_zip_has_bars": true, "tushare_has_bars": true, "source_has_data": true,
+     "first_missing_stage": "qfq_build_feature_side", "root_cause": "PANEL_BUILD_DEFECT", "repairable": true},
+    {"date": "2024-11-13..2024-12-16", "missing_both": "up to 4906 (feature side)", "filtered": "n/a (warmup)",
+     "max_run": 78, "vendor_zip_has_bars": true, "tushare_has_bars": true, "source_has_data": true,
+     "first_missing_stage": "qfq_build_feature_side", "root_cause": "PANEL_COVERAGE_ONSET", "repairable": "identity-changing"}
+  ],
+  "guard_recommendation": {
+    "principle": "Magnitude ratios cannot separate legitimate structure from defects in this window: the legitimate BSE-migration days carry the LARGEST filtered population (4.7%/day) while a real vendor hole (2025-11-18) carries 5.4% - adjacent values. Structural evidence separates them with a wide margin.",
+    "structurally_measured_facts": {
+      "max_filtered_ratio_legitimate_production_window": 0.047346,
+      "max_filtered_ratio_legitimate_ten_year_window": 0.046901,
+      "max_contiguous_run_legitimate": 3,
+      "defect_run_values": [23, 57],
+      "breadth_ratio_lowest_legitimate_non_truncation": 0.9698,
+      "breadth_ratio_p01_ten_year": 0.9953
+    },
+    "proposed_minimum_change": [
+      "keep the P3.1 contract fix (three-way decision: keep / filter / fail-closed on structural defects) unchanged",
+      "keep the day-breadth gate (validated, zero false positives in ten years); consider 0.95 instead of 0.90 to also catch partial truncation (2026-04-01 = 0.9211)",
+      "ADD a contiguous-run gate on the filtered set per decision day: fail closed at max_run >= 8 (measured legitimate max 3 over 2,429 + 435 sessions; observed defect 23 and 57), audit at >= 4",
+      "ADD a one-sided cross-panel gate for execution-bar-without-feature-bar (2026-07-17..07-31: 27/day) because those rows are silently dropped by the inner join",
+      "restore the single-day ratio gate from 50% back to the measured 10% (ten-year legitimate max 3.83% daily; production legitimate max 4.73%), or drop it once the structural gates exist",
+      "re-derive the window-level 2% gate: the ten-year legitimate maximum window value is 2.0773% (2016), so 2% is falsified as a default"
+    ],
+    "explicitly_not_recommended": [
+      "raising any ratio threshold so that 2025-11-17 passes",
+      "treating 'both panels lack the bar' as proof of suspension (no independent PIT-safe halt source exists; the two panels share the same upstream chain)"
+    ]
+  },
+  "boundaries": {
+    "no_writes": "all NAS access was read-only (duckdb read_only, one-off container with :ro mounts); no model/epoch/production artifact was created",
+    "not_executed": ["model freeze", "epoch open", "production preflight", "production promotion", "Alpha/feature/label/target/window changes", "data repair"],
+    "working_tree_state": "an external session is concurrently editing the P3.1 files; see the report's snapshot section for the exact hashes reviewed"
+  }
+}
