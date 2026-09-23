@@ -22,7 +22,15 @@ python scripts/alpha_v2_shadow_model_freeze.py \
 ```
 
 任何一份 execution 面板不是 ``raw + certified`` 就 **fail closed（exit 4）**，且守卫
-在构造完整特征矩阵之前执行——不允许"跑 90 分钟才发现口径错了"。
+在构造完整特征矩阵之前执行——不允许"跑 90 分钟才发现口径错了"。**契约违例一律以
+exit 4 退出**（``PriceSeriesContractError`` 在本文件被显式捕获，不走未捕获 traceback）。
+
+P3.1（有效决策集契约，2026-09-23）：PIT 候选池按设计含"当天停牌"的票
+（``expected_active_lookback_days=5``），这些 ``(symbol, date)`` 在 execution 面板里
+没有当日 bar 属**预期内事实**——它们被**过滤**出训练帧并记入审计
+（``dual_price_evidence.decision_alignment``：before / filtered / after / 原因 / 样例 /
+单日最大占比），而**不是**让整个 freeze 失败。反之，整票缺席 / 整天不是交易日 /
+feature 侧有 bar 而 execution 没有 → 面板结构缺陷，仍然 fail closed（exit 4）。
 
 ``--market-db`` 是旧的单库参数：**只在 ``--rehearsal`` 下被接受**（两个角色绑同一份
 库，provenance 如实标 ``db_role_binding=legacy_single_db`` 与
@@ -273,17 +281,42 @@ def main(argv: list[str] | None = None) -> int:
     slippage = matcher.static_slippage_ratio("trend")
 
     # ── 训练帧：feature 侧出 X，execution 侧出 y（守卫在函数第一步）───────────
-    built = build_dual_price_training_frame(
-        feature_panel=feature_panel,
-        execution_panel=execution_panel,
-        decisions=decisions,
-        matcher=matcher,
-        slippage_ratio=slippage,
-        execution_certification=execution_certification,
-        feature_certification=feature_certification,
-        spec=OutcomeSpec(),
-        context="freeze_model",
+    try:
+        built = build_dual_price_training_frame(
+            feature_panel=feature_panel,
+            execution_panel=execution_panel,
+            decisions=decisions,
+            matcher=matcher,
+            slippage_ratio=slippage,
+            execution_certification=execution_certification,
+            feature_certification=feature_certification,
+            spec=OutcomeSpec(),
+            context="freeze_model",
+        )
+    except PriceSeriesContractError as exc:
+        # 文档化的 exit 4 必须真的以 4 退出：本调用此前**没有**捕获（同文件对 panel /
+        # cert 的调用都有），于是价格序列契约违例会以未捕获 traceback 的形式变成解释器
+        # exit 1，与文档、上游判据、验收脚本里的 exit 码全部脱节（2026-09-23 判定）。
+        print(f"[freeze-model] 拒绝（exit_code={exc.exit_code}）: {exc}", file=sys.stderr)
+        return exc.exit_code
+    alignment = dict(built.evidence.get("decision_alignment") or {})
+    filtered_rows = int(alignment.get("filtered_missing_execution_rows", 0) or 0)
+    print(
+        "[freeze-model] Dual price alignment: "
+        f"before: {alignment.get('decision_rows_before', 0)} decision keys / "
+        f"filtered: {filtered_rows} unavailable execution bars / "
+        f"after: {alignment.get('decision_rows_after', 0)} aligned keys / "
+        f"status: {alignment.get('status', 'PASS')}"
     )
+    if filtered_rows:
+        print(
+            f"[freeze-model]   过滤原因 {alignment.get('filter_reason', '')} "
+            f"（占比 {float(alignment.get('filtered_ratio', 0.0)):.4%}，"
+            f"单日最大 {float(alignment.get('max_daily_filtered_ratio', 0.0)):.4%} @ "
+            f"{alignment.get('max_daily_filtered_date', '')}；"
+            f"例：{list(alignment.get('filtered_examples') or [])[:5]}）"
+            "——PIT 候选含停牌日，属预期内；被过滤行不进入训练帧"
+        )
     frame = select_frame_columns(
         built.frame,
         safe_features=built.safe_feature_columns,

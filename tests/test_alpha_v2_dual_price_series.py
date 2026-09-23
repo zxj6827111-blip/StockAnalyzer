@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import functools
 import json
+import re
 import subprocess
 import sys
 from datetime import date, datetime, timedelta
@@ -44,13 +45,19 @@ from _alpha_v2_m3_fixtures import (
     shadow_row_identity,
     write_freeze_manifest,
 )
-from _alpha_v2_research_helpers import DAYS, matcher as _matcher
+from _alpha_v2_research_helpers import DAYS, bar as _bar, matcher as _matcher, panel as _panel
 
 from stock_analyzer.alpha_v2.dual_price_series import (
     DB_ROLE_BINDING_DUAL,
     DB_ROLE_BINDING_LEGACY,
+    DEFECT_REASON_CROSS_PANEL_DIVERGENCE,
+    DEFECT_REASON_DATE_NOT_SESSION,
+    DEFECT_REASON_SYMBOL_ABSENT,
+    FILTER_REASON_NO_EXECUTION_BAR,
     PriceSeriesContractError,
+    assert_decisions_aligned,
     certification_from_declaration,
+    filter_decisions_by_execution_availability,
     price_series_identity_block,
     require_certified_execution_series,
     require_declared_feature_series,
@@ -1408,3 +1415,476 @@ def test_live_m5_rehearsal_style_fallback_is_labeled(tmp_path, monkeypatch):
     assert summary["validation_mode"] == "rehearsal"
     assert summary["rows_written"] == len(SYMBOLS)
     assert outcome_path(tmp_path, epoch.epoch_id, signal_day).exists()
+
+
+# ---------------------------------------------------------------------------
+# DP-11..DP-18：P3.1 有效决策集契约（PIT 候选 → execution 可用 → 训练帧）
+#
+# 背景（2026-09-23 P3 Freeze Preparation 实测）：生产窗口上原来的逐项对齐门把
+# 6602/1650654（0.400%）条 decision 判成"缺失"→ fail closed，freeze 根本跑不起来。
+# 那不是数据缺失，而是契约写错了位置：``expected_active_lookback_days=5`` 的设计就是
+# 让"最近 5 个交易日内交易过、当天停牌"（含退市/长停期间仍在 history 窗口内的票）
+# 留在**候选**池里——候选集不是可交易集。本组用例把修正后的契约钉死：
+#
+# ==========================  ==============================================
+# DP-11                       根因前提：PIT eligible 确实含"当天无 bar"的票
+# DP-12                       Case 1/2：交易日保留、停牌日过滤（不是 error）
+# DP-13                       Case 3a：整票缺席 execution 面板 → 仍然 fail
+# DP-14                       Case 3b/3c：整天不是交易日 / 跨面板分歧 → fail
+# DP-15                       量级闸：总体占比、单日占比
+# DP-16                       不变性：过滤 ≡ 只喂对齐后的决策（不改变策略）
+# DP-17                       严格版 assert_decisions_aligned 语义未被放松
+# DP-18                       CLI：打印 alignment 报告；结构缺陷以 exit 4 退出
+# ==========================  ==============================================
+# ---------------------------------------------------------------------------
+
+
+def _weekdays(count: int, *, start: date | None = None) -> list[date]:
+    """从 ``start``（默认 DAYS[0]）起的连续 count 个工作日（与 helpers 同口径）。"""
+    days: list[date] = []
+    current = start or DAYS[0]
+    while len(days) < count:
+        if current.weekday() < 5:
+            days.append(current)
+        current += timedelta(days=1)
+    return days
+
+
+def _availability_bars(
+    symbols: list[str],
+    days: list[date],
+    *,
+    missing: set[tuple[str, str]] | frozenset[tuple[str, str]] = frozenset(),
+    mode: str,
+    start_price: float = 10.0,
+) -> list[dict[str, object]]:
+    """造一段温和上行的合法行情；``missing`` 里的 ``(symbol, ISO 日期)`` 不产出 bar。
+
+    停牌形态：中间**没有** bar（而不是补一根零成交），复牌那根的 ``prev_close`` 取
+    上一根**实际存在**的 bar 收盘——这正是数据里的样子。
+    """
+    omitted = {(str(symbol), str(day)) for symbol, day in missing}
+    bars: list[dict[str, object]] = []
+    for index, symbol in enumerate(symbols):
+        prev = start_price + index
+        for day in days:
+            if (str(symbol), day.isoformat()) in omitted:
+                continue
+            close = round(prev * 1.004, 2)
+            bars.append(
+                _bar(
+                    symbol,
+                    day,
+                    open_=prev,
+                    high=round(max(prev, close) * 1.001, 2),
+                    low=round(min(prev, close) * 0.999, 2),
+                    close=close,
+                    prev_close=prev,
+                    price_series_mode=mode,
+                )
+            )
+            prev = close
+    return bars
+
+
+def _availability_panels(
+    days: list[date],
+    symbols: list[str],
+    *,
+    execution_missing: set[tuple[str, str]] | frozenset[tuple[str, str]] = frozenset(),
+    feature_missing: set[tuple[str, str]] | frozenset[tuple[str, str]] | None = None,
+    execution_symbols: list[str] | None = None,
+):
+    """一对面板（feature=qfq / execution=raw）+ 各自的口径认证。
+
+    ``feature_missing`` 默认与 ``execution_missing`` 相同——这是生产实测的形态
+    （两侧都没有那根 bar，``feature_only=0``）。显式传不同值即构造"跨面板分歧"；
+    ``execution_symbols`` 少于 feature 侧即构造"整票缺席"。
+    """
+    if feature_missing is None:
+        feature_missing = execution_missing
+    feature = _panel(_availability_bars(symbols, days, missing=feature_missing, mode="qfq"))
+    execution = _panel(
+        _availability_bars(
+            symbols if execution_symbols is None else execution_symbols,
+            days,
+            missing=execution_missing,
+            mode="raw",
+        )
+    )
+    return {
+        "feature": feature,
+        "execution": execution,
+        "feature_cert": feature.certify_price_mode(min_sample=1),
+        "execution_cert": execution.certify_price_mode(min_sample=1),
+    }
+
+
+def _build_availability(panels, decisions):
+    return dpf.build_dual_price_training_frame(
+        feature_panel=panels["feature"],
+        execution_panel=panels["execution"],
+        decisions=decisions,
+        matcher=_matcher(),
+        slippage_ratio=0.0,
+        execution_certification=panels["execution_cert"],
+        feature_certification=panels["feature_cert"],
+        context="dp_availability",
+    )
+
+
+def test_dp11_pit_eligible_universe_contains_symbols_without_bar_that_day():
+    """DP-11（根因前提）：PIT eligible 池确实包含"当天没有 bar"的票——它不是可交易集。
+
+    这是契约修正的**前提事实**，不是推论：``known_suspended``（eligible 但 lookback
+    内 0 根 bar，停牌/停更）被列进 ``eligible_symbols``，于是"当天无 bar"的
+    ``(symbol, date)`` 是候选池的正常成员。这条不成立，过滤就没有存在理由。
+    """
+    days = _weekdays(90)
+    halted = "600001"
+    halt_days = {days[index] for index in range(80, 90)}
+    panels = _availability_panels(
+        days,
+        [halted, "600002"],
+        execution_missing={(halted, day.isoformat()) for day in halt_days},
+    )
+    feature = panels["feature"]
+    as_of = days[85]
+    universe = feature.pit_universe(as_of=as_of, min_history_days=60)
+    assert halted in universe.eligible_symbols, "前提：长停票仍在 PIT eligible 池里"
+    assert halted in universe.known_suspended_symbols
+    last_bar = feature.symbol_bars(halted).index.max().date()
+    assert last_bar < as_of, "前提：该票在决策日当天没有 bar"
+    assert last_bar == days[79], "前提：缺失是停牌（前面有 bar），不是面板缺这只票"
+
+
+def test_dp12_trading_day_kept_and_halt_day_filtered(dual_dbs):
+    """DP-12（Case 1 + Case 2）：交易日保留；当天停牌的行**过滤**而不是抛错。
+
+    Case 1：``(600000, D)`` 有 execution bar → 保留。
+    Case 2：``(600001, D)`` 停牌（两侧都没 bar）→ 过滤；且**同票的前一个交易日决策
+    仍然保留**（过滤粒度是 ``(symbol, date)``，不是整票）。
+    """
+    days = list(DAYS[:35])
+    decision_days = [days[19], days[DECISION_INDEX]]
+    traded, halted = SYMBOLS[0], SYMBOLS[1]
+    panels = _availability_panels(
+        days,
+        SYMBOLS,
+        execution_missing={(halted, days[DECISION_INDEX].isoformat())},
+    )
+    decisions = [DecisionPoint(symbol, day) for day in decision_days for symbol in SYMBOLS]
+    built = _build_availability(panels, decisions)
+    report = built.evidence["decision_alignment"]
+
+    assert report["decision_rows_before"] == 8
+    assert report["filtered_missing_execution_rows"] == 1
+    assert report["decision_rows_after"] == 7
+    assert report["intersection"] == 7  # 与 decision_rows_after 同值（同一个交集）
+    assert report["filter_reason"] == FILTER_REASON_NO_EXECUTION_BAR
+    assert report["filtered_examples"] == [f"{halted}@{days[DECISION_INDEX].isoformat()}"]
+    assert report["status"] == "PASS"
+    assert report["aligned"] is False  # 发生了过滤（"零过滤"这个更强形态不成立）
+    assert report["filtered_dates"] == 1
+    assert report["universe"] == "pit_eligible_candidates"
+
+    keys = {
+        (str(row.symbol), str(row.decision_date))
+        for row in built.frame[["symbol", "decision_date"]].itertuples(index=False)
+    }
+    assert (traded, days[DECISION_INDEX].isoformat()) in keys  # Case 1：保留
+    assert (halted, days[DECISION_INDEX].isoformat()) not in keys  # Case 2：过滤
+    assert (halted, days[19].isoformat()) in keys  # 同票其它交易日不受影响
+    assert len(keys) == 7
+    accounting = built.evidence["decision_accounting"]
+    assert accounting["decision_universe_rows"] == 8
+    assert accounting["execution_available_rows"] == 7
+
+
+def test_dp13_symbol_absent_from_execution_panel_still_fails():
+    """DP-13（Case 3a）：整票缺席 execution 面板 → **仍然 fail closed**。
+
+    这是"真实数据缺失"的形态之一：feature 面板有这只票、execution 面板完全没有。
+    静默过滤会把"整只票断供"伪装成"少了几行训练样本"，所以必须拦。
+    """
+    days = list(DAYS[:35])
+    panels = _availability_panels(
+        days,
+        SYMBOLS,
+        execution_symbols=SYMBOLS[:3],
+    )
+    decisions = [DecisionPoint(SYMBOLS[3], days[DECISION_INDEX])]
+    with pytest.raises(PriceSeriesContractError) as excinfo:
+        _build_availability(panels, decisions)
+    assert DEFECT_REASON_SYMBOL_ABSENT in str(excinfo.value)
+
+
+def test_dp14_date_not_a_session_and_cross_panel_divergence_still_fail():
+    """DP-14（Case 3b/3c）：整天不是 execution 交易日 / 跨面板分歧 → **仍然 fail**。
+
+    3b：决策日整份 execution 面板没有（被截断/换库）——不是停牌，是面板不对。
+    3c：feature 侧**有**当天 bar 而 execution 没有——两份面板对同一事实给出不同答案，
+        且这种行还会改变质量池排名分母，静默过滤同样不可接受。
+    """
+    days = list(DAYS[:35])
+    decision_day = days[DECISION_INDEX]
+    traded = SYMBOLS[0]
+
+    whole_day_gone = {(symbol, decision_day.isoformat()) for symbol in SYMBOLS}
+    panels_b = _availability_panels(days, SYMBOLS, execution_missing=whole_day_gone)
+    with pytest.raises(PriceSeriesContractError) as excinfo_b:
+        _build_availability(panels_b, [DecisionPoint(traded, decision_day)])
+    assert DEFECT_REASON_DATE_NOT_SESSION in str(excinfo_b.value)
+
+    panels_c = _availability_panels(
+        days,
+        SYMBOLS,
+        execution_missing={(traded, decision_day.isoformat())},
+        feature_missing=set(),
+    )
+    with pytest.raises(PriceSeriesContractError) as excinfo_c:
+        _build_availability(panels_c, [DecisionPoint(traded, decision_day)])
+    assert DEFECT_REASON_CROSS_PANEL_DIVERGENCE in str(excinfo_c.value)
+
+
+def test_dp15_filter_ratio_ceilings_fail_closed():
+    """DP-15：过滤量级闸——总体占比超 2% / 单日**过半**被过滤 → fail。
+
+    判据本身是纯集合关系；量级闸是兜底，两条的语义不同（不能只留一个比例数）：
+
+    - 总体占比：窗口级断供（实测合法值 0.400%，上限 2%）；
+    - 单日占比：**这一天过半候选被过滤**=该日截面被毁（实测最大合法单日占比
+      12.25%：2025-11-17 两侧同时缺 724 个 symbol 的当日 bar，属链路覆盖缺口）。
+      只丢一侧由跨面板分歧检查逐键拦截，与量级无关，所以单日闸不必设得很紧。
+
+    这里用显式阈值做单变量实验（默认行数下限 50 会掩盖阈值逻辑，故先断言默认不误杀）。
+    """
+    days = _weekdays(30)
+    halted_day = days[25]
+    panels = _availability_panels(
+        days,
+        ["600000", "600001", "600002", "600003"],
+        execution_missing={
+            ("600001", halted_day.isoformat()),
+            ("600003", halted_day.isoformat()),
+        },
+    )
+    execution = panels["execution"]
+    traded = [DecisionPoint(symbol, halted_day) for symbol in ("600000", "600002")]
+    halted = [DecisionPoint(symbol, halted_day) for symbol in ("600001", "600003")]
+    decisions = [*traded, *halted]
+
+    # 默认阈值（总体 2% / 单日 50% / 行数下限 50）：小样本不误杀
+    ok = filter_decisions_by_execution_availability(
+        decisions=decisions, execution_panel=execution, context="unit"
+    )
+    assert ok.filtered_rows == 2 and ok.report["status"] == "PASS"
+    assert ok.report["decision_rows_after"] == 2
+    assert ok.report["filtered_dates_top"][0]["decision_date"] == halted_day.isoformat()
+
+    # 总体占比闸：floor=0、每日闸放到 99% → 2/4 = 50% > ceil(10%×4)=1 行
+    with pytest.raises(PriceSeriesContractError) as overall:
+        filter_decisions_by_execution_availability(
+            decisions=decisions,
+            execution_panel=execution,
+            context="unit",
+            max_filtered_ratio=0.10,
+            max_daily_filtered_ratio=0.99,
+            max_filtered_rows_floor=0,
+        )
+    assert "超过审计上限" in str(overall.value)
+
+    # 单日占比闸：总体闸放到 99%（允许 4 行）→ 每日允许 ceil(10%×4)=1 行，实际 2 行
+    with pytest.raises(PriceSeriesContractError) as daily:
+        filter_decisions_by_execution_availability(
+            decisions=decisions,
+            execution_panel=execution,
+            context="unit",
+            max_filtered_ratio=0.99,
+            max_daily_filtered_ratio=0.10,
+            max_filtered_rows_floor=0,
+        )
+    assert "单日过滤量异常" in str(daily.value)
+
+
+def test_dp15b_default_daily_ceiling_separates_partial_from_destroyed_cross_section():
+    """DP-15b（默认阈值语义，实测形态）：单日 40% 被过滤 → PASS；单日 60% → fail。
+
+    "部分覆盖缺口"（生产实测 2025-11-17 = 12.25%）必须放行并留证据，而"该日截面被毁"
+    必须拦住——这是**默认阈值**下的行为：200 只票 × 30 个决策日（6000 条候选）里，
+    某一天缺 80 票（该日 40%、全窗 1.3%）放行；缺 120 票（该日 60%）拦下。
+    窗口内多放几个决策日是有意的：总体闸（2%）算的是全窗，不能让"一天=全窗"的夹具
+    把总体闸和单日闸混成同一个判据。
+    """
+    days = _weekdays(30)
+    decision_days = days[:30]
+    partial_day = days[25]
+    symbols = [f"{600000 + index:06d}" for index in range(200)]
+    partial_missing = {(symbol, partial_day.isoformat()) for symbol in symbols[:80]}
+    destroyed_missing = {(symbol, partial_day.isoformat()) for symbol in symbols[:120]}
+    partial = _availability_panels(days, symbols, execution_missing=partial_missing)
+    destroyed = _availability_panels(days, symbols, execution_missing=destroyed_missing)
+    decisions = [DecisionPoint(symbol, day) for day in decision_days for symbol in symbols]
+
+    passed = filter_decisions_by_execution_availability(
+        decisions=decisions, execution_panel=partial["execution"], context="unit_partial"
+    )
+    assert passed.filtered_rows == 80 and passed.report["status"] == "PASS"
+    assert passed.report["max_daily_filtered_ratio"] == pytest.approx(0.4)
+    assert passed.report["filtered_ratio"] == pytest.approx(80 / len(decisions))
+    assert passed.report["limits"]["max_daily_filtered_ratio"] == 0.50
+    assert passed.report["filtered_dates_top"][0] == {
+        "decision_date": partial_day.isoformat(),
+        "filtered": 80,
+        "decisions": 200,
+        "ratio": 0.4,
+    }
+
+    with pytest.raises(PriceSeriesContractError) as excinfo:
+        filter_decisions_by_execution_availability(
+            decisions=decisions,
+            execution_panel=destroyed["execution"],
+            context="unit_destroyed",
+        )
+    assert "单日过滤量异常" in str(excinfo.value)
+
+
+def test_dp16_filtering_is_row_dropping_only(dual_dbs):
+    """DP-16（不变性）：过滤 ≡ 只把对齐后的决策喂进去——训练内容不受影响。
+
+    这是"契约修正不是策略变更"的可执行形式：同一批判据下，``build(全部候选)`` 与
+    ``build(只喂对齐行)`` 的**训练帧逐值相同**（行集合、特征、label、超额），
+    基准层与安全特征列也相同；差别只有审计里的 before/after 计数。
+    若有人把"过滤"改成"补行 / 回退 qfq / 改基准分母"，这条会立刻红。
+    """
+    days = list(DAYS[:35])
+    halted, halted_day = SYMBOLS[2], days[DECISION_INDEX]
+    panels = _availability_panels(
+        days,
+        SYMBOLS,
+        execution_missing={(halted, halted_day.isoformat())},
+    )
+    decision_days = days[16:24]
+    everything = [DecisionPoint(symbol, day) for day in decision_days for symbol in SYMBOLS]
+    kept_only = [
+        item for item in everything if (item.symbol, item.decision_date) != (halted, halted_day)
+    ]
+    filtered = _build_availability(panels, everything)
+    prefiltered = _build_availability(panels, kept_only)
+
+    report = filtered.evidence["decision_alignment"]
+    assert report["decision_rows_before"] == len(everything)
+    assert report["filtered_missing_execution_rows"] == 1
+    assert report["decision_rows_after"] == len(kept_only)
+    pd.testing.assert_frame_equal(
+        filtered.frame.reset_index(drop=True), prefiltered.frame.reset_index(drop=True)
+    )
+    assert filtered.evidence["benchmark_layers"] == prefiltered.evidence["benchmark_layers"]
+    assert (
+        filtered.evidence["benchmark_primary_layer"]
+        == prefiltered.evidence["benchmark_primary_layer"]
+    )
+    assert filtered.evidence["quality_pool_source"] == prefiltered.evidence["quality_pool_source"]
+    assert filtered.safe_feature_columns == prefiltered.safe_feature_columns
+
+
+def test_dp17_strict_alignment_assertion_is_not_relaxed():
+    """DP-17：``assert_decisions_aligned`` 仍是**零容忍**版本（过滤只在训练帧路径生效）。"""
+    days = list(DAYS[:35])
+    panels = _availability_panels(
+        days,
+        SYMBOLS,
+        execution_missing={(SYMBOLS[1], days[DECISION_INDEX].isoformat())},
+    )
+    decisions = [DecisionPoint(symbol, days[DECISION_INDEX]) for symbol in SYMBOLS]
+    with pytest.raises(PriceSeriesContractError):
+        assert_decisions_aligned(
+            decisions=decisions,
+            execution_panel=panels["execution"],
+            context="unit_strict",
+        )
+    aligned = [
+        DecisionPoint(symbol, days[DECISION_INDEX]) for symbol in SYMBOLS if symbol != SYMBOLS[1]
+    ]
+    payload = assert_decisions_aligned(
+        decisions=aligned, execution_panel=panels["execution"], context="unit_strict"
+    )
+    assert payload["aligned"] is True and payload["missing"] == 0
+
+
+def _freeze_cli(tmp_path: Path, *, feature_db: Path, execution_db: Path, days: list[date]):
+    return subprocess.run(  # noqa: S603 - 固定脚本 + 列表参数
+        [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "alpha_v2_shadow_model_freeze.py"),
+            "--rehearsal",
+            "--feature-market-db",
+            str(feature_db),
+            "--execution-market-db",
+            str(execution_db),
+            "--window-start",
+            days[0].isoformat(),
+            "--window-end",
+            days[-1].isoformat(),
+            "--warmup-days",
+            "5",
+            "--model-id",
+            "dp_availability_cli",
+            "--out",
+            str(tmp_path / "out"),
+        ],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=900,
+        check=False,
+    )
+
+
+def test_dp18_freeze_cli_reports_alignment_and_exits_4_on_defect(tmp_path):
+    """DP-18（Modification 2/3）：CLI 必须打印 alignment 报告；结构缺陷以 exit 4 退出。
+
+    ① 结构缺陷（execution 面板少了整票）→ **exit 4**（文档化的契约退出码），而不是
+       未捕获 traceback 的 exit 1；且不写任何工件。
+    ② 健康面板 → 报告行必须出现且自洽（before == after、filtered == 0、status PASS）。
+       ② 只断言那一行：完整 freeze 训练不在本用例范围内（同一入口的其它环节各有专项
+       用例），所以这里不约束 ② 的退出码。
+
+    夹具需要 ≥60 根 bar 才可能有 PIT eligible 票（``min_history_days=60``），
+    故用 80 个工作日而不是 35。
+    """
+    days = _weekdays(80)
+    broken_feature = _write_db(
+        tmp_path / "cli_feature_qfq.duckdb", mode="qfq", days=days, symbols=SYMBOLS
+    )
+    broken_execution = _write_db(
+        tmp_path / "cli_execution_raw.duckdb", mode="raw", days=days, symbols=SYMBOLS[:3]
+    )
+    failed = _freeze_cli(
+        tmp_path, feature_db=broken_feature, execution_db=broken_execution, days=days
+    )
+    assert failed.returncode == 4, (failed.returncode, failed.stderr[-1500:])
+    assert "Traceback" not in failed.stderr
+    assert "exit_code=4" in failed.stderr
+    assert DEFECT_REASON_SYMBOL_ABSENT in failed.stderr
+    assert not (tmp_path / "out").exists()
+
+    healthy_feature = _write_db(
+        tmp_path / "cli_ok_feature_qfq.duckdb", mode="qfq", days=days, symbols=SYMBOLS
+    )
+    healthy_execution = _write_db(
+        tmp_path / "cli_ok_execution_raw.duckdb", mode="raw", days=days, symbols=SYMBOLS
+    )
+    passed = _freeze_cli(
+        tmp_path, feature_db=healthy_feature, execution_db=healthy_execution, days=days
+    )
+    match = re.search(
+        r"Dual price alignment: before: (\d+) decision keys / "
+        r"filtered: (\d+) unavailable execution bars / "
+        r"after: (\d+) aligned keys / status: (\w+)",
+        passed.stdout,
+    )
+    assert match is not None, passed.stdout[-2000:]
+    before, filtered, after, status = match.groups()
+    assert int(before) > 0 and int(before) == int(after) and int(filtered) == 0
+    assert status == "PASS"

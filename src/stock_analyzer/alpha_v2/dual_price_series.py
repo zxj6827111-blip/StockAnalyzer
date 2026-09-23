@@ -24,14 +24,40 @@ feature   面板：模式必须可证（qfq / raw 之一），并且必须等于
 三条纪律：
 
 1. **守卫在重活之前**：freeze 在构造完整特征矩阵之前就要拒绝，不允许"跑 90 分钟才报错"；
-2. **绝不猜测**：缺失的 raw execution row 不会退回 qfq、不会用 qfq 反推——直接不可用并
-   fail closed（见 :func:`assert_decisions_aligned`）；
+2. **绝不猜测**：缺失的 raw execution row 不会退回 qfq、不会用 qfq 反推——该样本直接
+   不可用（见下面"有效决策集"）；
 3. **身份成对封存**：``feature_data_identity`` / ``execution_data_identity`` 两条独立身份
    （库、口径、认证结论、指纹版本、source window、指纹、列、行数），两条都进工件哈希。
+
+**有效决策集契约（2026-09-23，P3.1）**：PIT 合格池是**候选**集而不是**可交易**集——
+``expected_active_lookback_days=5`` 的设计就是让"最近 5 个交易日内交易过、当天停牌"
+（以及退市/长停期间仍在 history 窗口内的票）留在候选里。所以三段集合必须显式分开：
+
+```text
+decision universe       PIT eligible ∩ feature 日历（候选，可能是停牌日）
+execution available     上述候选 ∩ execution 面板当日有 bar   ← 唯一可进入训练帧的集合
+training frame          execution available ∩ feature frame ∩ 有 label 的行
+```
+
+裁决只有两种，且**判据是可复现的集合关系**，不是比例感觉：
+
+- 该 ``(symbol, decision_date)`` 在 execution 面板既没有当日 bar，也**不是**"整票缺席/
+  整天缺席/feature 侧有 bar"→ **合法过滤**（记 ``NO_EXECUTION_BAR_ON_DECISION_DATE``
+  并写入审计：过滤前后行数、样例、按日最大占比）；
+- 整票缺席（``SYMBOL_NOT_IN_EXECUTION_PANEL``）、整天不是 execution 的交易日
+  （``DECISION_DATE_NOT_A_SESSION_IN_EXECUTION_PANEL``）、或 feature 侧**有**当日 bar
+  而 execution 没有（``FEATURE_PANEL_HAS_BAR_ON_DECISION_DATE``）→ **结构缺陷，fail
+  closed**：这三种都不是"停牌"，而是两份面板对同一份事实给出了不同答案——静默过滤会
+  把真实的断供/截断/换库伪装成"少了几行训练样本"。
+  另有两条量级闸（总体占比 / 单日占比）防止"看起来很合法"的大面积过滤。
+
+``assert_decisions_aligned`` 保留为**零容忍**版本（任何一条不齐即抛），供研究/回放等
+"必须逐条对齐"的路径使用；训练帧走 :func:`filter_decisions_by_execution_availability`。
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -116,6 +142,32 @@ IDENTITY_COMPARE_KEYS: tuple[str, ...] = (
     "price_series_mode",
     *IDENTITY_CONTENT_KEYS,
 )
+
+#: **合法过滤**的唯一原因码：该 ``(symbol, decision_date)`` 在 execution 面板里没有当日
+#: bar，但票与日期都在面板里（即"该票当天没交易"，而不是"面板缺这块数据"）。
+FILTER_REASON_NO_EXECUTION_BAR = "NO_EXECUTION_BAR_ON_DECISION_DATE"
+
+#: **结构缺陷**原因码（fail closed）——这些不是停牌，是面板本身不对。
+DEFECT_REASON_SYMBOL_ABSENT = "SYMBOL_NOT_IN_EXECUTION_PANEL"
+DEFECT_REASON_DATE_NOT_SESSION = "DECISION_DATE_NOT_A_SESSION_IN_EXECUTION_PANEL"
+DEFECT_REASON_CROSS_PANEL_DIVERGENCE = "FEATURE_PANEL_HAS_BAR_ON_DECISION_DATE"
+
+#: 过滤量级上限（防"看起来合法"的大面积过滤把真实断供吃掉）：
+#:
+#: - **总体上限 2%**：实测生产窗口（2025-06-02..2026-08-31）6602/1650654 = **0.400%**，
+#:   取 2% ≈ 5 倍余量；量级不对说明窗口级的断供/截断/换库。
+#: - **单日上限 50%**：判据是"这一天**过半**候选被过滤"，即该日截面被毁掉——只有这种
+#:   规模才可能是"整片 bar 缺失"。**实测最大合法单日占比 = 12.25%
+#:   （2025-11-17，634/5175）**：那一日 raw 与 qfq 两侧**同时**少 724 个 symbol 的
+#:   当日 bar（逐票形态是"前一根 11-14、后一根 11-18、只缺这一天"），属**上游链路
+#:   的覆盖率缺口**（两侧一致，不是跨面板分歧）。
+#:   注意分工：**单侧**丢失（execution 缺、feature 有）由跨面板分歧检查逐键拦截，
+#:   与量级无关；单日闸只兜"两侧同时大面积缺失"这一种，故阈值取"过半"而非"几个百分点"。
+#: - **行数下限 50**：小窗口/小夹具里几十行就是几个百分点，比例门会误杀；而"大面积
+#:   过滤"按定义是大数，行数下限不削弱任何检测能力。
+DEFAULT_MAX_FILTERED_RATIO = 0.02
+DEFAULT_MAX_DAILY_FILTERED_RATIO = 0.50
+DEFAULT_MAX_FILTERED_ROWS_FLOOR = 50
 
 
 class PriceSeriesContractError(RuntimeError):
@@ -456,13 +508,15 @@ def resolve_market_dbs(
 
 
 # ---------------------------------------------------------------------------
-# decision ↔ execution 面板逐项对齐
+# decision ↔ execution 面板：可用性过滤（合法停牌）与结构缺陷（fail closed）
 # ---------------------------------------------------------------------------
 
 
-def _execution_index(execution_panel: DailyPanel) -> set[tuple[str, str]]:
-    """execution 面板可用的 ``(symbol, ISO date)`` 集合。"""
-    bars = execution_panel.bars
+def _panel_bar_keys(panel: DailyPanel | None) -> set[tuple[str, str]]:
+    """面板可用的 ``(symbol, ISO date)`` 集合（空面板/缺列 → 空集）。"""
+    if panel is None:
+        return set()
+    bars = panel.bars
     if bars.empty or not {"symbol", "trade_date"}.issubset(set(bars.columns)):
         return set()
     import pandas as pd
@@ -476,6 +530,221 @@ def _execution_index(execution_panel: DailyPanel) -> set[tuple[str, str]]:
     return index
 
 
+@dataclass(frozen=True, slots=True)
+class DecisionAvailability:
+    """decision 可用性裁决结果：**可进入训练帧的决策** + 审计报告。
+
+    ``decisions`` 只含"execution 面板当日确有 bar"的决策，且保持原顺序（下游的
+    基准/风格分组按集合成员决定，顺序不是语义，但保序让产物可复现）。
+
+    三段行数是**显式字段**（不是从 ``report`` 里再取一次）：调用方要对账的是这三个
+    数字，让它们带着类型出现，才不会在"新加一个审计键"时把行数口径一起改掉。
+    """
+
+    decisions: tuple[Any, ...]
+    decision_rows_before: int
+    filtered_rows: int
+    decision_rows_after: int
+    report: dict[str, object]
+
+    def to_payload(self) -> dict[str, object]:
+        return dict(self.report)
+
+
+def _decision_key(item: Any) -> tuple[str, str]:
+    return (
+        str(getattr(item, "symbol", "") or ""),
+        str(getattr(item, "decision_date", "")),
+    )
+
+
+def filter_decisions_by_execution_availability(
+    *,
+    decisions: Sequence[Any],
+    execution_panel: DailyPanel,
+    context: str,
+    cross_check_panel: DailyPanel | None = None,
+    max_filtered_ratio: float = DEFAULT_MAX_FILTERED_RATIO,
+    max_daily_filtered_ratio: float = DEFAULT_MAX_DAILY_FILTERED_RATIO,
+    max_filtered_rows_floor: int = DEFAULT_MAX_FILTERED_ROWS_FLOOR,
+) -> DecisionAvailability:
+    """把"当天没有 execution bar"的候选**过滤掉**，其余原样返回；结构缺陷则 fail closed。
+
+    为什么不是 fail closed 一条路：PIT 候选池按设计包含"最近 5 个交易日内交易过、
+    当天停牌"的票（``expected_active_lookback_days=5``），它本来就是**候选**而不是
+    可交易集。这类 ``(symbol, date)`` 在 execution 面板上没有当日 bar，是**预期内**的
+    事实，不是数据缺失——把它当致命错误等于让生产窗口永远冻结不了；把它静默丢掉
+    则是另一个极端（真实的断供会被藏起来）。所以这里给出**显式的中间态**：
+
+    ```text
+    decision universe  ──►  execution availability 过滤  ──►  training frame
+    （PIT 候选）              （当日有 bar 才留下）            （特征 ∩ label）
+    ```
+
+    三种情况必须区分（判据是集合关系，可复现、不依赖比例直觉）：
+
+    ==========================================  ================================
+    ``(symbol, date)`` 的观测                     裁决
+    ==========================================  ================================
+    在 execution 面板里                             保留
+    票在、日在、仅当天无 bar（停牌）                 **过滤**（记原因 + 样例）
+    票在整个 execution 面板都不存在                  缺陷（symbol_not_in_panel）
+    该日期在 execution 面板里根本不是交易日          缺陷（date_not_a_session）
+    feature 面板当天**有** bar 而 execution 没有     缺陷（跨面板分歧）
+    ==========================================  ================================
+
+    ``cross_check_panel``（生产里传 feature 面板）是跨面板一致性证据：两份面板对
+    "这只票这一天有没有交易"必须给同一个答案；不一致说明其中一份缺数据，而不是停牌。
+    它同时保证"被过滤的行在两侧都不可用"——否则过滤会顺带改变质量池排名分母。
+
+    两条量级闸（总体占比、单日占比）是"合法形态但规模异常"的兜底：见
+    :data:`DEFAULT_MAX_FILTERED_RATIO` / :data:`DEFAULT_MAX_DAILY_FILTERED_RATIO`。
+
+    过渡性说明：返回的 ``report["decision_rows_before"]`` 是**候选集**规模（PIT
+    eligible），不是"全市场股票数"；两者不能混用（历史上出现过把质量池裁完的 300
+    当成全市场输入的取值错误）。
+    """
+    available = _panel_bar_keys(execution_panel)
+    sessions = {day for _symbol, day in available}
+    symbols = {symbol for symbol, _day in available}
+    cross_keys = _panel_bar_keys(cross_check_panel)
+
+    kept: list[Any] = []
+    filtered_examples: list[str] = []
+    defect_examples: dict[str, list[str]] = {}
+    per_date_total: dict[str, int] = {}
+    per_date_filtered: dict[str, int] = {}
+    for item in decisions:
+        symbol, day = _decision_key(item)
+        key = (symbol, day)
+        per_date_total[day] = per_date_total.get(day, 0) + 1
+        if key in available:
+            kept.append(item)
+            continue
+        reason = ""
+        if symbol not in symbols:
+            reason = DEFECT_REASON_SYMBOL_ABSENT
+        elif day not in sessions:
+            reason = DEFECT_REASON_DATE_NOT_SESSION
+        elif cross_check_panel is not None and key in cross_keys:
+            reason = DEFECT_REASON_CROSS_PANEL_DIVERGENCE
+        if reason:
+            defect_examples.setdefault(reason, []).append(f"{symbol}@{day}")
+            continue
+        per_date_filtered[day] = per_date_filtered.get(day, 0) + 1
+        if len(filtered_examples) < 20:
+            filtered_examples.append(f"{symbol}@{day}")
+
+    total = sum(per_date_total.values())
+    filtered = sum(per_date_filtered.values())
+    defects = {reason: len(items) for reason, items in sorted(defect_examples.items())}
+    if defects:
+        defect_total = sum(defects.values())
+        preview = {reason: items[:5] for reason, items in sorted(defect_examples.items())}
+        raise PriceSeriesContractError(
+            f"{context}: {defect_total}/{total} 条 decision 的缺失**不是**停牌口径，而是"
+            f"面板结构缺陷：{defects}（例：{preview}）——（同一批里另有 {filtered} 条属"
+            "合法停牌口径、本可过滤）。execution 面板必须与 feature 面板逐键覆盖同一份 "
+            "PIT 候选集，结构缺陷即 target 不可用；绝不允许退回 qfq、从 qfq 反推 raw，"
+            "或用过滤把断供藏起来",
+            role=ROLE_EXECUTION,
+        )
+
+    required = max(0, int(max_filtered_rows_floor))
+    allowed_rows = max(required, math.ceil(float(max_filtered_ratio) * max(1, total)))
+    if filtered > allowed_rows:
+        raise PriceSeriesContractError(
+            f"{context}: {filtered}/{total} 条 decision 因'当日无 execution bar'被过滤"
+            f"（{filtered / max(1, total):.4%}）超过审计上限 {allowed_rows} 行"
+            f"（max_filtered_ratio={max_filtered_ratio}, floor={required}）——这个规模不是"
+            f"停牌能解释的，先查 execution 面板是否断供/被截断（样例：{filtered_examples[:5]}）",
+            role=ROLE_EXECUTION,
+        )
+    worst_date, worst_ratio = "", 0.0
+    for day, count in per_date_filtered.items():
+        ratio = count / max(1, per_date_total.get(day, 0))
+        if ratio > worst_ratio:
+            worst_date, worst_ratio = day, ratio
+    allowed_daily = max(
+        required,
+        math.ceil(float(max_daily_filtered_ratio) * max(1, per_date_total.get(worst_date, 0))),
+    )
+    if per_date_filtered.get(worst_date, 0) > allowed_daily:
+        raise PriceSeriesContractError(
+            f"{context}: 单日过滤量异常——{worst_date} 有 "
+            f"{per_date_filtered[worst_date]}/{per_date_total.get(worst_date, 0)} 条 decision "
+            f"（{worst_ratio:.4%}）当天无 execution bar，超过单日上限 {allowed_daily} 行"
+            f"（max_daily_filtered_ratio={max_daily_filtered_ratio}）——**过半**候选当日"
+            "没有 bar 意味着这一天的截面已被毁掉，更像 execution 面板缺了这一段，而不是"
+            "当天全市场停牌",
+            role=ROLE_EXECUTION,
+        )
+
+    top_dates = sorted(
+        (
+            (
+                day,
+                int(count),
+                int(per_date_total.get(day, 0)),
+                count / max(1, per_date_total.get(day, 0)),
+            )
+            for day, count in per_date_filtered.items()
+        ),
+        key=lambda item: (-item[1], item[0]),
+    )[:5]
+    top_dates_payload: list[dict[str, object]] = [
+        {
+            "decision_date": day,
+            "filtered": rows,
+            "decisions": day_rows,
+            "ratio": round(ratio, 8),
+        }
+        for day, rows, day_rows, ratio in top_dates
+    ]
+    report: dict[str, object] = {
+        "context": str(context),
+        "universe": "pit_eligible_candidates",
+        "decision_rows_before": int(total),
+        "filtered_missing_execution_rows": int(filtered),
+        "decision_rows_after": int(len(kept)),
+        # ``intersection`` = decision 集合 ∩ execution 面板当日 bar（与
+        # ``decision_rows_after`` 同值，两个名字都留：验收里按名字取值，
+        # 同一份报告不能因为叫法不同而对不上账）。
+        "intersection": int(len(kept)),
+        "filtered_ratio": (round(filtered / total, 8) if total else 0.0),
+        "filter_reason": FILTER_REASON_NO_EXECUTION_BAR,
+        "filtered_examples": filtered_examples,
+        "filtered_dates": int(len(per_date_filtered)),
+        "max_daily_filtered_date": worst_date,
+        "max_daily_filtered_ratio": round(worst_ratio, 8),
+        # 过滤最集中的 5 天：单日量级异常（例如某天两侧同时缺一片 symbol）必须一眼可见，
+        # 而不是只留一个"最大占比"数字——实测 2025-11-17 就是这种形态（12.25%）。
+        "filtered_dates_top": top_dates_payload,
+        "execution_panel_bars": int(len(available)),
+        "execution_panel_sessions": int(len(sessions)),
+        "execution_panel_symbols": int(len(symbols)),
+        "cross_check_panel_source": str(getattr(cross_check_panel, "source", "") or ""),
+        "cross_check_bar_keys": int(len(cross_keys)),
+        "limits": {
+            "max_filtered_ratio": float(max_filtered_ratio),
+            "max_daily_filtered_ratio": float(max_daily_filtered_ratio),
+            "max_filtered_rows_floor": required,
+        },
+        # ``aligned`` 保留给"本次**一条都没被过滤**"这个更强的形态（零过滤证据）；
+        # 发生过过滤时它是 False，但整份裁决仍然 ``status == PASS``——
+        # "有行被过滤"与"契约被破坏"是两件事（见函数文档的三段集合契约）。
+        "aligned": filtered == 0,
+        "status": "PASS",
+    }
+    return DecisionAvailability(
+        decisions=tuple(kept),
+        decision_rows_before=int(total),
+        filtered_rows=int(filtered),
+        decision_rows_after=int(len(kept)),
+        report=report,
+    )
+
+
 def decision_alignment(
     *, decisions: Sequence[Any], execution_panel: DailyPanel
 ) -> dict[str, object]:
@@ -483,13 +752,17 @@ def decision_alignment(
 
     "全窗口行数差不多"不是对齐证据：差的那几条恰好是停牌/退市/次新时，恰恰是最需要
     小心处理的样本。所以按 (symbol, date) 精确比对。
+
+    这是**测量**函数（不抛错）；裁决有两个消费口：严格版
+    :func:`assert_decisions_aligned` 与过滤版
+    :func:`filter_decisions_by_execution_availability`。
     """
-    available = _execution_index(execution_panel)
+    available = _panel_bar_keys(execution_panel)
     total = 0
     missing_keys: list[str] = []
     for item in decisions:
         total += 1
-        key = (str(getattr(item, "symbol", "") or ""), str(getattr(item, "decision_date", "")))
+        key = _decision_key(item)
         if key not in available:
             missing_keys.append(f"{key[0]}@{key[1]}")
     return {
@@ -507,7 +780,12 @@ def assert_decisions_aligned(
     execution_panel: DailyPanel,
     context: str,
 ) -> dict[str, object]:
-    """缺 raw execution row ⇒ fail closed（**不得从 qfq 推测 raw**）。"""
+    """**零容忍**版本：任何一条缺 raw execution row ⇒ fail closed（不得从 qfq 推测 raw）。
+
+    训练帧不用这个（PIT 候选含合法停牌日，见
+    :func:`filter_decisions_by_execution_availability`）；它保留给"必须逐条对齐"的
+    路径与测试，语义与 2026-09-21 的原始守卫**完全一致**。
+    """
     payload = decision_alignment(decisions=decisions, execution_panel=execution_panel)
     total = int(payload["decisions"])
     missing = int(payload["missing"])
@@ -538,6 +816,13 @@ def resolve_db_path(repo_root: str | Path, db: str) -> Path:
 
 __all__ = [
     "CERT_EVIDENCE_AUDIT_KEYS",
+    "DEFAULT_MAX_DAILY_FILTERED_RATIO",
+    "DEFAULT_MAX_FILTERED_RATIO",
+    "DEFAULT_MAX_FILTERED_ROWS_FLOOR",
+    "DEFECT_REASON_CROSS_PANEL_DIVERGENCE",
+    "DEFECT_REASON_DATE_NOT_SESSION",
+    "DEFECT_REASON_SYMBOL_ABSENT",
+    "FILTER_REASON_NO_EXECUTION_BAR",
     "LIVE_STRICT_VALIDATION_MODES",
     "STYLE_SOURCE_EXECUTION_FALLBACK",
     "FEATURE_PRICE_SERIES_EVIDENCE_SCHEMA",
@@ -550,6 +835,7 @@ __all__ = [
     "FEATURE_PRICE_MODE_ALLOWED",
     "IDENTITY_COMPARE_KEYS",
     "IDENTITY_CONTENT_KEYS",
+    "DecisionAvailability",
     "MarketDbResolution",
     "PRICE_MODE_QFQ",
     "PRICE_MODE_RAW",
@@ -563,6 +849,7 @@ __all__ = [
     "decision_alignment",
     "feature_mode_of_freeze_manifest",
     "feature_mode_of_frozen_model",
+    "filter_decisions_by_execution_availability",
     "is_live_strict_mode",
     "price_series_identity_block",
     "require_certified_execution_series",
