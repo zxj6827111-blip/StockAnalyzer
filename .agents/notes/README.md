@@ -154,12 +154,14 @@ StockAnalyzer 当前重点决策领域包括：
 | 文档 | Status | 主题 | 什么时候需要读 |
 | --- | --- | --- | --- |
 | `ADR-001-runtime-identity-and-artifact-integrity.md` | Accepted | 运行/构建身份、模型工件完整性、epoch 锚定、fail-closed 退出码 | 改 `runtime_identity.py` / `frozen_model.py` / `freeze.py` / `epoch.py` / Dockerfile 构建身份 / 任何 CLI 的退出码时 |
-| `ADR-002-dual-price-freeze-contract.md` | **Draft** | QFQ / RAW 角色契约、PIT 候选集 ↔ 可交易集、停牌与真实缺失的裁决 | 改 `dual_price_series.py` / `dual_price_freeze.py` / `pit_universe` / `certify_price_mode` / freeze 对齐逻辑时 |
+| `ADR-002-dual-price-freeze-contract.md` | **Draft** | QFQ / RAW 角色契约、PIT 候选集 ↔ 可交易集、日截面健康门、"缺 bar"三类裁决与阈值证据 | 改 `dual_price_series.py`（含 `assess_decision_session_health` 与 4 个 `DEFAULT_*` 阈值）/ `dual_price_freeze.py` / `pit_universe` / `certify_price_mode` / freeze 对齐逻辑 / 任何"过滤占比阈值"时 |
 | `NOTE-001-alpha-v2-production-gates.md` | Accepted | train→freeze→preflight→epoch→shadow 的门禁顺序、退出码表、Shadow/Production 边界、当前不可达状态 | 改任一 Alpha V2 CLI、preflight 判定、shadow 配置开关、调度 job 时 |
 
-> ADR-002 是 Draft 的原因写在它 §1：契约第一段的价格角色口径已定；第二段（缺 execution
-> 当日 bar 时该 fail closed 还是该过滤）HEAD 与工作树做法相反，尚未裁决。
-> **读它时先看 §5。**
+> ADR-002 是 Draft 的原因写在它 §1：第一段（价格角色口径）已定；第二段（缺 execution
+> 当日 bar 时该 fail closed 还是该过滤）**方向已定、判据未定稿** —— `be2e4ef` 落了过滤式
+> 裁决，P3.1.1 补了日截面健康门并把"两侧同缺 = 停牌"这个断言从代码与文档里撤掉，
+> 但两条比例闸的阈值重设与 NAS 侧 2025-11-17 覆盖缺口仍未收口。
+> **读它时先看 §5（裁决）与 §6.1/§6.2（能力边界与真值源现状）。**
 
 新增 Note 时在上表加一行，一行说清"问题 + 机制 + 防御的故障类型"。索引是常驻上下文，
 不要往这里复制正文。

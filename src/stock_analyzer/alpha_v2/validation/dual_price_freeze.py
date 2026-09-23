@@ -15,9 +15,11 @@ execution_panel (raw)    ──► build_label_v2    ──► y（net/excess/up
 1. **守卫先于重活**：``require_certified_execution_series`` 在构造特征矩阵之前执行——
    execution 不是 raw+certified 就直接抛错，不允许跑几十分钟才失败；
 2. **逐项对齐但区分两种"缺"**：每条 decision 的 ``(symbol, date)`` 若在 execution 面板
-   没有当日 bar，要分**合法停牌**（PIT 候选池按设计包含"最近 5 个交易日内交易过、当天
-   停牌"的票 → 过滤掉，永远不进训练帧）与**结构缺陷**（整票缺席 / 整天不是交易日 /
-   feature 侧有 bar 而 execution 没有 → fail closed）。判据、量级闸与审计字段见
+   没有当日 bar，要分**当日无 execution bar**（PIT 候选池按设计包含"最近还活跃、当天
+   拿不到 bar"的票 → 过滤掉，不进训练帧；⚠️ 这**不等于证明停牌**）与**结构缺陷**
+   （日截面塌陷 / 日截面低于 feature 同日 / 整票缺席 / 整天不是交易日 / feature 侧有
+   bar 而 execution 没有 → fail closed）。判据、执行顺序（日级门**先于**逐键裁决）与
+   审计字段见
    :func:`~stock_analyzer.alpha_v2.dual_price_series.filter_decisions_by_execution_availability`；
 3. **绝对收益只来自 raw**：``net_return_*`` / ``excess_return_*`` / ``up_*`` /
    ``mae_*`` / ``mfe_*`` 与全部基准序列都由 execution 面板的 outcome 派生；
@@ -127,12 +129,14 @@ def build_dual_price_training_frame(
             db=str(feature_panel.source or ""),
         )
 
-    # ── 2) decision 可用性过滤（合法停牌 → 过滤；面板结构缺陷 → fail closed）─────
-    # PIT 候选池按设计包含"最近 5 个交易日内交易过、当天停牌"的票（含退市/长停期间
-    # 仍在 history 窗口内的票），它们当天没有 execution bar 是**预期内事实**——
-    # 这类行拿不到 target（T+1 入场不可成立），必须在构造 label/特征之前就出局。
-    # 但"整票缺席 / 整天不是交易日 / feature 侧有 bar 而 execution 没有"是面板缺陷，
-    # 由同一函数 fail closed（详见该函数文档）。cross_check_panel=feature 面板：
+    # ── 2) decision 可用性裁决（日级健康门 → 逐键结构缺陷 → 过滤不可交易观测）─────
+    # PIT 候选池按设计包含"最近还活跃、当天拿不到 execution bar"的票（含退市/长停期间
+    # 仍在 history 窗口内的票），它们当天没有 execution bar 就拿不到 T+1 入场，必须在
+    # 构造 label/特征之前就出局。但出局**不等于**它们被证明停牌：仓库没有独立 PIT-safe
+    # 的停牌真值源，且两份面板共享同一条上游链路（对称缺失原理上检不出来）。
+    # 所以同一函数里先跑日截面健康门（不看 decision 集合、只看这一天面板有多少根 bar），
+    # 再跑逐键结构缺陷判据（整票缺席 / 整天不是交易日 / feature 有而 execution 没有），
+    # 两者都 fail closed；剩下的才允许过滤。cross_check_panel=feature 面板：
     # 两份面板必须对"这只票这天有没有交易"给同一个答案。
     availability = filter_decisions_by_execution_availability(
         decisions=decisions,
@@ -197,6 +201,11 @@ def build_dual_price_training_frame(
         "decision_accounting": {
             "decision_universe_rows": availability.decision_rows_before,
             "execution_available_rows": availability.decision_rows_after,
+            # 被 FILTER 的行在这里显式入账（而不是只留一个"前后相减"的隐式差），
+            # 并带上原因码与"未证明停牌"的语义标注——审计要能直接读出这一层。
+            "filtered_unavailable_rows": availability.filtered_rows,
+            "filter_reason": str(alignment.get("filter_reason", "")),
+            "filter_reason_semantics": str(alignment.get("filter_reason_semantics", "")),
             "outcome_rows": int(len(run.frame)),
             "training_frame_rows": int(len(frame)),
         },

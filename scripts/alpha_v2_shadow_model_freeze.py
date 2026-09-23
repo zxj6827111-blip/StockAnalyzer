@@ -25,12 +25,18 @@ python scripts/alpha_v2_shadow_model_freeze.py \
 在构造完整特征矩阵之前执行——不允许"跑 90 分钟才发现口径错了"。**契约违例一律以
 exit 4 退出**（``PriceSeriesContractError`` 在本文件被显式捕获，不走未捕获 traceback）。
 
-P3.1（有效决策集契约，2026-09-23）：PIT 候选池按设计含"当天停牌"的票
-（``expected_active_lookback_days=5``），这些 ``(symbol, date)`` 在 execution 面板里
-没有当日 bar 属**预期内事实**——它们被**过滤**出训练帧并记入审计
+P3.1（有效决策集契约，2026-09-23，提交于 ``be2e4ef``）：PIT 候选池是**候选**而不是
+可交易集（``expected_active_lookback_days=5`` 个**自然日**），这些 ``(symbol, date)``
+在 execution 面板里没有当日 bar——它们被**过滤**出训练帧并记入审计
 （``dual_price_evidence.decision_alignment``：before / filtered / after / 原因 / 样例 /
-单日最大占比），而**不是**让整个 freeze 失败。反之，整票缺席 / 整天不是交易日 /
-feature 侧有 bar 而 execution 没有 → 面板结构缺陷，仍然 fail closed（exit 4）。
+单日最大占比），而**不是**让整个 freeze 失败。
+
+⚠️ 被过滤**不等于证明停牌**：本仓库没有可用于本链路的独立 PIT-safe 停牌真值源，
+且 feature / execution 共享同一条上游链路，"两边同时无 bar"对停牌与对称断供给不出
+不同答案。所以 P3.1.1 在同一入口前面加了一层**日截面健康门**（只看"这一天面板还剩
+多少根 bar"，与 decision 集合无关）：截面塌陷、或 execution 同日截面明显低于 feature
+→ 结构缺陷，fail closed（exit 4）。此外仍有的结构缺陷：整票缺席 / 整天不是交易日 /
+feature 侧有 bar 而 execution 没有 → 同样 fail closed（exit 4）。
 
 ``--market-db`` 是旧的单库参数：**只在 ``--rehearsal`` 下被接受**（两个角色绑同一份
 库，provenance 如实标 ``db_role_binding=legacy_single_db`` 与
@@ -309,13 +315,26 @@ def main(argv: list[str] | None = None) -> int:
         f"status: {alignment.get('status', 'PASS')}"
     )
     if filtered_rows:
+        health = dict(alignment.get("session_health") or {})
         print(
             f"[freeze-model]   过滤原因 {alignment.get('filter_reason', '')} "
             f"（占比 {float(alignment.get('filtered_ratio', 0.0)):.4%}，"
             f"单日最大 {float(alignment.get('max_daily_filtered_ratio', 0.0)):.4%} @ "
             f"{alignment.get('max_daily_filtered_date', '')}；"
             f"例：{list(alignment.get('filtered_examples') or [])[:5]}）"
-            "——PIT 候选含停牌日，属预期内；被过滤行不进入训练帧"
+            "——当日无 execution bar；被过滤行不进入训练帧。"
+            "⚠️ 这不代表已证明停牌（仓库无独立 PIT-safe 停牌真值源，两侧共享上游链路）"
+        )
+        worst_ratio = health.get("worst_breadth_ratio")
+        worst_text = "n/a" if worst_ratio is None else f"{float(worst_ratio):.4%}"
+        limits = dict(health.get("limits") or {})
+        print(
+            "[freeze-model]   Session health: "
+            f"judged={health.get('judged_dates', 0)} "
+            f"unjudgeable={health.get('unjudgeable_dates', 0)} "
+            f"worst_breadth={health.get('worst_breadth_date', '')} {worst_text} "
+            f"(min_ratio={float(limits.get('min_session_breadth_ratio', 0.0)):.2f}, "
+            f"enforced={health.get('enforced', True)})"
         )
     frame = select_frame_columns(
         built.frame,

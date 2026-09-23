@@ -52,9 +52,13 @@ from stock_analyzer.alpha_v2.dual_price_series import (
     DB_ROLE_BINDING_LEGACY,
     DEFECT_REASON_CROSS_PANEL_DIVERGENCE,
     DEFECT_REASON_DATE_NOT_SESSION,
+    DEFECT_REASON_SESSION_BREADTH_COLLAPSE,
+    DEFECT_REASON_SESSION_BELOW_FEATURE_BREADTH,
     DEFECT_REASON_SYMBOL_ABSENT,
     FILTER_REASON_NO_EXECUTION_BAR,
     PriceSeriesContractError,
+    _panel_bar_keys,
+    assess_decision_session_health,
     assert_decisions_aligned,
     certification_from_declaration,
     filter_decisions_by_execution_availability,
@@ -1418,24 +1422,35 @@ def test_live_m5_rehearsal_style_fallback_is_labeled(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# DP-11..DP-18：P3.1 有效决策集契约（PIT 候选 → execution 可用 → 训练帧）
+# DP-11..DP-19：有效决策集契约（PIT 候选 → 日截面健康门 → execution 可用 → 训练帧）
 #
 # 背景（2026-09-23 P3 Freeze Preparation 实测）：生产窗口上原来的逐项对齐门把
 # 6602/1650654（0.400%）条 decision 判成"缺失"→ fail closed，freeze 根本跑不起来。
-# 那不是数据缺失，而是契约写错了位置：``expected_active_lookback_days=5`` 的设计就是
-# 让"最近 5 个交易日内交易过、当天停牌"（含退市/长停期间仍在 history 窗口内的票）
-# 留在**候选**池里——候选集不是可交易集。本组用例把修正后的契约钉死：
+# ``expected_active_lookback_days=5``（⚠️ 5 个**自然日**）的设计就是把"最近还活跃、
+# 当天拿不到 bar"的票留在**候选**池里——候选集不是可交易集。
 #
-# ==========================  ==============================================
+# P3.1（``be2e4ef``）把"缺失"改成"过滤 + 入账"，但它的判据有一个原理性缺口：
+# 两份面板共享同一条上游链路，**同一个缺陷会同时命中两侧**，于是"两边都没 bar"
+# 这个观测对"不可交易"与"对称断供"给不出不同答案（2025-11-17 两侧同时少 724 个
+# symbol 就是这样被放行、并被当成"实测最大合法单日 12.25%"的）。
+# P3.1.1 因此加了一层**不看 decision 集合**的日截面健康门，并把 FILTER 的语义
+# 明确降级为"未证明停牌"。本组用例钉住修正后的契约：
+#
+# ==========================  ==================================================
 # DP-11                       根因前提：PIT eligible 确实含"当天无 bar"的票
-# DP-12                       Case 1/2：交易日保留、停牌日过滤（不是 error）
+# DP-12                       Case 1/2：交易日保留；当日无 execution bar → 过滤（不是 error）
 # DP-13                       Case 3a：整票缺席 execution 面板 → 仍然 fail
 # DP-14                       Case 3b/3c：整天不是交易日 / 跨面板分歧 → fail
-# DP-15                       量级闸：总体占比、单日占比
-# DP-16                       不变性：过滤 ≡ 只喂对齐后的决策（不改变策略）
+# DP-15                       比例兜底闸（provisional）：总体占比、单日占比
+# DP-15b                      单日截面塌陷 → 日级门先拦（轮不到比例闸）
+# DP-15c                      截面太小 → 如实记 unjudgeable，不假装通过
+# DP-15e                      execution 同日截面低于 feature → fail（反方向须放过）
+# DP-16                       不变性：过滤 ≡ 只喂对齐后的决策；被过滤行显式进账
 # DP-17                       严格版 assert_decisions_aligned 语义未被放松
 # DP-18                       CLI：打印 alignment 报告；结构缺陷以 exit 4 退出
-# ==========================  ==============================================
+# DP-19                       **两侧同时**截断 → 日级门拦（关门即复现旧漏洞）
+# DP-20                       面板首个 session 永不判塌陷（十年真实数据上验出的误杀回归）
+# ==========================  ==================================================
 # ---------------------------------------------------------------------------
 
 
@@ -1555,15 +1570,19 @@ def test_dp11_pit_eligible_universe_contains_symbols_without_bar_that_day():
     assert halted in universe.known_suspended_symbols
     last_bar = feature.symbol_bars(halted).index.max().date()
     assert last_bar < as_of, "前提：该票在决策日当天没有 bar"
-    assert last_bar == days[79], "前提：缺失是停牌（前面有 bar），不是面板缺这只票"
+    assert last_bar == days[79], (
+        "前提：缺失是序列**中间的洞**（前面有 bar），不是整票缺席面板——"
+        "注意这只排除 symbol_absent，不排除对称断供"
+    )
 
 
 def test_dp12_trading_day_kept_and_halt_day_filtered(dual_dbs):
-    """DP-12（Case 1 + Case 2）：交易日保留；当天停牌的行**过滤**而不是抛错。
+    """DP-12（Case 1 + Case 2）：交易日保留；当天无 execution bar 的行**过滤**而不是抛错。
 
     Case 1：``(600000, D)`` 有 execution bar → 保留。
-    Case 2：``(600001, D)`` 停牌（两侧都没 bar）→ 过滤；且**同票的前一个交易日决策
-    仍然保留**（过滤粒度是 ``(symbol, date)``，不是整票）。
+    Case 2：``(600001, D)`` 两侧都没 bar → 过滤；且**同票的前一个交易日决策
+    仍然保留**（过滤粒度是 ``(symbol, date)``，不是整票）。过滤的原因是"拿不到
+    可成交观测"，**不是**"已证明停牌"。
     """
     days = list(DAYS[:35])
     decision_days = [days[19], days[DECISION_INDEX]]
@@ -1707,46 +1726,205 @@ def test_dp15_filter_ratio_ceilings_fail_closed():
     assert "单日过滤量异常" in str(daily.value)
 
 
-def test_dp15b_default_daily_ceiling_separates_partial_from_destroyed_cross_section():
-    """DP-15b（默认阈值语义，实测形态）：单日 40% 被过滤 → PASS；单日 60% → fail。
+def test_dp15b_daily_breadth_collapse_fails_before_ratio_gates():
+    """DP-15b（P3.1.1 语义修正）：单日截面塌陷由**日级健康门**先拦，轮不到比例闸。
 
-    "部分覆盖缺口"（生产实测 2025-11-17 = 12.25%）必须放行并留证据，而"该日截面被毁"
-    必须拦住——这是**默认阈值**下的行为：200 只票 × 30 个决策日（6000 条候选）里，
-    某一天缺 80 票（该日 40%、全窗 1.3%）放行；缺 120 票（该日 60%）拦下。
-    窗口内多放几个决策日是有意的：总体闸（2%）算的是全窗，不能让"一天=全窗"的夹具
-    把总体闸和单日闸混成同一个判据。
+    原版这条断言"单日 40% 被过滤 → PASS（部分覆盖缺口放行 + 记录）"，理由是把
+    2025-11-17 的 12.25% 当成"实测最大合法值"。那个前提是错的：12.25% 是上游链路的
+    覆盖率**缺口**，而十年真实面板里形态合法的最大单日过滤只有 3.834%。把缺陷观测值
+    当天花板 = 亲手废掉唯一曾经真的报过异常的闸。
+
+    现在的契约：某决策日 execution 面板自身截面相对基线中位数掉到 90% 以下就是
+    **日级数据完整性异常 → fail closed**，不看它占全窗百分之几、也不看 decision 集合。
+    200 只票 × 30 个决策日：单日缺 80 票（截面 120/200=60%）与缺 120 票（40%）都必须拦，
+    且报的是日级原因码（证明它排在逐键裁决与两条比例闸**之前**）。
     """
     days = _weekdays(30)
     decision_days = days[:30]
     partial_day = days[25]
     symbols = [f"{600000 + index:06d}" for index in range(200)]
-    partial_missing = {(symbol, partial_day.isoformat()) for symbol in symbols[:80]}
-    destroyed_missing = {(symbol, partial_day.isoformat()) for symbol in symbols[:120]}
-    partial = _availability_panels(days, symbols, execution_missing=partial_missing)
-    destroyed = _availability_panels(days, symbols, execution_missing=destroyed_missing)
     decisions = [DecisionPoint(symbol, day) for day in decision_days for symbol in symbols]
 
-    passed = filter_decisions_by_execution_availability(
-        decisions=decisions, execution_panel=partial["execution"], context="unit_partial"
+    for dropped in (80, 120):
+        panels = _availability_panels(
+            days,
+            symbols,
+            execution_missing={
+                (symbol, partial_day.isoformat()) for symbol in symbols[:dropped]
+            },
+        )
+        with pytest.raises(PriceSeriesContractError) as excinfo:
+            filter_decisions_by_execution_availability(
+                decisions=decisions,
+                execution_panel=panels["execution"],
+                context=f"unit_breadth_drop_{dropped}",
+            )
+        message = str(excinfo.value)
+        assert DEFECT_REASON_SESSION_BREADTH_COLLAPSE in message
+        assert partial_day.isoformat() in message
+        # 原因码必须是**日级**的那条，而不是比例闸的"单日过滤量异常"——顺序即契约。
+        assert "单日过滤量异常" not in message
+
+    # 同一个大截面里只停 1 只票：截面 199/200 = 99.5%，日级门不动，正常过滤 + 入账。
+    clean = _availability_panels(
+        days, symbols, execution_missing={(symbols[7], partial_day.isoformat())}
     )
-    assert passed.filtered_rows == 80 and passed.report["status"] == "PASS"
-    assert passed.report["max_daily_filtered_ratio"] == pytest.approx(0.4)
-    assert passed.report["filtered_ratio"] == pytest.approx(80 / len(decisions))
-    assert passed.report["limits"]["max_daily_filtered_ratio"] == 0.50
-    assert passed.report["filtered_dates_top"][0] == {
-        "decision_date": partial_day.isoformat(),
-        "filtered": 80,
-        "decisions": 200,
-        "ratio": 0.4,
-    }
+    ok = filter_decisions_by_execution_availability(
+        decisions=decisions, execution_panel=clean["execution"], context="unit_single_halt"
+    )
+    assert ok.filtered_rows == 1 and ok.report["status"] == "PASS"
+    assert ok.report["session_health"]["judged_dates"] == len(days) - 1
+    # 面板首个 session 不判（DP-20），所以是 len(days)-1 而不是 len(days)
+    assert ok.report["session_health"]["enforced"] is True
+    assert float(ok.report["session_health"]["worst_breadth_ratio"]) > 0.99
+
+
+def test_dp15c_small_panel_is_reported_unjudgeable_not_silently_passed():
+    """DP-15c：基线截面太小（``< min_baseline_rows``）时**如实记 unjudgeable**，不假装通过。
+
+    几只票的夹具里"停一只"就是十几个百分点，比例塌陷在这个尺度上没有意义；但
+    "不判"和"判了且健康"必须能从审计里区分出来，否则生产窗口一旦截面变小，
+    这层门会静默失效。
+    """
+    days = _weekdays(30)
+    symbols = [f"{600000 + index:06d}" for index in range(6)]
+    halt_day = days[25]
+    panels = _availability_panels(
+        days, symbols, execution_missing={(symbols[1], halt_day.isoformat())}
+    )
+    decisions = [DecisionPoint(symbol, day) for day in days for symbol in symbols]
+    ok = filter_decisions_by_execution_availability(
+        decisions=decisions, execution_panel=panels["execution"], context="unit_small"
+    )
+    health = ok.report["session_health"]
+    assert ok.filtered_rows == 1 and ok.report["status"] == "PASS"
+    assert health["judged_dates"] == 0
+    assert health["unjudgeable_dates"] == len(days)
+    assert health["limits"]["min_baseline_rows"] == 100
+    # 显式降低基线门槛后，同一份数据就必须判出来（199/200 那种放行不等于 5/6 也放行）。
+    with pytest.raises(PriceSeriesContractError) as excinfo:
+        filter_decisions_by_execution_availability(
+            decisions=decisions,
+            execution_panel=panels["execution"],
+            context="unit_small_tight",
+            session_breadth_min_baseline_rows=3,
+        )
+    assert DEFECT_REASON_SESSION_BREADTH_COLLAPSE in str(excinfo.value)
+
+
+def test_dp15e_execution_breadth_below_feature_fails_closed():
+    """DP-15e（§3.3 两侧日截面大规模不一致）：execution 同日截面明显低于 feature → fail。
+
+    方向是**单边**的：raw 侧票多于 qfq 侧是设计内（qfq 因子缺失的票会被跳过，见
+    ``scripts/alpha_v2_raw_delta_coverage.py`` §8.5），反过来才是异常。
+
+    夹具刻意让 execution 自己的截面每天都平稳（100/100/…），所以**自身**广度门放过；
+    但 feature 同日有 200 只 → 两侧对"今天有多少票可交易"给了不同量级的答案。
+    这种形态下逐键判据只会把"两侧都无 bar"的键当成不可交易静默过滤掉，
+    日级两侧对比把它抢回来判成契约异常。
+    """
+    days = _weekdays(30)
+    symbols = [f"{600000 + index:06d}" for index in range(200)]
+    panels = _availability_panels(days, symbols, execution_symbols=symbols[:100])
+    decisions = [DecisionPoint(symbol, days[25]) for symbol in symbols[:100]]
+    with pytest.raises(PriceSeriesContractError) as excinfo:
+        filter_decisions_by_execution_availability(
+            decisions=decisions,
+            execution_panel=panels["execution"],
+            cross_check_panel=panels["feature"],
+            context="unit_panel_divergence",
+        )
+    assert DEFECT_REASON_SESSION_BELOW_FEATURE_BREADTH in str(excinfo.value)
+
+    # 反方向（execution 比 feature 多）必须放过：那是设计内的 qfq 侧跳过。
+    reverse = _availability_panels(days, symbols[:100], execution_symbols=symbols)
+    ok = filter_decisions_by_execution_availability(
+        decisions=[DecisionPoint(symbol, days[25]) for symbol in symbols[:100]],
+        execution_panel=reverse["execution"],
+        cross_check_panel=reverse["feature"],
+        context="unit_reverse",
+    )
+    assert ok.report["status"] == "PASS"
+    assert ok.report["session_health"]["min_panel_breadth_ratio_observed"] > 1.5
+
+
+def test_dp19_symmetric_both_panel_truncation_fails_closed():
+    """DP-19（本轮核心场景）：**两侧同时**缺同一片 symbol → 日级门必须拦。
+
+    这是 P3.1 逐键判据在原理上无能为力的那一类：feature 与 execution 共享同一条
+    上游链路，同一个缺陷会同时命中两侧，于是
+
+    ```text
+    逐键跨面板分歧检查  → 发现 0 处分歧（两侧一样缺）
+    整票缺席            → 不触发（这些票在别的日子有 bar）
+    该日不是交易日      → 不触发（其它 120 只票当天有 bar）
+    ```
+
+    旧契约因此会把这 80 条键全当成"当日无 execution bar"静默过滤掉 —— 这正是
+    2025-11-17（两侧同时少 724 个 symbol）被归成"部分覆盖缺口、放行"的路径。
+    日截面健康门看的是"这一天面板自己还剩多少根 bar"，与 decision 集合无关，
+    所以能抓到。这里同时用 ``enforce_session_health_guard=False`` 反证：
+    关掉门就退回旧行为（80 条全过滤 + PASS），即**这条测试验的确实是新增的那一层**。
+    """
+    days = _weekdays(30)
+    symbols = [f"{600000 + index:06d}" for index in range(200)]
+    thin_day = days[25]
+    missing = {(symbol, thin_day.isoformat()) for symbol in symbols[:80]}
+    panels = _availability_panels(days, symbols, execution_missing=missing)
+    # 夹具默认 feature_missing == execution_missing，即"两侧同缺"；显式钉住这一点，
+    # 否则这条测试会悄悄退化成"只有一侧缺"（那是 DP-14 3c 已经覆盖的形态）。
+    assert _panel_bar_keys(panels["feature"]) - _panel_bar_keys(panels["execution"]) == set()
+    decisions = [DecisionPoint(symbol, day) for day in days for symbol in symbols]
 
     with pytest.raises(PriceSeriesContractError) as excinfo:
         filter_decisions_by_execution_availability(
             decisions=decisions,
-            execution_panel=destroyed["execution"],
-            context="unit_destroyed",
+            execution_panel=panels["execution"],
+            cross_check_panel=panels["feature"],
+            context="unit_symmetric",
         )
-    assert "单日过滤量异常" in str(excinfo.value)
+    message = str(excinfo.value)
+    assert DEFECT_REASON_SESSION_BREADTH_COLLAPSE in message
+    assert thin_day.isoformat() in message
+
+    # 反证：关掉日级门 → 完全复现 P3.1 的旧行为（逐键判据一条缺陷都报不出来）。
+    legacy = filter_decisions_by_execution_availability(
+        decisions=decisions,
+        execution_panel=panels["execution"],
+        cross_check_panel=panels["feature"],
+        context="unit_symmetric_guard_off",
+        enforce_session_health_guard=False,
+    )
+    assert legacy.filtered_rows == 80
+    assert legacy.report["status"] == "PASS"
+    assert legacy.report["session_health"]["enforced"] is False
+    assert legacy.report["session_health"]["judged_dates"] == len(days) - 1
+
+
+def test_dp20_first_panel_session_is_never_a_breadth_collapse():
+    """DP-20：面板**第一个** session 一律不判，且不拿"其余 session 中位数"兜底。
+
+    这条是真实数据上验出来的回归用例：本地十年库里 2016-01-04 只有 2,364 只票，
+    而全期中位数是 3,982（截面十年从 2,817 长到 5,198）。首日的兜底基线会把
+    ``2026-01-04 → 59.4%`` 判成截面塌陷 —— 也就是**每一个窗口起点正好落在面板首日的
+    真实 freeze 都会被误杀**。没有前序 session 就没有"塌陷"这个概念可言。
+    """
+    growing = {f"d{index:04d}": 2400 + index * 10 for index in range(10)}
+    payload, defects = assess_decision_session_health(
+        decision_dates=sorted(growing), execution_counts=growing
+    )
+    assert defects == []
+    assert payload["unjudgeable_dates"] == 1
+    assert payload["judged_dates"] == len(growing) - 1
+    assert payload["unjudgeable_examples"] == ["d0000(no_preceding_session)"]
+
+    # 首日之后即使真塌陷也必须照报（证明"不判首日"没有把门整体关掉）。
+    collapsed = dict(growing)
+    collapsed["d0009"] = 100
+    _, defects_after = assess_decision_session_health(
+        decision_dates=sorted(collapsed), execution_counts=collapsed
+    )
+    assert [day for day, _reason, _detail in defects_after] == ["d0009"]
 
 
 def test_dp16_filtering_is_row_dropping_only(dual_dbs):
@@ -1786,6 +1964,25 @@ def test_dp16_filtering_is_row_dropping_only(dual_dbs):
     )
     assert filtered.evidence["quality_pool_source"] == prefiltered.evidence["quality_pool_source"]
     assert filtered.safe_feature_columns == prefiltered.safe_feature_columns
+
+    # 被 FILTER 的行必须**显式进账**（不是只留一个前后相减的隐式差），且带上原因码
+    # 与"未证明停牌"的语义标注 —— 否则审计上"少了 1 行"和"契约被破坏"分不开。
+    accounting = filtered.evidence["decision_accounting"]
+    assert accounting["decision_universe_rows"] == len(everything)
+    assert accounting["execution_available_rows"] == len(kept_only)
+    assert accounting["filtered_unavailable_rows"] == 1
+    assert (
+        accounting["decision_universe_rows"] - accounting["execution_available_rows"]
+        == accounting["filtered_unavailable_rows"]
+    )
+    assert accounting["filter_reason"] == FILTER_REASON_NO_EXECUTION_BAR
+    assert accounting["filter_reason_semantics"] == (
+        "execution_observation_unavailable_NOT_PROVEN_SUSPENDED"
+    )
+    # 过滤前后三段账里，进了训练帧的行数必须一致（过滤只少候选，不改已行的口径）。
+    assert accounting["training_frame_rows"] == prefiltered.evidence["decision_accounting"][
+        "training_frame_rows"
+    ]
 
 
 def test_dp17_strict_alignment_assertion_is_not_relaxed():
