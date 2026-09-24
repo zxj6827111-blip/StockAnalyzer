@@ -1,0 +1,78 @@
+{
+ "artifact": "P3_3_FEATURE_GAP_ROOT_CAUSE",
+ "generated_at": "2026-09-24",
+ "mode": "READ_ONLY_ANALYSIS",
+ "scope": "execution bar present / feature bar absent, freeze decision window 2025-06-02..2026-08-31",
+ "first_missing_stage": "QFQ_DELTA_IMPORT (feature derivation), NOT vendor source / NOT panel build",
+ "affected": {
+  "sessions": [
+   "2026-07-17",
+   "2026-07-20",
+   "2026-07-21",
+   "2026-07-22",
+   "2026-07-23",
+   "2026-07-24",
+   "2026-07-27",
+   "2026-07-28",
+   "2026-07-29",
+   "2026-07-30",
+   "2026-07-31"
+  ],
+  "symbols": 27,
+  "keys": 295,
+  "per_date": "27 x 10 sessions + 25 on 2026-07-31",
+  "examples": [
+   "000001",
+   "600000",
+   "600575",
+   "600780",
+   "300166"
+  ]
+ },
+ "mechanism": {
+  "code": "src/stock_analyzer/data/vendor_zip_overlay.py:1042-1065 (_load_vendor_daily_batch)",
+  "rule": "_normalize_vendor_daily(strict_factors=False) returns an EMPTY frame when the qfq factor load raises DataSourceError; the caller then does `if self.price_series_mode == 'qfq': skipped.add(symbol); remaining[symbol]=0` — raw mode takes a harmless debug branch instead. The whole symbol is therefore dropped for that import run, and because the nightly job is `--incremental` (appends newest dates only) the missed dates are never revisited.",
+  "silence": "import_vendor_zip_to_delta.py:549,556,598 report `skipped_symbols` and :629 prints the report, but `ok` stays true -> no exit code, no marker",
+  "documented_as_expected": [
+   "src/stock_analyzer/ops/nightly_readiness.py:62",
+   "docs/alpha_v2/RAW_Execution_Delta_Production_Wiring.md:270",
+   "docs/alpha_v2/PROGRESS.md:2123"
+  ],
+  "factor_parse_triggers": [
+   "vendor_zip_overlay.py:1119-1121 (one bad year entry voids the symbol)",
+   ":1473 missing column",
+   ":1480 non-positive factor",
+   ":1223-1226 alignment failure"
+  ]
+ },
+ "evidence": {
+  "asymmetry_window": "2024-11-14..2026-09-23 full source window: execution_has_bar_and_feature_missing = 112503 keys over 34 dates; feature_has_bar_and_execution_missing = 0",
+  "asymmetry_decision_window": "112503 is dominated by the QFQ coverage ramp-up 2024-11/12 (5055 symbols on 2024-11-15); inside the DECISION window the count is exactly 295 keys / 11 sessions",
+  "qfq_equals_raw_times_factor": {
+   "control_rows": 891,
+   "exact_match": 891,
+   "exact_match_ratio": 1.0,
+   "max_abs_rel_diff": 5.378247433765532e-11,
+   "adjustment_source": "local_vendor_qfq",
+   "price_series_mode": "qfq"
+  },
+  "repairability": {
+   "keys_with_raw_bar_and_factor": 295,
+   "not_derivable": 0,
+   "external_source_needed": false
+  },
+  "factor_archive_today": "all 27 symbols clean (0 non-positive, 0 NaN dates, entries current to 2026-09-23) -> the trigger self-healed; the 295 delta rows did not"
+ },
+ "ruled_out": {
+  "daily_trade_status": "annotation only. apply_trade_status_to_daily (market_warehouse.py:754-783) never deletes bars, and alpha_v2 does not read the table at all (dual_price_series.py:159-160, ADR-002 §6.2). Correlation with the 27 symbols is common-cause, not a join.",
+  "stale_factor_series": "vendor_zip_overlay.py:1213 does reindex(...).ffill().bfill(), so a factor series that merely stops advancing yields a present-but-stale bar, not an absent one",
+  "feature_side_availability_gate": "none exists; panel reads are WHERE + dropna(['trade_date','symbol']) only",
+  "nas_logs": "container logs start 2026-09-23 (recreated), so no July `batch skipping symbol` line survives -> trigger not directly observed"
+ },
+ "fix": {
+  "upstream": "the qfq-only skip must become a hard failure of the nightly import (exit code + readiness marker), not a warning",
+  "freeze_side": "FEATURE_BAR_MISSING_FOR_EXECUTABLE_DECISION (per key) + FEATURE_ROW_MISSING (post-merge) fail closed",
+  "data_side": "re-derive QFQ from incumbent RAW x vendor factor; batch p33-featuredrop-202607, 295 rows, PLANNED NOT APPLIED"
+ },
+ "read_only_statement": "All NAS access used read_only / ATTACH ... (READ_ONLY) connections under a 700MB engine limit inside the 4GiB api container. No library, ZIP or /app/src file was modified."
+}

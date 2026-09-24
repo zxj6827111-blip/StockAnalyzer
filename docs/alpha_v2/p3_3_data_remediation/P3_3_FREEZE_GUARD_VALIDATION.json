@@ -1,0 +1,102 @@
+{
+ "artifact": "P3_3_FREEZE_GUARD_VALIDATION",
+ "generated_at": "2026-09-24",
+ "guards": [
+  {
+   "id": "A1",
+   "name": "FEATURE_PANEL_HAS_BAR_ON_DECISION_DATE",
+   "kind": "per-key cross-panel",
+   "verdict": "HARD FAIL",
+   "test": "DP-14 3c (pre-existing)"
+  },
+  {
+   "id": "A2",
+   "name": "FEATURE_BAR_MISSING_FOR_EXECUTABLE_DECISION",
+   "kind": "per-key cross-panel, REVERSE direction (new in P3.3)",
+   "verdict": "HARD FAIL",
+   "test": "test_dp21_...",
+   "residual": "112503 keys exist in the warm-up region; the guard is scoped to decision keys, which is why the guard set must never be widened to panel rows without re-calibration"
+  },
+  {
+   "id": "A3",
+   "name": "FEATURE_ROW_MISSING (post-merge silent_drop == 0)",
+   "kind": "frame builder net",
+   "verdict": "HARD FAIL",
+   "test": "test_dp21b_... (bypasses A2 to prove the net itself holds)"
+  },
+  {
+   "id": "B",
+   "name": "max_daily_filtered_ratio 0.50 -> 0.10",
+   "kind": "magnitude alarm only",
+   "verdict": "HARD FAIL",
+   "test": "test_dp24_...",
+   "measured_hierarchy": "filtered_ratio > 10% implies breadth < 0.90, so with the breadth gate on this gate can never be first to fire; retained for the small-fixture escape hatch"
+  },
+  {
+   "id": "C",
+   "name": "EXECUTION_SHARED_MISSING_CONTIGUOUS_RUN run>=8 fail / >=4 audit",
+   "kind": "structural, reads ONLY the interior bucket",
+   "verdict": "HARD FAIL",
+   "test": "test_dp22_..., test_dp23_... (counterfactual asserts the renumbering cohort WOULD trip run>=8 if shape were ignored)",
+   "calibration": "run <= 3 on 2,429 local ten-year sessions + 435 production sessions (zero false positives at >=8); defect days 2025-11-17 run=57, 11-18 run=23"
+  },
+  {
+   "id": "D1",
+   "name": "EXECUTION_SESSION_BREADTH_COLLAPSE <0.90",
+   "kind": "daily breadth",
+   "verdict": "HARD FAIL",
+   "test": "DP-19 (pre-existing)"
+  },
+  {
+   "id": "D2",
+   "name": "EXECUTION_SESSION_BREADTH_BELOW_FEATURE",
+   "kind": "daily cross-panel breadth",
+   "verdict": "HARD FAIL",
+   "test": "DP-15e (pre-existing)"
+  },
+  {
+   "id": "D3",
+   "name": "dynamic breadth guard on repaired history (P3.3 §13 Guard D)",
+   "verdict": "NOT IMPLEMENTED",
+   "reason": "requires re-statistics on the REPAIRED dataset; full-window re-run deferred by user decision -> recorded as an open blocker, not as done"
+  },
+  {
+   "id": "SHAPE",
+   "name": "interior_resumes_later vs trailing_no_further_bar",
+   "kind": "classification, feeds C",
+   "verdict": "AUDIT",
+   "test": "test_dp23_...",
+   "semantics": "trailing = delisted_or_code_transition_NOT_SOURCE_GAP"
+  },
+  {
+   "id": "H",
+   "name": "decision accounting conservation",
+   "kind": "programmatic invariant",
+   "verdict": "HARD FAIL (explicit raise, not `assert`)",
+   "equations": [
+    "candidate == kept + filtered + defects",
+    "filtered == interior + trailing",
+    "silent_drop == 0"
+   ],
+   "test": "test_dp25_..., test_dp21b_..."
+  }
+ ],
+ "known_blind_spots": [
+  "scattered symmetric truncation (both panels, non-contiguous codes, <10%/day): all four layers silent. DP-19 layer-two pins this as unjudgeable. Only a real suspension source of truth closes it (ADR-002 §6.2).",
+  "both panels truncated for a whole span: every day looks healthy per-day; only the declared-window vs actual-coverage check catches it (2024-11 QFQ ramp is exactly this shape)."
+ ],
+ "suite": {
+  "test_alpha_v2_dual_price_series.py": "46 passed",
+  "test_alpha_v2_vendor_bar_repair.py": "8 passed",
+  "tests/test_alpha_v2_*.py": "714 passed / 1 skipped",
+  "ruff": "0 new findings",
+  "mypy --follow-imports=silent dual_price_series.py": "10 = baseline 10"
+ },
+ "not_run": [
+  "model freeze",
+  "epoch open",
+  "production preflight",
+  "full-window dry-run",
+  "memory re-measurement"
+ ]
+}

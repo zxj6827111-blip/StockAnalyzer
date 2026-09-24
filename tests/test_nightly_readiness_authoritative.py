@@ -408,6 +408,18 @@ def _v3_payload() -> dict[str, object]:
     }
     payload["symbol_membership"] = {"membership_locked": True}
     payload["raw_delta_baseline"] = {"ok": True}
+    # v3 现在必须自带 QFQ 对账结论：没有这块的 marker 是"没证明过两份库一致"，
+    # 严格消费者（active Alpha epoch）不放行。见 tests/test_nightly_readiness_qfq_parity.py。
+    payload["qfq_parity"] = {
+        "guard": "qfq_parity",
+        "evaluated": True,
+        "ok": True,
+        "derivation_gap_count": 0,
+        "factor_missing_count": 0,
+        "qfq_present_raw_missing_count": 0,
+        "blocking_reasons": [],
+        "affected_dates": [],
+    }
     return payload
 
 

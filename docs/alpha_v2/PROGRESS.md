@@ -2344,3 +2344,109 @@ PRODUCTION_PROMOTION     = LOCKED
 
 遗留 backlog（非本轮范围）：`MEMORY.md` 索引超限（40KB > 24.4KB 预算）——属 agent/tooling
 hygiene，与生产管线无关。
+
+# 23. P3.1 — 双价格 freeze 的有效决策集契约（2026-09-23，契约对齐，未部署）
+
+## 23.1 目标与边界
+
+解除 P3 Freeze Preparation 的 `BLOCKED_BY_CODE_DEFECT`：`build_dual_price_training_frame`
+要求**每条** PIT 候选在某日都有 execution 当日 bar，而 PIT 合格池按设计包含"最近 5 个
+交易日内交易过、当天停牌"的票（`expected_active_lookback_days=5`），于是生产窗口上
+6,602/1,650,654 条合法候选被当成"数据缺失"→ fail closed。
+
+**这是 contract alignment，不是 strategy change**：不改 PIT universe、不改
+`expected_active_lookback_days`、不改选股/特征/label/target/warmup/training window、
+不改价格口径、不动任何数据。改的只是"哪些候选有权进入训练帧"这件事在代码里的表达。
+
+## 23.2 落地内容
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/stock_analyzer/alpha_v2/dual_price_series.py` | 新增 `filter_decisions_by_execution_availability`（合法停牌→过滤 / 结构缺陷→fail closed）+ `DecisionAvailability` + 原因码与量级闸常量；`assert_decisions_aligned` 保留为**零容忍**版本，语义未变 |
+| `src/stock_analyzer/alpha_v2/validation/dual_price_freeze.py` | 对齐步骤改为过滤式；**过滤后的决策集**送进 `build_label_v2` / `compute_style_features` / `daily_feature_frame`；新增 `decision_accounting` 审计块 |
+| `scripts/alpha_v2_shadow_model_freeze.py` | 显式捕获 `PriceSeriesContractError`（文档化的 exit 4 不再退化成 traceback exit 1）；打印 `Dual price alignment: before / filtered / after / status` |
+| `tests/test_alpha_v2_dual_price_series.py` | 新增 DP-11..DP-18（9 例：前提、Case 1/2、Case 3a/3b/3c、量级闸、量级闸默认语义、不变性、严格版未放松、CLI exit 4 与报告行） |
+| `docs/alpha_v2/P0_Dual_Price_Series_Contract.md` | 新增 §2.1「有效决策集：候选 ≠ 可交易」+ §3 守卫落点更新 |
+
+裁决判据是**集合关系**，不是比例感觉：
+
+```text
+在 execution 面板里                          → 保留
+票在、日在、仅当天无 bar（停牌）             → 过滤（NO_EXECUTION_BAR_ON_DECISION_DATE）
+整票不在 execution 面板                      → fail closed
+该日不是 execution 的交易日                  → fail closed
+feature 有当日 bar 而 execution 没有         → fail closed（跨面板分歧）
+```
+
+## 23.3 关键选择（含一处"实测后修阈值"的记录）
+
+1. **过滤发生在构造 label/特征/风格之前**，而不是在最终帧上删行：被过滤的行不会以
+   "无 label 的空行"形态混进矩阵（`fit_frozen_model` 的 `labels.notna()` 掩码只是兜底）。
+2. **单侧丢失 ≠ 停牌**：`cross_check_panel=feature 面板` 逐键拦截"一侧有、一侧没有"，
+   与量级无关——这条同时保证被过滤的行在两侧都不可用，因此不会顺带改变质量池分母。
+3. **量级闸先按"每天几只停牌"设定（单日 10%），实测后改成"该日截面被毁"（单日 50%）**：
+   首次生产 dry-run 在 2025-11-17 被判 634/5175 = **12.25%** 拦截。逐项取证后确认这是
+   **两侧同时**缺 724 个 symbol 的**单日洞**（raw 与 qfq 该日均 4,713 只 vs 前一日
+   5,438；抽 200 例形态 200/200 = "前一根 11-14、后一根 11-18、只缺这一天"），即**上游
+   链路的覆盖率缺口**，不是跨面板分歧、也不是"整片 bar 丢失"。因此单日闸的语义收紧为
+   "**过半**候选被过滤 = 该日截面被毁"，并在证据里新增 `filtered_dates_top`（这类日期
+   一眼可见）。阈值来自实测（合法最大 12.25%），不是拍脑袋。
+4. **不做 try/except 绕过**：没有"忽略错误继续跑"的分支；被过滤的行数、原因、样例、
+   按日分布全部进 `dual_price_evidence.decision_alignment`（受 v3 工件哈希保护）。
+
+## 23.4 实测证据（NAS 生产窗口，只读一次性容器）
+
+```text
+镜像/环境   stock-analyzer:latest + /tmp/p3_heavy_env.txt（heavy 等效）
+代码身份    module_sha256=83de9367ff9a0f483d9010150f099c35967d24e4751ff55a51e3742f0898d7fc
+            （= 本地提交版 dual_price_series.py 的 LF 归一化 sha256，逐位一致）
+只读挂载    artifacts 卷 :ro、两个源文件与探针脚本 :ro；未写任何工件（artifacts_written=0）
+面板         feature 2,259,889 行 / 5,818 票 / 306 交易日；execution 2,372,392 行（与 P3 实测一致）
+口径         feature=qfq（certified=False，探针只认证 raw，属正常）；execution=raw certified=True
+
+决策集合     1,650,654 键（构造 923.6s；P3 实测 944.6s）
+旧严格门     RAISED：6602/1650654 找不到对应 bar（P3 blocker 复现，样例 002480@2025-06-03）
+新裁决       decision_rows_before          = 1,650,654
+            filtered_missing_execution_rows = 6,602（0.399963%）
+            decision_rows_after / intersection = 1,644,052
+            status                          = PASS
+            filtered_dates                  = 306
+            max_daily_filtered_ratio        = 12.2512% @ 2025-11-17
+保留集复核   kept_all_aligned=True，kept_missing=0（保留的每一条都有当日 bar）
+缺失形态     6,602 条中：feature 侧当天有 bar = **0**；execution 侧有 bar = **0**
+            整票缺席 = **0**；该日不是交易日的 = **0** → 全部是"两侧都没有当天 bar"
+            样例 002480@2025-06-03：前一根 05-23、后一根 06-10（长停）
+            样例 002199@2025-06-03：前一根 05-27、后一根 06-05
+```
+
+本地真实数据复核（不是夹具）：用仓库 `artifacts/warehouse/market.duckdb` 跑**真实 CLI**
+（`--rehearsal`、窗口 2025-10-01..2026-03-31、`--max-symbols 400`）→
+`before 46,400 / filtered 65（0.1401%）/ after 46,335 / status PASS`，随后正常训练
+17/17 目标（工件落在系统临时目录，**不在**仓库与生产 artifacts 内）。同一库若把窗口
+末尾扩到被截断的 2026-04-02/03（当日仅 49/43 只票），单日闸仍然拦下 —— 说明这条闸
+没有被这次调整弄成"永远放行"。
+
+## 23.5 本轮验证（本地实测）
+
+```text
+tests/test_alpha_v2_dual_price_series.py     35 passed（原 26 → +9）
+相邻 alpha_v2 模块定向（S11 outcomes / M3 enforcement / M41 provenance /
+  M4L preflight / RAW delta wiring）        157 passed
+ruff check（4 个改动文件）                    与基线同 2 条既有告警（E501/I001 均非本次引入）
+mypy（2 个 src 文件）                         12 errors = 基线 12（0 新增）
+ruff format --diff                            本次新增行无格式漂移（其余为既有漂移）
+生产 artifacts 卷                             alpha_v2/ 仅两个 RAW coverage 文件；RAW 库 mtime 未变
+```
+
+## 23.6 状态边界
+
+```text
+FREEZE_PREPARATION（契约层）  = PASS（生产窗口 dry-run 不再 fail closed）
+ALPHA_V2_EPOCH_001           = NOT_STARTED（本任务未生成 model / epoch / production artifact）
+NAS_FREEZE_HOST              = 仍不推荐（P3 实测：全窗口帧构造外推 ≈ 13.4 GiB 增量，
+                               与本次契约修复无关，属资源约束）
+部署                          = 未做（本分支未 push、未部署；NAS 仍跑旧镜像契约）
+```
+
+后续动作（**需用户授权**，本任务不做）：把本分支合并/部署后再跑一次真实 freeze；
+在此之前 P3 的资源结论不变，见 §P3 Freeze Preparation 记录。

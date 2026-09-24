@@ -22,7 +22,21 @@ python scripts/alpha_v2_shadow_model_freeze.py \
 ```
 
 任何一份 execution 面板不是 ``raw + certified`` 就 **fail closed（exit 4）**，且守卫
-在构造完整特征矩阵之前执行——不允许"跑 90 分钟才发现口径错了"。
+在构造完整特征矩阵之前执行——不允许"跑 90 分钟才发现口径错了"。**契约违例一律以
+exit 4 退出**（``PriceSeriesContractError`` 在本文件被显式捕获，不走未捕获 traceback）。
+
+P3.1（有效决策集契约，2026-09-23，提交于 ``be2e4ef``）：PIT 候选池是**候选**而不是
+可交易集（``expected_active_lookback_days=5`` 个**自然日**），这些 ``(symbol, date)``
+在 execution 面板里没有当日 bar——它们被**过滤**出训练帧并记入审计
+（``dual_price_evidence.decision_alignment``：before / filtered / after / 原因 / 样例 /
+单日最大占比），而**不是**让整个 freeze 失败。
+
+⚠️ 被过滤**不等于证明停牌**：本仓库没有可用于本链路的独立 PIT-safe 停牌真值源，
+且 feature / execution 共享同一条上游链路，"两边同时无 bar"对停牌与对称断供给不出
+不同答案。所以 P3.1.1 在同一入口前面加了一层**日截面健康门**（只看"这一天面板还剩
+多少根 bar"，与 decision 集合无关）：截面塌陷、或 execution 同日截面明显低于 feature
+→ 结构缺陷，fail closed（exit 4）。此外仍有的结构缺陷：整票缺席 / 整天不是交易日 /
+feature 侧有 bar 而 execution 没有 → 同样 fail closed（exit 4）。
 
 ``--market-db`` 是旧的单库参数：**只在 ``--rehearsal`` 下被接受**（两个角色绑同一份
 库，provenance 如实标 ``db_role_binding=legacy_single_db`` 与
@@ -273,16 +287,95 @@ def main(argv: list[str] | None = None) -> int:
     slippage = matcher.static_slippage_ratio("trend")
 
     # ── 训练帧：feature 侧出 X，execution 侧出 y（守卫在函数第一步）───────────
-    built = build_dual_price_training_frame(
-        feature_panel=feature_panel,
-        execution_panel=execution_panel,
-        decisions=decisions,
-        matcher=matcher,
-        slippage_ratio=slippage,
-        execution_certification=execution_certification,
-        feature_certification=feature_certification,
-        spec=OutcomeSpec(),
-        context="freeze_model",
+    try:
+        built = build_dual_price_training_frame(
+            feature_panel=feature_panel,
+            execution_panel=execution_panel,
+            decisions=decisions,
+            matcher=matcher,
+            slippage_ratio=slippage,
+            execution_certification=execution_certification,
+            feature_certification=feature_certification,
+            spec=OutcomeSpec(),
+            context="freeze_model",
+        )
+    except PriceSeriesContractError as exc:
+        # 文档化的 exit 4 必须真的以 4 退出：本调用此前**没有**捕获（同文件对 panel /
+        # cert 的调用都有），于是价格序列契约违例会以未捕获 traceback 的形式变成解释器
+        # exit 1，与文档、上游判据、验收脚本里的 exit 码全部脱节（2026-09-23 判定）。
+        print(f"[freeze-model] 拒绝（exit_code={exc.exit_code}）: {exc}", file=sys.stderr)
+        return exc.exit_code
+    alignment = dict(built.evidence.get("decision_alignment") or {})
+    filtered_rows = int(alignment.get("filtered_missing_execution_rows", 0) or 0)
+    print(
+        "[freeze-model] Dual price alignment: "
+        f"before: {alignment.get('decision_rows_before', 0)} decision keys / "
+        f"filtered: {filtered_rows} unavailable execution bars / "
+        f"after: {alignment.get('decision_rows_after', 0)} aligned keys / "
+        f"status: {alignment.get('status', 'PASS')}"
+    )
+    if filtered_rows:
+        health = dict(alignment.get("session_health") or {})
+        print(
+            f"[freeze-model]   过滤原因 {alignment.get('filter_reason', '')} "
+            f"（占比 {float(alignment.get('filtered_ratio', 0.0)):.4%}，"
+            f"单日最大 {float(alignment.get('max_daily_filtered_ratio', 0.0)):.4%} @ "
+            f"{alignment.get('max_daily_filtered_date', '')}；"
+            f"例：{list(alignment.get('filtered_examples') or [])[:5]}）"
+            "——当日无 execution bar；被过滤行不进入训练帧。"
+            "⚠️ 这不代表已证明停牌（仓库无独立 PIT-safe 停牌真值源，两侧共享上游链路）"
+        )
+        worst_ratio = health.get("worst_breadth_ratio")
+        worst_text = "n/a" if worst_ratio is None else f"{float(worst_ratio):.4%}"
+        limits = dict(health.get("limits") or {})
+        print(
+            "[freeze-model]   Session health: "
+            f"judged={health.get('judged_dates', 0)} "
+            f"unjudgeable={health.get('unjudgeable_dates', 0)} "
+            f"worst_breadth={health.get('worst_breadth_date', '')} {worst_text} "
+            f"(min_ratio={float(limits.get('min_session_breadth_ratio', 0.0)):.2f}, "
+            f"enforced={health.get('enforced', True)})"
+        )
+    frame_acc = dict(built.evidence.get("decision_accounting") or {})
+    shape = dict(alignment.get("missing_shape") or {})
+    asym = dict(alignment.get("panel_asymmetry") or {})
+    run_gate = dict(alignment.get("missing_numeric_run") or {})
+    defect_total = sum(
+        int(frame_acc.get(key, 0) or 0)
+        for key in (
+            "defect_symbol_not_in_execution_panel",
+            "defect_date_not_a_session",
+            "defect_feature_has_execution_missing",
+            "defect_execution_has_feature_missing",
+        )
+    )
+    print(
+        "[freeze-model] Decision accounting: "
+        f"candidate={frame_acc.get('candidate_decisions', 0)} "
+        f"kept={frame_acc.get('kept_training_decisions', 0)} "
+        f"filtered={frame_acc.get('filtered_no_execution_bar', 0)}"
+        f"[interior={shape.get('interior_resumes_later', 0)} "
+        f"trailing={shape.get('trailing_no_further_bar', 0)}] "
+        f"defects={defect_total} label_unavailable="
+        f"{frame_acc.get('label_unavailable_rows', 0)} "
+        f"training_frame={frame_acc.get('training_frame_rows', 0)} "
+        f"silent_drop={frame_acc.get('silent_drop', 0)} "
+        f"status={frame_acc.get('accounting_status', 'UNKNOWN')}"
+    )
+    print(
+        "[freeze-model] Panel asymmetry: "
+        f"feature_only={asym.get('feature_has_execution_missing', 0)} "
+        f"execution_only={asym.get('execution_has_feature_missing', 0)} "
+        "(both must be 0; execution_only used to vanish via inner join)"
+    )
+    guard_limits = dict(alignment.get("limits") or {})
+    print(
+        "[freeze-model] Structural run gate: "
+        f"worst={run_gate.get('worst_run', 0)} @ {run_gate.get('worst_date', '')} "
+        f"fail>={run_gate.get('fail_threshold', 0)} "
+        f"audit>={run_gate.get('audit_threshold', 0)} "
+        f"audit_dates={len(run_gate.get('audit_dates') or {})} "
+        f"daily_ratio_limit={float(guard_limits.get('max_daily_filtered_ratio', 0)):.2f}"
     )
     frame = select_frame_columns(
         built.frame,

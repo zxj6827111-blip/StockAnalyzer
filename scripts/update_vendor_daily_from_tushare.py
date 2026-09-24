@@ -87,6 +87,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from stock_analyzer.data.provider import DataSourceError  # noqa: E402
+from stock_analyzer.data.qfq_parity import factor_date_index  # noqa: E402
 from stock_analyzer.data.tushare_provider import (  # noqa: E402
     TushareProvider,
     _to_ts_code,
@@ -2181,7 +2182,12 @@ def _main(argv: list[str] | None = None) -> int:
                 if batch_payload is not None and batch_latest_daily is not None
                 else end_date
             )
+            # 逐键对账要把"raw 有/因子也有/qfq 没有"（缺陷）与"raw 有/根本没因子"
+            # （包含链容忍）分开，判定离不开复权因子包。这里传**回调**而不是索引本身：
+            # 全量解析 5,837 只票实测 279 秒，而健康的晚上一个差异键都没有，
+            # 不该让每晚都为"可能需要归因"先付这笔钱。loader 只在真需要归因时被调用。
             write_nightly_readiness(
+                qfq_factor_loader=lambda symbols: factor_date_index(vendor_root, symbols=symbols),
                 target_trade_date=readiness_target_date,
                 db_path=args.sync_vendor_delta,
                 index_path=args.index_path,

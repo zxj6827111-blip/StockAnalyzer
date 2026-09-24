@@ -14,11 +14,28 @@ execution_panel (raw)    ──► build_label_v2    ──► y（net/excess/up
 
 1. **守卫先于重活**：``require_certified_execution_series`` 在构造特征矩阵之前执行——
    execution 不是 raw+certified 就直接抛错，不允许跑几十分钟才失败；
-2. **逐项对齐**：每条 decision 的 ``(symbol, date)`` 都必须在 execution 面板里有对应
-   bar，缺一条即 fail closed（不退回 qfq、不从 qfq 反推 raw）；
+2. **逐项对齐但区分两种"缺"**：每条 decision 的 ``(symbol, date)`` 若在 execution 面板
+   没有当日 bar，要分**当日无 execution bar**（PIT 候选池按设计包含"最近还活跃、当天
+   拿不到 bar"的票 → 过滤掉，不进训练帧；⚠️ 这**不等于证明停牌**）与**结构缺陷**
+   （日截面塌陷 / 日截面低于 feature 同日 / 整票缺席 / 整天不是交易日 / feature 侧有
+   bar 而 execution 没有 → fail closed）。判据、执行顺序（日级门**先于**逐键裁决）与
+   审计字段见
+   :func:`~stock_analyzer.alpha_v2.dual_price_series.filter_decisions_by_execution_availability`；
 3. **绝对收益只来自 raw**：``net_return_*`` / ``excess_return_*`` / ``up_*`` /
    ``mae_*`` / ``mfe_*`` 与全部基准序列都由 execution 面板的 outcome 派生；
    feature 侧只贡献特征值与风格分组维度。
+
+三段集合必须能分别回答（``evidence["decision_alignment"]`` 就是这张账）：
+
+```text
+decision universe      PIT eligible ∩ feature 日历           = decision_rows_before
+execution available    上述 ∩ execution 面板当日有 bar        = decision_rows_after
+training frame         上述 ∩ feature frame ∩ 有 label 的行    = len(frame)
+```
+
+过滤发生在**构造 label / 特征 / 风格之前**，所以被过滤的行不会以"无 label 的空行"
+形态混进训练矩阵（``fit_frozen_model`` 的 ``labels.notna()`` 掩码只是最后一道兜底，
+不是这里的第一道）。
 """
 
 from __future__ import annotations
@@ -30,7 +47,9 @@ import pandas as pd
 
 from stock_analyzer.alpha_v2.dual_price_series import (
     ROLE_EXECUTION,
-    assert_decisions_aligned,
+    ROLE_FEATURE,
+    PriceSeriesContractError,
+    filter_decisions_by_execution_availability,
     require_certified_execution_series,
     require_declared_feature_series,
 )
@@ -112,17 +131,33 @@ def build_dual_price_training_frame(
             db=str(feature_panel.source or ""),
         )
 
-    # ── 2) decision ↔ execution 逐项对齐（缺行 = target 不可用，fail closed）───
-    alignment = assert_decisions_aligned(
+    # ── 2) decision 可用性裁决（日级健康门 → 逐键结构缺陷 → 过滤不可交易观测）─────
+    # PIT 候选池按设计包含"最近还活跃、当天拿不到 execution bar"的票（含退市/长停期间
+    # 仍在 history 窗口内的票），它们当天没有 execution bar 就拿不到 T+1 入场，必须在
+    # 构造 label/特征之前就出局。但出局**不等于**它们被证明停牌：仓库没有独立 PIT-safe
+    # 的停牌真值源，且两份面板共享同一条上游链路（对称缺失原理上检不出来）。
+    # 所以同一函数里先跑日截面健康门（不看 decision 集合、只看这一天面板有多少根 bar），
+    # 再跑逐键结构缺陷判据（整票缺席 / 整天不是交易日 / feature 有而 execution 没有），
+    # 两者都 fail closed；剩下的才允许过滤。cross_check_panel=feature 面板：
+    # 两份面板必须对"这只票这天有没有交易"给同一个答案。
+    availability = filter_decisions_by_execution_availability(
         decisions=decisions,
         execution_panel=execution_panel,
+        cross_check_panel=feature_panel,
         context=f"{context}:execution_panel",
     )
+    alignment = availability.report
+    training_decisions = list(availability.decisions)
+    if not training_decisions:
+        raise ValueError(
+            f"{context}: execution 可用决策集为空（{len(decisions)} 条候选全部无当日 bar）"
+            "——检查两份面板的窗口与交易日历；空训练帧不是合法产物"
+        )
 
     # ── 3) 绝对收益 / 基准：全部来自 raw execution 面板 ────────────────────────
     run = build_label_v2(
         panel=execution_panel,
-        decisions=decisions,
+        decisions=training_decisions,
         spec=spec,
         matcher=matcher,
         slippage_ratio=slippage_ratio,
@@ -133,12 +168,14 @@ def build_dual_price_training_frame(
             "execution_panel_source": str(execution_panel.source),
             "execution_price_mode": str(reviewed.mode),
             "execution_role": ROLE_EXECUTION,
+            "decision_rows_before_availability_filter": availability.decision_rows_before,
+            "decision_rows_filtered": availability.filtered_rows,
         },
     )
     if run.frame.empty:  # pragma: no cover - 与上面的空决策检查同因，防御性兜底
         raise ValueError(f"{context}: outcome 帧为空（{len(decisions)} 条决策全部无结果）")
     # 风格维度取 feature 侧契约（分组/匹配用，不是收益来源）。
-    styles = compute_style_features(panel=feature_panel, decisions=decisions)
+    styles = compute_style_features(panel=feature_panel, decisions=training_decisions)
     enriched = run.frame.merge(styles, on=["decision_date", "symbol"], how="left")
     suite = build_benchmark_suite(
         enriched, spec=benchmark_spec or BenchmarkSpec(style_min_peers=5)
@@ -146,11 +183,36 @@ def build_dual_price_training_frame(
     primary = merge_primary_excess(enriched, suite)
 
     # ── 4) 特征矩阵：只来自 feature 面板 ──────────────────────────────────────
-    features_all = daily_feature_frame(feature_panel, decisions)
+    features_all = daily_feature_frame(feature_panel, training_decisions)
     safe = [column for column in features_all.columns if column not in set(IDENTITY_COLUMNS)]
     safe = list(safe_feature_columns(safe))
     features = features_all[[*IDENTITY_COLUMNS, *safe]].copy()
     frame = features.merge(primary, on=list(IDENTITY_COLUMNS), how="inner")
+    # ⚠️ 上面这一行是本轮要封堵的**静默丢失点**：inner merge 会把"有 outcome 但没有特征行"
+    # 的决策直接变没，前后行数之差既不算过滤也不算缺陷。可用性裁决已经在那之前就
+    # fail closed（``FEATURE_BAR_MISSING_FOR_EXECUTABLE_DECISION``），这里再钉一次：
+    # 两道门之间任何一层新加的过滤都不许以"行数差不多"的形式通过。
+    lost_in_merge = set(
+        zip(
+            primary["decision_date"].astype(str),
+            primary["symbol"].astype(str),
+            strict=True,
+        )
+    ) - set(
+        zip(
+            frame["decision_date"].astype(str),
+            frame["symbol"].astype(str),
+            strict=True,
+        )
+    )
+    if lost_in_merge:
+        raise PriceSeriesContractError(
+            f"{context}: FEATURE_ROW_MISSING —— {len(lost_in_merge)} 条决策有 outcome 却没有"
+            f"特征行，被特征侧 inner join 丢弃（例：{sorted(lost_in_merge)[:5]}）。"
+            "它们绕过了可用性裁决的每一个桶，属于 unknown_drop；"
+            "禁止用改 merge 方式（left join + 填 NaN）把它糊过去",
+            role=ROLE_FEATURE,
+        )
     frame = build_head_targets(frame)
 
     evidence: dict[str, object] = {
@@ -160,6 +222,36 @@ def build_dual_price_training_frame(
         "execution_price_mode": str(reviewed.mode),
         "execution_price_mode_certified": bool(reviewed.certified),
         "decision_alignment": dict(alignment),
+        # 一条候选decision的完整去向账（P3.3 §11）：从 PIT 候选一直到训练帧，
+        # 每一行都必须落在一个**有名字**的桶里；``silent_drop`` 必须由程序算出来、
+        # 且只能等于 0，不能靠"前后行数差不多"糊过去。
+        # 前两段（候选→execution 可用）由可用性裁决自己守恒断言；这里补上后两段。
+        "decision_accounting": {
+            **(alignment.get("decision_accounting") or {}),  # type: ignore[union-attr]
+            "decision_universe_rows": availability.decision_rows_before,
+            "execution_available_rows": availability.decision_rows_after,
+            # 被 FILTER 的行在这里显式入账（而不是只留一个"前后相减"的隐式差），
+            # 并带上原因码与"未证明停牌"的语义标注——审计要能直接读出这一层。
+            "filtered_unavailable_rows": availability.filtered_rows,
+            "filter_reason": str(alignment.get("filter_reason", "")),
+            "filter_reason_semantics": str(alignment.get("filter_reason_semantics", "")),
+            "outcome_rows": int(len(run.frame)),
+            # 候选里"当天拿不到 label"的那部分（未成熟 / T+1 未成交）。它与
+            # silent_drop 的区别就是这条账的意义：前者是**业务事实**，后者是**缺陷**。
+            "label_unavailable_rows": int(
+                max(0, len(training_decisions) - int(len(run.frame)))
+            ),
+            "training_frame_rows": int(len(frame)),
+            # 有 outcome 却没进训练帧的行——本轮之前它哪儿都不在。
+            "silent_drop": int(len(lost_in_merge)),
+            "accounting_status": (
+                "PASS"
+                if not lost_in_merge
+                and str((alignment.get("decision_accounting") or {}).get("accounting_status"))
+                == "PASS"
+                else "FAIL"
+            ),
+        },
         "benchmark_layers": sorted(suite.series),
         "benchmark_primary_layer": str(suite.primary),
         "quality_pool_source": str(suite.report.get("quality_pool_source", "research_proxy")),

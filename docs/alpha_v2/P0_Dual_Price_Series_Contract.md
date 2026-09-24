@@ -36,16 +36,113 @@ Execution Series must be RAW
 
 1. **守卫先于重活**：execution 口径不合法时，在构造完整特征矩阵之前失败——不允许跑
    几十分钟才报错；
-2. **绝不猜测**：execution 面板缺一条 `(symbol, date)` 就是 target 不可用（fail closed），
-   不允许退回 qfq、不允许从 qfq 反推 raw；
+2. **绝不猜测**：execution 面板缺一条 `(symbol, date)` 就是 target 不可用，不允许退回
+   qfq、不允许从 qfq 反推 raw——**但"不可用"分两种，处置不同**（见 §2.1）；
 3. **两条身份各自成块**：`feature_data_identity` / `execution_data_identity` 分开记录、
    分开对账、分开封存。
+
+## 2.1 有效决策集：候选 ≠ 可交易（P3.1 `be2e4ef`；P3.1.1 加日截面健康门；P3.3 加双向对称、形状分桶与守恒账）
+
+PIT 合格池（`expected_active_lookback_days=5`，**5 个自然日**，见
+`asof_universe.build_pit_stats`）按设计含"最近还活跃、当天拿不到 execution bar"的票
+（含退市/长停期间仍在 history 窗口内的票）。这些 `(symbol, decision_date)` 的 target
+不成立（T+1 入场要求当日有决策 bar），必须在构造 label/特征之前出局。三段集合因此显式分开：
+
+```text
+decision universe      PIT eligible ∩ feature 日历         = decision_rows_before
+execution available     上述 ∩ execution 当日有 bar          = decision_rows_after / intersection
+training frame          上述 ∩ feature frame ∩ 有 label 的行   = len(frame)
+```
+
+裁决分四层，**日级健康门先于逐键裁决，逐键之后才是守恒账与结构闸**：
+
+| 观测 | 裁决 | 原因码 |
+| --- | --- | --- |
+| 【日级】决策日 execution 截面相对自身基线塌陷（<90%） | **fail closed** | `EXECUTION_SESSION_BREADTH_COLLAPSE` |
+| 【日级】execution 同日截面明显低于 feature（<90%） | **fail closed** | `EXECUTION_SESSION_BREADTH_BELOW_FEATURE` |
+| 【逐键】在 execution 面板里 | 保留 | — |
+| 【逐键】票在整个 execution 面板都不存在 | **fail closed** | `SYMBOL_NOT_IN_EXECUTION_PANEL` |
+| 【逐键】该日期在 execution 面板里不是交易日 | **fail closed** | `DECISION_DATE_NOT_A_SESSION_IN_EXECUTION_PANEL` |
+| 【逐键】feature 面板当天**有** bar 而 execution 没有 | **fail closed** | `FEATURE_PANEL_HAS_BAR_ON_DECISION_DATE` |
+| 【逐键】execution 当天**有** bar 而 feature 没有 | **fail closed** | `FEATURE_BAR_MISSING_FOR_EXECUTABLE_DECISION` |
+| 【过滤】以上全不成立（两侧同票同日都无 bar） | **过滤 + 按形状分桶入账** | `NO_EXECUTION_BAR_ON_DECISION_DATE` |
+| 【账】候选 ≠ 保留 + 过滤 + 缺陷 | **fail closed** | `decision 账不守恒`（显式 `raise`，不用 `assert`） |
+| 【结构】interior 桶里最长连号段 ≥ 8 | **fail closed** | `EXECUTION_SHARED_MISSING_CONTIGUOUS_RUN` |
+| 【帧】inner merge 后有 outcome 却无特征行 | **fail closed** | `FEATURE_ROW_MISSING`（`silent_drop` 必须为 0） |
+
+⚠️ **最后一行不等于"已证明停牌"**。本仓库不存在可用于 Alpha V2 freeze 的、独立且
+PIT-safe 的停牌真值源（`daily_trade_status` 实测 154 行 / 2 只票 / `sum(suspended)=0`
+且 alpha_v2 从不读；`security_status` 0 行 0 生产方；`daily_bars.suspended` 全库恒
+False）。更关键的是**两份面板共享同一条上游链路**：同一个缺陷会同时命中两侧，
+于是"两边都没 bar"这个观测对"不可交易"与"对称断供"**给不出不同答案**——逐键判据在
+这一类上原理性失效。日截面健康门就是为这一类补的：它完全不看 decision 集合，只看
+"这一天面板自己还剩多少根 bar"。
+
+四条逐键判据不是"停牌"，而是两份面板对同一份事实给出了不同答案——静默过滤会把真实的
+断供/截断/换库伪装成"少了几行训练样本"。**单侧**丢失由"跨面板分歧"逐键拦截（与量级无关），
+且**两个方向都要拦**：`execution 有 / feature 没有` 这一类在 P3.3 之前会走"保留"分支，
+然后在特征侧 `merge(..., how="inner")` 处消失，既不计入 filtered 也不计入 defects
+（2026-07-17..07-30 生产实测决策窗内 295 个这样的键）。
+
+"两侧同缺"按形状分两桶，因为二者观测相同而定性相反：
+`trailing_no_further_bar`（该票此后再无 bar）＝退市或**市场代码迁移**
+（北交所 430/83/87xxx → 920xxx，每天 246–256 条、票号连号，是合法市场事实，
+**不得** patch、**不得**当 source gap）；`interior_resumes_later`＝中间空洞（上游少交付）。
+连号结构闸**只看后者**，所以既拦得住 2025-11-17 / 11-18，也不会把换号窗口误判。
+单日比例闸已从被 `be2e4ef` 抬到的 50% 撤回到 10%，并且实测：广度门开着时它
+永远不会是第一个报的那条（`filtered_ratio > 10%` 蕴含 `breadth < 0.90`），
+只剩"广度门为小夹具关掉时"的兜底价值。
+
+### 2.2 三层判据的证据强度（P3.1.1 实测）
+
+| 层 | 判据 | 是否依赖 decision 集合 | 跨窗口实测 |
+| --- | --- | --- | --- |
+| 日级广度 | 当日 bar 数 / 面板自身前 ≤20 session 中位数 < **0.90** | **否** | 十年 2,489 个 session：judged 2,488 / unjudgeable 1，只命中 **2 个**，且两者都是真实尾部截断（2026-04-02/03）；对 2016 年 8,778 条合法"当日无 bar"**零误报**；NAS 上报的 2025-11-17 形态（5,438→4,713=0.8667）**会被抓到** |
+| 日级两侧 | execution 同日 bar 数 / feature 同日 < **0.90** | **否** | 方向单边（raw 多于 qfq 是设计内） |
+| 逐键集合 | 整票缺席 / 该日非 session / 跨面板分歧 | 是 | 逐键、与量级无关 |
+| 比例兜底 | 全窗 2%、单日 50%、50 行下限 | 是 | **provisional，已知不普适**（见下） |
+
+日级门**主动弃权**的两种情形（都如实记进 `session_health.unjudgeable_*`，绝不记成"通过"）：
+面板**第一个 session**（无前序可比——十年截面从 2,817 长到 5,198，用全局中位数兜底会把首日
+误判成 59% 塌陷，从而误杀"窗口起点=面板首日"的真实 freeze；实测抓到并已修）；
+基线截面 **< 100 行**（小尺度上比例无意义，生产每日 4,700–5,500 只不受影响）。
+
+两条比例闸**不是停牌定义**，只是量级报警，且已知会误杀：
+
+| 闸 | 默认 | 实测反例 / 依据 | 性质 |
+| --- | --- | --- | --- |
+| 全窗过滤占比 | 2% | 生产窗口 0.400%（6602/1650654）**但** 2016 年窗口 **2.0773%**（8778/422566）→ 该值不普适，已证实会 fail closed | provisional |
+| 单日过滤占比 | 50% | 由 10% 放宽而来，理由是把 12.25%（2025-11-17）当成"最大合法值"；实测十年最大**形态合法**单日过滤仅 **3.834%**（2016-04-22），p99 3.566% → 10% 从未误杀 | provisional（偏松） |
+| 行数下限 | 50 行 | 小窗口/小夹具不被比例门误杀 | 与比例共用 |
+
+> **2025-11-17 的正确定性**：raw 与 qfq **两侧同时**少 724 个 symbol 的当日 bar
+> （逐票形态"前一根 11-14、后一根 11-18"，抽样 200/200）。这不是"部分覆盖缺口可以放行"，
+> 而是**上游链路的数据缺陷**——本地 warehouse 同一天的截面毫无异常
+> （5,155 票，相邻 5,156 / 5,157，11 月均值 5,126）。现在它由日级广度门拦下
+> （−13.3% 远低于 0.90），而不是被当成阈值依据把闸放宽。
+> 此类日期在放行前必须先修链路；`filtered_dates_top` 仍提供可审计的按日分布。
+
+审计字段进 `dual_price_evidence.decision_alignment`：`decision_rows_before` /
+`filtered_missing_execution_rows` / `decision_rows_after` / `intersection` /
+`filtered_ratio` / `filter_reason` / `filter_reason_semantics` / `filtered_examples` /
+`filtered_dates_top` / `max_daily_filtered_ratio` / **`session_health`**（judged /
+unjudgeable / worst_breadth / panel 比值 / limits / enforced）/ `status`。
+`decision_accounting` 另显式记 `filtered_unavailable_rows` + 原因码 + 语义标注。
+
+`assert_decisions_aligned` 保留为**零容忍**版本（任何一条不齐即抛）。⚠️ 截至 `f2596ce`
+它**只有测试调用方**，所称"供研究/回放路径使用"尚无对应入口。
+训练帧走 `filter_decisions_by_execution_availability`。
+
+> 实测（生产窗口 2025-06-02..2026-08-31 / warmup 200，**P3.1 口径、日级门之前**）：
+> `1,650,654` 条候选 / `6,602` 条被过滤（`0.400%`）/ `1,644,052` 条进入训练帧，
+> `status=PASS`。⚠️ **该结论在 P3.1.1 之后不再成立**：同一窗口含 2025-11-17，
+> 日级广度门会 fail closed。上表数字是历史测量，不是当前预期。
 
 ## 3. 守卫落点
 
 | 环节 | 实现 | 失败形态 |
 | --- | --- | --- |
-| 冻结训练 | `dual_price_series.require_certified_execution_series`（`build_dual_price_training_frame` 第一步） | `PriceSeriesContractError`，CLI exit 4 |
+| 冻结训练 | `require_certified_execution_series` + `filter_decisions_by_execution_availability`（`build_dual_price_training_frame` 前两步；后者内部**日级广度门先于逐键裁决**） | 口径违例 / 日截面异常 / 逐键结构缺陷 → `PriceSeriesContractError`，CLI exit 4（**显式捕获**，不走未捕获 traceback）；当日无 execution bar → 过滤并记审计（**不代表已证明停牌**） |
 | `build_label_v2` | 默认 `enforce_execution_price_series=True`；非 raw / 未认证直接抛错 | `PriceSeriesContractError` |
 | outcome 成熟 | `outcome_maturation.mature_epoch_outcomes` 门 0（在任何计算/写入之前） | `PriceSeriesContractError`，CLI exit 4，**0 行 outcome** |
 | KPI 证据 | `validation_kpis`：逐日 `_day_outcome_price_series_ok` + 逐行 `_certified_raw_mask` | 该日不 clean；主样本为空；`price_series` 块如实计数 |
