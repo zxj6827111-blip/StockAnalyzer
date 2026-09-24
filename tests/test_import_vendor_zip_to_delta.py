@@ -94,10 +94,21 @@ def _qfq_fixture(root: Path) -> Path:
 
 
 def _run(args: list[str], capsys: pytest.CaptureFixture[str]) -> dict[str, object]:
-    rc = delta_import._main(args)
-    payload = json.loads(capsys.readouterr().out)
+    rc, payload = _run_rc(args, capsys)
     assert rc == 0, payload
     return payload
+
+
+def _run_rc(
+    args: list[str], capsys: pytest.CaptureFixture[str]
+) -> tuple[int, dict[str, object]]:
+    """跑一次导入器，返回 (真实退出码, JSON 报告)。
+
+    退出码必须**原样交给断言**：P3.3.1 之前所有用例都隐含"rc 恒为 0"，
+    于是"静默跳过但仍算成功"这条行为没人能测出来。
+    """
+    rc = delta_import._main(args)
+    return int(rc), json.loads(capsys.readouterr().out)
 
 
 def _provider(root: Path, index_path: Path, *, qfq: bool = False) -> VendorZipOverlayProvider:
@@ -294,12 +305,16 @@ def test_full_import_dry_run_never_creates_delta(
     assert not (tmp_path / "delta" / "market_delta.duckdb").exists()
 
 
-def test_full_import_skips_missing_qfq_factor_symbols(
+def test_full_import_fails_closed_on_missing_qfq_factor(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """qfq 模式下缺因子符号跳过并统计，不失败（与 batch 路径一致）。"""
+    """任务书 §9 Test 4：RAW 有 / 因子没有 / QFQ 没有 → QFQ_FACTOR_MISSING 且非零退出。
+
+    本用例原来断言的是相反的行为（"跳过并统计，**不失败**"），那是 2026-07
+    那 295 个缺键能一路静默的直接原因，因此按 P3.3.1 的契约改写而不是绕过它。
+    """
     index_path = _build_daily_fixture(tmp_path)
-    # 只有 000001.SZ 有因子；600000.SH 无因子，必须被跳过。
+    # 只有 000001.SZ 有因子；600000.SH 无因子，必须被记成结构性缺陷。
     _write_factors_zip(
         tmp_path,
         {
@@ -308,7 +323,7 @@ def test_full_import_skips_missing_qfq_factor_symbols(
         },
     )
 
-    report = _run(
+    rc, report = _run_rc(
         [
             "--data-root",
             str(tmp_path),
@@ -324,6 +339,13 @@ def test_full_import_skips_missing_qfq_factor_symbols(
         capsys,
     )
 
+    assert rc == 1, report  # 真实非零退出码，不是 warning
+    assert report["ok"] is False
+    assert report["qfq_skipped_symbols"] == ["600000"]
+    assert report["qfq_skip_reasons"] == {"QFQ_FACTOR_MISSING": ["600000"]}
+    assert report["factor_missing_count"] == 1
+    assert report["derivation_gap_count"] == 0
+    assert report["structural_defect_reason"] == "QFQ_FACTOR_MISSING"
     assert report["loaded_symbols"] == 1
     assert report["skipped_symbols"] == ["600000"]
     warehouse = MarketWarehouse(

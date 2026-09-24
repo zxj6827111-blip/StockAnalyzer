@@ -61,6 +61,21 @@ _MARKET_ENRICHMENT_COLUMNS = (
 )
 
 VENDOR_ZIP_INDEX_VERSION = 1
+
+#: qfq 批量读取中"某只票整批被跳过"的**两种成因**（P3.3.1）。
+#:
+#: 两者都不是停牌、都不是"数据本来就没有"，都不允许静默通过：
+#:
+#: - ``QFQ_FACTOR_MISSING``：该票在 ``复权因子`` 包里**取不到任何可用因子**
+#:   （entry 缺失、表头变了、因子非正、全 NaN）→ 无法派生 QFQ；
+#: - ``QFQ_DERIVATION_GAP``：因子序列**存在**，但仍然没能生成任何 bar
+#:   （因子无法与日线对齐等）→ 这是纯粹的自己弄丢了。
+#:
+#: 判据来自 ``_factor_missing_symbols``：批量加载先跑过一次，跳过时该集合的
+#: 成员关系已经稳定，所以这个二分类是确定的，不是猜的。
+QFQ_SKIP_REASON_FACTOR_MISSING = "QFQ_FACTOR_MISSING"
+QFQ_SKIP_REASON_DERIVATION_GAP = "QFQ_DERIVATION_GAP"
+
 logger = logging.getLogger(__name__)
 _YEAR_ARCHIVE_RE = re.compile(r"^(?P<year>\d{4})(?:\((?P<copy>\d+)\))?\.zip$", re.I)
 _DAILY_ENTRY_RE = re.compile(r"(?P<code>\d{6})\.(?:SH|SZ|BJ)\.csv$", re.I)
@@ -235,6 +250,11 @@ class VendorZipOverlayProvider:
     _minute_entry_index: dict[Path, dict[str, list[str]]] = field(default_factory=dict, init=False)
     _factor_cache: dict[str, pd.Series] = field(default_factory=dict, init=False)
     _factor_missing_symbols: set[str] = field(default_factory=set, init=False)
+    #: 最近一次 ``_load_vendor_daily_batch`` 里被跳过的票 → 原因码。
+    #: 公开字段是**有意的**：跳过必须能被调用方看见并据此失败，而不是只留一行 warning。
+    #: 旧实现把这个信息丢弃在函数局部变量里，调用方只能用集合差分反推"少了哪些票"，
+    #: 而"少票"既可能是 qfq 因子缺陷、也可能是该票根本不在日线索引里——两者处置相反。
+    qfq_skip_reasons: dict[str, str] = field(default_factory=dict, init=False)
     _intraday_batch_cache: OrderedDict[str, tuple[float, dict[str, pd.DataFrame]]] = field(
         default_factory=OrderedDict, init=False
     )
@@ -970,15 +990,29 @@ class VendorZipOverlayProvider:
         ``limit`` rows have been accumulated. Each annual ZIP archive is
         opened at most once.
 
-        In qfq mode, symbols whose factor data is missing or corrupted
-        (``_load_price_factors`` or factor parsing raises ``DataSourceError``)
-        are skipped with a WARNING instead of failing the whole batch: this
-        path is tolerant because the quality selector is backed by a coverage
-        gate (coverage >= 0.90). Structural daily-file errors (missing
-        date/OHLCV columns) still raise ``DataSourceError``, and the
-        single-symbol path (``fetch_daily_bars`` -> ``_load_vendor_daily``)
-        is unaffected, still failing closed on missing factors.
+        In qfq mode a symbol whose factor data is missing or unreadable yields
+        no rows for the whole batch. It is still not raised here, because one
+        corrupt symbol would otherwise block the nightly update of all ~5,400
+        symbols -- but it is NO LONGER INVISIBLE: the symbol is classified
+        (:data:`QFQ_SKIP_REASON_FACTOR_MISSING` vs
+        :data:`QFQ_SKIP_REASON_DERIVATION_GAP`) and recorded in
+        ``self.qfq_skip_reasons``, which the importer must consume and fail on.
+
+        ⚠️ The previous justification for the tolerance -- "this path is safe
+        because the quality selector is backed by a coverage gate
+        (coverage >= 0.90)" -- does not hold and is the reason a real defect
+        ran unnoticed: a whole-market ratio cannot see a 0.5% hole
+        (2026-07-17..07-30 lost 27 symbols = 295 (symbol, date) QFQ rows while
+        coverage stayed 0.995 and ``ok`` stayed true, and because the nightly
+        import is incremental the missed dates were never revisited). A ratio
+        gate is not a structural one.
+
+        Structural daily-file errors (missing date/OHLCV columns) still raise
+        ``DataSourceError``, and the single-symbol path
+        (``fetch_daily_bars`` -> ``_load_vendor_daily``) is unaffected, still
+        failing closed on missing factors.
         """
+        self.qfq_skip_reasons = {}
         if self.price_series_mode == "qfq":
             factor_archive = self._root / _QFQ_FACTORS_DIR_NAME / _QFQ_FACTORS_ARCHIVE_NAME
             if not factor_archive.exists():
@@ -1050,11 +1084,14 @@ class VendorZipOverlayProvider:
                             )
                             continue
                         if self.price_series_mode == "qfq":
+                            reason = self._qfq_skip_reason(symbol)
                             if symbol not in skipped:
                                 skipped.add(symbol)
+                                self.qfq_skip_reasons[symbol] = reason
                                 logger.warning(
-                                    f"batch skipping symbol {symbol} (missing/unreadable qfq "
-                                    f"factors); {len(skipped)} skipped so far"
+                                    f"batch skipping symbol {symbol}: {reason} "
+                                    f"(qfq rows cannot be derived); "
+                                    f"{len(skipped)} skipped so far"
                                 )
                             remaining[symbol] = 0
                         else:
@@ -1079,6 +1116,25 @@ class VendorZipOverlayProvider:
             frame.insert(0, "symbol", symbol)
             long_frames.append(frame)
         return long_frames
+
+    def _qfq_skip_reason(self, symbol: str) -> str:
+        """为什么这只票在 qfq 批量路径上什么都没生成——二分类，不留"未知"。
+
+        ``_load_price_factors_batch`` 在本次批量开头就跑了，所以
+        ``_factor_missing_symbols`` 的成员关系此时是确定的：
+
+        - 在集合里 → 因子根本取不到（entry 缺失 / 表头异常 / 非正 / 全 NaN）
+          → :data:`QFQ_SKIP_REASON_FACTOR_MISSING`，是**上游交付**问题；
+        - 不在集合里 → 因子序列是有的，却仍然没生成任何 bar
+          → :data:`QFQ_SKIP_REASON_DERIVATION_GAP`，是**我们自己派生**问题。
+
+        两者都必须让调用方失败，但原因不同、修的地方也不同——把它们合并成
+        "skipped_symbols 一个列表"正是旧实现看不懂自己在丢什么的原因。
+        """
+        candidates = {str(symbol), str(_normalize_symbol(symbol) or "")}
+        if candidates & self._factor_missing_symbols:
+            return QFQ_SKIP_REASON_FACTOR_MISSING
+        return QFQ_SKIP_REASON_DERIVATION_GAP
 
     def _load_price_factors_batch(self, symbols: list[str]) -> None:
         """Populate factor cache for many symbols with one ZIP directory scan."""

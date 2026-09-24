@@ -69,7 +69,9 @@ if str(SRC) not in sys.path:
 from stock_analyzer.data.market_warehouse import MarketWarehouse  # noqa: E402
 from stock_analyzer.data.provider import DataSourceError  # noqa: E402
 from stock_analyzer.data.tushare_provider import _to_ts_code  # noqa: E402
-from stock_analyzer.data.vendor_zip_overlay import (  # noqa: E402
+from stock_analyzer.data.vendor_zip_overlay import (  # noqa: E402  # noqa: E402
+    QFQ_SKIP_REASON_DERIVATION_GAP,
+    QFQ_SKIP_REASON_FACTOR_MISSING,
     VendorZipOverlayProvider,
     _is_zip_noise,
     _parse_vendor_factor_frame,
@@ -349,17 +351,38 @@ def _build_report(
     full_import_symbols: list[str],
     dry_run: bool,
     elapsed_sec: float,
+    qfq_skips: dict[str, str] | None = None,
 ) -> dict[str, object]:
+    skips = dict(qfq_skips or {})
+    by_reason: dict[str, list[str]] = {}
+    for symbol, reason in sorted(skips.items()):
+        by_reason.setdefault(str(reason), []).append(symbol)
     drift_enabled = str(price_series_mode).strip().lower() == "qfq"
     return {
         "script": "import_vendor_zip_to_delta",
         "mode": mode,
         "price_series_mode": str(price_series_mode).strip().lower(),
         "dry_run": dry_run,
+        # ⚠️ ``ok`` 不再无条件为真：qfq 角色下"整只票什么都没生成"是**结构性缺陷**，
+        # 不是可以忽略的噪声。旧实现把这条留在 true，于是 2026-07-17..07-30 少了
+        # 295 个 (symbol, date) QFQ 行、增量导入又永不回填，全程没人报失败。
+        # 已写进去的行**不回滚**（那些数据是对的），但这一轮必须被记为失败。
+        "ok": not by_reason,
         "requested_symbols": requested_symbols,
         "loaded_symbols": len(loaded_symbols),
         "skipped_symbols": skipped_symbols,
         "skipped_symbol_count": len(skipped_symbols),
+        # ``skipped_symbols`` 是"请求了却没出数据"的**总**集合，里面混着
+        # "该票根本不在日线索引里"（正常）与"qfq 派生缺陷"（必须失败），
+        # 所以判据只能看下面这个带原因码的子集，不能拿它凑数。
+        "qfq_skipped_symbols": sorted(skips),
+        "qfq_skipped_symbol_count": len(skips),
+        "qfq_skip_reasons": by_reason,
+        "derivation_gap_count": len(by_reason.get(QFQ_SKIP_REASON_DERIVATION_GAP, [])),
+        "factor_missing_count": len(by_reason.get(QFQ_SKIP_REASON_FACTOR_MISSING, [])),
+        "structural_defect_reason": (
+            sorted(by_reason)[0] if by_reason else ""
+        ),  # 只有一个缺陷类别时直接给出 code，多个时取字典序第一个（明细看 qfq_skip_reasons）
         "incremental_new_rows": fresh_rows,
         # 因子漂移重写只对 qfq 有意义（除权重标定的是复权序列的整段历史）。raw 序列没有
         # 因子，这条通道对它必须**关闭**——把它写成显式字段是让夜间审计能一眼看出"这次
@@ -450,6 +473,18 @@ def _main(argv: list[str] | None = None) -> int:
         index_latest = _index_latest_dates(provider.index_path)
         warehouse = provider._warehouse  # noqa: SLF001
 
+        # provider 每次 batch 会重置 qfq_skip_reasons，而这一轮最多跑四次 batch
+        # （incremental 下 fresh / full-import / drift，以及 full 模式一次），所以必须
+        # 在循环外累加，否则只有最后一次调用的缺陷留得下来。
+        qfq_skips: dict[str, str] = {}
+
+        def _batch(symbols_arg: list[str], limit_arg: int) -> list[pd.DataFrame]:
+            out = provider._load_vendor_daily_batch(  # noqa: SLF001
+                symbols=symbols_arg, limit=limit_arg
+            )
+            qfq_skips.update(provider.qfq_skip_reasons)
+            return out
+
         if args.incremental:
             delta_latest = _delta_latest_dates(warehouse, symbols)
             anchors = (
@@ -522,17 +557,13 @@ def _main(argv: list[str] | None = None) -> int:
             fresh_frames: list[pd.DataFrame] = []
             fresh_rows = 0
             if fresh_symbols:
-                frames = provider._load_vendor_daily_batch(  # noqa: SLF001
-                    symbols=fresh_symbols, limit=incremental_lookback
-                )
+                frames = _batch(fresh_symbols, incremental_lookback)
                 fresh_frames, fresh_rows = _filter_fresh_rows(
                     frames, delta_latest=delta_latest
                 )
             full_frames: list[pd.DataFrame] = []
             if full_import_symbols:
-                full_frames = provider._load_vendor_daily_batch(  # noqa: SLF001
-                    symbols=full_import_symbols, limit=limit
-                )
+                full_frames = _batch(full_import_symbols, limit)
             drift_frames: list[pd.DataFrame] = []
             if drift_symbols:
                 # 重算深度覆盖 delta 基线实际深度：除权重标定的是全部历史，
@@ -540,9 +571,7 @@ def _main(argv: list[str] | None = None) -> int:
                 drift_limit = max(
                     limit, _delta_max_history_depth(warehouse, drift_symbols)
                 )
-                drift_frames = provider._load_vendor_daily_batch(  # noqa: SLF001
-                    symbols=drift_symbols, limit=drift_limit
-                )
+                drift_frames = _batch(drift_symbols, drift_limit)
 
             all_frames = fresh_frames + full_frames + drift_frames
             loaded_symbols = sorted({str(frame["symbol"].iloc[0]) for frame in all_frames})
@@ -557,6 +586,7 @@ def _main(argv: list[str] | None = None) -> int:
                 fresh_rows=fresh_rows,
                 drift_symbols=drift_symbols,
                 full_import_symbols=full_import_symbols,
+                qfq_skips=qfq_skips,
                 dry_run=bool(args.dry_run),
                 elapsed_sec=time.perf_counter() - started_at,
             )
@@ -584,9 +614,8 @@ def _main(argv: list[str] | None = None) -> int:
                     )
                     stored_fresh = warehouse.upsert_daily_bars(frame=combined)
                     report["rows_stored"] = stored_fresh
-            report["ok"] = True
         else:
-            frames = provider._load_vendor_daily_batch(symbols=symbols, limit=limit)
+            frames = _batch(symbols, limit)
             loaded_symbols = sorted({str(frame["symbol"].iloc[0]) for frame in frames})
             skipped_symbols = sorted(set(symbols) - set(loaded_symbols))
             rows = sum(len(frame) for frame in frames)
@@ -599,6 +628,7 @@ def _main(argv: list[str] | None = None) -> int:
                 fresh_rows=0,
                 drift_symbols=[],
                 full_import_symbols=loaded_symbols,
+                qfq_skips=qfq_skips,
                 dry_run=bool(args.dry_run),
                 elapsed_sec=time.perf_counter() - started_at,
             )
@@ -610,7 +640,6 @@ def _main(argv: list[str] | None = None) -> int:
                     frame=combined,
                     overwrite_existing=bool(args.overwrite_existing),
                 )
-            report["ok"] = True
     except Exception as exc:
         print(
             json.dumps(
