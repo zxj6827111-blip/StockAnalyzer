@@ -41,7 +41,7 @@ Execution Series must be RAW
 3. **两条身份各自成块**：`feature_data_identity` / `execution_data_identity` 分开记录、
    分开对账、分开封存。
 
-## 2.1 有效决策集：候选 ≠ 可交易（P3.1 `be2e4ef`；P3.1.1 加日截面健康门）
+## 2.1 有效决策集：候选 ≠ 可交易（P3.1 `be2e4ef`；P3.1.1 加日截面健康门；P3.3 加双向对称、形状分桶与守恒账）
 
 PIT 合格池（`expected_active_lookback_days=5`，**5 个自然日**，见
 `asof_universe.build_pit_stats`）按设计含"最近还活跃、当天拿不到 execution bar"的票
@@ -54,7 +54,7 @@ execution available     上述 ∩ execution 当日有 bar          = decision_r
 training frame          上述 ∩ feature frame ∩ 有 label 的行   = len(frame)
 ```
 
-裁决分三层，**日级健康门先于逐键裁决**：
+裁决分四层，**日级健康门先于逐键裁决，逐键之后才是守恒账与结构闸**：
 
 | 观测 | 裁决 | 原因码 |
 | --- | --- | --- |
@@ -64,7 +64,11 @@ training frame          上述 ∩ feature frame ∩ 有 label 的行   = len(fr
 | 【逐键】票在整个 execution 面板都不存在 | **fail closed** | `SYMBOL_NOT_IN_EXECUTION_PANEL` |
 | 【逐键】该日期在 execution 面板里不是交易日 | **fail closed** | `DECISION_DATE_NOT_A_SESSION_IN_EXECUTION_PANEL` |
 | 【逐键】feature 面板当天**有** bar 而 execution 没有 | **fail closed** | `FEATURE_PANEL_HAS_BAR_ON_DECISION_DATE` |
-| 【过滤】以上全不成立（两侧同票同日都无 bar） | **过滤 + 入账** | `NO_EXECUTION_BAR_ON_DECISION_DATE` |
+| 【逐键】execution 当天**有** bar 而 feature 没有 | **fail closed** | `FEATURE_BAR_MISSING_FOR_EXECUTABLE_DECISION` |
+| 【过滤】以上全不成立（两侧同票同日都无 bar） | **过滤 + 按形状分桶入账** | `NO_EXECUTION_BAR_ON_DECISION_DATE` |
+| 【账】候选 ≠ 保留 + 过滤 + 缺陷 | **fail closed** | `decision 账不守恒`（显式 `raise`，不用 `assert`） |
+| 【结构】interior 桶里最长连号段 ≥ 8 | **fail closed** | `EXECUTION_SHARED_MISSING_CONTIGUOUS_RUN` |
+| 【帧】inner merge 后有 outcome 却无特征行 | **fail closed** | `FEATURE_ROW_MISSING`（`silent_drop` 必须为 0） |
 
 ⚠️ **最后一行不等于"已证明停牌"**。本仓库不存在可用于 Alpha V2 freeze 的、独立且
 PIT-safe 的停牌真值源（`daily_trade_status` 实测 154 行 / 2 只票 / `sum(suspended)=0`
@@ -74,8 +78,20 @@ False）。更关键的是**两份面板共享同一条上游链路**：同一�
 这一类上原理性失效。日截面健康门就是为这一类补的：它完全不看 decision 集合，只看
 "这一天面板自己还剩多少根 bar"。
 
-三条逐键判据不是"停牌"，而是两份面板对同一份事实给出了不同答案——静默过滤会把真实的
-断供/截断/换库伪装成"少了几行训练样本"。**单侧**丢失由"跨面板分歧"逐键拦截（与量级无关）。
+四条逐键判据不是"停牌"，而是两份面板对同一份事实给出了不同答案——静默过滤会把真实的
+断供/截断/换库伪装成"少了几行训练样本"。**单侧**丢失由"跨面板分歧"逐键拦截（与量级无关），
+且**两个方向都要拦**：`execution 有 / feature 没有` 这一类在 P3.3 之前会走"保留"分支，
+然后在特征侧 `merge(..., how="inner")` 处消失，既不计入 filtered 也不计入 defects
+（2026-07-17..07-30 生产实测决策窗内 295 个这样的键）。
+
+"两侧同缺"按形状分两桶，因为二者观测相同而定性相反：
+`trailing_no_further_bar`（该票此后再无 bar）＝退市或**市场代码迁移**
+（北交所 430/83/87xxx → 920xxx，每天 246–256 条、票号连号，是合法市场事实，
+**不得** patch、**不得**当 source gap）；`interior_resumes_later`＝中间空洞（上游少交付）。
+连号结构闸**只看后者**，所以既拦得住 2025-11-17 / 11-18，也不会把换号窗口误判。
+单日比例闸已从被 `be2e4ef` 抬到的 50% 撤回到 10%，并且实测：广度门开着时它
+永远不会是第一个报的那条（`filtered_ratio > 10%` 蕴含 `breadth < 0.90`），
+只剩"广度门为小夹具关掉时"的兜底价值。
 
 ### 2.2 三层判据的证据强度（P3.1.1 实测）
 

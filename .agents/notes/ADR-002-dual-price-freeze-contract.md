@@ -2,7 +2,7 @@
 
 Status: Draft
 
-As-of: 2026-09-23 @ HEAD `f2596ce`（详见 §11）
+As-of: 2026-09-24 @ HEAD `9ee30bc`（P3.3 代码与本 Note 同批提交，详见 §11）
 
 ## 1. Status
 
@@ -17,10 +17,12 @@ As-of: 2026-09-23 @ HEAD `f2596ce`（详见 §11）
 
 第二段：决策集裁决口径（(symbol, decision_date) 在 execution 面板没有当日 bar 时
         该 fail closed 还是该过滤）
-        → 已经走过两次落地：be2e4ef（P3.1，过滤式裁决）与本轮 P3.1.1
-          （加日截面健康门 + 把 FILTER 语义降级为"未证明停牌"）。
-          第二段**方向已定、判据仍有待定项**：两条比例闸的阈值重设、
-          以及 NAS 侧 vendor_delta 2025-11-17 覆盖缺口是否已被修，都还没结论。
+        → 已经走过三次落地：be2e4ef（P3.1，过滤式裁决）、P3.1.1
+          （日截面健康门 + FILTER 语义降级）与 P3.3（跨面板双向对称 + 形状分桶
+          + 连号结构闸 + 守恒账，见 §5.7）。
+          第二段**判据已成形、数据仍未修**：单日闸 50%→10% 已撤销，
+          但 NAS 侧 vendor_delta 的 2025 缺行与 2026-07 feature 侧缺行
+          都还没有落进任何生产库，Guard D 的 breadth 阈值也未在修复后历史上重标。
 ```
 
 第二段终局（阈值按多窗口分布重设 + NAS 窗口实测通过）后，本 ADR 升为 Accepted。
@@ -267,6 +269,49 @@ count / median(前 ≤20 session)：p01=0.9923  p05=0.9996  median=1.0028
 > 兜底基线等于换一个统计量，而那个统计量这里不成立。
 
 
+### 5.7 P3.3：跨面板对称性、形状分桶与守恒账（本轮）
+
+> 涉及 `dual_price_series.py`（`max_numeric_symbol_run` / `_symbol_bar_dates` /
+> `_has_later_bar` 三个新私有件 + 2 个新原因码 + 2 个新阈值常量 +
+> `DEFAULT_MAX_DAILY_FILTERED_RATIO` 0.50→0.10 + `decision_accounting` 守恒断言）、
+> `validation/dual_price_freeze.py`（inner merge 之后的 `silent_drop` 兜底网 +
+> `label_unavailable_rows` 入账）、`scripts/alpha_v2_shadow_model_freeze.py`
+> （三行新读数）、`tests/test_alpha_v2_dual_price_series.py`（DP-21/21b/22/23/24/25
+> 六条新增 + DP-19 反证改写）。
+
+三件事，都不是"再调一个阈值"：
+
+1. **反向不对称必须有名字。** 旧裁决表里 `execution 有 bar、feature 没有` 的键走"保留"
+   分支，然后在 `features.merge(primary, how="inner")` 处消失——不计入 filtered、不计入
+   defects、不计入任何原因码。生产实测决策窗内 295 个这种键（2026-07-17..07-30，
+   27 票含 000001/600000，每天 25–31 条落在候选里）。现在它在逐键层 fail closed
+   （`FEATURE_BAR_MISSING_FOR_EXECUTABLE_DECISION`），并在 merge 处再兜一次
+   （`FEATURE_ROW_MISSING` + `silent_drop` 必须为 0），因为两道门之间还可能长出新的过滤器。
+2. **"两侧同缺"按形状分两桶，因为观测相同而定性相反。** `trailing_no_further_bar`
+   （该票此后再无 bar）＝退市或**市场代码迁移**；`interior_resumes_later`＝中间空洞。
+   北交所换号每天留 246–256 条过滤、票号是**连号**的，任何只看规模的判据都会把它判成
+   source gap；只有"还会不会复牌"能把它和 vendor 缺行分开。结构闸
+   （`EXECUTION_SHARED_MISSING_CONTIGUOUS_RUN`，`run>=8` fail / `>=4` audit）
+   因此**只看 interior 桶**。这条是 2025-11-18 的第一道有效防线：日截面广度门看不见它
+   （breadth 0.9517，0.90/0.95 都不触发），比例闸也看不见（5.43%，而合法最大 4.73% 就在隔壁）。
+3. **守恒账由程序断言，不是文档承诺。** `候选 == 保留 + 过滤 + 缺陷` 且
+   `过滤 == interior + trailing`，不成立就抛 `PriceSeriesContractError`。
+   用 `raise` 而不是 `assert`——`python -O` 会把 `assert` 连表达式一起删掉。
+
+本轮实测新增的两条**层级关系**结论（写下来免得下一个人重新推一遍）：
+
+* 单日比例闸在广度门开着时**永远不会是第一个报的**：被过滤的票当天在 execution 面板里
+  也没有 bar，所以 `filtered_ratio > 10%` 蕴含 `breadth < 0.90`。它的真实价值只剩
+  "广度门被小夹具关掉"时的兜底。DP-24 因此显式关掉广度门来单测它。
+* 结构闸是 supplemental，不能单独作为数据质量判断（Invariant 6）：它只认连号，
+  散开的对称缺失（ADR-002 §6.1 盲区一）三层判据**全部沉默**——DP-19 的第二层反证
+  现在钉的就是"这一类依然不可判"，防止"加了结构门就安全了"的错觉。
+
+**本轮明确没做**：① 2025 vendor 缺行的数据修复尚未落到任何生产库（见
+`docs/alpha_v2/p3_3_data_remediation/`）；② §13 Guard D 的动态 breadth 阈值需要用
+**修复后**的历史重标，本轮没有做（全窗口重跑推后）；③ `security_identity_mapping`
+表仍是 0 行，换号仍靠形状识别而非官方映射（§14 允许两者，但显式映射更准）。
+
 ## 6. Invariants（不论 §5 怎么定都不能改）
 
 1. **绝不从 qfq 反推 raw**，也绝不在 execution 侧退回 qfq。这条与 §5 的裁决选择无关。
@@ -290,6 +335,15 @@ count / median(前 ≤20 session)：p01=0.9923  p05=0.9996  median=1.0028
     §7 里 10%→50% 那次放宽就是这条的反例。
 11. **日级判据必须先于逐键 FILTER 裁决**（`filter_decisions_by_execution_availability`
     内部顺序）。反过来做会让"整天截面塌陷"被拆成几千条逐票过滤，从契约上消失。
+12. **可成交决策不得因为"特征侧没有这一行"而静默消失**（P3.3）。逐键层
+    `FEATURE_BAR_MISSING_FOR_EXECUTABLE_DECISION`、帧构造层 `FEATURE_ROW_MISSING`
+    两道门都必须 fail closed，且 `decision_accounting.silent_drop` 必须被程序算出来
+    并等于 0。禁止改成 left join + 填 NaN：那会把"数据缺行"变成"特征值为 0"，
+    比丢行更难发现。
+13. **"两侧同缺"必须按形状分桶后再判**（P3.3）。`trailing_no_further_bar`
+    （退市 / 市场代码迁移）与 `interior_resumes_later`（中间空洞）是**不同的事实**，
+    结构闸只看后者。把它们合并成一个"过滤总数"就是 2025-10 换号窗口被误判成
+    source gap 的原因，也是 2025-11-18 被漏放过的原因。
 
 ### 6.1 日截面健康门的能力边界（必须一起读，否则会被当成万能门）
 
@@ -371,7 +425,7 @@ count / median(前 ≤20 session)：p01=0.9923  p05=0.9996  median=1.0028
 
 ```text
 src/stock_analyzer/backtest/price_contract.py                       # "Feature may be QFQ / Execution must be RAW" 的原始契约
-src/stock_analyzer/alpha_v2/dual_price_series.py                    # 角色常量、认证要求、身份对账键、日截面健康门 + 可用性裁决（1112 行）
+src/stock_analyzer/alpha_v2/dual_price_series.py                    # 角色常量、认证要求、身份对账键、日截面健康门 + 可用性裁决 + 形状分桶/连号结构闸/守恒账（1354 行）
 src/stock_analyzer/alpha_v2/validation/dual_price_freeze.py         # build_dual_price_training_frame 四步编排（249 行）
 src/stock_analyzer/alpha_v2/research/panel.py                       # DailyPanel / pit_universe / certify_price_mode / PriceModeCertification
 src/stock_analyzer/alpha_v2/research/outcomes.py                    # build_label_v2、T+1 可成交性、no_fill 语义
@@ -397,21 +451,25 @@ docs/alpha_v2/P0_Dual_Price_Series_Contract.md                       # 契约正
 > 勘误：`validation/dual_price_series.py` **不存在**；`dual_price_series.py` 在
 > `alpha_v2/` 根下。项目 `AGENTS.md` 原先写错，已更正。
 
-`filter_decisions_by_execution_availability` 内部顺序（P3.1.1 新增，读代码时容易漏）：
+`filter_decisions_by_execution_availability` 内部顺序（P3.1.1 引入日级层，P3.3 补形状与结构层，读代码时容易漏）：
 
 ```text
 dual_price_series.py
-  _session_bar_counts                    # 面板逐 session bar 数（日级广度的原料）
-  assess_decision_session_health         # 两条日级判据 → (payload, defects)
+  _session_bar_counts / _symbol_bar_dates   # 面板逐 session bar 数 + 每票 bar 日期（形状判据的原料）
+  assess_decision_session_health            # 两条日级判据 → (payload, defects)
   filter_decisions_by_execution_availability
-      └─ 先：session 缺陷 → PriceSeriesContractError（CLI exit 4）
-      └─ 后：逐键集合关系 → 保留 / 缺陷 / 过滤
-      └─ 末：两条 provisional 比例闸
+      └─ 1) session 缺陷 → PriceSeriesContractError（CLI exit 4）
+      └─ 2) 逐键集合关系 → 保留 / 跨面板双向缺陷 / 过滤（按 interior|trailing 分桶）
+      └─ 3) 守恒账断言（候选 == 保留 + 过滤 + 缺陷；过滤 == interior + trailing）
+      └─ 4) max_numeric_symbol_run 结构闸（只看 interior 桶）
+      └─ 5) 两条 provisional 比例闸（兜底量级）
+validation/dual_price_freeze.py
+      └─ 6) inner merge 之后 silent_drop 必须为 0（第 2 步与第 6 步之间任何新过滤器都过不了这一关）
 ```
 
 ## 10. Evidence
 
-- 代码：上节全部路径（HEAD `f2596ce` + 本轮 P3.1.1 工作区改动）
+- 代码：上节全部路径（P3.1.1 已随本分支提交，不再是工作区改动）
 - 测试：`tests/test_alpha_v2_dual_price_series.py` **39 例全绿**
   （DP-11..DP-20：前提 / 保留 / 过滤 / 三类逐键缺陷 / 日级广度塌陷 / unjudgeable 如实记账 /
   两侧广度比 / 比例闸 / 不变性 + 显式入账 / 零容忍版未放松 / CLI exit 4 /
@@ -437,14 +495,23 @@ dual_price_series.py
   `b2caa4c` production RAW execution delta pipeline、
   `378abc9` (2026-09-22) require dual-delta readiness for live epoch、
   **`be2e4ef` (2026-09-23) filter unavailable execution bars during dual price freeze**、
-  `f2596ce` (2026-09-23) docs(agents) bootstrap decision knowledge
+  `f2596ce` (2026-09-23) docs(agents) bootstrap decision knowledge、
+  `be2e4ef`/`f2596ce` 以 cherry-pick 进 `feat/alpha-v2-p3-3-data-remediation`、
+  P3.1.1（日截面健康门）与 P3.2（覆盖审计证据）各自成提交进同一条链、
+  **P3.3（本轮）：双向对称 + 形状分桶 + 连号结构闸 + 守恒账**
 
 ## 11. As-of
 
-- HEAD：`f2596ce`（分支 `feat/alpha-v2-raw-execution-delta-r1`；其父 `be2e4ef` 即 P3.1）
-- 最后对照代码核实：2026-09-23（P3.1.1 本轮）
+- HEAD（本 Note 核实时的分支 tip）：`9ee30bc`；分支 `feat/alpha-v2-p3-3-data-remediation`，
+  基线 `origin/main` = `75a8898`；P3.1 `be2e4ef` 与 P3.1.1 均以 cherry-pick 方式进链）
+- 最后对照代码核实：2026-09-24（P3.3 本轮）
 - **§4 / §5.1 / §5.2 / §5.3 / §7 / §8.1 / §8.2 描述已提交实现；
-  §5.5 / §5.6 / §6.1 / §6.2 / §8.3 / §8.4 中标注 P3.1.1 的部分处于工作区未提交状态。**
-- 本轮实际运行：`pytest tests/test_alpha_v2_dual_price_series.py -q` → **39 passed**；
-  ruff / mypy 与基线逐项对齐；两次十年真实面板只读统计与门验证。
-  **未**运行 freeze / training / Production Preflight，**未**连 NAS，**未** commit / push。
+  §5.5 / §5.6 / §6.1 / §6.2 / §8.3 / §8.4 中标注 P3.1.1 的部分，以及 §5.7 /
+  Invariant 12–13 标注 P3.3 的部分，属于本分支的实现。**
+- 本轮实际运行：`pytest tests/test_alpha_v2_dual_price_series.py -q` → **46 passed**；
+  `pytest tests/test_alpha_v2_*.py -q -p no:randomly` → **714 passed / 1 skipped**；
+  ruff 新增告警 0（该文件唯一 E501 是既有的）；mypy `--follow-imports=silent`
+  对 `dual_price_series.py` = **10 = 基线 10**，0 新增。
+  **未**运行 freeze / training / Production Preflight；NAS 侧仅**只读**查询
+  （`read_only` / `ATTACH ... (READ_ONLY)` + `memory_limit=700MB`，容器 4 GiB 上限内）；
+  **未**修改任何生产库或原始 ZIP。

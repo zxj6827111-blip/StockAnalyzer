@@ -47,6 +47,8 @@ import pandas as pd
 
 from stock_analyzer.alpha_v2.dual_price_series import (
     ROLE_EXECUTION,
+    ROLE_FEATURE,
+    PriceSeriesContractError,
     filter_decisions_by_execution_availability,
     require_certified_execution_series,
     require_declared_feature_series,
@@ -186,6 +188,31 @@ def build_dual_price_training_frame(
     safe = list(safe_feature_columns(safe))
     features = features_all[[*IDENTITY_COLUMNS, *safe]].copy()
     frame = features.merge(primary, on=list(IDENTITY_COLUMNS), how="inner")
+    # ⚠️ 上面这一行是本轮要封堵的**静默丢失点**：inner merge 会把"有 outcome 但没有特征行"
+    # 的决策直接变没，前后行数之差既不算过滤也不算缺陷。可用性裁决已经在那之前就
+    # fail closed（``FEATURE_BAR_MISSING_FOR_EXECUTABLE_DECISION``），这里再钉一次：
+    # 两道门之间任何一层新加的过滤都不许以"行数差不多"的形式通过。
+    lost_in_merge = set(
+        zip(
+            primary["decision_date"].astype(str),
+            primary["symbol"].astype(str),
+            strict=True,
+        )
+    ) - set(
+        zip(
+            frame["decision_date"].astype(str),
+            frame["symbol"].astype(str),
+            strict=True,
+        )
+    )
+    if lost_in_merge:
+        raise PriceSeriesContractError(
+            f"{context}: FEATURE_ROW_MISSING —— {len(lost_in_merge)} 条决策有 outcome 却没有"
+            f"特征行，被特征侧 inner join 丢弃（例：{sorted(lost_in_merge)[:5]}）。"
+            "它们绕过了可用性裁决的每一个桶，属于 unknown_drop；"
+            "禁止用改 merge 方式（left join + 填 NaN）把它糊过去",
+            role=ROLE_FEATURE,
+        )
     frame = build_head_targets(frame)
 
     evidence: dict[str, object] = {
@@ -195,10 +222,12 @@ def build_dual_price_training_frame(
         "execution_price_mode": str(reviewed.mode),
         "execution_price_mode_certified": bool(reviewed.certified),
         "decision_alignment": dict(alignment),
-        # 三段集合的同一张账：候选 → execution 可用 → outcome 行 → 训练帧行。
-        # 末两段不再相等是正常的（未成熟/未成交的行拿不到 label），但**第一段到
-        # 第二段的差**必须能被 decision_alignment 的审计字段完全解释。
+        # 一条候选decision的完整去向账（P3.3 §11）：从 PIT 候选一直到训练帧，
+        # 每一行都必须落在一个**有名字**的桶里；``silent_drop`` 必须由程序算出来、
+        # 且只能等于 0，不能靠"前后行数差不多"糊过去。
+        # 前两段（候选→execution 可用）由可用性裁决自己守恒断言；这里补上后两段。
         "decision_accounting": {
+            **(alignment.get("decision_accounting") or {}),  # type: ignore[union-attr]
             "decision_universe_rows": availability.decision_rows_before,
             "execution_available_rows": availability.decision_rows_after,
             # 被 FILTER 的行在这里显式入账（而不是只留一个"前后相减"的隐式差），
@@ -207,7 +236,21 @@ def build_dual_price_training_frame(
             "filter_reason": str(alignment.get("filter_reason", "")),
             "filter_reason_semantics": str(alignment.get("filter_reason_semantics", "")),
             "outcome_rows": int(len(run.frame)),
+            # 候选里"当天拿不到 label"的那部分（未成熟 / T+1 未成交）。它与
+            # silent_drop 的区别就是这条账的意义：前者是**业务事实**，后者是**缺陷**。
+            "label_unavailable_rows": int(
+                max(0, len(training_decisions) - int(len(run.frame)))
+            ),
             "training_frame_rows": int(len(frame)),
+            # 有 outcome 却没进训练帧的行——本轮之前它哪儿都不在。
+            "silent_drop": int(len(lost_in_merge)),
+            "accounting_status": (
+                "PASS"
+                if not lost_in_merge
+                and str((alignment.get("decision_accounting") or {}).get("accounting_status"))
+                == "PASS"
+                else "FAIL"
+            ),
         },
         "benchmark_layers": sorted(suite.series),
         "benchmark_primary_layer": str(suite.primary),

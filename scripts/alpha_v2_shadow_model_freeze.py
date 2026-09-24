@@ -336,6 +336,47 @@ def main(argv: list[str] | None = None) -> int:
             f"(min_ratio={float(limits.get('min_session_breadth_ratio', 0.0)):.2f}, "
             f"enforced={health.get('enforced', True)})"
         )
+    frame_acc = dict(built.evidence.get("decision_accounting") or {})
+    shape = dict(alignment.get("missing_shape") or {})
+    asym = dict(alignment.get("panel_asymmetry") or {})
+    run_gate = dict(alignment.get("missing_numeric_run") or {})
+    defect_total = sum(
+        int(frame_acc.get(key, 0) or 0)
+        for key in (
+            "defect_symbol_not_in_execution_panel",
+            "defect_date_not_a_session",
+            "defect_feature_has_execution_missing",
+            "defect_execution_has_feature_missing",
+        )
+    )
+    print(
+        "[freeze-model] Decision accounting: "
+        f"candidate={frame_acc.get('candidate_decisions', 0)} "
+        f"kept={frame_acc.get('kept_training_decisions', 0)} "
+        f"filtered={frame_acc.get('filtered_no_execution_bar', 0)}"
+        f"[interior={shape.get('interior_resumes_later', 0)} "
+        f"trailing={shape.get('trailing_no_further_bar', 0)}] "
+        f"defects={defect_total} label_unavailable="
+        f"{frame_acc.get('label_unavailable_rows', 0)} "
+        f"training_frame={frame_acc.get('training_frame_rows', 0)} "
+        f"silent_drop={frame_acc.get('silent_drop', 0)} "
+        f"status={frame_acc.get('accounting_status', 'UNKNOWN')}"
+    )
+    print(
+        "[freeze-model] Panel asymmetry: "
+        f"feature_only={asym.get('feature_has_execution_missing', 0)} "
+        f"execution_only={asym.get('execution_has_feature_missing', 0)} "
+        "(both must be 0; execution_only used to vanish via inner join)"
+    )
+    guard_limits = dict(alignment.get("limits") or {})
+    print(
+        "[freeze-model] Structural run gate: "
+        f"worst={run_gate.get('worst_run', 0)} @ {run_gate.get('worst_date', '')} "
+        f"fail>={run_gate.get('fail_threshold', 0)} "
+        f"audit>={run_gate.get('audit_threshold', 0)} "
+        f"audit_dates={len(run_gate.get('audit_dates') or {})} "
+        f"daily_ratio_limit={float(guard_limits.get('max_daily_filtered_ratio', 0)):.2f}"
+    )
     frame = select_frame_columns(
         built.frame,
         safe_features=built.safe_feature_columns,

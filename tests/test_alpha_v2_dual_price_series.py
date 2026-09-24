@@ -45,23 +45,30 @@ from _alpha_v2_m3_fixtures import (
     shadow_row_identity,
     write_freeze_manifest,
 )
-from _alpha_v2_research_helpers import DAYS, bar as _bar, matcher as _matcher, panel as _panel
+from _alpha_v2_research_helpers import DAYS
+from _alpha_v2_research_helpers import bar as _bar
+from _alpha_v2_research_helpers import matcher as _matcher
+from _alpha_v2_research_helpers import panel as _panel
 
 from stock_analyzer.alpha_v2.dual_price_series import (
     DB_ROLE_BINDING_DUAL,
     DB_ROLE_BINDING_LEGACY,
+    DEFAULT_MAX_DAILY_FILTERED_RATIO,
     DEFECT_REASON_CROSS_PANEL_DIVERGENCE,
     DEFECT_REASON_DATE_NOT_SESSION,
-    DEFECT_REASON_SESSION_BREADTH_COLLAPSE,
+    DEFECT_REASON_FEATURE_BAR_MISSING,
     DEFECT_REASON_SESSION_BELOW_FEATURE_BREADTH,
+    DEFECT_REASON_SESSION_BREADTH_COLLAPSE,
+    DEFECT_REASON_SHARED_MISSING_CONTIGUOUS_RUN,
     DEFECT_REASON_SYMBOL_ABSENT,
     FILTER_REASON_NO_EXECUTION_BAR,
     PriceSeriesContractError,
     _panel_bar_keys,
-    assess_decision_session_health,
     assert_decisions_aligned,
+    assess_decision_session_health,
     certification_from_declaration,
     filter_decisions_by_execution_availability,
+    max_numeric_symbol_run,
     price_series_identity_block,
     require_certified_execution_series,
     require_declared_feature_series,
@@ -1863,8 +1870,8 @@ def test_dp19_symmetric_both_panel_truncation_fails_closed():
     旧契约因此会把这 80 条键全当成"当日无 execution bar"静默过滤掉 —— 这正是
     2025-11-17（两侧同时少 724 个 symbol）被归成"部分覆盖缺口、放行"的路径。
     日截面健康门看的是"这一天面板自己还剩多少根 bar"，与 decision 集合无关，
-    所以能抓到。这里同时用 ``enforce_session_health_guard=False`` 反证：
-    关掉门就退回旧行为（80 条全过滤 + PASS），即**这条测试验的确实是新增的那一层**。
+    所以能抓到。``enforce_session_health_guard=False`` 的反证部分由 P3.3 改写：
+    结构闸不依赖那把开关，所以关掉日级门不再等于退回旧行为。
     """
     days = _weekdays(30)
     symbols = [f"{600000 + index:06d}" for index in range(200)]
@@ -1887,18 +1894,18 @@ def test_dp19_symmetric_both_panel_truncation_fails_closed():
     assert DEFECT_REASON_SESSION_BREADTH_COLLAPSE in message
     assert thin_day.isoformat() in message
 
-    # 反证：关掉日级门 → 完全复现 P3.1 的旧行为（逐键判据一条缺陷都报不出来）。
-    legacy = filter_decisions_by_execution_availability(
-        decisions=decisions,
-        execution_panel=panels["execution"],
-        cross_check_panel=panels["feature"],
-        context="unit_symmetric_guard_off",
-        enforce_session_health_guard=False,
-    )
-    assert legacy.filtered_rows == 80
-    assert legacy.report["status"] == "PASS"
-    assert legacy.report["session_health"]["enforced"] is False
-    assert legacy.report["session_health"]["judged_dates"] == len(days) - 1
+    # 反证（P3.3 之后已改写）：关掉日级门**不再**回到"80 条静默过滤"的旧行为——
+    # 结构闸不看那把开关。原反证想证明的是"这一层是唯一防线"，该前提已不成立，
+    # 两层各自的边界见 test_dp19_negative_control_is_now_caught_by_the_structural_layer。
+    with pytest.raises(PriceSeriesContractError) as legacy_exc:
+        filter_decisions_by_execution_availability(
+            decisions=decisions,
+            execution_panel=panels["execution"],
+            cross_check_panel=panels["feature"],
+            context="unit_symmetric_guard_off",
+            enforce_session_health_guard=False,
+        )
+    assert DEFECT_REASON_SHARED_MISSING_CONTIGUOUS_RUN in str(legacy_exc.value)
 
 
 def test_dp20_first_panel_session_is_never_a_breadth_collapse():
@@ -1925,6 +1932,312 @@ def test_dp20_first_panel_session_is_never_a_breadth_collapse():
         decision_dates=sorted(collapsed), execution_counts=collapsed
     )
     assert [day for day, _reason, _detail in defects_after] == ["d0009"]
+
+
+def test_dp21_executable_decision_without_feature_row_fails_closed():
+    """P3.3 Case C（本轮关键回归）：execution 有 bar、feature 没有 → **HARD FAIL**。
+
+    这类键在 P3.1/P3.1.1 的裁决表里是"保留"分支——它当场就能成交，所以留下来；
+    但 ``build_dual_price_training_frame`` 第 4 步是
+    ``features.merge(primary, on=IDENTITY_COLUMNS, how="inner")``，feature 侧没有这一行
+    就等于这条 decision 在训练帧里**不存在**。它不计入 filtered、不计入 defects、
+    不计入任何原因码，只在 ``training_frame_rows < outcome_rows`` 里以
+    "未成熟/未成交"的名义被平均掉。生产实测：2026-07-17..07-30 决策窗内 295 个键
+    （000001 平安银行、600000 浦发银行都在内），每天 25–31 条落进候选集。
+    """
+    days = _weekdays(30)
+    symbols = [f"{600000 + index:06d}" for index in range(200)]
+    thin_day = days[25]
+    # 只有一侧缺：feature 少 3 条散票（散开、不连号，确保不是结构闸或广度门报的）。
+    one_sided = {(symbols[i], thin_day.isoformat()) for i in (0, 5, 9)}
+    panels = _availability_panels(
+        days, symbols, execution_missing=frozenset(), feature_missing=one_sided
+    )
+    decisions = [DecisionPoint(symbol, day) for day in days for symbol in symbols]
+
+    with pytest.raises(PriceSeriesContractError) as excinfo:
+        filter_decisions_by_execution_availability(
+            decisions=decisions,
+            execution_panel=panels["execution"],
+            cross_check_panel=panels["feature"],
+            context="unit_feature_missing",
+        )
+    message = str(excinfo.value)
+    assert DEFECT_REASON_FEATURE_BAR_MISSING in message
+    # 报的就是那 3 条，且报的是"能成交却没有特征行"这个方向，不是反向分歧。
+    for symbol, day in sorted(one_sided):
+        assert f"{symbol}@{day}" in message
+    assert "inner" in message
+
+    # 关掉 feature 面板交叉检查时不判（没有第二份面板就没有"分歧"这个概念可言），
+    # 这条钉住新守卫不会误伤只带 execution 面板的调用路径。
+    uncrossed = filter_decisions_by_execution_availability(
+        decisions=decisions,
+        execution_panel=panels["execution"],
+        context="unit_feature_missing_no_cross_check",
+    )
+    assert uncrossed.report["status"] == "PASS"
+    assert uncrossed.report["panel_asymmetry"]["execution_has_feature_missing"] == 0
+
+
+def test_dp21b_feature_row_loss_during_frame_build_fails_closed(monkeypatch):
+    """DP-21 的上游守卫被绕过时，inner join 那张网本身必须接得住（变异验证）。
+
+    只测守卫会漏掉一件事：守卫和 merge 之间任何一层新加的过滤，都可能让"行数差不多"
+    重新变成通过的理由。所以这里直接伪造"特征矩阵少一行"，要求 merge 处报
+    ``FEATURE_ROW_MISSING``，而不是安静地少一行。
+    """
+    days = _weekdays(30)
+    symbols = [f"{600000 + index:06d}" for index in range(40)]
+    panels = _availability_panels(days, symbols, execution_missing=frozenset())
+    decisions = [DecisionPoint(symbol, day) for day in days for symbol in symbols]
+
+    # 正向对照：不打补丁时这条路是通的（否则下面的"报错"证明不了任何东西）。
+    clean = _build_availability(panels, decisions)
+    assert clean.evidence["decision_accounting"]["silent_drop"] == 0
+
+    original = dpf.daily_feature_frame
+
+    def _drop_one(panel, wanted):
+        return original(panel, wanted).iloc[1:]
+
+    monkeypatch.setattr(dpf, "daily_feature_frame", _drop_one)
+    with pytest.raises(PriceSeriesContractError) as excinfo:
+        _build_availability(panels, decisions)
+    message = str(excinfo.value)
+    assert "FEATURE_ROW_MISSING" in message
+    assert "unknown_drop" in message
+    # 明确禁止用 left join / 填 NaN 把这一层糊过去。
+    assert "left join" in message
+
+
+def test_dp22_contiguous_interior_missing_run_fails_even_when_breadth_is_normal():
+    """P3.3 Case E：连号段结构门。专门挑**广度门看不见**的那一档。
+
+    2025-11-18 的真实形状是：当天只少 4.8%（breadth = 0.9517，0.90 / 0.95 都不触发），
+    单日过滤 5.43%（离任何合理比例闸都还远），但少的是 **23 只连号沪市主板**。
+    这里用 200 只票掉 10 只连号复现同一形状：广度比 190/200 = 0.95 > 0.90，
+    所以报错必须来自结构门，而不是那一层。
+    """
+    days = _weekdays(30)
+    symbols = [f"{600000 + index:06d}" for index in range(200)]
+    thin_day = days[25]
+    missing = {(symbol, thin_day.isoformat()) for symbol in symbols[:10]}
+    panels = _availability_panels(days, symbols, execution_missing=missing)
+    decisions = [DecisionPoint(symbol, day) for day in days for symbol in symbols]
+
+    # 前置事实：这一天的截面**是**健康的，日级门不该说话。
+    health, health_defects = assess_decision_session_health(
+        decision_dates=[thin_day.isoformat()],
+        execution_counts={
+            day.isoformat(): (190 if day == thin_day else 200) for day in days
+        },
+    )
+    assert health_defects == []
+    assert health["worst_breadth_ratio"] == 0.95
+
+    with pytest.raises(PriceSeriesContractError) as excinfo:
+        filter_decisions_by_execution_availability(
+            decisions=decisions,
+            execution_panel=panels["execution"],
+            cross_check_panel=panels["feature"],
+            context="unit_contiguous_run",
+        )
+    message = str(excinfo.value)
+    assert DEFECT_REASON_SHARED_MISSING_CONTIGUOUS_RUN in message
+    assert thin_day.isoformat() in message
+    assert "600000" in message
+
+
+def test_dp23_code_migration_cohort_is_not_a_source_gap():
+    """P3.3 Case F：北交所换号（430/83/87xxx → 920xxx）**不得误报**。
+
+    真实事件：旧代码最后一根 bar 停在 2025-09-30，新代码首根 bar 在 2025-10-09，
+    此后约 3 周旧代码仍是 PIT 候选 → 每天 246–256 条被过滤（4.55%–4.74%，全窗口
+    最大的合法过滤群体），而实测连号段只有 **2**。
+
+    夹具按同一形状构造：200 只连号旧代码从 day X 起再也没有 bar，200 只新代码从
+    day X 起才有 bar —— 当天总截面不变（广度门 1.0），但被过滤的旧代码是**200 连号**。
+    只有"此后再无 bar＝尾部退出"这一层形状判据能把它和 vendor 缺行分开，
+    所以这条测的是形状分桶本身，而不是又一个阈值。
+    """
+    days = _weekdays(30)
+    # 规模要贴生产形状：换号群体是**小尾巴**（真实是 246/5,400 ≈ 4.6%/天），
+    # 但它必须是**连号**的，否则这条测试就没有区分度。
+    stay = [f"{600000 + 3 * index:06d}" for index in range(1960)]
+    old_codes = [f"{430041 + index:06d}" for index in range(40)]
+    new_codes = [f"{920041 + index:06d}" for index in range(40)]
+    symbols = stay + old_codes + new_codes
+    missing = {(s, day.isoformat()) for s in old_codes for day in days[20:]}
+    missing |= {(s, day.isoformat()) for s in new_codes for day in days[:20]}
+    panels = _availability_panels(days, symbols, execution_missing=missing)
+
+    # 反事实：这批票号的连号段本身**远超**结构闸阈值。若形状分桶失效，
+    # 这个合法事件会被当成 vendor 缺行拒掉——这条测试验的正是那层区分。
+    run_if_judged_as_hole, _sample = max_numeric_symbol_run(old_codes)
+    assert run_if_judged_as_hole >= 8
+
+    # PIT 候选按事实构造：没上市的新代码不能当候选（否则就是把"尚未存在"当缺口）。
+    decisions = [DecisionPoint(symbol, day) for day in days for symbol in stay + old_codes]
+    decisions += [
+        DecisionPoint(symbol, day) for day in days[20:] for symbol in new_codes
+    ]
+
+    result = filter_decisions_by_execution_availability(
+        decisions=decisions,
+        execution_panel=panels["execution"],
+        cross_check_panel=panels["feature"],
+        context="unit_code_migration",
+    )
+    report = result.report
+    assert report["status"] == "PASS"
+    shape = report["missing_shape"]
+    # 换号留下的过滤全部落在 trailing 桶里，一条都不进"中间空洞"，
+    # 因此结构闸看到的连号段是 0。
+    assert shape["trailing_no_further_bar"] == 40 * (len(days) - 20)
+    assert shape["interior_resumes_later"] == 0
+    assert report["missing_numeric_run"]["worst_run"] == 0
+    assert report["missing_numeric_run"]["audit_dates"] == {}
+    assert shape["trailing_semantics"] == "delisted_or_code_transition_NOT_SOURCE_GAP"
+    assert report["decision_accounting"]["filtered_trailing_no_further_bar"] > 0
+
+
+def test_dp24_daily_ratio_guard_is_no_longer_fifty_percent():
+    """P3.3 §12：50% 那一步放宽必须撤销。
+
+    ``be2e4ef`` 把单日闸从 10% 抬到 50%，理由是"实测最大合法单日 12.25%"——
+    而那 12.25% 正是被审计的缺陷本身（拿异常值标定放行线，ADR-002 Invariant 10）。
+
+    ⚠️ 顺带记下一条本轮实测出来的**层级冗余**：被过滤的票当天在 execution 面板里也没有
+    bar，所以 ``filtered_ratio > 10%`` 蕴含 ``breadth < 0.90`` —— 单日比例闸在日级广度门
+    开着的时候**永远不会**是第一个报的那条。因此这里显式关掉广度门来单测比例闸，
+    而不是假装它是独立防线。它的真实价值是广度门被关掉（小夹具）时的兜底。
+    """
+    assert DEFAULT_MAX_DAILY_FILTERED_RATIO <= 0.10
+    days = _weekdays(30)
+    # 票号间隔 3 保证最长连号段 = 1（结构闸不可能触发）；面板要足够大，
+    # 否则 10% 还没撞上那条 50 行的**小窗口地板**，测的就不是比例闸了。
+    symbols = [f"{600000 + 3 * index:06d}" for index in range(2000)]
+    thin_day = days[25]
+    decisions = [DecisionPoint(symbol, day) for day in days for symbol in symbols]
+
+    def _run(missing_count: int):
+        missing = {(s, thin_day.isoformat()) for s in symbols[:missing_count]}
+        panels = _availability_panels(days, symbols, execution_missing=missing)
+        return filter_decisions_by_execution_availability(
+            decisions=decisions,
+            execution_panel=panels["execution"],
+            cross_check_panel=panels["feature"],
+            context="unit_daily_ratio",
+            enforce_session_health_guard=False,
+        )
+
+    # 211/2000 = 10.55% > 10%：必须被拒，且是比例闸拒的。
+    with pytest.raises(PriceSeriesContractError) as excinfo:
+        _run(211)
+    message = str(excinfo.value)
+    assert "max_daily_filtered_ratio" in message
+    assert DEFECT_REASON_SHARED_MISSING_CONTIGUOUS_RUN not in message
+
+    # 200/2000 = 10.0%（等于上限、未超过）必须放行——证明这条闸真的在按
+    # 重设后的数值判，而不是无条件拒绝一切。
+    ok = _run(200)
+    assert ok.report["status"] == "PASS"
+    assert ok.report["max_daily_filtered_ratio"] == 0.1
+
+
+def test_dp25_decision_accounting_is_conserved_across_every_bucket():
+    """P3.3 Case H：每一条候选必须落进一个**有名字**的桶，且只落一次。
+
+    守恒式：``候选 == 保留 + 过滤 + 缺陷``，并且 ``过滤 == 中间空洞 + 尾部退出``。
+    ``unknown_drop`` 必须是显式的 0，而不是"没人算过"。
+    """
+    days = _weekdays(30)
+    symbols = [f"{600000 + index:06d}" for index in range(200)]
+    mid_day = days[20]
+    # 三种形态混在同一天里：两侧同缺且会复牌（中间空洞）、缺了就不回来（尾部退出）、
+    # 以及正常成交（保留）。
+    interior = {(symbol, mid_day.isoformat()) for symbol in symbols[0:3]}
+    trailing = {(symbol, day.isoformat()) for symbol in symbols[197:] for day in days[24:]}
+    panels = _availability_panels(days, symbols, execution_missing=interior | trailing)
+    decisions = [DecisionPoint(symbol, day) for day in days for symbol in symbols]
+
+    result = filter_decisions_by_execution_availability(
+        decisions=decisions,
+        execution_panel=panels["execution"],
+        cross_check_panel=panels["feature"],
+        context="unit_accounting",
+    )
+    acc = result.report["decision_accounting"]
+    assert acc["accounting_status"] == "PASS"
+    assert acc["unknown_drop"] == 0
+    bucket_sum = (
+        acc["kept_training_decisions"]
+        + acc["filtered_no_execution_bar"]
+        + acc["defect_symbol_not_in_execution_panel"]
+        + acc["defect_date_not_a_session"]
+        + acc["defect_feature_has_execution_missing"]
+        + acc["defect_execution_has_feature_missing"]
+    )
+    assert bucket_sum == acc["candidate_decisions"] == len(decisions)
+    shape = result.report["missing_shape"]
+    assert (
+        shape["interior_resumes_later"] + shape["trailing_no_further_bar"]
+        == acc["filtered_no_execution_bar"]
+    )
+    assert shape["interior_resumes_later"] == len(interior)
+    assert shape["trailing_no_further_bar"] == len(trailing)
+    # 行数三段自身也要自洽：保留数 = 候选 - 过滤 - 缺陷。
+    assert result.decision_rows_after == result.decision_rows_before - acc[
+        "filtered_no_execution_bar"
+    ]
+
+
+def test_dp19_negative_control_is_now_caught_by_the_structural_layer():
+    """DP-19 的"关掉日级门就复现旧漏洞"反证，P3.3 之后**不再成立**。
+
+    原反证要求：``enforce_session_health_guard=False`` 时 80 条连号缺失全部静默过滤。
+    现在结构闸不看那把开关，所以同样的形状照样被拒。这是防线的**加强**，
+    不是那条测试写错了——但它原来想证明的"这一层是唯一的防线"已经不成立，
+    所以把它改写成两层各自的边界：连号段（结构可分）被拦，散票对称缺失仍然漏。
+    """
+    days = _weekdays(30)
+    symbols = [f"{600000 + index:06d}" for index in range(200)]
+    thin_day = days[25]
+
+    # 层一：连号 80 只 —— 关掉日级门，结构闸仍然拦。
+    contiguous = {(symbol, thin_day.isoformat()) for symbol in symbols[:80]}
+    panels = _availability_panels(days, symbols, execution_missing=contiguous)
+    decisions = [DecisionPoint(symbol, day) for day in days for symbol in symbols]
+    with pytest.raises(PriceSeriesContractError) as excinfo:
+        filter_decisions_by_execution_availability(
+            decisions=decisions,
+            execution_panel=panels["execution"],
+            cross_check_panel=panels["feature"],
+            context="unit_dp19_layer1",
+            enforce_session_health_guard=False,
+        )
+    assert "连号" in str(excinfo.value)
+
+    # 层二：散开 80 只、每天只掉 40 —— 三层判据全部沉默。
+    # 这就是 ADR-002 §6.1 承认的残留盲区，唯一真解是独立停牌真值源；
+    # 这里把它钉成"已知不可判"，防止后来人以为加了结构门就安全了。
+    scattered = {
+        (symbols[i], day.isoformat())
+        for day in (days[24], days[25])
+        for i in range(0, 200, 5)  # 每 5 只取 1 只 -> 连号段 = 1
+    }
+    loose = _availability_panels(days, symbols, execution_missing=scattered)
+    passed = filter_decisions_by_execution_availability(
+        decisions=decisions,
+        execution_panel=loose["execution"],
+        cross_check_panel=loose["feature"],
+        context="unit_dp19_layer2",
+        enforce_session_health_guard=False,
+    )
+    assert passed.report["status"] == "PASS"
+    assert passed.report["missing_numeric_run"]["worst_run"] == 1
+    assert passed.report["filtered_missing_execution_rows"] == len(scattered)
 
 
 def test_dp16_filtering_is_row_dropping_only(dual_dbs):

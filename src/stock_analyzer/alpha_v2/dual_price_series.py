@@ -66,8 +66,9 @@ training frame          execution available ∩ feature frame ∩ 有 label 的�
 
 from __future__ import annotations
 
+import bisect
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -174,6 +175,37 @@ DEFECT_REASON_CROSS_PANEL_DIVERGENCE = "FEATURE_PANEL_HAS_BAR_ON_DECISION_DATE"
 DEFECT_REASON_SESSION_BREADTH_COLLAPSE = "EXECUTION_SESSION_BREADTH_COLLAPSE"
 DEFECT_REASON_SESSION_BELOW_FEATURE_BREADTH = "EXECUTION_SESSION_BREADTH_BELOW_FEATURE"
 
+#: P3.3 —— **execution 有当日 bar、feature 面板却没有**（反向不对称）。
+#: 这一类键在可用性裁决里会被**保留**，然后在
+#: ``validation/dual_price_freeze.py`` 的 ``features.merge(primary, how="inner")``
+#: 处**静默消失**：既不在过滤账里，也不在缺陷账里，训练帧行数悄悄变少。
+#: 2026-07-17..07-30 实测生产决策窗内 295 个这样的键（27 票 × 11 session），
+#: 其中每天 25–31 个会进入当日 PIT 候选 → 被 inner join 吞掉。必须 fail closed。
+DEFECT_REASON_FEATURE_BAR_MISSING = "FEATURE_BAR_MISSING_FOR_EXECUTABLE_DECISION"
+
+#: P3.3 —— 被过滤的"当日无 execution bar"键里，**票号连续段过长**。
+#: 正常停牌/退市是零散票号（实测 2008–2026 十年 2,429 个交易日 + 生产 435 个交易日，
+#: 合法上界 = 3）；vendor 交付包缺行是**按票号成批丢**（2025-11-17 = 57 连号、
+#: 11-18 = 23 连号）。这条判据量的是**形状**，不是规模，因此不会被"北交所换号
+#: 每天过滤 246–256 条"这种大规模但连号只有 2 的合法事件误杀。
+DEFECT_REASON_SHARED_MISSING_CONTIGUOUS_RUN = "EXECUTION_SHARED_MISSING_CONTIGUOUS_RUN"
+
+#: P3.3 —— "该票在 execution 面板里此后再没有 bar"。
+#: 退市与**市场代码迁移**（北交所 430/83/87xxx → 920xxx，2025-09-30 旧码最后一根 bar、
+#: 2025-10-09 新码第一根 bar）都落在这里。它不是覆盖缺口，**不得**按 source gap 处理，
+#: 也不得为此 patch 任何 bar；但它同时意味着"两侧同缺"这一形态**不可判定**，
+#: 所以必须单列入账，不能混进"合法停牌"。
+MISSING_SHAPE_TRAILING = "TRAILING_NO_FURTHER_BAR"
+#: P3.3 —— 此后还会复现（有 later bar）。真正的"中间空洞"。
+MISSING_SHAPE_INTERIOR = "INTERIOR_HOLE_RESUMES_LATER"
+
+#: P3.3 —— 连号段结构闸的取值。``>= fail`` 直接拒绝；``>= audit`` 只记账并要求
+#: 独立来源复核。标定样本：2,864 个 session 上 ``run>=8`` **零误报**，
+#: 而两个已知缺陷日是 23 / 57（3–7 倍余量）；``run`` 落在 4..7 的实例为 0。
+#: ⚠️ 这是 **supplemental** 判据，不是唯一的数据质量判断（见 ADR-002 Invariant 6）。
+DEFAULT_MAX_MISSING_NUMERIC_RUN = 8
+DEFAULT_AUDIT_MISSING_NUMERIC_RUN = 4
+
 #: **provisional anomaly guard（临时异常哨兵），不是停牌定义。**
 #:
 #: 这两条比例闸只回答"过滤规模是否反常"，**不回答**"被过滤的行是不是停牌"。
@@ -184,18 +216,20 @@ DEFECT_REASON_SESSION_BELOW_FEATURE_BREADTH = "EXECUTION_SESSION_BREADTH_BELOW_F
 #:   证伪其普适性**：同一 PIT 语义在十年面板的 2016 年窗口上是
 #:   **8778/422566 = 2.0773%**（2016 年真实大面积重组停牌，抽 350 键逐票取证
 #:   gap 2..180 个 session、100% 在之后复牌）——换窗口/换 universe 规模会误杀。
-#: - **单日上限 50%**：判据是"这一天过半候选被过滤"。它原本是 10%，被
+#: - **单日上限 10%**：判据是"这一天这么多候选当日无 bar"。它曾是 10%，被
 #:   ``be2e4ef`` 以"实测最大合法单日 12.25%（2025-11-17）"为由放宽到 50%。
-#:   ⚠️ 那次放宽**把 12.25% 当成了合法值**，而它是上游链路的覆盖率缺口
-#:   （见 :data:`DEFECT_REASON_SESSION_BREADTH_COLLAPSE` 为什么存在）。
-#:   十年面板实测的最大**形态合法**单日过滤占比只有 **3.834%**（2016-04-22），
-#:   p99 也只有 3.566%——即 10% 那条旧阈值十年间从未误杀过任何一天。
+#:   那次放宽**把 12.25% 当成了合法值**，而它是上游链路的覆盖率缺口——被观测到的
+#:   异常值反过来抬高了放行阈值（ADR-002 Invariant 10 的反例）。P3.3 撤销它。
+#:   ⚠️ 但**不要**据此认为 10% 是"合法/非法"的分界：合法最大单日过滤实测
+#:   4.73%（2025-10-09，北交所换号）、十年窗口 3.83%（2016-04-22）——10% 只是
+#:   留了余量的**量级报警**。真正判缺陷形状的是上面的连号段结构闸。
+#:   修复后的 clean dataset 尚未重标（全窗口重跑推后），所以这个值本身仍是 provisional。
 #: - **行数下限 50**：小窗口/小夹具里几十行就是几个百分点，比例门会误杀。
 #:
 #: 保留而不删除的理由：集合关系判据对"两侧对称缺失"原理上失效（见函数文档），
-#: 比例闸是那一形态下**仅剩**的兜底。定稿前必须按 §ADR-002 用多窗口分布重设。
+#: 比例闸是那一形态下**仅剩**的量级兜底；结构闸（连号段）才是定性判据。
 DEFAULT_MAX_FILTERED_RATIO = 0.02
-DEFAULT_MAX_DAILY_FILTERED_RATIO = 0.50
+DEFAULT_MAX_DAILY_FILTERED_RATIO = 0.10
 DEFAULT_MAX_FILTERED_ROWS_FLOOR = 50
 
 #: **日截面健康门（session/day health guard）——先于逐键 FILTER 裁决执行。**
@@ -631,6 +665,56 @@ def _session_bar_counts(panel: DailyPanel | None) -> dict[str, int]:
     return {str(day): int(rows) for day, rows in dates.dropna().value_counts().to_dict().items()}
 
 
+def _symbol_bar_dates(panel: DailyPanel | None) -> dict[str, list[str]]:
+    """``symbol -> 该票在面板里的全部 bar 日期（升序 ISO 字符串）``。
+
+    只用来回答一个问题：**这只票在这天之后还会不会再出现**。有 later bar 的缺失是
+    中间空洞（上游少了一批），永远不再有 bar 的缺失是尾部退出（退市 / 代码迁移）。
+    两者在"两侧同缺"这个观测上完全一样，在**是否算数据缺陷**上完全不同。
+    """
+    if panel is None:
+        return {}
+    bars = panel.bars
+    if bars.empty or "trade_date" not in set(bars.columns):
+        return {}
+    import pandas as pd
+
+    dates = pd.to_datetime(bars["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    frame = pd.DataFrame({"symbol": bars["symbol"].astype(str), "d": dates}).dropna()
+    grouped = frame.groupby("symbol")["d"]
+    return {str(sym): sorted(set(vals)) for sym, vals in grouped}
+
+
+def _has_later_bar(dates: Sequence[str], day: str) -> bool:
+    """该票在 ``day`` **之后**是否还有 bar（``dates`` 已升序）。"""
+    return bisect.bisect_right(list(dates), day) < len(dates)
+
+
+def max_numeric_symbol_run(symbols: Iterable[str]) -> tuple[int, list[str]]:
+    """一组票号里**最长连续数字段**的长度，以及该段样例。
+
+    ``000001/000002/000003`` → 3；``600469..600486`` → 18。字母开头或非数字票号一律
+    断开（宁可少报也不要把不相干的票拼成一段）。6 位前导零按整数比较，
+    所以 ``002387 / 002388`` 是相邻的。
+    """
+    codes = {int(s) for s in symbols if str(s).strip().isdigit()}
+    if not codes:
+        return 0, []
+    ordered = sorted(codes)
+    best_run: list[int] = []
+    current: list[int] = []
+    for value in ordered:
+        if current and value == current[-1] + 1:
+            current.append(value)
+        else:
+            if len(current) > len(best_run):
+                best_run = current
+            current = [value]
+    if len(current) > len(best_run):
+        best_run = current
+    return len(best_run), [f"{v:06d}" for v in best_run[:6]]
+
+
 def _breadth_baseline(baseline: Sequence[int], count: int) -> float:
     """``count`` 之前若干 session 的中位数（中位数为 0 时返回 0 表示不可判）。"""
     if not baseline:
@@ -765,6 +849,8 @@ def filter_decisions_by_execution_availability(
     min_panel_breadth_ratio: float = DEFAULT_MIN_PANEL_BREADTH_RATIO,
     session_breadth_min_baseline_rows: int = DEFAULT_SESSION_BREADTH_MIN_BASELINE_ROWS,
     enforce_session_health_guard: bool = True,
+    max_missing_numeric_run: int = DEFAULT_MAX_MISSING_NUMERIC_RUN,
+    audit_missing_numeric_run: int = DEFAULT_AUDIT_MISSING_NUMERIC_RUN,
 ) -> DecisionAvailability:
     """裁决哪些 PIT 候选有权进入训练帧：**当日无 execution bar** 的过滤，结构缺陷 fail closed。
 
@@ -796,12 +882,26 @@ def filter_decisions_by_execution_availability(
     ================================================  ==============================
     【日级】决策日截面相对面板自身基线塌陷            缺陷（session_breadth_collapse）
     【日级】execution 当日截面明显低于 feature 同日    缺陷（session_below_feature_breadth）
-    【逐键】``(symbol,date)`` 在 execution 面板里      保留
+    【逐键】``(symbol,date)`` 在两侧面板里都有 bar      保留
+    【逐键】execution 有 bar 而 feature 没有            缺陷（**P3.3 新增**，
+                                                    feature_bar_missing_for_executable_decision）
     【逐键】票整体不在 execution 面板                  缺陷（symbol_not_in_panel）
     【逐键】该日期在 execution 面板里不是交易日        缺陷（date_not_a_session）
     【逐键】feature 有当日 bar 而 execution 没有        缺陷（跨面板分歧）
-    【兜底】以上都不成立 → 两侧同日同票都无 bar         **过滤**（记原因 + 样例）
+    【结构】过滤掉的中间空洞里最长连号段 ≥ 阈值        缺陷（shared_missing_contiguous_run）
+    【兜底】以上都不成立 → 两侧同日同票都无 bar         **过滤**（按形状分两桶入账）
     ================================================  ==============================
+
+    P3.3 新增的**反向不对称**那一行是本契约最容易被写坏的地方：该键在 execution 侧
+    "有 bar"所以会被保留，随后在 ``build_dual_price_training_frame`` 的 inner merge
+    处消失。它不属于"被过滤"，也不属于旧版的全部缺陷码，因此旧实现在**任何**审计字段里
+    都看不见它——这就是 ``unknown_drop`` 必须显式为 0 并被程序断言的原因。
+
+    "两侧同缺"按形状分两桶，因为二者观测相同、定性相反：
+    ``trailing_no_further_bar``（该票此后再也没有 bar）= 退市或**市场代码迁移**
+    （北交所 430/83/87xxx → 920xxx，2025-10 起每天 246–256 条、全窗口最大的合法过滤群体，
+    实测连号段只有 2）；``interior_resumes_later``（此后还会复牌）= 真正的中间空洞。
+    结构闸只看后者，所以既拦得住 2025-11-17 / 11-18，也不会把换号窗口判成 source gap。
 
     两条比例闸（总体 / 单日）是 **provisional anomaly guard，不是停牌定义**：
     它们只在"集合关系对对称缺失原理上失效"这一种形态下作量级兜底，阈值待按多窗口
@@ -851,16 +951,30 @@ def filter_decisions_by_execution_availability(
             role=ROLE_EXECUTION,
         )
 
+    symbol_dates = _symbol_bar_dates(execution_panel)
     kept: list[Any] = []
     filtered_examples: list[str] = []
     defect_examples: dict[str, list[str]] = {}
     per_date_total: dict[str, int] = {}
     per_date_filtered: dict[str, int] = {}
+    per_date_interior: dict[str, list[str]] = {}
+    interior_rows = 0
+    trailing_rows = 0
     for item in decisions:
         symbol, day = _decision_key(item)
         key = (symbol, day)
         per_date_total[day] = per_date_total.get(day, 0) + 1
         if key in available:
+            # 反向不对称（Guard A 的第二方向）：execution 当天有 bar，feature 面板却没有
+            # 这一行。这条 decision 会被"保留"，然后在
+            # ``build_dual_price_training_frame`` 的 ``features.merge(..., how="inner")``
+            # 处**静默消失**——它既不在过滤账里，也不在任何缺陷账里。
+            # 2026-07-17..07-30 生产决策窗实测 295 个这种键，每天 25–31 个进候选集。
+            if cross_check_panel is not None and key not in cross_keys:
+                defect_examples.setdefault(DEFECT_REASON_FEATURE_BAR_MISSING, []).append(
+                    f"{symbol}@{day}"
+                )
+                continue
             kept.append(item)
             continue
         reason = ""
@@ -876,6 +990,14 @@ def filter_decisions_by_execution_availability(
         per_date_filtered[day] = per_date_filtered.get(day, 0) + 1
         if len(filtered_examples) < 20:
             filtered_examples.append(f"{symbol}@{day}")
+        # 两侧同缺的两种形状，观测相同、定性相反，必须分开入账：
+        # - 此后再无 bar → 退市 / **市场代码迁移**（北交所 430/83/87xxx → 920xxx）；
+        # - 之后还会复牌 → **中间空洞**，即上游那一天的这批票没交付。
+        if _has_later_bar(symbol_dates.get(symbol, ()), day):
+            interior_rows += 1
+            per_date_interior.setdefault(day, []).append(symbol)
+        else:
+            trailing_rows += 1
 
     total = sum(per_date_total.values())
     filtered = sum(per_date_filtered.values())
@@ -883,12 +1005,50 @@ def filter_decisions_by_execution_availability(
     if defects:
         defect_total = sum(defects.values())
         preview = {reason: items[:5] for reason, items in sorted(defect_examples.items())}
+        asymmetry = sum(
+            count
+            for reason, count in defects.items()
+            if reason
+            in (DEFECT_REASON_CROSS_PANEL_DIVERGENCE, DEFECT_REASON_FEATURE_BAR_MISSING)
+        )
         raise PriceSeriesContractError(
             f"{context}: {defect_total}/{total} 条 decision 的缺失**不能**按'当日无 execution "
             f"bar'过滤，而是面板结构缺陷：{defects}（例：{preview}）——（同一批里另有 {filtered} 条"
-            "两侧都无 bar、本可过滤，但它们的缺失**同样未被证明是停牌**）。execution 面板必须与 "
+            f"两侧都无 bar、本可过滤（其中 {interior_rows} 条此后还会复牌＝中间空洞、"
+            f"{trailing_rows} 条此后再无 bar＝退市或代码迁移），"
+            "但它们的缺失**同样未被证明是停牌**）。"
+            f"其中 {asymmetry} 条属于**两份面板对同一件事给了不同答案**："
+            "feature 有 bar 而 execution 没有会被判为不可交易，execution 有 bar 而 feature "
+            "没有更危险——它会被保留下来，"
+            "再被训练帧构造处的 inner join 静默丢掉，账面上哪儿都不在。execution 面板必须与 "
             "feature 面板逐键覆盖同一份 PIT 候选集，结构缺陷即 target 不可用；绝不允许退回 qfq、"
             "从 qfq 反推 raw，或用过滤把断供藏起来",
+            role=ROLE_EXECUTION,
+        )
+
+    # ── 结构闸（Guard C）：被过滤的中间空洞是否**按票号成批**消失 ──────────────
+    # 这是唯一能同时抓住 2025-11-17（724 条、57 连号）与 **2025-11-18（271 条、23 连号）**
+    # 的判据：日截面广度门看不见 11-18（那天只掉 4.8%，breadth=0.9517，0.90/0.95 都不触发），
+    # 比例闸也看不见（5.43% < 任何合理阈值，且合法最大 4.73% 就在隔壁）。
+    # 只有"少的是不是一整段连号"把这个形态和零散停牌分开。
+    run_audit: dict[str, object] = {}
+    worst_run_date, worst_run, worst_run_sample = "", 0, []
+    for day, syms in per_date_interior.items():
+        run, sample = max_numeric_symbol_run(syms)
+        if run >= int(audit_missing_numeric_run):
+            run_audit[day] = {"interior_missing": len(syms), "max_run": run, "sample": sample[:6]}
+        if run > worst_run:
+            worst_run_date, worst_run, worst_run_sample = day, run, sample
+        elif run == worst_run and worst_run and day < worst_run_date:
+            worst_run_date, worst_run, worst_run_sample = day, run, sample
+    if worst_run >= int(max_missing_numeric_run):
+        raise PriceSeriesContractError(
+            f"{context}: {DEFECT_REASON_SHARED_MISSING_CONTIGUOUS_RUN} —— "
+            f"{worst_run_date} 有 {worst_run} 只**连号**票当日无 execution bar"
+            f"（样例 {worst_run_sample}），达到结构闸 {max_missing_numeric_run} —— "
+            "真实停牌/退市在票号上是零散的（2008–2026 十年 2,429 个交易日 + 生产 435 个交易日的"
+            "合法上界是 3），成批连号只会是上游按段少交付。这不是'不可交易'，是**数据没到**："
+            "先补数据链路，再来 freeze。禁止用调大该阈值放行",
             role=ROLE_EXECUTION,
         )
 
@@ -922,6 +1082,48 @@ def filter_decisions_by_execution_availability(
             "当天一半股票同时不可交易",
             role=ROLE_EXECUTION,
         )
+
+    # ── decision 账必须守恒（任务 P3.3 §11）──────────────────────────────────
+    # 每一条 PIT 候选 decision 必须落进且只落进一个**有名字**的桶。历史上最坏的形态
+    # 就是"总数对不上但没人报错"：inner join 吞掉的行既不算过滤也不算缺陷。
+    # 这里用显式 raise 而不是 assert —— python -O 会把 assert 连表达式一起删掉，
+    # 而这条不变量正是生产路径要保的。
+    defect_rows = sum(len(items) for items in defect_examples.values())
+    unaccounted = total - len(kept) - filtered - defect_rows
+    if unaccounted:
+        raise PriceSeriesContractError(
+            f"{context}: decision 账不守恒——候选 {total} ≠ 保留 {len(kept)} + 过滤 {filtered} "
+            f"+ 缺陷 {defect_rows}（差 {unaccounted} 条**去向不明**）。"
+            "任何一条 decision 都必须能被某个桶解释，未知丢失不是可接受的产物",
+            role=ROLE_EXECUTION,
+        )
+    if filtered != interior_rows + trailing_rows:
+        raise PriceSeriesContractError(
+            f"{context}: 过滤账不守恒——{filtered} 条'当日无 execution bar'被过滤，"
+            f"但形状分类只解释了 {interior_rows}+{trailing_rows} 条",
+            role=ROLE_EXECUTION,
+        )
+    feature_missing_rows = len(defect_examples.get(DEFECT_REASON_FEATURE_BAR_MISSING, []))
+    cross_panel_rows = len(defect_examples.get(DEFECT_REASON_CROSS_PANEL_DIVERGENCE, []))
+    accounting_status = "PASS"
+    accounting: dict[str, object] = {
+        "candidate_decisions": int(total),
+        "kept_training_decisions": int(len(kept)),
+        "filtered_no_execution_bar": int(filtered),
+        "filtered_interior_resumes_later": int(interior_rows),
+        "filtered_trailing_no_further_bar": int(trailing_rows),
+        "defect_symbol_not_in_execution_panel": len(
+            defect_examples.get(DEFECT_REASON_SYMBOL_ABSENT, [])
+        ),
+        "defect_date_not_a_session": len(defect_examples.get(DEFECT_REASON_DATE_NOT_SESSION, [])),
+        "defect_feature_has_execution_missing": int(cross_panel_rows),
+        "defect_execution_has_feature_missing": int(feature_missing_rows),
+        "unknown_drop": 0,
+        "accounting_status": accounting_status,
+        "conservation": "candidate == kept + filtered + defects",
+        # label_unavailable / training_frame 两桶在
+        # ``validation/dual_price_freeze.py`` 里补——那里才知道 outcome 长什么样。
+    }
 
     top_dates = sorted(
         (
@@ -968,6 +1170,28 @@ def filter_decisions_by_execution_availability(
         "filtered_dates_top": top_dates_payload,
         # 日截面健康门（**先于**上面的逐键裁决执行）：不依赖 decision 集合的那一层证据。
         "session_health": dict(session_health),
+        # P3.3 三层证据里"形状"那一层的读数：中间空洞 vs 尾部退出（退市/代码迁移）。
+        "missing_shape": {
+            "interior_resumes_later": int(interior_rows),
+            "trailing_no_further_bar": int(trailing_rows),
+            "trailing_semantics": "delisted_or_code_transition_NOT_SOURCE_GAP",
+        },
+        # 跨面板非对称的两个方向，分开记（方向二是被 inner join 静默吞掉的那一类）。
+        "panel_asymmetry": {
+            "feature_has_execution_missing": int(cross_panel_rows),
+            "execution_has_feature_missing": int(feature_missing_rows),
+            "execution_has_feature_missing_reason": DEFECT_REASON_FEATURE_BAR_MISSING,
+        },
+        # 结构闸读数（缺陷已在上面 raise；这里只留健康日的形状统计）。
+        "missing_numeric_run": {
+            "worst_date": worst_run_date,
+            "worst_run": int(worst_run),
+            "fail_threshold": int(max_missing_numeric_run),
+            "audit_threshold": int(audit_missing_numeric_run),
+            "audit_dates": dict(sorted(run_audit.items())),
+        },
+        "decision_accounting": dict(accounting),
+
         "execution_panel_bars": int(len(available)),
         "execution_panel_sessions": int(len(sessions)),
         "execution_panel_symbols": int(len(symbols)),
@@ -979,6 +1203,10 @@ def filter_decisions_by_execution_availability(
             "max_daily_filtered_ratio": float(max_daily_filtered_ratio),
             "max_filtered_rows_floor": required,
             "ratio_gates_are_suspension_definition": False,
+            # 结构闸才是定性判据（supplemental，但优先于比例闸执行）。
+            "max_missing_numeric_run": int(max_missing_numeric_run),
+            "audit_missing_numeric_run": int(audit_missing_numeric_run),
+            "run_gate_is_sole_judgement": False,
         },
         # ``aligned`` 保留给"本次**一条都没被过滤**"这个更强的形态（零过滤证据）；
         # 发生过过滤时它是 False，但整份裁决仍然 ``status == PASS``——
@@ -1069,19 +1297,25 @@ def resolve_db_path(repo_root: str | Path, db: str) -> Path:
 
 __all__ = [
     "CERT_EVIDENCE_AUDIT_KEYS",
+    "DEFAULT_AUDIT_MISSING_NUMERIC_RUN",
     "DEFAULT_MAX_DAILY_FILTERED_RATIO",
     "DEFAULT_MAX_FILTERED_RATIO",
     "DEFAULT_MAX_FILTERED_ROWS_FLOOR",
+    "DEFAULT_MAX_MISSING_NUMERIC_RUN",
     "DEFAULT_MIN_PANEL_BREADTH_RATIO",
     "DEFAULT_MIN_SESSION_BREADTH_RATIO",
     "DEFAULT_SESSION_BREADTH_BASELINE_SESSIONS",
     "DEFAULT_SESSION_BREADTH_MIN_BASELINE_ROWS",
     "DEFECT_REASON_CROSS_PANEL_DIVERGENCE",
     "DEFECT_REASON_DATE_NOT_SESSION",
+    "DEFECT_REASON_FEATURE_BAR_MISSING",
     "DEFECT_REASON_SESSION_BREADTH_COLLAPSE",
     "DEFECT_REASON_SESSION_BELOW_FEATURE_BREADTH",
+    "DEFECT_REASON_SHARED_MISSING_CONTIGUOUS_RUN",
     "DEFECT_REASON_SYMBOL_ABSENT",
     "FILTER_REASON_NO_EXECUTION_BAR",
+    "MISSING_SHAPE_INTERIOR",
+    "MISSING_SHAPE_TRAILING",
     "LIVE_STRICT_VALIDATION_MODES",
     "STYLE_SOURCE_EXECUTION_FALLBACK",
     "FEATURE_PRICE_SERIES_EVIDENCE_SCHEMA",
@@ -1111,6 +1345,7 @@ __all__ = [
     "feature_mode_of_frozen_model",
     "filter_decisions_by_execution_availability",
     "is_live_strict_mode",
+    "max_numeric_symbol_run",
     "price_series_identity_block",
     "require_certified_execution_series",
     "require_declared_feature_series",
