@@ -9,7 +9,7 @@ import re
 import threading
 import zipfile
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -89,6 +89,47 @@ _MINUTE_ARCHIVE_RE = re.compile(r"^(?P<year>\d{4})(?:-(?P<month>\d{2}))?", re.I)
 _DELTA_ACCESS_MODES = frozenset({"read_write", "read_only", "disabled"})
 _QFQ_FACTORS_DIR_NAME = "复权因子"
 _QFQ_FACTORS_ARCHIVE_NAME = "复权因子_前复权.zip"
+
+
+def build_qfq_factor_date_index(
+    data_root: str | Path, *, symbols: Collection[str] | None = None
+) -> dict[str, list[str]]:
+    """``symbol -> 有可用因子的日期(升序 ISO)``，读自 ``复权因子_前复权.zip``。
+
+    放在本模块而不是对账模块里：包名、entry 命名、"什么算一个可用因子"这三件事
+    由这里定义（见 :func:`_parse_vendor_factor_frame`）。派生与对账必须共用同一套
+    规则，否则会出现"派生说没因子、对账说有"的两套真相——那正是本轮要消灭的静默。
+
+    ``symbols`` 给定时**只解析这些票**。全量解析 5,837 只票实测要 279 秒，把它挂在
+    每晚关键路径上是无谓成本：健康的夜扫描一个差异键都没有。
+    """
+    archive_path = Path(data_root) / _QFQ_FACTORS_DIR_NAME / _QFQ_FACTORS_ARCHIVE_NAME
+    if not archive_path.exists():
+        raise DataSourceError(f"vendor qfq factor archive missing: {archive_path}")
+    wanted = None if symbols is None else {_normalize_symbol(str(x)) for x in symbols}
+    collected: dict[str, list[str]] = {}
+    with zipfile.ZipFile(archive_path) as archive:
+        for name in archive.namelist():
+            if _is_zip_noise(name):
+                continue
+            match = _DAILY_ENTRY_RE.fullmatch(Path(name.replace("\\", "/")).name)
+            if match is None:
+                continue
+            symbol = _normalize_symbol(match.group("code"))
+            if not symbol or (wanted is not None and symbol not in wanted):
+                continue
+            try:
+                with archive.open(name) as stream:
+                    series = _parse_vendor_factor_frame(pd.read_csv(stream), symbol=symbol)
+            except (KeyError, DataSourceError):
+                # 解析失败＝该票该包不可用；与批量派生同一处置，交给分类器判 B/C。
+                collected.setdefault(symbol, [])
+                continue
+            if not series.empty:
+                collected.setdefault(symbol, []).extend(
+                    idx.strftime("%Y-%m-%d") for idx in series.index
+                )
+    return {symbol: sorted(set(days)) for symbol, days in collected.items() if days}
 
 
 def build_vendor_zip_daily_index(

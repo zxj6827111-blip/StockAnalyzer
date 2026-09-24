@@ -612,6 +612,9 @@ def _dual_readiness_payload(*, schema_version: int) -> dict[str, object]:
         payload["execution_delta"] = {"ok": True, "role": "execution"}
         payload["symbol_membership"] = {"membership_locked": True}
         payload["raw_delta_baseline"] = {"ok": True}
+        # v3 起必须自带 QFQ 对账结论；缺这块等于"没证明过两份库逐键一致"，
+        # active epoch 不放行（见 tests/test_nightly_readiness_qfq_parity.py::qfq5）。
+        payload["qfq_parity"] = {"evaluated": True, "ok": True, "derivation_gap_count": 0}
     return payload
 
 

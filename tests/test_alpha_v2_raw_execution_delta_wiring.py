@@ -1148,3 +1148,89 @@ def test_coverage_validator_rejects_same_db_for_both_roles(
 
     assert report["coverage_status"] == "BLOCKED"
     assert any(item.startswith("raw_and_feature_db_paths_identical") for item in report["blockers"])
+
+
+def test_qfq_derivation_gap_fails_the_real_nightly_run_and_retires_the_marker(
+    updater: object,
+    coverage_module: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P3.3.1b Test 7 + Test 16，打在**真实入口**上（updater._main + 真 importer）。
+
+    场景照搬生产：qfq 侧历史某一天少一行（不是目标日，所以成员锁步看不出来），
+    增量导入又永不回填旧日期。要求这条链一路传到：本轮失败、readiness 不发布、
+    昨天的 PASS 不可消费、原因码可读。
+    """
+    layout = _prepared_layout(tmp_path, coverage_module)
+    monkeypatch.setenv("SA__NIGHTLY_READINESS_PATH", str(layout["readiness"]))
+
+    def _run() -> tuple[int, dict[str, object]]:
+        recorder = _RecordingImporter()
+        monkeypatch.setattr(updater, "_load_delta_importer", lambda: recorder)
+        return _main_with_fake_api(
+            updater,
+            monkeypatch,
+            _dual_run_argv(
+                vendor_root=layout["vendor_root"],
+                index_path=layout["index_path"],
+                feature_db=layout["feature_db"],
+                raw_db=layout["raw_db"],
+            ),
+        )
+
+    # run A：健康夜，两个角色都推进，marker 发布
+    assert _run()[0] == 0
+    assert layout["readiness"].exists()
+
+    # 弄掉 qfq 侧**一个历史日**的行（raw 仍在）：目标日成员照常齐全，
+    # 所以这必须靠逐键对账才看得见——正是 2026-07 那 295 个键的形状。
+    with duckdb.connect(str(layout["feature_db"])) as connection:
+        columns = [
+            str(row[0])
+            for row in connection.execute("DESCRIBE SELECT * FROM daily_bars").fetchall()
+        ]
+        victim = connection.execute(
+            f"SELECT {', '.join(columns)} FROM daily_bars "
+            "ORDER BY date ASC, symbol ASC LIMIT 1"
+        ).fetchone()
+        assert victim is not None
+        symbol_at, date_at = victim[columns.index("symbol")], victim[columns.index("date")]
+        connection.execute(
+            "DELETE FROM daily_bars WHERE symbol=? AND date=?", [symbol_at, date_at]
+        )
+    placeholders = ", ".join("?" * len(columns))
+
+    # run B：本轮必须失败，且不发布新 PASS
+    exit_code, summary = _run()
+    assert exit_code == 1, summary
+    assert summary["ok"] is False
+    readiness = summary["readiness"]
+    assert isinstance(readiness, dict) and readiness["written"] is False
+    assert "QFQ_DERIVATION_GAP" in str(readiness.get("error", "")), readiness
+    assert "qfq_parity" in str(readiness.get("error", "")) or "QFQ" in str(readiness)
+
+    # 旧 PASS 不可消费：本轮开头已原子 retire，失败又没有发布新的
+    assert not layout["readiness"].exists()
+    stale = sorted(p.name for p in layout["readiness"].parent.glob("nightly_data_ready.stale-*"))
+    assert stale, "必须留下可审计的失效证据，而不是静默删除"
+    gate = check_nightly_readiness(
+        expected_trade_date=TARGET_DATE, require_dual_delta=True
+    )
+    assert gate.ready is False
+    assert gate.reason == "nightly_data_not_ready"
+
+    # run C：行补回去后必须幂等恢复，且不产生重复逻辑键
+    with duckdb.connect(str(layout["feature_db"])) as connection:
+        connection.execute(
+            f"INSERT INTO daily_bars ({', '.join(columns)}) VALUES ({placeholders})",
+            list(victim),
+        )
+    assert _run()[0] == 0, "修好后重跑必须恢复 PASS"
+    assert layout["readiness"].exists()
+    with duckdb.connect(str(layout["feature_db"]), read_only=True) as connection:
+        dupes = int(connection.execute(
+            "SELECT COUNT(*) FROM (SELECT symbol, date FROM daily_bars "
+            "GROUP BY symbol, date HAVING COUNT(*) > 1)"
+        ).fetchone()[0])
+    assert dupes == 0, "失败的中间轮不得留下重复键"

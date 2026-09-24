@@ -2,7 +2,7 @@
 
 Status: Draft
 
-As-of: 2026-09-24 @ HEAD `9ee30bc`（P3.3 代码与本 Note 同批提交，详见 §11）
+As-of: 2026-09-24 @ HEAD `5bf2be9`（P3.3 / P3.3.1 / P3.3.1b 代码与本 Note 同批提交，详见 §11）
 
 ## 1. Status
 
@@ -312,6 +312,55 @@ count / median(前 ≤20 session)：p01=0.9923  p05=0.9996  median=1.0028
 **修复后**的历史重标，本轮没有做（全窗口重跑推后）；③ `security_identity_mapping`
 表仍是 0 行，换号仍靠形状识别而非官方映射（§14 允许两者，但显式映射更准）。
 
+### 5.8 P3.3.1 / P3.3.1b：QFQ 完整性失败必须一路传到 readiness
+
+> 涉及 `data/vendor_zip_overlay.py`（`qfq_skip_reasons` /
+> `build_qfq_factor_date_index`）、`data/qfq_parity.py`（新模块）、
+> `scripts/import_vendor_zip_to_delta.py`（`ok` 与原因码）、
+> `ops/nightly_readiness.py`（`qfq_parity` 区块 + `READINESS_REASON_QFQ_PARITY`）、
+> `scripts/update_vendor_daily_from_tushare.py`（惰性因子 loader）。
+
+四条正式契约，都是本轮**定下来**的，不是待议：
+
+1. **QFQ parity fail closed。** `raw 有 bar + 因子也取到 + qfq 没有这一行` 是
+   `QFQ_DERIVATION_GAP`，readiness **拒绝发布**（`write_nightly_readiness` 抛
+   `ValueError`），并带自己的原因码
+   `nightly_qfq_parity_failed`——不能混进 `nightly_data_not_ready`（重试就好）或
+   `nightly_dual_delta_not_ready`（等别的运行），因为它**重试永远不会变好**，
+   只有修数据才行。`QFQ_ROW_WITHOUT_RAW` 同理阻塞。
+2. **上游防与下游检同时存在。** provider 把跳过分类成 `QFQ_FACTOR_MISSING` /
+   `QFQ_DERIVATION_GAP` 并公开，导入器据此置 `ok=false` → 真实非零退出；
+   readiness 再独立逐键复核（不信 updater 自述，沿用本模块既有立场）。
+   只留一层都不成立：provider 看不见跨库事实，readiness 看不见"为什么跳过"。
+3. **部分写入允许，部分运行不可消费。** 夜间批量**不因一只坏票中断**，已写进去的
+   数据也**不回滚**（那些行本身是对的）；但这一轮必须 `full_run_ok=false`、
+   非零退出、没有正向日就绪。即
+   `PARTIAL_DATA_WRITE_ALLOWED = true` 且 `PARTIAL_RUN_READY = false`，
+   直到下一次完整成功运行重新发布 PASS。不得为了"看起来更严谨"改成全事务回滚——
+   那会让一只新票的因子缺失冻结全市场 5,400 只的更新。
+4. **失败的运行不得留下可消费旧 PASS。** 机制早就有：updater 在**动任何数据之前**
+   `invalidate_nightly_readiness()` 把 authoritative 与全部 legacy mirror 原子
+   rename 成 `nightly_data_ready.stale-*`（保留 payload 与 mtime 供事后审计，
+   不是删除）。本轮补的是另一半：对账失败时**不发布**新 marker。
+   ⚠️ 更正一处上一轮的误判：我此前把"失败不发布 marker → 旧 marker 仍可被消费到
+   `max_age_hours`"记成缺口，实测读码后发现开头那次 retire 已经堵住这条路。
+
+**两个维度不得互相替代**（这是 §5 里最容易写坏的新地方）：
+
+```text
+membership 维度  extra_execution_vs_expected   raw 有该票 / feature 没有该票  → 包含链容忍，不阻塞
+parity    维度   QFQ_DERIVATION_GAP           raw 有该键 / 因子也有 / 差一天  → 阻塞发布
+```
+
+前者看"票在不在"，后者看"某一天那一行在不在"。北交所换号、新股未发因子都落在前者；
+2026-07 那 295 个键只落在后者。`factor_missing_for_raw` 继续只记账。
+
+**成本事实（实测，决定设计）**：全量解析复权因子包（5,837 只票）要 **279 秒**，
+所以 `qfq_parity` 先用一次 `EXCEPT` 问"有没有差异"，**没有差异就不碰因子包**；
+真有差异时才按涉及的票惰性取索引（7 月那 295 个键 → 27 只票 → **2.33 秒**）。
+生产默认窗口是 raw 库里 `<= target` 的最近 30 个交易日，**不是**十年全扫——
+历史缺口由 P3.3 repair manifest 负责。
+
 ## 6. Invariants（不论 §5 怎么定都不能改）
 
 1. **绝不从 qfq 反推 raw**，也绝不在 execution 侧退回 qfq。这条与 §5 的裁决选择无关。
@@ -344,6 +393,18 @@ count / median(前 ≤20 session)：p01=0.9923  p05=0.9996  median=1.0028
     （退市 / 市场代码迁移）与 `interior_resumes_later`（中间空洞）是**不同的事实**，
     结构闸只看后者。把它们合并成一个"过滤总数"就是 2025-10 换号窗口被误判成
     source gap 的原因，也是 2025-11-18 被漏放过的原因。
+14. **容错路径不得对跨库可验证的缺陷保持沉默**（P3.3.1）。任何"某侧整只票 / 整段
+    日期这次不生成"的容忍分支，必须留下原因码并让**这一轮**失败：只写
+    ``logger.warning`` 而把 ``ok`` 留在 true，等于把事故现场从账上抹掉
+    （2026-07-17..07-30 的 295 个键就是这么静默产生且永不回填的）。"批量不中断、
+    已写数据不回滚"允许，"本轮算成功"不允许。
+15. **失败的运行不得留下可消费的旧 PASS，但也不得靠删证据实现**（P3.3.1b）。
+    复用既有原子 retire（``invalidate_nightly_readiness`` 把 marker rename 成
+    ``*.stale-*``，payload 与 mtime 全部保留供事后审计）+ 完整性失败时**不发布**新 marker。
+    禁止用 ``rm`` 一类"删掉历史证据"的动作代替失效机制。
+16. **数据层可以部分推进，消费层必须整轮一致**（P3.3.1b）。
+    ``PARTIAL_DATA_WRITE_ALLOWED = true`` 且 ``PARTIAL_RUN_READY = false``：
+    一只票的因子问题不得冻结全市场更新，也不得让半套数据被下游当成就绪。
 
 ### 6.1 日截面健康门的能力边界（必须一起读，否则会被当成万能门）
 
@@ -443,7 +504,13 @@ src/stock_analyzer/ops/intraday_freshness.py                        # :230-272 r
 scripts/alpha_v2_raw_delta_coverage.py                              # :26-33 §8.5 另一处"两边都没有→不报"裁决，必须与本契约同步
 scripts/alpha_v2_research_run.py:224 / scripts/alpha_v2_m4h_run.py:610  # 把 eligible_symbols 直喂 build_label_v2，**无**可用性过滤（口径不一致，待处置）
 scripts/backfill_trade_status.py                                    # daily_trade_status 事后全量回填（非 PIT）
-scripts/alpha_v2_shadow_model_freeze.py                             # 冻结入口，exit 4 语义；打印 alignment + session health
+scripts/alpha_v2_shadow_model_freeze.py                             # 冻结入口，exit 4 语义；打印 alignment + session health + decision 账/非对称/结构闸读数
+src/stock_analyzer/data/qfq_parity.py                               # P3.3.1 跨库逐键对账：asymmetry_keys / assess_qfq_parity / factor_date_index
+src/stock_analyzer/data/vendor_bar_repair.py                        # P3.3 insert-missing-only 修复层（provenance / verify / revert），**尚无生产调用方**
+src/stock_analyzer/data/vendor_zip_overlay.py                       # qfq_skip_reasons + build_qfq_factor_date_index（按票过滤，全量 279s 实测）
+scripts/import_vendor_zip_to_delta.py                               # qfq 跳过 -> ok=false + 原因码 -> 真实非零退出
+scripts/update_vendor_daily_from_tushare.py                         # 把惰性因子 loader 交给 readiness；角色 rc 聚合进 full_run_ok
+src/stock_analyzer/ops/nightly_readiness.py                         # qfq_parity 区块 / READINESS_REASON_QFQ_PARITY / 发布前 fail closed / invalidate_*
 scripts/alpha_v2_shadow_mature.py                                   # 成熟入口，exit 4 / 11
 docs/alpha_v2/P0_Dual_Price_Series_Contract.md                       # 契约正文（§2.1 三层裁决 / §2.2 证据强度与实测阈值）
 ```

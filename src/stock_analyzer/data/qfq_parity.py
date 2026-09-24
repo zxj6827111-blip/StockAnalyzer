@@ -26,8 +26,9 @@ RAW 与 QFQ 都没有          → 不在本模块职责内
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import duckdb
 import pandas as pd
@@ -195,6 +196,59 @@ def factor_availability_from_series(
         return bisect.bisect_right(series, str(day)) > 0
 
     return _has
+
+
+def asymmetry_keys(
+    *, raw_db: str, qfq_db: str, window: Sequence[str]
+) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+    """``(raw_only_keys, qfq_only_keys)``——一次 EXCEPT，**不碰复权因子包**。
+
+    单独暴露这一层是因为成本结构：判定"有没有差异"只要两份库各扫一次窗口，
+    而把差异归到 B/C 需要解析因子包（全量 5,837 只票实测 279 秒）。
+    健康的夜扫描差异集合是空的，那种夜晚必须花接近零的钱。
+    """
+    if len(window) != 2:
+        raise ValueError("window must be (start, end)")
+    con = duckdb.connect(":memory:")
+    con.execute("SET memory_limit='700MB'")
+    con.execute("SET threads=2")
+    con.execute(f"ATTACH '{qfq_db}' AS q (READ_ONLY)")
+    con.execute(f"ATTACH '{raw_db}' AS r (READ_ONLY)")
+    try:
+        query = (
+            "SELECT symbol, CAST(date AS VARCHAR) FROM {left}.daily_bars "
+            "WHERE date BETWEEN ? AND ? EXCEPT "
+            "SELECT symbol, CAST(date AS VARCHAR) FROM {right}.daily_bars "
+            "WHERE date BETWEEN ? AND ?"
+        )
+        raw_only = {
+            (str(a), str(b))
+            for a, b in con.execute(
+                query.format(left="r", right="q"), [*window, *window]
+            ).fetchall()
+        }
+        qfq_only = {
+            (str(a), str(b))
+            for a, b in con.execute(
+                query.format(left="q", right="r"), [*window, *window]
+            ).fetchall()
+        }
+    finally:
+        con.close()
+    return raw_only, qfq_only
+
+
+def factor_date_index(
+    vendor_root: str | Path, *, symbols: Collection[str] | None = None
+) -> dict[str, list[str]]:
+    """``symbol -> 升序因子日期``，规则与真正的派生共用（见 ``_parse_vendor_factor_frame``）。
+
+    延迟 import：``vendor_zip_overlay`` 会拉起整个 warehouse 依赖栈，而对账模块也要被
+    不依赖那套东西的单元测试导入。
+    """
+    from stock_analyzer.data.vendor_zip_overlay import build_qfq_factor_date_index
+
+    return build_qfq_factor_date_index(vendor_root, symbols=symbols)
 
 
 def frame_of(parity: QfqParity) -> pd.DataFrame:

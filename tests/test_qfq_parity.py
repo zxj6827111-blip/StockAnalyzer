@@ -6,11 +6,11 @@
 
 from __future__ import annotations
 
+import zipfile
 from collections.abc import Iterable
 from pathlib import Path
 
 import duckdb
-import pandas as pd
 import pytest
 
 from stock_analyzer.data import qfq_parity as qp
@@ -161,3 +161,49 @@ def test_t10_read_only_is_enforced_on_the_source_libraries(tmp_path: Path) -> No
     with duckdb.connect(qfq_db, read_only=True) as con:
         with pytest.raises(duckdb.Error):
             con.execute("INSERT INTO daily_bars VALUES ('x','2026-07-20',1,1,1,1,'qfq')")
+
+
+FACTOR_CSV = "股票代码,交易日期,复权因子\n{code},20260720,1.0\n{code},20260721,1.0\n"
+
+
+def _factor_zip(tmp_path: Path, codes: list[str]) -> Path:
+    root = tmp_path / "vendor"
+    (root / "复权因子").mkdir(parents=True, exist_ok=True)
+    archive = root / "复权因子" / "复权因子_前复权.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        for code in codes:
+            if code == "555555":
+                zf.writestr(f"2026/{code}.SZ.csv", "坏表头,没有因子列\nx,y\n")
+                continue
+            zf.writestr(f"2026/{code}.SZ.csv", FACTOR_CSV.format(code=f"{code}.SZ"))
+    return root
+
+
+def test_factor_date_index_parses_only_requested_symbols(tmp_path: Path) -> None:
+    """成本闸：全量解析 5,837 只票实测 279 秒，健康夜扫描不该付这份钱。"""
+    root = _factor_zip(tmp_path, ["000001", "600000", "555555"])
+    full = qp.factor_date_index(root)
+    assert full["000001"] == ["2026-07-20", "2026-07-21"]
+    assert "555555" not in full, "解析不出可用因子的票必须按'没有因子'处理"
+    picked = qp.factor_date_index(root, symbols=["600000"])
+    assert set(picked) == {"600000"}
+    assert qp.factor_date_index(root, symbols=["000001", "555555"]) == {
+        "000001": ["2026-07-20", "2026-07-21"]
+    }
+
+
+def test_asymmetry_keys_prepasses_without_the_factor_archive(tmp_path: Path) -> None:
+    """有差异时先拿到键集，再决定要不要为归因付解析成本（§4 的覆盖集合口径）。"""
+    raw_db = _library(
+        tmp_path / "raw2.duckdb",
+        [("000001", "2026-07-20"), ("000001", "2026-07-21")],
+        "raw",
+    )
+    qfq_db = _library(tmp_path / "qfq2.duckdb", [("000001", "2026-07-21")], "qfq")
+    raw_only, qfq_only = qp.asymmetry_keys(
+        raw_db=raw_db, qfq_db=qfq_db, window=["2026-07-01", "2026-07-31"]
+    )
+    assert raw_only == {("000001", "2026-07-20")}
+    assert qfq_only == set()
+    with pytest.raises(ValueError, match="window"):
+        qp.asymmetry_keys(raw_db=raw_db, qfq_db=qfq_db, window=["2026-07-01"])
