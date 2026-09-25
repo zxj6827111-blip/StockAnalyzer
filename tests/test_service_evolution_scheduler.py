@@ -549,9 +549,17 @@ def _patch_readiness_consume(
     """消费代码在函数体内 import，patch 模块属性即可拦截。"""
     import stock_analyzer.ops.nightly_readiness as readiness_module
 
-    def _fake_consume(**kwargs: object) -> dict[str, object]:
+    def _fake_consume(**kwargs: object) -> readiness_module.Consumption:
         calls.append({"consumed": True, **kwargs})
-        return {"target_trade_date": "2026-08-21"}
+        return readiness_module.Consumption(
+            status=readiness_module.CONSUME_CONSUMED,
+            consumer=str(kwargs.get("consumer", "")),
+            payload={"target_trade_date": "2026-08-21"},
+            reason=readiness_module.CONSUME_CONSUMED,
+            target_trade_date="2026-08-21",
+            payload_sha256="",
+            audit_path=None,
+        )
 
     monkeypatch.setattr(readiness_module, "consume_nightly_readiness", _fake_consume)
 
@@ -610,6 +618,82 @@ def test_offhours_consumes_readiness_on_watchlist_sync_evidence(
     assert len(calls) == 1
     # 消费凭证必须能回答"是哪条链路消费的"，否则审计只剩一个匿名文件。
     assert calls[0]["consumer"] == "evolution_offhours"
+    # P3.3.1e：确认必须带上门禁那份目标日期——发布文件现在会活过一整晚，
+    # 不带日期的确认会给昨天的发布补一张今天的凭证。
+    assert "expected_trade_date" in calls[0]
+
+
+def test_offhours_acknowledgement_keeps_readiness_for_later_jobs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """生产事故形态：evolution_offhours 20:40 确认之后，21:45 起的链路必须仍就绪。
+
+    这里不打桩 readiness——用真实文件、真实门禁、真实 ``probe_nightly_readiness``，
+    因为缺陷恰好出在"确认动作把发布事实搬走"这一步，桩掉它就测不到了。
+    """
+    import stock_analyzer.ops.nightly_readiness as readiness_module
+    from stock_analyzer.ops.nightly_readiness import (
+        CONSUME_ALREADY_CONSUMED,
+        CONSUME_CONSUMED,
+        check_nightly_readiness,
+        consume_nightly_readiness,
+    )
+
+    auth = tmp_path / "artifacts" / "runtime" / "nightly_data_ready.json"
+    # 用模块级路径覆盖而不是 SA__ 环境变量：config loader 会把未知 SA__ 键判为非法。
+    monkeypatch.setattr(readiness_module, "authoritative_readiness_path", lambda: auth)
+    monkeypatch.setattr(readiness_module, "_candidate_readiness_paths", lambda: [auth])
+    readiness_module.write_json_document(
+        auth,
+        {
+            "schema_version": 2,
+            "target_trade_date": "2026-08-21",
+            "daily": {"ok": True, "latest_trade_date": "2026-08-21"},
+            "index": {"ok": True, "symbols_on_target_date": 2},
+            "delta": {"ok": True, "symbols_on_target_date": 2},
+            "created_at": "2026-08-21T19:48:12+08:00",
+            "updater_commit": "abc1234",
+            "source": "stock_updater.sh",
+        },
+    )
+
+    config = _load_test_config(tmp_path)
+    service = _new_service(config=config, tmp_path=tmp_path)
+    service.state.watchlist = ["600000.SH"]
+    _patch_attr(service, "_resolve_nightly_expected_trade_date", lambda: "2026-08-21")
+    _patch_attr(service, "run_evolution_offhours", lambda **_: _evolution_report())
+    _patch_attr(
+        service,
+        "run_week5_scan",
+        lambda **_: _week5_refresh(
+            summary={"watchlist_synced": True},
+            watchlist_sync={"updated": True},
+        ),
+    )
+
+    first_run = service._job_evolution_offhours()
+
+    assert first_run["report"]["readiness_consumed"] is True
+    assert first_run["report"]["readiness_consumption_status"] == CONSUME_CONSUMED
+    # 回归锚：确认之后发布事实必须还在，且别的消费者看得见。
+    assert auth.exists()
+    assert check_nightly_readiness(expected_trade_date="2026-08-21").ready is True
+    assert service._week5_automation_service.probe_nightly_readiness()["allowed"] is True
+
+    assert [path.name for path in auth.parent.glob("nightly_data_ready.consumed-*.json")] == [
+        "nightly_data_ready.consumed-20260821-evolution_offhours.json"
+    ]
+
+    # 同一作业重试只会重放自己的凭证，不会伤到后面的消费者。
+    second_run = service._job_evolution_offhours()
+    assert second_run["report"]["readiness_consumption_status"] == CONSUME_ALREADY_CONSUMED
+    assert (
+        consume_nightly_readiness(
+            consumer="week5_night_scan", expected_trade_date="2026-08-21"
+        ).status
+        == CONSUME_CONSUMED
+    )
 
 
 def test_offhours_consumes_readiness_on_final_signals_evidence(

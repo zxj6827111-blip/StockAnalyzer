@@ -7,10 +7,13 @@ date-mismatched readiness as a hard scheduler failure
 (``_scheduler_ran=true, _scheduler_success=false,
 _scheduler_detail=nightly_data_not_ready``).
 
-The file is consumed exactly once by a successful evolution/week5/final-
-selector/watchlist-sync chain; on success it is moved to a dated
-consumption audit file (see ``Consumption`` below).  On failure it is kept
-so the scheduler backs off and retries.
+The readiness file states a FACT about one trading day ("数据已经准备完成"), not a
+work claim.  Several independent scheduler jobs act on that same fact every
+night, so ``consume_nightly_readiness`` records a **per-consumer acknowledgement**
+and deliberately leaves the published file in place (see ``Consumption`` below).
+A consumer that fails before its acknowledgement keeps the file for a retry; the
+file is retired by the next publication or by ``invalidate_nightly_readiness``,
+never by being read.
 
 The implementation deliberately avoids importing service internals so the
 updater, the scheduler and tests can all call the same helpers.
@@ -81,24 +84,39 @@ Readiness 自己开库验证，不信 updater 自述
 库都由本模块**只读打开**，逐项核对最新交易日、目标日成员集合、行内价格口径。updater 的
 自述只进 summary 供人看，release 判定完全来自这里的实测。
 
-Consumption
------------
-``consume_nightly_readiness`` is called by the scheduler after a
-successful full scan.  It moves ``nightly_data_ready.json`` atomically
-(``os.replace``) onto a per-target-date audit file
-``nightly_data_ready.consumed-YYYYMMDD.json`` and returns the payload it
-consumed.  The audit file wraps the payload verbatim
-(``readiness_payload``) with the consumption facts an auditor needs the
-next day: ``target_trade_date`` / ``published_at`` / ``consumed_at`` /
-``payload_sha256`` / ``build_commit`` / ``consumer`` / ``result_status``.
+Publication and consumption
+---------------------------
+``write_nightly_readiness`` publishes the fact twice over: the active file
+``nightly_data_ready.json`` (what the gate reads) plus an immutable
+``nightly_data_ready.published-YYYYMMDD.json`` record carrying
+``payload_sha256`` / ``published_at`` / ``build_commit`` /
+``readiness_payload``, so "who published what bytes for which trading day"
+stays answerable after the next night replaces the active file.
 
-Consumption evidence is append-only: every publication that gets consumed
-keeps its own file, so a second night never destroys the first night's
-proof.  A same-date re-consumption lands on ``…consumed-YYYYMMDD.1.json``
-rather than overwriting or unlinking the existing record.  The historical
-single-name ``nightly_data_ready.consumed.json`` is no longer written and
-is never deleted or rewritten — it remains the record of whatever night
-consumed it before this rule existed.
+``consume_nightly_readiness(consumer=...)`` is called by a scheduler job once
+its own downstream work succeeded.  It writes
+``nightly_data_ready.consumed-YYYYMMDD-<consumer>.json`` wrapping the payload
+verbatim (``readiness_payload``) with ``target_trade_date`` /
+``published_at`` / ``consumed_at`` / ``payload_sha256`` / ``build_commit`` /
+``consumer`` / ``result_status``, and **does not touch the published file**.
+Each consumer therefore acknowledges the same payload hash independently: one
+consumer acknowledging can never make another consumer see
+``nightly_data_not_ready``.
+
+Acknowledgement is idempotent per (payload, consumer) — matched on the record
+content, not the file name, so a release a consumer acknowledged under the
+previous per-date naming (``consumed-YYYYMMDD.json``, P3.3.1d) still counts
+after this change — and returns ``already_consumed_by_this_consumer`` on a
+repeat, so a retry neither re-runs the consumer's work nor writes a second
+record.  The claim itself is made with an atomic exclusive link, so two
+consumers racing at the same minute cannot overwrite each other.
+
+Evidence is append-only: a re-publication of the same trading day lands on
+``…consumed-YYYYMMDD-<consumer>.1.json`` instead of overwriting, and
+``nightly_data_ready.consumed.json`` — the name written before per-date
+records existed — is never deleted or rewritten and is never mistaken for a
+current acknowledgement, because it carries no ``consumer`` /
+``payload_sha256`` to match against.
 
 Location
 --------
@@ -113,7 +131,9 @@ Single authoritative path
 ``authoritative_readiness_path()`` is the single write target.  Legacy
 mirrors under ``src/artifacts/runtime`` are never written; they are only
 read as fallback for backwards-compat when the authoritative file is
-absent, and ``consume`` drains all mirrors.
+absent.  A consumer acknowledges whichever file the gate actually read, and
+``invalidate_nightly_readiness`` drains every mirror so a stale copy cannot
+come back as tonight's readiness.
 """
 
 from __future__ import annotations
@@ -122,6 +142,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -142,14 +163,27 @@ from stock_analyzer.ops.raw_delta_baseline import (
 
 READINESS_FILENAME = "nightly_data_ready.json"
 #: 历史遗留的单文件消费凭证名。不再写入、不再删除，只作为它那一晚的证据保留。
+#: 它也没有 ``consumer`` / ``payload_sha256`` 可比对，因此永远不会被当成当前凭证。
 CONSUMED_FILENAME = "nightly_data_ready.consumed.json"
-#: 消费凭证按目标交易日命名：``nightly_data_ready.consumed-YYYYMMDD.json``。
-#: 固定文件名会让第二晚的 ``os.replace`` 覆盖第一晚的凭证，而旧实现在覆盖前
-#: 直接 ``unlink`` 新发布的 readiness —— 当晚发布过的 payload 就此消失，
-#: 事后无法证明"谁在什么时候发布并被谁消费"。一日一份才可追溯。
+#: 消费凭证按"目标交易日 + 消费者"命名：
+#: ``nightly_data_ready.consumed-YYYYMMDD-<consumer>.json``。
+#: 日期让第二晚不会盖掉第一晚的凭证，消费者名让 A 的确认不会挡到 B ——
+#: 旧实现把两者合成一个固定名并用 ``os.replace`` 搬走 readiness，
+#: 结果第一个消费者直接消灭了后面所有消费者的事实来源（P3.3.1e 修的正是这条）。
 CONSUMED_PREFIX = "nightly_data_ready.consumed"
-#: 消费凭证文件的结构版本（不是 readiness 的 schema_version）。
+#: 发布凭证按目标交易日命名：``nightly_data_ready.published-YYYYMMDD.json``。
+#: active readiness 会被下一晚原子替换，这份记录负责回答"那一晚到底发布过什么字节"。
+PUBLISHED_PREFIX = "nightly_data_ready.published"
+#: 凭证文件的结构版本（不是 readiness 的 schema_version）。
 CONSUMPTION_RECORD_SCHEMA_VERSION = 1
+PUBLICATION_RECORD_SCHEMA_VERSION = 1
+RECORD_TYPE_PUBLICATION = "nightly_readiness_publication"
+RECORD_TYPE_CONSUMPTION = "nightly_readiness_consumption"
+#: 文件名里只保留这些字符，其余替换为 ``_``；凭证归属以记录内的 ``consumer``
+#: 字段为准，所以即便两个名字净化后相同也不会互相冒领（多出来的那份落到 ``.1``）。
+_UNSAFE_TOKEN_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+#: 同一 (日期, 消费者) 的凭证序号上限，防止极端情况下无界循环。
+_MAX_EVIDENCE_SUFFIX = 200
 #: 单 delta（feature/qfq）写入版本；没有 execution 库时的默认值，历史文件也仍是它。
 READINESS_SCHEMA_VERSION = 2
 #: 双 delta（feature/qfq + execution/raw）写入版本。只有显式传入 execution 库时才写。
@@ -193,6 +227,41 @@ class ReadinessGate:
         if self.ready:
             return True, True, "ok"
         return True, False, self.reason  # ran=true, success=false
+
+
+#: ``Consumption.status`` 的三种取值。互斥，调用方按状态决定下游，不要靠 ``is None`` 猜。
+CONSUME_CONSUMED = "consumed"
+CONSUME_ALREADY_CONSUMED = "already_consumed_by_this_consumer"
+CONSUME_NOT_READY = "nightly_data_not_ready"
+
+
+@dataclass(slots=True, frozen=True)
+class Consumption:
+    """Result of :func:`consume_nightly_readiness`.
+
+    ``ok`` means "this consumer's use of the published release is on record" —
+    true for both a fresh acknowledgement and an idempotent repeat.  It is
+    deliberately *not* "the readiness file was destroyed": under the
+    multi-consumer contract the published fact outlives every acknowledgement,
+    so the return value must never be used to decide whether the *next*
+    consumer will see readiness.
+    """
+
+    status: str
+    consumer: str
+    payload: dict[str, Any]
+    reason: str
+    target_trade_date: str
+    payload_sha256: str
+    audit_path: Path | None
+
+    @property
+    def ok(self) -> bool:
+        return self.status in (CONSUME_CONSUMED, CONSUME_ALREADY_CONSUMED)
+
+    @property
+    def consumed(self) -> bool:
+        return self.status == CONSUME_CONSUMED
 
 
 def _coerce_date(value: object) -> date | None:
@@ -317,6 +386,124 @@ def write_json_document(path: Path, payload: Mapping[str, Any]) -> Path:
 
 def _read_json(path: Path) -> dict[str, Any] | None:
     return read_json_document(path)[0]
+
+
+def _payload_sha256(raw: str) -> str:
+    """Hash of the published bytes — the join key between evidence files."""
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _consumer_token(consumer: str) -> str:
+    text = str(consumer or "").strip()
+    if not text:
+        return "unspecified"
+    return _UNSAFE_TOKEN_RE.sub("_", text)[:80]
+
+
+def _evidence_stamp(payload: Mapping[str, Any]) -> date:
+    """Which trading day's release this evidence belongs to.
+
+    Falls back to ``created_at`` and then to today so an unusual payload still
+    produces a dated record instead of no record.
+    """
+    stamp = _coerce_date(payload.get("target_trade_date")) or _coerce_date(
+        payload.get("created_at")
+    )
+    return stamp or datetime.now(UTC).date()
+
+
+def _evidence_stem(prefix: str, stamp: date, consumer: str) -> str:
+    suffix = f"-{consumer}" if consumer else ""
+    return f"{prefix}-{stamp.strftime('%Y%m%d')}{suffix}"
+
+
+def _next_free_evidence_path(directory: Path, *, stem: str) -> Path:
+    """First unused ``<stem>[.<n>].json`` name; existing files are never reused."""
+    candidate = directory / f"{stem}.json"
+    suffix = 1
+    while candidate.exists():
+        if suffix > _MAX_EVIDENCE_SUFFIX:  # pragma: no cover - defensive bound
+            raise RuntimeError(f"too many {stem}*.json evidence files in {directory}")
+        candidate = directory / f"{stem}.{suffix}.json"
+        suffix += 1
+    return candidate
+
+
+def _claim_evidence_path(
+    directory: Path,
+    *,
+    stem: str,
+    record: Mapping[str, Any],
+    match: Mapping[str, str],
+) -> Path | None:
+    """Publish ``record`` under an exclusive name, or report an identical claim.
+
+    ``os.link`` is the exclusive-create primitive here: it makes the finished
+    record visible in a single step, so a racing consumer either wins a name or
+    reads a complete file — never a half-written one.  A taken name is only
+    skipped when its content does *not* describe this very acknowledgement
+    (different consumer, or a re-published payload); when it does, ``None`` is
+    returned so the caller reports ``already_consumed_by_this_consumer``
+    instead of running its downstream a second time.
+    """
+    tmp = directory / f".{stem}.{uuid4().hex}.claiming"
+    write_json_document(tmp, record)
+    try:
+        target = directory / f"{stem}.json"
+        suffix = 0
+        while True:
+            try:
+                os.link(tmp, target)
+                return target
+            except FileExistsError as exc:
+                existing = _read_json(target)
+                if existing is not None and all(
+                    str(existing.get(key, "")) == value for key, value in match.items()
+                ):
+                    return None
+                suffix += 1
+                if suffix > _MAX_EVIDENCE_SUFFIX:  # pragma: no cover - defensive bound
+                    raise RuntimeError(
+                        f"too many {stem}*.json evidence files in {directory}"
+                    ) from exc
+                target = directory / f"{stem}.{suffix}.json"
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _evidence_records(
+    directory: Path,
+    *,
+    prefix: str,
+    record_type: str,
+    trade_dates: Collection[str] | None = None,
+) -> list[tuple[Path, dict[str, Any]]]:
+    """Read-only sweep of one kind of evidence file in ``directory``.
+
+    ``trade_dates`` are ISO dates; ``None`` means "every date on file".  The
+    historical fixed-name files (``nightly_data_ready.consumed.json``) do not
+    match the prefix pattern and are excluded by construction.
+    """
+    wanted = {str(item).strip() for item in (trade_dates or set()) if str(item).strip()}
+    found: list[tuple[Path, dict[str, Any]]] = []
+    for path in sorted(directory.glob(f"{prefix}-*.json")):
+        stamp = _evidence_stamp_from_name(path.name, prefix=prefix)
+        if wanted and stamp not in wanted:
+            continue
+        payload, _raw = read_json_document(path)
+        if payload is None or str(payload.get("record_type", "")) != record_type:
+            continue
+        found.append((path, payload))
+    return found
+
+
+def _evidence_stamp_from_name(name: str, *, prefix: str) -> str:
+    """``YYYY-MM-DD`` from ``<prefix>-YYYYMMDD[-consumer][.n].json`` or ``''``."""
+    head = name[len(prefix) + 1 :].split(".")[0].split("-")[0]
+    try:
+        return datetime.strptime(head, "%Y%m%d").date().isoformat()
+    except ValueError:
+        return ""
 
 
 def _expected_trade_date_from_payload(
@@ -945,7 +1132,38 @@ def write_nightly_readiness(
             "index_path",
         }
         payload.update({key: value for key, value in extra.items() if key not in reserved})
-    return write_json_document(target, payload)
+    written = write_json_document(target, payload)
+    _write_publication_record(target=written, payload=payload)
+    return written
+
+
+def _write_publication_record(*, target: Path, payload: Mapping[str, Any]) -> Path:
+    """Keep an immutable copy of what was published for this trading day.
+
+    The active file is what the gate reads, and the next night replaces it
+    atomically — without this record there would be no way to prove after the
+    fact which bytes tonight's acknowledgements were supposed to match.
+    """
+    raw = read_json_document(target)[1] or ""
+    stamp = _evidence_stamp(payload)
+    record: dict[str, Any] = {
+        "schema_version": PUBLICATION_RECORD_SCHEMA_VERSION,
+        "record_type": RECORD_TYPE_PUBLICATION,
+        "target_trade_date": stamp.isoformat(),
+        "published_at": str(payload.get("created_at", "") or ""),
+        "payload_sha256": _payload_sha256(raw),
+        "build_commit": str(payload.get("updater_commit", "") or ""),
+        "producer": str(payload.get("source", "") or ""),
+        "readiness_schema_version": payload.get("schema_version"),
+        "source_path": str(target),
+        "readiness_payload": dict(payload),
+    }
+    return write_json_document(
+        _next_free_evidence_path(
+            target.parent, stem=_evidence_stem(PUBLISHED_PREFIX, stamp, "")
+        ),
+        record,
+    )
 
 
 def check_nightly_readiness(
@@ -974,6 +1192,15 @@ def check_nightly_readiness(
     Returns a :class:`ReadinessGate` whose ``scheduler_triple`` satisfies the
     scheduler contract: missing or date-mismatched readiness yields
     ``(ran=true, success=false, detail=nightly_data_not_ready)``.
+
+    Readiness survives other consumers acknowledging it, so a gate result is
+    not a claim on work — the caller still has to acknowledge for its own
+    record.  Because the published file now stays in place until the next
+    publication retires it, ``expected_trade_date`` is what keeps yesterday's
+    release from passing as tonight's: callers that know the real date (the
+    warehouse's latest index date) must pass it.  Omitting it only checks the
+    payload against itself, which is what tests and offline audits want and
+    production gates must not settle for.
     """
     payload = read_nightly_readiness(path=path)
     if payload is None:
@@ -1105,6 +1332,12 @@ def invalidate_nightly_readiness(
     and mtime for post-mortem auditing and are never restored
     automatically.
 
+    This is the retirement path for a published readiness file: consumption
+    no longer removes it (every consumer needs it for the whole trading day),
+    so an update run that is about to touch data has to retire it here first.
+    A run that then fails leaves no active readiness at all, and the next
+    night's publication replaces the file for the new trading date.
+
     Returns the source paths that were invalidated (they no longer exist).
     """
     marker = stamp or datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -1135,29 +1368,6 @@ def invalidate_nightly_readiness(
     return invalidated
 
 
-def _next_consumption_audit_path(source: Path, payload: Mapping[str, Any]) -> Path:
-    """Pick the audit path for this payload without touching existing ones.
-
-    The date comes from ``target_trade_date`` (falling back to
-    ``created_at``, then to today) so the file name answers "which trading
-    day's release is this" at a glance.  Two consumptions of the same
-    trading day — e.g. a legacy mirror drained together with the
-    authoritative file — get a ``.1`` / ``.2`` counter instead of
-    overwriting or deleting each other.
-    """
-    stamp = _coerce_date(payload.get("target_trade_date")) or _coerce_date(
-        payload.get("created_at")
-    )
-    if stamp is None:
-        stamp = datetime.now(UTC).date()
-    candidate = source.parent / f"{CONSUMED_PREFIX}-{stamp.strftime('%Y%m%d')}.json"
-    suffix = 1
-    while candidate.exists():
-        candidate = source.parent / f"{CONSUMED_PREFIX}-{stamp.strftime('%Y%m%d')}.{suffix}.json"
-        suffix += 1
-    return candidate
-
-
 def _consumption_record(
     *,
     source: Path,
@@ -1168,77 +1378,244 @@ def _consumption_record(
     """Wrap a consumed payload with the facts an auditor needs next day."""
     return {
         "schema_version": CONSUMPTION_RECORD_SCHEMA_VERSION,
-        "record_type": "nightly_readiness_consumption",
+        "record_type": RECORD_TYPE_CONSUMPTION,
         "target_trade_date": str(payload.get("target_trade_date", "") or ""),
         "published_at": str(payload.get("created_at", "") or ""),
         "consumed_at": datetime.now(UTC).isoformat(),
-        # 只有成功的扫描才会调用消费，所以这里成立即代表该次发布已被用掉。
+        # 每份凭证只对它自己那个 consumer 成立。旧实现把"消费"实现成把 readiness
+        # 搬走，于是这一条事实上覆盖了所有消费者——P3.3.1e 拆开的就是这一点。
         "result_status": "consumed",
         "consumer": consumer,
-        "payload_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+        "payload_sha256": _payload_sha256(raw),
         "build_commit": str(payload.get("updater_commit", "") or ""),
         "source_path": str(source),
         "readiness_payload": dict(payload),
     }
 
 
-def _consume_one(
-    source: Path,
-    *,
-    consumer: str,
-) -> dict[str, Any] | None:
-    """Move one readable readiness file into a dated audit file; return payload.
-
-    An unreadable file is left untouched, exactly as before: this function
-    only ever archives evidence it can attribute to a published release.
-    """
-    payload, raw = read_json_document(source)
-    if payload is None:
-        return None
-    audit_path = _next_consumption_audit_path(source, payload)
-    try:
-        os.replace(source, audit_path)
-    except OSError:
-        return None
-    record = _consumption_record(
-        source=source,
-        payload=payload,
-        raw=raw or "",
+def _not_ready(consumer: str) -> Consumption:
+    return Consumption(
+        status=CONSUME_NOT_READY,
         consumer=consumer,
+        payload={},
+        reason=CONSUME_NOT_READY,
+        target_trade_date="",
+        payload_sha256="",
+        audit_path=None,
     )
-    try:
-        write_json_document(audit_path, record)
-    except OSError:
-        # The payload itself is already safely under the audit name; losing
-        # only the wrapper is reported, never retried into a second file.
-        logger.exception("failed to wrap nightly readiness audit evidence at %s", audit_path)
-    return payload
+
+
+def _acknowledge_one(source: Path, *, consumer: str) -> Consumption:
+    """Record one consumer's use of the published release; leave the release alone."""
+    payload, raw = read_json_document(source)
+    if payload is None or raw is None:
+        return _not_ready(consumer)
+    sha = _payload_sha256(raw)
+    stamp = _evidence_stamp(payload)
+    already = _existing_ack_path(source.parent, stamp=stamp, consumer=consumer, sha=sha)
+    if already is not None:
+        return _already_consumed(payload, consumer, stamp, sha, already)
+    ack_path = _claim_evidence_path(
+        source.parent,
+        stem=_evidence_stem(CONSUMED_PREFIX, stamp, _consumer_token(consumer)),
+        record=_consumption_record(
+            source=source,
+            payload=payload,
+            raw=raw,
+            consumer=consumer,
+        ),
+        match={"consumer": consumer, "payload_sha256": sha},
+    )
+    if ack_path is None:
+        # 同名竞争：对手（同一消费者的另一条进程）刚写完凭证。
+        return _already_consumed(
+            payload,
+            consumer,
+            stamp,
+            sha,
+            _existing_ack_path(source.parent, stamp=stamp, consumer=consumer, sha=sha),
+        )
+    return Consumption(
+        status=CONSUME_CONSUMED,
+        consumer=consumer,
+        payload=dict(payload),
+        reason=CONSUME_CONSUMED,
+        target_trade_date=stamp.isoformat(),
+        payload_sha256=sha,
+        audit_path=ack_path,
+    )
+
+
+def _already_consumed(
+    payload: Mapping[str, Any],
+    consumer: str,
+    stamp: date,
+    sha: str,
+    audit_path: Path | None,
+) -> Consumption:
+    return Consumption(
+        status=CONSUME_ALREADY_CONSUMED,
+        consumer=consumer,
+        payload=dict(payload),
+        reason=CONSUME_ALREADY_CONSUMED,
+        target_trade_date=stamp.isoformat(),
+        payload_sha256=sha,
+        audit_path=audit_path,
+    )
+
+
+def _existing_ack_path(
+    directory: Path,
+    *,
+    stamp: date,
+    consumer: str,
+    sha: str,
+) -> Path | None:
+    """The record that already proves this consumer used this payload."""
+    for path, record in _evidence_records(
+        directory,
+        prefix=CONSUMED_PREFIX,
+        record_type=RECORD_TYPE_CONSUMPTION,
+        trade_dates={stamp.isoformat()},
+    ):
+        if (
+            str(record.get("consumer", "")) == consumer
+            and str(record.get("payload_sha256", "")) == sha
+        ):
+            return path
+    return None
 
 
 def consume_nightly_readiness(
     *,
-    path: str | Path | None = None,
     consumer: str = "unspecified",
-) -> dict[str, Any] | None:
-    """Archive the readiness file(s) as dated consumption audit evidence.
+    expected_trade_date: str | date | datetime | None = None,
+    require_dual_delta: bool = False,
+    path: str | Path | None = None,
+) -> Consumption:
+    """Acknowledge the published readiness on behalf of one consumer.
 
-    Each consumed release lands in its own
-    ``nightly_data_ready.consumed-YYYYMMDD.json`` next to the readiness
-    file, wrapping the payload verbatim with the consumption facts (see the
-    module docstring).  Nothing that was ever published is overwritten or
-    deleted here.
+    Writes ``nightly_data_ready.consumed-YYYYMMDD-<consumer>.json`` next to the
+    readiness file, wrapping the payload verbatim (``readiness_payload``) with
+    the consumption facts and the ``payload_sha256`` that links it back to the
+    publication record.  **The readiness file itself is not moved or deleted**:
+    it is the published fact for that trading day, and the next consumer must
+    still see it.  Retirement belongs to ``write_nightly_readiness`` (next
+    publication) and ``invalidate_nightly_readiness`` (update run), not to
+    whoever got there first.
 
-    When ``path`` is given, only that file is consumed.  Otherwise all
-    candidate locations are drained so a stale mirror cannot be re-read
-    after the authoritative file is consumed; each drained location keeps
-    its own audit file in its own directory.
+    The gate is evaluated first and must pass — a consumer cannot acknowledge a
+    release the gate would refuse (yesterday's date, v2 under
+    ``require_dual_delta``, failed QFQ parity).  Without that, a stale file
+    that now survives every night could keep collecting acknowledgements on
+    days it never covered.
+
+    Repeating for the same (payload, consumer) returns
+    ``already_consumed_by_this_consumer`` without writing a second record, so a
+    retried job neither re-runs nor disturbs anyone else.
+
+    When ``path`` is given only that file is considered.  Otherwise the
+    resolution order matches :func:`read_nightly_readiness` — authoritative
+    file first, legacy mirror as fallback — and stops at the first readable
+    one.  Leftover mirrors are drained by ``invalidate_nightly_readiness``.
     """
-    if path is not None:
-        return _consume_one(Path(path), consumer=consumer)
-    # Drain all candidates; return the first payload found.
-    first_payload: dict[str, Any] | None = None
+    gate = check_nightly_readiness(
+        expected_trade_date=expected_trade_date,
+        path=path,
+        require_dual_delta=require_dual_delta,
+    )
+    if not gate.ready:
+        return Consumption(
+            status=CONSUME_NOT_READY,
+            consumer=consumer,
+            payload=dict(gate.payload),
+            reason=gate.reason,
+            target_trade_date=gate.expected_trade_date,
+            payload_sha256="",
+            audit_path=None,
+        )
+    source = Path(path) if path is not None else _readiness_source_for(gate.payload)
+    if source is None:
+        return _not_ready(consumer)
+    return _acknowledge_one(source, consumer=consumer)
+
+
+def _readiness_source_for(payload: Mapping[str, Any]) -> Path | None:
+    """Which file the gate's payload actually came from (same read order)."""
     for candidate in _candidate_readiness_paths():
-        payload = _consume_one(candidate, consumer=consumer)
-        if payload is not None and first_payload is None:
-            first_payload = payload
-    return first_payload
+        if read_json_document(candidate)[0] == payload:
+            return candidate
+    return None
+
+
+def nightly_readiness_audit(
+    *,
+    target_trade_date: str | date | None = None,
+    directory: str | Path | None = None,
+    expected_consumers: Collection[str] = (),
+) -> dict[str, Any]:
+    """Who published what for which trading day, and who has acknowledged it.
+
+    Read-only.  Answers the audit questions without a shell session on the
+    NAS: every acknowledgement carries the ``payload_sha256`` of the release it
+    covers, so "same target date, same published bytes?" is a set comparison —
+    and ``expected_consumers`` turns that into the list of jobs that have not
+    confirmed yet.
+    """
+    root = Path(directory) if directory is not None else authoritative_readiness_path().parent
+    resolved: date | None = None
+    if target_trade_date is not None:
+        resolved = _coerce_date(target_trade_date)
+        if resolved is None:
+            raise ValueError(f"invalid target_trade_date: {target_trade_date!r}")
+    dates = None if resolved is None else {resolved.isoformat()}
+    published = [
+        {
+            "file": path.name,
+            "target_trade_date": str(record.get("target_trade_date", "")),
+            "published_at": str(record.get("published_at", "")),
+            "payload_sha256": str(record.get("payload_sha256", "")),
+            "build_commit": str(record.get("build_commit", "")),
+            "producer": str(record.get("producer", "")),
+        }
+        for path, record in _evidence_records(
+            root,
+            prefix=PUBLISHED_PREFIX,
+            record_type=RECORD_TYPE_PUBLICATION,
+            trade_dates=dates,
+        )
+    ]
+    acknowledgements: list[dict[str, Any]] = []
+    for path, record in _evidence_records(
+        root,
+        prefix=CONSUMED_PREFIX,
+        record_type=RECORD_TYPE_CONSUMPTION,
+        trade_dates=dates,
+    ):
+        item = {
+            "file": path.name,
+            "consumer": str(record.get("consumer", "")),
+            "consumed_at": str(record.get("consumed_at", "")),
+            "payload_sha256": str(record.get("payload_sha256", "")),
+            "result_status": str(record.get("result_status", "")),
+        }
+        if dates is None:
+            item["target_trade_date"] = str(record.get("target_trade_date", ""))
+        acknowledgements.append(item)
+    hashes = {str(entry["payload_sha256"]) for entry in published}
+    if not hashes:
+        active, active_raw = read_json_document(root / READINESS_FILENAME)
+        if active is not None and (dates is None or _evidence_stamp(active).isoformat() in dates):
+            hashes.add(_payload_sha256(active_raw or ""))
+    confirmed = {str(entry["consumer"]) for entry in acknowledgements}
+    return {
+        "target_trade_date": "" if resolved is None else resolved.isoformat(),
+        "directory": str(root),
+        "published": published,
+        "published_payload_sha256": sorted(hashes),
+        "acknowledgements": sorted(acknowledgements, key=lambda item: str(item["file"])),
+        "acknowledged_consumers": sorted(confirmed),
+        "unacknowledged_consumers": sorted(
+            {str(item) for item in expected_consumers} - confirmed
+        ),
+    }
