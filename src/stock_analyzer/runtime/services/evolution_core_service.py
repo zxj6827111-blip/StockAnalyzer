@@ -634,13 +634,32 @@ class RuntimeEvolutionCoreService:
                     consume_nightly_readiness,  # noqa: WPS433
                 )
 
-                consumed = consume_nightly_readiness(consumer="evolution_offhours")
-                if consumed is not None:
+                # 确认前必须重过一遍门禁（同一个 expected_trade_date，不二次解析）：
+                # published readiness 现在活得过一整晚，少了这道校验就会有人给
+                # 昨天的发布补一张今天的凭证。
+                consumed = consume_nightly_readiness(
+                    consumer="evolution_offhours",
+                    expected_trade_date=(
+                        None if readiness_gate is None else readiness_gate.expected_trade_date
+                    ),
+                )
+                if consumed.ok:
+                    # 只登记本作业这一次用掉了哪份发布；published readiness 原地
+                    # 保留，21:45 的 week5_night_scan 与 22:00 起的 alpha_v2_shadow_cycle
+                    # 还要靠它判断今晚的数据事实是否成立。
                     report["readiness_consumed"] = True
+                    report["readiness_consumption_status"] = consumed.status
                     week5_refresh = dict(week5_refresh)
                     week5_refresh["readiness_consumed"] = True
-            except Exception:
-                pass
+                    week5_refresh["readiness_consumption_status"] = consumed.status
+            except Exception as exc:
+                # 确认失败不能让审计链静默：留痕后由下一轮重试。
+                service._record_audit_event(
+                    event_type="evolution_offhours_readiness_consume_failed",
+                    trace_id="scheduler-evolution",
+                    level="warn",
+                    payload={"error": f"{type(exc).__name__}:{exc}"},
+                )
         return {
             "report": report,
             "tdx_sync": report.get("tdx_sync", {}),
