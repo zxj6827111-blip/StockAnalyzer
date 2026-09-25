@@ -634,7 +634,7 @@ class RuntimeEvolutionCoreService:
                     consume_nightly_readiness,  # noqa: WPS433
                 )
 
-                consumed = consume_nightly_readiness()
+                consumed = consume_nightly_readiness(consumer="evolution_offhours")
                 if consumed is not None:
                     report["readiness_consumed"] = True
                     week5_refresh = dict(week5_refresh)

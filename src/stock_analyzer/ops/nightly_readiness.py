@@ -8,9 +8,9 @@ date-mismatched readiness as a hard scheduler failure
 _scheduler_detail=nightly_data_not_ready``).
 
 The file is consumed exactly once by a successful evolution/week5/final-
-selector/watchlist-sync chain; on success it is atomically renamed to
-``nightly_data_ready.consumed.json``.  On failure it is kept so the
-scheduler backs off and retries.
+selector/watchlist-sync chain; on success it is moved to a dated
+consumption audit file (see ``Consumption`` below).  On failure it is kept
+so the scheduler backs off and retries.
 
 The implementation deliberately avoids importing service internals so the
 updater, the scheduler and tests can all call the same helpers.
@@ -84,10 +84,21 @@ Readiness 自己开库验证，不信 updater 自述
 Consumption
 -----------
 ``consume_nightly_readiness`` is called by the scheduler after a
-successful full scan.  It renames ``nightly_data_ready.json`` to
-``nightly_data_ready.consumed.json`` atomically (``os.replace``) and
-returns the payload it consumed.  A missing file before consumption is
-not an error; the caller decides the fate of the schedule.
+successful full scan.  It moves ``nightly_data_ready.json`` atomically
+(``os.replace``) onto a per-target-date audit file
+``nightly_data_ready.consumed-YYYYMMDD.json`` and returns the payload it
+consumed.  The audit file wraps the payload verbatim
+(``readiness_payload``) with the consumption facts an auditor needs the
+next day: ``target_trade_date`` / ``published_at`` / ``consumed_at`` /
+``payload_sha256`` / ``build_commit`` / ``consumer`` / ``result_status``.
+
+Consumption evidence is append-only: every publication that gets consumed
+keeps its own file, so a second night never destroys the first night's
+proof.  A same-date re-consumption lands on ``…consumed-YYYYMMDD.1.json``
+rather than overwriting or unlinking the existing record.  The historical
+single-name ``nightly_data_ready.consumed.json`` is no longer written and
+is never deleted or rewritten — it remains the record of whatever night
+consumed it before this rule existed.
 
 Location
 --------
@@ -107,6 +118,7 @@ absent, and ``consume`` drains all mirrors.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -129,7 +141,15 @@ from stock_analyzer.ops.raw_delta_baseline import (
 )
 
 READINESS_FILENAME = "nightly_data_ready.json"
+#: 历史遗留的单文件消费凭证名。不再写入、不再删除，只作为它那一晚的证据保留。
 CONSUMED_FILENAME = "nightly_data_ready.consumed.json"
+#: 消费凭证按目标交易日命名：``nightly_data_ready.consumed-YYYYMMDD.json``。
+#: 固定文件名会让第二晚的 ``os.replace`` 覆盖第一晚的凭证，而旧实现在覆盖前
+#: 直接 ``unlink`` 新发布的 readiness —— 当晚发布过的 payload 就此消失，
+#: 事后无法证明"谁在什么时候发布并被谁消费"。一日一份才可追溯。
+CONSUMED_PREFIX = "nightly_data_ready.consumed"
+#: 消费凭证文件的结构版本（不是 readiness 的 schema_version）。
+CONSUMPTION_RECORD_SCHEMA_VERSION = 1
 #: 单 delta（feature/qfq）写入版本；没有 execution 库时的默认值，历史文件也仍是它。
 READINESS_SCHEMA_VERSION = 2
 #: 双 delta（feature/qfq + execution/raw）写入版本。只有显式传入 execution 库时才写。
@@ -263,16 +283,40 @@ def nightly_readiness_paths() -> list[Path]:
     return list(_candidate_readiness_paths())
 
 
-def _read_json(path: Path) -> dict[str, Any] | None:
+def read_json_document(path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    """Read a JSON object file, keeping the raw text next to the parsed dict.
+
+    The raw text is what gets hashed into the consumption audit record, so
+    the hash proves which exact bytes were published — not a re-serialised
+    copy of them.  Returns ``(None, ...)`` when unreadable or not a JSON
+    object.
+    """
     try:
         raw = path.read_text(encoding="utf-8")
     except OSError:
-        return None
+        return None, None
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
+        return None, raw
+    return (parsed, raw) if isinstance(parsed, dict) else (None, raw)
+
+
+def write_json_document(path: Path, payload: Mapping[str, Any]) -> Path:
+    """Atomically write ``payload`` as JSON (tmp + ``os.replace`` + fsync)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    with tmp.open("w", encoding="utf-8") as fp:
+        json.dump(dict(payload), fp, ensure_ascii=False, indent=2, sort_keys=True)
+        fp.write("\n")
+        fp.flush()
+        os.fsync(fp.fileno())
+    os.replace(tmp, path)
+    return path
+
+
+def _read_json(path: Path) -> dict[str, Any] | None:
+    return read_json_document(path)[0]
 
 
 def _expected_trade_date_from_payload(
@@ -862,7 +906,6 @@ def write_nightly_readiness(
             raw_baseline_block = {"ok": True, "reason": "verification_disabled_by_caller"}
 
     target = Path(path) if path is not None else authoritative_readiness_path()
-    target.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {
         "schema_version": READINESS_SCHEMA_VERSION_DUAL if dual else READINESS_SCHEMA_VERSION,
         "target_trade_date": coerced.isoformat(),
@@ -902,14 +945,7 @@ def write_nightly_readiness(
             "index_path",
         }
         payload.update({key: value for key, value in extra.items() if key not in reserved})
-    tmp = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
-    with tmp.open("w", encoding="utf-8") as fp:
-        json.dump(payload, fp, ensure_ascii=False, indent=2, sort_keys=True)
-        fp.write("\n")
-        fp.flush()
-        os.fsync(fp.fileno())
-    os.replace(tmp, target)
-    return target
+    return write_json_document(target, payload)
 
 
 def check_nightly_readiness(
@@ -1065,8 +1101,9 @@ def invalidate_nightly_readiness(
     ``read_nightly_readiness`` falls back to legacy mirrors, so ALL
     candidate locations are drained here, not just the authoritative one.
 
-    Consumed files are not touched; stale files keep their payload and
-    mtime for post-mortem auditing and are never restored automatically.
+    Consumed audit files are not touched; stale files keep their payload
+    and mtime for post-mortem auditing and are never restored
+    automatically.
 
     Returns the source paths that were invalidated (they no longer exist).
     """
@@ -1076,8 +1113,8 @@ def invalidate_nightly_readiness(
     for candidate in _candidate_readiness_paths():
         if _read_json(candidate) is None:
             continue
-        # 中缀命名与 consumed 文件（nightly_data_ready.consumed.json）一致：
-        # 前缀固定，按文件名排序即按失效时间排序。
+        # 中缀命名与 consumed 凭证（nightly_data_ready.consumed-YYYYMMDD.json）
+        # 一致：前缀固定，按文件名排序即按时间排序。
         target = candidate.with_name(f"nightly_data_ready.stale-{marker}.json")
         suffix = 1
         while target.exists():
@@ -1098,46 +1135,110 @@ def invalidate_nightly_readiness(
     return invalidated
 
 
+def _next_consumption_audit_path(source: Path, payload: Mapping[str, Any]) -> Path:
+    """Pick the audit path for this payload without touching existing ones.
+
+    The date comes from ``target_trade_date`` (falling back to
+    ``created_at``, then to today) so the file name answers "which trading
+    day's release is this" at a glance.  Two consumptions of the same
+    trading day — e.g. a legacy mirror drained together with the
+    authoritative file — get a ``.1`` / ``.2`` counter instead of
+    overwriting or deleting each other.
+    """
+    stamp = _coerce_date(payload.get("target_trade_date")) or _coerce_date(
+        payload.get("created_at")
+    )
+    if stamp is None:
+        stamp = datetime.now(UTC).date()
+    candidate = source.parent / f"{CONSUMED_PREFIX}-{stamp.strftime('%Y%m%d')}.json"
+    suffix = 1
+    while candidate.exists():
+        candidate = source.parent / f"{CONSUMED_PREFIX}-{stamp.strftime('%Y%m%d')}.{suffix}.json"
+        suffix += 1
+    return candidate
+
+
+def _consumption_record(
+    *,
+    source: Path,
+    payload: Mapping[str, Any],
+    raw: str,
+    consumer: str,
+) -> dict[str, Any]:
+    """Wrap a consumed payload with the facts an auditor needs next day."""
+    return {
+        "schema_version": CONSUMPTION_RECORD_SCHEMA_VERSION,
+        "record_type": "nightly_readiness_consumption",
+        "target_trade_date": str(payload.get("target_trade_date", "") or ""),
+        "published_at": str(payload.get("created_at", "") or ""),
+        "consumed_at": datetime.now(UTC).isoformat(),
+        # 只有成功的扫描才会调用消费，所以这里成立即代表该次发布已被用掉。
+        "result_status": "consumed",
+        "consumer": consumer,
+        "payload_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+        "build_commit": str(payload.get("updater_commit", "") or ""),
+        "source_path": str(source),
+        "readiness_payload": dict(payload),
+    }
+
+
+def _consume_one(
+    source: Path,
+    *,
+    consumer: str,
+) -> dict[str, Any] | None:
+    """Move one readable readiness file into a dated audit file; return payload.
+
+    An unreadable file is left untouched, exactly as before: this function
+    only ever archives evidence it can attribute to a published release.
+    """
+    payload, raw = read_json_document(source)
+    if payload is None:
+        return None
+    audit_path = _next_consumption_audit_path(source, payload)
+    try:
+        os.replace(source, audit_path)
+    except OSError:
+        return None
+    record = _consumption_record(
+        source=source,
+        payload=payload,
+        raw=raw or "",
+        consumer=consumer,
+    )
+    try:
+        write_json_document(audit_path, record)
+    except OSError:
+        # The payload itself is already safely under the audit name; losing
+        # only the wrapper is reported, never retried into a second file.
+        logger.exception("failed to wrap nightly readiness audit evidence at %s", audit_path)
+    return payload
+
+
 def consume_nightly_readiness(
     *,
     path: str | Path | None = None,
+    consumer: str = "unspecified",
 ) -> dict[str, Any] | None:
-    """Atomically rename the readiness file(s) to the consumed name.
+    """Archive the readiness file(s) as dated consumption audit evidence.
+
+    Each consumed release lands in its own
+    ``nightly_data_ready.consumed-YYYYMMDD.json`` next to the readiness
+    file, wrapping the payload verbatim with the consumption facts (see the
+    module docstring).  Nothing that was ever published is overwritten or
+    deleted here.
 
     When ``path`` is given, only that file is consumed.  Otherwise all
     candidate locations are drained so a stale mirror cannot be re-read
-    after the authoritative file is consumed.
+    after the authoritative file is consumed; each drained location keeps
+    its own audit file in its own directory.
     """
     if path is not None:
-        source = Path(path)
-        payload = _read_json(source)
-        if payload is None:
-            return None
-        target = source.with_name(CONSUMED_FILENAME)
-        try:
-            os.replace(source, target)
-        except OSError:
-            return None
-        return payload
+        return _consume_one(Path(path), consumer=consumer)
     # Drain all candidates; return the first payload found.
     first_payload: dict[str, Any] | None = None
     for candidate in _candidate_readiness_paths():
-        payload = _read_json(candidate)
-        if payload is None:
-            continue
-        if first_payload is None:
+        payload = _consume_one(candidate, consumer=consumer)
+        if payload is not None and first_payload is None:
             first_payload = payload
-        target = candidate.with_name(CONSUMED_FILENAME)
-        # Avoid overwriting an existing consumed file from another candidate
-        # with different content — keep the first consumed payload's file.
-        if target.exists():
-            try:
-                candidate.unlink()
-            except OSError:
-                pass
-            continue
-        try:
-            os.replace(candidate, target)
-        except OSError:
-            continue
     return first_payload
