@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+from datetime import datetime
 from pathlib import Path
 
 import duckdb
@@ -519,3 +521,194 @@ def test_rdy_broken_v3_still_reports_data_not_ready_for_week5(tmp_path: Path) ->
     gate = check_nightly_readiness(expected_trade_date=_DUAL_TARGET, path=path)
     assert gate.ready is False
     assert gate.reason == "nightly_data_not_ready"
+
+
+# ---------------------------------------------------------------------------
+# P3.3.1d：消费证据留存
+#
+# 旧实现把消费凭证固定写成 ``nightly_data_ready.consumed.json``。第二晚消费时这个
+# 名字已被上一晚占用，代码走的是 ``candidate.unlink()`` 分支——**当晚刚发布**的
+# ``nightly_data_ready.json`` 连字节都没有留下，事后既证明不了它发布过，也证明不了
+# 它被谁消费。下面四组测试钉住的是"发布 → 消费 → 结果"这条链每天都可追溯。
+# ---------------------------------------------------------------------------
+
+
+def _publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    auth: Path,
+    *,
+    trade_date: str,
+    commit: str,
+    tag: str = "",
+) -> str:
+    """Publish readiness to ``auth`` and return the exact bytes on disk.
+
+    Candidate list is narrowed to ``auth`` so the drain path stays hermetic
+    and cannot touch a real local ``artifacts/runtime`` directory.
+    """
+    import stock_analyzer.ops.nightly_readiness as mod
+
+    index_path, db_path = _write_artifacts(
+        tmp_path / (tag or trade_date.replace("-", "")),
+        target_trade_date=trade_date,
+    )
+    monkeypatch.setenv("SA__NIGHTLY_READINESS_PATH", str(auth))
+    monkeypatch.setattr(mod, "_candidate_readiness_paths", lambda: [auth])
+    write_nightly_readiness(
+        target_trade_date=trade_date,
+        index_path=index_path,
+        db_path=db_path,
+        updater_commit=commit,
+    )
+    return auth.read_text(encoding="utf-8")
+
+
+def _audit_files(directory: Path) -> list[Path]:
+    return sorted(directory.glob("nightly_data_ready.consumed-*.json"))
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def test_case1_consume_leaves_dated_audit_with_all_consumption_facts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 1：publish → consume 后必须有按日期命名的消费凭证。"""
+    auth = tmp_path / "artifacts" / "runtime" / "nightly_data_ready.json"
+    published = _publish(
+        tmp_path, monkeypatch, auth, trade_date="2026-08-20", commit="aaa1111"
+    )
+    payload = consume_nightly_readiness(consumer="evolution_offhours")
+
+    assert payload is not None
+    assert not auth.exists()
+    audits = _audit_files(auth.parent)
+    assert [path.name for path in audits] == ["nightly_data_ready.consumed-20260820.json"]
+    record = json.loads(audits[0].read_text(encoding="utf-8"))
+    assert record["target_trade_date"] == "2026-08-20"
+    assert record["published_at"] == str(payload["created_at"])
+    assert datetime.fromisoformat(record["consumed_at"]).tzinfo is not None
+    assert record["payload_sha256"] == _sha256(published)
+    assert record["build_commit"] == "aaa1111"
+    assert record["consumer"] == "evolution_offhours"
+    assert record["result_status"] == "consumed"
+    # 凭证里的 payload 必须就是发布时的字节，不是二次加工的副本。
+    assert record["readiness_payload"] == json.loads(published)
+
+
+def test_case2_second_night_keeps_first_night_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 2：连续两晚各自留下独立凭证——旧实现在这里会删掉第二晚的 payload。"""
+    auth = tmp_path / "artifacts" / "runtime" / "nightly_data_ready.json"
+    day1 = _publish(
+        tmp_path, monkeypatch, auth, trade_date="2026-08-20", commit="c1", tag="d1"
+    )
+    assert consume_nightly_readiness(consumer="evolution_offhours") is not None
+    day2 = _publish(
+        tmp_path, monkeypatch, auth, trade_date="2026-08-21", commit="c2", tag="d2"
+    )
+    assert consume_nightly_readiness(consumer="evolution_offhours") is not None
+
+    audits = _audit_files(auth.parent)
+    assert [path.name for path in audits] == [
+        "nightly_data_ready.consumed-20260820.json",
+        "nightly_data_ready.consumed-20260821.json",
+    ]
+    first = json.loads(audits[0].read_text(encoding="utf-8"))
+    second = json.loads(audits[1].read_text(encoding="utf-8"))
+    assert (first["build_commit"], second["build_commit"]) == ("c1", "c2")
+    assert first["payload_sha256"] == _sha256(day1)
+    assert second["payload_sha256"] == _sha256(day2)
+
+
+def test_case3_same_date_reconsume_never_unlinks_nor_overwrites(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 3：已有 consumed 文件时再次消费——不 unlink 新 payload、不覆盖历史。
+
+    同日重发（补跑 updater）与遗留的 ``nightly_data_ready.consumed.json`` 都要保住，
+    二者都是"当晚确实发布过"的唯一证据。
+    """
+    auth = tmp_path / "artifacts" / "runtime" / "nightly_data_ready.json"
+    auth.parent.mkdir(parents=True, exist_ok=True)
+    legacy = auth.parent / "nightly_data_ready.consumed.json"
+    legacy.write_text(
+        json.dumps({"schema_version": 2, "target_trade_date": "2026-08-19"}),
+        encoding="utf-8",
+    )
+    legacy_bytes = legacy.read_bytes()
+
+    first = _publish(
+        tmp_path, monkeypatch, auth, trade_date="2026-08-20", commit="c1", tag="run1"
+    )
+    assert consume_nightly_readiness(consumer="evolution_offhours") is not None
+    second = _publish(
+        tmp_path, monkeypatch, auth, trade_date="2026-08-20", commit="c2", tag="run2"
+    )
+    assert consume_nightly_readiness(consumer="evolution_offhours") is not None
+
+    audits = {path.name: path for path in _audit_files(auth.parent)}
+    assert set(audits) == {
+        "nightly_data_ready.consumed-20260820.json",
+        "nightly_data_ready.consumed-20260820.1.json",
+    }
+    assert (
+        json.loads(audits["nightly_data_ready.consumed-20260820.json"].read_text(
+            encoding="utf-8"
+        ))["payload_sha256"]
+        == _sha256(first)
+    )
+    assert (
+        json.loads(audits["nightly_data_ready.consumed-20260820.1.json"].read_text(
+            encoding="utf-8"
+        ))["payload_sha256"]
+        == _sha256(second)
+    )
+    # 旧文件不删不改。
+    assert legacy.read_bytes() == legacy_bytes
+
+
+def test_audit_files_are_outside_the_candidate_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """凭证文件不得被后续 invalidate / 重消费重新当成可发布文件。
+
+    同时证明显式 ``path=`` 入口也走按日期留存，且不再产生固定名凭证。
+    """
+    from stock_analyzer.ops.nightly_readiness import invalidate_nightly_readiness
+
+    auth = tmp_path / "artifacts" / "runtime" / "nightly_data_ready.json"
+    _publish(tmp_path, monkeypatch, auth, trade_date="2026-08-20", commit="c1", tag="d1")
+    assert consume_nightly_readiness(consumer="evolution_offhours") is not None
+    _publish(
+        tmp_path, monkeypatch, auth, trade_date="2026-08-21", commit="c2", tag="d2"
+    )
+
+    invalidated = invalidate_nightly_readiness(stamp="20260822T000000Z")
+
+    assert [Path(item).name for item in invalidated] == ["nightly_data_ready.json"]
+    audits = _audit_files(auth.parent)
+    assert [path.name for path in audits] == ["nightly_data_ready.consumed-20260820.json"]
+
+    explicit = tmp_path / "single" / "nightly_data_ready.json"
+    index_path, db_path = _write_artifacts(
+        tmp_path / "explicit", target_trade_date="2026-08-23"
+    )
+    write_nightly_readiness(
+        target_trade_date="2026-08-23",
+        index_path=index_path,
+        db_path=db_path,
+        path=explicit,
+        updater_commit="c3",
+    )
+    consumed = consume_nightly_readiness(path=explicit, consumer="manual_replay")
+    assert consumed is not None
+    assert json.loads(
+        (explicit.parent / "nightly_data_ready.consumed-20260823.json").read_text(
+            encoding="utf-8"
+        )
+    )["consumer"] == "manual_replay"
+    assert not (explicit.parent / "nightly_data_ready.consumed.json").exists()

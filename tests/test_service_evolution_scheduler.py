@@ -549,8 +549,8 @@ def _patch_readiness_consume(
     """消费代码在函数体内 import，patch 模块属性即可拦截。"""
     import stock_analyzer.ops.nightly_readiness as readiness_module
 
-    def _fake_consume() -> dict[str, object]:
-        calls.append({"consumed": True})
+    def _fake_consume(**kwargs: object) -> dict[str, object]:
+        calls.append({"consumed": True, **kwargs})
         return {"target_trade_date": "2026-08-21"}
 
     monkeypatch.setattr(readiness_module, "consume_nightly_readiness", _fake_consume)
@@ -608,6 +608,8 @@ def test_offhours_consumes_readiness_on_watchlist_sync_evidence(
     service._job_evolution_offhours()
 
     assert len(calls) == 1
+    # 消费凭证必须能回答"是哪条链路消费的"，否则审计只剩一个匿名文件。
+    assert calls[0]["consumer"] == "evolution_offhours"
 
 
 def test_offhours_consumes_readiness_on_final_signals_evidence(
