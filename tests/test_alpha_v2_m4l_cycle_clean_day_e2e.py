@@ -14,8 +14,13 @@ production prerequisites ready + S08 七项全齐 + funnel linked + active epoch
 反向变异（任一 S08 输入缺失）：deadline 前 → waiting 且**不写任何快照**；
 deadline 后 → 落 missing 台账且 ``clean_oos_days == 0``（DH-2/4/5/6）。
 
-时间基准用**真实当天**：capture 的写入窗口是真实墙钟，合成库的最后一个交易日
-就是今天（``_trading_days_ending(today)``），因此不需要注入时钟也不产生 backfill。
+时间基准是**固定的有效交易日**（``TODAY`` 常量，经 ``market_calendar`` 断言真实
+可交易）：``date.today()`` 在周末/节假日运行时不是交易日，而合成库的最后交易日
+（``_trading_days_ending`` 跳过周末）会与 as_of 错位，data_health 恒
+not_available，CI 随真实日历漂移。父进程调度时钟经 ``service._job_now`` 注入；
+capture 子进程的"T 日快照只允许 T 日写入"墙钟校验经 CLI 官方 ``--capture-date``
+冻结时钟通道对齐（rehearsal/CI 专用，production epoch 传它直接 exit 8）——
+写入因此仍是当日正常写（backfilled=false），不产生 backfill。
 """
 
 from __future__ import annotations
@@ -55,13 +60,20 @@ from stock_analyzer.alpha_v2.validation.runtime_identity import (
 )
 from stock_analyzer.config import load_config
 from stock_analyzer.feature.snapshot import FORMAT_VERSION
+from stock_analyzer.market_calendar import is_a_share_trading_day
 from stock_analyzer.runtime.service import StockAnalyzerService
 from stock_analyzer.runtime.services.live_shadow_cycle_service import (
     LiveShadowCycleService,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-TODAY = date.today()
+# 测试时钟锚点：固定的**真实有效 A 股交易日**（2026-09-24，周四，中秋休市前最后
+# 一个交易日）。不能取 date.today()——周末/节假日的 CI 运行日不是交易日，
+# _trading_days_ending 生成的合成库止于上一个周五，与 as_of 错位一天，data_health
+# 恒 not_available。也不能取 2026-09-25：那是中秋休市日（market_calendar 有案），
+# "固定一个有效交易日"要求锚点本身真实可交易；锚点必须早于真实今天（禁止未来日期）。
+TODAY = date(2026, 9, 24)
+assert is_a_share_trading_day(TODAY), f"测试锚点 {TODAY} 必须是真实 A 股交易日"
 FEATURES = ["ret_1d", "ret_5d", "ma5", "volume_ratio_5"]
 MODEL_ID = "alpha_v2_shadow_clean_day"
 
@@ -358,6 +370,22 @@ def clean_day_env(tmp_path, monkeypatch):
     service._week5_automation_service = _StubAutomation()
     cycle = LiveShadowCycleService(service)
     service._live_shadow_cycle = cycle
+
+    # capture 子进程的墙钟对齐（frozen date 注入的另一半）：
+    # service._job_now 只固定了父进程的调度时钟；capture 是独立子进程，
+    # "signal_date == 真实写入日"的墙钟校验读的是系统时间，TODAY 固定后必须
+    # 同步注入，否则 signal_date 会被判成 backfill（exit 8）。走 CLI 官方的
+    # --capture-date 冻结时钟通道（rehearsal/CI 专用；production epoch 传它直接
+    # exit 8，生产不可达），signal_date 因此是当日正常写入：backfilled=false、
+    # actual_capture_date == signal_date，clean 资格口径与真实当日完全一致。
+    _original_run_cli = cycle._run_cli
+
+    def _run_cli_with_frozen_capture_clock(script_name, argv, *, timeout_sec):
+        if script_name == "alpha_v2_shadow_capture.py" and "--capture-date" not in argv:
+            argv = [*argv, "--capture-date", TODAY.isoformat()]
+        return _original_run_cli(script_name, argv, timeout_sec=timeout_sec)
+
+    cycle._run_cli = _run_cli_with_frozen_capture_clock
     return {
         "tmp": tmp_path,
         "root": root,
