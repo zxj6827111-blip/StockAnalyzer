@@ -1335,12 +1335,14 @@ class RuntimeWeek5Service:
         snapshot_current: bool,
         latest_trade_date: str,
         now: object,
+        require_current_trade_date: bool = False,
     ) -> dict[str, object]:
         return self._service._build_data_gate(  # noqa: SLF001
             snapshot_manifest=snapshot_manifest,
             snapshot_current=snapshot_current,
             latest_trade_date=latest_trade_date,
             now=now,
+            require_current_trade_date=require_current_trade_date,
         )
 
     def prefer_local_symbol_universe(self) -> bool:

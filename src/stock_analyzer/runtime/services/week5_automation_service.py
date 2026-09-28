@@ -1511,7 +1511,14 @@ class RuntimeWeek5AutomationService:
         blocking = [
             reason
             for reason in reasons
-            if reason.startswith(("provider_hard_degraded", "data_stale", "feature_snapshot"))
+            if reason.startswith(
+                (
+                    "provider_hard_degraded",
+                    "data_stale",
+                    "feature_snapshot",
+                    "trade_date_not_current",
+                )
+            )
         ]
         prefilter = _mapping(report.get("prefilter"))
         selection = _mapping(prefilter.get("universe_quality_selection"))
