@@ -7538,8 +7538,16 @@ class StockAnalyzerService:
         snapshot_current: bool,
         latest_trade_date: str,
         now: object | None = None,
+        require_current_trade_date: bool = False,
     ) -> dict[str, object]:
-        """Data trust gate: ok / watch_only / blocked with reasons."""
+        """Data trust gate: ok / watch_only / blocked with reasons.
+
+        ``require_current_trade_date=True``（生产实时扫描路径）时启用
+        **交易日历感知的 fail-closed**：``latest_trade_date`` 必须等于最近一个
+        已收盘的 A 股交易日，否则追加 ``trade_date_not_current`` 并判 blocked。
+        节假日期间会自动回退到节前最后交易日，不会把正常休市误判为断供；
+        历史回放路径必须传 False（历史快照的 trade_date 天然早于 now）。
+        """
         status = "ok"
         reasons: list[str] = []
         current = now or datetime.now(UTC)
@@ -7573,6 +7581,30 @@ class StockAnalyzerService:
                 if staleness > max_staleness:
                     reasons.append(f"data_stale:{staleness}d")
 
+        # 交易日历感知的新鲜度门（fail-closed）：默认只在生产实时路径启用
+        # （engine 传 require_current_trade_date=not historical），且保留配置
+        # 开关作为紧急回滚手段。9/24 型"扫描日数据没进来"此前最多 watch_only
+        # 继续出票；升级后直接 blocked，不再产出幽灵信号。
+        # 只在快照存在时执行：快照缺失属于 feature_snapshot_stale 场景，由
+        # recovery 直扫应急通道处理（那个通道依赖 gate reasons 纯 feature_snapshot
+        # 才会触发 emergency_direct_scan）；断供场景（快照在、日期旧）才是本门
+        # 的管辖范围。判定用 < 而不是 !=：数据日期 >= 最近交易日即放行（周末/
+        # 节假日里合成快照的 trade_date 是"今天"，晚于 expected 属正常，不得拦）。
+        gate_requires_current = require_current_trade_date and bool(
+            getattr(self._config.week5, "require_current_trade_date", True)
+        )
+        if gate_requires_current and snapshot_manifest is not None:
+            from stock_analyzer.market_calendar import latest_expected_trading_day
+
+            expected_day = latest_expected_trading_day(current)
+            parsed_current = _parse_iso_date(str(latest_trade_date).strip())
+            if parsed_current is None or parsed_current < expected_day:
+                reasons.append(
+                    "trade_date_not_current:"
+                    f"{str(latest_trade_date).strip() or 'missing'}"
+                    f":{expected_day.isoformat()}"
+                )
+
         snapshot_enabled = bool(self._config.week5.feature_snapshot_enabled)
         require_current = bool(self._config.week5.feature_snapshot_require_current)
         if snapshot_enabled and require_current:
@@ -7604,7 +7636,14 @@ class StockAnalyzerService:
                 reasons.append(f"data_quality_watch:{quality_score:.3f}")
 
         if any(
-            reason.startswith(("provider_", "feature_snapshot", "data_quality_blocked"))
+            reason.startswith(
+                (
+                    "provider_",
+                    "feature_snapshot",
+                    "data_quality_blocked",
+                    "trade_date_not_current",
+                )
+            )
             for reason in reasons
         ):
             status = "blocked"

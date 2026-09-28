@@ -568,6 +568,10 @@ class Week5Config(_StrictModel):
     data_quality_pass_threshold: float = 0.88
     data_quality_watch_threshold: float = 0.72
     max_data_staleness_days: int = 3
+    # 交易日历感知的新鲜度门（Phase 1.1 fail-closed）：生产实时路径要求行情
+    # 数据达到最近已收盘交易日，未达到则 data_gate 直接 blocked、不出信号。
+    # 历史回放路径不受此开关影响（engine 按 historical 标志跳过）。
+    require_current_trade_date: bool = True
     universe_quality_selector_enabled: bool = True
     universe_quality_target_size: int = 100
     universe_quality_min_history_days: int = 60

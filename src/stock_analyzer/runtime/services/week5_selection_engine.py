@@ -469,6 +469,7 @@ class Week5SelectionEngine:
             snapshot_manifest=snapshot_manifest,
             snapshot_current=snapshot_current,
             latest_trade_date=str(snapshot_manifest.trade_date) if snapshot_manifest else "",
+            require_current_trade_date=not self._historical,
         )
         gate_status = str(data_gate.get("status", "ok"))
         # S04：deep 目标默认取本次运行契约（夜扫/night-equivalent = 50），
@@ -700,6 +701,7 @@ class Week5SelectionEngine:
                 snapshot_manifest=snapshot_manifest,
                 snapshot_current=snapshot_current,
                 latest_trade_date=str(snapshot_manifest.trade_date) if snapshot_manifest else "",
+                require_current_trade_date=not self._historical,
             )
             gate_status = str(data_gate.get("status", "ok"))
 
@@ -1713,6 +1715,7 @@ class Week5SelectionEngine:
         snapshot_manifest: object,
         snapshot_current: bool,
         latest_trade_date: str,
+        require_current_trade_date: bool = False,
     ) -> dict[str, Any]:
         if not self._historical:
             return self._backend.build_data_gate(
@@ -1720,6 +1723,7 @@ class Week5SelectionEngine:
                 snapshot_current=snapshot_current,
                 latest_trade_date=latest_trade_date,
                 now=self._ctx.now,
+                require_current_trade_date=require_current_trade_date,
             )
         return build_historical_data_gate(
             provider=self._ctx.provider,
