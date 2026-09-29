@@ -2004,6 +2004,17 @@ class Week5SelectionEngine:
                         break
         except Exception:
             pass
+        # 合成 provider 环境（测试/回放）没有真实分钟数据可同步或校验；
+        # fresh_symbols 过滤与 fresh frame 重建在这里只依赖环境状态
+        # （同 worker 其它测试写入的共享 duckdb、网络、时序），会把
+        # snapshot_funnel 候选意外裁剪——PR #37 与 #94 的 CI flaky 同源
+        # （_is_synthetic 此前只旁路阻断检查，不旁路 fresh 链路）。
+        # 归零 required date 让同步、freshness、fresh frame 三段全部
+        # 短路，deep 直接消费快照 frame；生产 provider 恒非 synthetic。
+        _is_synthetic = _detect_synthetic_provider(backend)
+        if _is_synthetic:
+            sync_targets = []
+            required_intraday_date = None
         sync_report: dict[str, Any] = {}
         if (
             sync_targets
@@ -2141,7 +2152,6 @@ class Week5SelectionEngine:
             if freshness_report
             else len(eligible)
         )
-        _is_synthetic = _detect_synthetic_provider(backend)
         should_gate = bool(
             snapshot_mode
             and funnel_policy == "snapshot_funnel"
