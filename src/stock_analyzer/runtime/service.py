@@ -10405,6 +10405,7 @@ class StockAnalyzerService:
                 "requested_split_names": list(dataset.requested_split_names),
                 "row_count": dataset.row_count,
                 "split_counts": dict(dataset.split_counts),
+                "label_ledger": dict(dataset.label_ledger),
             },
             records,
             frame,
