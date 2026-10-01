@@ -778,6 +778,7 @@ class StockAnalyzerService:
             model_registry=self._model_registry,
             feature_schema_registry=self._feature_schema_registry,
             label_policy_registry=self._label_policy_registry,
+            labels_config=self._config.labels,
         )
 
     def _build_champion_shadow_report_builder(self) -> ChampionShadowReportBuilder:

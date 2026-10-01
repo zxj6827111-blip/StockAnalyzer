@@ -3,11 +3,16 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from stock_analyzer.config import load_config
 from stock_analyzer.evolution.shadow_dataset_builder import ShadowDatasetBuilder
 from stock_analyzer.learning.dataset_manifest import DatasetManifestBuilder
 from stock_analyzer.learning.feature_schema_registry import FeatureSchemaRegistry
-from stock_analyzer.learning.label_policy_registry import LabelPolicyRegistry
+from stock_analyzer.learning.label_policy_registry import (
+    LabelPolicyRegistry,
+    ReturnRankParams,
+)
 from stock_analyzer.learning.sample_schema import (
     BackfillFidelityTier,
     MaturityStatus,
@@ -239,6 +244,98 @@ def test_shadow_dataset_builder_supports_return_rank_v3_policy(tmp_path: Path) -
     assert ledger["labelled"] == float(len(expected_labels))
     assert ledger.get("dropped_middle_dropped", 0.0) > 0.0
     assert ledger["unaccounted"] == 0.0
+
+
+def test_shadow_dataset_builder_uses_config_fallback_for_legacy_v3_record(
+    tmp_path: Path,
+) -> None:
+    """生产 2026-09 现状：v3 契约记录登记早于 A3 参数持久化，记录本身不带
+    分位参数。builder 与训练入口同规：传入 labels_config 且能复现契约 hash
+    时受控采用 config 参数；不传 labels_config 则保持 fail-closed 拒绝。"""
+    (
+        config,
+        store,
+        feature_registry,
+        _label_registry_unused,
+        feature_record,
+        label_record,
+    ) = _build_return_rank_fixture(tmp_path)
+
+    legacy_record = label_record.model_copy(
+        update={
+            "top_quantile": None,
+            "bottom_quantile": None,
+            "drop_middle": None,
+            "min_cross_section": None,
+        }
+    )
+    assert legacy_record.return_rank_params() is None
+    legacy_registry = LabelPolicyRegistry(db_path=tmp_path / "label_policy_legacy.duckdb")
+    legacy_registry.register(legacy_record)
+
+    manifest = DatasetManifestBuilder(store=store).create_manifest(
+        feature_schema_id=feature_record.feature_schema_id,
+        feature_schema_hash=feature_record.feature_schema_hash,
+        label_policy_id=legacy_record.label_policy_id,
+        label_policy_hash=legacy_record.label_policy_hash,
+        fidelity_filter=[BackfillFidelityTier.GOLD],
+        calibration_ratio=config.training.calibration_ratio,
+        test_ratio=config.training.test_ratio,
+    )
+    trainer = ModelTrainer(
+        training=config.training,
+        labels=config.labels,
+        models=config.models,
+    )
+    result = trainer.train_on_dataset_manifest(
+        store=store,
+        dataset_manifest=manifest,
+        feature_schema_registry=feature_registry,
+        label_policy_registry=legacy_registry,
+    )
+    artifact_path = tmp_path / "shadow_dataset_artifact_v3_legacy.json"
+    result.artifact.save(artifact_path)
+    registry = ModelRegistry(db_path=tmp_path / "model_registry_legacy.duckdb")
+    record = registry.register_artifact(
+        artifact=result.artifact,
+        artifact_uri=str(artifact_path.resolve()),
+    )
+
+    builder_kwargs = dict(
+        store=store,
+        model_registry=registry,
+        feature_schema_registry=feature_registry,
+        label_policy_registry=legacy_registry,
+    )
+
+    # 与训练入口同规：labels_config 能复现契约 hash → 受控采用 config 参数。
+    builder = ShadowDatasetBuilder(**builder_kwargs, labels_config=config.labels)
+    dataset = builder.build_for_model(model_id=record.model_id)
+    manifest_items = store.list_manifest_items(manifest.dataset_manifest_id)
+    snapshot_ids = [item.snapshot_id for item in manifest_items]
+    expected_labels = _return_rank_labels_from_outcomes(
+        outcomes={
+            outcome.snapshot_id: outcome
+            for outcome in store.list_outcomes(snapshot_ids=snapshot_ids)
+        },
+        snapshots={
+            snapshot.snapshot_id: snapshot
+            for snapshot in store.list_snapshots(snapshot_ids=snapshot_ids)
+        },
+        params=ReturnRankParams(
+            top_quantile=float(config.labels.return_rank_top_quantile),
+            bottom_quantile=float(config.labels.return_rank_bottom_quantile),
+            drop_middle=bool(config.labels.return_rank_drop_middle),
+            min_cross_section=int(config.labels.return_rank_min_cross_section),
+        ),
+    )
+    assert dataset.row_count == len(expected_labels) > 0
+    assert {row.snapshot_id: row.label for row in dataset.rows} == expected_labels
+
+    # 不传 labels_config（如独立脚本误用）→ 维持 fail-closed，不静默派生。
+    strict_builder = ShadowDatasetBuilder(**builder_kwargs)
+    with pytest.raises(ValueError, match="re-register the contract"):
+        strict_builder.build_for_model(model_id=record.model_id)
 
 
 def _build_return_rank_fixture(

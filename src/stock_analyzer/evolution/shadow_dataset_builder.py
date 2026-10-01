@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from stock_analyzer.config import LabelsConfig
 from stock_analyzer.learning.feature_schema_registry import FeatureSchemaRegistry
 from stock_analyzer.learning.label_policy_registry import (
     LabelPolicyRecord,
@@ -176,11 +177,13 @@ class ShadowDatasetBuilder:
         model_registry: ModelRegistry,
         feature_schema_registry: FeatureSchemaRegistry | None = None,
         label_policy_registry: LabelPolicyRegistry | None = None,
+        labels_config: LabelsConfig | None = None,
     ) -> None:
         self._store = store
         self._model_registry = model_registry
         self._feature_schema_registry = feature_schema_registry
         self._label_policy_registry = label_policy_registry
+        self._labels_config = labels_config
 
     def build_for_model(
         self,
@@ -257,15 +260,18 @@ class ShadowDatasetBuilder:
         # schema v3（return_rank）的 label 是同日横截面分位，无法逐行从
         # outcome 度量派生（v1/v2 的 TP/SL 路径标签才可逐行算）：与训练入口
         # 共用 _return_rank_labels_with_ledger 整表现算，防两入口口径漂移。
-        # 参数只从 manifest 绑定的契约记录解析（不读当前 config）；契约缺
-        # 参数时 resolve_return_rank_params 显式拒绝（要求重新登记契约）。
+        # 参数解析与训练入口同规（service.py trainer 同款）：记录已持久化
+        # 则直接用；旧 v3 记录缺参数时仅当 labels_config 能复现契约 hash
+        # 才受控采用，否则 resolve_return_rank_params 显式拒绝。
         v3_labels: dict[str, float] | None = None
         label_ledger: dict[str, float] = {}
         if str(label_policy.schema_version).strip() == "3":
             v3_labels, label_ledger = _return_rank_labels_with_ledger(
                 outcomes=outcomes,
                 snapshots=snapshots,
-                params=resolve_return_rank_params(label_policy),
+                params=resolve_return_rank_params(
+                    label_policy, config_labels=self._labels_config
+                ),
             )
 
         rows: list[ShadowDatasetRow] = []
