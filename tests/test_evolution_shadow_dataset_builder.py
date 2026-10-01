@@ -16,7 +16,7 @@ from stock_analyzer.learning.sample_schema import (
 )
 from stock_analyzer.learning.sample_store import SampleStore
 from stock_analyzer.models.registry import ModelRegistry
-from stock_analyzer.models.trainer import ModelTrainer
+from stock_analyzer.models.trainer import ModelTrainer, _return_rank_labels_from_outcomes
 
 
 def test_shadow_dataset_builder_builds_scored_test_split_rows(tmp_path: Path) -> None:
@@ -155,5 +155,158 @@ def _build_learning_protocol_fixture(
         )
         store.write_snapshot(snapshot)
         store.upsert_outcome(outcome)
+
+    return config, store, feature_registry, label_registry, feature_record, label_record
+
+
+def test_shadow_dataset_builder_supports_return_rank_v3_policy(tmp_path: Path) -> None:
+    """schema v3（return_rank）契约必须走横截面批量标签，而不是逐行
+    _label_from_outcome（2026-09-30 生产 factor_ic_decay_report 连败第二根因）。
+    标签集合必须与共享实现 _return_rank_labels_from_outcomes 逐行一致。"""
+    (
+        config,
+        store,
+        feature_registry,
+        label_registry,
+        feature_record,
+        label_record,
+    ) = _build_return_rank_fixture(tmp_path)
+
+    manifest = DatasetManifestBuilder(store=store).create_manifest(
+        feature_schema_id=feature_record.feature_schema_id,
+        feature_schema_hash=feature_record.feature_schema_hash,
+        label_policy_id=label_record.label_policy_id,
+        label_policy_hash=label_record.label_policy_hash,
+        fidelity_filter=[BackfillFidelityTier.GOLD],
+        calibration_ratio=config.training.calibration_ratio,
+        test_ratio=config.training.test_ratio,
+    )
+    trainer = ModelTrainer(
+        training=config.training,
+        labels=config.labels,
+        models=config.models,
+    )
+    result = trainer.train_on_dataset_manifest(
+        store=store,
+        dataset_manifest=manifest,
+        feature_schema_registry=feature_registry,
+        label_policy_registry=label_registry,
+    )
+    artifact_path = tmp_path / "shadow_dataset_artifact_v3.json"
+    result.artifact.save(artifact_path)
+    registry = ModelRegistry(db_path=tmp_path / "model_registry.duckdb")
+    record = registry.register_artifact(
+        artifact=result.artifact,
+        artifact_uri=str(artifact_path.resolve()),
+    )
+    builder = ShadowDatasetBuilder(
+        store=store,
+        model_registry=registry,
+        feature_schema_registry=feature_registry,
+        label_policy_registry=label_registry,
+    )
+
+    dataset = builder.build_for_model(model_id=record.model_id)
+
+    manifest_items = store.list_manifest_items(manifest.dataset_manifest_id)
+    snapshot_ids = [item.snapshot_id for item in manifest_items]
+    return_rank_params = label_record.return_rank_params()
+    assert return_rank_params is not None
+    expected_labels = _return_rank_labels_from_outcomes(
+        outcomes={
+            outcome.snapshot_id: outcome
+            for outcome in store.list_outcomes(snapshot_ids=snapshot_ids)
+        },
+        snapshots={
+            snapshot.snapshot_id: snapshot
+            for snapshot in store.list_snapshots(snapshot_ids=snapshot_ids)
+        },
+        params=return_rank_params,
+    )
+
+    assert str(label_record.schema_version) == "3"
+    assert dataset.label_policy_id == label_record.label_policy_id
+    assert len(manifest_items) == 60
+    assert dataset.row_count == len(dataset.rows) == len(expected_labels)
+    # drop_middle 契约必须真的剔掉中间档，不是全体放行的假绿。
+    assert 0 < dataset.row_count < len(manifest_items)
+    assert {row.snapshot_id for row in dataset.rows} == set(expected_labels)
+    for row in dataset.rows:
+        assert row.label == expected_labels[row.snapshot_id]
+        assert row.label in (0.0, 1.0)
+    ledger = dataset.label_ledger
+    assert ledger["entered"] == float(len(manifest_items))
+    assert ledger["labelled"] == float(len(expected_labels))
+    assert ledger.get("dropped_middle_dropped", 0.0) > 0.0
+    assert ledger["unaccounted"] == 0.0
+
+
+def _build_return_rank_fixture(
+    tmp_path: Path,
+) -> tuple[
+    object,
+    SampleStore,
+    FeatureSchemaRegistry,
+    LabelPolicyRegistry,
+    object,
+    object,
+]:
+    root = Path(__file__).resolve().parents[1]
+    config = load_config(root / "config" / "default.yaml")
+    config.training.min_samples = 20
+    config.training.validation_ratio = 0.2
+    config.training.calibration_ratio = 0.1
+    config.training.test_ratio = 0.1
+    config.labels.basis = "return_rank"
+    config.labels.return_rank_top_quantile = 0.4
+    config.labels.return_rank_bottom_quantile = 0.4
+    config.labels.return_rank_drop_middle = True
+    config.labels.return_rank_min_cross_section = 5
+
+    store = SampleStore(db_path=tmp_path / "sample_store.duckdb")
+    feature_registry = FeatureSchemaRegistry(db_path=tmp_path / "feature_schema.duckdb")
+    label_registry = LabelPolicyRegistry(db_path=tmp_path / "label_policy.duckdb")
+    feature_record = feature_registry.register_feature_names(
+        feature_names=["feature_b", "feature_a"],
+        feature_schema_id="feature_schema_v1_111827cbef02",
+        feature_engineer_version="test",
+        code_version="git:test",
+    )
+    label_record = label_registry.register_from_config(config.labels)
+    assert str(label_record.schema_version) == "3"
+
+    returns_pattern = [0.20, 0.16, 0.12, 0.08, 0.04, 0.00, -0.04, -0.08, -0.12, -0.16]
+    base_time = datetime(2026, 1, 1, 14, 30, tzinfo=UTC)
+    for day in range(6):
+        decision_time = base_time + timedelta(days=day)
+        for index, realized_return in enumerate(returns_pattern):
+            snapshot = SignalSnapshot(
+                snapshot_id=f"snap-{day:02d}-{index:02d}",
+                code_version="git:test",
+                symbol=f"600{index:03d}.SH",
+                strategy="trend",
+                decision_time=decision_time,
+                feature_vector={
+                    "feature_b": float(index % 7),
+                    "feature_a": float((index % 3) / 3.0),
+                },
+                feature_schema_id=feature_record.feature_schema_id,
+                feature_schema_hash=feature_record.feature_schema_hash,
+                runtime_config_hash="runtime_hash_1",
+                label_policy_id=label_record.label_policy_id,
+                label_policy_hash=label_record.label_policy_hash,
+            )
+            outcome = OutcomeRecord(
+                snapshot_id=snapshot.snapshot_id,
+                maturity_status=MaturityStatus.RECONCILED,
+                label_mature_time=decision_time + timedelta(days=7),
+                realized_return=realized_return,
+                max_favorable_excursion=max(realized_return, 0.0),
+                max_adverse_excursion=min(realized_return, 0.0),
+                backfill_fidelity_tier=BackfillFidelityTier.GOLD,
+                backfill_source="runtime_observed",
+            )
+            store.write_snapshot(snapshot)
+            store.upsert_outcome(outcome)
 
     return config, store, feature_registry, label_registry, feature_record, label_record

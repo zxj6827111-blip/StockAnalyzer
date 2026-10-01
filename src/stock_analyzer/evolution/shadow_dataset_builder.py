@@ -12,13 +12,17 @@ from pathlib import Path
 import pandas as pd
 
 from stock_analyzer.learning.feature_schema_registry import FeatureSchemaRegistry
-from stock_analyzer.learning.label_policy_registry import LabelPolicyRecord, LabelPolicyRegistry
+from stock_analyzer.learning.label_policy_registry import (
+    LabelPolicyRecord,
+    LabelPolicyRegistry,
+    resolve_return_rank_params,
+)
 from stock_analyzer.learning.sample_schema import DatasetManifest, DatasetSplitPlanEntry
 from stock_analyzer.learning.sample_store import SampleStore
 from stock_analyzer.models.artifact import ModelArtifact
 from stock_analyzer.models.predictor import SignalPredictor
 from stock_analyzer.models.registry import ModelRegistry, ModelRegistryRecord
-from stock_analyzer.models.trainer import _label_from_outcome
+from stock_analyzer.models.trainer import _label_from_outcome, _return_rank_labels_with_ledger
 
 
 @dataclass(slots=True)
@@ -124,6 +128,7 @@ class ShadowDataset:
     split_counts: dict[str, int]
     predictor_mode: dict[str, object]
     manifest_split_plan: list[DatasetSplitPlanEntry] = field(default_factory=list)
+    label_ledger: dict[str, float] = field(default_factory=dict)
     rows: list[ShadowDatasetRow] = field(default_factory=list)
 
     def to_dict(
@@ -153,6 +158,7 @@ class ShadowDataset:
             "manifest_split_plan": [
                 entry.model_dump(mode="json") for entry in self.manifest_split_plan
             ],
+            "label_ledger": dict(self.label_ledger),
             "preview": [row.preview_dict() for row in self.rows[: max(1, int(preview_limit))]],
         }
         if include_rows:
@@ -248,6 +254,20 @@ class ShadowDatasetBuilder:
             for outcome in self._store.list_outcomes(snapshot_ids=snapshot_ids)
         }
 
+        # schema v3（return_rank）的 label 是同日横截面分位，无法逐行从
+        # outcome 度量派生（v1/v2 的 TP/SL 路径标签才可逐行算）：与训练入口
+        # 共用 _return_rank_labels_with_ledger 整表现算，防两入口口径漂移。
+        # 参数只从 manifest 绑定的契约记录解析（不读当前 config）；契约缺
+        # 参数时 resolve_return_rank_params 显式拒绝（要求重新登记契约）。
+        v3_labels: dict[str, float] | None = None
+        label_ledger: dict[str, float] = {}
+        if str(label_policy.schema_version).strip() == "3":
+            v3_labels, label_ledger = _return_rank_labels_with_ledger(
+                outcomes=outcomes,
+                snapshots=snapshots,
+                params=resolve_return_rank_params(label_policy),
+            )
+
         rows: list[ShadowDatasetRow] = []
         split_counts: dict[str, int] = {}
         for item in manifest_items:
@@ -258,12 +278,20 @@ class ShadowDatasetBuilder:
             if outcome is None:
                 raise ValueError(f"outcome missing for manifest item: {item.snapshot_id}")
 
-            label_value = _label_from_outcome(outcome=outcome, policy=label_policy)
-            if label_value is None:
-                raise ValueError(
-                    "manifest row is not label-resolvable: "
-                    f"{manifest.dataset_manifest_id}:{item.snapshot_id}"
-                )
+            if v3_labels is not None:
+                # v3：分位契约剔除的行（中间段 / 截面太薄 / 未成熟）不进样本，
+                # 语义与训练 trainer 行循环一致。
+                label_value = v3_labels.get(item.snapshot_id)
+                if label_value is None:
+                    continue
+            else:
+                # v1/v2：标签逐行可算而返回 None = 该行标签结构性不可用。
+                label_value = _label_from_outcome(outcome=outcome, policy=label_policy)
+                if label_value is None:
+                    raise ValueError(
+                        "manifest row is not label-resolvable: "
+                        f"{manifest.dataset_manifest_id}:{item.snapshot_id}"
+                    )
 
             projected_features = {
                 column: float(snapshot.feature_vector.get(column, 0.0))
@@ -312,6 +340,15 @@ class ShadowDatasetBuilder:
             rows.append(row)
             split_counts[item.split_name] = split_counts.get(item.split_name, 0) + 1
 
+        # 互斥对账（entered = labelled + dropped_total），与训练入口同一记账规则。
+        label_ledger.setdefault("entered", float(len(manifest_items)))
+        label_ledger["labelled"] = float(len(rows))
+        label_ledger["dropped_total"] = sum(
+            value for key, value in label_ledger.items() if key.startswith("dropped_")
+        )
+        label_ledger["unaccounted"] = (
+            label_ledger["entered"] - label_ledger["labelled"] - label_ledger["dropped_total"]
+        )
         shadow_dataset_id = _build_shadow_dataset_id(
             model_id=registry_record.model_id,
             dataset_manifest_id=manifest.dataset_manifest_id,
@@ -342,6 +379,7 @@ class ShadowDatasetBuilder:
             split_counts=split_counts,
             predictor_mode=predictor_mode,
             manifest_split_plan=list(manifest.split_plan),
+            label_ledger=label_ledger,
             rows=rows,
         )
 
