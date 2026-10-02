@@ -1262,6 +1262,13 @@ class TrainingConfig(_StrictModel):
     # 晋级硬门（P1-b 补救）：完整 test split 的去重交易日下限。
     min_test_trade_dates: int = 20
     min_hard_class_samples: int = 30
+    # 校准窗方向门：isotonic 单调保序，在方向为反的校准窗上唯一诚实的解是常数，
+    # 故"输出塌缩"是方向事实而不是校准器缺陷（9/13 校准窗 AUC≈0.44 即此）。
+    # 只作用于 manifest 训练入口（能产出可注册/可热载工件的路径）；研究侧
+    # temporal 路径继续原样产出反向折线，那里看到反向模型正是诊断手段。
+    calibration_direction_gate_enabled: bool = True
+    # 硬样本低于该下限即不断言方向（单一类别同理），避免玩具数据误伤。
+    calibration_direction_gate_min_hard_samples: int = 50
     # manifest 生成期硬门：test split 必须覆盖足够的时间窗口与 symbol-day 样本。
     min_test_split_window_days: int = 20
     min_test_split_unique_symbol_dates: int = 30

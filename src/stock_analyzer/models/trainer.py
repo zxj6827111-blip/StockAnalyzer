@@ -571,6 +571,31 @@ class ModelTrainer:
 
         lgbm_calibration_raw = lgbm.predict_proba(x_calibration)
         xgb_calibration_raw = xgb.predict_proba(x_calibration)
+        direction_gate_min_hard_samples = max(
+            1, int(self._training.calibration_direction_gate_min_hard_samples)
+        )
+        calibration_direction_metrics, calibration_direction_violations = (
+            _calibration_direction_report(
+                y_true=y_calibration,
+                raw_scores={"lgbm": lgbm_calibration_raw, "xgb": xgb_calibration_raw},
+                min_hard_samples=direction_gate_min_hard_samples,
+            )
+        )
+        if (
+            calibration_direction_violations
+            and split_source == "manifest"
+            and bool(self._training.calibration_direction_gate_enabled)
+        ):
+            # 只卡 manifest 入口：这条路径的工件会落盘、进 registry、被热载。反向
+            # 校准窗上保序回归只能给出常数，放过去等于让"修好的校准器把反向模型
+            # 打得更整齐"（9/13 的挑战者就是这么走完全部流程的）。
+            raise ValueError(
+                "calibration window direction gate failed: "
+                f"{','.join(calibration_direction_violations)}; "
+                f"calibration_hard_samples="
+                f"{int(calibration_direction_metrics['calibration_hard_samples'])}; "
+                f"min_hard_samples={direction_gate_min_hard_samples}"
+            )
         lgbm_calibrator = IsotonicCalibrator()
         xgb_calibrator = IsotonicCalibrator()
         lgbm_calibrator.fit(lgbm_calibration_raw, y_calibration)
@@ -614,6 +639,7 @@ class ModelTrainer:
         metrics["time_gate_kept_rows"] = _as_float(resolved_time_gate.get("kept_rows"))
         metrics["time_gate_dropped_rows"] = _as_float(resolved_time_gate.get("dropped_rows"))
         metrics["calibration_samples"] = float(len(x_calibration))
+        metrics.update(calibration_direction_metrics)
         metrics["test_samples"] = float(len(x_test))
         metrics["embargo_days"] = float(embargo_trading_days)
         metrics["embargo_rows"] = float(samples_embargo)
@@ -1121,6 +1147,38 @@ def _evaluate_metrics(
             for metric_name, value in health.items():
                 metrics[f"{metric_name}_{scale_name}_{output_name}"] = value
     return metrics
+
+
+def _calibration_direction_report(
+    *,
+    y_true: FloatArray,
+    raw_scores: dict[str, FloatArray],
+    min_hard_samples: int,
+) -> tuple[dict[str, float], list[str]]:
+    """校准窗方向事实：硬标签子集上各基模型 **raw**（未经校准）AUC。
+
+    返回 ``(指标, 违例)``。方向不可判定（硬样本不足下限，或只有一种类别）时
+    只记录指标、不报违例——``_binary_auc`` 在单类别时返回 0.5，那个 0.5 是
+    "无法评估"而不是"反向"，不能拿来断方向。
+    """
+
+    hard_mask = (y_true == 0.0) | (y_true == 1.0)
+    hard_samples = int(np.count_nonzero(hard_mask))
+    y_hard = y_true[hard_mask].astype(float)
+    hard_positives = int(np.count_nonzero(y_hard >= 0.5))
+    assessable = (
+        hard_samples >= max(1, int(min_hard_samples))
+        and hard_positives > 0
+        and hard_samples - hard_positives > 0
+    )
+    metrics: dict[str, float] = {"calibration_hard_samples": float(hard_samples)}
+    violations: list[str] = []
+    for output_name, scores in raw_scores.items():
+        auc = _binary_auc(y_hard, scores[hard_mask].astype(float)) if hard_samples else 0.5
+        metrics[f"calibration_auc_hard_{output_name}"] = round(auc, 6)
+        if assessable and auc <= 0.5:
+            violations.append(f"{output_name}_calibration_auc_reverse:{round(auc, 6)}")
+    return metrics, violations
 
 
 def _binary_auc(y_true: FloatArray, probabilities: FloatArray) -> float:

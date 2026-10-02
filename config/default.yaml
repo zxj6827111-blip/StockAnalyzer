@@ -813,6 +813,12 @@ training:
   # 晋级硬门：完整 test split 去重交易日下限（P1-b）
   min_test_trade_dates: 20
   min_hard_class_samples: 30
+  # 校准窗方向门：isotonic 单调保序，反向校准窗上唯一诚实的解是常数，故"输出塌缩"
+  # 是方向事实而不是校准器缺陷（9/13 校准窗 AUC≈0.44 即此）。只卡 manifest 训练入口
+  # （工件会落盘进 registry / 被热载）；研究侧 temporal 路径继续原样产出反向折线。
+  calibration_direction_gate_enabled: true
+  # 校准窗硬标签样本低于该下限即不断言方向（单一类别同理），避免玩具数据误伤。
+  calibration_direction_gate_min_hard_samples: 50
   # manifest 生成期硬门：test split 的最小日历窗口与 symbol-day 覆盖
   min_test_split_window_days: 20
   min_test_split_unique_symbol_dates: 30
