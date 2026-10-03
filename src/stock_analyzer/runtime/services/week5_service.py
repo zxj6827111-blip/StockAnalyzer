@@ -3359,13 +3359,22 @@ def _build_fresh_deep_frame(
     one feature row.  The resulting DataFrame is used for deep ranking instead
     of the stale snapshot_frame.
 
-    Returns ``{"frame": DataFrame, "failed": [symbols]}``.
+    Returns ``{"frame": DataFrame, "failed": [symbols], "market_index_attached": bool}``.
 
     Light stage remains daily-only; this helper is deep-only.
     """
     from stock_analyzer.feature.engineer import FeatureEngineer
+    from stock_analyzer.feature.snapshot import _fetch_snapshot_benchmark_frame
 
     engineer = FeatureEngineer()
+    # 市场相对族（excess_ret/rs_ma/beta）的基准指数输入：v1 时代 deep frame
+    # 从未传入 market_index，该族在扫描侧恒为 fillna(0) 常数（D1 对拍死值
+    # 根因之一）。指数取数失败不阻断 deep frame 构建，只以
+    # market_index_attached=False 显式暴露，保持与快照链同一口径。
+    benchmark_frame = _fetch_snapshot_benchmark_frame(provider, lookback_days=lookback_days)
+    market_index_attached = not benchmark_frame.empty
+    if market_index_attached:
+        engineer.attach_market_index(benchmark_frame)
     rows: list[pd.DataFrame] = []
     failed: list[str] = []
     for symbol in symbols:
@@ -3416,7 +3425,11 @@ def _build_fresh_deep_frame(
                 payload[str(k)] = v
         rows.append(pd.DataFrame([payload]))
     frame = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
-    return {"frame": frame, "failed": failed}
+    return {
+        "frame": frame,
+        "failed": failed,
+        "market_index_attached": market_index_attached,
+    }
 
 
 def _artifact_inference_blocked_detail(

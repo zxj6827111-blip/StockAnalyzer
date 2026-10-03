@@ -39,7 +39,8 @@ import numpy as np
 import pandas as pd
 
 from stock_analyzer.config import LimitRuleConfig, StockAnalyzerConfig
-from stock_analyzer.feature.engineer import FeatureEngineer
+from stock_analyzer.feature.engineer import FEATURE_COMPUTE_VERSION, FeatureEngineer
+from stock_analyzer.feature.market_context import fetch_market_benchmark_bars
 from stock_analyzer.risk.board_risk import consecutive_limit_up_count
 
 # v2: 新增 P1 过热风险 raw 列（ma5/ma10/atr14/bias_ma5/bias_ma10/ret5/
@@ -400,6 +401,20 @@ def build_feature_snapshot(
     signature = compute_source_signature(config, provider_status)
     factor_hash = _factor_archive_hash(config)
 
+    # 市场相对族特征输入：全量/增量构建共用一次基准指数取数，挂在 engineer
+    # 实例上随批次进进程池（worker 载荷签名不变）。取不到指数时保持 v1 行为
+    # （该族 fillna(0)），并以 market_index_attached 显式暴露而非静默。
+    market_relative = getattr(config, "market_relative_feature", None)
+    benchmark_frame = _fetch_snapshot_benchmark_frame(
+        provider,
+        lookback_days=lookback,
+        benchmark_symbol=str(getattr(market_relative, "benchmark_symbol", "000300") or "000300"),
+        fallback_symbol=str(getattr(market_relative, "fallback_symbol", "399001") or "399001"),
+    )
+    market_index_attached = not benchmark_frame.empty
+    if market_index_attached:
+        engineer.attach_market_index(benchmark_frame)
+
     workers = max(1, min(8, int(max_workers)))
     chunk_size = max(1, int(batch_size))
     _write_progress_mark(
@@ -580,6 +595,7 @@ def build_feature_snapshot(
         "requested_symbol_count": len(normalized),
         "published_symbol_count": int(len(frame)),
         "root": str(root),
+        "market_index_attached": market_index_attached,
         "stages": {
             "snapshot_fetch": {
                 "duration_ms": fetch_ms,
@@ -1149,6 +1165,7 @@ def _incremental_snapshot_build(
             "scope": scope,
             "universe_hash": universe_hash,
             "root": str(root),
+            "market_index_attached": getattr(engineer, "_market_index_context", None) is not None,
         }
 
     if not dirty:
@@ -1444,6 +1461,7 @@ def _incremental_snapshot_build(
         "requested_symbol_count": len(normalized_symbols),
         "published_symbol_count": int(len(merged)),
         "root": str(root),
+        "market_index_attached": getattr(engineer, "_market_index_context", None) is not None,
         "stages": {
             "snapshot_fetch": {
                 "duration_ms": probe_ms,
@@ -1857,7 +1875,9 @@ def _feature_schema_hash(engineer: FeatureEngineer) -> str:
 
     Probes the real feature pipeline with a synthetic bar frame so any change
     to the feature column definitions or compute logic changes the hash and
-    invalidates existing snapshots.
+    invalidates existing snapshots.  列集合不感知"同列不同值"的计算语义变化，
+    故额外混入 ``FEATURE_COMPUTE_VERSION``：值级修复（如市场相对族接入基准
+    指数）同样使既有快照失效、强制全量重建，避免新旧值混存同一快照店。
     """
     try:
         probe = _dummy_bars()
@@ -1867,8 +1887,58 @@ def _feature_schema_hash(engineer: FeatureEngineer) -> str:
             columns = [str(column) for column in features.columns]
     except Exception:
         columns = []
-    payload = f"{type(engineer).__name__}:{columns}"
+    payload = f"{type(engineer).__name__}:v{FEATURE_COMPUTE_VERSION}:{columns}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+class _IndexFeedOnly:
+    """只暴露专用指数接口的 provider 包装。
+
+    ``fetch_market_benchmark_bars`` 在 ``fetch_index_daily`` 不可用时会退回
+    用 ``fetch_daily_bars('000300')`` 兜底——那是股票日线接口，把股票库当
+    指数源属于口径污染；这里包一层让兜底路径必然失败（由调用方捕获后按
+    "无指数上下文"处理），保证快照的市场相对族只来自真实指数 feed。
+    """
+
+    def __init__(self, provider: object) -> None:
+        self._provider = provider
+
+    def fetch_index_daily(self, **kwargs: Any) -> pd.DataFrame:
+        fn = getattr(self._provider, "fetch_index_daily", None)
+        if not callable(fn):
+            raise RuntimeError("no_index_feed")
+        frame = fn(**kwargs)
+        if not isinstance(frame, pd.DataFrame):
+            raise RuntimeError("index_feed_not_dataframe")
+        return frame
+
+
+def _fetch_snapshot_benchmark_frame(
+    provider: object,
+    *,
+    lookback_days: int,
+    benchmark_symbol: str = "000300",
+    fallback_symbol: str = "399001",
+) -> pd.DataFrame:
+    """为快照构建拉取基准指数日线（市场相对族的特征输入）。
+
+    v1 时代快照链从未把 market_index 传给 ``FeatureEngineer.transform``，
+    excess_ret/rs_ma/beta 一族在生产快照里恒为 0。这里失败一律返回空帧
+    （build 继续走旧行为，只在结果里以 ``market_index_attached`` 显式暴露），
+    不让指数取数故障放大成整个快照构建失败。
+    """
+    try:
+        frame = fetch_market_benchmark_bars(
+            _IndexFeedOnly(provider),  # type: ignore[arg-type]
+            lookback_days=max(120, int(lookback_days) + 5),
+            primary_symbol=str(benchmark_symbol).strip() or "000300",
+            fallback_symbol=str(fallback_symbol).strip() or "399001",
+        )
+    except Exception:
+        return pd.DataFrame()
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return pd.DataFrame()
+    return frame
 
 
 def _dummy_bars() -> pd.DataFrame:
