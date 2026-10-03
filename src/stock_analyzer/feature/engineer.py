@@ -5,6 +5,14 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+# 特征计算语义版本：schema hash 只覆盖列名集合，无法感知"同列不同值"的
+# 计算修复；凡改变特征取值语义（不增删列）的修复必须递增本版本号，让
+# 快照/数据集身份失效，旧时代产物不再被判兼容。v2（2026-10-03）：市场
+# 相对族（excess_ret/rs_ma/beta 等）支持经 attach_market_index 注入基准
+# 指数上下文；v1 时代生产快照链从未传入 market_index，该族在生产侧恒为
+# fillna(0) 的常数 0，与 PIT 面板不可比（D1 对拍 33 列死值根因之一）。
+FEATURE_COMPUTE_VERSION = 2
+
 
 class FeatureEngineer:
     """Build online-usable features from historical bars."""
@@ -19,6 +27,17 @@ class FeatureEngineer:
         "float_market_cap",
     }
 
+    def __init__(self) -> None:
+        # 批量构建路径（快照全量/增量、deep frame）共享同一 engineer 实例并
+        # 经进程池 pickle：把基准指数帧挂在实例上即可让所有 worker 复用，
+        # 不必改动 (symbol, bars, engineer) 的 worker 载荷签名（测试依赖
+        # monkeypatch 这些 worker，扩签名会连带破坏它们）。
+        self._market_index_context: pd.DataFrame | None = None
+
+    def attach_market_index(self, frame: pd.DataFrame | None) -> None:
+        """为后续 transform 调用注入默认基准指数帧（显式实参优先）。"""
+        self._market_index_context = frame
+
     def transform(
         self,
         bars: pd.DataFrame,
@@ -26,6 +45,8 @@ class FeatureEngineer:
         intraday_5m: pd.DataFrame | None = None,
         market_index: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
+        if market_index is None:
+            market_index = self._market_index_context
         missing = self.required_columns - set(bars.columns)
         if missing:
             raise ValueError(f"missing required columns: {sorted(missing)}")
