@@ -254,3 +254,47 @@ def test_snapshot_benchmark_frame_accepts_overlay_provider() -> None:
     )
     frame = _fetch_snapshot_benchmark_frame(overlay, lookback_days=250)
     assert not frame.empty
+
+
+class _NoFeedWrapper:
+    """无任何指数接口的包装层（模拟 Resilient/Hybrid 形状：inner 属性）。"""
+
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+
+    def fetch_daily_bars(self, *, symbol: str, lookback_days: int) -> pd.DataFrame:
+        return _bars(periods=60)
+
+
+def test_snapshot_benchmark_frame_unwraps_provider_chain() -> None:
+    """生产链形状：接口只在内层 overlay，解包必须穿过多层包装。
+
+    v2/v3/v4 三次重建全零的根因：_IndexFeedOnly 只查顶层。本用例钉死
+    "包装链上任何深度的专用指数接口都可达"。
+    """
+    overlay = _overlay_with_warehouses(
+        enrichment=_FakeWarehouse(rows=150, tag="delta"),
+        delta=_FakeWarehouse(rows=150, tag="delta"),
+    )
+    chained = _NoFeedWrapper(inner=_NoFeedWrapper(inner=overlay))
+    frame = _fetch_snapshot_benchmark_frame(chained, lookback_days=250)
+    assert not frame.empty
+
+    # 整链无接口 → 空帧回落（不触达股票日线兜底）。
+    starved = _fetch_snapshot_benchmark_frame(
+        _NoFeedWrapper(inner=_NoFeedWrapper(inner=None)), lookback_days=250
+    )
+    assert isinstance(starved, pd.DataFrame) and starved.empty
+
+
+def test_snapshot_benchmark_frame_unwraps_real_cached_provider() -> None:
+    """真实 CachedProvider（slots dataclass）在内层有接口时必须可达。"""
+    from stock_analyzer.data.cached_provider import CachedProvider
+
+    overlay = _overlay_with_warehouses(
+        enrichment=_FakeWarehouse(rows=150, tag="delta"),
+        delta=_FakeWarehouse(rows=150, tag="delta"),
+    )
+    cached = CachedProvider(inner=overlay, cache=object(), ttl_sec=60)  # type: ignore[arg-type]
+    frame = _fetch_snapshot_benchmark_frame(cached, lookback_days=250)
+    assert not frame.empty

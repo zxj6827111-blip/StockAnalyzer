@@ -1891,6 +1891,31 @@ def _feature_schema_hash(engineer: FeatureEngineer) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
+_WRAPPER_INNER_ATTRS = ("inner", "primary", "base_provider", "provider", "backup")
+
+
+def _index_feed_node(node: object, depth: int = 0) -> Any:
+    """沿 provider 包装链解包，找到第一个真正暴露 fetch_index_daily 的节点。
+
+    生产链是 CachedProvider(ResilientProvider(HybridRuntimeProvider(overlay)))，
+    接口只存在于最内层 overlay——只查顶层会永远 miss（v2/v3/v4 三次重建
+    全零的根因）。找不到返回 None，由调用方按"无指数上下文"降级。
+    返回类型为 Any：接口由运行时 callable/isinstance 守卫，不依赖静态类型。
+    """
+    if node is None or depth > 6:
+        return None
+    if callable(getattr(node, "fetch_index_daily", None)):
+        return node
+    for attr in _WRAPPER_INNER_ATTRS:
+        child = getattr(node, attr, None)
+        if child is None or child is node:
+            continue
+        found = _index_feed_node(child, depth + 1)
+        if found is not None:
+            return found
+    return None
+
+
 class _IndexFeedOnly:
     """只暴露专用指数接口的 provider 包装。
 
@@ -1898,16 +1923,17 @@ class _IndexFeedOnly:
     用 ``fetch_daily_bars('000300')`` 兜底——那是股票日线接口，把股票库当
     指数源属于口径污染；这里包一层让兜底路径必然失败（由调用方捕获后按
     "无指数上下文"处理），保证快照的市场相对族只来自真实指数 feed。
+    解包只沿包装属性找专用接口，绝不触达 ``fetch_daily_bars`` 等股票接口。
     """
 
     def __init__(self, provider: object) -> None:
         self._provider = provider
 
     def fetch_index_daily(self, **kwargs: Any) -> pd.DataFrame:
-        fn = getattr(self._provider, "fetch_index_daily", None)
-        if not callable(fn):
+        node = _index_feed_node(self._provider)
+        if node is None:
             raise RuntimeError("no_index_feed")
-        frame = fn(**kwargs)
+        frame = node.fetch_index_daily(**kwargs)
         if not isinstance(frame, pd.DataFrame):
             raise RuntimeError("index_feed_not_dataframe")
         return frame
