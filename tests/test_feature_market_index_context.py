@@ -184,3 +184,67 @@ def test_build_fresh_deep_frame_attaches_market_index() -> None:
     bare_frame = bare["frame"]
     assert isinstance(bare_frame, pd.DataFrame) and len(bare_frame) == 1
     assert float(bare_frame["excess_ret_5"].iloc[0]) == 0.0
+
+
+class _FakeWarehouse:
+    """最小 MarketWarehouse 替身：只带 fetch_index_daily。"""
+
+    def __init__(self, *, rows: int | None, error: bool = False) -> None:
+        self._rows = rows
+        self._error = error
+
+    def fetch_index_daily(self, *, index_code: str) -> pd.DataFrame:
+        if self._error:
+            raise RuntimeError("warehouse unavailable")
+        if self._rows is None:
+            return pd.DataFrame()
+        return _benchmark(periods=self._rows, slope=0.06)
+
+
+def _overlay_with_warehouses(
+    enrichment: _FakeWarehouse | None, delta: _FakeWarehouse | None
+) -> Any:
+    """子类覆写两个惰性仓库解析器（slots 类不可打实例属性补丁）。"""
+    from stock_analyzer.data.vendor_zip_overlay import VendorZipOverlayProvider
+
+    class _Stub(VendorZipOverlayProvider):
+        def __post_init__(self) -> None:
+            self._stub_enrichment = enrichment
+            self._stub_delta = delta
+
+        def _market_enrichment(self) -> Any:
+            return self._stub_enrichment
+
+        def _delta_warehouse(self) -> Any:
+            return self._stub_delta
+
+    return _Stub(data_root="stub", index_path="stub", delta_db_path="stub")
+
+
+def test_vendor_overlay_fetch_index_daily_prefers_enrichment() -> None:
+    overlay = _overlay_with_warehouses(
+        enrichment=_FakeWarehouse(rows=125), delta=_FakeWarehouse(rows=125)
+    )
+    frame = overlay.fetch_index_daily(index_code="000300.SH")
+    assert not frame.empty
+
+
+def test_vendor_overlay_fetch_index_daily_fallback_and_empty() -> None:
+    # enrichment 缺库（懒解析返回 None）→ delta 兜底。
+    fallback = _overlay_with_warehouses(None, _FakeWarehouse(rows=125))
+    assert not fallback.fetch_index_daily(index_code="000300.SH").empty
+
+    # enrichment 出错 + delta 空表 → 空帧（不阻断日线链、不伪造指数）。
+    empty = _overlay_with_warehouses(
+        _FakeWarehouse(rows=None, error=True), _FakeWarehouse(rows=None)
+    )
+    frame = empty.fetch_index_daily(index_code="000300.SH")
+    assert isinstance(frame, pd.DataFrame) and frame.empty
+
+
+def test_snapshot_benchmark_frame_accepts_overlay_provider() -> None:
+    overlay = _overlay_with_warehouses(
+        enrichment=_FakeWarehouse(rows=150), delta=_FakeWarehouse(rows=150)
+    )
+    frame = _fetch_snapshot_benchmark_frame(overlay, lookback_days=250)
+    assert not frame.empty
