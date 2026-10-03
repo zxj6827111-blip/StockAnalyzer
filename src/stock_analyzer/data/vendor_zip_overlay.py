@@ -502,6 +502,30 @@ class VendorZipOverlayProvider:
         result.attrs["delta_db_path"] = str(Path(self.delta_db_path).expanduser())
         return result
 
+    def fetch_index_daily(self, *, index_code: str = "000300.SH") -> pd.DataFrame:
+        """基准指数日线（市场相对族特征：excess_ret/rs_ma/beta 的输入）。
+
+        只读既有数据源：market.duckdb（enrichment warehouse，PIT 面板链的
+        同一权威库）为主、delta 库兜底；两者都不可用或无该表时返回空帧，
+        由快照构建的 ``_IndexFeedOnly`` 链按"无指数上下文"处理——绝不从
+        股票日线伪造指数。PR#98 的快照链已接 ``fetch_index_daily`` 接口，
+        但本 overlay 此前未暴露该方法，导致 v2 重建仍全零（2026-10-04 实测）。
+        """
+        normalized = str(index_code).strip().upper() or "000300.SH"
+        for warehouse in (self._market_enrichment(), self._delta_warehouse()):
+            if warehouse is None:
+                continue
+            fetch = getattr(warehouse, "fetch_index_daily", None)
+            if not callable(fetch):
+                continue
+            try:
+                frame = fetch(index_code=normalized)
+            except Exception:  # noqa: BLE001 - 指数缺失降级为空帧，不阻断日线链
+                continue
+            if isinstance(frame, pd.DataFrame) and not frame.empty:
+                return frame
+        return pd.DataFrame()
+
     def fetch_universe_quality_metrics(
         self,
         *,

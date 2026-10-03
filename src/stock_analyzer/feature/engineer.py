@@ -11,7 +11,9 @@ import pandas as pd
 # 相对族（excess_ret/rs_ma/beta 等）支持经 attach_market_index 注入基准
 # 指数上下文；v1 时代生产快照链从未传入 market_index，该族在生产侧恒为
 # fillna(0) 的常数 0，与 PIT 面板不可比（D1 对拍 33 列死值根因之一）。
-FEATURE_COMPUTE_VERSION = 2
+# v3（2026-10-04）：vendor overlay 暴露 fetch_index_daily（v2 重建实测
+# 仍全零——生产 provider 链缺指数接口，`_IndexFeedOnly` 正确失败回落）。
+FEATURE_COMPUTE_VERSION = 3
 
 
 class FeatureEngineer:
