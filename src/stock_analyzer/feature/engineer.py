@@ -16,7 +16,11 @@ import pandas as pd
 # v4（2026-10-04）：overlay 指数源改为配置库（warehouse_db_path）优先——
 # v3 重建实测 legacy 启发式库（停更 8/14）排在首位并短路新鲜库，指数帧
 # 陈旧导致最新行 excess 仍为零。
-FEATURE_COMPUTE_VERSION = 4
+# v5（2026-10-04）：_IndexFeedOnly 沿包装链解包——生产链
+# CachedProvider(ResilientProvider(Hybrid(overlay))) 的接口只在最内层，
+# 只查顶层使 v2/v3/v4 三次重建的挂载全部 miss（探针手工解包后整链实测
+# excess 非零 244/250，端到端证据）。
+FEATURE_COMPUTE_VERSION = 5
 
 
 class FeatureEngineer:
