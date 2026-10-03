@@ -187,18 +187,21 @@ def test_build_fresh_deep_frame_attaches_market_index() -> None:
 
 
 class _FakeWarehouse:
-    """最小 MarketWarehouse 替身：只带 fetch_index_daily。"""
+    """最小 MarketWarehouse 替身：只带 fetch_index_daily，帧带来源 tag。"""
 
-    def __init__(self, *, rows: int | None, error: bool = False) -> None:
+    def __init__(self, *, rows: int | None, error: bool = False, tag: str = "") -> None:
         self._rows = rows
         self._error = error
+        self._tag = tag
 
     def fetch_index_daily(self, *, index_code: str) -> pd.DataFrame:
         if self._error:
             raise RuntimeError("warehouse unavailable")
         if self._rows is None:
             return pd.DataFrame()
-        return _benchmark(periods=self._rows, slope=0.06)
+        frame = _benchmark(periods=self._rows, slope=0.06)
+        frame.attrs["source_tag"] = self._tag
+        return frame
 
 
 def _overlay_with_warehouses(
@@ -221,20 +224,23 @@ def _overlay_with_warehouses(
     return _Stub(data_root="stub", index_path="stub", delta_db_path="stub")
 
 
-def test_vendor_overlay_fetch_index_daily_prefers_enrichment() -> None:
+def test_vendor_overlay_fetch_index_daily_prefers_configured_delta() -> None:
+    # 配置库（warehouse_db_path，market sync 的写入目标）优先于 legacy 启发式库。
     overlay = _overlay_with_warehouses(
-        enrichment=_FakeWarehouse(rows=125), delta=_FakeWarehouse(rows=125)
+        enrichment=_FakeWarehouse(rows=125, tag="enrichment"),
+        delta=_FakeWarehouse(rows=125, tag="delta"),
     )
     frame = overlay.fetch_index_daily(index_code="000300.SH")
     assert not frame.empty
+    assert frame.attrs["source_tag"] == "delta"
 
 
 def test_vendor_overlay_fetch_index_daily_fallback_and_empty() -> None:
-    # enrichment 缺库（懒解析返回 None）→ delta 兜底。
-    fallback = _overlay_with_warehouses(None, _FakeWarehouse(rows=125))
+    # 配置库缺表（空帧）→ legacy enrichment 兜底。
+    fallback = _overlay_with_warehouses(_FakeWarehouse(rows=125), _FakeWarehouse(rows=None))
     assert not fallback.fetch_index_daily(index_code="000300.SH").empty
 
-    # enrichment 出错 + delta 空表 → 空帧（不阻断日线链、不伪造指数）。
+    # 两个来源都出空帧/出错 → 空帧（不阻断日线链、不伪造指数）。
     empty = _overlay_with_warehouses(
         _FakeWarehouse(rows=None, error=True), _FakeWarehouse(rows=None)
     )

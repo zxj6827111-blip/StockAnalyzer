@@ -13,7 +13,10 @@ import pandas as pd
 # fillna(0) 的常数 0，与 PIT 面板不可比（D1 对拍 33 列死值根因之一）。
 # v3（2026-10-04）：vendor overlay 暴露 fetch_index_daily（v2 重建实测
 # 仍全零——生产 provider 链缺指数接口，`_IndexFeedOnly` 正确失败回落）。
-FEATURE_COMPUTE_VERSION = 3
+# v4（2026-10-04）：overlay 指数源改为配置库（warehouse_db_path）优先——
+# v3 重建实测 legacy 启发式库（停更 8/14）排在首位并短路新鲜库，指数帧
+# 陈旧导致最新行 excess 仍为零。
+FEATURE_COMPUTE_VERSION = 4
 
 
 class FeatureEngineer:
