@@ -148,6 +148,9 @@ class TailLabelRecord:
     gap_exit: bool
     deferred_sessions: int
     corporate_action_uncertain: bool
+    #: 反馈闭环（§3.4）按这两个维度分组；缺省时归入 unattributed/unknown。
+    model_version: str = ""
+    market_state: str = ""
     details: Mapping[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -194,6 +197,8 @@ class TailLabelRecord:
             "gap_exit": self.gap_exit,
             "deferred_sessions": self.deferred_sessions,
             "corporate_action_uncertain": self.corporate_action_uncertain,
+            "model_version": self.model_version,
+            "market_state": self.market_state,
             "label_definition": (
                 f"按 trend 尾盘契约 {self.contract_version}/{self.contract_digest} 在 "
                 f"尾盘窗口确认后以参考金额 {self.reference_notional:.0f} 元成交，"
@@ -221,6 +226,8 @@ def build_tail_net_profit_label(
     overnight_features: Mapping[str, Any] | None = None,
     capture_mode: str = CAPTURE_REPLAYED,
     quote_as_of: datetime | None = None,
+    model_version: str = "",
+    market_state: str = "",
 ) -> TailLabelRecord:
     """观察池决策日 ``decision_date`` 的样本，在次日 ``entry_date`` 尾盘确认并成交。
 
@@ -261,7 +268,7 @@ def build_tail_net_profit_label(
             reason=entry.no_fill_reason if entry.confirmed else entry.reason,
             entry=entry, exit_result=None, label=None, net_return=None,
             gross_return=None, capture_mode=capture_mode, contract=contract,
-            trainable=False,
+            trainable=False, model_version=model_version, market_state=market_state,
         )
 
     exit_result = simulate_tail_exit(
@@ -288,6 +295,7 @@ def build_tail_net_profit_label(
         net_return=exit_result.net_return if trainable else None,
         gross_return=exit_result.gross_return if trainable else None,
         capture_mode=capture_mode, contract=contract, trainable=trainable,
+        model_version=model_version, market_state=market_state,
     )
 
 
@@ -310,6 +318,8 @@ def _record(
     capture_mode: str,
     contract: TrendStrategyContract,
     trainable: bool,
+    model_version: str = "",
+    market_state: str = "",
 ) -> TailLabelRecord:
     return TailLabelRecord(
         symbol=symbol,
@@ -349,6 +359,8 @@ def _record(
             bool(exit_result.corporate_action_uncertain) if exit_result else False
         ),
         details=dict(entry.details),
+        model_version=model_version,
+        market_state=market_state,
     )
 
 

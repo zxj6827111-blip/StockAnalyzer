@@ -321,6 +321,102 @@ def _count_by_symbol(rejected: Sequence[Mapping[str, Any]]) -> dict[str, list[st
     return {key: sorted(values) for key, values in sorted(grouped.items())}
 
 
+def page_view(report: Mapping[str, Any]) -> dict[str, Any]:
+    """页面视图：候选、最终推荐、成交状态分列，并标明概率口径 / 参考金额 / 数据日期。
+
+    计划 §3.4 要求"注明概率所对应的策略、参考金额及数据日期"——这些是响应体里的
+    必填元信息，缺失即报错，而不是让页面自己猜。
+    """
+    for key in ("trade_date", "probability_field", "reference_notional", "contract_version",
+                "contract_digest"):
+        if report.get(key) in (None, ""):
+            raise ValueError(f"tail shadow report is missing required field {key!r}")
+    rows = [dict(item) for item in report.get("final_recommendations") or []]
+    rejections = dict(report.get("final_rejections") or {})
+    rejected_reasons = dict(report.get("rejected_reasons") or {})
+    candidates = sorted({
+        *[str(row.get("symbol")) for row in rows],
+        *[symbol for values in rejections.values() for symbol in values],
+        *[symbol for values in rejected_reasons.values() for symbol in values],
+    })
+    return {
+        "status": "ok" if report.get("ok", True) else "error",
+        "mode": str(report.get("mode", "shadow")),
+        "meta": {
+            "trade_date": str(report["trade_date"]),
+            "probability_field": str(report["probability_field"]),
+            "probability_meaning": (
+                "按该契约成交并扣除佣金/最低佣金/过户费/印花税/滑点后，"
+                "持有至多 5 个交易日净收益>0 的概率"
+            ),
+            "strategy": str(report.get("strategy", "trend")),
+            "reference_notional_cny": float(report["reference_notional"]),
+            "contract_version": str(report["contract_version"]),
+            "contract_digest": str(report["contract_digest"]),
+            "entry_window": list(report.get("tail_entry_window") or ["14:30", "14:50"]),
+            "min_net_profit_probability": report.get("min_net_profit_probability"),
+            "data_as_of": str(
+                (rows[0].get("data_as_of") if rows else report.get("trade_date")) or ""
+            ),
+        },
+        "candidates": candidates,
+        "final_recommendations": rows,
+        "fills": {
+            str(row.get("symbol")): dict(row.get("fill") or {})
+            for row in rows
+        },
+        "rejection_reasons": {
+            "final_ranking": rejections,
+            "pre_confirmation": rejected_reasons,
+        },
+        "blocking_reason": str(report.get("blocking_reason") or ""),
+        "caveats": sorted({
+            caveat
+            for row in rows
+            for caveat in (row.get("caveats") or [])
+        }),
+    }
+
+
+def _report_dir_for(service: Any) -> Path:
+    raw = str(getattr(
+        getattr(getattr(service, "_config", None), "week5", None),
+        "tail_shadow_report_dir", REPORT_DIR_DEFAULT,
+    ) or REPORT_DIR_DEFAULT)
+    resolver = getattr(service, "_resolve_evolution_path", None)
+    return Path(resolver(raw)) if callable(resolver) else Path(raw)
+
+
+def tail_shadow_page(service: Any, *, trade_date: str | None = None) -> dict[str, Any]:
+    """读某日（默认最新）的尾盘影子留档并转成页面视图。"""
+    directory = _report_dir_for(service)
+    pattern = (f"tail_shadow_report_{trade_date}.json" if trade_date
+               else "tail_shadow_report_*.json")
+    files = sorted(directory.glob(pattern))
+    if not files:
+        return {"status": "no_report", "meta": {"report_dir": str(directory)},
+                "candidates": [], "final_recommendations": [], "fills": {},
+                "rejection_reasons": {}, "blocking_reason": "no_tail_shadow_report"}
+    payload = json.loads(files[-1].read_text(encoding="utf-8"))
+    return page_view(payload)
+
+
+def tail_shadow_history(service: Any, *, limit: int = 20) -> dict[str, Any]:
+    directory = _report_dir_for(service)
+    files = sorted(directory.glob("tail_shadow_report_*.json"))[-max(1, int(limit)):]
+    days = []
+    for path in files:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        view = page_view(payload)
+        days.append({
+            "trade_date": view["meta"]["trade_date"],
+            "final_symbols": [row.get("symbol") for row in view["final_recommendations"]],
+            "candidate_count": len(view["candidates"]),
+            "blocking_reason": view["blocking_reason"],
+        })
+    return {"days": days, "count": len(days)}
+
+
 def _reason_map(
     rows: Sequence[Mapping[str, Any]],
     decisions: Mapping[str, TailEntryDecision],
@@ -401,83 +497,6 @@ def _apply_cap(result: Any, affordable: int) -> Any:
                    counts=counts)
 
 
-def _reason_map(
-    rows: Sequence[Mapping[str, Any]],
-    decisions: Mapping[str, TailEntryDecision],
-    rejections: Mapping[str, Sequence[str]],
-) -> dict[str, str]:
-    """符号 → 它**最早**被挡下的原因，供逐层留档分组。"""
-    reasons: dict[str, str] = {}
-    for reason, symbols in rejections.items():
-        for symbol in symbols:
-            reasons.setdefault(str(symbol), str(reason))
-    for symbol, decision in decisions.items():
-        if decision.filled:
-            continue
-        reasons[symbol] = decision.no_fill_reason or decision.reason or "not_filled"
-    return reasons
-
-
-def _stage(
-    *,
-    stage: str,
-    kind: str,
-    inputs: Sequence[str],
-    advanced: Sequence[str],
-    reason_map: Mapping[str, str],
-    timestamp: datetime | None,
-    identity: ModelIdentity | None,
-    contract: TrendStrategyContract,
-    features_used: Sequence[str] = (),
-) -> Any:
-    """一层留档：只统计本层的输入，被挡住的原因按符号归组。"""
-    input_set = {str(symbol) for symbol in inputs}
-    kept = {str(symbol) for symbol in advanced}
-    rejected: dict[str, list[str]] = {}
-    for symbol in sorted(input_set - kept):
-        rejected.setdefault(str(reason_map.get(symbol, "dropped")), []).append(symbol)
-    return record_stage(
-        stage=stage,
-        kind=kind,
-        input_symbols=sorted(input_set),
-        advanced_symbols=tuple(sorted(kept & input_set)),
-        rejected=rejected,
-        features_used=features_used,
-        data_as_of=(timestamp or datetime.min).isoformat(),
-        contract=contract,
-        model_identity=identity,
-        feature_compute_version=_feature_compute_version(),
-        label_policy_id=getattr(identity, "label_policy_id", "") if identity else "",
-    )
-
-
-def _hard_gate_confirmation(context: Any) -> tuple[bool, str]:
-    """确认谓词的默认实现：**只用硬门**。
-
-    新路径不让旧综合分/等级/分歧试探决定资格（计划 §3.4）；模型分只参与最终排序。
-    有确认可用的最新价即通过硬门复核，其余判定留给 ``rank_final_recommendations``。
-    """
-    if context.latest_price_raw is None:
-        return False, "no_completed_minute_bar"
-    return True, ""
-
-
-def _contract_with_cap(
-    contract: TrendStrategyContract, cap: int
-) -> TrendStrategyContract:
-    """资金约束只能**收紧**名额上限，不能凭空放宽到超过契约值。"""
-    allowed = max(1, min(int(cap), int(contract.max_final_recommendations)))
-    if allowed == int(contract.max_final_recommendations):
-        return contract
-    params = {
-        key: value
-        for key, value in contract.to_dict().items()
-        if key != "confirmation_slots"
-    }
-    params["max_final_recommendations"] = allowed
-    return TrendStrategyContract(**params)
-
-
 def _row_for(rows: Sequence[Mapping[str, Any]], symbol: str) -> Mapping[str, Any]:
     for row in rows:
         if str(row.get("symbol")) == symbol:
@@ -532,4 +551,10 @@ def _feature_compute_version() -> int:
         return 0
 
 
-__all__ = ["REPORT_DIR_DEFAULT", "TrendTailShadowService", "_hard_gate_confirmation"]
+__all__ = [
+    "REPORT_DIR_DEFAULT",
+    "TrendTailShadowService",
+    "page_view",
+    "tail_shadow_history",
+    "tail_shadow_page",
+]
