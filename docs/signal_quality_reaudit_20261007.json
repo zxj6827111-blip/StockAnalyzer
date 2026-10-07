@@ -1,0 +1,1904 @@
+{
+  "protocol": {
+    "start": "2026-07-07",
+    "end": "2026-09-30",
+    "day_policy": "stored-wall-clock",
+    "primary_dedup": "capture_mode+symbol+day+strategy: earliest observation",
+    "entry": "first subsequent bar open; suspension/missing-bar distinction unverified",
+    "exit": "entry bar + horizon - 1: QFQ close / QFQ open - 1",
+    "trade_simulation": false,
+    "top_k": "up to 5 distinct stocks; select before inspecting outcomes",
+    "same_names_baseline": "retrospective diagnostic, not a PIT strategy",
+    "wf": "past fully matured 5D IC, minimum 20 days, signed mean weights, current percentile ranks",
+    "costs": "0/20/40 bp round-trip sensitivity; no calibrated execution/slippage model",
+    "block_bootstrap": "3000 moving-block draws; block=holding horizon; consecutive observed days",
+    "price_asof": "2026-09-30"
+  },
+  "raw_rows": 34370,
+  "cross_mode_latest_count": 19500,
+  "mode_first_counts": {
+    "replayed_recompute": 13299,
+    "observed_snapshot": 6997
+  },
+  "mode_last_counts": {
+    "replayed_recompute": 13299,
+    "observed_snapshot": 6997
+  },
+  "legacy_mode_counts": {
+    "replayed_recompute": 13293,
+    "observed_snapshot": 6207
+  },
+  "cohorts": {
+    "legacy_all": {
+      "1": {
+        "candidates": 19500,
+        "matured": 19382,
+        "missing_entry": 118,
+        "pending_or_missing_outcome": 118,
+        "win_rate_gross": 0.5532452791249614,
+        "mean_return_gross": 0.005027269804558497,
+        "terminal_loss_gt_5pct": 0.07481168094107936,
+        "intrahold_low_loss_gt_5pct": 0.1420390052626148,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.5532452791249614,
+            "mean_return": 0.005027269804558497
+          },
+          "20": {
+            "win_rate": 0.532401196986895,
+            "mean_return": 0.003027269804558497
+          },
+          "40": {
+            "win_rate": 0.5048498606954906,
+            "mean_return": 0.001027269804558497
+          }
+        }
+      },
+      "3": {
+        "candidates": 19500,
+        "matured": 19126,
+        "missing_entry": 118,
+        "pending_or_missing_outcome": 374,
+        "win_rate_gross": 0.5679180173585695,
+        "mean_return_gross": 0.013520822806093841,
+        "terminal_loss_gt_5pct": 0.14817525880999685,
+        "intrahold_low_loss_gt_5pct": 0.30722576597302104,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.5679180173585695,
+            "mean_return": 0.013520822806093841
+          },
+          "20": {
+            "win_rate": 0.5585590295932239,
+            "mean_return": 0.011520822806093841
+          },
+          "40": {
+            "win_rate": 0.5431349994771515,
+            "mean_return": 0.009520822806093841
+          }
+        }
+      },
+      "5": {
+        "candidates": 19500,
+        "matured": 18889,
+        "missing_entry": 118,
+        "pending_or_missing_outcome": 611,
+        "win_rate_gross": 0.5830377468367833,
+        "mean_return_gross": 0.020136690537716877,
+        "terminal_loss_gt_5pct": 0.18899888824183386,
+        "intrahold_low_loss_gt_5pct": 0.38244480914818146,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.5830377468367833,
+            "mean_return": 0.020136690537716877
+          },
+          "20": {
+            "win_rate": 0.574090740642702,
+            "mean_return": 0.018136690537716875
+          },
+          "40": {
+            "win_rate": 0.5606437609190534,
+            "mean_return": 0.016136690537716877
+          }
+        }
+      },
+      "10": {
+        "candidates": 19500,
+        "matured": 18055,
+        "missing_entry": 118,
+        "pending_or_missing_outcome": 1445,
+        "win_rate_gross": 0.6348933813348103,
+        "mean_return_gross": 0.046453805024966134,
+        "terminal_loss_gt_5pct": 0.202603157020216,
+        "intrahold_low_loss_gt_5pct": 0.4618111326502354,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.6348933813348103,
+            "mean_return": 0.046453805024966134
+          },
+          "20": {
+            "win_rate": 0.6296316809747993,
+            "mean_return": 0.04445380502496613
+          },
+          "40": {
+            "win_rate": 0.6209914151204653,
+            "mean_return": 0.04245380502496614
+          }
+        }
+      }
+    },
+    "legacy_observed": {
+      "1": {
+        "candidates": 6207,
+        "matured": 6089,
+        "missing_entry": 118,
+        "pending_or_missing_outcome": 118,
+        "win_rate_gross": 0.5158482509443258,
+        "mean_return_gross": 0.002172084424417516,
+        "terminal_loss_gt_5pct": 0.09492527508622105,
+        "intrahold_low_loss_gt_5pct": 0.17441287567745115,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.5158482509443258,
+            "mean_return": 0.002172084424417516
+          },
+          "20": {
+            "win_rate": 0.49843980949252753,
+            "mean_return": 0.00017208442441751575
+          },
+          "40": {
+            "win_rate": 0.47626868122844473,
+            "mean_return": -0.0018279155755824843
+          }
+        }
+      },
+      "3": {
+        "candidates": 6207,
+        "matured": 5833,
+        "missing_entry": 118,
+        "pending_or_missing_outcome": 374,
+        "win_rate_gross": 0.498371335504886,
+        "mean_return_gross": 0.003358234325735083,
+        "terminal_loss_gt_5pct": 0.19269672552717299,
+        "intrahold_low_loss_gt_5pct": 0.37356420366878107,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.498371335504886,
+            "mean_return": 0.003358234325735083
+          },
+          "20": {
+            "win_rate": 0.4923709926281502,
+            "mean_return": 0.0013582343257350828
+          },
+          "40": {
+            "win_rate": 0.4777987313560775,
+            "mean_return": -0.0006417656742649172
+          }
+        }
+      },
+      "5": {
+        "candidates": 6207,
+        "matured": 5596,
+        "missing_entry": 118,
+        "pending_or_missing_outcome": 611,
+        "win_rate_gross": 0.4753395282344532,
+        "mean_return_gross": -0.0023016451890722806,
+        "terminal_loss_gt_5pct": 0.26697641172265907,
+        "intrahold_low_loss_gt_5pct": 0.45889921372408865,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.4753395282344532,
+            "mean_return": -0.0023016451890722806
+          },
+          "20": {
+            "win_rate": 0.4665832737669764,
+            "mean_return": -0.00430164518907228
+          },
+          "40": {
+            "win_rate": 0.45407433881343817,
+            "mean_return": -0.00630164518907228
+          }
+        }
+      },
+      "10": {
+        "candidates": 6207,
+        "matured": 4762,
+        "missing_entry": 118,
+        "pending_or_missing_outcome": 1445,
+        "win_rate_gross": 0.500629987400252,
+        "mean_return_gross": 0.0004856056486799775,
+        "terminal_loss_gt_5pct": 0.29378412431751366,
+        "intrahold_low_loss_gt_5pct": 0.5459890802183957,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.500629987400252,
+            "mean_return": 0.0004856056486799775
+          },
+          "20": {
+            "win_rate": 0.49412011759764807,
+            "mean_return": -0.0015143943513200226
+          },
+          "40": {
+            "win_rate": 0.48551028979420413,
+            "mean_return": -0.0035143943513200227
+          }
+        }
+      }
+    },
+    "legacy_replayed": {
+      "1": {
+        "candidates": 13293,
+        "matured": 13293,
+        "missing_entry": 0,
+        "pending_or_missing_outcome": 0,
+        "win_rate_gross": 0.5703753855412623,
+        "mean_return_gross": 0.0063351178283062165,
+        "terminal_loss_gt_5pct": 0.06559843526668171,
+        "intrahold_low_loss_gt_5pct": 0.12720980967426465,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.5703753855412623,
+            "mean_return": 0.0063351178283062165
+          },
+          "20": {
+            "win_rate": 0.5479575716542541,
+            "mean_return": 0.0043351178283062165
+          },
+          "40": {
+            "win_rate": 0.5179417738659445,
+            "mean_return": 0.0023351178283062164
+          }
+        }
+      },
+      "3": {
+        "candidates": 13293,
+        "matured": 13293,
+        "missing_entry": 0,
+        "pending_or_missing_outcome": 0,
+        "win_rate_gross": 0.5984352666817122,
+        "mean_return_gross": 0.017980190789689165,
+        "terminal_loss_gt_5pct": 0.12863913337846988,
+        "intrahold_low_loss_gt_5pct": 0.2781163018129843,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.5984352666817122,
+            "mean_return": 0.017980190789689165
+          },
+          "20": {
+            "win_rate": 0.5876024975551042,
+            "mean_return": 0.015980190789689167
+          },
+          "40": {
+            "win_rate": 0.5718047092454676,
+            "mean_return": 0.013980190789689165
+          }
+        }
+      },
+      "5": {
+        "candidates": 13293,
+        "matured": 13293,
+        "missing_entry": 0,
+        "pending_or_missing_outcome": 0,
+        "win_rate_gross": 0.6283758369066426,
+        "mean_return_gross": 0.02958263402128809,
+        "terminal_loss_gt_5pct": 0.15617242157526517,
+        "intrahold_low_loss_gt_5pct": 0.3502595350936583,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.6283758369066426,
+            "mean_return": 0.02958263402128809
+          },
+          "20": {
+            "win_rate": 0.6193485293011359,
+            "mean_return": 0.02758263402128809
+          },
+          "40": {
+            "win_rate": 0.6055066576393591,
+            "mean_return": 0.02558263402128809
+          }
+        }
+      },
+      "10": {
+        "candidates": 13293,
+        "matured": 13293,
+        "missing_entry": 0,
+        "pending_or_missing_outcome": 0,
+        "win_rate_gross": 0.6829910479199579,
+        "mean_return_gross": 0.06292116118458958,
+        "terminal_loss_gt_5pct": 0.16993906567366282,
+        "intrahold_low_loss_gt_5pct": 0.4316557586699767,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.6829910479199579,
+            "mean_return": 0.06292116118458958
+          },
+          "20": {
+            "win_rate": 0.6781764838636877,
+            "mean_return": 0.06092116118458958
+          },
+          "40": {
+            "win_rate": 0.6695253140750771,
+            "mean_return": 0.05892116118458958
+          }
+        }
+      }
+    },
+    "observed_first": {
+      "1": {
+        "candidates": 6997,
+        "matured": 6879,
+        "missing_entry": 118,
+        "pending_or_missing_outcome": 118,
+        "win_rate_gross": 0.5223142898677133,
+        "mean_return_gross": 0.0023825516281427797,
+        "terminal_loss_gt_5pct": 0.09216455880215148,
+        "intrahold_low_loss_gt_5pct": 0.16862916121529292,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.5223142898677133,
+            "mean_return": 0.0023825516281427797
+          },
+          "20": {
+            "win_rate": 0.5037069341474052,
+            "mean_return": 0.0003825516281427796
+          },
+          "40": {
+            "win_rate": 0.4798662596307603,
+            "mean_return": -0.0016174483718572204
+          }
+        }
+      },
+      "3": {
+        "candidates": 6997,
+        "matured": 6623,
+        "missing_entry": 118,
+        "pending_or_missing_outcome": 374,
+        "win_rate_gross": 0.5040012079118225,
+        "mean_return_gross": 0.004122116510360971,
+        "terminal_loss_gt_5pct": 0.18994413407821228,
+        "intrahold_low_loss_gt_5pct": 0.3643364034425487,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.5040012079118225,
+            "mean_return": 0.004122116510360971
+          },
+          "20": {
+            "win_rate": 0.4982636267552469,
+            "mean_return": 0.0021221165103609708
+          },
+          "40": {
+            "win_rate": 0.4828627510191756,
+            "mean_return": 0.00012211651036097074
+          }
+        }
+      },
+      "5": {
+        "candidates": 6997,
+        "matured": 6386,
+        "missing_entry": 118,
+        "pending_or_missing_outcome": 611,
+        "win_rate_gross": 0.4882555590353899,
+        "mean_return_gross": -0.0006443319737675274,
+        "terminal_loss_gt_5pct": 0.25916066395239584,
+        "intrahold_low_loss_gt_5pct": 0.4483244597557156,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.4882555590353899,
+            "mean_return": -0.0006443319737675274
+          },
+          "20": {
+            "win_rate": 0.47917319135609143,
+            "mean_return": -0.0026443319737675273
+          },
+          "40": {
+            "win_rate": 0.46617601002192294,
+            "mean_return": -0.004644331973767527
+          }
+        }
+      },
+      "10": {
+        "candidates": 6997,
+        "matured": 5552,
+        "missing_entry": 118,
+        "pending_or_missing_outcome": 1445,
+        "win_rate_gross": 0.5147694524495677,
+        "mean_return_gross": 0.004374872213862838,
+        "terminal_loss_gt_5pct": 0.28296109510086453,
+        "intrahold_low_loss_gt_5pct": 0.5345821325648416,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.5147694524495677,
+            "mean_return": 0.004374872213862838
+          },
+          "20": {
+            "win_rate": 0.5088256484149856,
+            "mean_return": 0.002374872213862838
+          },
+          "40": {
+            "win_rate": 0.5,
+            "mean_return": 0.0003748722138628381
+          }
+        }
+      }
+    },
+    "observed_last": {
+      "1": {
+        "candidates": 6997,
+        "matured": 6879,
+        "missing_entry": 118,
+        "pending_or_missing_outcome": 118,
+        "win_rate_gross": 0.5223142898677133,
+        "mean_return_gross": 0.0023825516281427805,
+        "terminal_loss_gt_5pct": 0.09216455880215148,
+        "intrahold_low_loss_gt_5pct": 0.16862916121529292,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.5223142898677133,
+            "mean_return": 0.0023825516281427805
+          },
+          "20": {
+            "win_rate": 0.5037069341474052,
+            "mean_return": 0.0003825516281427805
+          },
+          "40": {
+            "win_rate": 0.4798662596307603,
+            "mean_return": -0.0016174483718572196
+          }
+        }
+      },
+      "3": {
+        "candidates": 6997,
+        "matured": 6623,
+        "missing_entry": 118,
+        "pending_or_missing_outcome": 374,
+        "win_rate_gross": 0.5040012079118225,
+        "mean_return_gross": 0.004122116510360969,
+        "terminal_loss_gt_5pct": 0.18994413407821228,
+        "intrahold_low_loss_gt_5pct": 0.3643364034425487,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.5040012079118225,
+            "mean_return": 0.004122116510360969
+          },
+          "20": {
+            "win_rate": 0.4982636267552469,
+            "mean_return": 0.002122116510360969
+          },
+          "40": {
+            "win_rate": 0.4828627510191756,
+            "mean_return": 0.000122116510360969
+          }
+        }
+      },
+      "5": {
+        "candidates": 6997,
+        "matured": 6386,
+        "missing_entry": 118,
+        "pending_or_missing_outcome": 611,
+        "win_rate_gross": 0.4882555590353899,
+        "mean_return_gross": -0.0006443319737675277,
+        "terminal_loss_gt_5pct": 0.25916066395239584,
+        "intrahold_low_loss_gt_5pct": 0.4483244597557156,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.4882555590353899,
+            "mean_return": -0.0006443319737675277
+          },
+          "20": {
+            "win_rate": 0.47917319135609143,
+            "mean_return": -0.0026443319737675277
+          },
+          "40": {
+            "win_rate": 0.46617601002192294,
+            "mean_return": -0.004644331973767528
+          }
+        }
+      },
+      "10": {
+        "candidates": 6997,
+        "matured": 5552,
+        "missing_entry": 118,
+        "pending_or_missing_outcome": 1445,
+        "win_rate_gross": 0.5147694524495677,
+        "mean_return_gross": 0.004374872213862838,
+        "terminal_loss_gt_5pct": 0.28296109510086453,
+        "intrahold_low_loss_gt_5pct": 0.5345821325648416,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.5147694524495677,
+            "mean_return": 0.004374872213862838
+          },
+          "20": {
+            "win_rate": 0.5088256484149856,
+            "mean_return": 0.002374872213862838
+          },
+          "40": {
+            "win_rate": 0.5,
+            "mean_return": 0.0003748722138628381
+          }
+        }
+      }
+    },
+    "all_market": {
+      "1": {
+        "candidates": 337277,
+        "matured": 331723,
+        "missing_entry": 5554,
+        "pending_or_missing_outcome": 5554,
+        "win_rate_gross": 0.505484998025461,
+        "mean_return_gross": 0.0012153058332041436,
+        "terminal_loss_gt_5pct": 0.04794663017035297,
+        "intrahold_low_loss_gt_5pct": 0.09013845889492136,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.505484998025461,
+            "mean_return": 0.0012153058332041436
+          },
+          "20": {
+            "win_rate": 0.4810188018316487,
+            "mean_return": -0.0007846941667958565
+          },
+          "40": {
+            "win_rate": 0.44535048820853546,
+            "mean_return": -0.0027846941667958565
+          }
+        }
+      },
+      "3": {
+        "candidates": 337277,
+        "matured": 320615,
+        "missing_entry": 5554,
+        "pending_or_missing_outcome": 16662,
+        "win_rate_gross": 0.4983110584345711,
+        "mean_return_gross": 0.002014363653298804,
+        "terminal_loss_gt_5pct": 0.12909252530293341,
+        "intrahold_low_loss_gt_5pct": 0.251491664457371,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.4983110584345711,
+            "mean_return": 0.002014363653298804
+          },
+          "20": {
+            "win_rate": 0.4843004850053803,
+            "mean_return": 1.4363653298803819e-05
+          },
+          "40": {
+            "win_rate": 0.4644729660184333,
+            "mean_return": -0.0019856363467011962
+          }
+        }
+      },
+      "5": {
+        "candidates": 337277,
+        "matured": 309509,
+        "missing_entry": 5554,
+        "pending_or_missing_outcome": 27768,
+        "win_rate_gross": 0.510792901014187,
+        "mean_return_gross": 0.004132480048687654,
+        "terminal_loss_gt_5pct": 0.17960382412143103,
+        "intrahold_low_loss_gt_5pct": 0.3419351295115812,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.510792901014187,
+            "mean_return": 0.004132480048687654
+          },
+          "20": {
+            "win_rate": 0.5003505552342581,
+            "mean_return": 0.0021324800486876537
+          },
+          "40": {
+            "win_rate": 0.48505859280344027,
+            "mean_return": 0.00013248004868765366
+          }
+        }
+      },
+      "10": {
+        "candidates": 337277,
+        "matured": 281756,
+        "missing_entry": 5554,
+        "pending_or_missing_outcome": 55521,
+        "win_rate_gross": 0.5255611238092533,
+        "mean_return_gross": 0.012054425811695902,
+        "terminal_loss_gt_5pct": 0.2191967517994293,
+        "intrahold_low_loss_gt_5pct": 0.4776863669274124,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.5255611238092533,
+            "mean_return": 0.012054425811695902
+          },
+          "20": {
+            "win_rate": 0.5179517028918639,
+            "mean_return": 0.010054425811695902
+          },
+          "40": {
+            "win_rate": 0.506754070898224,
+            "mean_return": 0.008054425811695902
+          }
+        }
+      }
+    },
+    "same_names_all_days": {
+      "1": {
+        "candidates": 76199,
+        "matured": 74941,
+        "missing_entry": 1258,
+        "pending_or_missing_outcome": 1258,
+        "win_rate_gross": 0.5187280660786485,
+        "mean_return_gross": 0.003126202926363982,
+        "terminal_loss_gt_5pct": 0.05703153147142419,
+        "intrahold_low_loss_gt_5pct": 0.10983306868069548,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.5187280660786485,
+            "mean_return": 0.003126202926363982
+          },
+          "20": {
+            "win_rate": 0.4958967721274069,
+            "mean_return": 0.0011262029263639818
+          },
+          "40": {
+            "win_rate": 0.4646855526347393,
+            "mean_return": -0.0008737970736360182
+          }
+        }
+      },
+      "3": {
+        "candidates": 76199,
+        "matured": 72425,
+        "missing_entry": 1258,
+        "pending_or_missing_outcome": 3774,
+        "win_rate_gross": 0.52136693130825,
+        "mean_return_gross": 0.007730705107210984,
+        "terminal_loss_gt_5pct": 0.14170521228857438,
+        "intrahold_low_loss_gt_5pct": 0.28095270969968933,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.52136693130825,
+            "mean_return": 0.007730705107210984
+          },
+          "20": {
+            "win_rate": 0.5095201933034174,
+            "mean_return": 0.005730705107210984
+          },
+          "40": {
+            "win_rate": 0.49202623403520884,
+            "mean_return": 0.003730705107210984
+          }
+        }
+      },
+      "5": {
+        "candidates": 76199,
+        "matured": 69909,
+        "missing_entry": 1258,
+        "pending_or_missing_outcome": 6290,
+        "win_rate_gross": 0.5409889999856957,
+        "mean_return_gross": 0.01397499919684741,
+        "terminal_loss_gt_5pct": 0.18535524753608262,
+        "intrahold_low_loss_gt_5pct": 0.36425925131242043,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.5409889999856957,
+            "mean_return": 0.01397499919684741
+          },
+          "20": {
+            "win_rate": 0.5316911985581255,
+            "mean_return": 0.01197499919684741
+          },
+          "40": {
+            "win_rate": 0.5177301921068818,
+            "mean_return": 0.00997499919684741
+          }
+        }
+      },
+      "10": {
+        "candidates": 76199,
+        "matured": 63624,
+        "missing_entry": 1258,
+        "pending_or_missing_outcome": 12575,
+        "win_rate_gross": 0.5766377467622281,
+        "mean_return_gross": 0.031638911223991685,
+        "terminal_loss_gt_5pct": 0.21043945680875142,
+        "intrahold_low_loss_gt_5pct": 0.4806519552370175,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.5766377467622281,
+            "mean_return": 0.031638911223991685
+          },
+          "20": {
+            "win_rate": 0.570083616245442,
+            "mean_return": 0.029638911223991683
+          },
+          "40": {
+            "win_rate": 0.5603703005155287,
+            "mean_return": 0.027638911223991685
+          }
+        }
+      }
+    }
+  },
+  "ic": {
+    "meta": {
+      "5": {
+        "days": 61,
+        "mean": 0.008194688671092503,
+        "positive_days_ratio": 0.5245901639344263,
+        "block_ci": [
+          -0.06696906244707967,
+          0.10253508092033382
+        ],
+        "unique_values": 873
+      },
+      "10": {
+        "days": 54,
+        "mean": -0.019036271205609325,
+        "positive_days_ratio": 0.4074074074074074,
+        "block_ci": [
+          -0.08893075322108174,
+          0.09902391478392705
+        ],
+        "unique_values": 873
+      }
+    },
+    "lgbm": {
+      "5": {
+        "days": 60,
+        "mean": 0.06469442375123671,
+        "positive_days_ratio": 0.65,
+        "block_ci": [
+          0.011184916189960209,
+          0.11564808735339105
+        ],
+        "unique_values": 725
+      },
+      "10": {
+        "days": 53,
+        "mean": 0.011933870185527303,
+        "positive_days_ratio": 0.49056603773584906,
+        "block_ci": [
+          -0.040449994962012674,
+          0.05392120516025672
+        ],
+        "unique_values": 725
+      }
+    },
+    "xgb": {
+      "5": {
+        "days": 61,
+        "mean": -0.02256454454626102,
+        "positive_days_ratio": 0.47540983606557374,
+        "block_ci": [
+          -0.12289226656824585,
+          0.09015001230836625
+        ],
+        "unique_values": 759
+      },
+      "10": {
+        "days": 54,
+        "mean": -0.026729824798783348,
+        "positive_days_ratio": 0.42592592592592593,
+        "block_ci": [
+          -0.11779538363269319,
+          0.12679193720792326
+        ],
+        "unique_values": 759
+      }
+    },
+    "board": {
+      "5": {
+        "days": 61,
+        "mean": -0.04225372809028494,
+        "positive_days_ratio": 0.4426229508196721,
+        "block_ci": [
+          -0.1068534762853364,
+          0.018553021126174445
+        ],
+        "unique_values": 4745
+      },
+      "10": {
+        "days": 54,
+        "mean": -0.07137698770981099,
+        "positive_days_ratio": 0.2962962962962963,
+        "block_ci": [
+          -0.15000425049109803,
+          -0.0033323272483940063
+        ],
+        "unique_values": 4745
+      }
+    },
+    "completion": {
+      "5": {
+        "days": 58,
+        "mean": 0.07217988424244018,
+        "positive_days_ratio": 0.6724137931034483,
+        "block_ci": [
+          0.008511963379193225,
+          0.14301886123557736
+        ],
+        "unique_values": 82
+      },
+      "10": {
+        "days": 51,
+        "mean": 0.08812947509105142,
+        "positive_days_ratio": 0.7254901960784313,
+        "block_ci": [
+          0.0190505634532778,
+          0.12155170381449011
+        ],
+        "unique_values": 82
+      }
+    }
+  },
+  "by_strategy": {
+    "monster": {
+      "5": {
+        "candidates": 5221,
+        "matured": 4979,
+        "missing_entry": 51,
+        "pending_or_missing_outcome": 242,
+        "win_rate_gross": 0.47740510142598913,
+        "mean_return_gross": -0.003709906503537311,
+        "terminal_loss_gt_5pct": 0.2596907009439646,
+        "intrahold_low_loss_gt_5pct": 0.4484836312512553,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.47740510142598913,
+            "mean_return": -0.003709906503537311
+          },
+          "20": {
+            "win_rate": 0.46856798553926493,
+            "mean_return": -0.0057099065035373115
+          },
+          "40": {
+            "win_rate": 0.4553123117091786,
+            "mean_return": -0.0077099065035373116
+          }
+        }
+      },
+      "10": {
+        "candidates": 5221,
+        "matured": 4520,
+        "missing_entry": 51,
+        "pending_or_missing_outcome": 701,
+        "win_rate_gross": 0.5073008849557522,
+        "mean_return_gross": 0.0012567430865628919,
+        "terminal_loss_gt_5pct": 0.28738938053097346,
+        "intrahold_low_loss_gt_5pct": 0.5376106194690266,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.5073008849557522,
+            "mean_return": 0.0012567430865628919
+          },
+          "20": {
+            "win_rate": 0.5006637168141593,
+            "mean_return": -0.0007432569134371082
+          },
+          "40": {
+            "win_rate": 0.4918141592920354,
+            "mean_return": -0.0027432569134371084
+          }
+        }
+      }
+    },
+    "trend": {
+      "5": {
+        "candidates": 1776,
+        "matured": 1407,
+        "missing_entry": 67,
+        "pending_or_missing_outcome": 369,
+        "win_rate_gross": 0.5266524520255863,
+        "mean_return_gross": 0.010203923593911052,
+        "terminal_loss_gt_5pct": 0.2572850035536603,
+        "intrahold_low_loss_gt_5pct": 0.44776119402985076,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.5266524520255863,
+            "mean_return": 0.010203923593911052
+          },
+          "20": {
+            "win_rate": 0.5167022032693674,
+            "mean_return": 0.008203923593911052
+          },
+          "40": {
+            "win_rate": 0.5046197583511016,
+            "mean_return": 0.006203923593911052
+          }
+        }
+      },
+      "10": {
+        "candidates": 1776,
+        "matured": 1032,
+        "missing_entry": 67,
+        "pending_or_missing_outcome": 744,
+        "win_rate_gross": 0.5474806201550387,
+        "mean_return_gross": 0.01803179436056414,
+        "terminal_loss_gt_5pct": 0.26356589147286824,
+        "intrahold_low_loss_gt_5pct": 0.5213178294573644,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.5474806201550387,
+            "mean_return": 0.01803179436056414
+          },
+          "20": {
+            "win_rate": 0.5445736434108527,
+            "mean_return": 0.016031794360564143
+          },
+          "40": {
+            "win_rate": 0.5358527131782945,
+            "mean_return": 0.014031794360564141
+          }
+        }
+      }
+    }
+  },
+  "monthly": {
+    "2026-07": {
+      "5": {
+        "candidates": 3321,
+        "matured": 3319,
+        "missing_entry": 1,
+        "pending_or_missing_outcome": 2,
+        "win_rate_gross": 0.5317866827357638,
+        "mean_return_gross": -0.002742754492221476,
+        "terminal_loss_gt_5pct": 0.23139499849352216,
+        "intrahold_low_loss_gt_5pct": 0.40494124736366377,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.5317866827357638,
+            "mean_return": -0.002742754492221476
+          },
+          "20": {
+            "win_rate": 0.5242542934618861,
+            "mean_return": -0.0047427544922214755
+          },
+          "40": {
+            "win_rate": 0.5073817414884001,
+            "mean_return": -0.0067427544922214755
+          }
+        }
+      },
+      "10": {
+        "candidates": 3321,
+        "matured": 3319,
+        "missing_entry": 1,
+        "pending_or_missing_outcome": 2,
+        "win_rate_gross": 0.6037963241940344,
+        "mean_return_gross": 0.014567891348979393,
+        "terminal_loss_gt_5pct": 0.22205483579391383,
+        "intrahold_low_loss_gt_5pct": 0.4588731545646279,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.6037963241940344,
+            "mean_return": 0.014567891348979393
+          },
+          "20": {
+            "win_rate": 0.5989755950587526,
+            "mean_return": 0.012567891348979393
+          },
+          "40": {
+            "win_rate": 0.5872250677915035,
+            "mean_return": 0.010567891348979393
+          }
+        }
+      }
+    },
+    "2026-08": {
+      "5": {
+        "candidates": 1207,
+        "matured": 1207,
+        "missing_entry": 0,
+        "pending_or_missing_outcome": 0,
+        "win_rate_gross": 0.47058823529411764,
+        "mean_return_gross": 0.000410459935527118,
+        "terminal_loss_gt_5pct": 0.21623860811930407,
+        "intrahold_low_loss_gt_5pct": 0.4382767191383596,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.47058823529411764,
+            "mean_return": 0.000410459935527118
+          },
+          "20": {
+            "win_rate": 0.45816072908036454,
+            "mean_return": -0.001589540064472882
+          },
+          "40": {
+            "win_rate": 0.44490472245236123,
+            "mean_return": -0.003589540064472882
+          }
+        }
+      },
+      "10": {
+        "candidates": 1207,
+        "matured": 1207,
+        "missing_entry": 0,
+        "pending_or_missing_outcome": 0,
+        "win_rate_gross": 0.40016570008285,
+        "mean_return_gross": -0.014547227790221827,
+        "terminal_loss_gt_5pct": 0.3396851698425849,
+        "intrahold_low_loss_gt_5pct": 0.5973487986743994,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.40016570008285,
+            "mean_return": -0.014547227790221827
+          },
+          "20": {
+            "win_rate": 0.39022369511184757,
+            "mean_return": -0.016547227790221827
+          },
+          "40": {
+            "win_rate": 0.3852526926263463,
+            "mean_return": -0.018547227790221825
+          }
+        }
+      }
+    },
+    "2026-09": {
+      "5": {
+        "candidates": 2469,
+        "matured": 1860,
+        "missing_entry": 117,
+        "pending_or_missing_outcome": 609,
+        "win_rate_gross": 0.4220430107526882,
+        "mean_return_gross": 0.00241563066291528,
+        "terminal_loss_gt_5pct": 0.3365591397849462,
+        "intrahold_low_loss_gt_5pct": 0.532258064516129,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.4220430107526882,
+            "mean_return": 0.00241563066291528
+          },
+          "20": {
+            "win_rate": 0.41236559139784945,
+            "mean_return": 0.00041563066291528013
+          },
+          "40": {
+            "win_rate": 0.4064516129032258,
+            "mean_return": -0.00158436933708472
+          }
+        }
+      },
+      "10": {
+        "candidates": 2469,
+        "matured": 1026,
+        "missing_entry": 117,
+        "pending_or_missing_outcome": 1443,
+        "win_rate_gross": 0.361598440545809,
+        "mean_return_gross": -0.006338242605359047,
+        "terminal_loss_gt_5pct": 0.41325536062378165,
+        "intrahold_low_loss_gt_5pct": 0.7056530214424951,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.361598440545809,
+            "mean_return": -0.006338242605359047
+          },
+          "20": {
+            "win_rate": 0.3567251461988304,
+            "mean_return": -0.008338242605359047
+          },
+          "40": {
+            "win_rate": 0.35282651072124754,
+            "mean_return": -0.010338242605359047
+          }
+        }
+      }
+    }
+  },
+  "rankings": {
+    "5": {
+      "common_decision_days": 59,
+      "pool": {
+        "candidates": 6020,
+        "matured": 6020,
+        "missing_entry": 0,
+        "pending_or_missing_outcome": 0,
+        "win_rate_gross": 0.49551495016611297,
+        "mean_return_gross": 0.0006142020359696203,
+        "terminal_loss_gt_5pct": 0.2569767441860465,
+        "intrahold_low_loss_gt_5pct": 0.4456810631229236,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.49551495016611297,
+            "mean_return": 0.0006142020359696203
+          },
+          "20": {
+            "win_rate": 0.4863787375415282,
+            "mean_return": -0.0013857979640303796
+          },
+          "40": {
+            "win_rate": 0.473421926910299,
+            "mean_return": -0.0033857979640303797
+          }
+        }
+      },
+      "meta": {
+        "candidates": 292,
+        "matured": 292,
+        "missing_entry": 0,
+        "pending_or_missing_outcome": 0,
+        "win_rate_gross": 0.5034246575342466,
+        "mean_return_gross": 0.0074003016003951,
+        "terminal_loss_gt_5pct": 0.2363013698630137,
+        "intrahold_low_loss_gt_5pct": 0.4246575342465753,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.5034246575342466,
+            "mean_return": 0.0074003016003951
+          },
+          "20": {
+            "win_rate": 0.4965753424657534,
+            "mean_return": 0.0054003016003951
+          },
+          "40": {
+            "win_rate": 0.4794520547945205,
+            "mean_return": 0.0034003016003950996
+          }
+        },
+        "mean_daily_excess_vs_pool": 0.00823513378895641,
+        "paired_block_ci_excess": [
+          -0.007795537388959547,
+          0.020338378446501132
+        ]
+      },
+      "completion": {
+        "candidates": 292,
+        "matured": 292,
+        "missing_entry": 0,
+        "pending_or_missing_outcome": 0,
+        "win_rate_gross": 0.5068493150684932,
+        "mean_return_gross": 0.0051138573591116366,
+        "terminal_loss_gt_5pct": 0.21575342465753425,
+        "intrahold_low_loss_gt_5pct": 0.4143835616438356,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.5068493150684932,
+            "mean_return": 0.0051138573591116366
+          },
+          "20": {
+            "win_rate": 0.5,
+            "mean_return": 0.0031138573591116365
+          },
+          "40": {
+            "win_rate": 0.4965753424657534,
+            "mean_return": 0.0011138573591116365
+          }
+        },
+        "mean_daily_excess_vs_pool": 0.0059719415230080316,
+        "paired_block_ci_excess": [
+          -0.010456987161948959,
+          0.018579412104435745
+        ]
+      }
+    },
+    "10": {
+      "common_decision_days": 53,
+      "pool": {
+        "candidates": 5314,
+        "matured": 5314,
+        "missing_entry": 0,
+        "pending_or_missing_outcome": 0,
+        "win_rate_gross": 0.5131727512231841,
+        "mean_return_gross": 0.004478233073326744,
+        "terminal_loss_gt_5pct": 0.2852841550621001,
+        "intrahold_low_loss_gt_5pct": 0.5374482499059089,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.5131727512231841,
+            "mean_return": 0.004478233073326744
+          },
+          "20": {
+            "win_rate": 0.5075272864132481,
+            "mean_return": 0.002478233073326744
+          },
+          "40": {
+            "win_rate": 0.4984945427173504,
+            "mean_return": 0.00047823307332674377
+          }
+        }
+      },
+      "meta": {
+        "candidates": 262,
+        "matured": 262,
+        "missing_entry": 0,
+        "pending_or_missing_outcome": 0,
+        "win_rate_gross": 0.4618320610687023,
+        "mean_return_gross": -0.0015169105031428813,
+        "terminal_loss_gt_5pct": 0.2824427480916031,
+        "intrahold_low_loss_gt_5pct": 0.5114503816793893,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.4618320610687023,
+            "mean_return": -0.0015169105031428813
+          },
+          "20": {
+            "win_rate": 0.44656488549618323,
+            "mean_return": -0.0035169105031428814
+          },
+          "40": {
+            "win_rate": 0.44274809160305345,
+            "mean_return": -0.005516910503142881
+          }
+        },
+        "mean_daily_excess_vs_pool": -0.0014999405674185726,
+        "paired_block_ci_excess": [
+          -0.02112439311268546,
+          0.014279275084906295
+        ]
+      },
+      "completion": {
+        "candidates": 262,
+        "matured": 262,
+        "missing_entry": 0,
+        "pending_or_missing_outcome": 0,
+        "win_rate_gross": 0.46564885496183206,
+        "mean_return_gross": -0.001079146589350132,
+        "terminal_loss_gt_5pct": 0.29770992366412213,
+        "intrahold_low_loss_gt_5pct": 0.5267175572519084,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.46564885496183206,
+            "mean_return": -0.001079146589350132
+          },
+          "20": {
+            "win_rate": 0.4541984732824427,
+            "mean_return": -0.003079146589350132
+          },
+          "40": {
+            "win_rate": 0.42748091603053434,
+            "mean_return": -0.005079146589350133
+          }
+        },
+        "mean_daily_excess_vs_pool": -0.0010671324715178171,
+        "paired_block_ci_excess": [
+          -0.028037192328519384,
+          0.012108288637443131
+        ]
+      }
+    }
+  },
+  "selected_symbols_history": {
+    "600663": {
+      "5": {
+        "candidates": 6,
+        "matured": 5,
+        "missing_entry": 1,
+        "pending_or_missing_outcome": 1,
+        "win_rate_gross": 0.0,
+        "mean_return_gross": -0.020598217056251932,
+        "terminal_loss_gt_5pct": 0.0,
+        "intrahold_low_loss_gt_5pct": 0.0,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.0,
+            "mean_return": -0.020598217056251932
+          },
+          "20": {
+            "win_rate": 0.0,
+            "mean_return": -0.02259821705625193
+          },
+          "40": {
+            "win_rate": 0.0,
+            "mean_return": -0.024598217056251932
+          }
+        }
+      },
+      "10": {
+        "candidates": 6,
+        "matured": 5,
+        "missing_entry": 1,
+        "pending_or_missing_outcome": 1,
+        "win_rate_gross": 0.0,
+        "mean_return_gross": -0.022643670715499952,
+        "terminal_loss_gt_5pct": 0.0,
+        "intrahold_low_loss_gt_5pct": 0.2,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.0,
+            "mean_return": -0.022643670715499952
+          },
+          "20": {
+            "win_rate": 0.0,
+            "mean_return": -0.02464367071549995
+          },
+          "40": {
+            "win_rate": 0.0,
+            "mean_return": -0.026643670715499952
+          }
+        }
+      }
+    },
+    "002832": {
+      "5": {
+        "candidates": 13,
+        "matured": 12,
+        "missing_entry": 1,
+        "pending_or_missing_outcome": 1,
+        "win_rate_gross": 0.3333333333333333,
+        "mean_return_gross": -0.02001695166132758,
+        "terminal_loss_gt_5pct": 0.16666666666666666,
+        "intrahold_low_loss_gt_5pct": 0.5,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.3333333333333333,
+            "mean_return": -0.02001695166132758
+          },
+          "20": {
+            "win_rate": 0.3333333333333333,
+            "mean_return": -0.022016951661327583
+          },
+          "40": {
+            "win_rate": 0.25,
+            "mean_return": -0.02401695166132758
+          }
+        }
+      },
+      "10": {
+        "candidates": 13,
+        "matured": 10,
+        "missing_entry": 1,
+        "pending_or_missing_outcome": 3,
+        "win_rate_gross": 0.2,
+        "mean_return_gross": -0.02840206745277024,
+        "terminal_loss_gt_5pct": 0.2,
+        "intrahold_low_loss_gt_5pct": 0.8,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.2,
+            "mean_return": -0.02840206745277024
+          },
+          "20": {
+            "win_rate": 0.2,
+            "mean_return": -0.030402067452770243
+          },
+          "40": {
+            "win_rate": 0.2,
+            "mean_return": -0.032402067452770245
+          }
+        }
+      }
+    }
+  },
+  "matched_baselines": {
+    "observed_first": {
+      "5": {
+        "market": {
+          "matched_rows": 6386,
+          "unmatched_rows": 0,
+          "signal_win_rate": 0.4882555590353899,
+          "control_win_rate": 0.4764501878658817,
+          "signal_return": -0.0006443319737675274,
+          "control_return": -0.003490638335386374,
+          "mean_daily_excess": -0.0008717439084905893,
+          "paired_block_ci_excess": [
+            -0.00943638139776717,
+            0.008377793763227108
+          ]
+        },
+        "same_names": {
+          "matched_rows": 6386,
+          "unmatched_rows": 0,
+          "signal_win_rate": 0.4882555590353899,
+          "control_win_rate": 0.5080912399304076,
+          "signal_return": -0.0006443319737675274,
+          "control_return": 0.006681090609440821,
+          "mean_daily_excess": -0.01119898183254191,
+          "paired_block_ci_excess": [
+            -0.019320664571120257,
+            -0.0025401702875616295
+          ]
+        }
+      },
+      "10": {
+        "market": {
+          "matched_rows": 5552,
+          "unmatched_rows": 0,
+          "signal_win_rate": 0.5147694524495677,
+          "control_win_rate": 0.5169967575933536,
+          "signal_return": 0.004374872213862838,
+          "control_return": 0.003949078753025632,
+          "mean_daily_excess": -0.005211074125477672,
+          "paired_block_ci_excess": [
+            -0.02222569266298306,
+            0.007548232373294974
+          ]
+        },
+        "same_names": {
+          "matched_rows": 5552,
+          "unmatched_rows": 0,
+          "signal_win_rate": 0.5147694524495677,
+          "control_win_rate": 0.5644925030759244,
+          "signal_return": 0.004374872213862838,
+          "control_return": 0.022341122472174627,
+          "mean_daily_excess": -0.025211396726445387,
+          "paired_block_ci_excess": [
+            -0.042139220529093406,
+            -0.0097670606667206
+          ]
+        }
+      }
+    },
+    "legacy_observed": {
+      "5": {
+        "market": {
+          "matched_rows": 5596,
+          "unmatched_rows": 0,
+          "signal_win_rate": 0.4753395282344532,
+          "control_win_rate": 0.46807801149636136,
+          "signal_return": -0.0023016451890722806,
+          "control_return": -0.004549006818397048,
+          "mean_daily_excess": -0.0008178399824165712,
+          "paired_block_ci_excess": [
+            -0.008822916863736466,
+            0.007515844027643213
+          ]
+        },
+        "same_names": {
+          "matched_rows": 5596,
+          "unmatched_rows": 0,
+          "signal_win_rate": 0.4753395282344532,
+          "control_win_rate": 0.5006199368578188,
+          "signal_return": -0.0023016451890722806,
+          "control_return": 0.00567162387763696,
+          "mean_daily_excess": -0.011153175271456825,
+          "paired_block_ci_excess": [
+            -0.018898095866135785,
+            -0.003369416779547429
+          ]
+        }
+      },
+      "10": {
+        "market": {
+          "matched_rows": 4762,
+          "unmatched_rows": 0,
+          "signal_win_rate": 0.500629987400252,
+          "control_win_rate": 0.5108325046571254,
+          "signal_return": 0.0004856056486799775,
+          "control_return": 0.0033451099096239193,
+          "mean_daily_excess": -0.005717753867332203,
+          "paired_block_ci_excess": [
+            -0.020226571407080163,
+            0.005462816395548866
+          ]
+        },
+        "same_names": {
+          "matched_rows": 4762,
+          "unmatched_rows": 0,
+          "signal_win_rate": 0.500629987400252,
+          "control_win_rate": 0.5602645743013972,
+          "signal_return": 0.0004856056486799775,
+          "control_return": 0.021789359912268665,
+          "mean_daily_excess": -0.025484674797073587,
+          "paired_block_ci_excess": [
+            -0.04042025699684812,
+            -0.010996637411304522
+          ]
+        }
+      }
+    },
+    "monster": {
+      "5": {
+        "market": {
+          "matched_rows": 4979,
+          "unmatched_rows": 0,
+          "signal_win_rate": 0.47740510142598913,
+          "control_win_rate": 0.46224351450082113,
+          "signal_return": -0.003709906503537311,
+          "control_return": -0.006097094291331086,
+          "mean_daily_excess": 0.0012400064219961321,
+          "paired_block_ci_excess": [
+            -0.007991141317682757,
+            0.011410537842924803
+          ]
+        },
+        "same_names": {
+          "matched_rows": 4979,
+          "unmatched_rows": 0,
+          "signal_win_rate": 0.47740510142598913,
+          "control_win_rate": 0.49618099110061054,
+          "signal_return": -0.003709906503537311,
+          "control_return": 0.003470144578762369,
+          "mean_daily_excess": -0.008990224239196052,
+          "paired_block_ci_excess": [
+            -0.01779302008230726,
+            2.8068672638365477e-05
+          ]
+        }
+      },
+      "10": {
+        "market": {
+          "matched_rows": 4520,
+          "unmatched_rows": 0,
+          "signal_win_rate": 0.5073008849557522,
+          "control_win_rate": 0.5125045571724043,
+          "signal_return": 0.0012567430865628919,
+          "control_return": 0.00295826917195745,
+          "mean_daily_excess": -0.004875149266316239,
+          "paired_block_ci_excess": [
+            -0.02134063752701965,
+            0.006290446075520152
+          ]
+        },
+        "same_names": {
+          "matched_rows": 4520,
+          "unmatched_rows": 0,
+          "signal_win_rate": 0.5073008849557522,
+          "control_win_rate": 0.5607726156292718,
+          "signal_return": 0.0012567430865628919,
+          "control_return": 0.02084875065123732,
+          "mean_daily_excess": -0.024439285010699443,
+          "paired_block_ci_excess": [
+            -0.04095096491923285,
+            -0.01040435272702901
+          ]
+        }
+      }
+    },
+    "trend": {
+      "5": {
+        "market": {
+          "matched_rows": 1407,
+          "unmatched_rows": 0,
+          "signal_win_rate": 0.5266524520255863,
+          "control_win_rate": 0.5267238386723044,
+          "signal_return": 0.010203923593911052,
+          "control_return": 0.0057329183132623215,
+          "mean_daily_excess": 0.0016713975919244327,
+          "paired_block_ci_excess": [
+            -0.009002483502189606,
+            0.01955849129040588
+          ]
+        },
+        "same_names": {
+          "matched_rows": 1407,
+          "unmatched_rows": 0,
+          "signal_win_rate": 0.5266524520255863,
+          "control_win_rate": 0.5502384530956952,
+          "signal_return": 0.010203923593911052,
+          "control_return": 0.018043777380406006,
+          "mean_daily_excess": -0.009780180480161129,
+          "paired_block_ci_excess": [
+            -0.021148770279866717,
+            0.008033170657281919
+          ]
+        }
+      },
+      "10": {
+        "market": {
+          "matched_rows": 1032,
+          "unmatched_rows": 0,
+          "signal_win_rate": 0.5474806201550387,
+          "control_win_rate": 0.5366718989719306,
+          "signal_return": 0.01803179436056414,
+          "control_return": 0.008288671104215736,
+          "mean_daily_excess": 0.003001689668655594,
+          "paired_block_ci_excess": [
+            -0.02130652067443689,
+            0.02656651990137091
+          ]
+        },
+        "same_names": {
+          "matched_rows": 1032,
+          "unmatched_rows": 0,
+          "signal_win_rate": 0.5474806201550387,
+          "control_win_rate": 0.5807850333655264,
+          "signal_return": 0.01803179436056414,
+          "control_return": 0.028877479672403922,
+          "mean_daily_excess": -0.019025813812491375,
+          "paired_block_ci_excess": [
+            -0.04654110436716007,
+            0.008076914113448904
+          ]
+        }
+      }
+    }
+  },
+  "wf_candidate_days": 40,
+  "wf_rankings": {
+    "5": {
+      "common_decision_days": 33,
+      "pool": {
+        "candidates": 2472,
+        "matured": 2472,
+        "missing_entry": 0,
+        "pending_or_missing_outcome": 0,
+        "win_rate_gross": 0.438915857605178,
+        "mean_return_gross": 0.0014124443384694286,
+        "terminal_loss_gt_5pct": 0.3070388349514563,
+        "intrahold_low_loss_gt_5pct": 0.5105177993527508,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.438915857605178,
+            "mean_return": 0.0014124443384694286
+          },
+          "20": {
+            "win_rate": 0.42880258899676377,
+            "mean_return": -0.0005875556615305714
+          },
+          "40": {
+            "win_rate": 0.4215210355987055,
+            "mean_return": -0.0025875556615305717
+          }
+        }
+      },
+      "meta": {
+        "candidates": 162,
+        "matured": 162,
+        "missing_entry": 0,
+        "pending_or_missing_outcome": 0,
+        "win_rate_gross": 0.38271604938271603,
+        "mean_return_gross": -0.004923892011908466,
+        "terminal_loss_gt_5pct": 0.32098765432098764,
+        "intrahold_low_loss_gt_5pct": 0.5,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.38271604938271603,
+            "mean_return": -0.004923892011908466
+          },
+          "20": {
+            "win_rate": 0.3765432098765432,
+            "mean_return": -0.0069238920119084665
+          },
+          "40": {
+            "win_rate": 0.36419753086419754,
+            "mean_return": -0.008923892011908467
+          }
+        },
+        "mean_daily_excess_vs_pool": -0.0012044783218942443,
+        "paired_block_ci_excess": [
+          -0.01977454161563651,
+          0.006728531937054727
+        ]
+      },
+      "completion": {
+        "candidates": 162,
+        "matured": 162,
+        "missing_entry": 0,
+        "pending_or_missing_outcome": 0,
+        "win_rate_gross": 0.4506172839506173,
+        "mean_return_gross": 0.004362567668604695,
+        "terminal_loss_gt_5pct": 0.24691358024691357,
+        "intrahold_low_loss_gt_5pct": 0.47530864197530864,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.4506172839506173,
+            "mean_return": 0.004362567668604695
+          },
+          "20": {
+            "win_rate": 0.4444444444444444,
+            "mean_return": 0.0023625676686046954
+          },
+          "40": {
+            "win_rate": 0.4382716049382716,
+            "mean_return": 0.0003625676686046953
+          }
+        },
+        "mean_daily_excess_vs_pool": 0.007913136637155043,
+        "paired_block_ci_excess": [
+          -0.010913286196747297,
+          0.02590953312096463
+        ]
+      },
+      "wf_ic_mix": {
+        "candidates": 162,
+        "matured": 162,
+        "missing_entry": 0,
+        "pending_or_missing_outcome": 0,
+        "win_rate_gross": 0.49382716049382713,
+        "mean_return_gross": 0.008804011777097364,
+        "terminal_loss_gt_5pct": 0.2037037037037037,
+        "intrahold_low_loss_gt_5pct": 0.35802469135802467,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.49382716049382713,
+            "mean_return": 0.008804011777097364
+          },
+          "20": {
+            "win_rate": 0.47530864197530864,
+            "mean_return": 0.006804011777097364
+          },
+          "40": {
+            "win_rate": 0.46296296296296297,
+            "mean_return": 0.004804011777097364
+          }
+        },
+        "mean_daily_excess_vs_pool": 0.01227382721640239,
+        "paired_block_ci_excess": [
+          -0.009847268349339862,
+          0.026351664868374865
+        ]
+      }
+    },
+    "10": {
+      "common_decision_days": 27,
+      "pool": {
+        "candidates": 1766,
+        "matured": 1766,
+        "missing_entry": 0,
+        "pending_or_missing_outcome": 0,
+        "win_rate_gross": 0.38052095130237823,
+        "mean_return_gross": -0.011055203570911679,
+        "terminal_loss_gt_5pct": 0.3822197055492639,
+        "intrahold_low_loss_gt_5pct": 0.6585503963759909,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.38052095130237823,
+            "mean_return": -0.011055203570911679
+          },
+          "20": {
+            "win_rate": 0.37485843714609285,
+            "mean_return": -0.013055203570911679
+          },
+          "40": {
+            "win_rate": 0.37202718006795016,
+            "mean_return": -0.015055203570911679
+          }
+        }
+      },
+      "meta": {
+        "candidates": 132,
+        "matured": 132,
+        "missing_entry": 0,
+        "pending_or_missing_outcome": 0,
+        "win_rate_gross": 0.3181818181818182,
+        "mean_return_gross": -0.02781130721065129,
+        "terminal_loss_gt_5pct": 0.3939393939393939,
+        "intrahold_low_loss_gt_5pct": 0.5984848484848485,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.3181818181818182,
+            "mean_return": -0.02781130721065129
+          },
+          "20": {
+            "win_rate": 0.30303030303030304,
+            "mean_return": -0.02981130721065129
+          },
+          "40": {
+            "win_rate": 0.30303030303030304,
+            "mean_return": -0.031811307210651285
+          }
+        },
+        "mean_daily_excess_vs_pool": -0.015336864009717439,
+        "paired_block_ci_excess": [
+          -0.04405107551651309,
+          0.002060364728185781
+        ]
+      },
+      "completion": {
+        "candidates": 132,
+        "matured": 132,
+        "missing_entry": 0,
+        "pending_or_missing_outcome": 0,
+        "win_rate_gross": 0.3484848484848485,
+        "mean_return_gross": -0.016832917057818995,
+        "terminal_loss_gt_5pct": 0.3560606060606061,
+        "intrahold_low_loss_gt_5pct": 0.6287878787878788,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.3484848484848485,
+            "mean_return": -0.016832917057818995
+          },
+          "20": {
+            "win_rate": 0.32575757575757575,
+            "mean_return": -0.018832917057818997
+          },
+          "40": {
+            "win_rate": 0.32575757575757575,
+            "mean_return": -0.020832917057818996
+          }
+        },
+        "mean_daily_excess_vs_pool": -0.004602438082503638,
+        "paired_block_ci_excess": [
+          -0.020382012919400262,
+          0.0024439146842242213
+        ]
+      },
+      "wf_ic_mix": {
+        "candidates": 132,
+        "matured": 132,
+        "missing_entry": 0,
+        "pending_or_missing_outcome": 0,
+        "win_rate_gross": 0.29545454545454547,
+        "mean_return_gross": -0.019107842902467233,
+        "terminal_loss_gt_5pct": 0.2803030303030303,
+        "intrahold_low_loss_gt_5pct": 0.5378787878787878,
+        "cost_scenarios": {
+          "0": {
+            "win_rate": 0.29545454545454547,
+            "mean_return": -0.019107842902467233
+          },
+          "20": {
+            "win_rate": 0.2878787878787879,
+            "mean_return": -0.021107842902467235
+          },
+          "40": {
+            "win_rate": 0.2878787878787879,
+            "mean_return": -0.023107842902467233
+          }
+        },
+        "mean_daily_excess_vs_pool": -0.006826810019493031,
+        "paired_block_ci_excess": [
+          -0.02313696381443646,
+          0.012744276554152285
+        ]
+      }
+    }
+  },
+  "timestamp_audit": {
+    "observed_rows": 21071,
+    "decision_minus_created_median_hours": 7.999837631944445,
+    "near_positive_8h_rows": 20319
+  },
+  "source": {
+    "archive_sha256": "3ecfe3b80f2ec3c20b244b5cac70418832d714427f7add443e482e076520b5fc",
+    "source_build_commit": "1eda512fe8fa2822ba890630fdd2ce77509d1cd8"
+  },
+  "runtime_facts": {
+    "nas_build_commit": "1eda512fe8fa2822ba890630fdd2ce77509d1cd8",
+    "api_health": "ok; simulation mode; read-only GET /health/deep",
+    "loaded_model_content_hash": "71f64a21c131fe594d871bf4eaa87e75d8667fb722556de0f2f85a8607cb2559",
+    "loaded_model_created_at": "2026-08-16T19:06:43.598054",
+    "model_manifest": "dataset_manifest_v1_50ec7236be71",
+    "model_manifest_capture_counts": [
+      [
+        "dataset_manifest_v1_50ec7236be71",
+        "train",
+        "observed_snapshot",
+        8307
+      ],
+      [
+        "dataset_manifest_v1_50ec7236be71",
+        "calibration",
+        "observed_snapshot",
+        3734
+      ],
+      [
+        "dataset_manifest_v1_50ec7236be71",
+        "test",
+        "observed_snapshot",
+        3936
+      ]
+    ],
+    "model_label": "soup_10d_tp8_before_sl5; next_tradable_vwap",
+    "model_feature_column_count": 197,
+    "model_relative_index_feature_columns": [],
+    "registry": "loaded content matches trained challenger record; no champion",
+    "latest_scan_timestamp": "2026-10-05T21:45:42.926902",
+    "latest_final_count": 0,
+    "latest_data_gate": {
+      "status": "watch_only",
+      "reasons": [
+        "data_stale:5d"
+      ],
+      "data_quality_score": 0.8889,
+      "source_trust_levels": {
+        "provider": "",
+        "degraded_mode": false,
+        "synthetic_fallback_allowed": false,
+        "synthetic": false
+      },
+      "financial_trust_level": "missing"
+    },
+    "price_limits_in_export": "RAW up_limit/down_limit all missing; suspension field always false",
+    "source_archive_path": "/Volumes/workSSD/software development/StockAnalyzer/tmp_signal_reaudit_20261007/source.json.gz",
+    "audit_script_sha256": "78941235d0eca0c81166ef1f4b280934a5adb6d6fe5e4d563d16d919f6049e2e"
+  },
+  "interpretation": {
+    "status": "ANALYSIS_COMPLETED; audit code/tests completed; no model repair, training, freeze, preflight or deployment",
+    "reproduced": "Original mixed dedup cohort: 5D 47.53% / -0.230%, 10D 50.06% / +0.049%; 600663 0/5, 002832 4/12 at 5D.",
+    "incorrect_aggregate": "62.84%/+2.958% and 68.30%/+6.292% are replayed-only, not all 19,500 samples. Matured pooled results are 58.30%/+2.014% and 63.49%/+4.645%.",
+    "dedup_bias": "Deduplicate separately by provenance. Mixing modes first removes 790 observed candidates; independent observed cohort has 6997 candidate rows.",
+    "baseline_weighting": "Match market and same-name controls by entry date. On corrected cohort, 5D observed 48.83% vs market 47.65%, 10D 51.48% vs market 51.70%. Market paired moving-block confidence intervals contain zero; same-name diagnostic remains stronger.",
+    "causality": "Serving artifact trained on 15,977 observed gold samples with soup v1 label. The v3 bronze models are separate challengers. Bronze cannot currently be identified as the cause of serving-model weakness.",
+    "timezone": "NAS process clock is Asia/Shanghai. Naive datetime.now() is serialized with replace(tzinfo=UTC); snapshots decision time is roughly 8 hours later than UTC created_at. For this audit only, recorded wall-clock date is explicitly retained; history is not overwritten.",
+    "model_probabilities": "Serving model predicts TP8-before-SL5 over 10D, not P(5D net return >0). ScoreEngine total_score/100 is not an upward probability. A rank v3 model also would not predict that event.",
+    "strategies": "Restored observed trend 5D 52.67%/+1.020%, monster 47.74%/-0.371%. Same-entry-date market control for trend 52.67%; trend edge is not established.",
+    "walk_forward": "Our fixed independent protocol gives 33 fully mature 5D evaluation days / 162 selections: meta 38.27%/-0.492%, completion 45.06%/+0.436%, IC mix 49.38%/+0.880%. IC mix excess CI [-0.985%,+2.635%] contains zero. 10D IC mix 29.55%/-1.911%. Earlier 28-day probe exact weights/tie handling were unavailable; its precise figures were not independently reproduced.",
+    "limitations": "Logged candidates, not final actionable recommendations. QFQ research ratios, not trades. No fill/limit-down/T+1 execution replay, no cash dividends reconciliation. Costs 20/40bp are sensitivity scenarios only. Same-name universe is retrospective. Repeated weekend/stale scans and overlapping holdings reduce independence. Three months are insufficient to certify stability; count of unique scores alone does not prove model collapse.",
+    "priorities": [
+      "Audit/fix timestamp and identity contracts for new records; preserve history with explicit migration provenance.",
+      "Define separate absolute event-probability label for chosen horizon/costs and expected return/downside heads; do not reinterpret soup or rank scores as upward probability.",
+      "Separate trend/monster and fresh/stale/non-actionable stages; retain final scores, actions, gate status, score source, feature compute version and loaded model hash in immutable decision evidence.",
+      "Validate training/live feature values and as-of sources. Serving 197-column model has none of the relative-index features; existing index-feed fixes are not automatically learned by that artifact.",
+      "Use longer PIT-safe training panels; replay must be historically blind and matched to live population. Observed-only live-performance reports plus source-separated training gates; no arbitrary universal bronze percentage threshold.",
+      "Pre-register purged walk-forward, matched baselines, actual execution/cost/no-fill assumptions, Top-K and coverage/downside gates; require new future shadow evidence before model replacement."
+    ]
+  }
+}
