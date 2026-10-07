@@ -23,6 +23,10 @@ from stock_analyzer.research.trend_data_readiness import (
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", required=True, help="market.duckdb 路径（只读打开）")
+    parser.add_argument(
+        "--minute-db", default="",
+        help="带时刻的分钟研究库（scripts/sync_tail_minute_bars.py 产物，只读）",
+    )
     parser.add_argument("--out", default="artifacts/research/trend_data_readiness.json")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
@@ -33,10 +37,18 @@ def main(argv: list[str] | None = None) -> int:
         return 5
 
     connection = duckdb.connect(str(db_path), read_only=True)
+    minute_connection = (
+        duckdb.connect(str(Path(args.minute_db)), read_only=True)
+        if args.minute_db and Path(args.minute_db).exists() else None
+    )
     try:
-        report = audit_trend_data_readiness(connection=connection)
+        report = audit_trend_data_readiness(
+            connection=connection, minute_connection=minute_connection
+        )
     finally:
         connection.close()
+        if minute_connection is not None:
+            minute_connection.close()
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

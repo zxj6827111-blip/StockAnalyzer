@@ -18,7 +18,7 @@ As-of: 2026-10-08 @ HEAD `59c2d0f`
 | D4 | `max_hold_days` 声明 10、消费方 fallback 5 | `default.yaml:255` vs `runtime/service.py:14348`、`:16252` | 同一信号在不同路径对应不同平仓日 |
 | D5 | **1 万元参考金额此前不存在**，最近的是 100 000 | `alpha_v2/research/outcomes.py:75` | 差一个数量级会改变最低佣金占比 → 改变"扣费后是否盈利"的标签 |
 | D6 | 按日期冻结的成本表**只对印花税分段**，佣金/最低佣金/过户费/滑点没有历史档 | `config.py:821-823`（本次已扩展，见 ADR-003 §5） | 历史净收益其实按当前成本补算，无法与当时口径区分 |
-| D7 | 分钟行情落库**只有日级聚合列、没有 bar 时刻列** | `market_warehouse.py:274-309`（12 个聚合列） | 14:30-14:50 逐 5 分钟确认与"确认后下一根成交"**不可重建** → 尾盘验证与净盈利标签训练 blocked |
+| D7 | 分钟行情落库**只有日级聚合列、没有 bar 时刻列** | `market_warehouse.py:274-309`（12 个聚合列） | 14:30-14:50 逐 5 分钟确认与"确认后下一根成交"**不可重建** → 尾盘验证与净盈利标签训练 blocked。2026-10-08 修正根因定位：时刻在**源**里是有的（`normalize_vendor_minute_frame` 以 `datetime` 为索引），是 `summarize_minute_bars` 落库前折成一天一行；采集通路见 `scripts/sync_tail_minute_bars.py` + ADR-003 §6 |
 | D8 | `scripts/sync_index_daily.py` **没有调度入口**，`index_daily` 两个库停在 2026-08-14 | 该脚本 `:4-8` 自述 `market_warehouse_sync` never ran | 相对强弱特征在近期窗口上是滞后/缺失的 |
 | D9 | 指数缺失可被静默变成"空帧"，进而让 rs 族失去意义 | `feature/snapshot.py:1949-1968`（异常返回空帧）、`engineer.py:371` 只在**全 NaN** 时给 NaN | 部分过期的指数会让横截面 pct_change 错位，但仍被当有效特征 |
 | D10 | 分层截断配置**互相矛盾**：夜间 quality 300、非夜间 100，`week5.night_*` 键不在 YAML 里 | `config.py:501-503` vs `default.yaml:398` | 同一层名在不同 profile 下代表不同规模，跨日比较失去意义 |

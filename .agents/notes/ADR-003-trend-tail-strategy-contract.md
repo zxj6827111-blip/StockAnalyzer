@@ -122,12 +122,37 @@ As-of: 2026-10-08 @ HEAD `f0f9f24`（本 ADR 与 `contracts/trend_strategy.py`�
 落库的分钟表 `intraday_summary_1m` / `intraday_summary_5m` 只有 12 个**日级聚合列**
 （`minute_count / last30_return / close_position` 等），没有任何 bar 时刻列
 （`market_warehouse.py:274-309`）。因此 14:30–14:50 的逐 5 分钟确认与"确认后下一根
-成交"无法从历史数据重建 → `research/trend_data_readiness.py` 的
+成交"无法从**落库数据**重建 → `research/trend_data_readiness.py` 的
 `tail_window_minute_bars` 判 **blocked**，退出码 5。
 
-结论：**尾盘策略的历史验证与 `p_net_profit_5d_tail` 的真实模型训练目前不可执行**。
-必须先采集带时刻的分钟行情（并让 `scripts/sync_index_daily.py` 真正进调度 —— 它没有
-调度入口，`index_daily` 两个库停在 2026-08-14），再谈 §4 的选股质量验收。
+**2026-10-08 修正了对根因的判断**：这不是"源数据没有分钟时刻"。
+`data/vendor_zip_overlay.normalize_vendor_minute_frame` 读源 CSV 时就带着
+`datetime` 列并以它为索引，是 `data/intraday_summary.summarize_minute_bars`
+在落库前把它折成了一行一天。也就是说时刻信息**在源里存在，在管道里被丢掉**。
+（`read_tdx_minute_bars` 同样能解出带日期的分钟 bar。）
+
+因此采集侧的通路已经建好，且刻意只写独立研究库、不进生产 provider：
+
+```text
+scripts/sync_tail_minute_bars.py   本地跑：vendor ZIP → artifacts/research/
+                                   tail_minute_bars.duckdb（表 minute_bars_1min）
+research/minute_bar_store.py       按分钟存 bar；price_basis / bar_time_semantics
+                                   必须显式声明；bars_for() 直接吐契约要的形状，
+                                   非 raw 口径拒绝用于成交模拟
+scripts/audit_trend_data_readiness.py --minute-db <研究库>
+                                   只有研究库里真的有带时刻的 bar，
+                                   tail_window_minute_bars 才允许翻成 ok
+```
+
+**仍然没解决的两件事**（所以 §4 的选股质量验收现在依旧不可执行）：
+
+1. 本机没有 vendor 离线包（`--root` 指向外部路径），历史分钟**实际能覆盖多少个交易日**
+   还没测过；尾盘验证需要 ≥4 个测试折 + 标签真实成熟，覆盖不够就还是 blocked。
+   这一步必须在有源包的本机跑，不放 NAS。
+2. `scripts/sync_index_daily.py` **没有调度入口**，`index_daily` 两个库停在
+   2026-08-14 → 相对强弱特征滞后（这是另一条链路的缺口，不因分钟库而消失）。
+
+结论不变：**不得用开盘回测顶替尾盘策略验证**。
 
 ## 7. Implementation Locations
 
@@ -156,11 +181,18 @@ As-of: 2026-10-08 @ HEAD `f0f9f24`（本 ADR 与 `contracts/trend_strategy.py`�
   （只有读接口，没有手动 run 入口）
 - `frontend/src/pages/TailShadow.tsx` + `frontend/src/App.tsx` —— "尾盘确认"页：
   候选 / 最终推荐 / 成交状态分列，元信息缺失即报错
+- `src/stock_analyzer/research/minute_bar_store.py` —— 带时刻的分钟研究库
+  （表 `minute_bars_1min/5min`）；`price_basis` / `bar_time_semantics` 强制声明，
+  非 raw 拒绝用于成交模拟
+- `scripts/sync_tail_minute_bars.py` —— 本地把 vendor 分钟 ZIP 落到研究库
+  （`--price-basis` / `--bar-time-semantics` 无默认值，读不到就退出码 5）
+- `scripts/audit_trend_data_readiness.py --minute-db` —— 就绪门多看一个来源，
+  判定标准不变
 - 测试（2026-10-08 实测条数）：`test_trend_strategy_contract.py`(55)、
   `test_tail_net_profit_label.py`(19)、`test_trend_data_readiness.py`(13)、
   `test_funnel_trace.py`(16)、`test_tail_net_profit_trainer.py`(19)、
   `test_trend_candidate_contract.py`(13)、`test_trend_tail_shadow_runtime.py`(17)、
-  `test_trend_tail_page_and_feedback.py`(25)
+  `test_trend_tail_page_and_feedback.py`(25)、`test_minute_bar_store.py`(15)
 
 ## 8. 尚未接线的调用方（升级 Accepted 前必须改完）
 

@@ -115,8 +115,13 @@ def audit_trend_data_readiness(
     contract: TrendStrategyContract = DEFAULT_TREND_CONTRACT,
     benchmark_codes: tuple[str, ...] = ("000300", "399001"),
     min_rows_per_day: int = MIN_DAILY_ROWS_PER_DAY,
+    minute_connection: Any | None = None,
 ) -> dict[str, Any]:
-    """按尾盘策略契约的要求探测仓库数据，返回可审计的就绪报告。"""
+    """按尾盘策略契约的要求探测仓库数据，返回可审计的就绪报告。
+
+    ``minute_connection`` 指向带时刻的分钟研究库（可选）：只有它真的非空，
+    ``tail_window_minute_bars`` 才会从 blocked 翻成 ok。
+    """
     probe = _Probe(connection)
     try:
         tables = probe.tables()
@@ -141,7 +146,10 @@ def audit_trend_data_readiness(
     checks.append(_audit_trade_status(probe, bars_table, tables))
     checks.append(_audit_security_status_intervals(probe, tables))
     checks.append(_audit_index_continuity(probe, bars_table, tables, benchmark_codes))
-    checks.append(_audit_tail_minute_bars(probe, tables))
+    checks.append(_audit_tail_minute_bars(
+        probe, tables,
+        minute_probe=(_Probe(minute_connection) if minute_connection is not None else None),
+    ))
     checks.append(_audit_calendar(probe, bars_table))
 
     blocking = [check.name for check in checks if check.status == STATUS_BLOCKED]
@@ -375,38 +383,53 @@ def _audit_index_continuity(
     )
 
 
-def _audit_tail_minute_bars(probe: _Probe, tables: set[str]) -> ReadinessCheck:
+def _audit_tail_minute_bars(
+    probe: _Probe,
+    tables: set[str],
+    *,
+    minute_probe: _Probe | None = None,
+) -> ReadinessCheck:
     """尾盘窗口能不能重建：需要**带时间戳的**分钟 bar，而不是日级汇总。
 
     ``intraday_summary_1m/5m`` 只有 12 个日级聚合列（minute_count / last30_return
     等），没有 bar 时刻列，因此 14:30–14:50 的逐 5 分钟确认与"确认后下一根成交"
     无法从落库数据重建。这一项必须是 ``blocked``，且**不得**改用开盘价回测顶替。
+
+    ``minute_probe`` 是带时刻的**分钟研究库**（``research/minute_bar_store.py``
+    的产物）：它存在且非空时本项才允许翻成 ok，判定标准不变，只是多看一个来源。
     """
     name = "tail_window_minute_bars"
+    sources: list[tuple[str, _Probe, set[str]]] = [("warehouse", probe, tables)]
+    if minute_probe is not None:
+        sources.append(("research_minute", minute_probe, minute_probe.tables()))
     looked: dict[str, Any] = {}
-    for interval, candidates in MINUTE_TABLES.items():
-        table = _pick(tables, candidates)
-        if table is None:
-            looked[interval] = {"table": None, "candidates": list(candidates)}
-            continue
-        columns = probe.columns(table)
-        time_column = _pick(columns, BAR_TIME_COLUMNS)
-        rows = int(probe.scalar(f"SELECT COUNT(*) FROM {table}") or 0)
-        tail_bars = None
-        if time_column is not None:
-            tail_bars = probe.scalar(
-                f"SELECT COUNT(*) FROM {table} WHERE "
-                f"date_part('hour', CAST({time_column} AS TIMESTAMP)) = 14 AND "
-                f"date_part('minute', CAST({time_column} AS TIMESTAMP)) BETWEEN 30 AND 50"
-            )
-        looked[interval] = {
-            "table": table,
-            "rows": rows,
-            "has_bar_time_column": time_column is not None,
-            "bar_time_column": time_column,
-            "tail_window_bar_rows": int(tail_bars or 0),
-            "columns": sorted(columns),
-        }
+    for label, active, available in sources:
+        for interval, candidates in MINUTE_TABLES.items():
+            table = _pick(available, candidates)
+            key = interval if label == "warehouse" else f"{label}:{interval}"
+            if table is None:
+                looked[key] = {"table": None, "candidates": list(candidates),
+                               "source": label}
+                continue
+            columns = active.columns(table)
+            time_column = _pick(columns, BAR_TIME_COLUMNS)
+            rows = int(active.scalar(f"SELECT COUNT(*) FROM {table}") or 0)
+            tail_bars = None
+            if time_column is not None:
+                tail_bars = active.scalar(
+                    f"SELECT COUNT(*) FROM {table} WHERE "
+                    f"date_part('hour', CAST({time_column} AS TIMESTAMP)) = 14 AND "
+                    f"date_part('minute', CAST({time_column} AS TIMESTAMP)) BETWEEN 30 AND 50"
+                )
+            looked[key] = {
+                "table": table,
+                "source": label,
+                "rows": rows,
+                "has_bar_time_column": time_column is not None,
+                "bar_time_column": time_column,
+                "tail_window_bar_rows": int(tail_bars or 0),
+                "columns": sorted(columns),
+            }
     usable = any(
         isinstance(info, dict) and info.get("has_bar_time_column") and info.get("rows")
         for info in looked.values()
@@ -418,7 +441,9 @@ def _audit_tail_minute_bars(probe: _Probe, tables: set[str]) -> ReadinessCheck:
         STATUS_BLOCKED,
         looked,
         "落库的分钟表只有日级聚合、没有 bar 时刻列，14:30-14:50 确认与确认后成交无法重建；"
-        "尾盘策略验证记为阻塞，必须继续采集带时刻的分钟行情，不得用开盘回测代替",
+        "尾盘策略验证记为阻塞，必须继续采集带时刻的分钟行情"
+        "（scripts/sync_tail_minute_bars.py → research/minute_bar_store.py），"
+        "不得用开盘回测代替",
     )
 
 
