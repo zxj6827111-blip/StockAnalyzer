@@ -372,6 +372,35 @@ class SoupStrategyConfig(_StrictModel):
     disagreement_probe_max_position: float = 0.01
 
 
+class TrendStrategyConfig(_StrictModel):
+    """trend 尾盘策略契约的唯一配置声明。
+
+    字段名与 ``contracts.trend_strategy.TrendStrategyContract`` 的参数一一对应，
+    由 ``contract_from_config()`` 直接构造；契约自身做 fail-closed 校验。
+    """
+
+    contract_version: str = "trend_tail_v1"
+    strategy: str = "trend"
+    timezone: str = "Asia/Shanghai"
+    entry_window_start: str = "14:30"
+    entry_window_end: str = "14:50"
+    check_interval_minutes: int = 5
+    fill_bar_offset: int = 1
+    reference_notional: float = 10_000.0
+    take_profit_pct: float = 0.08
+    stop_loss_pct: float = 0.05
+    holding_days: int = 5
+    entry_day_counts_as_holding_day: bool = True
+    same_bar_conflict_policy: str = "stop_loss_first"
+    exit_defer_max_sessions: int = 5
+    max_final_recommendations: int = 3
+    min_net_profit_probability: float = 0.60
+    max_quote_age_seconds: int = 120
+    execution_price_basis: str = "raw"
+    cost_model_version: str = "cost_schedule_v2"
+    corporate_action_uncertain: bool = True
+
+
 class CapitalCurveConfig(_StrictModel):
     drawdown_alert: float = 5.0
     drawdown_reduce: float = 10.0
@@ -820,8 +849,18 @@ class LimitRuleVersionEntry(_StrictModel):
 
 
 class CostScheduleEntry(_StrictModel):
+    """按日期冻结的交易成本档位（``from`` 生效日起，取不晚于交易日的那一档）。
+
+    只有被显式赋值的字段参与覆盖，``None`` 表示沿用 ``backtest_matcher`` 的静态值。
+    旧 YAML 只声明 ``stamp_tax_rate``，行为与扩展前完全一致。
+    """
+
     from_date: str = Field(alias="from")
     stamp_tax_rate: float = 0.0005
+    commission_rate: float | None = None
+    min_commission_per_order: float | None = None
+    transfer_fee_rate: float | None = None
+    slippage_ratio: float | None = None
 
 
 class LimitRuleConfig(_StrictModel):
@@ -2013,6 +2052,7 @@ class StockAnalyzerConfig(_StrictModel):
     score: ScoreConfig
     strategy_scores: dict[str, StrategyScoreConfig] = Field(default_factory=dict)
     soup_strategy: SoupStrategyConfig
+    trend_strategy: TrendStrategyConfig = Field(default_factory=TrendStrategyConfig)
     capital_curve: CapitalCurveConfig
     circuit_breaker: CircuitBreakerConfig
     monster_risk: MonsterRiskConfig = Field(default_factory=MonsterRiskConfig)
