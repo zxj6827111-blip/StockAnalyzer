@@ -2,7 +2,7 @@
 
 Status: Draft
 
-As-of: 2026-10-08 @ HEAD `59c2d0f`（本 ADR 与 `contracts/trend_strategy.py`、
+As-of: 2026-10-08 @ HEAD `16d6b96`（本 ADR 与 `contracts/trend_strategy.py`、
 `labels/tail_net_profit.py`、`research/trend_data_readiness.py`、
 `research/funnel_trace.py` 同批提交）
 
@@ -13,10 +13,12 @@ As-of: 2026-10-08 @ HEAD `59c2d0f`（本 ADR 与 `contracts/trend_strategy.py`�
 ```text
 已接：  契约模块自身（入场/成交/出场/成本/准入排序）、净盈利标签构造、
         数据就绪审计、漏斗留档。
-未接：  runtime 实时链路的最终推荐出口（现在仍是 week5 综合分 + final_signal_cap=5）、
-        历史验证入口（asof_backtest 仍是 default_horizon_days=10 + 开盘口径）、
-        以及任何真实 p_net_profit_5d_tail 模型的训练 —— 后者被 §6 的分钟行情
-        阻塞卡住，不是没做，是做不了。
+已接（影子）：盘中的 run_live_runtime 现在额外跑一条尾盘影子链路并逐日留档
+        （不改旧输出）—— 这是 §4 未来影子验证的证据来源。
+未接：  runtime 旧路径的最终推荐出口（仍是 week5 综合分 + final_signal_cap=5，
+        按计划要等证据达标后单独切换）、历史验证入口（asof_backtest 仍是
+        default_horizon_days=10 + 开盘口径）、以及任何真实 p_net_profit_5d_tail
+        模型的训练 —— 后两者被 §6 的分钟行情阻塞卡住，不是没做，是做不了。
 ```
 
 三条消费路径全部改指本契约、且 §4 的"线上与历史判定一致"在真实数据上验过之后，
@@ -135,9 +137,13 @@ As-of: 2026-10-08 @ HEAD `59c2d0f`（本 ADR 与 `contracts/trend_strategy.py`�
 
 ## 8. 尚未接线的调用方（升级 Accepted 前必须改完）
 
-| 位置 | 现在的口径 | 应改成 |
+| 位置 | 现在的口径 | 状态 |
 | --- | --- | --- |
-| `runtime/service.py:7267 _final_signal_selector` | `funnel_score` + `final_signal_min_threshold=70`、cap 5 | `rank_final_recommendations()` |
-| `runtime/services/week5_automation_service.py:1241 run_live_runtime` | 全时段雷达节奏，无尾盘窗口判定 | 调 `evaluate_tail_entry()` |
-| `labels/soup.py` + `LabelsConfig` | 开盘入场、8%/5%/10d | 保留（旧标签不改写），新路径用 `tail_net_profit` |
-| `backtest/holding_curve.py` / `AsofBacktestConfig` | horizon 10、开盘口径 | 调 `simulate_tail_exit()` 或显式标注为"另一个策略" |
+| `runtime/services/week5_automation_service.py:1241 run_live_runtime` | 全时段雷达节奏，无尾盘窗口判定 | **已接（影子）**：`_trend_tail_shadow_report()` 调 `TrendTailShadowService`，内部用 `evaluate_tail_entry` + `rank_final_recommendations`；只新增 `report["trend_tail_shadow"]`，**不改写 `actionable_signals`**（AST 守卫测试钉住）。旧路径继续服务真实推送 |
+| `runtime/service.py:7267 _final_signal_selector` | `funnel_score` + `final_signal_min_threshold=70`、cap 5 | **未接**。它是旧路径的唯一出口，接管即等于生产切换，必须等证据达标后单独发布（§5） |
+| `labels/soup.py` + `LabelsConfig` | 开盘入场、8%/5%/10d | **不改写**（按计划要求旧标签保留原语义）；新路径已有 `labels/tail_net_profit.py` |
+| `backtest/holding_curve.py` / `AsofBacktestConfig` | horizon 10、开盘口径 | **未接**，且当前无法接：`simulate_tail_exit` 需要带时刻的分钟 bar（§6 阻塞）。在此之前它是"另一个策略"的验证器，不能给尾盘背书 |
+
+影子链路当前必然输出 0 只，原因是真实的：既没有 `p_net_profit_5d_tail` 的生产者
+（`no_tail_probability_available`），也没有带时刻的分钟行情
+（`minute_bars_unavailable`）。这两个原因都由留档写下来，不是静默空结果。

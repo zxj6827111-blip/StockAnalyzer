@@ -248,7 +248,8 @@ def archive_final_recommendations(
     for rank, candidate in enumerate(result.selected, start=1):
         snapshot = snapshots.get(candidate.symbol)
         caveats: list[str] = []
-        if snapshot is None:
+        # 空 dict 与缺失等价：没有特征的"快照"代表不了这条推荐凭什么被选出。
+        if not snapshot:
             caveats.append(MISSING_FEATURE_SNAPSHOT)
         fill = fill_map.get(candidate.symbol)
         if fill is None:

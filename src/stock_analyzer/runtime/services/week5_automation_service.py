@@ -8,7 +8,7 @@ state, snapshot replay, stage separation and signal-only safety.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, tzinfo
 from queue import Empty, Queue
 from threading import Event, Lock, Thread
@@ -20,6 +20,9 @@ import pandas as pd
 
 from stock_analyzer.feature.snapshot import load_feature_snapshot, snapshot_is_current
 from stock_analyzer.ops.nightly_readiness import check_nightly_readiness
+from stock_analyzer.runtime.services.trend_tail_shadow_service import (
+    TrendTailShadowService,
+)
 from stock_analyzer.runtime.services.week5_candidate_state import CandidateStateStore
 from stock_analyzer.runtime.services.week5_market_snapshot_service import (
     Week5MarketSnapshotService,
@@ -52,6 +55,8 @@ class RuntimeWeek5AutomationService:
         )
 
         self._live_shadow_cycle = LiveShadowCycleService(service)
+        # trend 尾盘影子链路：算自己的最终推荐并留档，不改 actionable_signals。
+        self._trend_tail_shadow = TrendTailShadowService(service)
         self._market_radar_lock = Lock()
         self._market_radar_active = False
         self._market_radar_worker: Thread | None = None
@@ -1312,6 +1317,10 @@ class RuntimeWeek5AutomationService:
             "notify_enabled": bool(notify_enabled),
             "signal_only": True,
         }
+        report["trend_tail_shadow"] = self._trend_tail_shadow_report(
+            pool_rows=pool_rows,
+            now=now,
+        )
         self._emit_actionable_notifications(
             report,
             notify_enabled=notify_enabled,
@@ -1330,6 +1339,33 @@ class RuntimeWeek5AutomationService:
             trade_date=now.date().isoformat(),
         )
         return report
+
+    def _trend_tail_shadow_report(
+        self,
+        *,
+        pool_rows: Sequence[Mapping[str, Any]],
+        now: datetime,
+    ) -> dict[str, object]:
+        """跑一次尾盘影子链路。
+
+        失败不静默吞掉：异常转成报告里的 ``ok=false`` + 错误串，既不让 job 挂掉，
+        也不留下"看起来正常"的空白（计划 §3.1「记录失败必须可见」）。
+        分钟行情与 ``p_net_profit_5d_tail`` 概率目前都没有生产者，因此这里必然
+        输出 0 只并写明阻塞原因 —— 那是事实，不是待补的空格。
+        """
+        try:
+            return self._trend_tail_shadow.run(
+                timestamp=now,
+                watch_pool=[dict(row) for row in pool_rows],
+            )
+        except Exception as exc:  # noqa: BLE001 - job 边界：失败可见但不中断主链
+            return {
+                "ok": False,
+                "mode": "shadow",
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+                "final_symbols": [],
+            }
 
     def latest_live_runtime(self) -> dict[str, object]:
         return _mapping(self.candidate_state().get("latest_live_runtime"))
