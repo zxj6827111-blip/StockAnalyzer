@@ -221,18 +221,23 @@ def test_page_view_states_probability_meaning_notional_and_data_date(tmp_path) -
     assert meta["contract_version"] == CONTRACT.contract_version
     assert meta["contract_digest"] == CONTRACT.digest()
     assert meta["entry_window"] == ["14:30", "14:50"]
+    assert meta["max_recommendations"] == 3
+    assert meta["holding_days"] == CONTRACT.holding_days
+    # 阈值来自契约，且页面拿到的是真实数值而不是缺省 0。
+    assert meta["min_net_profit_probability"] == pytest.approx(0.60)
     # 口径必须写成"扣费后净收益>0"，不能让页面把它读成涨幅预期或命中证明。
     assert "净收益" in meta["probability_meaning"]
     assert "滑点" in meta["probability_meaning"]
+    assert str(CONTRACT.holding_days) in meta["probability_meaning"]
 
 
 @pytest.mark.parametrize("missing", [
-    "trade_date", "probability_field", "reference_notional",
-    "contract_version", "contract_digest",
+    "trade_date", "probability_field", "reference_notional", "contract_version",
+    "contract_digest", "strategy", "entry_window", "min_net_profit_probability",
 ])
 def test_page_view_refuses_to_guess_missing_meta(tmp_path, missing: str) -> None:
     report = dict(_report(tmp_path, ["600000.SH"], {"600000.SH": 0.71}))
-    report[missing] = ""
+    report[missing] = [] if missing == "entry_window" else ""
     with pytest.raises(ValueError, match=missing):
         page_view(report)
 

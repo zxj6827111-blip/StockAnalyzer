@@ -2,9 +2,9 @@
 
 Status: Draft
 
-As-of: 2026-10-08 @ HEAD `16d6b96`（本 ADR 与 `contracts/trend_strategy.py`、
+As-of: 2026-10-08 @ HEAD `f0f9f24`（本 ADR 与 `contracts/trend_strategy.py`、
 `labels/tail_net_profit.py`、`research/trend_data_readiness.py`、
-`research/funnel_trace.py` 同批提交）
+`research/funnel_trace.py`、`research/tail_mature_feedback.py` 同批演进）
 
 ## 1. Status 为什么是 Draft
 
@@ -15,6 +15,9 @@ As-of: 2026-10-08 @ HEAD `16d6b96`（本 ADR 与 `contracts/trend_strategy.py`�
         数据就绪审计、漏斗留档。
 已接（影子）：盘中的 run_live_runtime 现在额外跑一条尾盘影子链路并逐日留档
         （不改旧输出）—— 这是 §4 未来影子验证的证据来源。
+已接（展示与反馈）：GET /week5/tail-shadow/{latest,history} + 前端"尾盘确认"页
+        （候选 / 最终推荐 / 成交状态分列）；research/tail_mature_feedback 按模型
+        版本 / 市场状态 / 拒绝原因聚合，输出上限是 challenger 建议。
 未接：  runtime 旧路径的最终推荐出口（仍是 week5 综合分 + final_signal_cap=5，
         按计划要等证据达标后单独切换）、历史验证入口（asof_backtest 仍是
         default_horizon_days=10 + 开盘口径）、以及任何真实 p_net_profit_5d_tail
@@ -95,6 +98,15 @@ As-of: 2026-10-08 @ HEAD `16d6b96`（本 ADR 与 `contracts/trend_strategy.py`�
 / 契约摘要不匹配），与 ADR-001 的身份纪律一致；旧综合分、S/A 等级、分歧试探、
 恢复买入都不参与新路径资格。
 
+停牌判定两侧不对称，是刻意的：
+
+- **入场与出场都认 `trade_status` 里的显式停牌码**（`S/halt/停牌/...`，
+  `SUSPENDED_TRADE_STATUS`）以及 `suspended/is_suspended/suspend` 标记。只认显式
+  布尔标记会漏掉真实数据里唯一会说停牌的字段，把停牌股当成可买可卖。
+- **缺状态或 `unknown` 不算停牌**（"不把缺 bar 当停牌"）。入场侧因此可能继续，
+  出场侧由 `_trade_status_declared()` 兜住：状态未声明 → `unknown_trade_status`
+  → 不确定样本，不生成已实现盈亏标签。
+
 ## 5. 数据契约侧的同批变更
 
 - `CostScheduleEntry` 从"只对 `stamp_tax_rate` 分段"扩展为可覆盖
@@ -132,8 +144,23 @@ As-of: 2026-10-08 @ HEAD `16d6b96`（本 ADR 与 `contracts/trend_strategy.py`�
 - `src/stock_analyzer/models/output_semantics.py` —— `net_profit_5d_tail` 语义登记
 - `src/stock_analyzer/research/trend_data_readiness.py` + `scripts/audit_trend_data_readiness.py`
 - `src/stock_analyzer/research/funnel_trace.py` —— 分层留档与最终推荐留档
-- `tests/test_trend_strategy_contract.py`（53）、`tests/test_tail_net_profit_label.py`（18）、
-  `tests/test_trend_data_readiness.py`（13）、`tests/test_funnel_trace.py`（16）
+- `src/stock_analyzer/models/tail_net_profit_trainer.py` —— 日期切分 +  embargo、
+  LR 基线 / 既有 LightGBM 参数、独立校准段、5pp 分块 bootstrap 判定
+- `src/stock_analyzer/feature/trend_candidate_contract.py` —— 硬门/预测规则分类、
+  先算后截、四组特征消融与"缺失不填零"
+- `src/stock_analyzer/runtime/services/trend_tail_shadow_service.py` —— 影子链路 +
+  `page_view()` / `tail_shadow_page()` / `tail_shadow_history()`
+- `src/stock_analyzer/research/tail_mature_feedback.py` —— 成熟结果按模型版本 /
+  市场状态 / 拒绝原因反馈，输出止于 challenger 建议
+- `src/stock_analyzer/api/week5.py` —— `GET /week5/tail-shadow/latest|history`
+  （只有读接口，没有手动 run 入口）
+- `frontend/src/pages/TailShadow.tsx` + `frontend/src/App.tsx` —— "尾盘确认"页：
+  候选 / 最终推荐 / 成交状态分列，元信息缺失即报错
+- 测试（2026-10-08 实测条数）：`test_trend_strategy_contract.py`(55)、
+  `test_tail_net_profit_label.py`(19)、`test_trend_data_readiness.py`(13)、
+  `test_funnel_trace.py`(16)、`test_tail_net_profit_trainer.py`(19)、
+  `test_trend_candidate_contract.py`(13)、`test_trend_tail_shadow_runtime.py`(17)、
+  `test_trend_tail_page_and_feedback.py`(25)
 
 ## 8. 尚未接线的调用方（升级 Accepted 前必须改完）
 
@@ -142,6 +169,7 @@ As-of: 2026-10-08 @ HEAD `16d6b96`（本 ADR 与 `contracts/trend_strategy.py`�
 | `runtime/services/week5_automation_service.py:1241 run_live_runtime` | 全时段雷达节奏，无尾盘窗口判定 | **已接（影子）**：`_trend_tail_shadow_report()` 调 `TrendTailShadowService`，内部用 `evaluate_tail_entry` + `rank_final_recommendations`；只新增 `report["trend_tail_shadow"]`，**不改写 `actionable_signals`**（AST 守卫测试钉住）。旧路径继续服务真实推送 |
 | `runtime/service.py:7267 _final_signal_selector` | `funnel_score` + `final_signal_min_threshold=70`、cap 5 | **未接**。它是旧路径的唯一出口，接管即等于生产切换，必须等证据达标后单独发布（§5） |
 | `labels/soup.py` + `LabelsConfig` | 开盘入场、8%/5%/10d | **不改写**（按计划要求旧标签保留原语义）；新路径已有 `labels/tail_net_profit.py` |
+| `frontend/src/pages/Recommendations.tsx` | 旧生命周期推荐表（综合分口径） | **未改**。新页面 `TailShadow.tsx` 只读影子留档并独立成页，两页并存、不共用排序键；切换前旧页面仍是用户看到的那一份 |
 | `backtest/holding_curve.py` / `AsofBacktestConfig` | horizon 10、开盘口径 | **未接**，且当前无法接：`simulate_tail_exit` 需要带时刻的分钟 bar（§6 阻塞）。在此之前它是"另一个策略"的验证器，不能给尾盘背书 |
 
 影子链路当前必然输出 0 只，原因是真实的：既没有 `p_net_profit_5d_tail` 的生产者

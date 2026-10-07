@@ -246,7 +246,13 @@ class TrendTailShadowService:
             "contract_version": contract.contract_version,
             "contract_digest": contract.digest(),
             "probability_field": NET_PROFIT_PROBABILITY_FIELD,
+            "strategy": contract.strategy,
             "reference_notional": float(contract.reference_notional),
+            "entry_window": [contract.entry_window_start, contract.entry_window_end],
+            "min_net_profit_probability": float(contract.min_net_profit_probability),
+            "holding_days": int(contract.holding_days),
+            "take_profit_pct": float(contract.take_profit_pct),
+            "stop_loss_pct": float(contract.stop_loss_pct),
             "watch_pool_size": len(rows),
             "confirmed": sum(1 for d in decisions.values() if d.confirmed),
             "filled": len(filled_symbols),
@@ -328,8 +334,8 @@ def page_view(report: Mapping[str, Any]) -> dict[str, Any]:
     必填元信息，缺失即报错，而不是让页面自己猜。
     """
     for key in ("trade_date", "probability_field", "reference_notional", "contract_version",
-                "contract_digest"):
-        if report.get(key) in (None, ""):
+                "contract_digest", "strategy", "entry_window", "min_net_profit_probability"):
+        if report.get(key) in (None, "", []):
             raise ValueError(f"tail shadow report is missing required field {key!r}")
     rows = [dict(item) for item in report.get("final_recommendations") or []]
     rejections = dict(report.get("final_rejections") or {})
@@ -347,14 +353,18 @@ def page_view(report: Mapping[str, Any]) -> dict[str, Any]:
             "probability_field": str(report["probability_field"]),
             "probability_meaning": (
                 "按该契约成交并扣除佣金/最低佣金/过户费/印花税/滑点后，"
-                "持有至多 5 个交易日净收益>0 的概率"
+                f"持有至多 {int(report.get('holding_days') or 0)} 个交易日净收益>0 的概率"
             ),
-            "strategy": str(report.get("strategy", "trend")),
+            "strategy": str(report["strategy"]),
             "reference_notional_cny": float(report["reference_notional"]),
             "contract_version": str(report["contract_version"]),
             "contract_digest": str(report["contract_digest"]),
-            "entry_window": list(report.get("tail_entry_window") or ["14:30", "14:50"]),
-            "min_net_profit_probability": report.get("min_net_profit_probability"),
+            "entry_window": [str(value) for value in report["entry_window"]],
+            "min_net_profit_probability": float(report["min_net_profit_probability"]),
+            "holding_days": int(report.get("holding_days") or 0),
+            "max_recommendations": report.get("max_recommendations_effective"),
+            "take_profit_pct": report.get("take_profit_pct"),
+            "stop_loss_pct": report.get("stop_loss_pct"),
             "data_as_of": str(
                 (rows[0].get("data_as_of") if rows else report.get("trade_date")) or ""
             ),

@@ -253,6 +253,49 @@ def test_suspended_fill_bar_is_no_fill_but_not_a_loss() -> None:
     assert decision.quantity == 0
 
 
+def test_halt_code_in_trade_status_blocks_the_buy() -> None:
+    """停牌信号常常只写在 trade_status 里：只认显式标记会把停牌股当成可买。"""
+    for code in ("S", "halt", "停牌"):
+        decision = evaluate_tail_entry(
+            symbol="600000.SH", trading_day=TRADE_DAY,
+            minute_bars=_bars({"14:30": 10.0, "14:31": 10.05}, trade_status=code),
+            confirmation=_always_confirm,
+        )
+        assert decision.confirmed, code
+        assert decision.no_fill_reason == "suspended", code
+
+
+def test_halted_exit_day_defers_instead_of_assuming_a_sell() -> None:
+    """第 5 日停牌卖不掉 → 顺延到真正可成交那天，成熟时间跟着往后移。"""
+    result = simulate_tail_exit(
+        symbol="600000.SH", entry_date=TRADE_DAY,
+        daily_bars=[
+            _daily(TRADE_DAY, open_=10.0, high=10.1, low=9.9, close=10.0),
+            _daily(NEXT_DAY, open_=10.2, high=10.3, low=10.1, close=10.25),
+            _daily(date(2026, 10, 12), open_=10.2, high=10.3, low=10.1, close=10.25),
+            _daily(date(2026, 10, 13), open_=10.2, high=10.3, low=10.1, close=10.25),
+            _daily(date(2026, 10, 14), open_=10.2, high=10.3, low=10.1,
+                   close=10.25, trade_status="S"),
+            _daily(date(2026, 10, 15), open_=10.2, high=10.3, low=10.1, close=10.22),
+        ],
+        **_entry(),
+    )
+    assert result.status == STATUS_FILLED
+    assert result.deferred_sessions >= 1
+    assert result.exit_date == datetime(2026, 10, 15)
+
+
+def test_missing_trade_status_is_not_read_as_suspension() -> None:
+    """缺状态 ≠ 停牌：这里只在入场侧放宽，出场侧的未知状态仍是 fail-closed。"""
+    decision = evaluate_tail_entry(
+        symbol="600000.SH", trading_day=TRADE_DAY,
+        minute_bars=_bars({"14:30": 10.0, "14:31": 10.05}, trade_status="unknown",
+                          up_limit=11.0),
+        confirmation=_always_confirm,
+    )
+    assert decision.no_fill_reason != "suspended"
+
+
 def test_limit_up_locked_fill_is_no_fill() -> None:
     decision = evaluate_tail_entry(
         symbol="600000.SH", trading_day=TRADE_DAY,

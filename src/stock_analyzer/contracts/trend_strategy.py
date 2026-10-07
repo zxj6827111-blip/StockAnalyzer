@@ -298,14 +298,30 @@ def _positive_float(bar: Mapping[str, Any], *keys: str) -> float | None:
     return None
 
 
+#: 明确表示"这段时间不能交易"的状态码；缺失或 unknown 不算停牌（走未知状态分支）。
+SUSPENDED_TRADE_STATUS = frozenset({
+    "s", "suspend", "suspended", "halt", "halted", "h", "p", "停牌", "暂停交易",
+})
+
+
 def _is_suspended(bar: Mapping[str, Any]) -> bool:
+    """停牌判定：显式标记优先，其次看交易状态码。
+
+    ``trade_status`` 是数据源里唯一会说"停牌"的字段（tushare ``suspend_d`` /
+    行情状态码），只认显式标记会让停牌股被当成可正常买入。
+    """
     for key in ("suspended", "is_suspended", "suspend"):
         value = bar.get(key)
         if value is None:
             continue
         if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "y", "suspended"}
-        return bool(value)
+            if value.strip().lower() in {"1", "true", "y", "yes", "suspended", "halt"}:
+                return True
+        elif bool(value):
+            return True
+    raw = bar.get("trade_status")
+    if raw is not None and str(raw).strip().lower() in SUSPENDED_TRADE_STATUS:
+        return True
     return False
 
 
