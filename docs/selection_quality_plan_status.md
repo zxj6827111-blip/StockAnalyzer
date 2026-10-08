@@ -118,6 +118,13 @@ As-of: 2026-10-08 @ HEAD `b33b581`（分支 `feat/stock-selection-quality-overha
 
 ## 4. 基线事实（避免把既有问题当成新引入）
 
+- **`ruff check scripts tests src` 全仓跑现在有 75 个错误，全部是既有状态**（本轮实测：
+  集中在 `src/stock_analyzer/research/heavy_ts_shadow.py`、`scripts/p1_*` 等本轮未触碰的文件，
+  本轮改过的四个文件里 0 个）。`clean-scope` 质量门跑的是更窄的范围（`ruff_clean_scope` rc=0），
+  所以"门绿"不等于"全仓 ruff 绿"；提交说明里若写"ruff 全绿"必须限定范围
+  （`b2cc522` 那条就这么写错了，这里更正）。日常口径：只对本次触碰的文件跑
+  `ruff check <files>`，仓库级数字要用 75 作基线对照，别当成新引入的回归。
+
 - `mypy src` 因 numpy stub 与 `pyproject.toml` 的 `python_version="3.11"` 直接中止 ⇒
   clean-scope 门 rc=2，唯一 blocking 恒为 `mypy_blocking`；`ruff_clean_scope rc=0`。
 - 两条测试在基线 `6c7079c` 就红：`test_service_model_registry…can_warn_without_transition`、
