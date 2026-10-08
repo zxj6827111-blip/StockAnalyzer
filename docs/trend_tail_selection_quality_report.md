@@ -437,6 +437,47 @@ src/stock_analyzer/data/efinance_provider.py:18  同一个字面值
 所以"清单遮蔽了多少净盈利机会"仍未测量；要答它得在这份全市场清单上重跑标签重建
 （分钟库目前只覆盖池内 208 只 ⇒ 先要把分钟 bar 扩到全市场，这是 §5 里"继续采集"的那一项）。
 
+## 3i. 干净窗口上的全市场重放第一次落档：19/19 份，阈值不再等于占位常数（本轮实测）
+
+§3g.2 只重算了全市场口径；这轮把同一份干净窗口喂进**真正的重放链**，让
+`universe`/`hard_eligibility` 两层自己落档，产物在
+`artifacts/research/funnel_traces_marketwide_aug/`（19 份，`written_at` 带 Asia/Shanghai 时刻）。
+输入是 5,194 只全市场清单（sha256 `929680bd…599099`，生产者
+`build_tail_universe_symbols.py`，由清单同名 provenance 文件报出）。
+
+| 读数 | 值 |
+| --- | --- |
+| 决策日 | 19（2026-08-03~08-29；08-31 无下一入场日故不成样） |
+| 考虑过的 symbol-day | 98,184 |
+| 过完所有硬门 | **66,509（67.7%）** |
+| 市值门阈值 | **2,020,343,250 元**（只由测过的市值推出）；淘汰 2,176 |
+| `unproven_float_market_cap` | 1 |
+| `min_avg_turnover_20` / `insufficient_history_at_asof` / `overextension_risk` | 29,408 / 46 / 44 |
+| `days_with_non_evaluable_gate_inputs` | **[]（空）** —— 这 19 天每条硬门都有判别力 |
+| `verify_trace()` | **19/19 份、0 条失败** |
+
+三个要点：
+
+1. **§3b.2 留的那个验证边界现在补上了。** 当时写过："显式归因顺序这条代码路径目前只有
+   单测覆盖，下一次真实重放才给它生产证据。"这轮就是那次真实重放：落档的 notes 里
+   实际写出的归因顺序已经是
+   `…min_float_market_cap|unproven_float_market_cap|stale_market_data|…`，
+   而 `unproven_float_market_cap` 作为一个新登记的 HARD 名字，第一次在生产写入器的
+   产物里出现且没有触发 `SystemExit` —— 词汇表闭合因此有了端到端证据，不再只有断言。
+2. **阈值口径肉眼可见地变了**：污染窗口里市值门的阈值就是占位常数 1.2e10（于是门失效），
+   现在同一列在干净窗口上推出 20.2 亿，并且淘汰了 2,176 只 symbol-day。重放报告里
+   `thresholds.float_cap_interpretation = unproven_float_cap_placeholder_v1` 留下"这批数是
+   按哪一版解释规则算的"，换版重跑会留下对得上的痕迹。
+3. **仍然不能拿去算命中率**，两条都要说清：
+   - 这 66,509 个合格 symbol-day **一条成熟尾盘标签都没有**。分钟库只覆盖 208 只池内票、
+     日期到 2026-07-17 为止，所以本次重放没带 `--minute-db`，日内两列整列缺失
+     （报告 `not_reproducible_at_daily` 有记）。§3f 的"遮蔽量大但没有标签"这条限制不变，
+     只是现在它在两个窗口上都成立。
+   - §2 要求"每层记录使用的特征与特征计算版本"，这两层的
+     `features_used` 是空、`feature_compute_version` 是 0（`record_stage` 的默认值），
+     sidecar 里也没有携带特征契约版本。**这是这两层尚未满足的 §2 子项**，已进缺口清单；
+     修法要给清单事实加一个版本字段并让写入器传进 `record_stage`，不是这轮的最小改动。
+
 ## 4. 不依赖模型的排序对照（同一批成熟标签直接算）
 
 每日从可判池里按某个声明字段取 `Top-3`（同分按代码序，与线上一致），

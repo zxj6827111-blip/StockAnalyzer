@@ -34,7 +34,7 @@ As-of: 2026-10-08 @ HEAD `b33b581`（分支 `feat/stock-selection-quality-overha
 | 计划条目 | 实现 | 证据 | 状态 |
 | --- | --- | --- | --- |
 | §1 净盈利概率语义、0–3 只/日、1 万参考额、TP+8%/SL−5%、持有 5 日（入场日为第 1 日）、monster 独立 | `contracts/trend_strategy.py` 单一契约，线上/标签/历史验证共用 | `test_trend_strategy_contract.py`(55)；ADR-003 | 代码+测试完成 |
-| §2 九层漏斗逐层可追溯（输入/晋级/原因/特征/原始预测/校准概率/模型身份/数据时间） | `research/funnel_trace.py`（写时计数恒等式 + 读时 `verify_trace()`）、`research/night_scan_funnel_trace.py`（夜扫三层 + 前两层生产者）、`scripts/record_replay_funnel_trace.py`（历史侧接线）、`research/selection_funnel_view.py`（拼成九层视图并判"哪些问题答不了"） | `test_funnel_trace.py`(17)、`test_funnel_trace_verification.py`(7)、`test_night_scan_funnel_trace.py`(9)、`test_record_replay_funnel_trace.py`(3)、`test_selection_funnel_view.py`(3)、`test_shadow_evidence.py`(5)；接线由 `test_week5_automation.py::test_night_scan_writes_the_night_half_funnel_trace` 与 `::test_night_scan_reports_why_the_trace_was_not_written` 钉住；`scripts/audit_selection_funnel.py` | **历史侧 94 个决策日已全部落档**（94/94，`verify_trace()` 通过）；**另加 33 个决策日的全市场口径留档**（`funnel_traces_marketwide_janfeb/`，33/33 通过，inputs 170,776 / 晋级 113,208，见质量报告 §3h）；生产夜扫路径仍只有 Quality300/Light100/Deep50 三层，前两层要接生产得先让选择器导出符号级清单；见下方缺口 |
+| §2 九层漏斗逐层可追溯（输入/晋级/原因/特征/原始预测/校准概率/模型身份/数据时间） | `research/funnel_trace.py`（写时计数恒等式 + 读时 `verify_trace()`）、`research/night_scan_funnel_trace.py`（夜扫三层 + 前两层生产者）、`scripts/record_replay_funnel_trace.py`（历史侧接线）、`research/selection_funnel_view.py`（拼成九层视图并判"哪些问题答不了"） | `test_funnel_trace.py`(17)、`test_funnel_trace_verification.py`(7)、`test_night_scan_funnel_trace.py`(9)、`test_record_replay_funnel_trace.py`(3)、`test_selection_funnel_view.py`(3)、`test_shadow_evidence.py`(5)；接线由 `test_week5_automation.py::test_night_scan_writes_the_night_half_funnel_trace` 与 `::test_night_scan_reports_why_the_trace_was_not_written` 钉住；`scripts/audit_selection_funnel.py` | **历史侧 94 个决策日已全部落档**（94/94，`verify_trace()` 通过）；**另加 33 个决策日的全市场口径留档**（`funnel_traces_marketwide_janfeb/`，33/33 通过，inputs 170,776 / 晋级 113,208，见质量报告 §3h）；**本轮再加 19 个干净决策日的全市场重放落档**（`funnel_traces_marketwide_aug/`，19/19 通过，考虑 98,184 / 过完所有硬门 66,509=67.7%，市值门阈值 20.2 亿只由测过的值推出、`days_with_non_evaluable_gate_inputs=[]`，见 §3i）；生产夜扫路径仍只有 Quality300/Light100/Deep50 三层，前两层要接生产得先让选择器导出符号级清单；见下方缺口 |
 | §2 最终推荐单独留档并关联特征快照 | `archive_final_recommendations()`；缺快照落成 `feature_snapshot_missing` caveat 而不是省略 | `test_missing_feature_snapshot_is_a_visible_caveat` | 代码+测试完成 |
 | §2 逐层消融预测性规则、硬门保留 | `StageTrace.kind ∈ {hard_gate, predictive}` + `compare_traces()`（要求交易日集合完全一致） | `test_funnel_trace.py` 消融对照组用例 | 代码完成；**对照组需真实留档才能跑** |
 | §2 根因清单，区分已证实/假设；不把 bronze 占比当根因 | `.agents/notes/NOTE-002-selection-quality-root-causes.md` D1–D14 + H1–H5 | 该文件 + `scripts/audit_selection_funnel.py` 退出码 3 的机器判定 | 已交付，随实测更新 |
@@ -136,6 +136,18 @@ As-of: 2026-10-08 @ HEAD `b33b581`（分支 `feat/stock-selection-quality-overha
      本地重算不成立，因为 `daily_bars` 的 46 列里没有任何股本数字段。
      另有**一项要决策才动的写侧改动**：让 ingest 写 NULL 而不是兜底常量 —— 这是跨模块的
      数据语义变更（`src/` 下 26 个文件出现 `float_market_cap`），按 AGENTS.md §12 需另开 ADR。
+   - **全市场清单**（5,194 只，sha256 `929680bd…599099`）已经能喂进重放并落档：干净窗口
+     2026-08-03~08-29 的 19 个决策日 19/19 份通过 `verify_trace()`（质量报告 §3i），
+     考虑 98,184 / 过完所有硬门 66,509。但这批 symbol-day **一条成熟尾盘标签都没有**：
+     分钟库只覆盖 208 只池内票、日期止于 2026-07-17，本次重放没带 `--minute-db`，
+     日内两列整列缺失。要把 §2 的"遮蔽了多少盈利机会"真正回答，得先把分钟行情
+     从 208 只扩到全市场清单，再重跑标签重建与 ≥4 折滚动验证。
+   - **§2 的"每层记录使用的特征与特征计算版本"在这两层还没满足**：
+     `universe`/`hard_eligibility` 的 `features_used` 是空、`feature_compute_version` 是 0
+     （`record_stage` 的默认值），而 sidecar 的逐日事实里也没有携带特征契约版本。
+     `hard_eligibility` 实际上是要读 `avg_turnover_20` / `float_market_cap` / bar 日期 /
+     ST 与停牌声明的，所以这不是"该层不用特征"，而是这一项没接通。
+     修法：给清单事实加一个版本字段并由写入器传进 `record_stage`（不动归档 schema）。
    - 带时刻的尾盘分钟行情与 `daily_trade_status` 两项**本轮已解决**：
      分钟 bar 从 vendor `Stock_1min_2000-now` 落进独立研究库（6,464,825 行 / 129 交易日），
      可交易状态由"当天确有成交的 RAW 日线"正向声明，精确涨跌停从 `stk_limit` 补采。
