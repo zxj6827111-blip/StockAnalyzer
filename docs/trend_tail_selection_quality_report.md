@@ -1138,3 +1138,36 @@ capacity_minus_gap (turnover, avg_turnover_20, -gap_up_pct) → 契约直接拒�
 3. §4.4 / §4.6 / §4.7 三处关于排序层的乐观读法至此全部作废。本轮对 §4 选股质量验收的净结论：
    **四类信息在当前样本上不支持任何排序改善**；还没被否掉的只有
    「更长真实历史」与「第五类信息」两条，且都需要远端补采。
+
+## 4.8 §4 工程验收逐条对到测试 id（可核对，不再靠叙述）
+
+把 §4 工程验收点名的每个场景对到**仓库里真实存在的那个测试函数**上（下表由脚本按 `^def test_` 在 `tests/` 里核对生成，不是凭记忆列的）：
+
+| §4 点名的场景 | 钉住它的测试 |
+| --- | --- |
+| 时区跨日 | `test_trend_strategy_contract.py::test_confirmation_datetimes_are_local_to_the_trading_day`；`test_trend_strategy_contract.py::test_cross_day_bars_do_not_leak_into_the_tail_window` |
+| 节假日/非交易日 | `test_trend_strategy_contract.py::test_holiday_and_non_trading_day_are_not_tail_days` |
+| 尾盘窗口每 5 分钟检查、只读已完成 bar | `test_trend_strategy_contract.py::test_confirmation_never_reads_an_unfinished_bar`；`test_trend_strategy_contract.py::test_live_path_never_evaluates_a_slot_that_has_not_arrived_yet`；`test_trend_strategy_contract.py::test_completed_bars_helper_respects_the_completion_boundary` |
+| 确认后成交（下一分钟价） | `test_trend_strategy_contract.py::test_fill_uses_the_next_completed_bar_after_confirmation_not_the_slot_bar` |
+| 涨跌停（精确价、封死即不成交） | `test_tail_rebuild.py::test_day_limits_reach_the_minute_bars_so_limit_up_lock_is_provable`；`test_trend_strategy_contract.py::test_limit_up_locked_fill_is_no_fill`；`test_tail_reference_store.py::test_approximated_limit_prices_are_not_usable_by_default`；`test_trend_data_readiness.py::test_absent_limit_field_is_blocked_not_guessed_by_percentage` |
+| 停牌 | `test_trend_strategy_contract.py::test_halt_code_in_trade_status_blocks_the_buy`；`test_trend_strategy_contract.py::test_halted_exit_day_defers_instead_of_assuming_a_sell`；`test_tail_rebuild.py::test_suspend_flag_from_the_reference_store_blocks_the_fill` |
+| 缺 bar 不当停牌 / 状态未知不出已实现标签 | `test_trend_strategy_contract.py::test_missing_bar_is_not_reported_as_suspension`；`test_trend_strategy_contract.py::test_missing_trade_status_is_not_read_as_suspension`；`test_trend_data_readiness.py::test_no_declared_trade_status_blocks_label_production`；`test_tail_rebuild.py::test_missing_status_declaration_yields_no_realized_label_but_is_not_a_gap` |
+| T+1（入场日不触发 TP/SL，入场必须是下一交易日） | `test_trend_strategy_contract.py::test_no_tp_or_sl_can_trigger_on_the_entry_day_because_of_t_plus_1`；`test_tail_rebuild.py::test_request_rejects_an_entry_day_that_is_not_the_next_session` |
+| 跳空止损用开盘价 | `test_trend_strategy_contract.py::test_gap_down_stop_exit_uses_the_open_not_the_stop_level` |
+| 同根双触发按止损优先 | `test_trend_strategy_contract.py::test_double_trigger_same_bar_resolves_to_stop_loss_first` |
+| 第 5 日退出与顺延/未成熟 | `test_trend_strategy_contract.py::test_plan_exit_on_fifth_day_at_close_when_neither_level_hit`；`test_trend_strategy_contract.py::test_defer_window_exhaustion_does_not_fake_a_successful_exit`；`test_tail_net_profit_label.py::test_immature_exit_stays_uncertain_without_a_label`；`test_trend_strategy_contract.py::test_series_end_before_plan_exit_is_uncertain_not_realized_profit` |
+| 最低佣金与一手规则（1 万元参考额） | `test_trend_strategy_contract.py::test_minimum_commission_applies_on_a_10k_notional_order`；`test_trend_strategy_contract.py::test_reference_notional_below_one_lot_is_no_fill`；`test_trend_strategy_contract.py::test_net_return_charges_both_sides_of_cost` |
+| 不用 QFQ 模拟成交 / 分钟不足不用开盘回测 | `test_trend_data_readiness.py::test_only_qfq_prices_are_blocked_for_fills`；`test_tail_reference_store.py::test_adjusted_basis_is_refused_rather_than_rescaled`；`test_tail_rebuild.py::test_missing_minute_bars_are_insufficient_and_never_an_open_price_backtest` |
+| 特征缺失 | `test_tail_net_profit_trainer.py::test_feature_incomplete_rows_are_excluded_and_reported_never_zero_filled`；`test_replay_tail_intraday_features.py::test_missing_tail_window_is_absent_rather_than_zero_filled`；`test_trend_tail_shadow_runtime.py::test_missing_feature_snapshot_is_a_visible_caveat` |
+| 模型身份异常 | `test_tail_walk_forward.py::test_identity_mismatch_blocks_the_whole_validation_instead_of_scoring_anything`；`test_trend_strategy_contract.py::test_missing_model_identity_fails_closed`；`test_trend_strategy_contract.py::test_model_identity_violations_produce_zero_recommendations` |
+| 相同输入线上与历史同判定 | `test_trend_strategy_contract.py::test_live_and_history_paths_agree_on_identical_input`；`test_trend_tail_shadow_runtime.py::test_live_and_history_chain_paths_agree_on_identical_bars`；`test_tail_rebuild.py::test_live_and_rebuild_paths_agree_on_identical_bars` |
+| 0.60 准入 + 概率降序 + 代码同分 + 上限 3 + 空仓不补 | `test_trend_strategy_contract.py::test_ranking_uses_threshold_desc_and_symbol_tiebreak`；`test_trend_tail_shadow_runtime.py::test_same_probability_orders_by_symbol`；`test_trend_tail_shadow_runtime.py::test_recommendations_follow_threshold_and_cap`；`test_trend_strategy_contract.py::test_empty_recommendation_is_allowed_and_never_backfilled` |
+| observed 与 replayed 分开、不借样本数 | `test_tail_net_profit_label.py::test_observed_and_replayed_samples_are_reported_separately`；`test_trend_tail_page_and_feedback.py::test_replayed_samples_do_not_borrow_observed_sample_count` |
+| 自动学习只产 challenger、影子双门槛 | `test_trend_tail_page_and_feedback.py::test_automatic_learning_stops_at_challenger`；`test_tail_net_profit_trainer.py::test_shadow_gate_requires_both_days_and_matured_fills` |
+
+**核对结果**：19 个场景组共 49 个测试名全部存在
+
+写这张表的过程中我自己起草了两条「缺口」，核对后**都不成立，这里如实改掉**：「无法核算的公司行动单列为不确定样本」其实由 `test_trend_strategy_contract.py:497-502` 断言（`corporate_action_uncertain is True`），它的下游归类由 `test_net_profit_rate_denominator_excludes_unfilled_and_uncertain` 钉住；「按拒绝原因反馈」也不是只有字段传递 —— `test_reject_reason_feedback_keeps_unfilled_rejections_separate` 与 `test_rejection_reasons_are_counted_for_funnel_diagnosis` 各自钉住一条。逐条存在性（脚本核对，非凭记忆）：`test_net_profit_rate_denominator_excludes_unfilled_and_uncertain` → test_tail_net_profit_label.py, test_trend_tail_page_and_feedback.py；`test_reject_reason_feedback_keeps_unfilled_rejections_separate` → test_trend_tail_page_and_feedback.py；`test_rejection_reasons_are_counted_for_funnel_diagnosis` → test_tail_net_profit_label.py；`test_feedback_is_sliced_by_model_version_and_market_state` → test_trend_tail_page_and_feedback.py
+
+**这条更正本身就是教训**：上一轮我说过「§4 工程验收 13 场景逐条有测试钉住」，那时靠的是记忆；这次把每个场景对到具体测试 id 并按 `^def test_` 实测存在性，才发现自己顺手写的两条缺口是错的。**引用 §4 工程验收状态时以这张表为准。**
+仍要说清的边界：这张表证明的是**代码路径与语义有测试覆盖**（§4 工程验收的含义），它**不等于**选股质量验收通过——后者仍未通过，见 §4.7.1。
