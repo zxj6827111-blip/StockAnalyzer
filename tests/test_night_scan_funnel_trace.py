@@ -231,7 +231,31 @@ def test_universe_layers_use_the_snapshot_real_per_symbol_reasons() -> None:
     assert "不等于证明停牌" in eligibility.notes
 
 
-def test_universe_layers_refuse_counts_only_inputs_and_merge_in_order() -> None:
+def test_universe_layers_refuse_a_day_whose_gate_input_is_a_constant() -> None:
+    """硬门输入列被填成常数的那天，前两层不落档。
+
+    那天的 `min_float_market_cap` 阈值等于该列众数，门对任何行都不淘汰；
+    落档就等于声称"硬性资格检查判过了"（2026-10-08 float_market_cap=1.2e10 事故）。
+    """
+    from stock_analyzer.research.night_scan_funnel_trace import build_universe_stage_traces
+
+    universe = {
+        "universe_snapshot_id": "snap-1", "as_of": "2026-04-01",
+        "eligible_symbols": ["600000", "000001"], "expected_active_symbols": ["600000"],
+        "excluded_reasons": {"000001": "min_avg_turnover_20"},
+        "known_suspended_symbols": [], "survivorship_coverage": "incomplete_or_unknown",
+        "delisting_coverage_verified": False,
+        "non_evaluable_gates": ["min_float_market_cap"],
+    }
+    assert build_universe_stage_traces(
+        universe=universe, data_as_of="2026-04-01",
+        contract=DEFAULT_TREND_CONTRACT,
+    ) == ()
+    # 同一份快照去掉这个标记就必须落档：证明拒的是标记本身，不是别的一致性检查。
+    universe.pop("non_evaluable_gates")
+    assert len(build_universe_stage_traces(
+        universe=universe, data_as_of="2026-04-01", contract=DEFAULT_TREND_CONTRACT,
+    )) == 2
     from stock_analyzer.research.night_scan_funnel_trace import (
         build_universe_stage_traces,
     )

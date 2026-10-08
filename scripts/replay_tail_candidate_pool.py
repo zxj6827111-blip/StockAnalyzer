@@ -311,6 +311,29 @@ def symbols_file_facts(path: Path | str) -> dict[str, Any]:
     }
 
 
+#: 哪条硬门的输入列。列被填成常数 ⇒ 按分位算出的阈值 = 众数 ⇒ 这条门那天对任何行
+#: 都不淘汰，却仍然"跑完了"；留档于是把"没有声明"读成"没有一只票不达标"（§3g）。
+#: 所以这种天的前两层不落档：宁可不落，也不落一条说门判过的留档。
+GATE_INPUT_COLUMNS = {"min_avg_turnover_20": "avg_turnover_20",
+                      "min_float_market_cap": "float_market_cap"}
+MAX_MODAL_VALUE_SHARE = 0.50
+
+
+def degenerate_gate_inputs(frame: pd.DataFrame) -> list[str]:
+    """当天没有判别力的硬门（其输入列在当天被填成同一个值）。缺列不报错，交给调用方。"""
+    broken: list[str] = []
+    for rule, column in GATE_INPUT_COLUMNS.items():
+        if column not in frame.columns:
+            continue
+        values = pd.to_numeric(frame[column], errors="coerce").dropna()
+        if values.empty:
+            broken.append(rule)
+            continue
+        if float(values.value_counts().iloc[0]) / len(values) > MAX_MODAL_VALUE_SHARE:
+            broken.append(rule)
+    return sorted(broken)
+
+
 def _universe_fact(
     *,
     decision_date: date,
@@ -321,6 +344,7 @@ def _universe_fact(
     pit_excluded: Sequence[str],
     coverage: str,
     delisting_verified: bool,
+    non_evaluable_gates: Sequence[str] = (),
 ) -> dict[str, Any]:
     """一个决策日的**符号级** universe / hard_eligibility 事实（计划 §2 前两层）。
 
@@ -360,6 +384,8 @@ def _universe_fact(
         },
         "survivorship_coverage": coverage,
         "delisting_coverage_verified": bool(delisting_verified),
+        # 非空 = 这几条硬门当天的输入列没有判别力；留档写入器据此**不落这两层**。
+        "non_evaluable_gates": sorted(str(rule) for rule in non_evaluable_gates),
     }
 
 
@@ -523,6 +549,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             advanced=[str(symbol) for symbol in outcome.eligible],
             rejected=outcome.rejected,
             pit_excluded=list(pit_excluded),
+            non_evaluable_gates=degenerate_gate_inputs(eligible_frame),
             coverage=str(args.survivorship_coverage),
             delisting_verified=bool(int(args.delisting_coverage_verified)),
         ))
@@ -542,6 +569,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "ok": True,
         "universe_facts_path": universe_facts_path,
         "universe_fact_days": len(universe_facts),
+        # 哪天有硬门的输入列没有判别力：这些天的前两层不落档（见 _universe_fact 的说明）。
+        "days_with_non_evaluable_gate_inputs": [
+            str(fact["decision_date"]) for fact in universe_facts
+            if fact.get("non_evaluable_gates")
+        ],
         "universe_symbols_considered": sum(
             len(fact["eligible_symbols"]) for fact in universe_facts
         ),

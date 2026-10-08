@@ -97,6 +97,9 @@ def _universe_facts(universe: Any) -> dict[str, Any]:
     if isinstance(raw_reasons, Mapping):
         for symbol, reason in raw_reasons.items():
             reasons.setdefault(str(reason), []).append(str(symbol))
+    # 当天的硬门输入列没有判别力（常数填充）⇒ 这两层不落档：留档声称"硬性资格检查判过"
+    # 就成了假话，而那正是 2026-10-08 float_market_cap=1.2e10 事故的样子。
+    broken = [str(rule) for rule in (fact("non_evaluable_gates") or ())]
     if not eligible or not active:
         # 只有计数（旧 payload 的形状）时不落这两层：用计数冒充成员会让留档说谎。
         return {}
@@ -109,6 +112,7 @@ def _universe_facts(universe: Any) -> dict[str, Any]:
         "reasons": reasons,
         "coverage": str(fact("survivorship_coverage") or ""),
         "delisting_verified": bool(fact("delisting_coverage_verified")),
+        "non_evaluable_gates": broken,
     }
 
 
@@ -133,6 +137,9 @@ def build_universe_stage_traces(
     """
     facts = _universe_facts(universe)
     if not facts:
+        return ()
+    if facts["non_evaluable_gates"]:
+        # 有硬门当天的输入列没有判别力：这一层的"晋级/淘汰"不能声称是判出来的。
         return ()
     considered = sorted(set(facts["eligible"]) | {
         symbol for symbols in facts["reasons"].values() for symbol in symbols
