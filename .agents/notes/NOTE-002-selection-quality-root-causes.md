@@ -43,6 +43,8 @@ As-of: 2026-10-08（D15 已补采真值、D16 覆盖面是自设参数已修、*
 - **observed 与 replayed 两个总体的前向结果差一个量级**（5d 47.5% vs 62.8%），
   且 `replayed_recompute` 的 `model_outputs_json` 全空（distinct p_meta = 0）。
   → 任何胜率统计都必须先 `where feature_capture_mode='observed_snapshot'`。
+- **排序层的损失第一次被单独量出来，而且赢的不是趋势信息**（最后 40 个决策日 2026-05-20..07-16，窗口内池子净盈利率仅 0.2961；`scripts/measure_tail_selection_ceiling.py` → `artifacts/research/mw_selection_ceiling_40d.json`）：按 `turnover` 降序每日前 3 → 0.4250（Δ **+12.88pp**，交易日分块 CI [2.889, 23.214]）、`avg_turnover_20` 降序 → 0.4083（Δ +11.23pp，CI [0.714, 21.733]）、`gap_up_pct` 升序 → 0.4417（Δ +14.57pp，CI [5.457, 23.413]）；而趋势位置/市场相对强弱各臂 Δ +2.9～+6.1pp、CI 下界全部 ≤0。覆盖率不是约束（各臂 coverage=1.0、3 个名额都填得上），平均净收益只勉强为正（+0.05%～+0.28%/笔），p05 与最差笔贴着 −5% 止损位。
+  → 支持「损失主要在排序与交易规则侧」，且**候选排序第一因子应是容量/流动性**；但这不是 §4 验收：容量与硬门流动性下限同源、赢的是可成交性不是预测力，`gap_up_pct` 那臂还是 22 个臂里的方向二次选择（只能记成跳空高开=风险信号的假设），多重比较未校正。读数与限制见质量报告 §4.4。
 - **项目自己的锁定 OOS 上限**：绝对命中率 43–45%、TopK 净收益为负
   （`docs/alpha_v2/M4H_Historical_Locked_OOS_Report.md:206,591`）。
   → 这是新概率的**现实参照**：0.60 阈值只是选股规则，不是已证明的命中率。
@@ -110,6 +112,7 @@ As-of: 2026-10-08（D15 已补采真值、D16 覆盖面是自设参数已修、*
 - `scripts/sync_tail_minute_bars.py`、`scripts/sync_tail_reference_data.py` 的 `--symbols/--symbols-file` —— D16：覆盖面由调用参数决定，报告必须写清用了哪份清单
 - `scripts/measure_tail_feature_direction.py` + `artifacts/research/mw_feature_direction_91d.json` / `mw_feature_direction_125d_rolling.json` —— §2 特征判别力读数的唯一生产者（只读，含 --rolling 剖面）
 - `scripts/sync_tail_reference_data.py` 的 `--limit-prices-csv` —— D17：精确涨跌停的唯一来源是远端 stk_limit，本地仓库副本里没有涨跌停表，采集面塌了就只能远端补，不能用开盘价近似
+- `scripts/measure_tail_selection_ceiling.py` + `artifacts/research/mw_selection_ceiling_40d.json` —— §2 排序层的唯一生产者（每日前 3、六项指标、交易日分块 bootstrap）
 - `src/stock_analyzer/research/tail_walk_forward.py` 的校准段方向门（`calibration window direction is not positive`）—— 四种特征组合全部在这里 fail-closed，四折测试段不产出数字
 - `runtime/universe_candidate_selector.py::_gate_membership`、`research/night_scan_funnel_trace.py::live_universe_facts` —— 生产夜扫前两层留档
 - `docs/alpha_v2/M4H_Historical_Locked_OOS_Report.md` —— 锁定 OOS 上限参照

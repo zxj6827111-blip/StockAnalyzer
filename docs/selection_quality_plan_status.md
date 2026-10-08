@@ -190,3 +190,4 @@ PR #105 OPEN 且 mergeable。故意不把 As-of 写成单个 SHA：那会让这�
 - 两条测试在基线 `6c7079c` 就红：`test_service_model_registry…can_warn_without_transition`、
   `test_alpha_v2_m4l_e2e_rehearsal::test_attack_a_source_label_without_funnel_artifact_fails`。
 - 本机无 `data/*.duckdb`（库在 NAS），`artifacts/*` 被 gitignore ⇒ 运行报告类工件无法入库。
+| §4.4 排序层读数与 §4.5 概率模型读数不一致这件事怎么处置 | 规则侧：`turnover`/`avg_turnover_20` 每日前 3 → 0.4250 / 0.4083，Δ +12.88pp / +11.23pp，交易日分块 CI 下界均 >0（评估段 2026-05-20..07-16，窗口内池子仅 0.2961）。概率侧：同一列进 LR 仍在第 1 折校准段 fail-closed（0.4894 / 0.4807，退 5）。契约拒收 `-gap_up_pct` 这种负号语法，是期望行为 | **需要用户决策的岔口**：拉长真实历史走概率模型（要远端补采，解 D17），还是把容量优先做成显式排序规则（流动性同时当硬门与第一因子，牺牲分散度，属策略形态变更）。在 §4 验收未通过前不擅自实现后者 |
