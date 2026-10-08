@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -266,7 +267,7 @@ def test_train_then_freeze_then_shadow_chain_agrees(tmp_path: Path, monkeypatch)
     # ADR-001：训练 commit 与运行 commit 是两个事实，但必须相等，否则身份不成立。
     service._runtime_code_commit = lambda: COMMIT
     report = TrendTailShadowService(service, report_dir=tmp_path / "shadow").run(
-        timestamp=service_timestamp(), watch_pool=_pool(["600000.SH"]),
+        timestamp=datetime(2026, 10, 9, 14, 45, 0), watch_pool=_pool(["600000.SH"]),
         minute_bars={"600000.SH": _bars()}, probabilities={"600000.SH": 0.9},
     )
     assert report["blocking_reason"] in (None, "")
@@ -274,6 +275,75 @@ def test_train_then_freeze_then_shadow_chain_agrees(tmp_path: Path, monkeypatch)
     assert report["final_symbols"] == ["600000.SH"]
 
 
-def service_timestamp():
-    from datetime import datetime
-    return datetime(2026, 10, 9, 14, 45, 0)
+def test_shadow_service_scores_the_pool_from_the_challenger_artifact(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """没人生成 p_net_profit_5d_tail 时，由已核验的工件自己算 —— 缺特征的不补名额。
+
+    这条是 §3.4"统一按新概率排序 + 数据不足就 0 只"的落地证据：分数必须与
+    独立加载同一工件算出来的值逐位一致，而不是留档里另一个数。
+    """
+    from stock_analyzer.labels.tail_net_profit import register_tail_label_policy
+    from stock_analyzer.learning.label_policy_registry import LabelPolicyRegistry
+    from stock_analyzer.runtime.services.trend_tail_shadow_service import (
+        TrendTailShadowService,
+    )
+    from tests.test_trend_tail_shadow_runtime import FakeService, _bars
+
+    train_cli = _load_cli("train_tail_net_profit_model")
+    monkeypatch.setattr(train_cli, "_training_identity", lambda: (COMMIT, "git_checkout", []))
+    monkeypatch.setattr(train_cli, "train_tail_net_profit_model", lambda **_: _trained_payload())
+    artifact = tmp_path / "models" / "tail_lr.json"
+    manifest = tmp_path / "tail_model_serving_manifest.json"
+    assert train_cli.main(["--samples", _samples(tmp_path), "--features", ",".join(FEATURES),
+                           "--model-id", "trend-tail-lr-selfcheck", "--out", str(artifact),
+                           "--manifest-out", str(manifest), "--quiet"]) == 0
+
+    predictor = load_tail_model_predictor(artifact)
+    strong = {"excess_ret_20": 0.09, "atr14_pct": 0.03}
+    weak = {"excess_ret_20": 0.01, "atr14_pct": 0.06}
+    assert predictor.probability(strong) > predictor.probability(weak)
+
+    registry_db = tmp_path / "learning_protocol.duckdb"
+    register_tail_label_policy(LabelPolicyRegistry(registry_db))
+    service = FakeService(manifest=None, tmp_path=tmp_path, tail_manifest_path=str(manifest))
+    service._runtime_code_commit = lambda: COMMIT
+    pool = [
+        {"symbol": "600111.SH", "risk_state": "", "features": strong},
+        {"symbol": "600222.SH", "risk_state": "", "features": weak},
+        # 缺 atr14_pct：不许当成 0 分参与排序，必须点名。
+        {"symbol": "600333.SH", "risk_state": "", "features": {"excess_ret_20": 0.09}},
+    ]
+    report = TrendTailShadowService(service, report_dir=tmp_path / "shadow").run(
+        timestamp=datetime(2026, 10, 9, 14, 45, 0), watch_pool=pool,
+        minute_bars={row["symbol"]: _bars() for row in pool},
+    )
+    identity = report["model_identity"]
+    assert identity["probability_source"] == "challenger_artifact"
+    assert any(item.startswith("probability_scoring_failed:600333.SH:feature_missing")
+               for item in identity["recording_failures"])
+    # 只有过阈值（0.60）的才会被推荐；断言用的是同一把尺子，不是写死的期望。
+    assert report["final_symbols"] == ([
+        "600111.SH"] if predictor.probability(strong) >= DEFAULT_TREND_CONTRACT
+        .min_net_profit_probability else [])
+    assert "600333.SH" not in report["final_symbols"]
+
+
+def test_shadow_service_without_challenger_artifact_does_not_invent_scores(
+    tmp_path: Path,
+) -> None:
+    """没有清单就是不打分：0 只 + 点名，而不是拿旧综合分冒充净盈利概率。"""
+    from stock_analyzer.runtime.services.trend_tail_shadow_service import (
+        TrendTailShadowService,
+    )
+    from tests.test_trend_tail_shadow_runtime import FakeService, _bars
+
+    service = FakeService(manifest=None, tmp_path=tmp_path)
+    report = TrendTailShadowService(service, report_dir=tmp_path / "shadow").run(
+        timestamp=datetime(2026, 10, 9, 14, 45, 0),
+        watch_pool=[{"symbol": "600111.SH", "risk_state": "", "features": {}}],
+        minute_bars={"600111.SH": _bars()},
+    )
+    assert report["final_symbols"] == []
+    assert report["model_identity"]["probability_source"] == "none"
+    assert "challenger_artifact_not_bound" in report["model_identity"]["recording_failures"]

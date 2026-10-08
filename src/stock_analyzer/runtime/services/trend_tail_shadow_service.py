@@ -97,7 +97,20 @@ class TrendTailShadowService:
         bar_map = dict(minute_bars or {})
         prob_map = dict(probabilities or {})
 
-        identity, identity_error, recording_failures = self._resolve_model_identity(prob_map)
+        # 专属清单只读一次：打分与身份绑定必须看同一份文件，不能各读各的。
+        tail_manifest, tail_failures = _read_tail_serving_manifest(self._service, contract)
+        probability_source = "caller_supplied" if prob_map else "none"
+        scoring_failures: tuple[str, ...] = ()
+        if not prob_map and rows:
+            prob_map, probability_source, scoring_failures = self._score_watch_pool(
+                rows, tail_manifest
+            )
+
+        identity, identity_error, recording_failures = self._resolve_model_identity(
+            prob_map, tail_manifest=tail_manifest, tail_failures=tail_failures
+        )
+        recording_failures = tuple(dict.fromkeys(list(recording_failures) + list(
+            scoring_failures)))
         rejections: dict[str, list[str]] = {}
         decisions: dict[str, TailEntryDecision] = {}
 
@@ -275,6 +288,7 @@ class TrendTailShadowService:
             "model_identity": {
                 "recorded": bool(identity is not None and not identity_error),
                 "error": identity_error or result.blocking_reason,
+                "probability_source": probability_source,
                 # §3.1"记录失败必须可见"：绑定不上哪一项，就点名哪一项，不留空当默认值。
                 "recording_failures": list(recording_failures),
                 "training_manifest_id": str(getattr(identity, "training_manifest_id", "") or ""),
@@ -294,8 +308,53 @@ class TrendTailShadowService:
             report["artifact_paths"] = self._write(trace, report)
         return report
 
+    def _score_watch_pool(
+        self, rows: list[dict[str, Any]], tail_manifest: Mapping[str, Any]
+    ) -> tuple[dict[str, float], str, tuple[str, ...]]:
+        """没人生成概率时，由**已核验的 challenger 工件**自己算。
+
+        这里不设兜底：清单缺失 / 工件加载不过 / 某只缺特征，都返回点名原因，
+        让这一轮按 §3.4"数据不足、模型无效 ⇒ 输出 0 只"落地，而不是补一个
+        看起来像概率的数（缺特征填零会被当成真实信息拿去排序）。
+        """
+        if not tail_manifest:
+            return {}, "none", ("challenger_artifact_not_bound",)
+        artifact_path = _manifest_field(
+            tail_manifest, "artifact_path", "authoritative_artifact")
+        if not artifact_path:
+            return {}, "none", ("challenger_artifact_path_missing",)
+        try:
+            from stock_analyzer.models.tail_model_artifact import (
+                TailArtifactError,
+                load_tail_model_predictor,
+            )
+
+            resolved = getattr(self._service, "_resolve_evolution_path",
+                               lambda value: value)(artifact_path)
+            predictor = load_tail_model_predictor(Path(resolved), contract=self._contract)
+        except TailArtifactError as exc:
+            return {}, "none", (f"challenger_artifact_unusable:{exc}",)
+        except Exception as exc:  # noqa: BLE001 - 加载不过就是模型无效，点名即可
+            return {}, "none", (f"challenger_artifact_load_failed:{type(exc).__name__}",)
+
+        scored: dict[str, float] = {}
+        failures: list[str] = []
+        for row in rows:
+            symbol = str(row.get("symbol", "")).strip()
+            if not symbol:
+                continue
+            try:
+                scored[symbol] = predictor.probability(dict(row.get("features") or {}))
+            except TailArtifactError as exc:
+                failures.append(f"probability_scoring_failed:{symbol}:{exc}")
+        return scored, "challenger_artifact", tuple(failures)
+
     def _resolve_model_identity(
-        self, probabilities: Mapping[str, float]
+        self,
+        probabilities: Mapping[str, float],
+        *,
+        tail_manifest: Mapping[str, Any] | None = None,
+        tail_failures: tuple[str, ...] = (),
     ) -> tuple[ModelIdentity | None, str, tuple[str, ...]]:
         """在服模型必须**就是**本契约的净盈利模型，否则身份按不可验证处理。
 
@@ -304,8 +363,9 @@ class TrendTailShadowService:
         """
         if not probabilities:
             return None, "no_tail_probability_available", ()
-        tail_manifest, tail_failures = _read_tail_serving_manifest(
-            self._service, self._contract)
+        if tail_manifest is None:
+            tail_manifest, tail_failures = _read_tail_serving_manifest(
+                self._service, self._contract)
         if tail_manifest and tail_failures:
             # 专属清单存在但对不上 = 模型无效，直接 0 只；退回旧在服清单等于
             # 静默换一个模型（§3.3 明令禁止）。

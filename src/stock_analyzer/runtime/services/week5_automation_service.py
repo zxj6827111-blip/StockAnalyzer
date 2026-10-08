@@ -1350,8 +1350,10 @@ class RuntimeWeek5AutomationService:
 
         失败不静默吞掉：异常转成报告里的 ``ok=false`` + 错误串，既不让 job 挂掉，
         也不留下"看起来正常"的空白（计划 §3.1「记录失败必须可见」）。
-        分钟行情与 ``p_net_profit_5d_tail`` 概率目前都没有生产者，因此这里必然
-        输出 0 只并写明阻塞原因 —— 那是事实，不是待补的空格。
+        调用方**不传概率**：``p_net_profit_5d_tail`` 由影子服务从已核验的 challenger
+        工件自己算（``models/tail_model_artifact``），所以这里传什么分数都不该改变
+        排序口径。分钟行情的生产者还没有，因此当前每一轮仍会是 0 只并写明阻塞原因 ——
+        那是事实，不是待补的空格。
         """
         try:
             return self._trend_tail_shadow.run(

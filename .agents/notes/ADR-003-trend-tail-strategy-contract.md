@@ -209,6 +209,13 @@ As-of: 2026-10-08 @ HEAD `6c7079c` 之后的工作树（本 ADR 与 `contracts/t
   LightGBM 只在原生库可用时开启，不可用就 ``lightgbm_unavailable`` 停住，
   不静默换成逻辑回归（§3.3）。工件字段一律经 ``artifact_identity_view()`` 这一个
   出口读，两个 CLI 不再各写一套取值顺序。
+- - **线上概率由 challenger 工件自己算**（§3.4"统一按新概率排序"的落地方式）：
+  影子服务在调用方没给 ``probabilities`` 时，从**同一份**已核验专属清单指向的工件
+  加载打分器并给观察池打分；留档里记 ``model_identity.probability_source``
+  （``caller_supplied`` / ``challenger_artifact`` / ``none``）。没有清单就是
+  ``challenger_artifact_not_bound`` + 0 只，**不会**拿旧综合分冒充净盈利概率；
+  某只缺特征就点名 ``probability_scoring_failed:<symbol>:feature_missing:<名字>``
+  并让它不参与排序（缺特征不填零）。清单在一轮里只读一次，打分与身份绑定看同一份文件。
 - 影子服务的读取顺序随之确定：**专属清单存在 → 必须用它**（对不上就
   `tail_serving_manifest_unverified` ⇒ 0 只，绝不退回旧清单，因为那是静默换模型）；
   专属清单不存在 → 退回旧在服清单并留名 `tail_serving_manifest_absent`。
@@ -347,7 +354,7 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库> --reference-db <�
 - 测试（2026-10-08 实测条数）：`test_trend_strategy_contract.py`(55)、
   `test_tail_net_profit_label.py`(22)、`test_trend_data_readiness.py`(22)、
   `test_funnel_trace.py`(17)、`test_tail_net_profit_trainer.py`(20)、
-  `test_trend_candidate_contract.py`(16)、`test_trend_tail_shadow_runtime.py`(29)、`test_tail_serving_manifest.py`(8)、`test_tail_model_artifact.py`(9)、
+  `test_trend_candidate_contract.py`(16)、`test_trend_tail_shadow_runtime.py`(29)、`test_tail_serving_manifest.py`(8)、`test_tail_model_artifact.py`(11)、
   `test_trend_tail_page_and_feedback.py`(26)、`test_minute_bar_store.py`(15)、
   `test_tail_walk_forward.py`(20)、`test_tail_exit_funnel.py`(14)、
   `test_tail_reference_store.py`(14)、`test_tail_rebuild.py`(18)
