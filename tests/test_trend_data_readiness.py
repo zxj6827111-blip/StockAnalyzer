@@ -524,3 +524,87 @@ def test_cli_reads_the_reference_copy_only_when_told_to(tmp_path) -> None:
     names = {item["name"] for item in report["checks"]}
     assert {"reference_copy_present", "reference_copy_trade_status_declared"} <= names
     assert report["readiness"] == READINESS_READY
+
+
+# --- 副本可以替源头说话，但只在"成交与出场真的读副本"的那两项上 ---------------------
+
+
+def test_reference_copy_raw_basis_credits_an_undeclared_warehouse(tmp_path) -> None:
+    """仓库没写复权口径列 ≠ 不能重建标签：成交与出场读的是那份 price_basis='raw' 的副本。
+
+    修之前这条判 blocked，把整条尾盘验证堵在"源头少一个字段"上；而计划 §3.1 要求的
+    验证对象本来就是补齐后的**独立研究库**。抵账必须写明来源，不能假装仓库自己声明过。
+    """
+    conn = _connect()
+    _seed_bars(conn, price_mode=False)
+    _seed_index(conn)
+    _statuses(conn)
+    _seed_minute_bars(conn)
+    reference = _reference_db(tmp_path)
+    report = audit_trend_data_readiness(connection=conn, reference_connection=reference)
+    reference.close()
+
+    check = _by_name(report)["raw_price_basis_declared"]
+    assert check["status"] == "ok"
+    assert check["detail"]["satisfied_by"] == "reference_copy"
+    assert check["detail"]["warehouse_mode_column"] is None
+    assert "raw_price_basis_declared" not in report["blocking_gaps"]
+    assert "研究库里口径可证明为 raw 的" in check["note"]
+
+
+def test_qfq_only_copy_earns_no_credit(tmp_path) -> None:
+    """副本里混了非 raw 口径时不能替仓库抵账——那是 ADR-002 的红线，不是覆盖率问题。"""
+    conn = _connect()
+    _seed_bars(conn, price_mode=False)
+    _seed_index(conn)
+    _statuses(conn)
+    _seed_minute_bars(conn)
+    reference = _reference_db(tmp_path)
+    reference.close()
+    path = tmp_path / "reference.duckdb"
+    writer = duckdb.connect(str(path))
+    writer.execute("UPDATE ref_daily_bars_raw SET price_basis = 'qfq'")
+    writer.close()
+
+    report = audit_trend_data_readiness(
+        connection=conn, reference_connection=duckdb.connect(str(path), read_only=True),
+    )
+    assert "raw_price_basis_declared" in report["blocking_gaps"]
+    assert "reference_copy_raw_only" in report["blocking_gaps"]
+
+
+def test_empty_warehouse_security_status_is_read_from_the_reference_copy(tmp_path) -> None:
+    """生产 security_status 是 0 行（NAS 实测）：§3.1 要的是"在研究库补齐后验证"，
+    所以副本里有区间就该认定能力存在，并把来源表写出来。"""
+    conn = _ready_conn()
+    conn.execute("DELETE FROM security_status")
+    reference = _reference_db(tmp_path)
+    report = audit_trend_data_readiness(connection=conn, reference_connection=reference)
+    reference.close()
+
+    check = _by_name(report)["security_status_intervals"]
+    assert check["detail"]["source_table"] == "ref_security_status"
+    assert check["detail"]["rows"] == len(_REF_SYMBOLS)
+    assert check["status"] == "ok"
+
+
+def test_truncated_name_history_stays_insufficient_with_a_reason(tmp_path) -> None:
+    """tushare 单次上限截断到的那部分不能算"证明过"：留在不足，并说清为什么。"""
+    conn = _ready_conn()
+    conn.execute("DELETE FROM security_status")
+    reference = _reference_db(tmp_path)
+    reference.close()
+    path = tmp_path / "reference.duckdb"
+    writer = duckdb.connect(str(path))
+    writer.execute("UPDATE ref_security_status SET coverage_complete = false")
+    writer.close()
+
+    report = audit_trend_data_readiness(
+        connection=conn, reference_connection=duckdb.connect(str(path), read_only=True),
+    )
+    check = _by_name(report)["security_status_intervals"]
+    assert check["status"] == "insufficient"
+    assert check["detail"]["coverage_complete_share"] == 0.0
+    assert "10,000" in check["note"]
+    assert "security_status_intervals" in report["insufficient_items"]
+    assert report["blocking_gaps"] == []
