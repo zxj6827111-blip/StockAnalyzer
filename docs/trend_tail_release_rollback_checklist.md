@@ -44,7 +44,7 @@ As-of: 2026-10-08 @ HEAD `e70d84d`（分支 `feat/stock-selection-quality-overha
 | R9 | 线上/历史判定一致 | 同一 `confirmation` 谓词 + 同一 bar 序列，`evaluate_tail_entry(quote_as_of=…)` 与 `evaluate_tail_entry(quote_as_of=None)` 结果相同（已有测试；发布前在真实数据上抽查一日） |
 | R10 | 漏斗留档完整 | 当日 `funnel_trace_*.json` 每层计数自洽（**可判**：`scripts/audit_selection_funnel.py` 读侧跑 `verify_trace()`，计数不闭合 / 契约摘要不是当前契约 / 内容与存储摘要对不上 → 退 5，不拿不可信证据下结论）、`model_identity.identity_recorded=true`、最终推荐每行 `caveats` 不含 `feature_snapshot_missing` |
 | R11 | 质量验收门 | `evaluate_selection_quality(...).passed == True`（提升 ≥5pp、分块 CI 下界 >0、平均净收益 >0、尾部 p05 不明显恶化、折数 ≥4） |
-| R12 | 影子观察达标 | `shadow_readiness(observed_trade_days≥60, matured_simulated_fills≥100).ready_for_release_review == True` |
+| R12 | 影子观察达标 | `scripts/audit_shadow_evidence.py --trace-dir artifacts/runtime/trend_tail_shadow`（`research/shadow_evidence.py`）算出 `shadow_readiness(observed_trade_days≥60, matured_simulated_fills≥100).ready_for_release_review == True`；被阻断的轮次、`_night` 半段留档、自检不过或时间不可证的文件都不计入分子分母，且逐份点名。observed 与 replayed 必须分别跑一次命令，不得合并 |
 | R13 | 页面不猜口径 | `page_view(report)` 在 `strategy / entry_window / min_net_profit_probability / contract_digest / reference_notional` 任一缺失时 raise；"尾盘确认"页与旧"推荐汇总"页各自读各自的接口，前端构建（`npm run build`）通过 |
 | R14 | 反馈闭环不越权 | `summarize_mature_feedback(...)` 的 `state` 只取 `challenger_suggested / keep_observing / shadow_only`，`promotion` 固定为人工票据字符串；净盈利率分母只含已实现样本，observed 与 replayed 不互借样本量 |
 | R15 | 线上/历史同判定 | 同一批分钟 bar + 同一组概率下，`timestamp` 模式与 `timestamp=None + trade_date` 模式的入选集合、漏斗计数、拒绝原因、成交（数量/金额/成交时刻）逐项相等；历史重算的 `trade_date`/`data_as_of` 落在请求的那天，**不是今天**；两者都不给则 `TrendContractError` |

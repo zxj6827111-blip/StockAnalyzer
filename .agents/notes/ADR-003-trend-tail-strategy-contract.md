@@ -327,6 +327,13 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库> --reference-db <�
   `night_truncation_reason_not_recorded`（视图据此仍判"原因不可用"）；成员不是上层子集时
   `inputs` 取两层并集并在 `notes` 点名越界符号，使 `inputs == advanced + dropped` 恒成立。
   三层全部标 `predictive`（§2 消融只动这类，硬门不在这里）。报告无成员时返回 `None`，不编造。
+- `src/stock_analyzer/research/shadow_evidence.py` + `scripts/audit_shadow_evidence.py` ——
+  R12 门槛的**生产者**：`shadow_readiness(≥60 完整交易日, ≥100 笔成熟成交)` 这两个输入此前没人算。
+  口径三条：`blocking_reason` 非空的那一轮不算观察日；`_night` 半段留档不算"又一个交易日"；
+  `verify_trace()` 不过或时间解释 `evidence_eligible=false` 的文件**点名排除**而不是少算，
+  `capture_mode` 必须显式声明且只能是 observed / replayed 之一（两者合并的门槛读数没有意义）。
+  退出码 0=证据达标可进人工评审 / 3=证据不足继续影子（真实状态，非错误）/ 5=读不出留档。
+  配套：`FunnelTrace.digest()` 纳入 `blocking_reason`，否则抹掉阻断标记就能把失败轮变成达标日。
 - `src/stock_analyzer/research/selection_funnel_view.py` +
   `scripts/audit_selection_funnel.py` —— 把夜扫半段（优先 `night_scan_funnel_trace`，
   无留档时退回 `production_funnel` 快照的成员与计数）与尾盘半段（``funnel_trace``：原因/特征/身份/数据时间齐全）对成 §2 的九层视图；
@@ -382,7 +389,7 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库> --reference-db <�
   以及"选股质量验收 = blocked"的实测口径（本文件不产命中率数字）
 - 测试（2026-10-08 实测条数）：`test_trend_strategy_contract.py`(55)、
   `test_tail_net_profit_label.py`(22)、`test_trend_data_readiness.py`(22)、
-  `test_funnel_trace.py`(17)、`test_record_time_semantics.py`(6)、`test_selection_funnel_view.py`(3)、`test_night_scan_funnel_trace.py`(6)、`test_funnel_trace_verification.py`(7)、`test_tail_net_profit_trainer.py`(20)、
+  `test_funnel_trace.py`(17)、`test_record_time_semantics.py`(6)、`test_selection_funnel_view.py`(3)、`test_night_scan_funnel_trace.py`(6)、`test_funnel_trace_verification.py`(7)、`test_shadow_evidence.py`(4)、`test_tail_net_profit_trainer.py`(20)、
   `test_trend_candidate_contract.py`(16)、`test_trend_tail_shadow_runtime.py`(29)、`test_tail_serving_manifest.py`(8)、`test_tail_model_artifact.py`(11)、
   `test_trend_tail_page_and_feedback.py`(26)、`test_minute_bar_store.py`(15)、
   `test_tail_walk_forward.py`(20)、`test_tail_exit_funnel.py`(14)、

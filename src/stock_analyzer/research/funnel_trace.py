@@ -171,6 +171,9 @@ class FunnelTrace:
             "strategy": self.strategy,
             "stages": [item.as_dict() for item in self.stages],
             "final": [row.symbol for row in self.final_recommendations],
+            # 被阻断的那一轮不算完整观察日（影子门槛的分母），所以它必须进摘要：
+            # 否则把 blocking_reason 抹掉就能把一轮失败悄悄变成一天达标证据。
+            "blocking": self.blocking_reason,
             "contract_digest": self.contract_digest,
         }
         blob = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
