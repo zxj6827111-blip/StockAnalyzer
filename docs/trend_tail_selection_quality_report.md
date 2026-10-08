@@ -636,6 +636,14 @@ token 只按变量名从环境变量读、取值不落任何产物）：
 每条留档带 11 个判定输入列（`features_used`）与两条版本串
 （`feature_compute_version=trend_asof_v1`、`float_cap_interpretation=unproven_float_cap_placeholder_v1`）。
 
+同一口径把三月整月跑通（`mw_mar_report.json`）：21 个决策日、
+`days_with_non_evaluable_gate_inputs` 为空、**21/21 天全部落档**
+（`funnel_traces_marketwide_mar/`），逐原因淘汰合计
+`min_avg_turnover_20` 32,392、`min_float_market_cap` 10,330、`is_st` 1,719、
+`board_eligibility` 24、`overextension_risk` 81、`stale_market_data` 1，
+另有 18 只落在 `unproven_float_market_cap`（就是 §3j 说的 17,491 行覆盖缺口里当天仍在用的那些）。
+三月市值列的占位比例经真值替换后从 6.14% 降到 1.25%。
+
 这一格补上的是 §2 "每层记输入/晋级/拒绝原因/使用的特征"在**污染窗口**上的留档缺口；
 它同时也说明：之前对这些日子"晋级只剩 212"的读数不是市场真相，
 而是解释规则把 216,862 个 symbol-day 挂到 `unproven_float_market_cap` 上的结果。
