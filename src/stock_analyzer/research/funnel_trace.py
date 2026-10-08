@@ -32,6 +32,7 @@ from stock_analyzer.contracts.trend_strategy import (
     ModelIdentity,
     TrendStrategyContract,
 )
+from stock_analyzer.research.record_time_semantics import annotate_time_semantics
 
 KIND_HARD_GATE = "hard_gate"
 KIND_PREDICTIVE = "predictive"
@@ -351,8 +352,22 @@ def write_trace(
     return path
 
 
-def read_trace(path: Path | str) -> dict[str, Any]:
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+def read_trace(
+    path: Path | str, *, expected_timezone: str | None = None
+) -> dict[str, Any]:
+    """读一条留档，并**附带**带版本的时间解释（§3.1：旧记录原样保留，不自动套新口径）。
+
+    同一目录里会同时躺着修复前后的留档；解释结果只加在 ``time_interpretation`` 这个
+    新字段上，被存储的原始值一个字节都不改。
+    """
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise FunnelTraceError(f"留档不是对象: {path}")
+    return annotate_time_semantics(
+        payload,
+        expected_timezone=(DEFAULT_TREND_CONTRACT.timezone
+                           if expected_timezone is None else expected_timezone),
+    )
 
 
 def diagnose_funnel(traces: Iterable[FunnelTrace]) -> dict[str, Any]:

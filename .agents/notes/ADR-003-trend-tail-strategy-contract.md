@@ -181,6 +181,13 @@ As-of: 2026-10-08 @ HEAD `6c7079c` 之后的工作树（本 ADR 与 `contracts/t
   这一项**不作为阻塞原因**：影子链路照常出结果，失败只在 `recording_failures` 里留名。
 - 留档落盘时刻改为带时区（契约时区 Asia/Shanghai）并附 `written_at_timezone`；
   裸 `datetime.now()` 会跟宿主机偏移走，而留档是影子验证唯一的证据来源。
+- **旧留档按带版本的规则解释，不自动套新口径**（`research/record_time_semantics.py`，
+  由 `read_trace()` 附加到新字段 `time_interpretation`）：写侧修好了，但同一目录里会
+  同时躺着修复前后的文件，裸时间戳没有偏移 ⇒ 把它当成 Asia/Shanghai 是猜测。规则只
+  **附加、绝不改写被存储的原值**：带偏移 = `record_time_v2`（可用）；裸时间戳 =
+  `record_time_v1` + `legacy_time_basis_unverified`（不给 instant、不算可用证据）；
+  声明的时区名与该时刻真实偏移矛盾 → 撤销资格（矛盾比缺失危险）。
+  `timezone_not_expected` 只留 caveat："不是我期望的时区"不等于"这条记录说谎"。
 - 已知连带事实：`model_serving_manifest.v1` **不含任何 commit 字段**，所以对真实清单
   尾盘身份必然 `training_commit_unknown` ⇒ 0 只。这是 fail-closed 的正确行为，但意味着
   影子验证在扩清单 schema（或另出带 commit 的 freeze manifest）之前不会开始累积成交；
@@ -311,7 +318,10 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库> --reference-db <�
   退出码 0/3(标签未绑定)/4(契约摘要不一致)/5(身份不可证或自检失败)
 - `src/stock_analyzer/models/output_semantics.py` —— `net_profit_5d_tail` 语义登记
 - `src/stock_analyzer/research/trend_data_readiness.py` + `scripts/audit_trend_data_readiness.py`
+- `src/stock_analyzer/research/record_time_semantics.py` —— 留档时间的带版本解释
+  （旧记录原样保留但不给它发明时区；声明矛盾即撤销证据资格）
 - `src/stock_analyzer/research/funnel_trace.py` —— 分层留档与最终推荐留档；
+  `read_trace()` 附带 `time_interpretation`（只加字段，不改原值）；
   `write_trace(..., suffix=)` 让"成交与退出"这层落到**另一个文件**，不回头覆盖入场那天的留档
 - `src/stock_analyzer/models/tail_net_profit_trainer.py` —— 日期切分 +  embargo、
   LR 基线 / 既有 LightGBM 参数、独立校准段、5pp 分块 bootstrap 判定，
@@ -353,7 +363,7 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库> --reference-db <�
   以及"选股质量验收 = blocked"的实测口径（本文件不产命中率数字）
 - 测试（2026-10-08 实测条数）：`test_trend_strategy_contract.py`(55)、
   `test_tail_net_profit_label.py`(22)、`test_trend_data_readiness.py`(22)、
-  `test_funnel_trace.py`(17)、`test_tail_net_profit_trainer.py`(20)、
+  `test_funnel_trace.py`(17)、`test_record_time_semantics.py`(6)、`test_tail_net_profit_trainer.py`(20)、
   `test_trend_candidate_contract.py`(16)、`test_trend_tail_shadow_runtime.py`(29)、`test_tail_serving_manifest.py`(8)、`test_tail_model_artifact.py`(11)、
   `test_trend_tail_page_and_feedback.py`(26)、`test_minute_bar_store.py`(15)、
   `test_tail_walk_forward.py`(20)、`test_tail_exit_funnel.py`(14)、
