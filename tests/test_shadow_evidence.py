@@ -144,3 +144,31 @@ def test_the_gate_is_reachable_and_reported_by_the_cli(tmp_path: Path) -> None:
     sparse.mkdir()
     _day(sparse, DAY_ONE, rows=[_row("600000.SH")])
     assert cli.main(["--trace-dir", str(sparse), "--quiet"]) == 3
+
+
+def test_service_counts_readiness_from_its_own_trace_dir(tmp_path: Path) -> None:
+    """门槛输入跟着留档目录走：影子进行到哪一步不该只躺在命令行里，也不该靠人估。"""
+    from stock_analyzer.runtime.services.trend_tail_shadow_service import (
+        TrendTailShadowService,
+    )
+
+    service = TrendTailShadowService(object(), report_dir=tmp_path)
+    empty = service.shadow_readiness_summary()
+    assert empty["note"] == "no_funnel_traces_written_yet"
+    assert empty["observed_trade_days"] == 0
+    assert empty["readiness"]["ready_for_release_review"] is False
+
+    _day(tmp_path, DAY_ONE, rows=[_row("600000.SH")])
+    _day(tmp_path, DAY_ONE, suffix="night", rows=[_row("600000.SH")])
+    summary = service.shadow_readiness_summary()
+    assert summary["capture_mode"] == CAPTURE_MODE_OBSERVED
+    assert summary["observed_trade_days"] == 1        # _night 那份不算第二个观察日
+    assert summary["matured_simulated_fills"] == 1
+
+    # 留档被改得读不出来时，门槛按 0 计并写明原因——既不 crash 也不假装达标。
+    broken = tmp_path / "funnel_trace_broken.json"
+    broken.write_text("{", encoding="utf-8")
+    unreadable = service.shadow_readiness_summary()
+    assert unreadable["note"].startswith("shadow_evidence_unreadable:")
+    assert unreadable["observed_trade_days"] == 0
+    assert unreadable["readiness"]["ready_for_release_review"] is False

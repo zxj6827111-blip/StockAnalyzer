@@ -333,6 +333,8 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库> --reference-db <�
   `verify_trace()` 不过或时间解释 `evidence_eligible=false` 的文件**点名排除**而不是少算，
   `capture_mode` 必须显式声明且只能是 observed / replayed 之一（两者合并的门槛读数没有意义）。
   退出码 0=证据达标可进人工评审 / 3=证据不足继续影子（真实状态，非错误）/ 5=读不出留档。
+  同一组数字也由 `TrendTailShadowService.shadow_readiness_summary()` 挂进影子报告
+  `trend_tail_shadow.shadow_readiness`（只读；留档读不出时按 0 计并写明 `note`，不 crash 也不假装达标）。
   配套：`FunnelTrace.digest()` 纳入 `blocking_reason`，否则抹掉阻断标记就能把失败轮变成达标日。
 - `src/stock_analyzer/research/selection_funnel_view.py` +
   `scripts/audit_selection_funnel.py` —— 把夜扫半段（优先 `night_scan_funnel_trace`，

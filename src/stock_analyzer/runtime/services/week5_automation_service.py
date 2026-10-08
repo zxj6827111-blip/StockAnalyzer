@@ -1362,18 +1362,22 @@ class RuntimeWeek5AutomationService:
         那是事实，不是待补的空格。
         """
         try:
-            return self._trend_tail_shadow.run(
+            report = self._trend_tail_shadow.run(
                 timestamp=now,
                 watch_pool=[dict(row) for row in pool_rows],
             )
         except Exception as exc:  # noqa: BLE001 - job 边界：失败可见但不中断主链
-            return {
+            report = {
                 "ok": False,
                 "mode": "shadow",
                 "status": "error",
                 "error": f"{type(exc).__name__}: {exc}",
                 "final_symbols": [],
             }
+        # R12 的门槛输入跟着留档一起进报告：影子进行到哪一步不该只躺在命令行里，
+        # 也不该由人脑估。只读，不影响本轮任何判定。
+        report["shadow_readiness"] = self._trend_tail_shadow.shadow_readiness_summary()
+        return report
 
     def latest_live_runtime(self) -> dict[str, object]:
         return _mapping(self.candidate_state().get("latest_live_runtime"))

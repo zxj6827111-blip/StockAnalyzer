@@ -50,6 +50,12 @@ from stock_analyzer.research.night_scan_funnel_trace import (
     NIGHT_TRACE_SUFFIX,
     build_night_scan_funnel_trace,
 )
+from stock_analyzer.research.shadow_evidence import (
+    CAPTURE_MODE_OBSERVED,
+    shadow_readiness,
+    summarize_shadow_evidence,
+    trace_paths,
+)
 
 REPORT_DIR_DEFAULT = "artifacts/runtime/trend_tail_shadow"
 
@@ -104,6 +110,42 @@ class TrendTailShadowService:
             "trade_date": trace.trade_date.isoformat(),
             "layers": [item.stage for item in trace.stages],
         }
+
+    def shadow_readiness_summary(self) -> dict[str, Any]:
+        """把发布清单 R12 的门槛输入从留档目录里数出来（只读，不参与本轮任何判定）。
+
+        只算 ``observed_snapshot`` 口径：事后重算的样本与系统当时的真实打分差一个量级，
+        混进同一个分子分母得到的门槛读数没有意义。目录里一份留档都没有时不抛错，
+        但必须写明"还没有留档"——否则 0 会被读成"这 60 天都合格"。
+        """
+        base: dict[str, Any] = {
+            "capture_mode": CAPTURE_MODE_OBSERVED,
+            "trace_dir": str(self._report_dir),
+        }
+        paths = trace_paths(self._report_dir)
+        if not paths:
+            return {
+                **base,
+                "trace_files_seen": 0,
+                "observed_trade_days": 0,
+                "matured_simulated_fills": 0,
+                "note": "no_funnel_traces_written_yet",
+                "readiness": shadow_readiness(observed_trade_days=0,
+                                             matured_simulated_fills=0),
+            }
+        try:
+            return summarize_shadow_evidence(paths, capture_mode=CAPTURE_MODE_OBSERVED)
+        except (OSError, ValueError) as exc:
+            # 数不出来不等于达标，也等于不达标：把原因写清楚，门槛仍按 0 计。
+            return {
+                **base,
+                "trace_files_seen": len(paths),
+                "observed_trade_days": 0,
+                "matured_simulated_fills": 0,
+                "note": f"shadow_evidence_unreadable:{type(exc).__name__}",
+                "readiness": shadow_readiness(observed_trade_days=0,
+                                             matured_simulated_fills=0),
+            }
 
     def run(
         self,
