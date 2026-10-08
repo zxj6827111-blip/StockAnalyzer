@@ -14,6 +14,12 @@ As-of: 2026-10-08 @ HEAD `b33b581`（分支 `feat/stock-selection-quality-overha
   其中**「特征缺失」这一项此前是虚的**：训练器遇 null 会抛裸 `TypeError`，既不归因也不留痕；
   现已改成"排除并计入 `artifact["feature_completeness"]`，整列不可用才 raise"，
   由 `tests/test_tail_net_profit_trainer.py` 两条用例钉住。
+  **§4 那句"涉及策略和时间语义的变更同步 Note/ADR"本轮补齐**：资格层留档的可信度
+  （词汇表闭合、归因顺序是契约事实、无判别力的门不落档、占位常量按带版本解释规则读）
+  写成 `.agents/notes/ADR-004-eligibility-evidence-integrity.md`（Status: Draft，两条未决项
+  写在它 §6），根因清单同步 `NOTE-002` 的 D15，README 索引两行同步。
+  `clean-scope` 门本轮实跑：rc=2，`blocking_failures` 只有 `mypy_blocking`
+  （numpy stub + `python_version="3.11"`，与 HEAD 基线一致），`ruff_clean_scope` rc=0。
 - **选股质量验收：已测量、未通过**（不再是"缺数据所以测不了"）。带时刻的尾盘分钟行情
   其实一直在 NAS 上（vendor `Stock_1min_2000-now` 与 `qq_minute_raw`），精确涨跌停也从
   tushare `stk_limit` 补采到位，于是 §4 第一次真跑：94 个决策日、5,613 条标签、
@@ -37,7 +43,7 @@ As-of: 2026-10-08 @ HEAD `b33b581`（分支 `feat/stock-selection-quality-overha
 | §2 九层漏斗逐层可追溯（输入/晋级/原因/特征/原始预测/校准概率/模型身份/数据时间） | `research/funnel_trace.py`（写时计数恒等式 + 读时 `verify_trace()`）、`research/night_scan_funnel_trace.py`（夜扫三层 + 前两层生产者）、`scripts/record_replay_funnel_trace.py`（历史侧接线）、`research/selection_funnel_view.py`（拼成九层视图并判"哪些问题答不了"） | `test_funnel_trace.py`(17)、`test_funnel_trace_verification.py`(7)、`test_night_scan_funnel_trace.py`(9)、`test_record_replay_funnel_trace.py`(3)、`test_selection_funnel_view.py`(3)、`test_shadow_evidence.py`(5)；接线由 `test_week5_automation.py::test_night_scan_writes_the_night_half_funnel_trace` 与 `::test_night_scan_reports_why_the_trace_was_not_written` 钉住；`scripts/audit_selection_funnel.py` | **历史侧 94 个决策日已全部落档**（94/94，`verify_trace()` 通过）；**另加 33 个决策日的全市场口径留档**（`funnel_traces_marketwide_janfeb/`，33/33 通过，inputs 170,776 / 晋级 113,208，见质量报告 §3h）；**本轮再加 19 个干净决策日的全市场重放落档**（`funnel_traces_marketwide_aug/`，19/19 通过，考虑 98,184 / 过完所有硬门 66,509=67.7%，市值门阈值 20.2 亿只由测过的值推出、`days_with_non_evaluable_gate_inputs=[]`，见 §3i）；生产夜扫路径仍只有 Quality300/Light100/Deep50 三层，前两层要接生产得先让选择器导出符号级清单；见下方缺口 |
 | §2 最终推荐单独留档并关联特征快照 | `archive_final_recommendations()`；缺快照落成 `feature_snapshot_missing` caveat 而不是省略 | `test_missing_feature_snapshot_is_a_visible_caveat` | 代码+测试完成 |
 | §2 逐层消融预测性规则、硬门保留 | `StageTrace.kind ∈ {hard_gate, predictive}` + `compare_traces()`（要求交易日集合完全一致） | `test_funnel_trace.py` 消融对照组用例 | 代码完成；**对照组需真实留档才能跑** |
-| §2 根因清单，区分已证实/假设；不把 bronze 占比当根因 | `.agents/notes/NOTE-002-selection-quality-root-causes.md` D1–D14 + H1–H5 | 该文件 + `scripts/audit_selection_funnel.py` 退出码 3 的机器判定 | 已交付，随实测更新 |
+| §2 根因清单，区分已证实/假设；不把 bronze 占比当根因 | `.agents/notes/NOTE-002-selection-quality-root-causes.md` D1–D15 + H1–H5；资格层证据的可信度规则单独成文 `.agents/notes/ADR-004-eligibility-evidence-integrity.md` | 两个 note 文件 + `scripts/audit_selection_funnel.py` 退出码 3 的机器判定 | 已交付，随实测更新（D15 = 浮盈市值门被 provider 兜底常量填成常数而整天失效，根因已定位到 `tushare_provider.py` 的 fillna + 吞异常） |
 | §3.1 新记录时区/交易日/去重/标签成熟；旧记录带版本解释 | `write_trace()` 落带时区时刻；`research/record_time_semantics.py` v1/v2 解释、声明矛盾即撤销证据资格 | `test_record_time_semantics.py`(6) | 代码+测试完成 |
 | §3.1 绑定实际模型/manifest/特征版本/运行身份，记录失败可见 | `models/tail_serving_manifest.py`（challenger-only，verify 时重哈希工件）+ `models/tail_model_artifact.py` + `runtime_identity` 共享解析器 | `test_tail_serving_manifest.py`(8)、`test_tail_model_artifact.py`(11)、`test_trend_tail_shadow_runtime.py`(29) | 代码+测试完成 |
 | §3.1 补齐校验日历/RAW/精确涨跌停/停复牌/证券状态；复用现有接口、独立研究库 | `research/trend_data_readiness.py` + `scripts/audit_trend_data_readiness.py`；研究库 `artifacts/research/tail_minute_bars.duckdb` 的 `ref_*` 参考表 | `test_trend_data_readiness.py`(22)、`test_tail_reference_store.py`(14) | 代码完成；**就绪审计退出码仍为 5(blocked)**，因本机无库、缺 `trade_status` 列 |

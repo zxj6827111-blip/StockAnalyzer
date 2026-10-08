@@ -2,7 +2,8 @@
 
 Status: Draft
 
-As-of: 2026-10-08 @ HEAD `e90b5de`（D14 收窄：夜扫半段已有留档生产者）
+As-of: 2026-10-08 @ HEAD `ce19b76`（新增 D15：流通市值被 provider 兜底常量静默填充，
+浮盈市值硬门因此整天失效；读侧带版本解释规则与防御见 ADR-004）
 
 回答的问题是改进计划 §2 的那句"整条链路在哪里损失选股质量"。本文只列**可核实的事实**
 与**明确标注为假设的猜测**，不给因果结论——因果需要 §4 的对照实验
@@ -26,6 +27,8 @@ As-of: 2026-10-08 @ HEAD `e90b5de`（D14 收窄：夜扫半段已有留档生产
 | D12 | 最终推荐没有独立留档，只有一个候选快照 | `runtime/service.py:6566` → `artifacts/runtime/universe_quality_snapshot.json` | "候选快照代表最终推荐"这个前提不成立（尾盘后的判定完全没落库） |
 | D13 | `soup_strategy.max_holdings` YAML 值是 1，而契约/新路径要求 3 | `default.yaml:257` | 声明与意图不一致，`audit_strategy_contract_conflicts()` 现在会报出来 |
 | D14 | §2 的九层漏斗留档仍不完整。夜扫半段（Quality300/Light100/Deep50）自本提交起**有生产者**（`research/night_scan_funnel_trace.py`，夜扫落定后写 `funnel_trace_<date>_night.json`），但它记的是成员+落差+数据时间，**逐只截断原因仍缺**（全部挂 `night_truncation_reason_not_recorded`）；`universe` 与 `hard_eligibility` 的**生产者已就位**（`night_scan_funnel_trace.build_universe_stage_traces()`，从 `AsofUniverseSnapshot` 的符号级事实构造、原因逐只来自 `resolve_asof_universe`），但**尚未接线**：夜扫报告里的 `universe_snapshot` 是 `to_payload()`，只有计数与 ≤50 样本，没有 `eligible_symbols` 清单 | `research/selection_funnel_view.py` 的 `coverage.layers_from_trace` / `layers_without_reasons` / `layers_unrecorded`；`scripts/audit_selection_funnel.py` 退出码 3 | 前两层（全市场→硬性资格）没有留档，"前置筛选是否过早淘汰了适合短期上涨的股票"仍只能靠印象回答；视图机器判为"凭现有证据答不了"（缺记录不折算成零淘汰，占位原因也不算有原因）。补齐需要夜扫把每只被挡下的原因落成结构化记录；前两层的具体障碍是 `data/asof_universe.to_payload()` 只带**计数**与 ≤50 的 `excluded_reasons_sample`，**不带 eligible 符号清单**，而 `StageTrace` 的 `advanced == len(advanced_symbols)` 恒等式不允许用计数冒充成员——要落这两层必须先决定让夜扫报告携带符号级名单（改生产报告体积与形状），属需确认的设计决策，不是可顺手补的小改 |
+
+| D15 | 流通市值列被数据供应商的**兜底常量** 12,000,000,000.0 静默填进"取不到 `circ_mv`"的那些行：`tushare_provider.py:1677-1684` 的 `fillna(_DEFAULT_FLOAT_MARKET_CAP)`，而它依赖的 `daily_basic` 调用外面 `except Exception: basic = pd.DataFrame()`（`:708-719`）**把失败吞掉**。三个 provider 用同一个字面值（`tushare:23` / `akshare:20` / `efinance:18`），所以这个数就是"没测过"的指纹。库内实测：2026-04 99.7%、05 99.98%、**06 全月只剩这一个取值**、03/07 各约五成；2022-05 起每月 15~46 行、2025-09~2026-02 每月 2,511~5,608 行 | 质量报告 §3g.1（值对上代码）；检测：`trend_data_readiness.column_concentration_<col>`（`MAX_MODAL_VALUE_SHARE=0.50`）与重放侧 `degenerate_gate_inputs()`；读侧规则：`UNPROVEN_FLOAT_MARKET_CAP` / `FLOAT_CAP_INTERPRETATION_VERSION` / HARD 名 `unproven_float_market_cap`，见 ADR-004 | **不是数值不准，是硬门失效**：阈值按同一列取分位 ⇒ 列成常数时阈值=众数 ⇒ `value < threshold` 恒假 ⇒ 这条门那天对全市场一个都不淘汰，留档却读起来像"没有一只票市值不达标"。它不是 NaN/0，所以所有防填零检查都不报警。打上读侧解释规则后重测：污染窗口 310,142 个 symbol-day 里 **216,862（69.9%）"市值从未测过"**、60 天里 40 天整日无从判定、晋级只剩 212；干净窗口（2026-08）只有 1 行占位、门正常淘汰 1,242。**真值还没重采**，写侧改成 NULL 是跨 26 个文件的数据语义变更，需另开 ADR（ADR-004 §6.1） |
 
 ## 2. 已实测、但还不足以定性为根因
 
