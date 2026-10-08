@@ -40,7 +40,7 @@ As-of: 2026-10-08 @ HEAD `ce19b76`
 | 1 | 能写进 `hard_eligibility` 留档的原因名**必须**在 `_RULE_KIND` 里登记为 `HARD`；生产者一旦吐出未登记或非 HARD 的名字就直接 `SystemExit` | 不做"未知名字当硬门"的宽容：`classify_rule()` 对未知名字按 `predictive` 处理，而 §2 的消融实验正是按 `classify_rule()` 分组的——一条没登记的硬门会**从消融视野里消失**，比少用一条规则严重得多 |
 | 2 | 多门命中时"第一条原因"的顺序是契约常量 `HARD_GATE_ATTRIBUTION_ORDER`，并被写进每条留档的 notes | 不依赖 dict 插入顺序：那样逐原因计数会随代码行序悄悄改数 |
 | 3 | 一条硬门当天的输入列没有判别力（众数占比 > 0.5，或列全空）⇒ 这天的 `universe`/`hard_eligibility` **不落档**；列里被填进数据供应商兜底常量的那些**行**单独记 `unproven_float_market_cap` 出局 | 不把"门跑完了没淘汰任何票"读成"这只票过了这条门"；也不为了让留档有数字而把阈值改成绝对值（口径就变了） |
-| 4 | 老记录**不重写**，按 `FLOAT_CAP_INTERPRETATION_VERSION` 这条带版本的解释规则读；解释版本本身进重放报告的 `thresholds` | 不就地 `UPDATE` 历史 `float_market_cap`——那会让既有留档与产物对不上，且我们没有当时的真值 |
+| 4 | 老记录**不重写**，按 `FLOAT_CAP_INTERPRETATION_VERSION` 这条带版本的解释规则读；解释版本本身进重放报告的 `thresholds` | 不就地 `UPDATE` 历史 `float_market_cap`——那会让既有留档与产物对不上。真值现在有独立来源了（研究库 `float_market_cap_ref`，2026-10-08 补采，见质量报告 §3j），但这条决定不变：真值作为另一张表由消费方显式加入并声明用了哪版口径，占位行留在原处当证据 |
 
 ---
 

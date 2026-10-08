@@ -75,6 +75,64 @@ def _truthy(column: pd.Series) -> pd.Series:
     return pd.to_numeric(column, errors="coerce").fillna(0) > 0
 
 
+#: 与真值差多少算"实质不同"：1% 以上。低于它的差异是万元/元换算后的舍入噪声。
+MEANINGFUL_DIFF_RATIO = 0.01
+
+
+def apply_float_cap_reference(
+    frame: pd.DataFrame, ref_db: Path
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """用独立补采的市值真值替换 ``float_market_cap``，并如实记数替换了什么。
+
+    仓库那一列在 2026-03 中旬以后是占位常数（§3g/ADR-004），市值门对它无从判定；
+    真值来自 tushare ``daily_basic.circ_mv``，落在研究库里。这里**只在能对上的
+    symbol-day 上替换**，并对不上的行保留原值 —— 覆盖不到的地方不能装作有数据。
+
+    返回的计数是给报告用的，不是装饰：``rows_placeholder_without_reference``
+    不为零就说明这一天仍然不能完全判定。
+    """
+    con = duckdb.connect(str(ref_db), read_only=True)
+    try:
+        ref = con.execute(
+            "SELECT symbol, CAST(trade_date AS VARCHAR) AS ref_date, float_market_cap "
+            "FROM float_market_cap_ref"
+        ).fetch_df()
+    finally:
+        con.close()
+    if ref.empty:
+        raise SystemExit(f"reference table is empty: {ref_db}")
+    ref["ref_date"] = pd.to_datetime(ref["ref_date"]).dt.date
+    merged = frame.merge(
+        ref.rename(columns={"ref_date": "date", "float_market_cap": "cap_ref"}),
+        on=["symbol", "date"],
+        how="left",
+    )
+    if len(merged) != len(frame):
+        raise SystemExit("reference join multiplied rows — ref table is not unique by "
+                         "symbol+date")
+    before = pd.to_numeric(merged["float_market_cap"], errors="coerce")
+    hit = merged["cap_ref"].notna()
+    placeholder_before = unproven_float_market_cap_mask(before)
+    after = merged["cap_ref"].where(hit, before)
+    merged["float_market_cap"] = after
+    stats: dict[str, Any] = {
+        "ref_db": str(ref_db),
+        "rows_total": int(len(merged)),
+        "rows_with_reference": int(hit.sum()),
+        "rows_replaced_from_placeholder": int((hit & placeholder_before).sum()),
+        "rows_left_placeholder_without_reference": int((~hit & placeholder_before).sum()),
+        # 只在"两边都声称是观测值"的行上比 —— 把占位常数换成真值本来就该差很多，
+        # 混进这个计数会得到一个 67% 这种看起来像"真值也大面积对不上"的假数字。
+        "rows_both_claim_measured": int((hit & ~placeholder_before).sum()),
+        "rows_measured_differing_beyond_1pct": int(
+            (hit & ~placeholder_before
+             & ((before / after).sub(1.0).abs() > MEANINGFUL_DIFF_RATIO)).sum()
+        ),
+        "float_cap_source": "tushare_daily_basic_circ_mv_research_reference",
+    }
+    return merged.drop(columns=["cap_ref"]), stats
+
+
 def day_funnel(frame: pd.DataFrame, day: date, *, min_turnover: float,
                min_float_cap: float) -> dict[str, Any]:
     """一天的全市场硬门漏斗：输入 = 当天有 bar 的符号，淘汰按契约归因顺序取第一条。"""
@@ -183,6 +241,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     frame = load_market_frame(warehouse, start, end)
     if frame.empty:
         raise SystemExit("no daily bars in the requested window")
+    cap_reference: dict[str, Any] = {}
+    if args.float_cap_ref_db:
+        frame, cap_reference = apply_float_cap_reference(
+            frame, Path(str(args.float_cap_ref_db)).expanduser()
+        )
     days = [d for d in sorted(frame["date"].unique()) if start <= d <= end]
     funnels = []
     for day in days:
@@ -212,6 +275,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "float_cap_quantile": args.float_cap_quantile,
         "min_history_bars": MIN_HISTORY_BARS,
         "max_bar_gap_calendar_days": MAX_BAR_GAP_CALENDAR_DAYS,
+        "float_cap_reference": cap_reference,
     })
     return report
 
@@ -225,6 +289,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--end", required=True, help="YYYY-MM-DD")
     parser.add_argument("--turnover-quantile", type=float, default=0.30)
     parser.add_argument("--float-cap-quantile", type=float, default=0.10)
+    parser.add_argument(
+        "--float-cap-ref-db",
+        default="",
+        help="独立补采的市值真值库（float_market_cap_ref）；给了就用它替换那一列，"
+             "不给就按仓库原值跑（占位常数会被记成 unproven_float_market_cap）",
+    )
     parser.add_argument("--report", default="")
     args = parser.parse_args(argv)
     try:
