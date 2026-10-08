@@ -2,7 +2,7 @@
 
 Status: Draft
 
-As-of: 2026-10-08（D15 已补采真值、D16 覆盖面是自设参数已修；§2 新增全市场 91 决策日的特征判别力读数——第一轮特征集里两条反号项解释了四折验证为何全部卡在校准段。台账 `docs/selection_quality_plan_status.md` §0 是当前交接面）
+As-of: 2026-10-08（D15 已补采真值、D16 覆盖面是自设参数已修、**D17 新增：6/7 月 ref_limit_prices 只剩 209 个符号，精确涨跌停只能远端补采**；§2 的特征判别力读数已按 124 决策日 + --rolling 剖面更正，结论从「两条反号列」改成「这四类信息方向本身不稳定」。台账 docs/selection_quality_plan_status.md §0 是当前交接面）
 浮盈市值硬门因此整天失效；读侧带版本解释规则与防御见 ADR-004）
 
 回答的问题是改进计划 §2 的那句"整条链路在哪里损失选股质量"。本文只列**可核实的事实**
@@ -30,6 +30,7 @@ As-of: 2026-10-08（D15 已补采真值、D16 覆盖面是自设参数已修；�
 
 | D15 | 流通市值列被数据供应商的**兜底常量** 12,000,000,000.0 静默填进"取不到 `circ_mv`"的那些行：`tushare_provider.py:1677-1684` 的 `fillna(_DEFAULT_FLOAT_MARKET_CAP)`，而它依赖的 `daily_basic` 调用外面 `except Exception: basic = pd.DataFrame()`（`:708-719`）**把失败吞掉**。三个 provider 用同一个字面值（`tushare:23` / `akshare:20` / `efinance:18`），所以这个数就是"没测过"的指纹。库内实测：2026-04 99.7%、05 99.98%、**06 全月只剩这一个取值**、03/07 各约五成；2022-05 起每月 15~46 行、2025-09~2026-02 每月 2,511~5,608 行 | 质量报告 §3g.1（值对上代码）；检测：`trend_data_readiness.column_concentration_<col>`（`MAX_MODAL_VALUE_SHARE=0.50`）与重放侧 `degenerate_gate_inputs()`；读侧规则：`UNPROVEN_FLOAT_MARKET_CAP` / `FLOAT_CAP_INTERPRETATION_VERSION` / HARD 名 `unproven_float_market_cap`，见 ADR-004 | **不是数值不准，是硬门失效**：阈值按同一列取分位 ⇒ 列成常数时阈值=众数 ⇒ `value < threshold` 恒假 ⇒ 这条门那天对全市场一个都不淘汰，留档却读起来像"没有一只票市值不达标"。它不是 NaN/0，所以所有防填零检查都不报警。打上读侧解释规则后重测：污染窗口 310,142 个 symbol-day 里 **216,862（69.9%）"市值从未测过"**、60 天里 40 天整日无从判定、晋级只剩 212；干净窗口（2026-08）只有 1 行占位、门正常淘汰 1,242。真值已于 2026-10-08 补采进研究库（129 天 / 708,047 行，独立表 `float_market_cap_ref`，质量报告 §3j）：同一套规则换上真值后污染窗口的晋级从 212 变成 208,128，市值门按 10 分位每天淘汰 2.7% 的输入——这才是它本来在做的事。仓库那一列**仍未就地改写**（写侧改成 NULL 是跨 26 个文件的数据语义变更，需另开 ADR，ADR-004 §6.1）；另测出 1~3 月有 9%~18% 的非占位行与 `circ_mv` 差出 1% 以上，说明 `float_market_cap` 不是单一定义的序列 |
 | D16 | 研究侧「数据不够」这个结论有三次其实是我自己设的符号上限：分钟库只灌了 208 只、参考库 `ref_daily_bars_raw` 也只灌了 208 只，而 vendor 包本身是全市场的（2026-04 每个交易日 5,194 个逐票 CSV；日线包重灌后 718,796 行 / 5,190 只）。根因都是同一句：ingest/sync 脚本传了 `--symbols-file artifacts/research/tail_symbols.txt`（那份 900 只清单，仓库里没有产生它的代码） | 质量报告 §3l / §3n.1；`scripts/sync_tail_minute_bars.py`、`scripts/sync_tail_reference_data.py` 的 `--symbols/--symbols-file` 参数 | **已证实并已修**：四月分钟 bar 全市场重灌 26,305,150 行 / 109,150 个完整尾盘 symbol-day；日线参考重灌 718,796 行 / 5,190 只、`gaps=[]`。修好后 §3n 那 10,828 条缺 `entry_daily_bar` 的判不动样本才可能出标签。**教训**：说「数据不足」之前先证明限制来自数据源而不是调用参数，否则会把工程缺陷记成数据缺口并白白停摆 |
+| D17 | 研究库 `ref_limit_prices` 的覆盖面在 6/7 月塌了：6 月 43,094 行 / 21 天（≈2,052 只/天），**7 月只有 4,793 行 / 209 个符号**，而同库 `ref_daily_bars_raw` 同期 5,182 / 5,176 只。2026-06-15 有 **4,957** 只在册股票没有涨跌停行 | 质量报告 §4.2；`scripts/sync_tail_reference_data.py` 的 `--limit-prices-csv`（唯一权威来源是 tushare `stk_limit`，doc_id=183）；`artifacts/research/tail_minute_bars.duckdb` 的 `ref_limit_prices` | **已证实**：125 决策日标签重跑因此退 3，`entry_day_limit_prices` 阻塞 5,464 条请求。本地补不了——`market_copy.duckdb` 里没有任何涨跌停表，只能远端补采；补采前这些日子的确认判定不得产出标签，也不得用开盘回测顶替 |
 
 ## 2. 已实测、但还不足以定性为根因
 
@@ -52,9 +53,15 @@ As-of: 2026-10-08（D15 已补采真值、D16 覆盖面是自设参数已修；�
   市场相对强弱 `excess_ret_20`=0.5600、`relative_strength`=0.5541；
   而量价/流动性 `avg_turnover_20`=**0.4672** 与波动/过热 `atr14_pct`=**0.4601** 是**反号**的
   （`realized_vol_20`=0.4782 同向）。
-  → 已证实的是"这四条不能一起进线性模型"：第一轮特征集含两条反号项，
-    `validate_tail_selection_quality.py` 四种组合全部在第 1 折校准段 fail-closed
-    （raw AUC 0.4384 / 0.4691 / 0.4696 / 0.4720，退出码 5），四折测试段因此根本没跑。
+  → **上一版这条的结论已经不够了**：把窗口从 91 个决策日扩到 124 个（37,200 请求 / 31,599 标签 /
+    21,760 笔成交退出 / 成交后净盈利率 0.4053）再量一次，`--rolling` 剖面显示
+    **11 条特征里没有一条能在多数窗上站稳方向**（正向窗 9–12 / 19≈掷硬币，同一条特征 AUC 从
+    0.3753 摆到 0.6321），且两种特征集在第 1 折校准段的读数与 91 日**逐位相同**
+    （0.4696 / 0.4720）——滚动折永远从最早那段开始校准，往尾部追加月份改不了它。
+  → 已证实的是：**2026 上半年这四类已有信息在全市场合格池上方向本身不稳定**，
+    不是"两条反号列拖累了线性模型"。`validate_tail_selection_quality.py` 四种组合因此在
+    第 1 折校准段全部 fail-closed（raw AUC 0.4384 / 0.4691 / 0.4696 / 0.4720，退出码 5），
+    四折测试段根本没跑，±5pp 与交易日分块 bootstrap **没有数**。
   → **还不足以定性**：这解释的是"为什么净盈利率改善没有数"，不是"净盈利率不会改善"。
     单特征 AUC 的分段口径与 walk-forward 折定义不同，且成交率 0.7190 / 成交后净盈利率 0.4121
     仍只是 `replayed_recompute` 总体，不能当 observed 命中率。
@@ -101,7 +108,8 @@ As-of: 2026-10-08（D15 已补采真值、D16 覆盖面是自设参数已修；�
 - `scripts/audit_observed_signal_returns.py` —— §2 的 observed 队列复现入口
 - `src/stock_analyzer/research/float_cap_reference.py`、`scripts/collect_float_market_cap_history.py`、`scripts/load_float_market_cap_research.py` —— D15 的真值补采与读取侧接线
 - `scripts/sync_tail_minute_bars.py`、`scripts/sync_tail_reference_data.py` 的 `--symbols/--symbols-file` —— D16：覆盖面由调用参数决定，报告必须写清用了哪份清单
-- `scripts/measure_tail_feature_direction.py` + `artifacts/research/mw_feature_direction_91d.json` —— §2 特征判别力读数的唯一生产者（只读，不改标签不改排序）
+- `scripts/measure_tail_feature_direction.py` + `artifacts/research/mw_feature_direction_91d.json` / `mw_feature_direction_125d_rolling.json` —— §2 特征判别力读数的唯一生产者（只读，含 --rolling 剖面）
+- `scripts/sync_tail_reference_data.py` 的 `--limit-prices-csv` —— D17：精确涨跌停的唯一来源是远端 stk_limit，本地仓库副本里没有涨跌停表，采集面塌了就只能远端补，不能用开盘价近似
 - `src/stock_analyzer/research/tail_walk_forward.py` 的校准段方向门（`calibration window direction is not positive`）—— 四种特征组合全部在这里 fail-closed，四折测试段不产出数字
 - `runtime/universe_candidate_selector.py::_gate_membership`、`research/night_scan_funnel_trace.py::live_universe_facts` —— 生产夜扫前两层留档
 - `docs/alpha_v2/M4H_Historical_Locked_OOS_Report.md` —— 锁定 OOS 上限参照

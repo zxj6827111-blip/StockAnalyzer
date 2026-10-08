@@ -119,11 +119,51 @@ def measure(rows: list[dict[str, Any]], name: str) -> dict[str, Any]:
     return out
 
 
+def rolling_profile(
+    rows: list[dict[str, Any]], name: str, *, window: int = 12, step: int = 6
+) -> dict[str, Any]:
+    """按连续决策日窗量每条特征的判别力剖面。
+
+    存在的理由：`validate_tail_selection_quality.py` 的滚动折**永远从最早那段开始校准**，
+    所以往窗口尾部追加再多的新月份，也不会改变第 1 折的校准段。只看最后一个时间外段
+    回答不了"到底有没有任何一段有方向"，而这个问题决定了失败该记成特征缺陷还是制度段差异。
+    """
+    days = sorted({str(r[DATE_FIELD]) for r in rows})
+    points: list[dict[str, Any]] = []
+    start = 0
+    while start + window <= len(days):
+        segment = set(days[start:start + window])
+        part = [r for r in rows if str(r[DATE_FIELD]) in segment]
+        pairs = [
+            (v, int(r[LABEL_FIELD])) for r in part if (v := _flat_value(r, name)) is not None
+        ]
+        points.append({
+            "from": days[start],
+            "to": days[start + window - 1],
+            "rows": len(pairs),
+            "auc": auc([p[0] for p in pairs], [p[1] for p in pairs]),
+        })
+        start += step
+    values = [p["auc"] for p in points if p["auc"] is not None]
+    return {
+        "windows": points,
+        "windows_positive": sum(1 for v in values if v > 0.5),
+        "windows_total": len(values),
+        "auc_min": min(values) if values else None,
+        "auc_max": max(values) if values else None,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--samples", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--features", default=",".join(PROBE_FEATURES))
+    parser.add_argument(
+        "--rolling",
+        action="store_true",
+        help="额外按连续 12 个决策日窗量判别力剖面（回答「有没有任何一段有方向」）",
+    )
     args = parser.parse_args(argv)
 
     rows = load_rows(Path(args.samples))
@@ -136,6 +176,7 @@ def main(argv: list[str] | None = None) -> int:
         for group, features in FEATURE_GROUPS.items()
         for feature in features
     }
+    names = [name.strip() for name in args.features.split(",") if name.strip()]
     report: dict[str, Any] = {
         "samples": len(rows),
         "decision_days": len({str(r[DATE_FIELD]) for r in rows}),
@@ -143,9 +184,12 @@ def main(argv: list[str] | None = None) -> int:
         "split_note": "train=前段决策日；calibration=倒数第 16-30 天；"
                       "out_of_sample_test=最后 15 天",
         "features": [
-            {**measure(rows, name.strip()), "group": group_of.get(name.strip(), "unmapped")}
-            for name in args.features.split(",")
-            if name.strip()
+            {
+                **({**measure(rows, name), "rolling": rolling_profile(rows, name)}
+                   if args.rolling else measure(rows, name)),
+                "group": group_of.get(name, "unmapped"),
+            }
+            for name in names
         ],
     }
     by_group: dict[str, list[float | None]] = defaultdict(list)
