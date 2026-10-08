@@ -113,6 +113,13 @@ def _universe_facts(universe: Any) -> dict[str, Any]:
         "coverage": str(fact("survivorship_coverage") or ""),
         "delisting_verified": bool(fact("delisting_coverage_verified")),
         "non_evaluable_gates": broken,
+        # §2 要每层记"使用的特征"：资格层记的是判定输入列与算它的契约版本。
+        # 旧 payload 没这两个键时留空，不替它编。
+        "gate_input_columns": tuple(sorted({str(c) for c in (fact("gate_input_columns") or ())})),
+        "feature_contract_version": str(fact("feature_contract_version") or ""),
+        "float_cap_interpretation_version": str(
+            fact("float_cap_interpretation_version") or ""
+        ),
     }
 
 
@@ -172,6 +179,9 @@ def build_universe_stage_traces(
         input_symbols=considered,
         advanced_symbols=kept,
         rejected=rejected,
+        # §2 要这一层记下它读了什么：判定输入列（由生产者按当天真的跑过的规则给），
+        # 不是模型特征清单，所以只在这份清单存在时才填，旧 payload 留空。
+        features_used=facts["gate_input_columns"],
         data_as_of=data_as_of,
         contract=contract,
         model_identity=model_identity,
@@ -179,6 +189,10 @@ def build_universe_stage_traces(
             "known_suspended 是 eligible 但窗口内无 bar，按契约不等于证明停牌；"
             "一只票同时踩中多条硬门时只记第一条，归因顺序来自契约："
             f"{'|'.join(HARD_GATE_ATTRIBUTION_ORDER)}"
+            + (f"；feature_compute_version={facts['feature_contract_version']}"
+               if facts["feature_contract_version"] else "")
+            + (f"；float_cap_interpretation={facts['float_cap_interpretation_version']}"
+               if facts["float_cap_interpretation_version"] else "")
         ),
     )
     return (universe_stage, eligibility_stage)

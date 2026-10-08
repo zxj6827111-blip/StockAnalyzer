@@ -231,6 +231,57 @@ def test_universe_layers_use_the_snapshot_real_per_symbol_reasons() -> None:
     assert "不等于证明停牌" in eligibility.notes
 
 
+def test_eligibility_layer_records_which_columns_its_gates_read() -> None:
+    """§2 要这一层记"用了哪些特征"：清单由生产者按当天跑过的规则给，写入器只转达。
+
+    同时钉住"旧 payload 不猜"：没有那几个键时 features_used 必须留空、notes 里
+    也不许冒出版本号 —— 否则就是在替没记录的历史编一份记录。
+    """
+    from stock_analyzer.research.night_scan_funnel_trace import (
+        build_universe_stage_traces,
+    )
+
+    def payload(**extra: object) -> dict:
+        base = {
+            "universe_snapshot_id": "replay:db:2026-10-09",
+            "as_of": "2026-10-09",
+            "eligible_symbols": ["600000.SH", "600001.SH", "600002.SH"],
+            "expected_active_symbols": ["600000.SH"],
+            "excluded_reasons": {
+                "600001.SH": "min_avg_turnover_20",
+                "600002.SH": "insufficient_history_at_asof",
+            },
+            "known_suspended_symbols": [],
+            "survivorship_coverage": "incomplete_or_unknown",
+            "delisting_coverage_verified": False,
+            "non_evaluable_gates": [],
+        }
+        base.update(extra)
+        return base
+
+    stages = build_universe_stage_traces(
+        universe=payload(
+            gate_input_columns=["suspended", "avg_turnover_20", "float_market_cap"],
+            feature_contract_version="trend_asof_v1",
+            float_cap_interpretation_version="unproven_float_cap_placeholder_v1",
+        ),
+        data_as_of="2026-10-09T15:00:00",
+        contract=CONTRACT,
+    )
+    eligibility = stages[1]
+    assert eligibility.features_used == (
+        "avg_turnover_20", "float_market_cap", "suspended",
+    )
+    assert "feature_compute_version=trend_asof_v1" in eligibility.notes
+    assert "float_cap_interpretation=unproven_float_cap_placeholder_v1" in eligibility.notes
+
+    bare = build_universe_stage_traces(
+        universe=payload(), data_as_of="2026-10-09T15:00:00", contract=CONTRACT,
+    )[1]
+    assert bare.features_used == ()
+    assert "feature_compute_version=" not in bare.notes
+
+
 def test_universe_layers_refuse_a_day_whose_gate_input_is_a_constant() -> None:
     """硬门输入列被填成常数的那天，前两层不落档。
 

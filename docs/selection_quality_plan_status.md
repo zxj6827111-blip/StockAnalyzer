@@ -40,7 +40,7 @@ As-of: 2026-10-08 @ HEAD `b33b581`（分支 `feat/stock-selection-quality-overha
 | 计划条目 | 实现 | 证据 | 状态 |
 | --- | --- | --- | --- |
 | §1 净盈利概率语义、0–3 只/日、1 万参考额、TP+8%/SL−5%、持有 5 日（入场日为第 1 日）、monster 独立 | `contracts/trend_strategy.py` 单一契约，线上/标签/历史验证共用 | `test_trend_strategy_contract.py`(55)；ADR-003 | 代码+测试完成 |
-| §2 九层漏斗逐层可追溯（输入/晋级/原因/特征/原始预测/校准概率/模型身份/数据时间） | `research/funnel_trace.py`（写时计数恒等式 + 读时 `verify_trace()`）、`research/night_scan_funnel_trace.py`（夜扫三层 + 前两层生产者）、`scripts/record_replay_funnel_trace.py`（历史侧接线）、`research/selection_funnel_view.py`（拼成九层视图并判"哪些问题答不了"） | `test_funnel_trace.py`(17)、`test_funnel_trace_verification.py`(7)、`test_night_scan_funnel_trace.py`(9)、`test_record_replay_funnel_trace.py`(3)、`test_selection_funnel_view.py`(3)、`test_shadow_evidence.py`(5)；接线由 `test_week5_automation.py::test_night_scan_writes_the_night_half_funnel_trace` 与 `::test_night_scan_reports_why_the_trace_was_not_written` 钉住；`scripts/audit_selection_funnel.py` | **历史侧 94 个决策日已全部落档**（94/94，`verify_trace()` 通过）；**另加 33 个决策日的全市场口径留档**（`funnel_traces_marketwide_janfeb/`，33/33 通过，inputs 170,776 / 晋级 113,208，见质量报告 §3h）；**本轮再加 19 个干净决策日的全市场重放落档**（`funnel_traces_marketwide_aug/`，19/19 通过，考虑 98,184 / 过完所有硬门 66,509=67.7%，市值门阈值 20.2 亿只由测过的值推出、`days_with_non_evaluable_gate_inputs=[]`，见 §3i）；生产夜扫路径仍只有 Quality300/Light100/Deep50 三层，前两层要接生产得先让选择器导出符号级清单；见下方缺口 |
+| §2 九层漏斗逐层可追溯（输入/晋级/原因/特征/原始预测/校准概率/模型身份/数据时间） | `research/funnel_trace.py`（写时计数恒等式 + 读时 `verify_trace()`）、`research/night_scan_funnel_trace.py`（夜扫三层 + 前两层生产者）、`scripts/record_replay_funnel_trace.py`（历史侧接线）、`research/selection_funnel_view.py`（拼成九层视图并判"哪些问题答不了"） | `test_funnel_trace.py`(17)、`test_funnel_trace_verification.py`(7)、`test_night_scan_funnel_trace.py`(10)、`test_record_replay_funnel_trace.py`(3)、`test_selection_funnel_view.py`(3)、`test_shadow_evidence.py`(5)；接线由 `test_week5_automation.py::test_night_scan_writes_the_night_half_funnel_trace` 与 `::test_night_scan_reports_why_the_trace_was_not_written` 钉住；`scripts/audit_selection_funnel.py` | **历史侧 94 个决策日已全部落档**（94/94，`verify_trace()` 通过）；**另加 33 个决策日的全市场口径留档**（`funnel_traces_marketwide_janfeb/`，33/33 通过，inputs 170,776 / 晋级 113,208，见质量报告 §3h）；**本轮再加 19 个干净决策日的全市场重放落档**（`funnel_traces_marketwide_aug/`，19/19 通过，考虑 98,184 / 过完所有硬门 66,509=67.7%，市值门阈值 20.2 亿只由测过的值推出、`days_with_non_evaluable_gate_inputs=[]`，见 §3i）；生产夜扫路径仍只有 Quality300/Light100/Deep50 三层，前两层要接生产得先让选择器导出符号级清单；见下方缺口 |
 | §2 最终推荐单独留档并关联特征快照 | `archive_final_recommendations()`；缺快照落成 `feature_snapshot_missing` caveat 而不是省略 | `test_missing_feature_snapshot_is_a_visible_caveat` | 代码+测试完成 |
 | §2 逐层消融预测性规则、硬门保留 | `StageTrace.kind ∈ {hard_gate, predictive}` + `compare_traces()`（要求交易日集合完全一致） | `test_funnel_trace.py` 消融对照组用例 | 代码完成；**对照组需真实留档才能跑** |
 | §2 根因清单，区分已证实/假设；不把 bronze 占比当根因 | `.agents/notes/NOTE-002-selection-quality-root-causes.md` D1–D15 + H1–H5；资格层证据的可信度规则单独成文 `.agents/notes/ADR-004-eligibility-evidence-integrity.md` | 两个 note 文件 + `scripts/audit_selection_funnel.py` 退出码 3 的机器判定 | 已交付，随实测更新（D15 = 浮盈市值门被 provider 兜底常量填成常数而整天失效，根因已定位到 `tushare_provider.py` 的 fillna + 吞异常） |
@@ -50,7 +50,7 @@ As-of: 2026-10-08 @ HEAD `b33b581`（分支 `feat/stock-selection-quality-overha
 | §3.1 校验指数链路，缺失不填零 | 指数缺口按 insufficient 处理 | `test_index_gap_is_insufficient_not_zero_filled` | 代码+测试完成 |
 | §3.1 "缺失不能被填成看起来合理的值后当成有效信息"（本轮由 §3g 缺陷具体化）+ "旧记录保留原值、用带版本的解释规则兼容" | `trend_candidate_contract`：`UNPROVEN_FLOAT_MARKET_CAP` / `FLOAT_CAP_INTERPRETATION_VERSION` / `unproven_float_market_cap_mask()` + 新 HARD 规则名 `unproven_float_market_cap`（进 `HARD_GATE_ATTRIBUTION_ORDER`）；重放与全市场两处消费点都不让占位行参与市值比较，分位阈值只从测过的值推，测过的为空则该天标 `float_cap_gate_evaluable=False` | `test_replay_tail_intraday_features.py::test_placeholder_float_cap_does_not_pass_the_size_gate`、`test_measure_marketwide_gate_coverage.py`(2 条新)；非 vacuity 已核：同一批数据在旧表达式下 3 只里有 2 只会带着没测过的市值晋级 | 代码+测试完成，**读侧已生效**；写侧（ingest 不再写兜底常量）是跨 26 个文件的数据语义变更，**要另开 ADR 才动**；数据本身仍缺（见缺口清单） |
 | §2 "前置筛选是否过早淘汰" —— 需要**全市场**口径的资格层读数 | `scripts/measure_marketwide_gate_coverage.py`（同一套登记为 HARD 的规则 + 契约归因顺序，套用到全市场日线；阈值注明是"每天全市场同分位"，不可与池内绝对阈值互校） | `test_measure_marketwide_gate_coverage.py`(5：计数恒等式 / 第一条命中归因 / 清单遮蔽量 / 占位市值不得晋级 / 测过的低市值仍走市值门) | **本轮第一次量出来**：95 个决策日、全市场输入 491,516 symbol-day、过完所有硬门 333,955（恒等式破坏 0 天）；其中 **255,356 个（76.4%）不在归档所用的 900 只清单里**（4,151 只）。所以 §3b 的淘汰分布只代表被预选过的一小撮，**测量范围缺陷已证实**；但这 25.5 万个 symbol-day 一条成熟标签都没有，故**不能**据此说遮蔽了多少盈利机会（见质量报告 §3f）。**本轮补两点**：① 那个 95 天窗口跨 2026-03~07，那段的"过了所有硬门"里有 69.9% 的 symbol-day 市值从未被测过（§3g.1），打上带版本的解释规则后同一窗口只剩 212 个晋级；② 遮蔽率本身在**干净窗口**上重测仍成立（2026-08 二十天：74,285 个全市场合格 symbol-day 里 58,642 个＝**79.0%** 不在 900 只清单内，3,768 只不同的票），所以 §2 第一问的方向性答案不是这个数据缺陷造出来的（§3g.2） |
-| §3.2 硬门保留 + 预测性加分/板块配额/探索样本分离；硬门后先算轻量特征再截断 | `feature/trend_candidate_contract.py`（`HARD` vs `predictive`、`assert_training_features()`、`HARD_GATE_ATTRIBUTION_ORDER`） | `test_trend_candidate_contract.py`(17)、`test_replay_tail_intraday_features.py`(10) | 代码+测试完成；**本轮新增两条已证实缺陷（留档词汇表）**：① `insufficient_history_at_asof` 曾被重放脚本写进 `hard_eligibility` 留档却没登记进 `_RULE_KIND`，消融实验按 `classify_rule()` 分组时看不见这条淘汰——已登记为 HARD 并加闭合校验（非 HARD 名字一进 sidecar 就 `SystemExit`）；② "第一条原因"的归因此前取决于 dict 插入顺序，现改为契约里的 `HARD_GATE_ATTRIBUTION_ORDER` 并写进每条留档 notes。详见质量报告 §3b.1/§3b.2 |
+| §3.2 硬门保留 + 预测性加分/板块配额/探索样本分离；硬门后先算轻量特征再截断 | `feature/trend_candidate_contract.py`（`HARD` vs `predictive`、`assert_training_features()`、`HARD_GATE_ATTRIBUTION_ORDER`） | `test_trend_candidate_contract.py`(17)、`test_replay_tail_intraday_features.py`(11) | 代码+测试完成；**本轮新增两条已证实缺陷（留档词汇表）**：① `insufficient_history_at_asof` 曾被重放脚本写进 `hard_eligibility` 留档却没登记进 `_RULE_KIND`，消融实验按 `classify_rule()` 分组时看不见这条淘汰——已登记为 HARD 并加闭合校验（非 HARD 名字一进 sidecar 就 `SystemExit`）；② "第一条原因"的归因此前取决于 dict 插入顺序，现改为契约里的 `HARD_GATE_ATTRIBUTION_ORDER` 并写进每条留档 notes。详见质量报告 §3b.1/§3b.2 |
 | §3.2 新 trend as-of 特征契约，训练与线上同一套；旧 T−1 与 Alpha V2 保持独立；四组特征逐组+消融 | 同一特征入口 + walk-forward 分组门；日内两列由 `replay_tail_candidate_pool.py --minute-db` 从分钟库真算 | `test_tail_walk_forward.py`(20)；特征白名单是训练的第一条前置检查 | 代码+测试完成；**四组时间外已测量**：4 个 OOS 测试窗平均 AUC 0.5012~0.5391（弱到不足以进正式候选）；**已证实缺陷**：33 列里 22 对 Spearman≥0.90，`relative_strength`≡`rank_ret_20`（ρ=1.0）等跨组重复同一信息 |
 | §3.3 新独立标签 + `p_net_profit_5d_tail`，不覆盖旧标签 | `labels/tail_net_profit.py` + `label_policy_v4_*` 注册/核验 + `output_semantics` | `test_tail_net_profit_label.py`(22) | 代码+测试完成 |
 | §3.3 尾盘每 5 分钟检查、只读已完成 bar、确认后下一分钟成交、未成交不计盈亏、T+1、双触发止损优先、第 5 日顺延、成熟=实际可成交退出、数据末尾强平不出已实现标签、按日期冻结成本、公司行动单列不确定 | 契约内单一实现，线上/历史共用 | `docs/trend_tail_acceptance_evidence.md` §1 表逐场景 → 测试名（13 场景全绿） | 代码+测试完成 |
@@ -148,12 +148,15 @@ As-of: 2026-10-08 @ HEAD `b33b581`（分支 `feat/stock-selection-quality-overha
      分钟库只覆盖 208 只池内票、日期止于 2026-07-17，本次重放没带 `--minute-db`，
      日内两列整列缺失。要把 §2 的"遮蔽了多少盈利机会"真正回答，得先把分钟行情
      从 208 只扩到全市场清单，再重跑标签重建与 ≥4 折滚动验证。
-   - **§2 的"每层记录使用的特征与特征计算版本"在这两层还没满足**：
-     `universe`/`hard_eligibility` 的 `features_used` 是空、`feature_compute_version` 是 0
-     （`record_stage` 的默认值），而 sidecar 的逐日事实里也没有携带特征契约版本。
-     `hard_eligibility` 实际上是要读 `avg_turnover_20` / `float_market_cap` / bar 日期 /
-     ST 与停牌声明的，所以这不是"该层不用特征"，而是这一项没接通。
-     修法：给清单事实加一个版本字段并由写入器传进 `record_stage`（不动归档 schema）。
+   - **§2 的"每层记录使用的特征与特征计算版本"：`hard_eligibility` 这半条已接通**（本轮）：
+     重放按当天真的跑过的规则映射判定输入列（`RULE_INPUT_COLUMNS` → sidecar 的
+     `gate_input_columns`），写入器转达成 `features_used`，并把
+     `feature_compute_version=trend_asof_v1` 与 `float_cap_interpretation=…v1` 写进 notes；
+     重跑的 19 份 8 月留档稳定记着那 11 列且 19/19 过 `verify_trace()`。
+     两个残留要一起看：`universe` 层 `features_used` 为空是**合法的**（那层不读任何列），
+     而 `feature_compute_version` 字段本身仍是 int、所有层都填默认 0（版本号走 notes 传），
+     把它改成字符串是一次跨全部层的归档 schema 变更，**没做**；夜扫三层与尾盘层的
+     同一字段也还是 0，同一原因。
    - 带时刻的尾盘分钟行情与 `daily_trade_status` 两项**本轮已解决**：
      分钟 bar 从 vendor `Stock_1min_2000-now` 落进独立研究库（6,464,825 行 / 129 交易日），
      可交易状态由"当天确有成交的 RAW 日线"正向声明，精确涨跌停从 `stk_limit` 补采。

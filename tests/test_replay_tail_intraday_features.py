@@ -227,3 +227,20 @@ def test_placeholder_float_cap_does_not_pass_the_size_gate() -> None:
         "unproven_float_market_cap": ("000001", "600000"),
         "min_float_market_cap": ("300750",),
     }
+
+
+def test_gate_input_columns_only_cover_the_rules_that_ran() -> None:
+    """留档要写"这层读了哪些列"，那份清单只能来自当天真的跑过的规则。
+
+    未知规则贡献 0 列：宁可不记，也不替没读过的列签"用过了"。
+    """
+    assert replay.gate_input_columns(
+        ["min_avg_turnover_20", "suspended", "composite_score_floor"]
+    ) == ("avg_turnover_20", "suspended")
+    assert replay.gate_input_columns(
+        ["min_float_market_cap", "unproven_float_market_cap"]
+    ) == ("float_market_cap",)
+    assert replay.gate_input_columns(
+        [replay.PIT_REJECT_REASON, "stale_market_data"]
+    ) == ("date", "prev_bar_date")
+    assert replay.gate_input_columns(["not_a_declared_rule"]) == ()

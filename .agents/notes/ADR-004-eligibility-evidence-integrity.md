@@ -158,6 +158,8 @@ src/stock_analyzer/feature/trend_candidate_contract.py
 ```text
 scripts/replay_tail_candidate_pool.py
   GATE_INPUT_COLUMNS（:319）/ MAX_MODAL_VALUE_SHARE = 0.50
+  RULE_INPUT_COLUMNS / gate_input_columns()（§2 要这一层记"读了哪些列"，
+  清单由当天真的跑过的规则映射出来，未知规则贡献 0 列）
   degenerate_gate_inputs()（:324）/ _universe_fact()（:339，非 HARD 名字 ⇒ SystemExit）
   daily_gates()（:394，占位行不进市值比较 + unproven_float_market_cap 单列）
   阈值推导只吃测过的值；report.thresholds.float_cap_interpretation

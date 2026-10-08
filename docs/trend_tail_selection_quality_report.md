@@ -473,10 +473,20 @@ src/stock_analyzer/data/efinance_provider.py:18  同一个字面值
      日期到 2026-07-17 为止，所以本次重放没带 `--minute-db`，日内两列整列缺失
      （报告 `not_reproducible_at_daily` 有记）。§3f 的"遮蔽量大但没有标签"这条限制不变，
      只是现在它在两个窗口上都成立。
-   - §2 要求"每层记录使用的特征与特征计算版本"，这两层的
-     `features_used` 是空、`feature_compute_version` 是 0（`record_stage` 的默认值），
-     sidecar 里也没有携带特征契约版本。**这是这两层尚未满足的 §2 子项**，已进缺口清单；
-     修法要给清单事实加一个版本字段并让写入器传进 `record_stage`，不是这轮的最小改动。
+   - §2 要求"每层记录使用的特征与特征计算版本"。这一条**在同一轮里已经补上**：
+     重放侧按当天真的跑过的规则映射出判定输入列（`RULE_INPUT_COLUMNS` →
+     `gate_input_columns`），写入器把它转达成 `hard_eligibility` 的 `features_used`，
+     并把 `feature_compute_version=trend_asof_v1`、`float_cap_interpretation=…v1`
+     写进同一条 notes。重新跑完的 19 份留档里，`hard_eligibility` 稳定记着那 11 列
+     （`symbol`、`is_st`、`is_delisting_risk`、`suspended`、`avg_turnover_20`、
+     `float_market_cap`、`date`、`prev_bar_date`、`ret_20_raw`、`range_position_60`、
+     `atr14_pct`），`verify_trace()` 仍是 19/19、0 条失败。
+     两处口径要说清，别读成"全满足了"：`universe` 层的 `features_used` 是空的，
+     因为那层确实不读任何列（它只记全集与覆盖率），这是**合法的空**不是没接通；
+     而 `feature_compute_version` 这个字段本身仍是 int、默认 0（所有层都是 0），
+     版本号是走 notes 传出去的——把它改成字符串是一次跨层的归档 schema 变更，
+     不在这一轮的范围里。旧 payload（没有这几个键的 sidecar）留空而不是被补猜，
+     由 `test_eligibility_layer_records_which_columns_its_gates_read` 钉住两侧。
 
 ## 4. 不依赖模型的排序对照（同一批成熟标签直接算）
 

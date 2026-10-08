@@ -320,6 +320,30 @@ GATE_INPUT_COLUMNS = {"min_avg_turnover_20": "avg_turnover_20",
                       "min_float_market_cap": "float_market_cap"}
 MAX_MODAL_VALUE_SHARE = 0.50
 
+#: 每条硬门**实际读到的列**。留档要按 §2 记"这一层用了哪些特征"，
+#: 但资格层用的不是模型特征而是这些判定输入，所以清单由规则映射出来，
+#: 不手写、不借 FEATURE_GROUPS（那会让留档声称用了当天其实没读的列）。
+RULE_INPUT_COLUMNS: dict[str, tuple[str, ...]] = {
+    "board_eligibility": ("symbol",),
+    "is_st": ("is_st",),
+    "is_delisting_risk": ("is_delisting_risk",),
+    "suspended": ("suspended",),
+    "min_avg_turnover_20": ("avg_turnover_20",),
+    "min_float_market_cap": ("float_market_cap",),
+    "unproven_float_market_cap": ("float_market_cap",),
+    "stale_market_data": ("date", "prev_bar_date"),
+    "overextension_risk": ("ret_20_raw", "range_position_60", "atr14_pct"),
+    PIT_REJECT_REASON: ("date",),
+}
+
+
+def gate_input_columns(rules_run: Sequence[str]) -> tuple[str, ...]:
+    """当天真的跑过的硬门所读的列（未知规则贡献 0 列，不猜）。"""
+    columns: set[str] = set()
+    for rule in rules_run:
+        columns.update(RULE_INPUT_COLUMNS.get(str(rule), ()))
+    return tuple(sorted(columns))
+
 
 def degenerate_gate_inputs(frame: pd.DataFrame) -> list[str]:
     """当天没有判别力的硬门（其输入列在当天被填成同一个值）。缺列不报错，交给调用方。"""
@@ -347,6 +371,7 @@ def _universe_fact(
     coverage: str,
     delisting_verified: bool,
     non_evaluable_gates: Sequence[str] = (),
+    rules_run: Sequence[str] = (),
 ) -> dict[str, Any]:
     """一个决策日的**符号级** universe / hard_eligibility 事实（计划 §2 前两层）。
 
@@ -388,6 +413,11 @@ def _universe_fact(
         "delisting_coverage_verified": bool(delisting_verified),
         # 非空 = 这几条硬门当天的输入列没有判别力；留档写入器据此**不落这两层**。
         "non_evaluable_gates": sorted(str(rule) for rule in non_evaluable_gates),
+        # §2 要求每层记"使用的特征"。资格层用的是判定输入列，不是模型特征，
+        # 所以这里按**当天真的跑过的规则**映射出来（不是整张候选表）。
+        "gate_input_columns": list(gate_input_columns(rules_run)),
+        "feature_contract_version": TREND_FEATURE_CONTRACT_VERSION,
+        "float_cap_interpretation_version": FLOAT_CAP_INTERPRETATION_VERSION,
     }
 
 
@@ -563,6 +593,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             rejected=outcome.rejected,
             pit_excluded=list(pit_excluded),
             non_evaluable_gates=degenerate_gate_inputs(eligible_frame),
+            rules_run=list(gates) + ([PIT_REJECT_REASON] if pit_excluded else []),
             coverage=str(args.survivorship_coverage),
             delisting_verified=bool(int(args.delisting_coverage_verified)),
         ))
