@@ -700,6 +700,32 @@ token 只按变量名从环境变量读、取值不落任何产物）：
 - 这是池子水平的对照，**不是**"按 `p_net_profit_5d_tail` 排序后选 Top-3"的结果，
   §4 的 ≥4 折滚动验证与 ≥5pp 改进仍未完成，本轮没有产出任何折内命中率数字。
 
+### 3n.1 判不动的那 10,828 条已经补上输入，并且验证器的折数门槛是一个明确数字
+
+两件事都是本轮实测出来的，不是推断：
+
+1. **`entry_daily_bar` 缺失是参考库的符号覆盖面，不是数据源缺失。**
+   `ref_daily_bars_raw` 原本只有 208 只 / 28,861 行 —— 当初
+   `sync_tail_reference_data.py` 也带了那份 900 只的 `--symbols-file`。
+   按 5,194 只全市场清单重灌后：**718,796 行 / 5,190 只**，
+   `trade_status_rows_landed=718,795`、`gaps=[]`
+   （口径与 §3.1 一致：仓库 `daily_bars` 从未声明复权口径，RAW 是由 vendor
+   日线包逐票成交量可证明的，不是猜的）。
+2. **§4 的"至少 4 个测试折"落到代码里是一个可核对的门槛**：
+   `validate_tail_selection_quality.py` 在 58 个交易日时退 3（blocked），
+   报的是 `insufficient_trade_dates: 58 trade dates cannot fill 4 folds:
+   need at least 71 (train>=45, calib>=12, embargo=5 between every segment)`。
+   这不是"数据不够所以不做"，而是把还差多少写清楚了：于是窗口从 3~5 月的 58 天
+   扩到 1~5 月的 **91 个交易日**（1~2 月全市场重放 33 天 / 9,900 条候选，
+   市值门在干净窗口逐只淘汰 16,406 只、`unproven_float_market_cap` 仅 66 只），
+   91 ≥ 71 才允许谈折数。
+
+标签重建与滚动验证的输入已就位：27,300 条候选
+（`mw_requests_91d.jsonl`）+ 注册过的标签策略 id
+`label_policy_v4_07335bbe3d3e`（`registered=true, failures=[]`）。
+折数结果无论好坏都按 §4 的六项指标与三条对照如实记在这里，
+重建口径（`replayed_recompute`）与真实观察（`observed_snapshot`）分开计数。
+
 ## 4. 不依赖模型的排序对照（同一批成熟标签直接算）
 
 每日从可判池里按某个声明字段取 `Top-3`（同分按代码序，与线上一致），
