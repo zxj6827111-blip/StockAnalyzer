@@ -1,6 +1,6 @@
 # trend 尾盘净盈利概率链路：发布与回滚清单 / 影子验证方案
 
-As-of: 2026-10-08 @ HEAD `6900e3a`（分支 `feat/stock-selection-quality-overhaul`）
+As-of: 2026-10-08 @ HEAD `535ecfc`（分支 `feat/stock-selection-quality-overhaul`）
 
 配套决策见 `.agents/notes/ADR-003-trend-tail-strategy-contract.md`；
 根因与阻塞见 `.agents/notes/NOTE-002-selection-quality-root-causes.md`。
@@ -32,8 +32,11 @@ As-of: 2026-10-08 @ HEAD `6900e3a`（分支 `feat/stock-selection-quality-overha
 | --- | --- | --- |
 | R1 | 契约摘要与工件一致 | `rank_final_recommendations` 的 `ModelIdentity.validate()` 返回空串；`contract_digest` 等于 `DEFAULT_TREND_CONTRACT.digest()` |
 | R2 | 训练 commit == 运行 commit | 走 `alpha_v2/validation/runtime_identity.resolve_runtime_code_identity()`，禁止 CLI 自己 `git rev-parse`（ADR-001 §7.2） |
-| R3 | 模型身份完整 | `artifact_content_hash` / `feature_compute_version` / `label_policy_id` 均非空；缺失即 0 只推荐，不补名额 |
-| R4 | 新 label_policy 已登记且未覆盖旧记录 | `label_policy_registry` 里 `schema_version=4`、`price_basis=tail_confirm_next_bar`、`maturity_rule=label_mature_time_tail_exit_v1`；旧 `soup_*` / `return_rank` 记录原样存在 |
+| R3 | 模型身份完整 | `artifact_content_hash` / `feature_compute_version` / `label_policy_id` 均非空；缺失即 0 只推荐，不补名额。留档 `model_identity.recording_failures` 必须逐项点名（`training_commit_absent_from_serving_manifest` 等），空清单不算过 |
+| R3b | 专属清单存在且工件没被换过 | `tail_model_serving_manifest.json` 存在时，`verify_tail_serving_manifest()` 重新哈希工件并逐字段比对；不过则 `blocking_reason = tail_serving_manifest_unverified` ⇒ 0 只。清单缺失时退回旧在服清单并留名 `tail_serving_manifest_absent` —— **退回可以，静默换模型不行** |
+| R3c | 概率来源可指认 | `model_identity.probability_source ∈ {caller_supplied, challenger_artifact, none}`；`none` 时该轮必须 0 只。`challenger_artifact` 时留档分数必须与独立加载同一工件的 `load_tail_model_predictor()` 逐位一致 |
+| R3d | 缺特征不填零 | 某只缺工件要求的特征 ⇒ `probability_scoring_failed:<symbol>:feature_missing:<名字>` 可见且不参与排序；不允许用 0 顶替 |
+| R4 | 新 label_policy 已登记且未覆盖旧记录 | `python scripts/register_tail_label_policy.py --registry-db <learning_protocol.duckdb> --verify-only` 退出码 **0**（3=未注册或对不上，5=registry 不可用）；旧 `soup_*` / `return_rank` 记录原样存在。影子侧的等价判据是 `model_identity.label_policy_verified == true` |
 | R5 | 输出语义已登记 | `output_semantics_for_basis("net_profit_5d_tail") == "event_probability"` |
 | R6 | 配置无残留冲突 | `audit_strategy_contract_conflicts(config) == []`（runtime/asof/labels 三块都改指契约后才会空） |
 | R7 | 成交口径是 raw | 数据就绪报告 `raw_price_basis_declared == ok` |
@@ -52,7 +55,22 @@ As-of: 2026-10-08 @ HEAD `6900e3a`（分支 `feat/stock-selection-quality-overha
 
 1. **只影子，不接管真推荐。** 新路径产物写到独立目录
    （建议 `artifacts/runtime/trend_tail_shadow/`），旧 trend 输出保持原样。
-2. 注册为 challenger：沿用 `runtime/services/learning_governance_service.py` 的
+2. 命令顺序（本地/研究区执行，NAS 不跑训练；退出码都是真实退出码）：
+
+   ```bash
+   # ① 标签口径落库（写 registry，按 hash 幂等）
+   python scripts/register_tail_label_policy.py --registry-db data/learning_protocol.duckdb   # 0
+   # ② 样本 → 工件（→ 可选清单）：3=训练按要求停止，5=身份不可证
+   python scripts/train_tail_net_profit_model.py --samples <jsonl> --features <a,b> \
+       --model-id <id> --out artifacts/research/models/<artifact>.json \
+       --manifest-out artifacts/research/tail_model_serving_manifest.json \
+       --registry-db data/learning_protocol.duckdb
+   # ③ 只读复核：0=绑定成立，3=口径未绑定
+   python scripts/register_tail_label_policy.py --registry-db data/learning_protocol.duckdb --verify-only
+   ```
+
+   清单状态只会是 `challenger`：晋升是人工动作，这份文件不自带那个权力。
+3. 注册为 challenger：沿用 `runtime/services/learning_governance_service.py` 的
    两阶段票据（proposal → 人工 approve → release ticket → execute → confirm），
    **不新增晋升入口**，也不允许训练流程自己切别名（ADR-001 §7.2）。
 3. 生产 compose 一律走 `scripts/nas_compose_files.sh` 给出的文件组合；手工拼 `-f`
@@ -67,7 +85,9 @@ As-of: 2026-10-08 @ HEAD `6900e3a`（分支 `feat/stock-selection-quality-overha
 | 触发条件 | 动作 |
 | --- | --- |
 | 尾盘留档缺特征快照 / 模型身份异常但仍在出推荐 | 立即停新路径 job，旧路径不受影响（旧模型与旧路径保留未删） |
-| 契约摘要与工件不符（`strategy_contract_digest_mismatch`） | 阻断推荐输出（代码已 fail-closed），回滚 alias 到上一 champion |
+| 契约摘要与工件不符（`strategy_contract_digest_mismatch` / `artifact_contract_mismatch`） | 阻断推荐输出（代码已 fail-closed），回滚 alias 到上一 champion |
+| `tail_serving_manifest_unverified`（工件哈希对不上 / 状态不是 challenger / registry 查不到该口径） | 把那份清单文件改名或移走（路径可用 `SA_TAIL_SERVING_MANIFEST_PATH`、配置或注入改指，但**设成空值不会关闭**，会落回默认路径）。文件不在 → 链路自动退回"0 只 + 点名原因"；旧路径与旧模型不受影响 |
+| `challenger_artifact_not_bound` / `probability_source = none` | 属预期的影子状态（还没在服模型），**不是**故障；不得为了出推荐而塞任何兜底分数 |
 | 连续多日 `blocking_reason` 非空 | 检查 `trend_data_readiness`，必要时回到"只观察不推荐" |
 | 净盈利率显著低于影子期估计 | 走 `learning_governance_service.rollback()`，保留证据目录不删 |
 
