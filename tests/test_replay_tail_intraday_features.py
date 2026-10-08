@@ -193,3 +193,37 @@ def test_every_name_the_replay_can_emit_is_a_declared_hard_rule() -> None:
     assert len(emitted) >= 8
     not_hard = sorted(name for name in emitted if classify_rule(name) != HARD)
     assert not_hard == []
+
+
+def test_placeholder_float_cap_does_not_pass_the_size_gate() -> None:
+    """§3g：市值列被填成供应商占位常量时，这条硬门不许给出"已通过"。
+
+    占位值 1.2e10 比阈值 1e10 大，``value < threshold`` 恒假 —— 改之前这两只都会
+    带着一个从未测量过的市值晋级；现在它们整批记到 ``unproven_float_market_cap``，
+    而真正测过且低于阈值的另一只仍记在市值门名下。
+    """
+    from stock_analyzer.feature.trend_candidate_contract import UNPROVEN_FLOAT_MARKET_CAP
+
+    rows = pd.DataFrame({
+        "symbol": ["600000", "000001", "300750"],
+        "date": [pd.Timestamp(DAY)] * 3,
+        "prev_bar_date": [pd.Timestamp(DAY)] * 3,
+        "is_st": [0, 0, 0], "is_delisting_risk": [0, 0, 0], "suspended": [0, 0, 0],
+        "avg_turnover_20": [5e9, 5e9, 5e9],
+        "float_market_cap": [
+            UNPROVEN_FLOAT_MARKET_CAP, UNPROVEN_FLOAT_MARKET_CAP, 8e9
+        ],
+        "ret_20_raw": [0.0, 0.0, 0.0],
+        "range_position_60": [0.0, 0.0, 0.0],
+        "atr14_pct": [0.0, 0.0, 0.0],
+    })
+    gates = replay.daily_gates(rows, min_turnover=1e9, min_float_cap=1e10)
+    assert set(gates["unproven_float_market_cap"]) == {"600000", "000001"}
+    assert gates["min_float_market_cap"] == ("300750",)
+    outcome = replay.apply_hard_gates(symbols=rows["symbol"].tolist(), gates=gates)
+    assert list(outcome.eligible) == []
+    hit = {name: tuple(v) for name, v in outcome.rejected.items() if v}
+    assert hit == {
+        "unproven_float_market_cap": ("000001", "600000"),
+        "min_float_market_cap": ("300750",),
+    }

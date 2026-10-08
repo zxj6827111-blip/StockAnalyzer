@@ -85,6 +85,10 @@ _RULE_KIND: dict[str, str] = {
     # 历史重放（scripts/replay_tail_candidate_pool.py）用它给被淘汰的 symbol-day 记原因，
     # 名字必须在这里登记，否则留档里会出现契约不认识的规则。
     "insufficient_history_at_asof": HARD,
+    # 流通市值列里出现数据供应商的占位常量（见 ``UNPROVEN_FLOAT_MARKET_CAP``）：
+    # 那一行的市值**没有被测量过**，所以 ``min_float_market_cap`` 对它无从判定。
+    # 这是数据完整性硬门，不是预测规则——把它当"已通过"会让这条门整天不淘汰任何票。
+    "unproven_float_market_cap": HARD,
     "financial_trust_insufficient": HARD,
     "trade_date_not_current": HARD,
     "limit_up_locked": HARD,
@@ -123,10 +127,41 @@ HARD_GATE_ATTRIBUTION_ORDER: tuple[str, ...] = (
     "suspended",
     "min_avg_turnover_20",
     "min_float_market_cap",
+    "unproven_float_market_cap",
     "stale_market_data",
     "overextension_risk",
     "insufficient_history_at_asof",
 )
+
+#: 数据供应商取不到流通市值时写进 ``float_market_cap`` 的**占位常量**（元）。
+#: tushare / akshare / efinance 三个 provider 用的是同一个字面值，所以它在库里是
+#: "这一天的市值没有被测量过"的指纹，而不是一个 120 亿的观测值。
+#:
+#: 已证实的危害（研究库 ``daily_bars``，逐月统计等于该常量的行数）：
+#: 2026-04 108,295/108,615 行、2026-05 92,967/92,989、2026-06 **108,538/108,538（全月只剩
+#: 这一个不同取值）**，2026-03 与 2026-07 各约五成；2022-05 起每月 15~46 行、
+#: 2025-09~2026-02 升到 2,511~5,608 行——占位符一直都在悄悄写，只是量级不同。
+#:
+#: 危害机制不是"数值不准"而是**门失效**：阈值取当天该列的 10 分位，列内 99.7% 都是这个
+#: 常量时，分位数就等于常量，``value < threshold`` 对占位行恒为假 —— 这条硬门那天对全市场
+#: 一个都不淘汰，却照样"跑完了"，留档于是把"没测过"读成"没有一只票市值不达标"。
+#:
+#: 老记录保留原值不重写（§3.1：带版本的解释规则兼容），读侧按这条规则把它当未知：
+#: 市值门对它**无法判定**，于是记 ``unproven_float_market_cap`` 出局，而不是记它通过。
+#: 反向误差是刻意选边的——真有某只票市值恰好等于 12,000,000,000.0 元时它也会被当未知，
+#: 那只是少留一只可判定样本，不会把未测过的东西当成有效信息。
+UNPROVEN_FLOAT_MARKET_CAP = 12_000_000_000.0
+FLOAT_CAP_INTERPRETATION_VERSION = "unproven_float_cap_placeholder_v1"
+
+
+def unproven_float_market_cap_mask(values: pd.Series) -> pd.Series:
+    """``float_market_cap`` 里"没被测量过"的那些行（=True）。
+
+    NaN 返回 False —— 那是本来就没这列的值，由读取它的门的既有语义处理；这里只抓
+    被占位常量**填过**的格子，因为那才是"看起来像数据"的那一种。
+    """
+    numbers = pd.to_numeric(values, errors="coerce")
+    return numbers.notna() & numbers.eq(UNPROVEN_FLOAT_MARKET_CAP)
 
 
 def classify_rule(name: str) -> str:

@@ -31,6 +31,7 @@ if str(_SRC) not in sys.path:
 
 from stock_analyzer.feature.trend_candidate_contract import (  # noqa: E402
     HARD_GATE_ATTRIBUTION_ORDER,
+    unproven_float_market_cap_mask,
 )
 
 _RC_OK = 0
@@ -80,7 +81,7 @@ def day_funnel(frame: pd.DataFrame, day: date, *, min_turnover: float,
     todays = frame.loc[frame["date"] == day]
     if todays.empty:
         return {"day": day.isoformat(), "inputs": 0, "advanced": 0, "rejected": {},
-                "advanced_symbols": []}
+                "float_cap_gate_evaluable": True, "advanced_symbols": []}
     code = todays["symbol"]
     hits = {
         "board_eligibility": ~code.str.startswith(
@@ -90,7 +91,14 @@ def day_funnel(frame: pd.DataFrame, day: date, *, min_turnover: float,
         "is_delisting_risk": _truthy(todays["is_delisting_risk"]),
         "suspended": _truthy(todays["suspended"]),
         "min_avg_turnover_20": todays["turnover"] < min_turnover,
-        "min_float_market_cap": todays["float_market_cap"] < min_float_cap,
+        # 占位常量那一格不是观测值：市值门对它无从判定，单独记 unproven_float_market_cap
+        # 出局。放它过去比较的话 ``value < threshold`` 恒假，等于白送一个"已通过"（§3g）。
+        "min_float_market_cap": (
+            ~unproven_float_market_cap_mask(todays["float_market_cap"])
+        ) & (todays["float_market_cap"] < min_float_cap),
+        "unproven_float_market_cap": unproven_float_market_cap_mask(
+            todays["float_market_cap"]
+        ),
         "stale_market_data": pd.to_datetime(todays["date"].astype(str)) - pd.to_datetime(
             todays["prev_bar_date"].astype(str)
         ) > pd.Timedelta(days=MAX_BAR_GAP_CALENDAR_DAYS),
@@ -115,6 +123,9 @@ def day_funnel(frame: pd.DataFrame, day: date, *, min_turnover: float,
         "advanced": int(len(advanced_symbols)),
         "rejected": rejected,
         "advanced_symbols": advanced_symbols,
+        # 阈值 NaN = 当天**没有任何测过的市值**，这条门整日无从判定；必须留痕，
+        # 不能让"门没淘汰任何票"被读成"所有票都过了市值门"。
+        "float_cap_gate_evaluable": bool(pd.notna(min_float_cap)),
         "identity_ok": int(len(todays)) == len(advanced_symbols) + sum(rejected.values()),
     }
 
@@ -124,6 +135,7 @@ def summarize(funnels: list[dict[str, Any]], pool: set[str]) -> dict[str, Any]:
     inputs = advanced = invisible_days = 0
     invisible: set[str] = set()
     broken_identity = 0
+    cap_days_unevaluable = 0
     per_day = []
     for item in funnels:
         if not item.get("inputs"):
@@ -131,6 +143,7 @@ def summarize(funnels: list[dict[str, Any]], pool: set[str]) -> dict[str, Any]:
         inputs += item["inputs"]
         advanced += item["advanced"]
         broken_identity += 0 if item.get("identity_ok") else 1
+        cap_days_unevaluable += 0 if item.get("float_cap_gate_evaluable", True) else 1
         for rule, count in item["rejected"].items():
             totals[rule] = totals.get(rule, 0) + count
         outside = [symbol for symbol in item["advanced_symbols"] if symbol not in pool]
@@ -141,6 +154,7 @@ def summarize(funnels: list[dict[str, Any]], pool: set[str]) -> dict[str, Any]:
     return {
         "decision_days": len(per_day),
         "counting_broken_days": broken_identity,
+        "float_cap_gate_days_unevaluable": cap_days_unevaluable,
         "marketwide_symbol_days_input": inputs,
         "marketwide_symbol_days_advanced": advanced,
         "marketwide_rejection_by_first_reason": dict(sorted(totals.items())),
@@ -173,10 +187,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     funnels = []
     for day in days:
         todays = frame.loc[frame["date"] == day]
+        # 分位阈值只在**测过**的市值上推：占位常量进池时（2026-06 全月只有这一个取值）
+        # quantile 就等于它本身，这条门那天对全市场一个都不淘汰（§3g）。
+        cap_measured = todays["float_market_cap"].loc[
+            ~unproven_float_market_cap_mask(todays["float_market_cap"])
+        ]
         funnels.append(day_funnel(
             frame, day,
             min_turnover=float(todays["turnover"].quantile(args.turnover_quantile)),
-            min_float_cap=float(todays["float_market_cap"].quantile(args.float_cap_quantile)),
+            min_float_cap=(
+                float(cap_measured.quantile(args.float_cap_quantile))
+                if len(cap_measured) else float("nan")
+            ),
         ))
     report = summarize(funnels, pool)
     report.update({

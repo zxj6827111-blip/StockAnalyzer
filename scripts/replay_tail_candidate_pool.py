@@ -50,6 +50,7 @@ if str(_SRC) not in sys.path:
 
 from stock_analyzer.contracts.trend_strategy import DEFAULT_TREND_CONTRACT  # noqa: E402
 from stock_analyzer.feature.trend_candidate_contract import (  # noqa: E402
+    FLOAT_CAP_INTERPRETATION_VERSION,
     HARD,
     HARD_GATE_ATTRIBUTION_ORDER,
     TREND_FEATURE_CONTRACT_VERSION,
@@ -58,6 +59,7 @@ from stock_analyzer.feature.trend_candidate_contract import (  # noqa: E402
     build_trend_feature_frame,
     classify_rule,
     compute_then_truncate,
+    unproven_float_market_cap_mask,
 )
 from stock_analyzer.research.tail_rebuild import RebuildRequest  # noqa: E402
 
@@ -403,6 +405,11 @@ def daily_gates(
     def declared_true(column: str) -> pd.Series:
         return pd.to_numeric(rows[column], errors="coerce").fillna(0) > 0
 
+    #: 占位常量那一格不是观测值（§3g 的根因，见契约 ``UNPROVEN_FLOAT_MARKET_CAP``）。
+    #: 它既不参与市值门的比较（否则 ``value < threshold`` 恒假 = 白送一个"已通过"），
+    #: 也不静默消失：单独记 ``unproven_float_market_cap`` 出局，留档里看得见是谁没被判过。
+    unproven_cap = unproven_float_market_cap_mask(rows["float_market_cap"])
+
     return {
         "board_eligibility": dropped(
             ~rows["symbol"].astype(str).str.slice(0, 2).isin(A_SHARE_CODE_PREFIXES)
@@ -411,7 +418,10 @@ def daily_gates(
         "is_delisting_risk": dropped(declared_true("is_delisting_risk")),
         "suspended": dropped(declared_true("suspended")),
         "min_avg_turnover_20": dropped(rows["avg_turnover_20"] < min_turnover),
-        "min_float_market_cap": dropped(rows["float_market_cap"] < min_float_cap),
+        "min_float_market_cap": dropped(
+            (~unproven_cap) & (rows["float_market_cap"] < min_float_cap)
+        ),
+        "unproven_float_market_cap": dropped(unproven_cap),
         "stale_market_data": dropped(
             pd.to_datetime(rows["date"]) - pd.to_datetime(rows["prev_bar_date"])
             > pd.Timedelta(days=MAX_BAR_GAP_CALENDAR_DAYS)
@@ -475,6 +485,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     cap = engineered.loc[
         (engineered["date"] >= start) & (engineered["date"] <= end), "float_market_cap"
     ].dropna()
+    # 分位阈值只能在**测过**的市值上推：占位常量进池的话，列内 99.7% 都是它时
+    # quantile(0.10) 就等于它本身，这条门那天对全市场一个都不淘汰（§3g）。
+    cap = cap.loc[~unproven_float_market_cap_mask(cap)]
     if liquid.empty or cap.empty:
         raise SystemExit("liquidity / float-cap columns are entirely empty — 阈值无从推导")
     min_turnover = float(liquid.quantile(args.min_turnover_quantile))
@@ -595,6 +608,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "thresholds": {
             "min_avg_turnover_20": min_turnover,
             "min_float_market_cap": min_float_cap,
+            # 阈值只由**测过**的市值推导；读侧对占位常量的解释规则带版本记进证据，
+            # 否则同一份库换个解释会得出不同的合格池，事后无法复现当时是哪一版。
+            "float_cap_interpretation": FLOAT_CAP_INTERPRETATION_VERSION,
             "min_history_bars": MIN_HISTORY_BARS,
             "overextension_ret_20": OVEREXTENSION_RET_20,
             "overextension_range_position_60": OVEREXTENSION_RANGE_POSITION,

@@ -312,10 +312,94 @@ dict 键序（把两条门的书写顺序对调，归因结果不变）、first-
 要补的数据与检查（下一轮）：
 
 - 用可核实来源重刷 2026-03 中旬之后的 `float_market_cap`（厂商快照里没有的那段要标
-  `insufficient`，不能继续留常数）；
-- 在 `trend_data_readiness.py` 加一条**列集中度**检查：某数值列在一个交易日内
-  最高频值占比 > 阈值（如 50%）时报 `insufficient`，并把这一列从特征与硬门的可用集合里摘掉；
-- 硬门阈值计算处显式判断"阈值等于该列众数"⇒ 报错而不是照常跑下去。
+  `insufficient`，不能继续留常数）；**仍未做 —— 这是这三条里只剩的一条，也是本节全部
+  读数的当前上限**。本地无从重算：`daily_bars` 的 46 列里没有任何股本数字段
+  （只有 `close, volume, turnover, float_market_cap, block_trade_volume` 命中市值口径），
+  所以 `close × 流通股本` 这条路在仓库内不成立，只能走容器内 tushare `daily_basic`
+  （`circ_mv`，万元）补采。
+- ~~在 `trend_data_readiness.py` 加一条**列集中度**检查~~ —— 已落 `d55ae34`
+  （`column_concentration_<col>`，众数占比 > 50% 报 `insufficient`）。
+- ~~硬门阈值计算处显式判断"阈值等于该列众数"⇒ 报错~~ —— 已落 `eca3773`
+  （`degenerate_gate_inputs()` + 留档写入器对这种天**不落 universe/hard_eligibility 两层**）。
+
+### 3g.1 根因找到了：那个常数就是数据供应商自己的兜底值（已证实，代码级）
+
+上面那张表的数字此前只能说明"有人往这一列写了一个常数"，说明不了是谁写的。
+把三个 provider 都查了一遍，值对上了：
+
+```text
+src/stock_analyzer/data/tushare_provider.py:23   _DEFAULT_FLOAT_MARKET_CAP = 12_000_000_000.0
+src/stock_analyzer/data/akshare_provider.py:20   同一个字面值
+src/stock_analyzer/data/efinance_provider.py:18  同一个字面值
+```
+
+写库那条路径是 `tushare_provider.py:1677-1684`：`daily_basic` 拿到 `circ_mv` 就
+`× 10000` 换算成元，**拿不到就 `fillna(_DEFAULT_FLOAT_MARKET_CAP)`**；而 `daily_basic`
+的调用外面包着 `except Exception: basic = pd.DataFrame()`（同文件 718-719 行）——
+接口失败被**静默吞掉**，退化成"这一列没有 circ_mv"，于是整列走兜底常量。
+库里 2026-04~06 那几个 99.7%~100% 的月份，就是这个吞异常路径的现场；
+2022-05 起每月 15~46 行、2025-09~2026-02 每月 2,511~5,608 行，是同一件事的低比例版本
+——**占位符一直在写，只是这几月写满了整列**。
+
+所以这条缺陷的准确表述要改一处：它不是"数据源缺了一段"，而是**采集失败被换成了一个
+看起来合理的值，并且这个替换没有任何留痕**（列里没有 provenance 标记，
+`daily_bars` 也没有能区分"测过 / 填的"的字段）。这正是计划 §3.1 禁的那类事——
+"缺失不能被填零后当成有效信息"——只是它填的不是 0，是 1.2e10。
+
+**本轮改的是读侧，不是写侧**，原因是刻意的：`src/` 下有 26 个文件出现
+`float_market_cap`（生产夜扫、特征快照、PIT 数据集、Alpha V2 面板都在读它），
+改 ingest 让它写 NULL 是一次跨模块的数据语义变更，按 AGENTS.md §12 要另开 ADR，
+不该塞进这轮。
+计划 §3.1 对老记录给的正是另一条路——"旧记录保留原始值，通过**带版本的解释规则**兼容"，
+所以本轮按那条落：
+
+- 契约新增 `UNPROVEN_FLOAT_MARKET_CAP = 12_000_000_000.0`、
+  `FLOAT_CAP_INTERPRETATION_VERSION = "unproven_float_cap_placeholder_v1"` 与
+  `unproven_float_market_cap_mask()`；NaN 返回 False（那是本来就缺，不是被填的）。
+- 新 HARD 规则名 `unproven_float_market_cap`，排在归因顺序里 `min_float_market_cap` 之后；
+  因为是 HARD，任何把它写进非 HARD 词表的改动仍会被 sidecar 的闭合校验 `SystemExit`。
+- 两处消费点（`replay_tail_candidate_pool.daily_gates`、
+  `measure_marketwide_gate_coverage.day_funnel`）：占位行**不进**市值比较
+  （进了就恒假、白拿一个"已通过"），改为整批记 `unproven_float_market_cap` 出局。
+- 分位阈值只从**测过的**市值推；测过的为空 ⇒ 阈值 NaN ⇒
+  该天记 `float_cap_gate_evaluable=False`，不许把"门没淘汰任何票"读成"全员通过"。
+
+误差方向是刻意选边的：真有某只票市值恰好等于 12,000,000,000.0 元时它也会被当未知，
+代价是少一个可判定样本；反过来如果信它，代价是把没测过的东西当成有效信息。
+
+### 3g.2 打上解释规则之后重测：污染窗口与干净窗口的读数差了 300 倍
+
+同一套脚本、同一份研究库、只改读侧解释（`artifacts/research/marketwide_gate_coverage_q2polluted.json`
+与 `…_aug.json`，全市场清单口径）：
+
+| 窗口 | 决策日 | 输入 symbol-day | 过完所有硬门 | `unproven_float_market_cap` | `min_float_market_cap` | 市值门无从判定的天数 | 恒等式破坏 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 2026-04-01~06-30（污染） | 60 | 310,142 | **212** | **216,862（69.9%）** | 8 | **40 / 60** | 0 |
+| 2026-08-03~08-29（干净） | 20 | 110,785 | 74,285 | 1 | 1,242 | 0 | 0 |
+
+三点要分开说：
+
+1. **污染窗口的"合格池"其实不存在**：69.9% 的 symbol-day 市值从未被测过，212 个晋级数
+   是"其余硬门都没拦住 + 市值门无法证明它不达标"的交集，不是一个可以拿去算命中率的池。
+   §3f 那份"95 个决策日 / 333,955 个 symbol-day 过了所有硬门"的读数里，跨 2026-03~07 的
+   那一段就是这个形状 —— 当时说"76.4% 是上界"仍然成立，但现在能给更强的说法：
+   **那些天里过门的行数根本不该被当成"过了硬性资格检查"**。
+2. **干净窗口不受影响**：8 月那 20 天只有 1 个 symbol-day 带占位值，`min_float_market_cap`
+   正常淘汰 1,242 行。也就是说这条门在有数据的时候是**有判别力的**，缺陷是数据侧的，
+   不是规则设计侧的。
+3. **清单遮蔽率的结论在干净窗口上站得住**：8 月 20 天里 74,285 个全市场合格
+   symbol-day 有 **58,642 个（79.0%）不在 900 只研究清单内**（3,768 只不同的票；
+   `…_aug_vs900.json`，`research_list_size=900`）。这和 §3f 的 76.4%、§3h 的 78.5% 是同量级，
+   所以"前置清单遮蔽了绝大多数合格候选"这条**不是**被污染的市值门造出来的假象。
+   注意口径：这一条必须拿 900 只清单当 `--symbols-file`；上面那张表用的是 5,194 只的
+   全市场清单，那份清单包含一切，所以它的"清单外合格数 = 0"是**平凡成立、没有含义的**，
+   不能拿来当遮蔽率读。
+
+仍未证明的：占位符污染**之前**的窗口（2022~2025-08）里每月那 15~46 行是零星失败，
+不影响整窗判别力；而 2025-09~2026-02 每月 2,511~5,608 行（约占当日 2~5%）意味着
+那半年里"市值门淘汰了 X 只"这个数被系统性低估了一到两成——方向上仍然只是打折，
+不改变 §3f 的结论形状。
+
 
 本轮顺手修掉一个我自己造成的假陈述：`universe_input_provenance.producer` 此前**硬编码**
 `unknown_not_recorded_in_repo`，而 `build_tail_universe_symbols.py` 已经能导出可复现清单
