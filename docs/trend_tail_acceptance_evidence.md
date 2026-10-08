@@ -26,6 +26,7 @@
 | 最低佣金 / 申报数量 / 成本日期版本 | `test_minimum_commission_applies_on_a_10k_notional_order`、`test_reference_notional_below_one_lot_is_no_fill`、`test_cost_schedule_is_date_versioned_and_reports_provenance`、`test_net_return_charges_both_sides_of_cost`、`test_engine_and_label_share_one_cost_authority` |
 | 特征 / 数据缺失 | `test_missing_feature_snapshot_is_a_visible_caveat`、`test_missing_minute_bars_are_reported_not_replaced_by_open_price`、`test_malformed_probability_is_dropped_not_coerced_to_zero`、`test_missing_limit_prices_stay_visible_instead_of_being_filled`、`test_index_gap_is_insufficient_not_zero_filled` |
 | 模型身份异常 | `test_model_identity_violations_produce_zero_recommendations`、`test_missing_model_identity_fails_closed`、`test_serving_model_from_another_label_policy_is_not_usable`、`test_missing_serving_manifest_is_visible_not_defaulted` |
+| 标签口径未绑定（registry 查不到 / 另一套 TP·SL / registry 没接线） | `test_registered_label_policy_is_positively_verified`、`test_declared_label_policy_absent_from_registry_is_named`、`test_unwired_registry_is_reported_as_unavailable`、`test_label_policy_with_other_tp_sl_is_drift_not_a_match`、`test_verify_names_the_cause_instead_of_returning_a_bare_none`、`test_registration_cli_uses_real_exit_codes` |
 
 **相同输入下线上与历史路径必须给出一致的筛选与交易判定**（对应发布清单 R15）分两层钉住：
 

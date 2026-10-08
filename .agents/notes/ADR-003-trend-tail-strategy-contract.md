@@ -2,7 +2,7 @@
 
 Status: Draft
 
-As-of: 2026-10-08 @ HEAD `e7023c1` 之后的工作树（本 ADR 与 `contracts/trend_strategy.py`、
+As-of: 2026-10-08 @ HEAD `6c7079c` 之后的工作树（本 ADR 与 `contracts/trend_strategy.py`、
 `labels/tail_net_profit.py`、`research/trend_data_readiness.py`、
 `research/funnel_trace.py`、`research/tail_mature_feedback.py`、
 `research/tail_reference_store.py`、`research/tail_rebuild.py`、
@@ -166,6 +166,19 @@ As-of: 2026-10-08 @ HEAD `e7023c1` 之后的工作树（本 ADR 与 `contracts/t
   与特征计算版本读不到各写一条原因，落进 `model_identity.recording_failures`，并由
   `page_view` 折成 `identity_recording_failed:*` 的 caveat。留档每层的
   `feature_compute_version` 改为取自同一个已验证身份，不再二次读模块常量。
+- **标签口径要能在 registry 里核，而不只是清单里一个字符串**（2026-10-08 补）：
+  `tail_label_policy_record()` 此前**没有任何调用方**，所以留档里的 `label_policy_id`
+  是谁都核不了的字符串。现在注册走显式动作 `scripts/register_tail_label_policy.py`
+  （registry 表在生产学习库里，让只读的影子运行去写它 = 读路径决定生产状态），
+  影子链路每次绑定都调 `verify_tail_label_policy()` 拿 registry 逐字段比对，产出
+  `label_policy_not_registered` / `label_policy_drifts_from_tail_contract:<字段>` /
+  `label_policy_registry_unavailable` / `label_policy_id_not_declared` 四种命名失败，
+  并置 `model_identity.label_policy_verified`（正向确认，不是"没报错"）。
+  其中漂移比查不到更危险：v4 前缀对得上、id 也真存在，但那是另一套 TP/SL 的标签，
+  留档看起来完全正常，样本却被另一个持有规则解释 —— 所以比对字段包含
+  `take_profit_pct / stop_loss_pct / horizon_days / price_basis / maturity_rule /
+  conflict_policy / conflict_soft_label_value / label_policy_hash` 等全部口径字段。
+  这一项**不作为阻塞原因**：影子链路照常出结果，失败只在 `recording_failures` 里留名。
 - 留档落盘时刻改为带时区（契约时区 Asia/Shanghai）并附 `written_at_timezone`；
   裸 `datetime.now()` 会跟宿主机偏移走，而留档是影子验证唯一的证据来源。
 - 已知连带事实：`model_serving_manifest.v1` **不含任何 commit 字段**，所以对真实清单
@@ -249,7 +262,11 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库> --reference-db <�
   `resolve_cost_profile()`
 - `src/stock_analyzer/execution/engine.py` —— `cost_profile()`、`estimate_cost()`
   消费冻结成本
-- `src/stock_analyzer/labels/tail_net_profit.py` —— 净盈利标签构造与分组报告
+- `src/stock_analyzer/labels/tail_net_profit.py` —— 净盈利标签构造与分组报告；
+  `register_tail_label_policy()` / `verify_tail_label_policy()` 是标签契约唯一的
+  落库与复核出口（返回 `(记录, 失败原因)`，不抛异常也不猜）
+- `scripts/register_tail_label_policy.py` —— 显式注册 / `--verify-only` 只读核对，
+  退出码 0=已绑定、3=未注册或对不上、5=registry 不可用
 - `src/stock_analyzer/models/output_semantics.py` —— `net_profit_5d_tail` 语义登记
 - `src/stock_analyzer/research/trend_data_readiness.py` + `scripts/audit_trend_data_readiness.py`
 - `src/stock_analyzer/research/funnel_trace.py` —— 分层留档与最终推荐留档；
@@ -293,9 +310,9 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库> --reference-db <�
 - `docs/trend_tail_acceptance_evidence.md` —— §4 验收证据：工程验收逐场景 → 测试名，
   以及"选股质量验收 = blocked"的实测口径（本文件不产命中率数字）
 - 测试（2026-10-08 实测条数）：`test_trend_strategy_contract.py`(55)、
-  `test_tail_net_profit_label.py`(19)、`test_trend_data_readiness.py`(22)、
+  `test_tail_net_profit_label.py`(22)、`test_trend_data_readiness.py`(22)、
   `test_funnel_trace.py`(17)、`test_tail_net_profit_trainer.py`(20)、
-  `test_trend_candidate_contract.py`(16)、`test_trend_tail_shadow_runtime.py`(22)、
+  `test_trend_candidate_contract.py`(16)、`test_trend_tail_shadow_runtime.py`(26)、
   `test_trend_tail_page_and_feedback.py`(26)、`test_minute_bar_store.py`(15)、
   `test_tail_walk_forward.py`(20)、`test_tail_exit_funnel.py`(14)、
   `test_tail_reference_store.py`(14)、`test_tail_rebuild.py`(18)

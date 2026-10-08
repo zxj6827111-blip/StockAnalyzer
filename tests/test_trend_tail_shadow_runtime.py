@@ -18,20 +18,43 @@ from stock_analyzer.contracts.trend_strategy import (
     NET_PROFIT_PROBABILITY_FIELD,
     TrendContractError,
 )
+from stock_analyzer.labels.tail_net_profit import (
+    TAIL_SCHEMA_VERSION,
+    register_tail_label_policy,
+    tail_label_policy_record,
+)
+from stock_analyzer.learning.label_policy_registry import (
+    LabelPolicyRegistry,
+    build_label_policy_record,
+)
 from stock_analyzer.runtime.services.trend_tail_shadow_service import (
     TrendTailShadowService,
 )
 
 CONTRACT = DEFAULT_TREND_CONTRACT
+#: 当前契约推导出的标签口径 id；留档里的 label_policy_id 必须能在 registry 里查到它。
+TAIL_POLICY_ID = tail_label_policy_record(CONTRACT).label_policy_id
 NOW = datetime(2026, 10, 9, 14, 45, 0)
 
 
 class FakeService:
-    def __init__(self, *, manifest: dict | None, tmp_path: Path) -> None:
+    """镜像真实 runtime service 的注入面。
+
+    真实 service 一定带 ``_label_policy_registry``（``_configure_learning_protocol_runtime``
+    里建的），所以这里默认也给一份真的、并已注册当前净盈利标签契约的 registry；
+    想模拟"没接线"或"口径漂移"时显式传 ``registry=`` 覆盖。
+    """
+
+    def __init__(self, *, manifest: dict | None, tmp_path: Path, registry: object = "default",
+                 ) -> None:
         self._manifest = manifest
         self._tmp = tmp_path
         self._config = type("C", (), {"training": type("T", (), {
             "serving_manifest_path": "artifacts/model_serving_manifest.json"})()})()
+        if registry == "default":
+            registry = LabelPolicyRegistry(tmp_path / "learning_protocol.duckdb")
+            register_tail_label_policy(registry)
+        self._label_policy_registry = registry
 
     def _resolve_evolution_path(self, value):
         return str(self._tmp / str(value).replace("artifacts/", ""))
@@ -48,7 +71,7 @@ def _tail_manifest() -> dict:
         "model_id": "trend-tail-lgbm-2026q4",
         "artifact_content_hash": "sha256:abcdef",
         "code_commit": "cafe123",
-        "label_policy_id": "label_policy_v4_07335bbe3d3e",
+        "label_policy_id": TAIL_POLICY_ID,
     }
 
 
@@ -120,6 +143,64 @@ def test_serving_model_from_another_label_policy_is_not_usable(tmp_path) -> None
     assert report["final_symbols"] == []
 
 
+def _policy_failures(report: dict) -> list[str]:
+    return [item for item in report["model_identity"]["recording_failures"]
+            if str(item).startswith("label_policy_")]
+
+
+def test_registered_label_policy_is_positively_verified(tmp_path) -> None:
+    """id 只是字符串时不算绑定：必须在 registry 里查到且逐字段对得上才算 verified。"""
+    report = _run(tmp_path, watch_pool=_pool(["600000.SH"]),
+                  probabilities={"600000.SH": 0.9})
+    assert _policy_failures(report) == []
+    assert report["model_identity"]["label_policy_verified"] is True
+
+
+def test_declared_label_policy_absent_from_registry_is_named(tmp_path) -> None:
+    """registry 里查不到这个 id → 说清"没注册"，而不是留一个没人能核的字符串。"""
+    service = FakeService(manifest=_tail_manifest(), tmp_path=tmp_path,
+                          registry=LabelPolicyRegistry(tmp_path / "empty.duckdb"))
+    report = _run(tmp_path, watch_pool=_pool(["600000.SH"]),
+                  probabilities={"600000.SH": 0.9}, service=service)
+    assert _policy_failures(report) == [f"label_policy_not_registered:{TAIL_POLICY_ID}"]
+    assert report["model_identity"]["label_policy_verified"] is False
+    # 影子链路不因为口径未绑定就伪造阻塞：它照样出结果，但失败原因必须留名。
+    assert report["blocking_reason"] in (None, "")
+
+
+def test_unwired_registry_is_reported_as_unavailable(tmp_path) -> None:
+    service = FakeService(manifest=_tail_manifest(), tmp_path=tmp_path, registry=None)
+    report = _run(tmp_path, watch_pool=_pool(["600000.SH"]),
+                  probabilities={"600000.SH": 0.9}, service=service)
+    assert _policy_failures(report) == ["label_policy_registry_unavailable"]
+
+
+def test_label_policy_with_other_tp_sl_is_drift_not_a_match(tmp_path) -> None:
+    """v4 前缀对得上、id 也真存在，但那是另一套 TP/SL 的标签口径 → 必须报漂移。
+
+    这是最危险的一种：留档看起来完全正常，样本却会被另一个持有规则解释。
+    """
+    other = build_label_policy_record(
+        label_name="net_profit_5d_tail_tp10_sl5", take_profit_pct=0.10,
+        stop_loss_pct=0.05, horizon_days=5, price_basis="tail_confirm_next_bar",
+        exclude_untradable=True, conflict_policy="stop_loss_first",
+        conflict_soft_label_value=0.0, schema_version=TAIL_SCHEMA_VERSION,
+    )
+    registry = LabelPolicyRegistry(tmp_path / "learning_protocol.duckdb")
+    registry.register(other)
+    service = FakeService(
+        manifest={**_tail_manifest(), "label_policy_id": other.label_policy_id},
+        tmp_path=tmp_path, registry=registry,
+    )
+    report = _run(tmp_path, watch_pool=_pool(["600000.SH"]),
+                  probabilities={"600000.SH": 0.9}, service=service)
+    failures = _policy_failures(report)
+    assert len(failures) == 1 and failures[0].startswith("label_policy_drifts_from_tail_contract:")
+    for field in ("take_profit_pct", "label_name", "label_policy_hash"):
+        assert field in failures[0]
+    assert report["model_identity"]["label_policy_verified"] is False
+
+
 def test_missing_serving_manifest_is_visible_not_defaulted(tmp_path) -> None:
     service = FakeService(manifest=None, tmp_path=tmp_path)
     report = _run(
@@ -156,7 +237,7 @@ def _v1_manifest(tmp_path, **overrides) -> dict:
 
     payload = build_serving_manifest(artifact_path=str(tmp_path / "artifact.json"))
     payload["serving"].update({
-        "label_policy_id": "label_policy_v4_07335bbe3d3e",
+        "label_policy_id": TAIL_POLICY_ID,
         "artifact_content_hash": "sha256:feedface",
         "dataset_manifest_id": "dataset_manifest_2026q4_5f3c",
     })

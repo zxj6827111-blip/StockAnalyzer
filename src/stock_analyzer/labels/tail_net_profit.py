@@ -93,6 +93,59 @@ def tail_label_policy_record(
     )
 
 
+#: registry 里哪几个字段决定"这条标签就是这条契约"。少一个都可能是在用
+#: 另一套 TP/SL、另一个持有期或另一种价格口径训练，而留档看不出来。
+TAIL_POLICY_COMPARED_FIELDS: tuple[str, ...] = (
+    "label_name", "schema_version", "take_profit_pct", "stop_loss_pct",
+    "horizon_days", "price_basis", "exclude_untradable", "conflict_policy",
+    "conflict_soft_label_value", "maturity_rule", "label_policy_hash",
+)
+
+
+def register_tail_label_policy(
+    registry: Any,
+    contract: TrendStrategyContract = DEFAULT_TREND_CONTRACT,
+) -> LabelPolicyRecord:
+    """把净盈利标签契约落进 ``LabelPolicyRegistry``（registry 按 hash 幂等）。
+
+    注册是**显式**动作而不是顺手副作用：registry 表在生产学习库里，让一次只读的
+    影子运行去写它，等于让读路径决定生产状态。
+    """
+    return registry.register(tail_label_policy_record(contract))
+
+
+def verify_tail_label_policy(
+    registry: Any,
+    *,
+    label_policy_id: str,
+    contract: TrendStrategyContract = DEFAULT_TREND_CONTRACT,
+) -> tuple[LabelPolicyRecord | None, tuple[str, ...]]:
+    """核对清单声明的 ``label_policy_id``：查得到，且逐字段等于本契约推导出的那条。
+
+    返回 ``(记录, 失败原因)``，不抛异常也不猜：一个只存在于字符串里的 id 不构成绑定，
+    而"查到了但字段不一样"比"查不到"更危险 —— 它会用另一个口径的标签解释这批样本。
+    """
+    declared = str(label_policy_id or "").strip()
+    if registry is None:
+        return None, ("label_policy_registry_unavailable",)
+    if not declared:
+        return None, ("label_policy_id_not_declared",)
+    expected = tail_label_policy_record(contract)
+    try:
+        stored = registry.get_by_id(declared)
+    except Exception as exc:  # noqa: BLE001 - 读不到就是身份不明，交给上层 fail-closed
+        return None, (f"label_policy_registry_read_failed:{type(exc).__name__}",)
+    if stored is None:
+        return None, (f"label_policy_not_registered:{declared}",)
+    drift = [
+        name for name in TAIL_POLICY_COMPARED_FIELDS
+        if getattr(stored, name, None) != getattr(expected, name, None)
+    ]
+    if drift:
+        return stored, (f"label_policy_drifts_from_tail_contract:{','.join(drift)}",)
+    return stored, ()
+
+
 def resolve_tail_slippage_ratio(
     *,
     matcher: Any,
@@ -511,13 +564,16 @@ __all__ = [
     "TAIL_MATURITY_RULE",
     "TAIL_NET_PROFIT_BASIS",
     "TAIL_NET_PROFIT_OUTPUT_FIELD",
+    "TAIL_POLICY_COMPARED_FIELDS",
     "TAIL_PRICE_BASIS",
     "TAIL_SCHEMA_VERSION",
     "TailLabelError",
     "TailLabelRecord",
     "build_tail_net_profit_label",
+    "register_tail_label_policy",
     "resolve_tail_slippage_ratio",
     "summarize_tail_labels",
     "tail_label_name",
     "tail_label_policy_record",
+    "verify_tail_label_policy",
 ]

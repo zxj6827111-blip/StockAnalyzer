@@ -7,7 +7,9 @@
 
 from __future__ import annotations
 
+import importlib.util
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -32,10 +34,12 @@ from stock_analyzer.labels.tail_net_profit import (
     TAIL_SCHEMA_VERSION,
     TailLabelError,
     build_tail_net_profit_label,
+    register_tail_label_policy,
     resolve_tail_slippage_ratio,
     summarize_tail_labels,
     tail_label_name,
     tail_label_policy_record,
+    verify_tail_label_policy,
 )
 from stock_analyzer.models.output_semantics import (
     OUTPUT_SEMANTICS_EVENT_PROBABILITY,
@@ -367,3 +371,59 @@ def test_engine_and_label_share_one_cost_authority() -> None:
     expected = engine.estimate_cost("buy", float(record.entry_price), record.quantity,
                                     trade_date=ENTRY_DAY)
     assert record.buy_cost == pytest.approx(expected)
+
+
+# ---------------------------------------------------------------------------
+# 标签契约的落库与复核（改进计划 §3.1"绑定实际…标签口径"、§4"模型身份异常"）
+# ---------------------------------------------------------------------------
+
+
+def _registry(tmp_path: Path):
+    from stock_analyzer.learning.label_policy_registry import LabelPolicyRegistry
+
+    return LabelPolicyRegistry(tmp_path / "learning_protocol.duckdb")
+
+
+def test_registered_policy_verifies_field_by_field(tmp_path: Path) -> None:
+    registry = _registry(tmp_path)
+    record = register_tail_label_policy(registry)
+    stored, failures = verify_tail_label_policy(
+        registry, label_policy_id=record.label_policy_id
+    )
+    assert failures == ()
+    assert stored is not None and stored.label_policy_hash == record.label_policy_hash
+    # 幂等：重复注册不产生第二条口径，registry 按 hash 去重后原样返回。
+    assert register_tail_label_policy(registry).label_policy_id == record.label_policy_id
+
+
+def test_verify_names_the_cause_instead_of_returning_a_bare_none(tmp_path: Path) -> None:
+    """三种失败必须是三个不同的原因串：查不到、口径漂移、registry 不可用。"""
+    registry = _registry(tmp_path)
+    missing, failures = verify_tail_label_policy(
+        registry, label_policy_id=tail_label_policy_record().label_policy_id
+    )
+    assert missing is None
+    assert failures[0].startswith("label_policy_not_registered:")
+
+    unwired, failures = verify_tail_label_policy(None, label_policy_id="label_policy_v4_x")
+    assert unwired is None and failures == ("label_policy_registry_unavailable",)
+
+    silent, failures = verify_tail_label_policy(registry, label_policy_id="")
+    assert silent is None and failures == ("label_policy_id_not_declared",)
+
+
+def test_registration_cli_uses_real_exit_codes(tmp_path: Path) -> None:
+    """人能在命令行上复核"这个 label_policy_id 到底绑没绑上"：0=绑上，3=没绑上。"""
+    spec = importlib.util.spec_from_file_location(
+        "register_tail_label_policy_cli",
+        Path(__file__).resolve().parents[1] / "scripts" / "register_tail_label_policy.py",
+    )
+    assert spec is not None and spec.loader is not None
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+
+    db = str(tmp_path / "learning_protocol.duckdb")
+    # --verify-only 不会顺手把契约注册进去：同一个库先核对必须报"未注册"。
+    assert cli.main(["--registry-db", db, "--verify-only", "--quiet"]) == 3
+    assert cli.main(["--registry-db", db, "--quiet"]) == 0
+    assert cli.main(["--registry-db", db, "--verify-only", "--quiet"]) == 0

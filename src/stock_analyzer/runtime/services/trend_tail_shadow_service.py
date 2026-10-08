@@ -36,6 +36,7 @@ from stock_analyzer.contracts.trend_strategy import (
     hard_gate_confirmation,
     rank_final_recommendations,
 )
+from stock_analyzer.labels.tail_net_profit import verify_tail_label_policy
 from stock_analyzer.research.funnel_trace import (
     KIND_HARD_GATE,
     KIND_PREDICTIVE,
@@ -276,6 +277,11 @@ class TrendTailShadowService:
                 # §3.1"记录失败必须可见"：绑定不上哪一项，就点名哪一项，不留空当默认值。
                 "recording_failures": list(recording_failures),
                 "training_manifest_id": str(getattr(identity, "training_manifest_id", "") or ""),
+                # 正向确认，不只是"没报错"：registry 里查得到这个 id，且逐字段等于
+                # 本契约推导出的那条标签口径。
+                "label_policy_verified": bool(identity is not None) and not any(
+                    str(item).startswith("label_policy_") for item in recording_failures
+                ),
             },
             "counts": dict(result.counts),
             "max_recommendations_effective": int(
@@ -304,6 +310,14 @@ class TrendTailShadowService:
         label_policy_id = _manifest_field(manifest, "label_policy_id")
         if not label_policy_id.startswith("label_policy_v4_"):
             return None, "serving_model_is_not_tail_label_policy", tuple(failures)
+        # 清单里写着一个 id 不等于这个 id 存在。registry 才是标签契约的落库处，
+        # 所以拿它逐字段核对一次：查不到、或者查到的是另一套 TP/SL/持有期/价格口径，
+        # 都记成可见的失败原因，而不是让留档里留一个无法解释的字符串。
+        _registered_policy, policy_failures = verify_tail_label_policy(
+            getattr(self._service, "_label_policy_registry", None),
+            label_policy_id=label_policy_id, contract=self._contract,
+        )
+        failures.extend(policy_failures)
         training_commit = _manifest_field(manifest, "code_commit", "commit", "training_commit")
         if not training_commit:
             failures.append("training_commit_absent_from_serving_manifest")
