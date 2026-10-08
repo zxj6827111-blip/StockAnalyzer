@@ -1236,3 +1236,39 @@ capacity_minus_gap (turnover, avg_turnover_20, -gap_up_pct) → 契约直接拒�
 边界：仍是**池子级**比较（整组 vs 整组），不是 §3.4 要求的按新概率选 Top-3 vs 旧 Top-3；
 每月只有一段（17~21 个决策日），CI 是当月内的交易日分块，跨月没有合并成单一区间
 （合并会把符号相反的月份抵消成"无效应"，那是掩盖而不是结论）。
+
+## 4.11 §2 第二问（是不是同一份信息被反复使用）第一次拿到硬证据（2026-10-08）
+
+用**已有**的 `scripts/measure_tail_feature_stability.py`（未新写代码）跑 124 决策日全市场样本：`trade_days=124`、`labelled_rows=21760`、`folds_measured=4/4`，冗余判定阈值 |ρ|≥0.9，结果落 `artifacts/research/mw_feature_stability_125d.json`。
+
+**跨组重复度是硬事实**（秩相关最高的几对，`same_group=false` 意味着它们登记在**不同信息组**）：
+
+| a | b | Spearman ρ | 同组？ | 两组分别是 |
+| --- | --- | --- | --- | --- |
+| `relative_strength` | `rank_ret_20` | **1.0** | **否** | market_relative vs trend_position |
+| `rs_ma20` | `ma20` | **0.9994** | **否** | market_relative vs trend_position |
+| `rs_ma5` | `ma5` | **0.9991** | **否** | market_relative vs trend_position |
+| `ma5` | `ma10` | **0.9978** | 是 | trend_position vs trend_position |
+| `rs_ma5` | `ma10` | **0.9971** | **否** | market_relative vs trend_position |
+| `ma10` | `ma20` | **0.9959** | 是 | trend_position vs trend_position |
+| `rs_ma20` | `ma10` | **0.9952** | **否** | market_relative vs trend_position |
+| `rs_ma5` | `rs_ma20` | **0.9915** | 是 | market_relative vs market_relative |
+
+`redundant_pairs` 共 **22 对**达到阈值。最刺眼的一对是 `relative_strength` 与 `rank_ret_20`：**ρ=1.0**——它们在横截面上是**同一个排序**，却被登记在两个不同的信息组里。也就是说只要综合分/等级同时用这两列，同一份信息就被**算了两次**，而流程看起来像是有两类独立证据。`rs_ma20`/`ma20`（0.9994）与 `rs_ma5`/`ma5`（0.9991）同理：所谓「相对强弱的均线」与「价格均线」在全市场横截面上几乎不可区分。
+
+四组的时间外稳定性（列级 AUC，按折的测试窗，只测不准入）：
+
+| 信息组 | 参与测量的列数 | 平均 AUC | AUC>0.5 占比 |
+| --- | --- | --- | --- |
+| market_relative | 9（36 次测量） | 0.5193 | 0.75 |
+| trend_position | 9（36 次测量） | 0.5209 | 0.8333 |
+| volume_liquidity | 7（27 次测量） | 0.5141 | 0.6667 |
+| volatility_overheat | 8（31 次测量） | 0.507 | 0.5161 |
+
+三条读法：
+
+1. **已证实**：旧评分体系「反复使用相同信息」不是猜测。ρ=1.0 的那一对足以说明「组数 = 4」给人造成的「证据有四类」的印象是虚的——真正独立的维度更少。
+2. **已证实**：四组的时间外平均 AUC 全在 0.507~0.5141 之间、AUC>0.5 的占比 0.51~0.67，与 §4.7.1 的「跨段方向不稳定」是同一件事的两个测面（一个看均值、一个看逐段符号）。
+3. 顺带量化了一个老缺口：`last30_volume_share` 与 `tail_volatility_ratio` 这两条**依赖日内的列**在 fold1 直接 `single_class_or_all_null`（`unusable` 列出），因为日频重放算不出它们——这与契约里「这两列在历史重放不可复现，一律留 NaN 不进 --features」是同一条约束的实测后果。
+
+边界：秩相关是在**全体已成交样本**上算的横截面合并秩，不是逐日截面秩；它证明的是「这些列彼此冗余」，不证明任何一列能提升净盈利率。列级 AUC 是测量不是准入（脚本文案自己就这么写），进正式候选仍由 trainer 的门决定。
