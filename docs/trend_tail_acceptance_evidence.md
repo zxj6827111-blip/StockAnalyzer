@@ -18,7 +18,7 @@
 | 尾盘窗口边界 | `test_tail_window_slots_start_inclusive_end_exclusive`、`test_live_path_never_evaluates_a_slot_that_has_not_arrived_yet`、`test_stale_live_quote_blocks_confirmation_instead_of_using_old_bar` |
 | 确认后成交（下一根，不吃确认槽本身） | `test_fill_uses_the_next_completed_bar_after_confirmation_not_the_slot_bar`、`test_confirmation_never_reads_an_unfinished_bar` |
 | 涨 / 跌停 | `test_limit_up_locked_fill_is_no_fill`、`test_limit_up_locked_entry_is_recorded_as_no_fill`（链路级）、`test_unsellable_exit_day_defers_and_maturity_is_the_actual_exit`、`test_missing_price_or_limit_data_fails_closed_without_guessing` |
-| 停牌 | `test_suspended_fill_bar_is_no_fill_but_not_a_loss`、`test_halt_code_in_trade_status_blocks_the_buy`、`test_halted_exit_day_defers_instead_of_assuming_a_sell`、`test_missing_trade_status_is_not_read_as_suspension`、`test_missing_bar_is_not_reported_as_suspension` |
+| 停牌 | `test_suspended_fill_bar_is_no_fill_but_not_a_loss`、`test_halt_code_in_trade_status_blocks_the_buy`、`test_halted_exit_day_defers_instead_of_assuming_a_sell`、`test_missing_trade_status_is_not_read_as_suspension`、`test_missing_bar_is_not_reported_as_suspension`（**这五行证明的是判定路径**；94 天重放里这条门没有正向输入可验，见 `trend_tail_selection_quality_report.md` §3d） |
 | T+1 | `test_no_tp_or_sl_can_trigger_on_the_entry_day_because_of_t_plus_1`、`test_entry_on_or_before_decision_day_is_rejected` |
 | 跳空止损 | `test_gap_down_stop_exit_uses_the_open_not_the_stop_level` |
 | 同根双触发 | `test_double_trigger_same_bar_resolves_to_stop_loss_first` |
