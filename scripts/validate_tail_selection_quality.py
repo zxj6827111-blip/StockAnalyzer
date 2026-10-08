@@ -125,7 +125,28 @@ def main(argv: list[str] | None = None) -> int:
             contract=DEFAULT_TREND_CONTRACT,
         )
     except (TailTrainingError, TrendContractError, ValueError) as exc:
-        # 训练或身份失败就停：不降级、不换模型、不给出"看起来能跑完"的数字。
+        # 训练或身份失败就停：不降级、不换模型、不给出「看起来能跑完」的数字。
+        # 但停也要留下可核对的工件 —— §2「模型降级影响多少股票」这一行需要的就是这个。
+        # 这里只登记失败本身（status=blocked + blockers），不产出任何质量数字。
+        failure = {
+            "status": STATUS_BLOCKED,
+            "metrics_computed": False,
+            "blockers": [f"{type(exc).__name__}: {exc}"],
+            "model_id": args.model_id,
+            "training_commit": args.training_commit,
+            "runtime_commit": args.runtime_commit,
+            "requested_folds": args.folds,
+            "blocked_fold_count": args.folds,
+            "sample_file": str(args.samples),
+        }
+        try:
+            Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.out).write_text(
+                json.dumps(failure, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            print(f"失败工件已写入 {args.out}", file=sys.stderr)
+        except OSError as write_exc:
+            print(f"失败工件写盘失败（判定不变）: {write_exc}", file=sys.stderr)
         print(f"training/identity failure: {type(exc).__name__}: {exc}", file=sys.stderr)
         return RC_ERROR
 
@@ -136,6 +157,15 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if report.get("status") == STATUS_BLOCKED:
+        # 阻塞状态也要留可核对的工件：否则 §2「模型降级影响多少」这一行永远没有分母，
+        # 而台账里只能写一句"验证器退 5"。写盘失败不改判定，只加一条 stderr 说明。
+        try:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(
+                json.dumps(report, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+            )
+        except OSError as exc:
+            print(f"blocked 报告写盘失败（判定不变）: {exc}", file=sys.stderr)
         print(f"blocked: {report.get('blockers')}")
         print("选股质量验收记为阻塞，继续采集带时刻的分钟行情，不得用开盘回测代替")
         return RC_BLOCKED
