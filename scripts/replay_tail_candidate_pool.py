@@ -290,11 +290,24 @@ def symbols_file_facts(path: Path | str) -> dict[str, Any]:
         line.strip() for line in raw.decode("utf-8").splitlines()
         if line.strip() and not line.startswith("#")
     ]
+    producer = "unknown_not_recorded_in_repo"
+    for candidate in (file.with_name(file.name + ".provenance.json"),
+                      file.with_name(file.stem + ".provenance.json"),
+                      file.with_name(file.stem + "_provenance.json")):
+        if not candidate.exists():
+            continue
+        try:
+            recorded = json.loads(candidate.read_text(encoding="utf-8")).get("producer")
+        except (ValueError, OSError):
+            recorded = None
+        if recorded:
+            producer = f"{recorded} (provenance={candidate.name})"
+            break
     return {
         "path": str(file),
         "sha256": hashlib.sha256(raw).hexdigest(),
         "symbols_count": len(symbols),
-        "producer": "unknown_not_recorded_in_repo",
+        "producer": producer,
     }
 
 

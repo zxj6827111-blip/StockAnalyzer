@@ -163,6 +163,17 @@ def test_symbols_file_facts_records_the_universe_input_provenance(tmp_path: Path
     assert replay.symbols_file_facts(file)["sha256"] != facts["sha256"]
 
 
+def test_symbols_file_facts_reads_the_sibling_provenance(tmp_path: Path) -> None:
+    """有生产者脚本就必须报出生产者，不能一律写 unknown（那是我自己造成的假陈述）。"""
+    file = tmp_path / "universe.txt"
+    file.write_text("600000\n000001\n", encoding="utf-8")
+    assert replay.symbols_file_facts(file)["producer"] == "unknown_not_recorded_in_repo"
+    (tmp_path / "universe.txt.provenance.json").write_text(
+        '{"producer": "build_tail_universe_symbols.py"}', encoding="utf-8")
+    assert replay.symbols_file_facts(file)["producer"].startswith(
+        "build_tail_universe_symbols.py (provenance=")
+
+
 def test_every_name_the_replay_can_emit_is_a_declared_hard_rule() -> None:
     """重放真正会写进留档的名字（``daily_gates`` 的键 + PIT 原因）必须全在 HARD 词表里。
 
