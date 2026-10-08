@@ -2,9 +2,10 @@
 
 Status: Draft
 
-As-of: 2026-10-08 @ HEAD `0c9f043`（本 ADR 与 `contracts/trend_strategy.py`、
+As-of: 2026-10-08 @ HEAD `dfe9a29` 之后的工作树（本 ADR 与 `contracts/trend_strategy.py`、
 `labels/tail_net_profit.py`、`research/trend_data_readiness.py`、
-`research/funnel_trace.py`、`research/tail_mature_feedback.py` 同批演进）
+`research/funnel_trace.py`、`research/tail_mature_feedback.py`、
+`feature/trend_candidate_contract.py` 同批演进）
 
 ## 1. Status 为什么是 Draft
 
@@ -119,6 +120,28 @@ As-of: 2026-10-08 @ HEAD `0c9f043`（本 ADR 与 `contracts/trend_strategy.py`�
   `test_live_and_history_chain_paths_agree_on_identical_bars` 比较入选集合、
   漏斗计数、拒绝原因与成交（数量/金额/成交时刻），断言二者一致。
 
+训练输入的白名单门（`feature/trend_candidate_contract.assert_training_features`）：
+
+计划 §3.2 写的是"新闻、主题和 completion 先作为特征或风险信息评估…历史不可复现的
+信息不得混入训练"。此前这一条**只有声明没有牙**：`ADVISORY_SOURCES` 在 `src/` 里没有
+任何消费方，唯一的测试是同义反复（`source in ADVISORY_SOURCES` 恒真）。现在的裁决点是
+`train_tail_net_profit_model()` 的第一条前置检查（`TailTrainingError`，与"原生 booster
+缺失就停"同一族），CLI 在读样本之前先拒（退出码 5）：
+
+- 放行清单只有一个：`REPRODUCIBLE_FEATURE_COLUMNS` = 四组已有行情列的并集。
+  线上打分侧本来就只能拿到 `build_trend_feature_frame()` 产出的这些列，
+  所以训练与线上共用同一份白名单，不存在"训练多带几列"的口子。
+- 拒绝分两种理由：名字里含 news/theme/completion/sentiment/sector_quota/exploration/
+  analyst/boost 词根 → "不可复现的信息源"；其余不认识的名字 → "未登记在特征契约里"。
+  **"不认识"不等于"可复现"**，`composite_score`、`p_meta` 走后者被拒。
+- 空清单与重复列各自拒绝：重复列会被下游静默丢弃，静默丢一列就是静默改契约。
+- `ADVISORY_SOURCES` 同步改成 `_RULE_KIND` 里真实存在的规则名
+  （`news_boost/theme_boost/completion_boost/sector_quota/exploration_sample`），
+  并由测试钉住它们全是 `predictive`、一个都不在 `HARD` 里。
+
+这条门只主张"训练输入在当时可复现"，**不主张这四组在时间外真的有效** ——
+后者要等真实成熟标签跑完消融。
+
 ## 5. 数据契约侧的同批变更
 
 - `CostScheduleEntry` 从"只对 `stamp_tax_rate` 分段"扩展为可覆盖
@@ -183,9 +206,10 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库>
 - `src/stock_analyzer/research/funnel_trace.py` —— 分层留档与最终推荐留档；
   `write_trace(..., suffix=)` 让"成交与退出"这层落到**另一个文件**，不回头覆盖入场那天的留档
 - `src/stock_analyzer/models/tail_net_profit_trainer.py` —— 日期切分 +  embargo、
-  LR 基线 / 既有 LightGBM 参数、独立校准段、5pp 分块 bootstrap 判定
+  LR 基线 / 既有 LightGBM 参数、独立校准段、5pp 分块 bootstrap 判定，
+  以及作为第一条前置检查的特征白名单门
 - `src/stock_analyzer/feature/trend_candidate_contract.py` —— 硬门/预测规则分类、
-  先算后截、四组特征消融与"缺失不填零"
+  先算后截、四组特征消融与"缺失不填零"、`assert_training_features()` 的训练输入白名单
 - `src/stock_analyzer/runtime/services/trend_tail_shadow_service.py` —— 影子链路 +
   `page_view()` / `tail_shadow_page()` / `tail_shadow_history()`
 - `src/stock_analyzer/research/tail_mature_feedback.py` —— 成熟结果按模型版本 /
@@ -214,10 +238,10 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库>
   以及"选股质量验收 = blocked"的实测口径（本文件不产命中率数字）
 - 测试（2026-10-08 实测条数）：`test_trend_strategy_contract.py`(55)、
   `test_tail_net_profit_label.py`(19)、`test_trend_data_readiness.py`(13)、
-  `test_funnel_trace.py`(16)、`test_tail_net_profit_trainer.py`(19)、
-  `test_trend_candidate_contract.py`(13)、`test_trend_tail_shadow_runtime.py`(19)、
+  `test_funnel_trace.py`(16)、`test_tail_net_profit_trainer.py`(20)、
+  `test_trend_candidate_contract.py`(16)、`test_trend_tail_shadow_runtime.py`(19)、
   `test_trend_tail_page_and_feedback.py`(25)、`test_minute_bar_store.py`(15)、
-  `test_tail_walk_forward.py`(18)、`test_tail_exit_funnel.py`(14)
+  `test_tail_walk_forward.py`(20)、`test_tail_exit_funnel.py`(14)
 
 ## 8. 尚未接线的调用方（升级 Accepted 前必须改完）
 

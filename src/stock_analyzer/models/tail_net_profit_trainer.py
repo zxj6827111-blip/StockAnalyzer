@@ -31,6 +31,7 @@ from stock_analyzer.contracts.trend_strategy import (
     DEFAULT_TREND_CONTRACT,
     TrendStrategyContract,
 )
+from stock_analyzer.feature.trend_candidate_contract import assert_training_features
 from stock_analyzer.labels.tail_net_profit import CAPTURE_OBSERVED, CAPTURE_REPLAYED
 from stock_analyzer.models.calibration import IsotonicCalibrator
 from stock_analyzer.models.fallback import LogisticProbModel
@@ -220,6 +221,12 @@ def train_tail_net_profit_model(
     也只能在那一组日期上做，不接受"训练时再自己切一刀"。
     """
     resolved_spec = spec or TailModelSpec()
+    # 特征必须先过契约门：不可复现的信息（新闻/主题/completion…）喂进来，
+    # 时间外验证只会给出一个无法复现的漂亮数字。
+    try:
+        assert_training_features(feature_names)
+    except ValueError as exc:
+        raise TailTrainingError(str(exc)) from exc
     if resolved_spec.kind == KIND_LOGISTIC and booster_trainer is not None:
         raise TailTrainingError("booster_trainer only applies to the lightgbm spec")
     if resolved_spec.kind == KIND_LIGHTGBM and booster_trainer is None:

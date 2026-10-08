@@ -9,7 +9,8 @@
   尾部不明显恶化、折数达标）
 - ``3`` 样本不足 → 记为 blocked，继续采集带时刻的分钟行情
 - ``4`` 跑完了但质量门不过
-- ``5`` 输入/训练/身份失败（包括要求 LightGBM 却没有原生 booster）
+- ``5`` 输入/训练/身份失败（包括要求 LightGBM 却没有原生 booster，以及
+  ``--features`` 里出现四组可复现行情信息之外的列）
 """
 
 from __future__ import annotations
@@ -29,6 +30,9 @@ if str(_SRC) not in sys.path:
 from stock_analyzer.contracts.trend_strategy import (  # noqa: E402
     DEFAULT_TREND_CONTRACT,
     TrendContractError,
+)
+from stock_analyzer.feature.trend_candidate_contract import (  # noqa: E402
+    assert_training_features,
 )
 from stock_analyzer.models.tail_net_profit_trainer import (  # noqa: E402
     MIN_TEST_FOLDS,
@@ -93,6 +97,12 @@ def main(argv: list[str] | None = None) -> int:
     feature_names = [name.strip() for name in str(args.features).split(",") if name.strip()]
     if not feature_names:
         print("--features 不能为空", file=sys.stderr)
+        return RC_ERROR
+    try:
+        assert_training_features(feature_names)
+    except ValueError as exc:
+        # 先于读样本失败：特征清单不合法时解析再久也训不出可用的模型。
+        print(f"特征不符合 trend 契约: {exc}", file=sys.stderr)
         return RC_ERROR
 
     try:

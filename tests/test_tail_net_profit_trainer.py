@@ -129,6 +129,21 @@ def test_logistic_spec_rejects_a_booster_injection() -> None:
         )
 
 
+def test_non_reproducible_features_are_refused_before_any_sample_work() -> None:
+    """§3.2"历史不可复现的信息不得混入训练"：门排在查样本之前。
+
+    ``rows=[]`` 本会先撞上"no labelled rows"，这里仍报特征问题，证明训练根本没开始。
+    """
+    with pytest.raises(TailTrainingError, match="不可复现的信息源"):
+        train_tail_net_profit_model(
+            rows=[], feature_names=[*FEATURES, "news_sentiment"], **_identity_kwargs(),
+        )
+    with pytest.raises(TailTrainingError, match="未登记在特征契约里"):
+        train_tail_net_profit_model(
+            rows=[], feature_names=["composite_score"], **_identity_kwargs(),
+        )
+
+
 # ---------------------------------------------------------------------------
 # 端到端：逻辑回归基线
 # ---------------------------------------------------------------------------

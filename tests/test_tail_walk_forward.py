@@ -38,7 +38,9 @@ from stock_analyzer.research.tail_walk_forward import (
 )
 
 CONTRACT = DEFAULT_TREND_CONTRACT
-FEATURES = ["signal", "noise"]
+# 特征列名必须都登记在 trend 特征契约的四组可复现行情信息里，否则训练入口会拒绝
+# （见 assert_training_features）。ret_5 带可学信号，close_position 是常数噪声列。
+FEATURES = ["ret_5", "close_position"]
 START = date(2024, 1, 2)
 
 
@@ -61,15 +63,15 @@ def _rows(*, days: int = 120, labelled: bool = True) -> list[dict]:
         for index in range(6):
             unfilled = index == 5
             positive = index < 3
-            signal = 0.9 if positive else 0.1
+            strength = 0.9 if positive else 0.1
             label = None if not labelled else (None if unfilled else (1 if positive else 0))
             out.append({
                 "symbol": f"{600000 + index}.SH",
                 "decision_date": day,
                 "entry_date": day + timedelta(days=1),
-                "signal": signal,
-                "noise": 0.5,
-                "composite_score": 1.0 - signal,
+                "ret_5": strength,
+                "close_position": 0.5,
+                "composite_score": 1.0 - strength,
                 "label": label,
                 "filled": not unfilled,
                 "trainable": not unfilled,
@@ -285,7 +287,7 @@ def test_sufficiency_blockers_is_a_standalone_gate() -> None:
 
 def test_score_rows_requires_a_calibrator_and_uses_it() -> None:
     with pytest.raises(ValueError, match="calibrator"):
-        score_rows({"model": object()}, [{"signal": 1.0}], feature_names=FEATURES)
+        score_rows({"model": object()}, [{"ret_5": 1.0}], feature_names=FEATURES)
 
     splits = build_rolling_splits(_trade_days(120), folds=4, contract=CONTRACT)
     artifact = train_tail_net_profit_model(
@@ -300,8 +302,8 @@ def test_score_rows_requires_a_calibrator_and_uses_it() -> None:
     probabilities = score_rows(
         artifact,
         [
-            {"symbol": "600000.SH", "signal": 0.9, "noise": 0.5},
-            {"symbol": "600001.SH", "signal": 0.1, "noise": 0.5},
+            {"symbol": "600000.SH", "ret_5": 0.9, "close_position": 0.5},
+            {"symbol": "600001.SH", "ret_5": 0.1, "close_position": 0.5},
         ],
         feature_names=FEATURES,
     )
@@ -313,6 +315,12 @@ def test_probability_field_is_the_new_one_not_the_old_composite() -> None:
     assert NET_PROFIT_PROBABILITY_FIELD == "p_net_profit_5d_tail"
     report = _run(_rows())
     assert report["arms"]["treatment"] == NET_PROFIT_PROBABILITY_FIELD
+
+
+def test_walk_forward_refuses_features_it_cannot_reproduce() -> None:
+    """§3.2 的门在编排层同样成立：一折都不许用不可复现的信息列去训。"""
+    with pytest.raises(TailTrainingError, match="不可复现的信息源"):
+        _run(_rows(), feature_names=["ret_5", "news_sentiment"])
 
 
 # ---------------------------------------------------------------------------
@@ -345,7 +353,7 @@ def _cli(args: list[str]) -> subprocess.CompletedProcess:
 def test_cli_returns_blocked_exit_when_samples_have_no_labels(tmp_path) -> None:
     samples = _write_samples(tmp_path, _rows(labelled=False))
     result = _cli([
-        "--samples", str(samples), "--features", "signal,noise",
+        "--samples", str(samples), "--features", "ret_5,close_position",
         "--model-id", "m", "--training-commit", "cafe123", "--runtime-commit", "cafe123",
         "--feature-compute-version", "1", "--label-policy-id", "label_policy_v4_x",
         "--out", str(tmp_path / "report.json"),
@@ -358,7 +366,7 @@ def test_cli_returns_blocked_exit_when_samples_have_no_labels(tmp_path) -> None:
 
 def test_cli_fails_visibly_on_an_unreadable_sample_file(tmp_path) -> None:
     result = _cli([
-        "--samples", str(tmp_path / "missing.jsonl"), "--features", "signal",
+        "--samples", str(tmp_path / "missing.jsonl"), "--features", "ret_5",
         "--model-id", "m", "--training-commit", "cafe123", "--runtime-commit", "cafe123",
         "--feature-compute-version", "1", "--label-policy-id", "label_policy_v4_x",
         "--out", str(tmp_path / "report.json"),
@@ -371,7 +379,7 @@ def test_cli_runs_the_full_walk_forward_and_writes_a_report(tmp_path) -> None:
     samples = _write_samples(tmp_path, _rows())
     out = tmp_path / "report.json"
     result = _cli([
-        "--samples", str(samples), "--features", "signal,noise",
+        "--samples", str(samples), "--features", "ret_5,close_position",
         "--model-id", "m", "--training-commit", "cafe123", "--runtime-commit", "cafe123",
         "--feature-compute-version", "1", "--label-policy-id", "label_policy_v4_x",
         "--folds", "4", "--out", str(out),
@@ -381,3 +389,16 @@ def test_cli_runs_the_full_walk_forward_and_writes_a_report(tmp_path) -> None:
     assert payload["status"] == STATUS_COMPLETED
     assert payload["fold_count"] == 4
     assert "0.60 是初始选股规则" in " ".join(payload["caveats"])
+
+
+def test_cli_refuses_illegal_features_before_reading_samples(tmp_path) -> None:
+    """特征清单不合法时不必去解析样本文件：退出码要能区分"这条链根本不该训"。"""
+    result = _cli([
+        "--samples", str(tmp_path / "missing.jsonl"), "--features", "news_sentiment",
+        "--model-id", "m", "--training-commit", "cafe123", "--runtime-commit", "cafe123",
+        "--feature-compute-version", "1", "--label-policy-id", "label_policy_v4_x",
+        "--out", str(tmp_path / "report.json"),
+    ])
+    assert result.returncode == 5, result.stdout + result.stderr
+    assert "特征不符合 trend 契约" in result.stderr
+    assert not (tmp_path / "report.json").exists()

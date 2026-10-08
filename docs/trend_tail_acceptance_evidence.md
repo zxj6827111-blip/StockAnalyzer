@@ -1,4 +1,4 @@
-# trend 尾盘链路：§4 验收证据（As-of 2026-10-08 @ HEAD `0c9f043`）
+# trend 尾盘链路：§4 验收证据（As-of 2026-10-08 @ `dfe9a29` 之后的工作树）
 
 范围只覆盖选股质量改进计划第一轮落地到 trend 的这条链路：夜扫观察池 → 次日
 14:30–14:50 尾盘确认 → 最多 3 只最终推荐 → 成交与 5 交易日退出。monster 与旧
@@ -36,6 +36,26 @@
   历史=最后一根已完成 bar 14:44），这一点由
   `test_history_mode_stamps_the_explicit_trade_date` 钉住。
 
+**§3.2 的另一条门：历史不可复现的信息不得进训练**（新闻 / 主题 / completion /
+板块配额 / 探索样本）。这一条此前**只有声明没有牙**：`ADVISORY_SOURCES` 在 `src/`
+里没有任何消费方，唯一碰它的测试是同义反复（`source in ADVISORY_SOURCES` 恒真）。
+现在由 `feature/trend_candidate_contract.assert_training_features()` 落地，逐条钉住：
+
+- `test_non_reproducible_information_is_refused_by_training` —— 带 news/theme/completion/
+  sector_quota/exploration/analyst 词根的列一律按"不可复现的信息源"拒绝；
+- `test_columns_outside_the_four_groups_are_refused_too` —— 不认识的列也拒（"未登记"），
+  空清单与重复列各拒一次；
+- `test_the_four_reproducible_groups_are_training_eligible` —— 四组整体与逐组都放行，
+  门不许把自己的输入挡掉；
+- `test_advisory_bonus_rules_are_declared_and_never_hard_gates` —— 五个建议性规则名
+  都必须在 `_RULE_KIND` 里且分类为 `predictive`，不得进 `HARD`；
+- 消费侧：`test_non_reproducible_features_are_refused_before_any_sample_work`（训练入口
+  排在查样本之前，`rows=[]` 仍报特征问题）、`test_walk_forward_refuses_features_it_cannot_reproduce`、
+  `test_cli_refuses_illegal_features_before_reading_samples`（退出码 5，且不落报告）。
+
+放行清单只有 `REPRODUCIBLE_FEATURE_COLUMNS` = 四组已有行情列；线上打分侧本来就只能
+拿到 `build_trend_feature_frame()` 产出的这些列，所以训练与线上用同一份白名单。
+
 ---
 
 ## 1b. §2 的 9 层漏斗：谁在写、还差谁
@@ -57,12 +77,12 @@
 
 | 命令 | 结果 |
 | --- | --- |
-| `pytest tests/test_trend_strategy_contract.py tests/test_trend_tail_shadow_runtime.py tests/test_trend_tail_page_and_feedback.py tests/test_minute_bar_store.py tests/test_funnel_trace.py tests/test_tail_net_profit_label.py tests/test_trend_data_readiness.py tests/test_tail_net_profit_trainer.py tests/test_trend_candidate_contract.py tests/test_tail_walk_forward.py tests/test_tail_exit_funnel.py -q` | **226 passed**（条数：55/19/25/15/16/19/13/19/13/18/14） |
-| `pytest tests -k "trend or tail"` | **228 passed, 4028 deselected** |
-| `pytest tests -k "week5 or live_runtime or automation"` | **319 passed, 3937 deselected**（影子接线未破坏既有自动化链） |
-| `ruff check` 本分支 8 个源文件 + 3 个测试文件 | All checks passed |
+| `pytest tests/test_trend_strategy_contract.py tests/test_trend_tail_shadow_runtime.py tests/test_trend_tail_page_and_feedback.py tests/test_minute_bar_store.py tests/test_funnel_trace.py tests/test_tail_net_profit_label.py tests/test_trend_data_readiness.py tests/test_tail_net_profit_trainer.py tests/test_trend_candidate_contract.py tests/test_tail_walk_forward.py tests/test_tail_exit_funnel.py -q` | **232 passed**（条数：55/19/25/15/16/19/13/20/16/20/14） |
+| `pytest tests -k "trend or tail"` | **234 passed, 4028 deselected** |
+| `pytest tests -k "week5 or live_runtime or automation"` | **319 passed, 3943 deselected**（影子接线未破坏既有自动化链） |
+| `ruff check` 本轮触及的 2 个源文件 + 3 个测试文件 + `scripts/validate_tail_selection_quality.py` | All checks passed |
 | `ruff check src tests`（仓库全量） | 48 errors —— 全部落在分支未触碰的文件，属既有基线 |
-| `mypy --python-version 3.12` 本分支 8 个源文件 | 剩 **2** errors，均在 `models/tail_net_profit_trainer.py:245/248` 的 LightGBM 注入点（运行时已由 `native booster trainer is unavailable` 硬门拦住，纯类型噪声）；本分支其余文件的 12 个已在本轮清掉 |
+| `mypy --python-version 3.12` 本分支源文件 | 剩 **2** errors，均在 `models/tail_net_profit_trainer.py:293/296` 的 LightGBM 注入点（运行时已由 `native booster trainer is unavailable` 硬门拦住，纯类型噪声）；`feature/trend_candidate_contract.py` 与 `research/tail_walk_forward.py` 本轮改过后仍为 0 error |
 | `python scripts/run_quality_gate.py --stage clean-scope --fail-on-error` | `blocking_failures = ["mypy_blocking"]`，**不是本分支引入**：报错是 `.venv` 里 numpy stub 的 `Type statement is only supported in Python 3.12 and greater`，而 `pyproject.toml` 钉 `python_version = "3.11"`，mypy 在检查任何项目文件之前就终止（"errors prevented further checking"）。同一命令加 `--python-version 3.12` 后，那 4 个目标文件（均非本分支文件）只剩 1 个既有 `var-annotated`。 |
 
 | `env -u PYTHONPATH python scripts/audit_trend_data_readiness.py --help` | 正常输出用法。本轮修掉了一个真实缺陷：该 CLI 缺 `src/` 路径自举，照本文件 §3 的命令去做解锁的人第一跳就是 `ModuleNotFoundError`；测试原来靠注入 `PYTHONPATH` 掩盖了它，现已改为不注入。 |
@@ -104,14 +124,14 @@ python scripts/audit_trend_data_readiness.py \
 # 3. 覆盖度达标后跑滚动验证：≥4 折、匹配基线对照、真实退出码
 python scripts/validate_tail_selection_quality.py \
     --samples artifacts/research/tail_samples.jsonl \
-    --features <契约里的特征名> --model-id <id> \
+    --features excess_ret_20,ma20_slope,avg_turnover_20,atr14_pct --model-id <id> \
     --training-commit <sha> --runtime-commit <sha> \
     --feature-compute-version <n> --label-policy-id <label_policy_v4_...>
 # 退出码：0=质量门通过 / 3=样本不足 blocked / 4=跑完但门不过 / 5=训练或身份失败
 ```
 
 第 3 步的编排已经存在（`research/tail_walk_forward.py`：折边界、注入 split 的
-embargo 核对、observed/replayed 分开计数、身份不通过就整轮不成立；18 条测试见
+embargo 核对、observed/replayed 分开计数、身份不通过就整轮不成立；20 条测试见
 `tests/test_tail_walk_forward.py`），缺的只是第 1、2 步落出来的真实数据。
 **这套编排至今只在合成样本上跑通过，没有在真实历史数据上跑过 —— 因此本文件
 不为任何真实命中率背书。**
@@ -125,6 +145,8 @@ embargo 核对、observed/replayed 分开计数、身份不通过就整轮不成
 ## 4. 本文件明确不主张的事
 
 - **0.60 是初始选股规则，不是已证明 60% 命中率。** 没有任何 observed 样本支撑该数字。
+- **特征白名单只证明"训练输入在夜扫当时可复现"，不证明这四组在时间外真的有效。**
+  `assert_training_features()` 挡的是 look-ahead，逐组消融的结论仍要等真实标签。
 - **bronze 样本占比没有被认定为当前生产模型的根因**；根因清单里它是假设，
   见 `.agents/notes/NOTE-002-selection-quality-root-causes.md`。
 - 旧完整链路在同一天**没有可比成交样本**，因此"较旧链路提升 X pp"当前无法计算，
@@ -140,7 +162,7 @@ embargo 核对、observed/replayed 分开计数、身份不通过就整轮不成
 
 ```text
 代码完成  ✔（含影子链路、契约、留档、页面、反馈）
-测试完成  ✔ 工程验收场景（226 + 319 passed，见 §2）
+测试完成  ✔ 工程验收场景（232 + 319 passed，见 §2）
 业务验证  ✘ 选股质量验收 blocked（§3：历史分钟数据覆盖度未知，且无真实标签）
 Freeze Ready  ✘ 未执行
 Production Ready ✘ 未执行；旧路径仍在服务真实推送

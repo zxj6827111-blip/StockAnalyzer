@@ -2,6 +2,7 @@
 
 钉住的三件事：硬门与预测性规则的边界、"算完轻量特征再截断"、
 缺数据一律 NaN 而不是填 0（FEATURE_COMPUTE_VERSION v1 的老坑）。
+再加一条：新闻/主题/completion 这类历史不可复现的信息不许进训练。
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from stock_analyzer.feature.trend_candidate_contract import (
     ablation_ladder,
     apply_hard_gates,
     assert_no_silent_zero_fill,
+    assert_training_features,
     build_trend_feature_frame,
     classify_rule,
     columns_for_groups,
@@ -86,9 +88,40 @@ def test_known_rule_split_covers_the_legacy_bonus_list() -> None:
             "overextension_risk"} <= set(declared_rules(HARD))
 
 
-def test_advisory_sources_are_not_hard_gates() -> None:
+def test_advisory_bonus_rules_are_declared_and_never_hard_gates() -> None:
+    """新闻/主题/completion/板块配额/探索样本只能做建议性加分，不得决定资格。"""
+    hard = set(declared_rules(HARD))
     for source in ADVISORY_SOURCES:
-        assert source in declared_rules(PREDICTIVE) or source in ADVISORY_SOURCES
+        assert is_declared_rule(source), source
+        assert classify_rule(source) == PREDICTIVE, source
+        assert source not in hard, source
+
+
+def test_non_reproducible_information_is_refused_by_training() -> None:
+    """§3.2"历史不可复现的信息不得混入训练"：这些列当时未必拿得到，喂进去就是 look-ahead。"""
+    for column in ("news_sentiment", "theme_heat", "completion_pct",
+                   "sector_quota_share", "exploration_flag", "analyst_rating"):
+        with pytest.raises(ValueError, match="不可复现的信息源"):
+            assert_training_features([column])
+
+
+def test_columns_outside_the_four_groups_are_refused_too() -> None:
+    """"不认识"不等于"可复现"：未登记的列同样拒绝，理由是"未登记"而不是"不可复现"。"""
+    for column in ("signal", "composite_score", "p_meta"):
+        with pytest.raises(ValueError, match="未登记在特征契约里"):
+            assert_training_features([column])
+    with pytest.raises(ValueError, match="at least one"):
+        assert_training_features([])
+    with pytest.raises(ValueError, match="duplicate"):
+        assert_training_features(["ret_5", "ret_5"])
+
+
+def test_the_four_reproducible_groups_are_training_eligible() -> None:
+    """四组已有信息整体放行，逐组也放行 —— 门不能把自己的输入拒掉。"""
+    every_group = columns_for_groups(FEATURE_GROUPS)
+    assert assert_training_features(every_group) == every_group
+    for group, columns in FEATURE_GROUPS.items():
+        assert assert_training_features(columns) == columns, group
 
 
 def test_truncation_happens_after_scoring_and_drops_unscored() -> None:

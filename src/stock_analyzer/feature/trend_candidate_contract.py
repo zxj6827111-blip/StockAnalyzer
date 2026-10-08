@@ -53,9 +53,20 @@ FEATURE_GROUPS: dict[str, tuple[str, ...]] = {
     ),
 }
 
-#: 计划里点名"必须有独立证据才能加分"的信息源。默认不启用。
-ADVISORY_SOURCES: tuple[str, ...] = ("news", "theme", "completion", "sector_quota",
-                                     "exploration_sample")
+#: 计划 §3.2 点名"其正向加分必须有独立证据"的信息源，用 ``_RULE_KIND`` 里的真实规则名。
+#: 它们是建议性的：不得当硬门（``apply_hard_gates`` 会拒），也不得进训练。
+ADVISORY_SOURCES: tuple[str, ...] = ("news_boost", "theme_boost", "completion_boost",
+                                     "sector_quota", "exploration_sample")
+
+#: 列名里出现这些词根 = 当时未必拿得到的信息（新闻分、主题热度、completion 进度…）。
+#: 它们可以当风险信息看，但**不许进训练**：历史上取不到的东西进特征就是 look-ahead。
+ADVISORY_TOKENS: tuple[str, ...] = ("news", "theme", "completion", "sentiment",
+                                    "sector_quota", "exploration", "analyst", "boost")
+
+#: 第一轮唯一允许参与训练/打分的列：四组已有行情信息（计划 §3.2）。
+REPRODUCIBLE_FEATURE_COLUMNS = frozenset(
+    column for columns in FEATURE_GROUPS.values() for column in columns
+)
 
 HARD = "hard_gate"
 PREDICTIVE = "predictive"
@@ -294,6 +305,35 @@ def columns_for_groups(groups: Iterable[str]) -> tuple[str, ...]:
     return tuple(picked)
 
 
+def assert_training_features(feature_names: Iterable[str]) -> tuple[str, ...]:
+    """训练/打分用的列必须都在四组可复现行情信息里，否则拒绝。
+
+    新闻分、主题热度、completion 进度这类东西在**当时**不一定拿得到；把它们喂进
+    ``p_net_profit_5d_tail`` 的训练，时间外验证会给出一个无法复现的漂亮数字
+    （计划 §3.2"历史不可复现的信息不得混入训练"）。未知列名同样拒绝 ——
+    "不认识"不等于"可复现"。
+    """
+    names = tuple(str(name) for name in feature_names)
+    if not names:
+        raise ValueError("trend training needs at least one feature column")
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise ValueError(f"duplicate feature columns would be silently dropped: {duplicates}")
+    outside = [name for name in names if name not in REPRODUCIBLE_FEATURE_COLUMNS]
+    if outside:
+        advisory = [
+            name for name in outside
+            if any(token in name.lower() for token in ADVISORY_TOKENS)
+        ]
+        detail = f"不可复现的信息源: {advisory}" if advisory else f"未登记在特征契约里: {outside}"
+        raise ValueError(
+            f"feature columns outside the four reproducible trend groups: {detail}; "
+            "第一轮只允许 market_relative / trend_position / volume_liquidity / "
+            "volatility_overheat 四组已有信息参与训练"
+        )
+    return names
+
+
 def select_ablation_columns(
     frame: TrendFeatureFrame,
     groups: Sequence[str],
@@ -309,9 +349,11 @@ def select_ablation_columns(
 
 __all__ = [
     "ADVISORY_SOURCES",
+    "ADVISORY_TOKENS",
     "FEATURE_GROUPS",
     "HARD",
     "PREDICTIVE",
+    "REPRODUCIBLE_FEATURE_COLUMNS",
     "TREND_FEATURE_CONTRACT_VERSION",
     "UNKNOWN_RULE_KIND",
     "FeatureAvailability",
@@ -320,6 +362,7 @@ __all__ = [
     "ablation_ladder",
     "apply_hard_gates",
     "assert_no_silent_zero_fill",
+    "assert_training_features",
     "classify_rule",
     "columns_for_groups",
     "compute_then_truncate",
