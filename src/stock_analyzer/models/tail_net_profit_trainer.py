@@ -146,6 +146,40 @@ def build_date_split(
     )
 
 
+def _observed_session_gap(dates: Sequence[Any], left: Any, right: Any) -> int:
+    """样本里真实存在的、落在两个段之间的交易日数（段相邻时为 0）。"""
+    if right <= left:
+        return 0
+    return len({day for day in dates if day is not None and left < day < right})
+
+
+def _require_injected_split(
+    split: DateSplit, dates: Sequence[Any], *, contract: TrendStrategyContract
+) -> None:
+    """注入的折边界必须自带 embargo。
+
+    训练/校准段最后一天与后段首日之间至少要隔着 ``holding_days`` 个**观察到的**交易日，
+    否则后段就是在偷看还没成熟的标签（计划 §4"标签必须在后续阶段开始前真实成熟"）。
+    数不满就失败，不做"大概是够的"这种推断。
+    """
+    required = max(1, int(contract.holding_days))
+    if int(split.embargo_sessions) < required:
+        raise TailTrainingError(
+            f"injected split embargo={split.embargo_sessions} < {required} holding sessions"
+        )
+    for name, prior, following in (
+        ("train→calibration", split.train_dates, split.calibration_dates),
+        ("calibration→test", split.calibration_dates, split.test_dates),
+    ):
+        if not prior or not following:
+            raise TailTrainingError(f"injected split has an empty segment at {name}")
+        gap = _observed_session_gap(dates, prior[-1], following[0])
+        if gap < required:
+            raise TailTrainingError(
+                f"injected split gap {name}={gap} observed trade days < {required}"
+            )
+
+
 def _auc(scores: Sequence[float], labels: Sequence[int]) -> float | None:
     pairs = [(float(value), int(label)) for value, label in zip(scores, labels, strict=True)]
     positives = [value for value, label in pairs if label == 1]
@@ -174,12 +208,16 @@ def train_tail_net_profit_model(
     feature_compute_version: int,
     label_policy_id: str,
     booster_trainer: Any | None = None,
+    split: DateSplit | None = None,
 ) -> dict[str, Any]:
     """训练一个与选股目标一致的候选模型；返回可注册的工件 dict（不落盘）。
 
     ``booster_trainer`` 是 LightGBM 路径注入点：必须是能产出 ``predict`` 对象的
     可调用体。为 None 且 spec 要求 LightGBM 时**直接失败**——本模块不 import
     lightgbm，也不许悄悄改用逻辑回归顶替。
+
+    ``split`` 由滚动前推验证注入：折边界由调用方决定时，标签成熟/embargo 的核对
+    也只能在那一组日期上做，不接受"训练时再自己切一刀"。
     """
     resolved_spec = spec or TailModelSpec()
     if resolved_spec.kind == KIND_LOGISTIC and booster_trainer is not None:
@@ -207,9 +245,12 @@ def train_tail_net_profit_model(
     if not usable:
         raise TailTrainingError("no labelled rows: every candidate sample is untrained")
     dates = [row[date_field] for row in usable]
-    split = build_date_split(
-        dates, embargo_sessions=max(1, int(contract.holding_days))
-    )
+    if split is None:
+        split = build_date_split(
+            dates, embargo_sessions=max(1, int(contract.holding_days))
+        )
+    else:
+        _require_injected_split(split, dates, contract=contract)
     train_rows = [row for row in usable if row[date_field] in set(split.train_dates)]
     calib_rows = [row for row in usable if row[date_field] in set(split.calibration_dates)]
     test_rows = [row for row in usable if row[date_field] in set(split.test_dates)]

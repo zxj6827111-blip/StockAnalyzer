@@ -1,4 +1,4 @@
-# trend 尾盘链路：§4 验收证据（As-of 2026-10-08 @ HEAD `e37e2c9`）
+# trend 尾盘链路：§4 验收证据（As-of 2026-10-08 @ HEAD `504859a`）
 
 范围只覆盖选股质量改进计划第一轮落地到 trend 的这条链路：夜扫观察池 → 次日
 14:30–14:50 尾盘确认 → 最多 3 只最终推荐 → 成交与 5 交易日退出。monster 与旧
@@ -42,7 +42,8 @@
 
 | 命令 | 结果 |
 | --- | --- |
-| `pytest tests/test_trend_strategy_contract.py tests/test_trend_tail_shadow_runtime.py tests/test_trend_tail_page_and_feedback.py tests/test_minute_bar_store.py tests/test_funnel_trace.py tests/test_tail_net_profit_label.py tests/test_trend_data_readiness.py tests/test_tail_net_profit_trainer.py tests/test_trend_candidate_contract.py -q` | **194 passed**（条数：55/19/25/15/16/19/13/19/13） |
+| `pytest tests/test_trend_strategy_contract.py tests/test_trend_tail_shadow_runtime.py tests/test_trend_tail_page_and_feedback.py tests/test_minute_bar_store.py tests/test_funnel_trace.py tests/test_tail_net_profit_label.py tests/test_trend_data_readiness.py tests/test_tail_net_profit_trainer.py tests/test_trend_candidate_contract.py tests/test_tail_walk_forward.py -q` | **212 passed**（条数：55/19/25/15/16/19/13/19/13/18） |
+| `pytest tests -k "trend or tail"` | **214 passed, 4028 deselected** |
 | `pytest tests -k "week5 or live_runtime or automation" -q` | **103 passed**（影子接线未破坏既有自动化链） |
 | `ruff check` 本分支 8 个源文件 + 3 个测试文件 | All checks passed |
 | `ruff check src tests`（仓库全量） | 48 errors —— 全部落在分支未触碰的文件，属既有基线 |
@@ -85,8 +86,20 @@ python scripts/sync_tail_minute_bars.py --root <vendor 分钟包目录> \
 python scripts/audit_trend_data_readiness.py \
     --db <market.duckdb> --minute-db artifacts/research/tail_minute_bars.duckdb
 
-# 3. 覆盖度达标后再谈折数与命中率
+# 3. 覆盖度达标后跑滚动验证：≥4 折、匹配基线对照、真实退出码
+python scripts/validate_tail_selection_quality.py \
+    --samples artifacts/research/tail_samples.jsonl \
+    --features <契约里的特征名> --model-id <id> \
+    --training-commit <sha> --runtime-commit <sha> \
+    --feature-compute-version <n> --label-policy-id <label_policy_v4_...>
+# 退出码：0=质量门通过 / 3=样本不足 blocked / 4=跑完但门不过 / 5=训练或身份失败
 ```
+
+第 3 步的编排已经存在（`research/tail_walk_forward.py`：折边界、注入 split 的
+embargo 核对、observed/replayed 分开计数、身份不通过就整轮不成立；18 条测试见
+`tests/test_tail_walk_forward.py`），缺的只是第 1、2 步落出来的真实数据。
+**这套编排至今只在合成样本上跑通过，没有在真实历史数据上跑过 —— 因此本文件
+不为任何真实命中率背书。**
 
 第 2 步未达标时的处理方式是计划里定死的：**尾盘策略验证明确记为阻塞、继续采集，
 不得用开盘价回测顶替**（`contracts/trend_strategy.py` 对

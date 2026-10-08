@@ -2,7 +2,7 @@
 
 Status: Draft
 
-As-of: 2026-10-08 @ HEAD `fac10c4`（本 ADR 与 `contracts/trend_strategy.py`、
+As-of: 2026-10-08 @ HEAD `504859a`（本 ADR 与 `contracts/trend_strategy.py`、
 `labels/tail_net_profit.py`、`research/trend_data_readiness.py`、
 `research/funnel_trace.py`、`research/tail_mature_feedback.py` 同批演进）
 
@@ -198,6 +198,10 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库>
   非 raw 拒绝用于成交模拟
 - `scripts/sync_tail_minute_bars.py` —— 本地把 vendor 分钟 ZIP 落到研究库
   （`--price-basis` / `--bar-time-semantics` 无默认值，读不到就退出码 5）
+- `src/stock_analyzer/research/tail_walk_forward.py` + `scripts/validate_tail_selection_quality.py`
+  —— 滚动前推验证的**编排层**：折边界带 embargo、注入 split 由训练器复核、
+  排序仍走 `rank_final_recommendations`（验证器不自带一套选股逻辑）；
+  样本不足/身份不通过一律 `blocked`，不产命中率数字
 - `scripts/audit_trend_data_readiness.py --minute-db` —— 就绪门多看一个来源，
   判定标准不变
 - `docs/trend_tail_acceptance_evidence.md` —— §4 验收证据：工程验收逐场景 → 测试名，
@@ -206,7 +210,8 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库>
   `test_tail_net_profit_label.py`(19)、`test_trend_data_readiness.py`(13)、
   `test_funnel_trace.py`(16)、`test_tail_net_profit_trainer.py`(19)、
   `test_trend_candidate_contract.py`(13)、`test_trend_tail_shadow_runtime.py`(19)、
-  `test_trend_tail_page_and_feedback.py`(25)、`test_minute_bar_store.py`(15)
+  `test_trend_tail_page_and_feedback.py`(25)、`test_minute_bar_store.py`(15)、
+  `test_tail_walk_forward.py`(18)
 
 ## 8. 尚未接线的调用方（升级 Accepted 前必须改完）
 
