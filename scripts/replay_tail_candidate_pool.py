@@ -61,6 +61,7 @@ from stock_analyzer.feature.trend_candidate_contract import (  # noqa: E402
     compute_then_truncate,
     unproven_float_market_cap_mask,
 )
+from stock_analyzer.research.float_cap_reference import apply_float_cap_reference  # noqa: E402
 from stock_analyzer.research.tail_rebuild import RebuildRequest  # noqa: E402
 
 #: as-of 时点历史 bar 不足 MIN_HISTORY_BARS 的票被剔出候选，但它们是"考虑过的"：
@@ -472,6 +473,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         encoding="utf-8").splitlines() if line.strip() and not line.startswith("#")]
     start, end = _parse_date(args.start), _parse_date(args.end)
     panel = load_panel(warehouse, symbols, start, end)
+    cap_reference: dict[str, Any] = {}
+    if getattr(args, "float_cap_ref_db", ""):
+        # 仓库那列在 2026-03 中旬以后是 provider 的占位常数（ADR-004 §3）；
+        # 给了真值库就在能对上的 symbol-day 上换掉它，让市值门真的判得动。
+        panel, cap_reference = apply_float_cap_reference(panel, args.float_cap_ref_db)
     if panel.empty:
         raise SystemExit("no daily bars in the requested window — 先确认符号清单与仓库路径")
     benchmark = load_benchmark(warehouse, args.benchmark_code, start, end)
@@ -624,6 +630,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "feature_contract_version": TREND_FEATURE_CONTRACT_VERSION,
         "warehouse": str(warehouse),
         "universe_input_provenance": symbols_file_facts(args.symbols_file),
+        "float_cap_reference": cap_reference,
         "benchmark_code": str(args.benchmark_code),
         "benchmark_available": bool(not benchmark.empty),
         "benchmark_last_date": (
@@ -695,6 +702,12 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=0,
         help="1=已用证券历史证明退市覆盖；0=没证明（默认，留档里会照写）",
+    )
+    parser.add_argument(
+        "--float-cap-ref-db",
+        default="",
+        help="独立补采的市值真值库（float_market_cap_ref）；不给就按仓库原值跑，"
+             "占位行会被记成 unproven_float_market_cap 并让这两天不落档",
     )
     parser.add_argument("--report", default="artifacts/research/tail_replay_report.json")
     parser.add_argument("--benchmark-code", default="000300.SH")
