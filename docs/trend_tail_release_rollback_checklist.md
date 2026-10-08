@@ -16,7 +16,15 @@ As-of: 2026-10-08 @ HEAD `e70d84d`（分支 `feat/stock-selection-quality-overha
 [ ] P0-1 带时刻的分钟行情落库并可回补（当前 intraday_summary_1m/5m 只有日级聚合列）
 [ ] P0-2 index_daily 常驻增量进调度（scripts/sync_index_daily.py 至今无调度入口，
        两库停在 2026-08-14）
-[ ] P0-3 scripts/audit_trend_data_readiness.py 退出码从 5(blocked) 降到 0/3
+[x] P0-3 scripts/audit_trend_data_readiness.py 退出码从 5(blocked) 降到 0/3
+        —— **2026-10-08 实测已达**：`--db artifacts/research/market_copy.duckdb
+        --minute-db/--reference-db artifacts/research/tail_minute_bars.duckdb`
+        退出码 **3**、`readiness=insufficient`、`blocking_gaps=[]`。
+        唯一 `insufficient` 项是 `column_concentration_float_market_cap`
+        （2,611 个交易日里 80 天超过众数占比上限、众数正是 12,000,000,000）——
+        仓库那一列按 §3.1 不就地改写，独立真值在研究库 `float_market_cap_ref`。
+        同一份报告里 `tail_window_minute_bars` 已 ok：研究库 1 分钟 bar
+        **120,762,449 行**、尾盘窗口 bar **10,522,869 行**（全市场，带 bar_time）。
 [ ] P0-4 至少 4 折、每折标签真实成熟的 walk-forward 结果（models/tail_net_profit_trainer
        .evaluate_selection_quality 判定 passed）
 ```
