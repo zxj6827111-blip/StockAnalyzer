@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -174,6 +174,19 @@ def test_round_trip_keeps_predictions_identity_and_timestamp() -> None:
     assert stage["contract_digest"] == CONTRACT.digest()
     assert payload["digest"] == trace.digest()
     path.unlink()
+
+
+def test_written_at_is_the_contract_timezone_not_the_host_clock(tmp_path) -> None:
+    """§3.1"修复新记录的时区"：留档时刻必须带时区并写明是哪个时区。
+
+    裸 ``datetime.now()`` 会跟宿主机偏移走，NAS 上跑的留档与本地对不上，
+    而这些留档就是影子验证唯一的证据来源。
+    """
+    trace = build_funnel_trace(trade_date=DAY, stages=[_stage("universe", inputs=5, advanced=5)])
+    payload = read_trace(write_trace(trace, tmp_path))
+    assert payload["written_at_timezone"] == CONTRACT.timezone == "Asia/Shanghai"
+    stamped = datetime.fromisoformat(payload["written_at"])
+    assert stamped.utcoffset() == timedelta(hours=8)
 
 
 # ---------------------------------------------------------------------------

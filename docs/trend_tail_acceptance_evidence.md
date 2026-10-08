@@ -1,4 +1,4 @@
-# trend 尾盘链路：§4 验收证据（As-of 2026-10-08 @ `dfe9a29` 之后的工作树）
+# trend 尾盘链路：§4 验收证据（As-of 2026-10-08 @ `335fcfd` 之后的工作树）
 
 范围只覆盖选股质量改进计划第一轮落地到 trend 的这条链路：夜扫观察池 → 次日
 14:30–14:50 尾盘确认 → 最多 3 只最终推荐 → 成交与 5 交易日退出。monster 与旧
@@ -56,6 +56,29 @@
 放行清单只有 `REPRODUCIBLE_FEATURE_COLUMNS` = 四组已有行情列；线上打分侧本来就只能
 拿到 `build_trend_feature_frame()` 产出的这些列，所以训练与线上用同一份白名单。
 
+**§3.1 的记录语义：本轮另外补上的三处真实缺陷**（来自对本分支的逐条审计，不是重构）：
+
+1. **身份读的是清单里不存在的顶层字段**。`build_serving_manifest` 产出的
+   `model_serving_manifest.v1` 把 `label_policy_id` 放在 `serving`、`model_id` 放在
+   `registry`、权威哈希放在 `authority`，顶层只有 `schema`/`generated_at`/`source`；
+   而 `_resolve_model_identity()` 原来按顶层读 —— 对着真实清单会**永远读空**，
+   "绑定实际加载的模型"只在测试用的扁平 fixture 里成立。现在由 `_manifest_field()`
+   按真实分层读，顶层仅作回退。钉住：`test_identity_binds_from_the_real_v1_manifest_sections`。
+2. **记录失败必须可见**（计划原话）。读不到清单原来只留一个空 dict、运行 commit
+   读不到只留 `""`、特征计算版本读不到只留 `0`，事后无法区分"没配路径 / 读盘炸了 /
+   内容为空"。现在这些以 `model_identity.recording_failures` 落进留档，并由
+   `page_view` 折成 `identity_recording_failed:*` 的 caveat 显示。钉住：
+   `test_missing_serving_manifest_is_visible_not_defaulted`、
+   `test_raising_manifest_reader_is_named_not_swallowed`、
+   `test_v1_manifest_without_a_code_commit_blocks_and_names_the_cause`、
+   `test_identity_binding_failure_shows_up_as_a_page_caveat`。
+   顺带把留档每层的 `feature_compute_version` 改成取自**同一个已验证身份**，
+   不再二次读模块常量（两处读值可以不一致，身份只有一份）。
+3. **留档时刻没有时区**。`write_trace()` 原来写裸 `datetime.now()`，宿主机偏移一变
+   NAS 与本地的留档就对不上，而这些留档是影子验证唯一的证据来源。现在写
+   契约时区（Asia/Shanghai）的带偏移时刻并附 `written_at_timezone`。钉住：
+   `test_written_at_is_the_contract_timezone_not_the_host_clock`。
+
 ---
 
 ## 1b. §2 的 9 层漏斗：谁在写、还差谁
@@ -77,12 +100,12 @@
 
 | 命令 | 结果 |
 | --- | --- |
-| `pytest tests/test_trend_strategy_contract.py tests/test_trend_tail_shadow_runtime.py tests/test_trend_tail_page_and_feedback.py tests/test_minute_bar_store.py tests/test_funnel_trace.py tests/test_tail_net_profit_label.py tests/test_trend_data_readiness.py tests/test_tail_net_profit_trainer.py tests/test_trend_candidate_contract.py tests/test_tail_walk_forward.py tests/test_tail_exit_funnel.py -q` | **232 passed**（条数：55/19/25/15/16/19/13/20/16/20/14） |
-| `pytest tests -k "trend or tail"` | **234 passed, 4028 deselected** |
-| `pytest tests -k "week5 or live_runtime or automation"` | **319 passed, 3943 deselected**（影子接线未破坏既有自动化链） |
-| `ruff check` 本轮触及的 2 个源文件 + 3 个测试文件 + `scripts/validate_tail_selection_quality.py` | All checks passed |
+| `pytest tests/test_trend_strategy_contract.py tests/test_trend_tail_shadow_runtime.py tests/test_trend_tail_page_and_feedback.py tests/test_minute_bar_store.py tests/test_funnel_trace.py tests/test_tail_net_profit_label.py tests/test_trend_data_readiness.py tests/test_tail_net_profit_trainer.py tests/test_trend_candidate_contract.py tests/test_tail_walk_forward.py tests/test_tail_exit_funnel.py -q` | **237 passed**（条数：55/22/26/15/17/19/13/20/16/20/14） |
+| `pytest tests -k "trend or tail"` | **238 passed, 4029 deselected** |
+| `pytest tests -k "week5 or live_runtime or automation"` | **319 passed, 3948 deselected**（身份绑定改动没有破坏既有自动化链） |
+| `ruff check` 本轮触及的 5 个源文件 + 6 个测试文件 + 2 个 scripts CLI | All checks passed |
 | `ruff check src tests`（仓库全量） | 48 errors —— 全部落在分支未触碰的文件，属既有基线 |
-| `mypy --python-version 3.12` 本分支源文件 | 剩 **2** errors，均在 `models/tail_net_profit_trainer.py:293/296` 的 LightGBM 注入点（运行时已由 `native booster trainer is unavailable` 硬门拦住，纯类型噪声）；`feature/trend_candidate_contract.py` 与 `research/tail_walk_forward.py` 本轮改过后仍为 0 error |
+| `mypy --python-version 3.12` 本分支源文件 | **4** errors，逐条用 `git show HEAD:<file>` 对照确认**都是既有噪声**：`research/funnel_trace.py:355`（HEAD 上是同一处，行号从 339 移到 355）、`research/tail_mature_feedback.py:313`、`models/tail_net_profit_trainer.py:293/296`（LightGBM 注入点，运行时已由 `native booster trainer is unavailable` 硬门拦住）。本轮新增代码没有带来新的类型错误。 |
 | `python scripts/run_quality_gate.py --stage clean-scope --fail-on-error` | `blocking_failures = ["mypy_blocking"]`，**不是本分支引入**：报错是 `.venv` 里 numpy stub 的 `Type statement is only supported in Python 3.12 and greater`，而 `pyproject.toml` 钉 `python_version = "3.11"`，mypy 在检查任何项目文件之前就终止（"errors prevented further checking"）。同一命令加 `--python-version 3.12` 后，那 4 个目标文件（均非本分支文件）只剩 1 个既有 `var-annotated`。 |
 
 | `env -u PYTHONPATH python scripts/audit_trend_data_readiness.py --help` | 正常输出用法。本轮修掉了一个真实缺陷：该 CLI 缺 `src/` 路径自举，照本文件 §3 的命令去做解锁的人第一跳就是 `ModuleNotFoundError`；测试原来靠注入 `PYTHONPATH` 掩盖了它，现已改为不注入。 |
@@ -162,9 +185,28 @@ embargo 核对、observed/replayed 分开计数、身份不通过就整轮不成
 
 ```text
 代码完成  ✔（含影子链路、契约、留档、页面、反馈）
-测试完成  ✔ 工程验收场景（232 + 319 passed，见 §2）
+测试完成  ✔ 工程验收场景（237 + 319 passed，见 §2）
 业务验证  ✘ 选股质量验收 blocked（§3：历史分钟数据覆盖度未知，且无真实标签）
 Freeze Ready  ✘ 未执行
 Production Ready ✘ 未执行；旧路径仍在服务真实推送
 已部署生产    ✘ 本轮没有任何生产动作
 ```
+
+---
+
+## 6. 本轮审计查出的、仍然未实现的事项（不含 §3 的数据门槛项）
+
+这些不是"待跑数据"，是**代码里根本还不存在的路径**。列出来是因为把"已接线"
+说成"已完成"，正是本计划 §2 要消灭的那类自欺。
+
+| # | 缺口 | 可核对的事实 | 影响 |
+| --- | --- | --- | --- |
+| 1 | v4 净盈利标签策略**没有任何 runtime/CLI 注册入口** | `labels/tail_net_profit.py:74 tail_label_policy_record()` 的 docstring 写着"供 ``LabelPolicyRegistry.register`` 落库"，但 `grep -rn tail_label_policy_record src/` 只命中定义文件本身，调用方只有测试 | 训练与留档里的 `label_policy_id` 只能由外部给定；"新增独立标签"还没进 registry |
+| 2 | **没有按版本解释旧记录的读取器** | `scripts/record_tail_exit_funnel.py` 对 `contract_digest` 不一致直接退 5；`TailLabelRecord.from_dict` 缺任一字段即 raise；`funnel_trace.read_trace()` 是裸 JSON | 对**新**记录这是对的（不接受别的口径写证据），但计划要求的"旧记录保留原始值 + 带版本解释规则兼容"目前只有 `label_policy_v4_*` 这个名字，没有实现 |
+| 3 | `model_serving_manifest.v1` 里**没有 code commit 字段** | `build_serving_manifest` 的 payload 顶层只有 `schema`/`generated_at`/`source`/`serving`/`registry`/`authority`/`research_fail_closed`，其中不含 commit | 对着**真实**清单，尾盘身份必然 `training_commit_unknown` ⇒ 0 只（fail-closed，行为正确但链路是黑的）。要打通得先扩清单 schema —— 那是 ADR-001 的信任边界变更，需单独决策，不在本轮顺手改 |
+| 4 | 研究侧的**参考数据没有写入通路**，分钟库里的涨跌停/交易状态列恒为 NULL | `security_status` 表由 `data/market_warehouse.py:502` 建、`:1137 upsert_security_status()` 写，但这个方法在 `src/` 与 `scripts/` 里**除定义外零调用**（现状已由既有证据记录：`scripts/alpha_v2_m4h_evidence_map.py:232` "security_status 表 0 行"）；`scripts/sync_tail_minute_bars.py` 全文没有出现过 `up_limit/down_limit/trade_status`，只把 vendor 帧交给 `upsert_frame`，所以分钟表这三列只能是 NULL | 计划 §3.1 要求"补齐并校验…在独立研究库补齐后验证"。涨跌停与停牌因此只能靠生产仓库的 `trade_status` 联结，历史重建没有独立可验的副本；§3.3 的"涨停锁死不记成交"在纯分钟库路径上无法自证 |
+| 5 | 影子链路**当日重跑没有幂等键** | `week5_automation_service.py` 的夜间扫描有 `_idempotent_night_scan`，而调用尾盘影子那条没有；`write_trace` 固定落 `funnel_trace_<date>.json` | 覆盖是确定性的（同样输入同样结果），但"今天跑过几次"不可见；60 交易日影子统计开始前应补一个运行序号或运行哈希 |
+
+第 3 条决定了另一件必须说清的事：**影子链路目前是"必然 0 只"的状态**，直到有一份
+带 commit 的在服清单存在。这是设计上的 fail-closed，不是 bug，但也意味着 §4 的
+"≥60 个完整交易日 + ≥100 笔成熟模拟成交"在模型真正训出来之前不可能开始累积。

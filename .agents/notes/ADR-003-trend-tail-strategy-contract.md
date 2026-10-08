@@ -2,7 +2,7 @@
 
 Status: Draft
 
-As-of: 2026-10-08 @ HEAD `dfe9a29` 之后的工作树（本 ADR 与 `contracts/trend_strategy.py`、
+As-of: 2026-10-08 @ HEAD `335fcfd` 之后的工作树（本 ADR 与 `contracts/trend_strategy.py`、
 `labels/tail_net_profit.py`、`research/trend_data_readiness.py`、
 `research/funnel_trace.py`、`research/tail_mature_feedback.py`、
 `feature/trend_candidate_contract.py` 同批演进）
@@ -151,6 +151,21 @@ As-of: 2026-10-08 @ HEAD `dfe9a29` 之后的工作树（本 ADR 与 `contracts/t
   `stamp_tax_rate`，行为与扩展前逐元一致。
 - 标签成熟时间走 `label_mature_time_tail_exit_v1`（= 实际可成交退出时刻），
   新 basis `net_profit_5d_tail` 在 `output_semantics` 登记为 `event_probability`。
+- **身份绑定读的是 `model_serving_manifest.v1` 的真实分层**（2026-10-08 修）：
+  `label_policy_id`/`artifact_content_hash`/`dataset_manifest_id` 在 `serving`，
+  `model_id` 在 `registry`，权威哈希在 `authority`，顶层只有 `schema`/`generated_at`/
+  `source`。原先按顶层读 → 对真实清单永远读空，"绑定实际加载的模型"只在扁平 fixture
+  里成立。顶层保留为回退。
+- **记录失败要留名**：读不到清单区分"没配路径 / reader 抛异常 / 内容为空"，运行 commit
+  与特征计算版本读不到各写一条原因，落进 `model_identity.recording_failures`，并由
+  `page_view` 折成 `identity_recording_failed:*` 的 caveat。留档每层的
+  `feature_compute_version` 改为取自同一个已验证身份，不再二次读模块常量。
+- 留档落盘时刻改为带时区（契约时区 Asia/Shanghai）并附 `written_at_timezone`；
+  裸 `datetime.now()` 会跟宿主机偏移走，而留档是影子验证唯一的证据来源。
+- 已知连带事实：`model_serving_manifest.v1` **不含任何 commit 字段**，所以对真实清单
+  尾盘身份必然 `training_commit_unknown` ⇒ 0 只。这是 fail-closed 的正确行为，但意味着
+  影子验证在扩清单 schema（或另出带 commit 的 freeze manifest）之前不会开始累积成交；
+  扩 schema 属于 ADR-001 的信任边界变更，需单独决策。
 
 ## 6. 已知阻塞（不是本 ADR 的例外，是它的前置条件）
 
@@ -238,9 +253,9 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库>
   以及"选股质量验收 = blocked"的实测口径（本文件不产命中率数字）
 - 测试（2026-10-08 实测条数）：`test_trend_strategy_contract.py`(55)、
   `test_tail_net_profit_label.py`(19)、`test_trend_data_readiness.py`(13)、
-  `test_funnel_trace.py`(16)、`test_tail_net_profit_trainer.py`(20)、
-  `test_trend_candidate_contract.py`(16)、`test_trend_tail_shadow_runtime.py`(19)、
-  `test_trend_tail_page_and_feedback.py`(25)、`test_minute_bar_store.py`(15)、
+  `test_funnel_trace.py`(17)、`test_tail_net_profit_trainer.py`(20)、
+  `test_trend_candidate_contract.py`(16)、`test_trend_tail_shadow_runtime.py`(22)、
+  `test_trend_tail_page_and_feedback.py`(26)、`test_minute_bar_store.py`(15)、
   `test_tail_walk_forward.py`(20)、`test_tail_exit_funnel.py`(14)
 
 ## 8. 尚未接线的调用方（升级 Accepted 前必须改完）

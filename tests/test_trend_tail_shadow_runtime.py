@@ -127,6 +127,72 @@ def test_missing_serving_manifest_is_visible_not_defaulted(tmp_path) -> None:
         probabilities={"600000.SH": 0.9}, service=service,
     )
     assert report["blocking_reason"] == "serving_manifest_missing"
+    # "读不到"要说清是哪一种读不到，而不是只留一个空 dict。
+    assert report["model_identity"]["recording_failures"] == ["serving_manifest_empty"]
+
+
+def test_raising_manifest_reader_is_named_not_swallowed(tmp_path) -> None:
+    class Boom(FakeService):
+        def _read_serving_manifest(self):
+            raise OSError("manifest file is gone")
+
+    report = _run(
+        tmp_path, watch_pool=_pool(["600000.SH"]),
+        probabilities={"600000.SH": 0.9}, service=Boom(manifest={}, tmp_path=tmp_path),
+    )
+    assert report["blocking_reason"] == "serving_manifest_missing"
+    assert report["model_identity"]["recording_failures"] == [
+        "serving_manifest_reader_raised:OSError",
+    ]
+    assert report["final_symbols"] == []
+
+
+def _v1_manifest(tmp_path, **overrides) -> dict:
+    """用真实构造器出 ``model_serving_manifest.v1`` 的原样分层，再填尾盘链路的字段。
+
+    顶层只有 schema/generated_at/source —— 按顶层读身份会永远读空。
+    """
+    from stock_analyzer.models.serving_manifest import build_serving_manifest
+
+    payload = build_serving_manifest(artifact_path=str(tmp_path / "artifact.json"))
+    payload["serving"].update({
+        "label_policy_id": "label_policy_v4_07335bbe3d3e",
+        "artifact_content_hash": "sha256:feedface",
+        "dataset_manifest_id": "dataset_manifest_2026q4_5f3c",
+    })
+    payload["registry"].update({"model_id": "trend-tail-lgbm-2026q4"})
+    payload["serving"].update(overrides)
+    return payload
+
+
+def test_identity_binds_from_the_real_v1_manifest_sections(tmp_path) -> None:
+    """§3.1"绑定实际加载的模型、训练 manifest"必须对 v1 的真实形状成立，不只在扁平 fixture 里。"""
+    manifest = _v1_manifest(tmp_path, code_commit="cafe123")
+    report = _run(
+        tmp_path, watch_pool=_pool(["600000.SH"]),
+        probabilities={"600000.SH": 0.71},
+        service=FakeService(manifest=manifest, tmp_path=tmp_path),
+    )
+    identity = report["model_identity"]
+    assert identity["recorded"] is True, identity
+    assert identity["error"] == ""
+    assert identity["training_manifest_id"] == "dataset_manifest_2026q4_5f3c"
+    assert report["final_symbols"] == ["600000.SH"]
+
+
+def test_v1_manifest_without_a_code_commit_blocks_and_names_the_cause(tmp_path) -> None:
+    """v1 清单本身不带 code_commit：这时宁可 0 只，也要把"为什么绑不上"写成事实。"""
+    report = _run(
+        tmp_path, watch_pool=_pool(["600000.SH"]),
+        probabilities={"600000.SH": 0.71},
+        service=FakeService(manifest=_v1_manifest(tmp_path), tmp_path=tmp_path),
+    )
+    assert report["blocking_reason"] == "training_commit_unknown"
+    assert report["final_symbols"] == []
+    failures = report["model_identity"]["recording_failures"]
+    assert "training_commit_absent_from_serving_manifest" in failures
+    # dataset_manifest_id 在清单里，所以这一项不该被点名。
+    assert "training_manifest_id_absent_from_serving_manifest" not in failures
 
 
 def test_recommendations_follow_threshold_and_cap(tmp_path) -> None:

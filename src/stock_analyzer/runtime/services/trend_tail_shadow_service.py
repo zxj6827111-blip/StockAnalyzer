@@ -94,7 +94,7 @@ class TrendTailShadowService:
         bar_map = dict(minute_bars or {})
         prob_map = dict(probabilities or {})
 
-        identity, identity_error = self._resolve_model_identity(prob_map)
+        identity, identity_error, recording_failures = self._resolve_model_identity(prob_map)
         rejections: dict[str, list[str]] = {}
         decisions: dict[str, TailEntryDecision] = {}
 
@@ -272,6 +272,9 @@ class TrendTailShadowService:
             "model_identity": {
                 "recorded": bool(identity is not None and not identity_error),
                 "error": identity_error or result.blocking_reason,
+                # §3.1"记录失败必须可见"：绑定不上哪一项，就点名哪一项，不留空当默认值。
+                "recording_failures": list(recording_failures),
+                "training_manifest_id": str(getattr(identity, "training_manifest_id", "") or ""),
             },
             "counts": dict(result.counts),
             "max_recommendations_effective": int(
@@ -285,32 +288,44 @@ class TrendTailShadowService:
 
     def _resolve_model_identity(
         self, probabilities: Mapping[str, float]
-    ) -> tuple[ModelIdentity | None, str]:
-        """在服模型必须**就是**本契约的净盈利模型，否则身份按不可验证处理。"""
+    ) -> tuple[ModelIdentity | None, str, tuple[str, ...]]:
+        """在服模型必须**就是**本契约的净盈利模型，否则身份按不可验证处理。
+
+        返回 ``(identity, 阻塞原因, 记录失败清单)``。第三项是 §3.1 的"记录失败必须
+        可见"：绑不上训练 manifest / 读不到运行 commit 时，留档里要能看出**为什么**空着。
+        """
         if not probabilities:
-            return None, "no_tail_probability_available"
-        manifest = _read_serving_manifest(self._service)
+            return None, "no_tail_probability_available", ()
+        manifest, manifest_failures = _read_serving_manifest(self._service)
+        failures = list(manifest_failures)
         if not manifest:
-            return None, "serving_manifest_missing"
-        label_policy_id = str(manifest.get("label_policy_id", "") or "")
+            return None, "serving_manifest_missing", tuple(failures)
+        label_policy_id = _manifest_field(manifest, "label_policy_id")
         if not label_policy_id.startswith("label_policy_v4_"):
-            return None, "serving_model_is_not_tail_label_policy"
+            return None, "serving_model_is_not_tail_label_policy", tuple(failures)
+        training_commit = _manifest_field(manifest, "code_commit", "commit", "training_commit")
+        if not training_commit:
+            failures.append("training_commit_absent_from_serving_manifest")
+        training_manifest_id = _manifest_field(manifest, "dataset_manifest_id", "manifest_id")
+        if not training_manifest_id:
+            failures.append("training_manifest_id_absent_from_serving_manifest")
+        runtime_commit, runtime_failures = _runtime_commit(self._service)
+        feature_compute_version, version_failures = _feature_compute_version()
+        failures.extend(runtime_failures)
+        failures.extend(version_failures)
         identity = ModelIdentity(
-            model_id=str(manifest.get("model_id", "") or manifest.get("artifact_path", "") or ""),
-            artifact_content_hash=str(
-                manifest.get("artifact_content_hash", "")
-                or manifest.get("authoritative_content_hash", "")
-                or ""
-            ),
-            training_commit=str(
-                manifest.get("code_commit", "") or manifest.get("commit", "") or ""
-            ),
-            runtime_commit=str(_runtime_commit(self._service)),
-            feature_compute_version=_feature_compute_version(),
+            model_id=(_manifest_field(manifest, "model_id")
+                      or _manifest_field(manifest, "artifact_path", "authoritative_artifact")),
+            artifact_content_hash=_manifest_field(
+                manifest, "artifact_content_hash", "authoritative_content_hash"),
+            training_commit=training_commit,
+            runtime_commit=runtime_commit,
+            feature_compute_version=feature_compute_version,
             label_policy_id=label_policy_id,
             contract_digest=self._contract.digest(),
+            training_manifest_id=training_manifest_id,
         )
-        return identity, identity.validate(self._contract)
+        return identity, identity.validate(self._contract), tuple(dict.fromkeys(failures))
 
     def _write(self, trace: Any, report: Mapping[str, Any]) -> dict[str, str]:
         self._report_dir.mkdir(parents=True, exist_ok=True)
@@ -391,6 +406,11 @@ def page_view(report: Mapping[str, Any]) -> dict[str, Any]:
             caveat
             for row in rows
             for caveat in (row.get("caveats") or [])
+            # §3.1"记录失败必须可见"：绑定不上训练 manifest / 读不到运行 commit，
+            # 也要在页面上说清楚，而不是只留一个空字段让读的人自己猜。
+        } | {
+            f"identity_recording_failed:{item}"
+            for item in ((report.get("model_identity") or {}).get("recording_failures") or [])
         }),
     }
 
@@ -522,7 +542,10 @@ def _stage(
         data_as_of=(timestamp or datetime.min).isoformat(),
         contract=contract,
         model_identity=identity,
-        feature_compute_version=_feature_compute_version(),
+        # 留档里的特征计算版本必须就是** gates 掉这次决策的那个身份**里的版本，
+        # 而不是再从模块常量读一遍（两处读值可以不一致，身份却只有一份）。
+        feature_compute_version=int(getattr(identity, "feature_compute_version", 0) or 0)
+        if identity is not None else _feature_compute_version()[0],
         label_policy_id=getattr(identity, "label_policy_id", "") if identity else "",
     )
 
@@ -574,41 +597,73 @@ def _trim(
     }
 
 
-def _read_serving_manifest(service: Any) -> dict[str, Any]:
+def _read_serving_manifest(service: Any) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """返回 ``(manifest, 记录失败原因)``。
+
+    "读不到" 不能只留下一个空 dict：没配路径、读盘炸了、内容空是三件不同的事，
+    计划 §3.1 要求记录失败必须可见，否则排查时只能看到 ``serving_manifest_missing``。
+    """
     reader = getattr(service, "_read_serving_manifest", None)
     if callable(reader):
         try:
-            return dict(reader() or {})
-        except Exception:  # noqa: BLE001 - 读不到就是身份不明，交给上层 fail-closed
-            return {}
-    try:
-        from stock_analyzer.models.serving_manifest import read_serving_manifest
+            payload = dict(reader() or {})
+        except Exception as exc:  # noqa: BLE001 - 读不到就是身份不明，交给上层 fail-closed
+            return {}, (f"serving_manifest_reader_raised:{type(exc).__name__}",)
+    else:
+        try:
+            from stock_analyzer.models.serving_manifest import read_serving_manifest
 
-        config = getattr(service, "_config", None)
-        path = getattr(getattr(config, "training", None), "serving_manifest_path", None)
-        if not path:
-            return {}
-        resolved = getattr(service, "_resolve_evolution_path", lambda value: value)(path)
-        return dict(read_serving_manifest(Path(resolved)) or {})
-    except Exception:  # noqa: BLE001
-        return {}
+            config = getattr(service, "_config", None)
+            path = getattr(getattr(config, "training", None), "serving_manifest_path", None)
+            if not path:
+                return {}, ("serving_manifest_path_not_configured",)
+            resolved = getattr(service, "_resolve_evolution_path", lambda value: value)(path)
+            payload = dict(read_serving_manifest(Path(resolved)) or {})
+        except Exception as exc:  # noqa: BLE001
+            return {}, (f"serving_manifest_read_failed:{type(exc).__name__}",)
+    if not payload:
+        return {}, ("serving_manifest_empty",)
+    return payload, ()
 
 
-def _runtime_commit(service: Any) -> str:
+_MANIFEST_SECTIONS = ("serving", "authority", "registry")
+
+
+def _manifest_field(manifest: Mapping[str, Any], *names: str) -> str:
+    """从 ``model_serving_manifest.v1`` 的**真实分层**里取字段。
+
+    ``build_serving_manifest`` 把 ``label_policy_id`` 放在 ``serving``、``model_id`` 放在
+    ``registry``、权威哈希放在 ``authority``，顶层只有 ``schema``/``generated_at``/``source``。
+    只按顶层读会永远读空 —— 那样 §3.1 的"绑定实际加载的模型"就只在扁平 fixture 里成立。
+    顶层仍作回退，兼容自定义/早期清单。
+    """
+    for name in names:
+        for section in _MANIFEST_SECTIONS:
+            block = manifest.get(section)
+            if isinstance(block, Mapping) and str(block.get(name, "") or "").strip():
+                return str(block[name]).strip()
+        if str(manifest.get(name, "") or "").strip():
+            return str(manifest[name]).strip()
+    return ""
+
+
+def _runtime_commit(service: Any) -> tuple[str, tuple[str, ...]]:
     getter = getattr(service, "_runtime_code_commit", None)
     if callable(getter):
-        return str(getter() or "")
-    state = getattr(service, "_state", None)
-    return str(getattr(state, "code_commit", "") or "")
+        value = str(getter() or "")
+    else:
+        value = str(getattr(getattr(service, "_state", None), "code_commit", "") or "")
+    return value, () if value else ("runtime_code_commit_unavailable",)
 
 
-def _feature_compute_version() -> int:
+def _feature_compute_version() -> tuple[int, tuple[str, ...]]:
     try:
         from stock_analyzer.feature.engineer import FEATURE_COMPUTE_VERSION
 
-        return int(FEATURE_COMPUTE_VERSION)
-    except Exception:  # noqa: BLE001
-        return 0
+        value = int(FEATURE_COMPUTE_VERSION)
+    except Exception as exc:  # noqa: BLE001
+        return 0, (f"feature_compute_version_unreadable:{type(exc).__name__}",)
+    return value, () if value > 0 else ("feature_compute_version_not_positive",)
 
 
 __all__ = [

@@ -23,6 +23,7 @@ from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from stock_analyzer.contracts.trend_strategy import (
     DEFAULT_TREND_CONTRACT,
@@ -319,17 +320,32 @@ def _to_date(value: date | str) -> date:
     return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
 
 
-def write_trace(trace: FunnelTrace, directory: Path | str, *, suffix: str = "") -> Path:
+def write_trace(
+    trace: FunnelTrace,
+    directory: Path | str,
+    *,
+    suffix: str = "",
+    contract: TrendStrategyContract = DEFAULT_TREND_CONTRACT,
+) -> Path:
     """落一条漏斗留档。
 
     ``suffix`` 给"同一个交易日、不同时间成熟"的层用（例如成交与退出要等 5 个交易日
     才知道结果）：它必须落到**另一个文件**，不能回头覆盖入场那天已经写好的留档。
+
+    ``written_at`` 必须是带时区的时刻并写明用的是哪个时区（计划 §3.1"修复新记录的时区"）。
+    裸 ``datetime.now()`` 会跟着宿主机的 UTC 偏移变，NAS 上跑出来的留档和本地对不上，
+    而留档正是影子验证唯一的证据来源。
     """
     out_dir = Path(directory)
     out_dir.mkdir(parents=True, exist_ok=True)
     tag = f"_{suffix}" if str(suffix or "").strip() else ""
     path = out_dir / f"funnel_trace_{trace.trade_date.isoformat()}{tag}.json"
-    payload = dict(trace.as_dict(), written_at=datetime.now().isoformat(timespec="seconds"))
+    written_at = datetime.now(ZoneInfo(contract.timezone))
+    payload = dict(
+        trace.as_dict(),
+        written_at=written_at.isoformat(timespec="seconds"),
+        written_at_timezone=contract.timezone,
+    )
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str),
                     encoding="utf-8")
     return path

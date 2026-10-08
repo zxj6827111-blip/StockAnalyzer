@@ -261,6 +261,20 @@ def test_model_blocked_run_is_visible_on_the_page(tmp_path) -> None:
     assert view["blocking_reason"] == "no_tail_probability_available"
 
 
+def test_identity_binding_failure_shows_up_as_a_page_caveat(tmp_path) -> None:
+    """§3.1"记录失败必须可见"：绑不上训练 manifest 要在页面上点名，不是留个空字段。
+
+    这份清单里没有 ``dataset_manifest_id``，所以准入照样过（身份本身可验证），
+    但"没绑上训练 manifest"这件事必须留下痕迹。
+    """
+    view = page_view(_report(tmp_path, ["600000.SH"], {"600000.SH": 0.71}))
+    assert view["final_recommendations"], "身份本身可验证，不该被误挡"
+    assert (
+        "identity_recording_failed:training_manifest_id_absent_from_serving_manifest"
+        in view["caveats"]
+    )
+
+
 def test_tail_shadow_page_reads_the_archived_report(tmp_path) -> None:
     service = FakeService(manifest=_tail_manifest(), tmp_path=tmp_path)
     report = _report(tmp_path, ["600000.SH"], {"600000.SH": 0.71})

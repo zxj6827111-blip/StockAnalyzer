@@ -846,7 +846,12 @@ def label_maturity_time(
 
 @dataclass(frozen=True)
 class ModelIdentity:
-    """决策时必须可验证的模型身份；任一字段缺失或不符 → 0 只推荐。"""
+    """决策时必须可验证的模型身份；任一字段缺失或不符 → 0 只推荐。
+
+    ``training_manifest_id`` 是计划 §3.1 要求绑定的"训练 manifest"：它记录**当时实际
+    加载的是哪份 serving manifest**，缺失不改变准入（准入仍由上面这些字段裁决），
+    但必须作为"记录失败"被看见 —— 静默留空就等于把绑不上说成绑上了。
+    """
 
     model_id: str
     artifact_content_hash: str
@@ -855,6 +860,7 @@ class ModelIdentity:
     feature_compute_version: int
     label_policy_id: str
     contract_digest: str
+    training_manifest_id: str = ""
 
     def validate(self, contract: TrendStrategyContract = DEFAULT_TREND_CONTRACT) -> str:
         if not str(self.model_id).strip():
