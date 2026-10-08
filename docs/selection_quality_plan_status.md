@@ -34,7 +34,7 @@ As-of: 2026-10-08 @ HEAD `b33b581`（分支 `feat/stock-selection-quality-overha
 | 计划条目 | 实现 | 证据 | 状态 |
 | --- | --- | --- | --- |
 | §1 净盈利概率语义、0–3 只/日、1 万参考额、TP+8%/SL−5%、持有 5 日（入场日为第 1 日）、monster 独立 | `contracts/trend_strategy.py` 单一契约，线上/标签/历史验证共用 | `test_trend_strategy_contract.py`(55)；ADR-003 | 代码+测试完成 |
-| §2 九层漏斗逐层可追溯（输入/晋级/原因/特征/原始预测/校准概率/模型身份/数据时间） | `research/funnel_trace.py`（写时计数恒等式 + 读时 `verify_trace()`）、`research/night_scan_funnel_trace.py`（夜扫三层 + 前两层生产者）、`research/selection_funnel_view.py`（拼成九层视图并判"哪些问题答不了"） | `test_funnel_trace.py`(17)、`test_funnel_trace_verification.py`(7)、`test_night_scan_funnel_trace.py`(8)、`test_selection_funnel_view.py`(3)、`test_shadow_evidence.py`(5)；接线由 `test_week5_automation.py::test_night_scan_writes_the_night_half_funnel_trace` 与 `::test_night_scan_reports_why_the_trace_was_not_written` 钉住；`scripts/audit_selection_funnel.py` | 前 5 层**代码+测试完成但未接线**，后 4 层已在影子链路；见下方缺口 |
+| §2 九层漏斗逐层可追溯（输入/晋级/原因/特征/原始预测/校准概率/模型身份/数据时间） | `research/funnel_trace.py`（写时计数恒等式 + 读时 `verify_trace()`）、`research/night_scan_funnel_trace.py`（夜扫三层 + 前两层生产者）、`scripts/record_replay_funnel_trace.py`（历史侧接线）、`research/selection_funnel_view.py`（拼成九层视图并判"哪些问题答不了"） | `test_funnel_trace.py`(17)、`test_funnel_trace_verification.py`(7)、`test_night_scan_funnel_trace.py`(8)、`test_record_replay_funnel_trace.py`(3)、`test_selection_funnel_view.py`(3)、`test_shadow_evidence.py`(5)；接线由 `test_week5_automation.py::test_night_scan_writes_the_night_half_funnel_trace` 与 `::test_night_scan_reports_why_the_trace_was_not_written` 钉住；`scripts/audit_selection_funnel.py` | **历史侧 94 个决策日已全部落档**（94/94，`verify_trace()` 通过）；生产夜扫路径仍只有 Quality300/Light100/Deep50 三层，前两层要接生产得先让选择器导出符号级清单；见下方缺口 |
 | §2 最终推荐单独留档并关联特征快照 | `archive_final_recommendations()`；缺快照落成 `feature_snapshot_missing` caveat 而不是省略 | `test_missing_feature_snapshot_is_a_visible_caveat` | 代码+测试完成 |
 | §2 逐层消融预测性规则、硬门保留 | `StageTrace.kind ∈ {hard_gate, predictive}` + `compare_traces()`（要求交易日集合完全一致） | `test_funnel_trace.py` 消融对照组用例 | 代码完成；**对照组需真实留档才能跑** |
 | §2 根因清单，区分已证实/假设；不把 bronze 占比当根因 | `.agents/notes/NOTE-002-selection-quality-root-causes.md` D1–D14 + H1–H5 | 该文件 + `scripts/audit_selection_funnel.py` 退出码 3 的机器判定 | 已交付，随实测更新 |
@@ -65,10 +65,11 @@ As-of: 2026-10-08 @ HEAD `b33b581`（分支 `feat/stock-selection-quality-overha
    2026-10-08 在 NAS 上核实过：最新一份部署报告 `nr-20260930-01.json` 里
    `universe_snapshot` / `universe_quality_selection` / `night_funnel_trace` **都是 0 hit**，
    所以接线不仅没做，连"改完能对着真报告验一次"的条件也不具备。
-   要做只有两条路，都要你点头：
-   - 让 `_hard_filter` 一并导出被淘汰的符号清单（生产选择器改动 + 夜扫报告体积从计数
-     变成 ~数千个代码，形状变化）；
-   - 或在生产路径新增一份 sidecar 工件专门携带符号级快照（新的生产 I/O）。
+   **本轮按"研究侧 sidecar"把历史侧接完了**：`replay_tail_candidate_pool.py --universe-facts`
+   逐日导出符号级事实，`record_replay_funnel_trace.py` 落成 94/94 个决策日的
+   `universe` + `hard_eligibility` 留档，每条都过 `verify_trace()`。
+   **生产夜扫仍然不落这两层**，卡点没变：要接就得让 `_hard_filter` 一并导出被淘汰的符号清单，
+   那会改变生产报告的形状与体积（从计数变成 ~数千个代码/日）。这一步还需要你点头，本轮没做。
 2. **需要时间，不需要代码**
    - 影子验证 ≥60 个完整交易日且 ≥100 笔成熟模拟成交：**当前 0 天 / 0 笔**。
      输入生产者与门槛判定都在（R12），但只能等真实尾盘观察逐日累积。

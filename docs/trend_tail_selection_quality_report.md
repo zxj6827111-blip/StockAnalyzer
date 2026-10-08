@@ -67,6 +67,28 @@ As-of: 2026-10-08 @ HEAD `a53032a`（分支 `feat/stock-selection-quality-overha
 训练器宁可不输出也不产出一个塌缩概率模型。因此本轮**没有** 4 折命中率数字，
 也不会有"通过历史开发验证"的冻结模型。
 
+## 3b. 漏斗前两层第一次有史可查（计划 §2）
+
+生产夜扫的选择器只输出"逐原因淘汰了多少只"的计数，而 `StageTrace` 的计数恒等式不许
+拿计数冒充成员，所以 `universe` / `hard_eligibility` 两层此前**没有任何历史留档**。
+本轮按"研究侧 sidecar、不碰生产报告"的做法接上：
+`replay_tail_candidate_pool.py --universe-facts` 逐日导出符号级事实
+（考虑集 / 晋级 / 每只的**第一条**淘汰原因），
+`record_replay_funnel_trace.py` 只读这份 sidecar、只写证据。
+
+| 读数 | 值 |
+| --- | --- |
+| 落档决策日 | **94 / 94**（`not_emitted` 为空，每条都过 `verify_trace()`） |
+| 全市场考虑集 | **84,371** 个 symbol-day（每日 896–900 只） |
+| 硬性资格检查晋级 | 每日 300–320 只 |
+| 逐原因淘汰（94 天合计） | `min_avg_turnover_20` **25,371**、`overextension_risk` 248、`is_st` 178、`min_float_market_cap` 132、`board_eligibility` 92、`insufficient_history_at_asof` 4 |
+| 幸存者偏差口径 | 留在 notes 里：`survivorship_coverage=incomplete_or_unknown`、`delisting_coverage_verified=False` |
+
+**这一层给 §2 的第一个诊断答案**：淘汰量几乎全部来自流动性下限，而它是
+`avg_turnover_20` 的**横截面 30 分位**——按构造就会削掉当日约三成，与"这批票不适合短期
+上涨"无关。它属于计划要求保留的资格/可成交硬门，但**阈值口径**（分位数 vs 绝对成交额）
+是下一轮该单独问的问题；本轮不改它，也不拿它当已证实的选股质量损失。
+
 ## 4. 不依赖模型的排序对照（同一批成熟标签直接算）
 
 每日从可判池里按某个声明字段取 `Top-3`（同分按代码序，与线上一致），

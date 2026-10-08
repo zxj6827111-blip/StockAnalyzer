@@ -33,7 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -56,6 +56,10 @@ from stock_analyzer.feature.trend_candidate_contract import (  # noqa: E402
     compute_then_truncate,
 )
 from stock_analyzer.research.tail_rebuild import RebuildRequest  # noqa: E402
+
+#: as-of 时点历史 bar 不足 MIN_HISTORY_BARS 的票被剔出候选，但它们是"考虑过的"：
+#: 前两层留档要把这类淘汰记成**原因**，而不是让它们在数字里消失。
+PIT_REJECT_REASON = "insufficient_history_at_asof"
 
 RC_OK = 0
 RC_ERROR = 5
@@ -270,6 +274,48 @@ def load_intraday_features(minute_db: str | Path, start: date, end: date) -> pd.
     return frame[["symbol", "date", "last30_volume_share", "tail_volatility_ratio"]]
 
 
+def _universe_fact(
+    *,
+    decision_date: date,
+    warehouse: Path | str,
+    considered: Sequence[str],
+    advanced: Sequence[str],
+    rejected: Mapping[str, Sequence[str]],
+    pit_excluded: Sequence[str],
+    coverage: str,
+    delisting_verified: bool,
+) -> dict[str, Any]:
+    """一个决策日的**符号级** universe / hard_eligibility 事实（计划 §2 前两层）。
+
+    生产夜扫的选择器只给逐原因计数，而 ``StageTrace`` 不许拿计数冒充成员，
+    所以留档用的事实由这条研究侧路径自己产。一只票被多条硬门同时淘汰时只记
+    **第一条**原因：``StageTrace`` 的计数恒等式要求"晋级 + 各原因淘汰 = 输入"，
+    一只票进两个桶会让留档自相矛盾，宁可不落。
+    """
+    first_reason: dict[str, str] = {}
+    for rule, symbols in rejected.items():
+        for symbol in symbols:
+            first_reason.setdefault(str(symbol), str(rule))
+    for symbol in pit_excluded:
+        first_reason.setdefault(str(symbol), PIT_REJECT_REASON)
+    universe = sorted(set(considered))
+    return {
+        "decision_date": decision_date.isoformat(),
+        "as_of": decision_date.isoformat(),
+        "universe_snapshot_id": f"replay:{Path(str(warehouse)).name}:{decision_date.isoformat()}",
+        "eligible_symbols": universe,
+        "expected_active_symbols": sorted(set(advanced)),
+        # 缺 bar 不等于停牌：这一份清单只在有正向停牌证据时才填。
+        "known_suspended_symbols": [],
+        "excluded_reasons": {
+            symbol: first_reason[symbol] for symbol in sorted(first_reason)
+            if symbol in set(universe)
+        },
+        "survivorship_coverage": coverage,
+        "delisting_coverage_verified": bool(delisting_verified),
+    }
+
+
 def daily_gates(
     rows: pd.DataFrame, *, min_turnover: float, min_float_cap: float
 ) -> dict[str, tuple[str, ...]]:
@@ -364,6 +410,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     requests: list[RebuildRequest] = []
     gate_totals: dict[str, int] = {}
     day_stats: list[dict[str, Any]] = []
+    universe_facts: list[dict[str, Any]] = []
     dates = [item for item in calendar if start <= item <= end]
     date_index = {item: position for position, item in enumerate(calendar)}
     for decision_date in dates:
@@ -422,11 +469,35 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "pooled": len(pool),
             "unknown_gate_rules": list(outcome.unknown_rules),
         })
+        universe_facts.append(_universe_fact(
+            decision_date=decision_date,
+            warehouse=warehouse,
+            considered=[str(symbol) for symbol in eligible_frame["symbol"]] + list(pit_excluded),
+            advanced=[str(symbol) for symbol in outcome.eligible],
+            rejected=outcome.rejected,
+            pit_excluded=list(pit_excluded),
+            coverage=str(args.survivorship_coverage),
+            delisting_verified=bool(int(args.delisting_coverage_verified)),
+        ))
 
     if not requests:
         raise SystemExit("重放没有产出任何请求 —— 硬门全灭或日期区间不足")
+    universe_facts_path = ""
+    if str(args.universe_facts or "").strip():
+        # 符号级事实单独成一份 sidecar：夜扫报告里只有计数，而 StageTrace 不许用计数
+        # 冒充成员。分开落也避免把上万代码塞进重放报告。
+        universe_facts_path = str(Path(str(args.universe_facts)).expanduser())
+        Path(universe_facts_path).parent.mkdir(parents=True, exist_ok=True)
+        with Path(universe_facts_path).open("w", encoding="utf-8") as handle:
+            for fact in universe_facts:
+                handle.write(json.dumps(fact, ensure_ascii=False) + "\n")
     return {
         "ok": True,
+        "universe_facts_path": universe_facts_path,
+        "universe_fact_days": len(universe_facts),
+        "universe_symbols_considered": sum(
+            len(fact["eligible_symbols"]) for fact in universe_facts
+        ),
         "feature_contract_version": TREND_FEATURE_CONTRACT_VERSION,
         "warehouse": str(warehouse),
         "benchmark_code": str(args.benchmark_code),
@@ -482,6 +553,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--start", required=True, help="YYYY-MM-DD")
     parser.add_argument("--end", required=True, help="YYYY-MM-DD")
     parser.add_argument("--requests", required=True)
+    parser.add_argument(
+        "--universe-facts",
+        default="",
+        help="符号级 universe/硬门事实 sidecar；漏斗前两层留档的唯一合法输入",
+    )
+    parser.add_argument(
+        "--survivorship-coverage",
+        default="incomplete_or_unknown",
+        help="退市/改名历史的覆盖口径；security_status 无数据时不要写成 complete",
+    )
+    parser.add_argument(
+        "--delisting-coverage-verified",
+        type=int,
+        default=0,
+        help="1=已用证券历史证明退市覆盖；0=没证明（默认，留档里会照写）",
+    )
     parser.add_argument("--report", default="artifacts/research/tail_replay_report.json")
     parser.add_argument("--benchmark-code", default="000300.SH")
     parser.add_argument("--pool-size", type=int, default=300)
