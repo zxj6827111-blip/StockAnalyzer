@@ -136,6 +136,28 @@ dict 键序（把两条门的书写顺序对调，归因结果不变）、first-
 硬编一个窗口只会产出对不上的新数。所以"显式归因顺序"这条代码路径目前只有单测覆盖，
 下一次真实重放才给它生产证据。
 
+### 3b.3 同一类缺陷在线上侧写入器还存在三处（本轮只测出，没有修）
+
+不要把上面那条守卫读成"词汇表已经闭合"。`night_scan_funnel_trace.build_universe_stage_traces()`
+是**快照/线上侧**那两层的写入器，它把快照里的原因名原样写进 `hard_eligibility`
+（`kind=hard_gate`），而实测这三个名字在契约里的分类是 `predictive`：
+
+| 原因名 | 出处 | `classify_rule()` 实测 | 按含义应该是什么 |
+| --- | --- | --- | --- |
+| `future_listed` | `data/asof_universe.EXCLUDE_FUTURE_LISTED` | **predictive** | 交易资格硬门（as_of 之后才上市的票不可能成交） |
+| `insufficient_history_window_bars` | `…EXCLUDE_INSUFFICIENT_HISTORY` | **predictive** | 数据完整性硬门（as_of 前历史 bar 不够算特征） |
+| `known_suspended` | 快照里"eligible 但窗口内没有任何 bar" | **predictive** | **语义未定**：缺 bar 按契约不等于证明停牌 |
+
+前两条的后果与 §3b.2 完全同型，而且方向更糟：§2 的消融按 `classify_rule()` 分组，
+于是**资格与数据完整性淘汰会被当成"可以移除的预测规则"**，正是计划明令不许的那样。
+第三条不能顺手改名——把它归到 `stale_market_data` 还是新登记一条事实，是契约决定。
+
+本轮试过直接加守卫（未登记名字就不落这两层），实测会打断
+`test_universe_layers_use_the_snapshot_real_per_symbol_reasons` 与
+`test_universe_layers_refuse_counts_only_inputs_and_merge_in_order` 两条现有测试，
+且让快照侧这两层在真实输入上**永久不落档**——那比现状更糟，所以撤回到只检测、不修复，
+把它列进状态台账的"需要一次决策"类：先给这三个名字定性，再谈守卫。
+
 ## 3c. 时间外稳定性与信息重复度（`measure_tail_feature_stability.py`）
 
 训练门停机后折内 test AUC 永远拿不到，但**不训练也能测**：每折测试窗相对该折训练/校准窗

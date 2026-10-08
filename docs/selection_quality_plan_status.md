@@ -57,6 +57,15 @@ As-of: 2026-10-08 @ HEAD `b33b581`（分支 `feat/stock-selection-quality-overha
 ## 3. 还缺什么（按性质分三类，不要混为一谈）
 
 1. **需要一次确认的设计决策：`universe` / `hard_eligibility` 两层的接线**
+
+   **新增同一决策项（本轮实测，见质量报告 §3b.3）**：线上侧写入器
+   `night_scan_funnel_trace.build_universe_stage_traces()` 会把三个
+   `classify_rule()==predictive` 的名字原样写进 `hard_eligibility` 层——
+   `future_listed`、`insufficient_history_window_bars`（这两个按含义是资格/数据完整性硬门）、
+   `known_suspended`（缺 bar 按契约不等于证明停牌，语义未定）。后果与已修掉的那条同型：
+   §2 的消融按 `classify_rule()` 分组，会把资格淘汰当成"可移除的预测规则"。
+   本轮试过加"未登记名字就不落档"的守卫，实测会打断两条现有测试并让这两层在真实输入上
+   永久不落档，因此**撤回到只检测、不修复**——要先由契约作者给这三个名字定性。
    生产者已就位且有测试，但**生产夜扫路径拿不到符号级事实**：
    `runtime/universe_candidate_selector.py::_hard_filter` 只返回
    `rejected: dict[str, int]`（逐原因**计数**，:447-575），夜扫报告里的
