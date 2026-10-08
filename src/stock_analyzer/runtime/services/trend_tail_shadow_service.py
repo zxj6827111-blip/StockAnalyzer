@@ -46,6 +46,10 @@ from stock_analyzer.research.funnel_trace import (
     record_stage,
     write_trace,
 )
+from stock_analyzer.research.night_scan_funnel_trace import (
+    NIGHT_TRACE_SUFFIX,
+    build_night_scan_funnel_trace,
+)
 
 REPORT_DIR_DEFAULT = "artifacts/runtime/trend_tail_shadow"
 
@@ -65,6 +69,41 @@ class TrendTailShadowService:
         raw_dir = str(report_dir or REPORT_DIR_DEFAULT)
         resolver = getattr(service, "_resolve_evolution_path", None)
         self._report_dir = Path(resolver(raw_dir)) if callable(resolver) else Path(raw_dir)
+
+    def record_night_scan(
+        self,
+        report: Mapping[str, Any],
+        *,
+        trade_date: date | datetime | str,
+        model_identity: ModelIdentity | Mapping[str, Any] | None = None,
+        features_used: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        """夜扫一跑完就把 Quality300/Light100/Deep50 落成与尾盘半段同构的留档。
+
+        只写证据，不参与任何选股判定；但**写失败要回显在返回值里**，不能静默——
+        "哪一层没有留档"本身就是改进计划 §2 要交付的根因事实。
+        夜扫与尾盘是两个时刻，两份留档分文件（``_night`` 后缀），互不覆盖。
+        """
+        try:
+            trace = build_night_scan_funnel_trace(
+                report=report,
+                trade_date=trade_date,
+                contract=self._contract,
+                model_identity=model_identity,
+                features_used=features_used,
+            )
+        except Exception as exc:  # noqa: BLE001 - 证据留档不得炸掉夜扫
+            return {"emitted": False, "reason": f"night_trace_failed:{type(exc).__name__}"}
+        if trace is None:
+            return {"emitted": False, "reason": "night_scan_report_has_no_funnel_members"}
+        path = write_trace(trace, self._report_dir, suffix=NIGHT_TRACE_SUFFIX,
+                           contract=self._contract)
+        return {
+            "emitted": True,
+            "path": str(path),
+            "trade_date": trace.trade_date.isoformat(),
+            "layers": [item.stage for item in trace.stages],
+        }
 
     def run(
         self,

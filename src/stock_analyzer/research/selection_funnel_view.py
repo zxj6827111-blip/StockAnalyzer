@@ -3,8 +3,9 @@
 改进计划 §2 要的是一条可追溯链：**全市场 → 硬性资格检查 → Quality300 → Light100 →
 Deep50 → 夜间观察池 → 尾盘确认 → 最终推荐 → 成交与退出**。现实是两半分别落在两种留档里：
 
-- 前三层（Quality300/Light100/Deep50）在 ``alpha_v2/validation/production_funnel`` 的
-  快照里，只有**成员与计数**，没有逐只拒绝原因；
+- 前三层（Quality300/Light100/Deep50）有两种来源：夜扫漏斗留档（``night_scan_funnel_trace``，
+  成员 + 落差 + 数据时间，但逐只原因仍未记），或旧的 ``production_funnel`` 快照
+  （只有成员与计数）。**有留档就优先用留档**，快照只作历史替代；
 - 后四层在 ``research/funnel_trace`` 的尾盘留档里，原因、特征、身份、数据时间齐全；
 - ``universe`` 与 ``hard_eligibility`` **两侧都没有生产者**。
 
@@ -19,6 +20,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 from stock_analyzer.contracts.trend_strategy import FUNNEL_LAYERS
+from stock_analyzer.research.night_scan_funnel_trace import NIGHT_UNATTRIBUTED_DROP
 
 NIGHT_HALF_LAYERS = ("quality_300", "light_100", "deep_50")
 TAIL_HALF_LAYERS = tuple(
@@ -26,6 +28,10 @@ TAIL_HALF_LAYERS = tuple(
     if stage not in NIGHT_HALF_LAYERS and stage != "universe"
 )
 UNRECORDED_LAYERS = ("universe", "hard_eligibility")
+
+#: 挂了名字但等于没记原因的原因（夜扫截断原因未落档，NOTE-002 D11）。
+#: 只有这类原因的层，"按拒绝原因的分布"依然答不了，不能算原因可用。
+UNATTRIBUTED_REASONS = frozenset({NIGHT_UNATTRIBUTED_DROP, "dropped"})
 
 _MEMBERS_KEY = {
     "quality_300": "quality_members",
@@ -102,22 +108,30 @@ def _night_layer_view(night: Mapping[str, Any], layer: str,
     }
 
 
-def _tail_layer_view(stage: Mapping[str, Any]) -> dict[str, Any]:
+def _trace_layer_view(stage: Mapping[str, Any], *, source: str) -> dict[str, Any]:
     rejected_symbols = {
         str(reason): list(symbols)
         for reason, symbols in (stage.get("rejected_symbols") or {}).items()
     }
+    attributed = {
+        reason: symbols
+        for reason, symbols in rejected_symbols.items()
+        if reason not in UNATTRIBUTED_REASONS
+    }
     inputs = int(stage.get("inputs", 0) or 0)
     advanced = int(stage.get("advanced", 0) or 0)
+    kept = [str(symbol) for symbol in (stage.get("advanced_symbols") or ())]
     return {
         "layer": str(stage.get("stage", "")),
-        "source": "funnel_trace",
+        "source": source,
         "recorded": True,
-        # "没有原因"有两种：这层没淘汰任何股票（不是缺口），或淘汰了却没记原因（是缺口）。
-        "reasons_available": bool(rejected_symbols) or inputs == advanced,
+        # "没有原因"有三种：这层没淘汰任何股票（不是缺口）、淘汰了只挂了占位原因
+        # （是缺口，D11）、淘汰了且原因齐全。只有最后一种能回答原因分布。
+        "reasons_available": bool(attributed) or inputs == advanced,
         "inputs": inputs,
         "advanced": advanced,
-        "advanced_symbols": list(stage.get("advanced_symbols") or ()),
+        "advanced_symbols": kept,
+        "members": kept,
         "rejected_by_reason": rejected_symbols,
         "features_used": list(stage.get("features_used") or ()),
         "raw_predictions": dict(stage.get("raw_predictions") or {}),
@@ -125,6 +139,9 @@ def _tail_layer_view(stage: Mapping[str, Any]) -> dict[str, Any]:
         "model_identity": dict(stage.get("model_identity") or {}),
         "data_as_of": str(stage.get("data_as_of", "") or ""),
         "drop_rate": float(stage.get("drop_rate", 0.0) or 0.0),
+        "notes": str(stage.get("notes", "") or ""),
+        "gaps": ([] if bool(attributed) or inputs == advanced
+                 else ["truncation_reason_not_recorded"]),
     }
 
 
@@ -172,6 +189,13 @@ def build_selection_funnel_view(
     layers: dict[str, dict[str, Any]] = {}
     previous: Mapping[str, Any] = {}
     for layer in NIGHT_HALF_LAYERS:
+        stage = stages_by_name.get(layer)
+        if stage is not None:
+            # 夜扫漏斗留档优先：它和尾盘半段同构，成员之外的落差/原因/身份/时间都在一条记录里。
+            view = _trace_layer_view(stage, source="night_scan_funnel_trace")
+            layers[layer] = view
+            previous = view
+            continue
         if not night:
             layers[layer] = {**_missing_layer_view(layer),
                               "gaps": ["night_scan_funnel_snapshot_absent"]}
@@ -184,9 +208,16 @@ def build_selection_funnel_view(
         if layer in layers:
             continue
         stage = stages_by_name.get(layer)
-        layers[layer] = _tail_layer_view(stage) if stage else _missing_layer_view(layer)
+        if stage is None:
+            layers[layer] = _missing_layer_view(layer)
+        else:
+            layers[layer] = _trace_layer_view(stage, source="funnel_trace")
 
     ordered = [layers[layer] for layer in FUNNEL_LAYERS]
+    from_trace = [
+        view["layer"] for view in ordered
+        if view["source"] in ("night_scan_funnel_trace", "funnel_trace")
+    ]
     questions = {
         key: {
             "question": question,
@@ -205,6 +236,7 @@ def build_selection_funnel_view(
         "coverage": {
             "layers_total": len(FUNNEL_LAYERS),
             "layers_recorded": len(FUNNEL_LAYERS) - len(unrecorded),
+            "layers_from_trace": from_trace,
             "layers_without_reasons": no_reasons,
             "layers_unrecorded": unrecorded,
             "final_recommendation_count": len(
@@ -224,6 +256,7 @@ __all__ = [
     "DIAGNOSIS_QUESTIONS",
     "NIGHT_HALF_LAYERS",
     "TAIL_HALF_LAYERS",
+    "UNATTRIBUTED_REASONS",
     "UNRECORDED_LAYERS",
     "build_selection_funnel_view",
 ]

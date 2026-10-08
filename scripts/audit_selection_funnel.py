@@ -58,7 +58,11 @@ def main(argv: list[str] | None = None) -> int:
         return RC_ERROR
     paths = sorted(tail_dir.glob("funnel_trace_*.json"))
     if args.trade_date:
-        paths = [path for path in paths if args.trade_date.replace("-", "") in path.name]
+        raw = args.trade_date.strip()
+        # 留档文件名是 ISO 带横线日期（funnel_trace_2026-10-09_night.json）；只按传进来的
+        # 字面量匹配，"20261009" 会把每一天的留档都筛没，然后报"一条留档都没有"。
+        iso = f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}" if len(raw) == 8 and raw.isdigit() else raw[:10]
+        paths = [path for path in paths if iso in path.name]
     if not paths:
         print(f"没有任何尾盘漏斗留档：{tail_dir}", file=sys.stderr)
         return RC_ERROR
@@ -83,6 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.quiet:
         coverage = view["coverage"]
         print(f"留档覆盖 {coverage['layers_recorded']}/{coverage['layers_total']} 层；"
+              f"来自漏斗留档：{coverage['layers_from_trace'] or '无'}；"
               f"缺记录：{coverage['layers_unrecorded'] or '无'}；"
               f"有成员但无拒绝原因：{coverage['layers_without_reasons'] or '无'}")
         for key, item in view["diagnosis"].items():

@@ -2,7 +2,7 @@
 
 Status: Draft
 
-As-of: 2026-10-08 @ HEAD `6c7079c` 之后的工作树（本 ADR 与 `contracts/trend_strategy.py`、
+As-of: 2026-10-08 @ HEAD `e90b5de` 之后的工作树（本 ADR 与 `contracts/trend_strategy.py`、
 `labels/tail_net_profit.py`、`research/trend_data_readiness.py`、
 `research/funnel_trace.py`、`research/tail_mature_feedback.py`、
 `research/tail_reference_store.py`、`research/tail_rebuild.py`、
@@ -318,9 +318,18 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库> --reference-db <�
   退出码 0/3(标签未绑定)/4(契约摘要不一致)/5(身份不可证或自检失败)
 - `src/stock_analyzer/models/output_semantics.py` —— `net_profit_5d_tail` 语义登记
 - `src/stock_analyzer/research/trend_data_readiness.py` + `scripts/audit_trend_data_readiness.py`
+- `src/stock_analyzer/research/night_scan_funnel_trace.py` —— 夜扫半段的**留档生产者**：
+  从夜扫报告的 `prefilter` 成员（Quality300/Light100/Deep50）构造与尾盘半段同构的
+  `FunnelTrace`，由 `TrendTailShadowService.record_night_scan()` 在夜扫落定后写到
+  `funnel_trace_<date>_night.json`（`_night` 后缀，不覆盖尾盘那天的留档），
+  `week5_automation_service` 把结果挂进报告 `night_funnel_trace` 使缺失可见。
+  两条不糊弄的约束：夜扫没有逐只截断原因（D11），淘汰的股票统一挂
+  `night_truncation_reason_not_recorded`（视图据此仍判"原因不可用"）；成员不是上层子集时
+  `inputs` 取两层并集并在 `notes` 点名越界符号，使 `inputs == advanced + dropped` 恒成立。
+  三层全部标 `predictive`（§2 消融只动这类，硬门不在这里）。报告无成员时返回 `None`，不编造。
 - `src/stock_analyzer/research/selection_funnel_view.py` +
-  `scripts/audit_selection_funnel.py` —— 把夜扫半段（``production_funnel`` 快照：只有成员
-  与计数）与尾盘半段（``funnel_trace``：原因/特征/身份/数据时间齐全）对成 §2 的九层视图；
+  `scripts/audit_selection_funnel.py` —— 把夜扫半段（优先 `night_scan_funnel_trace`，
+  无留档时退回 `production_funnel` 快照的成员与计数）与尾盘半段（``funnel_trace``：原因/特征/身份/数据时间齐全）对成 §2 的九层视图；
   **缺记录的层写 ``recorded=false``，绝不折算成"这层没淘汰股票"**，成员不是上层子集时
   不落落差，并输出 §2 五个诊断问题各自"凭现有证据能不能回答"。
   退出码 0=九层全有留档 / 3=有层缺记录 / 5=输入读不出或一条留档都没有
@@ -369,7 +378,7 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库> --reference-db <�
   以及"选股质量验收 = blocked"的实测口径（本文件不产命中率数字）
 - 测试（2026-10-08 实测条数）：`test_trend_strategy_contract.py`(55)、
   `test_tail_net_profit_label.py`(22)、`test_trend_data_readiness.py`(22)、
-  `test_funnel_trace.py`(17)、`test_record_time_semantics.py`(6)、`test_selection_funnel_view.py`(3)、`test_tail_net_profit_trainer.py`(20)、
+  `test_funnel_trace.py`(17)、`test_record_time_semantics.py`(6)、`test_selection_funnel_view.py`(3)、`test_night_scan_funnel_trace.py`(6)、`test_tail_net_profit_trainer.py`(20)、
   `test_trend_candidate_contract.py`(16)、`test_trend_tail_shadow_runtime.py`(29)、`test_tail_serving_manifest.py`(8)、`test_tail_model_artifact.py`(11)、
   `test_trend_tail_page_and_feedback.py`(26)、`test_minute_bar_store.py`(15)、
   `test_tail_walk_forward.py`(20)、`test_tail_exit_funnel.py`(14)、

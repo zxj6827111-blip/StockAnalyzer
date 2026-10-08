@@ -223,6 +223,12 @@ class RuntimeWeek5AutomationService:
         self._live_shadow_cycle.emit_funnel_from_scan_report(
             report=report, trade_date=now, trace_id=trace_id
         )
+        # §2 收口（NOTE-002 D14）：夜扫半段同步落成与尾盘半段**同构**的漏斗留档，
+        # 让 Quality300/Light100/Deep50 的输入/晋级/落差/数据时间进入同一条证据链。
+        # 只写证据目录，不参与本轮选股；落档结果写进报告，失败可见而非静默。
+        report["night_funnel_trace"] = self._trend_tail_shadow.record_night_scan(
+            report, trade_date=now
+        )
         rows = self._night_candidate_rows(report)
         rows = self._select_night_pool(rows)
         candidate_gate = self._candidate_gate_from_report(report, rows)
