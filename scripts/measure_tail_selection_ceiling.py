@@ -216,12 +216,80 @@ def _direction_from_sign_window(
     return rate_high >= rate_low, round(rate_high - rate_low, 4)
 
 
+def walk_forward_pre_registered(
+    rows: Sequence[dict[str, Any]], field: str, *, block: int, warmup: int
+) -> dict[str, Any]:
+    """把预登记口径铺开成多段：每段的方向只由**该段之前**的样本决定。
+
+    单段预登记（§4.6）仍然只说明一个 40 日窗口的故事。这里逐段推进，得到
+    「同一条规则在多少段里为正」的分布，用来区分稳健信号与单段运气。
+    """
+    days = sorted({str(r[DATE_FIELD]) for r in rows})
+    by_day = _day_groups(rows)
+    per_block: list[dict[str, Any]] = []
+    pooled: list[dict[str, Any]] = []
+    pool_eval: list[dict[str, Any]] = []
+    start = warmup
+    while start + block <= len(days):
+        eval_days = days[start:start + block]
+        sign_rows = [r for d in days[:start] for r in by_day[d]]
+        eval_rows = [r for d in eval_days for r in by_day[d]]
+        desc, spread = _direction_from_sign_window(sign_rows, field)
+        picked = select_top3(eval_rows, field, descending=desc, days=len(eval_days))
+        if picked:
+            hits = sum(1 for r in picked if int(r[LABEL_FIELD]) == 1)
+            pool_hits = sum(1 for r in eval_rows if int(r[LABEL_FIELD]) == 1)
+            per_block.append({
+                "from": eval_days[0],
+                "to": eval_days[-1],
+                "direction": "desc" if desc else "asc",
+                "sign_spread": spread,
+                "picks": len(picked),
+                "hit_rate": round(hits / len(picked), 4),
+                "pool_hit_rate": round(pool_hits / max(1, len(eval_rows)), 4),
+                "delta_pp": round(
+                    100 * (hits / len(picked) - pool_hits / max(1, len(eval_rows))), 3
+                ),
+                "mean_net_return": round(
+                    sum(float(r[NET_FIELD]) for r in picked) / len(picked), 6
+                ),
+            })
+            pooled.extend(picked)
+            pool_eval.extend(eval_rows)
+        start += block
+    if not per_block:
+        return {"note": f"决策日不足以铺开 walk-forward（需要 >{warmup + block} 天）"}
+    positive = sum(1 for b in per_block if b["delta_pp"] > 0)
+    return {
+        "blocks": per_block,
+        "blocks_total": len(per_block),
+        "blocks_positive": positive,
+        "pooled": {
+            "hit_rate": round(
+                sum(1 for r in pooled if int(r[LABEL_FIELD]) == 1) / len(pooled), 4
+            ),
+            "pool_hit_rate": round(
+                sum(1 for r in pool_eval if int(r[LABEL_FIELD]) == 1) / len(pool_eval), 4
+            ),
+            "mean_net_return": round(
+                sum(float(r[NET_FIELD]) for r in pooled) / len(pooled), 6
+            ),
+            "picks": len(pooled),
+        },
+        "delta_vs_pool": block_bootstrap_delta(
+            day_hit_series(pooled), day_hit_series(pool_eval)
+        ),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--samples", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--test-days", type=int, default=40)
     parser.add_argument("--features", default="")
+    parser.add_argument("--walk", action="store_true",
+               help="把预登记口径铺开成多段：每段方向只由该段之前的样本决定")
     parser.add_argument(
         "--pre-registered",
         action="store_true",
@@ -351,6 +419,25 @@ def main(argv: list[str] | None = None) -> int:
                 f"ci=[{cm['delta_vs_pool'].get('ci_low_pp')}, "
                 f"{cm['delta_vs_pool'].get('ci_high_pp')}] "
                 f"ci_low>0={cm['delta_vs_pool'].get('ci_low_above_zero')}"
+            )
+
+    if args.walk:
+        report["walk_forward_pre_registered"] = {}
+        for field in names:
+            result = walk_forward_pre_registered(rows, field, block=16, warmup=24)
+            report["walk_forward_pre_registered"][field] = result
+            if "blocks" not in result:
+                print(field, result.get("note"))
+                continue
+            pooled = result["pooled"]
+            d = result["delta_vs_pool"]
+            print(
+                f"WALK {field:<18} pos {result['blocks_positive']}/{result['blocks_total']} "
+                f"pooled_hit={pooled['hit_rate']} vs pool "
+                f"{pooled['pool_hit_rate']} "
+                f"mean_net={pooled['mean_net_return']} delta={d.get('mean_delta_pp')} "
+                f"ci=[{d.get('ci_low_pp')}, {d.get('ci_high_pp')}] "
+                f"ci_low>0={d.get('ci_low_above_zero')}"
             )
 
     out_path = Path(args.out)
