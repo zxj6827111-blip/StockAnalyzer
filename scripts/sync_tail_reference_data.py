@@ -27,6 +27,8 @@ import sys
 from datetime import date
 from pathlib import Path
 
+import pandas as pd
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _SRC = _PROJECT_ROOT / "src"
 if str(_SRC) not in sys.path:
@@ -73,6 +75,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--report", default="")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument(
+        "--limit-prices-csv",
+        default="",
+        help="tushare stk_limit 补采结果 CSV：trade_date,ts_code,up_limit,down_limit",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -116,6 +123,40 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     result["missing_sources"] = coverage["gaps"]
                 result["vendor_daily_bars"] = report
+            if args.limit_prices_csv:
+                # 精确涨跌停的唯一权威来源是 tushare stk_limit(doc_id=183)：仓库那条
+                # 只有 2 个符号 68 行。补采到的 CSV 在这里落库，口径由 source 说清楚，
+                # 绝不用 pre_close×比例反算的近似值冒充（approximated 保持 False）。
+                frame = pd.read_csv(Path(args.limit_prices_csv).expanduser())
+                missing = [
+                    name for name in ("trade_date", "ts_code", "up_limit", "down_limit")
+                    if name not in frame.columns
+                ]
+                if missing:
+                    print(f"--limit-prices-csv 缺少列 {missing}", file=sys.stderr)
+                    return RC_ERROR
+                frame = frame.assign(
+                    symbol=frame["ts_code"].astype(str).str.split(".").str[0].str.zfill(6),
+                    trade_date=pd.to_datetime(frame["trade_date"].astype(str),
+                                              errors="coerce").dt.date,
+                ).dropna(subset=["trade_date"])
+                landed_limit = store.upsert_limit_prices(
+                    frame, source="tushare_stk_limit", as_of=end.isoformat(),
+                )
+                coverage = store.coverage()
+                result["landed_rows"]["limit_prices"] = landed_limit
+                result["coverage"] = coverage
+                result["sufficient_sources"] = sorted(
+                    name for name in REFERENCE_TABLES
+                    if int(coverage["sources"][name]["rows"]) > 0
+                )
+                result["missing_sources"] = coverage["gaps"]
+                result["limit_prices_backfill"] = {
+                    "csv": str(args.limit_prices_csv),
+                    "rows_landed": landed_limit,
+                    "dates_covered": int(frame["trade_date"].nunique()),
+                    "symbols_covered": int(frame["symbol"].nunique()),
+                }
     except (TailReferenceError, OSError, ValueError) as exc:
         print(f"参考数据不可用: {type(exc).__name__}: {exc}", file=sys.stderr)
         return RC_ERROR

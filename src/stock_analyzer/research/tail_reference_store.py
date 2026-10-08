@@ -198,12 +198,19 @@ class TailReferenceStore:
     def _write(self, table: str, rows: list[tuple[Any, ...]], columns: Sequence[str]) -> int:
         if not rows:
             return 0
-        placeholders = ", ".join("?" for _ in columns)
-        self._con.executemany(
-            f"INSERT OR REPLACE INTO {table} ({', '.join(columns)}) "
-            f"VALUES ({placeholders})",
-            rows,
-        )
+        # DuckDB 的 executemany 在 Python 层逐行绑定参数：补采到的 stk_limit 只需
+        # 2.9 万行就要几十秒，全市场 77.6 万行则直接跑不完。改成注册临时帧再批量 INSERT，
+        # 列名仍由调用方显式给出，去重语义保持 INSERT OR REPLACE。
+        staging_view = f"staging_{table}"
+        staged = pd.DataFrame(rows, columns=list(columns))
+        self._con.register(staging_view, staged)
+        try:
+            self._con.execute(
+                f"INSERT OR REPLACE INTO {table} ({', '.join(columns)}) "
+                f"SELECT {', '.join(columns)} FROM {staging_view}"
+            )
+        finally:
+            self._con.unregister(staging_view)
         return len(rows)
 
     def upsert_calendar(

@@ -193,14 +193,24 @@ class MinuteBarStore:
             ))
         if not rows:
             return 0
-        self._conn.executemany(
-            f"""INSERT OR REPLACE INTO {table}
-                (symbol, trade_date, bar_time, open, high, low, close, volume, amount,
-                 up_limit, down_limit, trade_status, price_basis, bar_time_semantics,
-                 source, ingested_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            rows,
+        columns = (
+            "symbol", "trade_date", "bar_time", "open", "high", "low", "close", "volume",
+            "amount", "up_limit", "down_limit", "trade_status", "price_basis",
+            "bar_time_semantics", "source", "ingested_at",
         )
+        # DuckDB 的 executemany 是 Python 层逐行绑定参数：实测 9.6 万行分钟 bar 要 ~100 秒，
+        # 而同一批数据读源只用 1.4 秒 —— 瓶颈整个在写入侧。改成注册临时帧再批量 INSERT，
+        # 列名显式列出（不依赖表定义里的列顺序），主键去重语义仍是 INSERT OR REPLACE。
+        staging_view = "minute_bar_staging"
+        staged = pd.DataFrame(rows, columns=list(columns))
+        self._conn.register(staging_view, staged)
+        try:
+            self._conn.execute(
+                f"INSERT OR REPLACE INTO {table} ({', '.join(columns)}) "
+                f"SELECT {', '.join(columns)} FROM {staging_view}"
+            )
+        finally:
+            self._conn.unregister(staging_view)
         return len(rows)
 
     # --- 读取 -------------------------------------------------------------
