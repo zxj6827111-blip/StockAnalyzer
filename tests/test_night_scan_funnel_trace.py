@@ -170,3 +170,90 @@ def test_cli_finds_iso_named_traces_by_trade_date(tmp_path: Path) -> None:
     # 只按紧凑日期筛（历史上会退 5），现在两种写法都能命中。
     assert module.main(["--tail-dir", str(tmp_path), "--trade-date", "20261009",
                         "--quiet", "--out", str(out)]) == 3
+
+
+def _pit_snapshot():
+    """用真实的 S03 判定生成快照：留档里的原因必须是它算出来的，不是手搓的。"""
+    from datetime import timedelta
+
+    from stock_analyzer.data.asof_universe import SymbolPitStats, resolve_asof_universe
+
+    as_of = date(2026, 10, 9)
+    stats = {
+        "600000.SH": SymbolPitStats(symbol="600000.SH", bars_in_window=120,
+                                    bars_in_lookback=5, first_bar_date=as_of - timedelta(days=200),
+                                    last_bar_date=as_of),
+        "600001.SH": SymbolPitStats(symbol="600001.SH", bars_in_window=120,
+                                    bars_in_lookback=0, first_bar_date=as_of - timedelta(days=200),
+                                    last_bar_date=as_of - timedelta(days=30)),
+        "600002.SH": SymbolPitStats(symbol="600002.SH", bars_in_window=5,
+                                    bars_in_lookback=5, first_bar_date=as_of - timedelta(days=10),
+                                    last_bar_date=as_of),
+    }
+    return resolve_asof_universe(
+        as_of=as_of,
+        index_symbols=["600000.SH", "600001.SH", "600002.SH", "600003.SH"],
+        stats=stats, min_history_days=60, expected_active_lookback_days=5,
+    )
+
+
+def test_universe_layers_use_the_snapshot_real_per_symbol_reasons() -> None:
+    from stock_analyzer.research.funnel_trace import KIND_HARD_GATE
+    from stock_analyzer.research.night_scan_funnel_trace import (
+        build_universe_stage_traces,
+    )
+
+    stages = build_universe_stage_traces(
+        universe=_pit_snapshot(), data_as_of="2026-10-09T15:00:00", contract=CONTRACT,
+    )
+    assert [item.stage for item in stages] == ["universe", "hard_eligibility"]
+    universe, eligibility = stages
+    assert universe.kind == KIND_HARD_GATE and eligibility.kind == KIND_HARD_GATE
+    # 入口层不淘汰股票，只记下"这次考虑过的全集"与覆盖率口径。
+    assert (universe.inputs, universe.advanced) == (4, 4)
+    assert universe.rejected == {}
+    assert "universe_snapshot_id=" in universe.notes
+    assert "delisting_coverage_verified=False" in universe.notes
+    # 硬性资格层：晋级的是 as_of 时点真可能存在成交的那批，原因逐只来自快照本身。
+    assert (eligibility.inputs, eligibility.advanced) == (4, 1)
+    assert eligibility.advanced_symbols == ("600000.SH",)
+    # 原因名一律沿用快照里的常量，不由留档层重新命名：
+    # 这条断言之所以能抓错，正说明它是从 resolve_asof_universe 真算出来的。
+    from stock_analyzer.data.asof_universe import (
+        EXCLUDE_FUTURE_LISTED,
+        EXCLUDE_INSUFFICIENT_HISTORY,
+    )
+
+    assert set(eligibility.rejected) == {
+        "known_suspended", EXCLUDE_INSUFFICIENT_HISTORY, EXCLUDE_FUTURE_LISTED,
+    }
+    assert eligibility.rejected_symbols["known_suspended"] == ("600001.SH",)
+    assert "不等于证明停牌" in eligibility.notes
+
+
+def test_universe_layers_refuse_counts_only_inputs_and_merge_in_order() -> None:
+    from stock_analyzer.research.night_scan_funnel_trace import (
+        build_universe_stage_traces,
+    )
+
+    # 只有计数的旧 payload：宁可不落这两层，也不拿计数冒充成员。
+    counts_only = {"eligible_count": 300, "expected_active_count": 280}
+    assert build_universe_stage_traces(
+        universe=counts_only, data_as_of="x", contract=CONTRACT) == ()
+
+    trace = build_night_scan_funnel_trace(
+        report=_report(["A", "B", "C"], ["A", "B"], ["A"]),
+        trade_date="2026-10-09", contract=CONTRACT, universe=_pit_snapshot(),
+    )
+    assert trace is not None
+    assert [item.stage for item in trace.stages] == [
+        "universe", "hard_eligibility", "quality_300", "light_100", "deep_50",
+    ]
+
+    # 没有 universe 输入时仍然是原来的三层，行为不变。
+    plain = build_night_scan_funnel_trace(
+        report=_report(["A", "B", "C"], ["A", "B"], ["A"]),
+        trade_date="2026-10-09", contract=CONTRACT,
+    )
+    assert plain is not None
+    assert [item.stage for item in plain.stages] == ["quality_300", "light_100", "deep_50"]
