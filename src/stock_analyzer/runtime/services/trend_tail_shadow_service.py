@@ -30,6 +30,7 @@ from stock_analyzer.contracts.trend_strategy import (
     ModelIdentity,
     RankedCandidate,
     TailEntryDecision,
+    TrendContractError,
     TrendStrategyContract,
     evaluate_tail_entry,
     rank_final_recommendations,
@@ -74,10 +75,21 @@ class TrendTailShadowService:
         price_ticker: Any | None = None,
         slippage_ratio: float = 0.0,
         write_artifacts: bool = True,
+        trade_date: date | str | None = None,
     ) -> dict[str, Any]:
-        """跑一次尾盘确认。``timestamp`` 为 None 时按历史模式（不做陈旧度门）。"""
+        """跑一次尾盘确认。
+
+        两种模式共用同一套判定，唯一差别是有没有行情陈旧度门：
+
+        - **线上**：传 ``timestamp``（当前时钟），只评估已经到点的确认槽。
+        - **历史重算**：``timestamp=None`` + 显式 ``trade_date``，不做陈旧度门。
+
+        ``trade_date`` 不接受 ``date.today()`` 兜底：历史重算把留档盖成"今天"
+        会让漏斗层的时间语义整体失真，宁可抛错。
+        """
         contract = self._contract
-        day = timestamp.date() if isinstance(timestamp, datetime) else None
+        day = _resolve_trading_day(timestamp=timestamp, trade_date=trade_date)
+        as_of = timestamp or _latest_bar_time(minute_bars)
         rows = [dict(row) for row in watch_pool if str(row.get("symbol", "")).strip()]
         bar_map = dict(minute_bars or {})
         prob_map = dict(probabilities or {})
@@ -86,11 +98,7 @@ class TrendTailShadowService:
         rejections: dict[str, list[str]] = {}
         decisions: dict[str, TailEntryDecision] = {}
 
-        if day is None:
-            rejections.setdefault("no_trade_date", []).extend(
-                sorted(str(row["symbol"]) for row in rows)
-            )
-        elif identity_error:
+        if identity_error:
             # 身份不可验证：整轮直接 0 只。逐只确认也不做，避免用没核实的模型分数下单。
             rejections.setdefault(identity_error, []).extend(
                 sorted(str(row.get("symbol")) for row in rows)
@@ -109,7 +117,7 @@ class TrendTailShadowService:
                     confirmation=_hard_gate_confirmation,
                     contract=contract,
                     quote_as_of=timestamp,
-                    model_probabilities={NET_PROFIT_PROBABILITY_FIELD: prob_map.get(symbol)}
+                    model_probabilities={NET_PROFIT_PROBABILITY_FIELD: prob_map[symbol]}
                     if symbol in prob_map
                     else None,
                     overnight_features={
@@ -151,18 +159,14 @@ class TrendTailShadowService:
                 "risk_state": str(
                     _row_for(rows, symbol).get("risk_state", "") or ""
                 ),
-                "data_as_of": (
-                    decisions[symbol].fill_time.isoformat()
-                    if symbol in decisions and decisions[symbol].fill_time
-                    else ""
-                ),
+                "data_as_of": _fill_time_iso(decisions, symbol),
             }
             for symbol in sorted({str(row.get("symbol")) for row in rows})
         ]
         # 资金只够 k 只就把已选出的结果截到 k。**不能改契约再排**：改后的契约摘要会
         # 让模型身份校验失败，那会把"钱不够"错报成"模型不可信"。
         result = rank_final_recommendations(
-            trade_date=day or date.today(),
+            trade_date=day,
             rows=[] if budget_block else candidate_rows,
             model_identity=identity,
             contract=contract,
@@ -180,15 +184,15 @@ class TrendTailShadowService:
             contract=contract,
             fills={
                 symbol: {
-                    "filled": decisions[symbol].filled,
-                    "fill_time": decisions[symbol].fill_time.isoformat()
-                    if decisions[symbol].fill_time
-                    else None,
-                    "quantity": decisions[symbol].quantity,
-                    "entry_amount": decisions[symbol].entry_amount,
-                    "buy_cost": decisions[symbol].buy_cost,
+                    "filled": decision.filled,
+                    "fill_time": (
+                        decision.fill_time.isoformat() if decision.fill_time else None
+                    ),
+                    "quantity": decision.quantity,
+                    "entry_amount": decision.entry_amount,
+                    "buy_cost": decision.buy_cost,
                 }
-                for symbol in decisions
+                for symbol, decision in decisions.items()
             },
             probability_field=NET_PROFIT_PROBABILITY_FIELD,
         )
@@ -208,7 +212,7 @@ class TrendTailShadowService:
                 features_used=sorted(
                     {key for row in rows for key in (row.get("features") or {})}
                 ),
-                timestamp=timestamp, identity=identity, contract=contract,
+                timestamp=as_of, identity=identity, contract=contract,
             ),
             _stage(
                 stage="tail_confirmation",
@@ -216,7 +220,7 @@ class TrendTailShadowService:
                 inputs=attempted,
                 advanced=filled,
                 reason_map=by_symbol_reason,
-                timestamp=timestamp, identity=identity, contract=contract,
+                timestamp=as_of, identity=identity, contract=contract,
             ),
             _stage(
                 stage="final_recommendation",
@@ -228,11 +232,11 @@ class TrendTailShadowService:
                     for item, symbol in ((item, item.symbol)
                                           for item in result.rejected)
                 },
-                timestamp=timestamp, identity=identity, contract=contract,
+                timestamp=as_of, identity=identity, contract=contract,
             ),
         ]
         trace = build_funnel_trace(
-            trade_date=day or date.today(),
+            trade_date=day,
             stages=stages,
             final_recommendations=archive_rows,
             rejected_final=rejected_final,
@@ -242,7 +246,8 @@ class TrendTailShadowService:
         report: dict[str, Any] = {
             "ok": True,
             "mode": "shadow",
-            "trade_date": (day or date.today()).isoformat(),
+            "trade_date": day.isoformat(),
+            "data_as_of": as_of.isoformat(),
             "contract_version": contract.contract_version,
             "contract_digest": contract.digest(),
             "probability_field": NET_PROFIT_PROBABILITY_FIELD,
@@ -366,7 +371,9 @@ def page_view(report: Mapping[str, Any]) -> dict[str, Any]:
             "take_profit_pct": report.get("take_profit_pct"),
             "stop_loss_pct": report.get("stop_loss_pct"),
             "data_as_of": str(
-                (rows[0].get("data_as_of") if rows else report.get("trade_date")) or ""
+                report.get("data_as_of")
+                or (rows[0].get("data_as_of") if rows else "")
+                or report["trade_date"]
             ),
         },
         "candidates": candidates,
@@ -425,6 +432,49 @@ def tail_shadow_history(service: Any, *, limit: int = 20) -> dict[str, Any]:
             "blocking_reason": view["blocking_reason"],
         })
     return {"days": days, "count": len(days)}
+
+
+def _resolve_trading_day(
+    *, timestamp: datetime | None, trade_date: date | str | None
+) -> date:
+    """交易日只从 ``timestamp`` 或显式 ``trade_date`` 推导，**不接受 ``date.today()`` 兜底**。
+
+    历史重算若把留档盖成"今天"，漏斗每一层的时间语义会整体失真，§4 要求的
+    "相同输入下线上与历史路径判定一致"也就无从验证；宁可抛错。
+    """
+    if isinstance(timestamp, datetime):
+        return timestamp.date()
+    if isinstance(trade_date, datetime):
+        return trade_date.date()
+    if isinstance(trade_date, date):
+        return trade_date
+    if trade_date:
+        return date.fromisoformat(str(trade_date)[:10])
+    raise TrendContractError(
+        "尾盘确认需要 timestamp 或 trade_date 之一；历史重算不接受 date.today() 兜底"
+    )
+
+
+def _latest_bar_time(
+    minute_bars: Mapping[str, Sequence[tuple[datetime, Mapping[str, Any]]]] | None,
+) -> datetime:
+    """历史模式的数据时间：所有标的里最大的一根 bar 时刻。"""
+    latest: datetime | None = None
+    for bars in (minute_bars or {}).values():
+        for bar_time, _ in bars:
+            if isinstance(bar_time, datetime) and (latest is None or bar_time > latest):
+                latest = bar_time
+    return latest or datetime.min
+
+
+def _fill_time_iso(
+    decisions: Mapping[str, TailEntryDecision], symbol: str
+) -> str:
+    """成交时刻的 ISO 串；没下单或没成交就是空串，不猜一个时间。"""
+    decision = decisions.get(symbol)
+    if decision is None or decision.fill_time is None:
+        return ""
+    return decision.fill_time.isoformat()
 
 
 def _reason_map(

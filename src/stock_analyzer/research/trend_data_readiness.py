@@ -95,7 +95,7 @@ class _Probe:
         except Exception:  # noqa: BLE001
             return None
 
-    def rows(self, sql: str, params: list[Any] | None = None) -> list[tuple]:
+    def rows(self, sql: str, params: list[Any] | None = None) -> list[tuple[Any, ...]]:
         try:
             return list(self._conn.execute(sql, params or []).fetchall())
         except Exception:  # noqa: BLE001

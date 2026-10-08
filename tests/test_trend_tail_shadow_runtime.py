@@ -16,6 +16,7 @@ import pytest
 from stock_analyzer.contracts.trend_strategy import (
     DEFAULT_TREND_CONTRACT,
     NET_PROFIT_PROBABILITY_FIELD,
+    TrendContractError,
 )
 from stock_analyzer.runtime.services.trend_tail_shadow_service import (
     TrendTailShadowService,
@@ -243,16 +244,67 @@ def test_shadow_artifacts_are_written_per_trade_date(tmp_path) -> None:
     assert stored["mode"] == "shadow"
 
 
-def test_history_mode_without_a_clock_still_needs_bars(tmp_path) -> None:
-    """历史模式（timestamp=None）不写成交易日期即整体拒绝，不猜当天。"""
-    report = TrendTailShadowService(
-        FakeService(manifest=_tail_manifest(), tmp_path=tmp_path),
-        report_dir=tmp_path / "shadow",
-    ).run(timestamp=None, watch_pool=_pool(["600000.SH"]),
-          minute_bars={"600000.SH": _bars()},
-          probabilities={"600000.SH": 0.9})
-    assert report["final_symbols"] == []
-    assert report["rejected_reasons"]["no_trade_date"] == ["600000.SH"]
+def test_history_mode_requires_an_explicit_trade_date(tmp_path) -> None:
+    """历史重算不给交易日就抛错：**不接受 date.today() 兜底**。
+
+    旧实现一边文档写着"历史模式"，一边把留档盖成今天，时间语义静默失真。
+    """
+    with pytest.raises(TrendContractError):
+        _run(tmp_path, watch_pool=_pool(["600000.SH"]),
+             probabilities={"600000.SH": 0.9}, timestamp=None)
+
+
+def test_history_mode_stamps_the_explicit_trade_date(tmp_path) -> None:
+    day = date(2026, 9, 18)
+    report = _run(
+        tmp_path, watch_pool=_pool(["600000.SH"]), timestamp=None, trade_date=day,
+        bars={"600000.SH": _bars(day=day)}, probabilities={"600000.SH": 0.9},
+    )
+    assert report["trade_date"] == "2026-09-18"
+    # 历史模式没有时钟，数据时间只能取最后一根已完成 bar，而不是"今天"。
+    assert report["data_as_of"] == "2026-09-18T14:44:00"
+    stored = Path(report["artifact_paths"]["shadow_report"])
+    assert stored.name == "tail_shadow_report_2026-09-18.json"
+
+
+def test_live_and_history_chain_paths_agree_on_identical_bars(tmp_path) -> None:
+    """§4：同一份输入，线上与历史两条路径给出一致的筛选与交易判定。
+
+    比的是判定本身（谁入选、成交多少、谁被为什么挡下），不是留档时间戳——两条路径
+    的数据时间本就不同：线上读时钟，历史读最后一根已完成 bar。
+    """
+    pool = _pool(["600000.SH", "600001.SH", "600002.SH"])
+    probabilities = {"600000.SH": 0.9, "600001.SH": 0.8, "600002.SH": 0.55}
+
+    def _bars_on(target: date) -> dict:
+        return {row["symbol"]: _bars(day=target) for row in pool}
+
+    def _fingerprint(report: dict) -> dict:
+        return {
+            "final_symbols": report["final_symbols"],
+            "counts": report["counts"],
+            "confirmed": report["confirmed"],
+            "filled": report["filled"],
+            "rejected_reasons": report["rejected_reasons"],
+            "final_rejections": report["final_rejections"],
+            "blocking_reason": report["blocking_reason"],
+            "trades": [
+                (row["symbol"], row["fill"]["filled"], row["fill"]["quantity"],
+                 row["fill"]["entry_amount"], row["fill"]["fill_time"][11:])
+                for row in report["final_recommendations"]
+            ],
+        }
+
+    live = _run(tmp_path / "live", watch_pool=pool, probabilities=probabilities,
+                bars=_bars_on(NOW.date()))
+    history = _run(tmp_path / "history", watch_pool=pool, probabilities=probabilities,
+                   bars=_bars_on(date(2026, 9, 18)), timestamp=None,
+                   trade_date=date(2026, 9, 18))
+
+    assert _fingerprint(history) == _fingerprint(live)
+    assert live["final_symbols"] == ["600000.SH", "600001.SH"]
+    assert live["data_as_of"] == "2026-10-09T14:45:00"
+    assert history["data_as_of"] == "2026-09-18T14:44:00"
 
 
 # ---------------------------------------------------------------------------

@@ -477,7 +477,8 @@ def _as_date(value: Any) -> date:
     if isinstance(value, date):
         return value
     parsed = pd.to_datetime(value)
-    return parsed.date()
+    moment = parsed.to_pydatetime()
+    return date(moment.year, moment.month, moment.day)
 
 
 def _num(value: Any, default: float | None = None) -> float | None:

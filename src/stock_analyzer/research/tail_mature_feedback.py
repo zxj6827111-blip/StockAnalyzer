@@ -17,11 +17,14 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from stock_analyzer.contracts.trend_strategy import DEFAULT_TREND_CONTRACT, TrendStrategyContract
-from stock_analyzer.labels.tail_net_profit import (
-    CAPTURE_OBSERVED,
+from stock_analyzer.contracts.trend_strategy import (
+    DEFAULT_TREND_CONTRACT,
     STATUS_FILLED,
     STATUS_UNCERTAIN,
+    TrendStrategyContract,
+)
+from stock_analyzer.labels.tail_net_profit import (
+    CAPTURE_OBSERVED,
     TailLabelRecord,
 )
 
@@ -108,7 +111,9 @@ def summarize_mature_feedback(
     slices: list[FeedbackSlice] = []
     for (model_version, market_state, capture_mode, digest), bucket in sorted(groups.items()):
         realized = [item for item in bucket if item.trainable and item.net_return is not None]
-        returns = sorted(float(item.net_return) for item in realized)
+        returns = sorted(
+            float(item.net_return) for item in realized if item.net_return is not None
+        )
         slices.append(FeedbackSlice(
             model_version=model_version,
             contract_digest=digest,

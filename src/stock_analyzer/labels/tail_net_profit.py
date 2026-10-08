@@ -395,7 +395,14 @@ def _summarize_group(items: Sequence[TailLabelRecord]) -> dict[str, Any]:
     realized = [item for item in items if item.trainable and item.net_return is not None]
     uncertain = [item for item in items if item.status == STATUS_UNCERTAIN]
     not_filled = [item for item in items if item.status == STATUS_NOT_FILLED]
-    returns = sorted(float(item.net_return) for item in realized)
+    returns = sorted(
+        float(item.net_return) for item in realized if item.net_return is not None
+    )
+    gross = [
+        float(item.gross_return)
+        for item in realized
+        if item.gross_return is not None
+    ]
     profits = [value for value in returns if value > 0]
     return {
         "n_candidates": total,
@@ -411,11 +418,7 @@ def _summarize_group(items: Sequence[TailLabelRecord]) -> dict[str, Any]:
         "median_net_return": returns[len(returns) // 2] if returns else None,
         "tail_loss_p05": _percentile(returns, 0.05),
         "worst_net_return": returns[0] if returns else None,
-        "mean_gross_return": (
-            sum(float(item.gross_return) for item in realized) / len(realized)
-            if realized
-            else None
-        ),
+        "mean_gross_return": (sum(gross) / len(gross)) if gross else None,
         "capital_employed": sum(
             float(item.entry_price or 0.0) * item.quantity for item in filled
         ),

@@ -2,7 +2,7 @@
 
 Status: Draft
 
-As-of: 2026-10-08 @ HEAD `f0f9f24`（本 ADR 与 `contracts/trend_strategy.py`、
+As-of: 2026-10-08 @ HEAD `fac10c4`（本 ADR 与 `contracts/trend_strategy.py`、
 `labels/tail_net_profit.py`、`research/trend_data_readiness.py`、
 `research/funnel_trace.py`、`research/tail_mature_feedback.py` 同批演进）
 
@@ -107,6 +107,18 @@ As-of: 2026-10-08 @ HEAD `f0f9f24`（本 ADR 与 `contracts/trend_strategy.py`�
   出场侧由 `_trade_status_declared()` 兜住：状态未声明 → `unknown_trade_status`
   → 不确定样本，不生成已实现盈亏标签。
 
+影子链路的交易日语义（`TrendTailShadowService.run`）：
+
+- 日期**只能**从 `timestamp`（线上）或显式 `trade_date`（历史重算）推导；两者都没有
+  直接 `TrendContractError`，**不接受 `date.today()` 兜底**。留档盖成"今天"会让漏斗
+  每一层的时间语义整体失真，而 §4 要求线上与历史路径对相同输入给出一致判定。
+- 数据时间同理：线上是当前时钟，历史模式取最后一根已完成 bar
+  （`data_as_of`），逐层写进 `funnel_trace`，不是 `datetime.min` 占位。
+- 陈旧度门只在有 `timestamp` 时生效（历史 bar 不存在"实时快照过期"这件事）。
+  除这一条之外两条路径共用同一判定，
+  `test_live_and_history_chain_paths_agree_on_identical_bars` 比较入选集合、
+  漏斗计数、拒绝原因与成交（数量/金额/成交时刻），断言二者一致。
+
 ## 5. 数据契约侧的同批变更
 
 - `CostScheduleEntry` 从"只对 `stamp_tax_rate` 分段"扩展为可覆盖
@@ -191,7 +203,7 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库>
 - 测试（2026-10-08 实测条数）：`test_trend_strategy_contract.py`(55)、
   `test_tail_net_profit_label.py`(19)、`test_trend_data_readiness.py`(13)、
   `test_funnel_trace.py`(16)、`test_tail_net_profit_trainer.py`(19)、
-  `test_trend_candidate_contract.py`(13)、`test_trend_tail_shadow_runtime.py`(17)、
+  `test_trend_candidate_contract.py`(13)、`test_trend_tail_shadow_runtime.py`(19)、
   `test_trend_tail_page_and_feedback.py`(25)、`test_minute_bar_store.py`(15)
 
 ## 8. 尚未接线的调用方（升级 Accepted 前必须改完）

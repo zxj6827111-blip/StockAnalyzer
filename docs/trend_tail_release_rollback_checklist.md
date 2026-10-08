@@ -44,6 +44,7 @@ As-of: 2026-10-08 @ HEAD `6900e3a`（分支 `feat/stock-selection-quality-overha
 | R12 | 影子观察达标 | `shadow_readiness(observed_trade_days≥60, matured_simulated_fills≥100).ready_for_release_review == True` |
 | R13 | 页面不猜口径 | `page_view(report)` 在 `strategy / entry_window / min_net_profit_probability / contract_digest / reference_notional` 任一缺失时 raise；"尾盘确认"页与旧"推荐汇总"页各自读各自的接口，前端构建（`npm run build`）通过 |
 | R14 | 反馈闭环不越权 | `summarize_mature_feedback(...)` 的 `state` 只取 `challenger_suggested / keep_observing / shadow_only`，`promotion` 固定为人工票据字符串；净盈利率分母只含已实现样本，observed 与 replayed 不互借样本量 |
+| R15 | 线上/历史同判定 | 同一批分钟 bar + 同一组概率下，`timestamp` 模式与 `timestamp=None + trade_date` 模式的入选集合、漏斗计数、拒绝原因、成交（数量/金额/成交时刻）逐项相等；历史重算的 `trade_date`/`data_as_of` 落在请求的那天，**不是今天**；两者都不给则 `TrendContractError` |
 
 ---
 
