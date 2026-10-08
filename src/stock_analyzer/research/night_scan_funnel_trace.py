@@ -123,6 +123,50 @@ def _universe_facts(universe: Any) -> dict[str, Any]:
     }
 
 
+def live_universe_facts(report: Mapping[str, Any]) -> dict[str, Any]:
+    """把夜扫报告里的硬门**成员**读成留档层要的符号级事实。
+
+    线上这两层的输入不是"全市场"，而是这次批处理真的取到过指标的那批票；
+    幸存者偏差覆盖从来没证明过，所以 ``delisting_coverage_verified`` 恒为假、
+    覆盖率写成 ``incomplete_or_unknown`` —— 不能因为规模像 5,000 只就当它是全集。
+    报告里只有计数（旧形状）时返回空，这两层就不落档，与重放侧同一条规矩。
+    """
+    prefilter = report.get("prefilter") or {}
+    membership = (
+        prefilter.get("hard_gate_membership") or report.get("hard_gate_membership") or {}
+    )
+    considered = [str(symbol) for symbol in (membership.get("considered") or ())]
+    advanced = [str(symbol) for symbol in (membership.get("advanced") or ())]
+    if not considered or not advanced:
+        return {}
+    reasons = {
+        str(symbol): str(reason)
+        for reason, symbols in (membership.get("rejected_symbols") or {}).items()
+        for symbol in symbols
+    }
+    return {
+        "universe_snapshot_id": str(
+            prefilter.get("selection_snapshot_id") or "night_scan_universe_selection"
+        ),
+        "as_of": str(report.get("data_as_of") or report.get("generated_at") or ""),
+        "eligible_symbols": considered,
+        "expected_active_symbols": advanced,
+        "excluded_reasons": reasons,
+        "known_suspended_symbols": [],
+        "survivorship_coverage": str(
+            membership.get("survivorship_coverage") or "incomplete_or_unknown"
+        ),
+        "delisting_coverage_verified": False,
+        "non_evaluable_gates": list(membership.get("non_evaluable_gates") or ()),
+        "gate_input_columns": tuple(membership.get("gate_input_columns") or ()),
+        "feature_contract_version": str(membership.get("feature_contract_version") or ""),
+        "float_cap_interpretation_version": str(
+            membership.get("float_cap_interpretation_version") or ""
+        ),
+    }
+
+
+
 def build_universe_stage_traces(
     *,
     universe: Any,
@@ -263,4 +307,5 @@ __all__ = [
     "NIGHT_TRACE_SUFFIX",
     "NIGHT_UNATTRIBUTED_DROP",
     "build_night_scan_funnel_trace",
+    "live_universe_facts",
 ]

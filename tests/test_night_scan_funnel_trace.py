@@ -335,3 +335,112 @@ def test_universe_layers_refuse_counts_only_inputs_and_merge_in_order() -> None:
     )
     assert plain is not None
     assert [item.stage for item in plain.stages] == ["quality_300", "light_100", "deep_50"]
+
+
+def test_live_night_scan_membership_feeds_the_first_two_layers() -> None:
+    """线上夜扫自己导出的硬门成员要能撑起 universe + hard_eligibility 两层。
+
+    这一条把 §2 前两层从"只有研究侧重放有留档"变成"生产链路每天自己留"：
+    数据来自报告里的 hard_gate_membership（符号级），不是逐原因计数。
+    """
+    from stock_analyzer.research.night_scan_funnel_trace import (
+        build_universe_stage_traces,
+        live_universe_facts,
+    )
+
+    membership = {
+        "considered": ["600000.SH", "600001.SH", "600002.SH", "600003.SH"],
+        "advanced": ["600000.SH", "600001.SH"],
+        "rejected_symbols": {
+            "low_avg_turnover_20": ["600002.SH"],
+            "insufficient_history": ["600003.SH"],
+        },
+        "gate_input_columns": ["avg_turnover_20", "history_days"],
+        "feature_contract_version": "trend_asof_v1",
+        "float_cap_interpretation_version": "unproven_float_cap_placeholder_v1",
+        "non_evaluable_gates": [],
+    }
+    report = {"prefilter": {"hard_gate_membership": membership}}
+    facts = live_universe_facts(report)
+    assert facts["expected_active_symbols"] == ["600000.SH", "600001.SH"]
+    assert facts["excluded_reasons"] == {
+        "600002.SH": "low_avg_turnover_20", "600003.SH": "insufficient_history",
+    }
+    # 覆盖率没证明过就必须写未证明，不能因为规模像全市场就当全集。
+    assert facts["delisting_coverage_verified"] is False
+    assert facts["survivorship_coverage"] == "incomplete_or_unknown"
+
+    stages = build_universe_stage_traces(
+        universe=facts, data_as_of="2026-10-09T15:00:00", contract=CONTRACT,
+    )
+    assert [item.stage for item in stages] == ["universe", "hard_eligibility"]
+    eligibility = stages[1]
+    assert (eligibility.inputs, eligibility.advanced) == (4, 2)
+    assert set(eligibility.rejected) == {"low_avg_turnover_20", "insufficient_history"}
+    assert eligibility.features_used == ("avg_turnover_20", "history_days")
+    assert "feature_compute_version=trend_asof_v1" in eligibility.notes
+
+
+def test_live_night_scan_counts_only_report_emits_nothing() -> None:
+    """旧形状（只有计数）不落这两层：拿计数冒充成员等于留档说谎。"""
+    from stock_analyzer.research.night_scan_funnel_trace import (
+        build_universe_stage_traces,
+        live_universe_facts,
+    )
+
+    report = {"prefilter": {"rejected_count_by_reason": {"low_avg_turnover_20": 415}}}
+    assert live_universe_facts(report) == {}
+    assert build_universe_stage_traces(
+        universe=live_universe_facts(report), data_as_of="2026-10-09T15:00:00",
+        contract=CONTRACT,
+    ) == ()
+
+
+def test_hard_filter_exports_per_symbol_first_reason_membership() -> None:
+    """_hard_filter 现在必须逐只导出成员与第一条命中原因（计数答不出是谁）。"""
+    import pandas as pd
+
+    from stock_analyzer.runtime.universe_candidate_selector import (
+        UniverseCandidateSelector,
+    )
+
+    selector = object.__new__(UniverseCandidateSelector)
+    selector._min_history_days = 120
+    selector._min_avg_turnover_20 = 1e7
+    selector._min_float_market_cap = 2e9
+    selector._max_staleness_days = 5
+    selector._require_financial_data = False
+    selector._min_roe = 0.0
+    selector._max_debt_ratio = 100.0
+
+    metrics = pd.DataFrame({
+        "symbol": ["600000", "600001", "600002", "600003"],
+        "suspended": [False, False, False, False],
+        "is_st": [False, True, False, False],
+        "is_delisting_risk": [False, False, False, False],
+        "history_days": [500, 500, 30, 500],
+        "avg_turnover_20": [5e8, 5e8, 5e8, 1e5],
+        "float_market_cap": [5e10, 5e10, 5e10, 5e10],
+        "latest_close": [10.0, 10.0, 10.0, 10.0],
+        "latest_data_date": pd.to_datetime(["2026-10-09"] * 4),
+        "financial_data_complete": [True, True, True, True],
+        "roe": [0.1, 0.1, 0.1, 0.1],
+        "debt_ratio": [0.4, 0.4, 0.4, 0.4],
+    })
+    eligible, counts, membership = UniverseCandidateSelector._hard_filter(
+        selector, metrics, scope_set=set(), reference_date=None,
+    )
+    assert sorted(eligible["symbol"]) == ["600000"]
+    assert membership["considered"] == ["600000", "600001", "600002", "600003"]
+    assert membership["advanced"] == ["600000"]
+    assert membership["rejected_symbols"] == {
+        "is_st": ["600001"], "insufficient_history": ["600002"],
+        "low_avg_turnover_20": ["600003"],
+    }
+    # 一只票只进一个桶，恒等式才能闭合。
+    assert (len(membership["advanced"]) + sum(
+        len(v) for v in membership["rejected_symbols"].values()
+    )) == len(membership["considered"])
+    assert counts == {k: len(v) for k, v in membership["rejected_symbols"].items()}
+    assert membership["feature_contract_version"] == "trend_asof_v1"
+    assert "float_market_cap" in membership["gate_input_columns"]

@@ -49,6 +49,7 @@ from stock_analyzer.research.funnel_trace import (
 from stock_analyzer.research.night_scan_funnel_trace import (
     NIGHT_TRACE_SUFFIX,
     build_night_scan_funnel_trace,
+    live_universe_facts,
 )
 from stock_analyzer.research.shadow_evidence import (
     CAPTURE_MODE_OBSERVED,
@@ -97,6 +98,7 @@ class TrendTailShadowService:
                 contract=self._contract,
                 model_identity=model_identity,
                 features_used=features_used,
+                universe=live_universe_facts(report),
             )
         except Exception as exc:  # noqa: BLE001 - 证据留档不得炸掉夜扫
             return {"emitted": False, "reason": f"night_trace_failed:{type(exc).__name__}"}

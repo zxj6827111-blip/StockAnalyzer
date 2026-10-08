@@ -133,6 +133,67 @@ HARD_GATE_ATTRIBUTION_ORDER: tuple[str, ...] = (
     "insufficient_history_at_asof",
 )
 
+#: 线上夜扫的硬门名（``runtime/universe_candidate_selector._hard_filter`` 逐条判定用的名字）。
+#: 它们和研究侧重放用的名字**不是同一套词汇**（例如线上的 ``low_float_market_cap``
+#: 对应契约的 ``min_float_market_cap``），但都是同一批门。留档按层记原因时用的是
+#: 生产者自己的名字，所以这些名字必须登记进 ``_RULE_KIND``：一个没登记的名字会被
+#: ``classify_rule`` 判成 ``predictive``，消融实验就把它当成"可以拆掉的预测规则"，
+#: 而它是交易资格/数据完整性硬门——这类缺陷在 §3b.3 已经记过一次，不再重演。
+LIVE_HARD_GATE_NAMES: tuple[str, ...] = (
+    "invalid_code",
+    "out_of_board_scope",
+    "suspended",
+    "is_st",
+    "delisting_risk",
+    "invalid_history",
+    "insufficient_history",
+    "invalid_avg_turnover_20",
+    "low_avg_turnover_20",
+    "invalid_float_market_cap",
+    "low_float_market_cap",
+    "unproven_float_market_cap",
+    "invalid_close",
+    "invalid_latest_data_date",
+    "stale_market_data",
+    "financial_data_incomplete",
+    "missing_roe",
+    "roe_below_min",
+    "missing_debt_ratio",
+    "debt_ratio_above_max",
+)
+
+#: 线上硬门的**判定顺序** = ``_hard_filter`` 里 mask 逐条收紧的顺序。
+#: 写死成契约事实而不是 dict 插入序，理由与 ``HARD_GATE_ATTRIBUTION_ORDER`` 相同：
+#: 一只票同时踩中多条门时留档只能记第一条，顺序没定义则"逐原因淘汰多少只"会随代码行序漂移。
+LIVE_HARD_GATE_ATTRIBUTION_ORDER: tuple[str, ...] = LIVE_HARD_GATE_NAMES
+
+#: 每条线上硬门读了哪些列 —— 供留档的 ``features_used`` 使用（§2"每层记使用的特征"）。
+LIVE_GATE_INPUT_COLUMNS: dict[str, tuple[str, ...]] = {
+    "invalid_code": ("symbol",),
+    "out_of_board_scope": ("symbol",),
+    "suspended": ("suspended",),
+    "is_st": ("is_st",),
+    "delisting_risk": ("is_delisting_risk",),
+    "invalid_history": ("history_days",),
+    "insufficient_history": ("history_days",),
+    "invalid_avg_turnover_20": ("avg_turnover_20",),
+    "low_avg_turnover_20": ("avg_turnover_20",),
+    "invalid_float_market_cap": ("float_market_cap",),
+    "low_float_market_cap": ("float_market_cap",),
+    "unproven_float_market_cap": ("float_market_cap",),
+    "invalid_close": ("latest_close",),
+    "invalid_latest_data_date": ("latest_data_date",),
+    "stale_market_data": ("latest_data_date",),
+    "financial_data_incomplete": ("financial_data_complete",),
+    "missing_roe": ("roe",),
+    "roe_below_min": ("roe",),
+    "missing_debt_ratio": ("debt_ratio",),
+    "debt_ratio_above_max": ("debt_ratio",),
+}
+
+# 线上硬门名一并进分类表：不认识的名字会被 classify_rule 判成 predictive。
+_RULE_KIND.update(dict.fromkeys(LIVE_HARD_GATE_NAMES, HARD))
+
 #: 数据供应商取不到流通市值时写进 ``float_market_cap`` 的**占位常量**（元）。
 #: tushare / akshare / efinance 三个 provider 用的是同一个字面值，所以它在库里是
 #: "这一天的市值没有被测量过"的指纹，而不是一个 120 亿的观测值。

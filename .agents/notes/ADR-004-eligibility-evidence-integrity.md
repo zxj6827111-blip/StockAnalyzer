@@ -26,10 +26,10 @@ As-of: 2026-10-08 @ HEAD `ce19b76`
             无判别力的门不落这两层（§5）——三层都有专属测试，
             且 2026-08 干净窗口的 19 份真实留档全部通过 verify_trace()。
 未定：      ingest 该不该停止写兜底常量、改写成 NULL（§6.1，跨模块数据语义变更）。
-未定：      线上侧写入器仍在吐三个契约不认识的原因名（§6.2）。
+已闭合：    线上硬门的 20 个原因名已整体登记进 `_RULE_KIND`（`LIVE_HARD_GATE_NAMES`，全为 HARD）。
 ```
 
-§6.1 落地、且 §6.2 的原因名要么登记进 `_RULE_KIND` 要么改成不写之后，本 ADR 升 Accepted。
+§6.1 落地之后本 ADR 升 Accepted（§6.2 的原因名已于 2026-10-08 整体登记）。
 
 ---
 
@@ -125,6 +125,16 @@ Alpha V2 面板都在读它），把兜底常量换成 NULL 是一次跨模块�
 这也是同一份变更的范围。
 
 ### 6.2 线上侧还有三个契约不认识的原因名
+
+**2026-10-08 更新（已闭合，用户授权把这两层接进生产夜扫）**：`_RULE_KIND` 现在整体登记
+线上选择器能吐出的 20 个原因名（`LIVE_HARD_GATE_NAMES`，全部 `HARD`），判定顺序写死成
+`LIVE_HARD_GATE_ATTRIBUTION_ORDER`，每条门读哪些列写进 `LIVE_GATE_INPUT_COLUMNS`。
+线上名与研究侧重放名是**同一批门的两套词汇**（线上 `low_float_market_cap` ↔ 契约
+`min_float_market_cap`），这一点写在契约注释里而不是靠改名抹平：改名会动生产报告的既有字段，
+而两套名字都登记进分类表后，消融按 `classify_rule()` 分组就不可能再把硬门当成可拆的预测规则。
+`known_suspended` 的语义冲突不在这次闭合范围里：线上 `suspended` 读的是显式声明字段，
+与研究侧那个"由缺 bar 推断"的名字不是一回事（质量报告 §3d）。
+
 
 `future_listed`、`insufficient_history_window_bars`、`known_suspended` 实测都被
 `classify_rule()` 判为 `predictive`，却写进 `hard_eligibility`。给

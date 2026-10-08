@@ -558,6 +558,38 @@ token 只按变量名从环境变量读、取值不落任何产物）：
 - 分钟 bar 仍只覆盖池内 208 只，**这批新合格的 symbol-day 一条
   `p_net_profit_5d_tail` 成熟标签都没有**，所以"遮蔽了多少净盈利机会"依然未测量。
 
+## 3k. 生产夜扫现在自己落这两层（代码+测试完成，未部署）
+
+§2 的前两层此前只在研究侧重放里有留档：生产路径的
+`runtime/universe_candidate_selector.py::_hard_filter` 只吐逐原因**计数**，
+而 `StageTrace` 不许拿计数冒充成员（它要能回答"是哪一只在哪条门上出局"）。
+2026-10-08 用户授权改动生产报告形状，这一格接上了：
+
+- `_hard_filter` 按判定顺序逐只归因，导出 `considered / advanced / rejected_symbols`
+  （一只票同时踩多条门时只进第一条命中的桶，恒等式 `inputs = advanced + Σdropped` 才闭合）；
+  夜扫报告新增键 `prefilter.hard_gate_membership`。**判定结果一个都没改** ——
+  这次只加记录，不改选谁。
+- 线上 20 个硬门名整体登记进 `_RULE_KIND`（`LIVE_HARD_GATE_NAMES`，全为 HARD），
+  判定顺序写死成 `LIVE_HARD_GATE_ATTRIBUTION_ORDER`，每条门读哪些列写进
+  `LIVE_GATE_INPUT_COLUMNS` → 直接成为 `hard_eligibility` 层的 `features_used`。
+  不登记的后果是 ADR-004 §6.2 记过的那类缺陷：`classify_rule()` 不认识就按
+  `predictive` 处理，消融实验会把交易资格硬门当"可拆的预测规则"。
+- `research/night_scan_funnel_trace.py::live_universe_facts()` 把报告读成留档层要的
+  符号级事实；`TrendTailShadowService.record_night_scan()` 在夜扫半段一并落这两层。
+  只有计数的旧报告形状 ⇒ 返回空 ⇒ 这两层不落档，与重放侧同一条规矩。
+- 覆盖率仍写 `incomplete_or_unknown`、`delisting_coverage_verified=False`：
+  线上这一层的输入是"这次批处理取到过指标的那批票"，不是全集，
+  不能因为规模像 5,000 只就把它当全市场（§3e 的教训）。
+- 当天市值列一半以上是占位常数时，`non_evaluable_gates` 里记 `min_float_market_cap`，
+  于是这两层**拒绝落档**（§3g 的事故形状不允许再被写成"硬性资格检查判过"）。
+
+三条钉住它的测试（`tests/test_night_scan_funnel_trace.py` 10→13）：live 成员能撑起两层
+且 `features_used` 等于真读过的列；只有计数时返回 `()`；`_hard_filter` 导出的成员表与
+计数逐项相等且恒等式闭合。`clean-scope` 门与既有 38+34 条相关测试通过。
+
+**这不是部署**：NAS 上还没跑过一次带这两层的夜扫，报告体积影响未实测。
+下一步最小动作是下次夜扫后读一份真实留档，确认 `verify_trace()` 为空。
+
 ## 4. 不依赖模型的排序对照（同一批成熟标签直接算）
 
 每日从可判池里按某个声明字段取 `Top-3`（同分按代码序，与线上一致），

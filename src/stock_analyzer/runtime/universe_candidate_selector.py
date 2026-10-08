@@ -22,11 +22,19 @@ import random
 from collections.abc import Callable, Mapping
 from datetime import date, datetime
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 from uuid import uuid4
 
 import numpy as np
 import pandas as pd
+
+from stock_analyzer.feature.trend_candidate_contract import (
+    FLOAT_CAP_INTERPRETATION_VERSION,
+    LIVE_GATE_INPUT_COLUMNS,
+    LIVE_HARD_GATE_ATTRIBUTION_ORDER,
+    TREND_FEATURE_CONTRACT_VERSION,
+    unproven_float_market_cap_mask,
+)
 
 
 @runtime_checkable
@@ -284,7 +292,7 @@ class UniverseCandidateSelector:
                 end_date=end_date,
             )
         try:
-            eligible_rows, rejected_counts = self._hard_filter(
+            eligible_rows, rejected_counts, hard_gate_membership = self._hard_filter(
                 metrics,
                 scope_set=scope_set,
                 reference_date=resolved_reference_date,
@@ -316,6 +324,7 @@ class UniverseCandidateSelector:
                 input_hash=input_hash,
                 eligible_rows=eligible_rows,
                 rejected_counts=rejected_counts,
+                hard_gate_membership=hard_gate_membership,
                 core_selected=[],
                 exploration_selected=[],
                 selector_mode="quality_no_eligible",
@@ -342,6 +351,7 @@ class UniverseCandidateSelector:
                 input_hash=input_hash,
                 eligible_rows=eligible_rows,
                 rejected_counts=rejected_counts,
+                hard_gate_membership=hard_gate_membership,
                 core_selected=selected_symbols,
                 exploration_selected=[],
                 selector_mode="quality_all_eligible",
@@ -380,6 +390,7 @@ class UniverseCandidateSelector:
             input_hash=input_hash,
             eligible_rows=eligible_rows,
             rejected_counts=rejected_counts,
+            hard_gate_membership=hard_gate_membership,
             core_selected=core_selected,
             exploration_selected=exploration_selected,
             selector_mode="quality",
@@ -441,9 +452,9 @@ class UniverseCandidateSelector:
         *,
         scope_set: set[str],
         reference_date: date | None,
-    ) -> tuple[pd.DataFrame, dict[str, int]]:
+    ) -> tuple[pd.DataFrame, dict[str, int], dict[str, Any]]:
         if metrics.empty:
-            return metrics, {}
+            return metrics, {}, {}
         rejected: dict[str, int] = {
             "invalid_code": 0,
             "out_of_board_scope": 0,
@@ -466,6 +477,14 @@ class UniverseCandidateSelector:
             "debt_ratio_above_max": 0,
         }
         mask = pd.Series(True, index=metrics.index)
+        # 下面几条规则只在特定配置下才真的参与判定（scope / reference_date /
+        # require_financial_data），但函数末尾要按固定顺序一次成型逐只归因表，
+        # 所以先把它们定义成"一条都不命中"而不是留给某个分支去创建。
+        out_of_scope = pd.Series(False, index=metrics.index)
+        stale_data = pd.Series(False, index=metrics.index)
+        incomplete_financial = pd.Series(False, index=metrics.index)
+        missing_roe = pd.Series(False, index=metrics.index)
+        missing_debt = pd.Series(False, index=metrics.index)
 
         # Vectorized A-share code validation: 6-digit string of digits.
         symbol_str = metrics["symbol"].astype(str)
@@ -569,10 +588,82 @@ class UniverseCandidateSelector:
         rejected["debt_ratio_above_max"] = int((mask & high_debt).sum())
         mask &= ~high_debt
 
+        #: 判定顺序即归因顺序；名字没参与判定的（条件恒假）不会进归因表。
+        conditions: list[tuple[str, pd.Series]] = [
+            ("invalid_code", invalid_code),
+            ("out_of_board_scope", out_of_scope),
+            ("suspended", suspended),
+            ("is_st", is_st),
+            ("delisting_risk", delisting),
+            ("invalid_history", invalid_history),
+            ("insufficient_history", insufficient_history),
+            ("invalid_avg_turnover_20", invalid_turnover),
+            ("low_avg_turnover_20", low_turnover),
+            ("invalid_float_market_cap", invalid_cap),
+            ("low_float_market_cap", low_cap),
+            ("invalid_close", invalid_close),
+            ("invalid_latest_data_date", invalid_latest_date),
+            ("stale_market_data", stale_data),
+            ("financial_data_incomplete", incomplete_financial),
+            ("missing_roe", missing_roe),
+            ("roe_below_min", low_roe),
+            ("missing_debt_ratio", missing_debt),
+            ("debt_ratio_above_max", high_debt),
+        ]
         eligible = metrics.loc[mask].copy()
         # Reuse the already-computed board_series instead of re-applying.
         eligible["board"] = board_series.loc[mask].values
-        return eligible, {k: v for k, v in rejected.items() if v > 0}
+        return (
+            eligible,
+            {k: v for k, v in rejected.items() if v > 0},
+            self._gate_membership(metrics, mask, conditions, float_market_cap),
+        )
+
+    #: 硬门逐条判定的顺序 = 归因顺序；名字全部来自契约的
+    #: ``LIVE_HARD_GATE_ATTRIBUTION_ORDER``，不在这里重新定义一套词汇。
+    @staticmethod
+    def _gate_membership(
+        metrics: pd.DataFrame,
+        mask: pd.Series,
+        conditions: list[tuple[str, pd.Series]],
+        float_market_cap: pd.Series,
+    ) -> dict[str, object]:
+        """逐只导出硬门成员与第一条命中原因（§2 前两层要的东西，计数不够用）。
+
+        归因按 ``conditions`` 的顺序取第一条命中的规则 —— 一只票同一天踩中多条门时
+        只能进一个桶，否则 ``inputs == advanced + Σdropped`` 的恒等式不闭合。
+        市值列被填成供应商占位常数的那批**不改变判定结果**（生产决策仍按现行规则走），
+        只把 ``min_float_market_cap`` 记成"当天无从判定"，让留档层拒绝声称它判过。
+        """
+        symbols = metrics["symbol"].astype(str)
+        remaining = pd.Series(True, index=metrics.index)
+        rejected_symbols: dict[str, list[str]] = {}
+        for name, condition in conditions:
+            hit = remaining & condition.fillna(False)
+            if bool(hit.any()):
+                rejected_symbols[name] = sorted(symbols[hit].tolist())
+            remaining &= ~hit
+        unproven = unproven_float_market_cap_mask(float_market_cap).fillna(False)
+        share = float(unproven.mean()) if len(unproven) else 0.0
+        used_columns = {
+            column
+            for name, _ in conditions
+            for column in LIVE_GATE_INPUT_COLUMNS.get(name, ())
+        }
+        return {
+            "considered": sorted(symbols.tolist()),
+            "advanced": sorted(symbols[mask].tolist()),
+            "rejected_symbols": rejected_symbols,
+            "attribution_order": [name for name, _ in conditions],
+            "attribution_order_declared": list(LIVE_HARD_GATE_ATTRIBUTION_ORDER),
+            "gate_input_columns": sorted(used_columns),
+            "feature_contract_version": TREND_FEATURE_CONTRACT_VERSION,
+            "float_cap_interpretation_version": FLOAT_CAP_INTERPRETATION_VERSION,
+            "unproven_float_market_cap_share": round(share, 6),
+            "non_evaluable_gates": (
+                ["min_float_market_cap"] if share >= 0.5 else []
+            ),
+        }
 
     # ------------------------------------------------------------------
     # Core + exploration selection
@@ -1037,6 +1128,7 @@ class UniverseCandidateSelector:
         input_hash: str,
         eligible_rows: pd.DataFrame,
         rejected_counts: dict[str, int],
+        hard_gate_membership: Mapping[str, Any] | None = None,
         core_selected: list[str],
         exploration_selected: list[str],
         selector_mode: str,
@@ -1093,6 +1185,8 @@ class UniverseCandidateSelector:
             "target_size": target_size,
             "hard_eligible_count": len(eligible_rows),
             "rejected_count_by_reason": rejected_counts,
+            # §2 前两层要的是成员不是计数：计数答不出"哪一只在哪条门上出局"。
+            "hard_gate_membership": dict(hard_gate_membership or {}),
             "selected_count": len(selected),
             "core_selected_count": len(core_selected),
             "exploration_selected_count": len(exploration_selected),
