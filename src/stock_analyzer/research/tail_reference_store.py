@@ -485,6 +485,124 @@ class TailReferenceStore:
             "sufficient": not missing,
         }
 
+    def day_limits(
+        self,
+        symbol: str,
+        trade_date: date,
+        *,
+        limit_prices_require_exact: bool = True,
+    ) -> dict[str, Any]:
+        """``MinuteBarStore.bars_for(day_limits=...)`` 要的那一份日级权威字段。
+
+        只返回非空键：分钟源自己没有 ``up_limit`` / 状态列，缺的字段必须由契约判成
+        "无有效价格 / 未知状态"，不能在这一层补成看起来可用的值。
+        """
+        inputs = self.execution_inputs(
+            symbol, trade_date, limit_prices_require_exact=limit_prices_require_exact
+        )
+        return {
+            key: inputs[key]
+            for key in ("up_limit", "down_limit", "suspended", "suspend_type", "trade_status")
+            if inputs.get(key) is not None
+        }
+
+    def daily_bar_series(
+        self,
+        symbol: str,
+        start: date,
+        end: date,
+        *,
+        limit_prices_require_exact: bool = True,
+    ) -> dict[str, Any]:
+        """出场模拟要吃的 ``[(日期, raw 日线)]``，逐日带上精确上下限与状态声明。
+
+        这里不跳过也不粉饰任何缺口，因为两种缺法后果完全不同：
+
+        * 日历说这天开市、日线却没有 → ``missing_session_days``。少了中间一天，
+          "第 5 个交易日退出"就落在错误的日期上，而契约只看得见 bar 序列，看不见洞。
+        * 停复牌表里没有这天的 ``trade_status`` → ``undeclared_status_days``。
+          契约据此判未知状态、不产出已实现盈亏标签（§3.3）。注意生产仓库的
+          ``daily_trade_status`` 表**没有** ``trade_status`` 列，所以从仓库同步来的
+          研究库这一项通常是满的缺口 —— 这是数据来源没补齐，不是策略亏损。
+        * 日历本身为空 → ``calendar_declared=False``，无法校验序列完整性。
+        """
+        bars = self._rows(
+            f"SELECT trade_date, open, high, low, close, volume, price_basis "
+            f"FROM {REFERENCE_TABLES['daily_bars']} "
+            "WHERE symbol = ? AND trade_date BETWEEN ? AND ? ORDER BY trade_date",
+            [str(symbol), start, end],
+        )
+        limits = {
+            _day(row["trade_date"]): row
+            for row in self._rows(
+                f"SELECT trade_date, up_limit, down_limit, approximated "
+                f"FROM {REFERENCE_TABLES['limit_prices']} "
+                "WHERE symbol = ? AND trade_date BETWEEN ? AND ?",
+                [str(symbol), start, end],
+            )
+            if _day(row["trade_date"]) is not None
+        }
+        status = {
+            _day(row["trade_date"]): row
+            for row in self._rows(
+                f"SELECT trade_date, suspended, suspend_type, trade_status "
+                f"FROM {REFERENCE_TABLES['suspend_status']} "
+                "WHERE symbol = ? AND trade_date BETWEEN ? AND ?",
+                [str(symbol), start, end],
+            )
+            if _day(row["trade_date"]) is not None
+        }
+
+        sessions: list[tuple[date, dict[str, Any]]] = []
+        missing_limits_days: list[str] = []
+        undeclared_status_days: list[str] = []
+        for item in bars:
+            day = _day(item["trade_date"])
+            if day is None:
+                continue
+            bar: dict[str, Any] = {
+                "open": item["open"], "high": item["high"], "low": item["low"],
+                "close": item["close"], "volume": item["volume"],
+                "price_basis": item["price_basis"],
+            }
+            limit = limits.get(day) or {}
+            approximated = bool(limit.get("approximated"))
+            usable = bool(limit) and not (approximated and limit_prices_require_exact)
+            up_limit = limit.get("up_limit") if usable else None
+            down_limit = limit.get("down_limit") if usable else None
+            if up_limit is not None:
+                bar["up_limit"] = up_limit
+            if down_limit is not None:
+                bar["down_limit"] = down_limit
+            # 入场要 up_limit、出场要 down_limit：任一个不可用，这天就判不出涨跌停锁死。
+            if up_limit is None or down_limit is None:
+                missing_limits_days.append(day.isoformat())
+            declared = False
+            row = status.get(day)
+            if row is not None:
+                for key in ("suspended", "suspend_type", "trade_status"):
+                    if row.get(key) is not None:
+                        bar[key] = row[key]
+                declared = row.get("trade_status") is not None
+            if not declared:
+                undeclared_status_days.append(day.isoformat())
+            sessions.append((day, bar))
+
+        expected = self.calendar(start, end)
+        present = {day for day, _ in sessions}
+        missing_session_days = [day.isoformat() for day in expected if day not in present]
+        return {
+            "symbol": str(symbol),
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "sessions": sessions,
+            "calendar_declared": bool(expected),
+            "expected_sessions": len(expected),
+            "missing_session_days": missing_session_days,
+            "missing_limit_price_days": missing_limits_days,
+            "undeclared_status_days": undeclared_status_days,
+        }
+
     def coverage(self) -> dict[str, Any]:
         """每个来源各报行数与日期跨度；缺表就是 0 行 + 明确的 gaps 条目。"""
         per_source: dict[str, Any] = {}

@@ -2,9 +2,10 @@
 
 Status: Draft
 
-As-of: 2026-10-08 @ HEAD `335fcfd` 之后的工作树（本 ADR 与 `contracts/trend_strategy.py`、
+As-of: 2026-10-08 @ HEAD `e7023c1` 之后的工作树（本 ADR 与 `contracts/trend_strategy.py`、
 `labels/tail_net_profit.py`、`research/trend_data_readiness.py`、
 `research/funnel_trace.py`、`research/tail_mature_feedback.py`、
+`research/tail_reference_store.py`、`research/tail_rebuild.py`、
 `feature/trend_candidate_contract.py` 同批演进）
 
 ## 1. Status 为什么是 Draft
@@ -19,14 +20,19 @@ As-of: 2026-10-08 @ HEAD `335fcfd` 之后的工作树（本 ADR 与 `contracts/t
 已接（展示与反馈）：GET /week5/tail-shadow/{latest,history} + 前端"尾盘确认"页
         （候选 / 最终推荐 / 成交状态分列）；research/tail_mature_feedback 按模型
         版本 / 市场状态 / 拒绝原因聚合，输出上限是 challenger 建议。
+已接（历史重建消费侧）：research/tail_rebuild.py + scripts/rebuild_tail_labels.py
+        从研究库取分钟 bar + 日级参考数据，喂同一个标签权威；确认谓词与线上
+        引用同一个 `hard_gate_confirmation` 对象。合成样本上已跑通，真实数据上
+        被 §5 的 trade_status 来源缺口卡住（判 unknown_trade_status，不出标签）。
 未接：  runtime 旧路径的最终推荐出口（仍是 week5 综合分 + final_signal_cap=5，
         按计划要等证据达标后单独切换）、历史验证入口（asof_backtest 仍是
         default_horizon_days=10 + 开盘口径）、以及任何真实 p_net_profit_5d_tail
         模型的训练 —— 后两者被 §6 的分钟行情阻塞卡住，不是没做，是做不了。
 ```
 
-三条消费路径全部改指本契约、且 §4 的"线上与历史判定一致"在真实数据上验过之后，
-本 ADR 升 Accepted。
+三条消费路径全部改指本契约、且 §4 的"线上与历史判定一致"在**真实数据**上验过之后，
+本 ADR 升 Accepted。合成数据上的一致判定已经钉住（`test_live_and_rebuild_paths_agree_on_identical_bars`），
+但它不能替代真实数据那一步。
 
 ## 2. 决策
 
@@ -166,6 +172,27 @@ As-of: 2026-10-08 @ HEAD `335fcfd` 之后的工作树（本 ADR 与 `contracts/t
   尾盘身份必然 `training_commit_unknown` ⇒ 0 只。这是 fail-closed 的正确行为，但意味着
   影子验证在扩清单 schema（或另出带 commit 的 freeze manifest）之前不会开始累积成交；
   扩 schema 属于 ADR-001 的信任边界变更，需单独决策。
+- 参考数据的**消费侧**接通（改进计划 §3.1 "补齐后验证" 与 §4 "线上/历史一致"）：
+  `research/tail_rebuild.py` + `scripts/rebuild_tail_labels.py` 把研究库里的五类参考数据
+  喂给同一个 `build_tail_net_profit_label`，判定仍然只有那一个出口。三件事写进代码：
+  ① 缺分钟 bar / 缺精确涨跌停 / 日线内部有空洞 → `insufficient_reference_data`，
+  单独计数，**不折算成未成交或亏损**（否则成交率被数据缺口污染）；
+  ② 空洞只在"已观测序列内部"才阻塞 —— 序列末尾之后的空缺是样本未成熟，交给契约的
+  `insufficient_data_at_series_end`，两者不能混为一谈；
+  ③ 日历为空 (`trade_calendar_missing`) 直接判不足，因为无法校验"第 5 个交易日"落在哪天。
+- 连带修掉一个 fail-open：`MinuteBarStore.bars_for()` 原先给状态列为空的分钟 bar 填
+  `trade_status="normal"`，于是 `day_limits` 里来自 `suspend_d` 的权威状态被 `setdefault`
+  吞掉 —— 停牌股在研究库路径上会被当成可买。现在没有声明就**不留键**，日级值得以生效，
+  而分钟级自身声明仍优先于日级。
+- 确认谓词从服务的私有函数提升为契约的 `hard_gate_confirmation()`，线上影子链路与重建
+  CLI 引用的是**同一个函数对象**（`test_live_service_and_contract_share_one_confirmation_object`
+  钉住）。§4 要的一致性靠"共用一个对象"保证，不靠两边各写一份再对拍。
+- 数据侧新发现的真实缺口：生产仓库 `daily_trade_status` 表**没有 `trade_status` 列**
+  （只有 `suspended` / `suspend_type`），而同步脚本把它同时当作涨跌停与停复牌的来源。
+  因此从仓库同步来的研究库里 `trade_status` 恒为 NULL → 出场逐日判定必然
+  `unknown_trade_status` → 真实重建样本 0 条可训练。这是"来源没补齐"，不是策略亏损；
+  补齐入口是给 `daily_trade_status` 加显式状态列（或在同步层声明 `suspended` 布尔即状态），
+  属于数据层决策，不在本 ADR 里顺手改语义。
 
 ## 6. 已知阻塞（不是本 ADR 的例外，是它的前置条件）
 
@@ -249,6 +276,12 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库>
   样本不足/身份不通过一律 `blocked`，不产命中率数字
 - `scripts/audit_trend_data_readiness.py --minute-db` —— 就绪门多看一个来源，
   判定标准不变
+- `src/stock_analyzer/research/tail_rebuild.py` + `scripts/rebuild_tail_labels.py` ——
+  历史重建的**消费侧**：研究库 → `day_limits` / `daily_bar_series` → 同一个
+  `build_tail_net_profit_label`。参考数据缺口单独记 `insufficient_reference_data`
+  （退出码 3），不进样本流；`--zero-cost` 会把"无费用调试标签"写进报告
+- `contracts/trend_strategy.hard_gate_confirmation()` —— 线上与重建共用的确认谓词
+  （原先是影子服务的私有函数）
 - `docs/trend_tail_acceptance_evidence.md` —— §4 验收证据：工程验收逐场景 → 测试名，
   以及"选股质量验收 = blocked"的实测口径（本文件不产命中率数字）
 - 测试（2026-10-08 实测条数）：`test_trend_strategy_contract.py`(55)、
@@ -257,7 +290,7 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库>
   `test_trend_candidate_contract.py`(16)、`test_trend_tail_shadow_runtime.py`(22)、
   `test_trend_tail_page_and_feedback.py`(26)、`test_minute_bar_store.py`(15)、
   `test_tail_walk_forward.py`(20)、`test_tail_exit_funnel.py`(14)、
-  `test_tail_reference_store.py`(14)
+  `test_tail_reference_store.py`(14)、`test_tail_rebuild.py`(18)
 
 ## 8. 尚未接线的调用方（升级 Accepted 前必须改完）
 

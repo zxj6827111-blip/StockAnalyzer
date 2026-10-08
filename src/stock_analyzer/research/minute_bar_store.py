@@ -223,6 +223,7 @@ class MinuteBarStore:
         ``datetime/open/high/low/close/volume/amount``，**没有** ``up_limit``，
         而契约的硬门要精确价（tushare ``stk_limit`` / ``suspend_d``，日级）。
         不传就按分钟源原样返回，契约自己会判 ``no_valid_price_data``。
+        逐根 bar 已有的字段优先于传进来的日级值（分钟级证据比日级更细）。
         """
         table = MINUTE_TABLES.get(str(interval))
         if table is None:
@@ -247,8 +248,11 @@ class MinuteBarStore:
             bar: dict[str, Any] = {
                 "open": row[1], "high": row[2], "low": row[3], "close": row[4],
                 "volume": row[5], "amount": row[6],
-                "trade_status": row[9] or "normal",
             }
+            # 状态列没有就**留空**：填 "normal" 等于把"不知道"说成"可交易"，
+            # 而且 setdefault 会让 day_limits 里来自 suspend_d 的权威状态永远进不来。
+            if row[9] is not None:
+                bar["trade_status"] = row[9]
             if row[7] is not None:
                 bar["up_limit"] = row[7]
             if row[8] is not None:

@@ -1,4 +1,4 @@
-# trend 尾盘链路：§4 验收证据（As-of 2026-10-08 @ `335fcfd` 之后的工作树）
+# trend 尾盘链路：§4 验收证据（As-of 2026-10-08 @ `e7023c1` 之后的工作树）
 
 范围只覆盖选股质量改进计划第一轮落地到 trend 的这条链路：夜扫观察池 → 次日
 14:30–14:50 尾盘确认 → 最多 3 只最终推荐 → 成交与 5 交易日退出。monster 与旧
@@ -92,6 +92,38 @@
    `test_missing_warehouse_tables_are_reported_as_gaps`、`test_row_level_provenance_beats_the_caller_default`、
    以及 CLI 三条退出码测试。
 
+5. **§3.1 的"验证"另一半 + §4 的"线上与历史一致"落到结构上**：参考库建好后没人读它
+   就等于没有 —— 标签与历史重建此前不碰 `execution_inputs()`，所以"涨停锁死"在纯研究库
+   路径上无法自证。现在 `research/tail_rebuild.py` + `scripts/rebuild_tail_labels.py`
+   把日级精确涨跌停/停复牌喂进 `bars_for(day_limits=...)`、把 raw 日线序列喂进出场，
+   判定出口仍然只有 `build_tail_net_profit_label` 一个。同时修掉一个 fail-open：
+   `bars_for()` 原先给状态列为空的分钟 bar 补 `trade_status="normal"`，这会**吞掉**
+   `suspend_d` 传进来的权威状态（停牌股被当成可买）。钉住：
+   `test_day_limits_reach_the_minute_bars_so_limit_up_lock_is_provable`、
+   `test_suspend_flag_from_the_reference_store_blocks_the_fill`、
+   `test_trade_status_from_the_source_is_not_masked_by_a_default`、
+   `test_missing_minute_bars_are_insufficient_and_never_an_open_price_backtest`、
+   `test_reference_gaps_are_named_not_folded_into_the_fill_rate`、
+   `test_a_session_hole_inside_the_window_blocks_instead_of_shifting_day_five`、
+   `test_missing_status_declaration_yields_no_realized_label_but_is_not_a_gap`、
+   `test_live_and_rebuild_paths_agree_on_identical_bars`（同一批 bar，带线上时钟跑一次、
+   走重建跑一次，成交时点/价格/标签逐项相同）、`test_summary_keeps_gaps_fill_rate_and_labels_apart`、
+   `test_live_service_and_contract_share_one_confirmation_object`（确认谓词从服务私有函数
+   提升为契约的 `hard_gate_confirmation`，两边引用同一个对象）。
+
+---
+
+## 1a. 数据侧新查出的一个真实缺口（不是代码问题）
+
+生产仓库 `daily_trade_status` 表**没有 `trade_status` 列**
+（`data/market_warehouse.py:355-365` 只有 `suspended / suspend_type`），而
+`read_warehouse_reference_frames()` 同时把这张表当作涨跌停与停复牌两个来源。
+后果：从仓库同步出来的研究库里 `trade_status` 恒为 NULL → 出场逐日判定落到
+`unknown_trade_status` → **真实重建样本 0 条可训练**。这不是策略亏损，是来源没补齐；
+补齐方式（给该表加显式状态列，或在同步层声明"`suspended` 布尔即状态"）属于数据层决策，
+本轮不顺手改语义，只把它计进 `undeclared_status_days` 与报告的
+`trade_status_source_gap`。
+
 ---
 
 ## 1b. §2 的 9 层漏斗：谁在写、还差谁
@@ -124,6 +156,19 @@
 | `env -u PYTHONPATH python scripts/audit_trend_data_readiness.py --help` | 正常输出用法。本轮修掉了一个真实缺陷：该 CLI 缺 `src/` 路径自举，照本文件 §3 的命令去做解锁的人第一跳就是 `ModuleNotFoundError`；测试原来靠注入 `PYTHONPATH` 掩盖了它，现已改为不注入。 |
 
 未执行、因此不主张：`--stage full`、freeze、Production Preflight、任何生产部署。
+
+### 2b. 消费侧接线那一轮真实执行的命令（As-of 同一工作树）
+
+| 命令 | 结果 |
+| --- | --- |
+| `pytest tests/test_tail_rebuild.py --collect-only` | **18 tests collected**（新文件） |
+| `pytest <13 个 trend/tail/minute/funnel 测试文件> --tb=no` | **269 passed in 30.58s** |
+| `pytest tests/ -k "trend or tail" --tb=no` | **270 passed, 4029 deselected in 37.38s** |
+| `pytest tests/ -k "trend or tail or minute or funnel"` | 1 个 error：`test_alpha_v2_m4l_e2e_rehearsal` 依赖 lightgbm，本机 `.venv` 缺 `libomp.dylib` → 属既有环境基线，不是本分支引入 |
+| `ruff check` 本轮触及的 4 个源文件 + 1 个 CLI + 1 个测试文件 | All checks passed |
+| `ruff check src tests` / `ruff check scripts` | 48 / 27 errors —— 与分支起点同数，本轮没有新增 |
+| `mypy --python-version 3.12` 本轮 4 个源文件 | 这 4 个文件**自身 0 error**（其余报错来自被跟进导入的历史文件） |
+| `python -c "…_cost_side(config/default.yaml, 2026-03-09)"` | 冻结成本表可用：900 股 @10.05 买费 ¥5.09（最低佣金生效）、@10.60 卖费 ¥9.87（含印花税），trend 滑点 **0.0015**。这一步是必要的：`resolve_tail_slippage_ratio()` 的 `matcher` 参数要的是配置对象，先前误传 `ExecutionMatcher` 壳会**静默取到 0 滑点**，已改并留注释 |
 
 ---
 
@@ -166,6 +211,18 @@ python scripts/sync_tail_reference_data.py \
 python scripts/audit_trend_data_readiness.py \
     --db <market.duckdb> --minute-db artifacts/research/tail_minute_bars.duckdb
 
+# 3b. 从研究库重建 replayed 样本（标签侧；特征侧由调用方按同一个 as-of 契约拼接）
+python scripts/rebuild_tail_labels.py \
+    --db artifacts/research/tail_minute_bars.duckdb \
+    --requests artifacts/research/tail_requests.jsonl \
+    --labels artifacts/research/tail_replayed_labels.jsonl \
+    --report artifacts/research/tail_rebuild_report.json
+# 退出码：0=全部判得动 / 3=有请求参考数据不足（记为阻塞，单列计数，不折算成未成交）
+#        / 5=请求或研究库不可用。费用默认取 config/default.yaml 的冻结成本表；
+# 只有显式 --zero-cost 才算无费用调试标签，报告会写 cost_model=zero_cost_debug
+# 若报告里 missing_reference_inputs 含 entry_minute_bars → 分钟数据仍不足，
+# 按 §5 要求记为阻塞继续采集，**不得改用开盘回测**
+
 # 4. 覆盖度达标后跑滚动验证：≥4 折、匹配基线对照、真实退出码
 python scripts/validate_tail_selection_quality.py \
     --samples artifacts/research/tail_samples.jsonl \
@@ -207,7 +264,7 @@ embargo 核对、observed/replayed 分开计数、身份不通过就整轮不成
 
 ```text
 代码完成  ✔（含影子链路、契约、留档、页面、反馈）
-测试完成  ✔ 工程验收场景（251 + 319 passed，见 §2）
+测试完成  ✔ 工程验收场景（251 + 319 passed，见 §2；接线那一轮再 +18 → 269/270 passed，见 §2b）
 业务验证  ✘ 选股质量验收 blocked（§3：历史分钟数据覆盖度未知，且无真实标签）
 Freeze Ready  ✘ 未执行
 Production Ready ✘ 未执行；旧路径仍在服务真实推送
@@ -226,7 +283,7 @@ Production Ready ✘ 未执行；旧路径仍在服务真实推送
 | 1 | v4 净盈利标签策略**没有任何 runtime/CLI 注册入口** | `labels/tail_net_profit.py:74 tail_label_policy_record()` 的 docstring 写着"供 ``LabelPolicyRegistry.register`` 落库"，但 `grep -rn tail_label_policy_record src/` 只命中定义文件本身，调用方只有测试 | 训练与留档里的 `label_policy_id` 只能由外部给定；"新增独立标签"还没进 registry |
 | 2 | **没有按版本解释旧记录的读取器** | `scripts/record_tail_exit_funnel.py` 对 `contract_digest` 不一致直接退 5；`TailLabelRecord.from_dict` 缺任一字段即 raise；`funnel_trace.read_trace()` 是裸 JSON | 对**新**记录这是对的（不接受别的口径写证据），但计划要求的"旧记录保留原始值 + 带版本解释规则兼容"目前只有 `label_policy_v4_*` 这个名字，没有实现 |
 | 3 | `model_serving_manifest.v1` 里**没有 code commit 字段** | `build_serving_manifest` 的 payload 顶层只有 `schema`/`generated_at`/`source`/`serving`/`registry`/`authority`/`research_fail_closed`，其中不含 commit | 对着**真实**清单，尾盘身份必然 `training_commit_unknown` ⇒ 0 只（fail-closed，行为正确但链路是黑的）。要打通得先扩清单 schema —— 那是 ADR-001 的信任边界变更，需单独决策，不在本轮顺手改 |
-| 4 | ~~研究侧的参考数据没有写入通路~~ → **本轮已建**（`research/tail_reference_store.py` + `scripts/sync_tail_reference_data.py`，14 条测试）：五类来源按主键幂等落进研究库，只认 raw 日线，缺表报 `<source>_table_missing`，比例推算的上下限默认不可用 | 仍缺三件事：①在**真实** `market.duckdb` 上跑一次并留下报告；②生产库的 `security_status` 本身就是 0 行（`upsert_security_status` 零调用方），复制过来的也是空 → 这一路仍会报缺；③消费侧还没接线 —— 标签与历史重建目前不读 `execution_inputs()`，所以"涨停锁死"在纯研究库路径上仍未自证 |
+| 4 | ~~研究侧的参考数据没有写入通路~~ → **本轮已建**（`research/tail_reference_store.py` + `scripts/sync_tail_reference_data.py`，14 条测试）；~~消费侧没接线~~ → **本轮已接**（`research/tail_rebuild.py` + `scripts/rebuild_tail_labels.py`，18 条测试）：五类来源按主键幂等落进研究库，只认 raw 日线，缺表报 `<source>_table_missing`，比例推算的上下限默认不可用；重建把日级精确涨跌停/停复牌喂进分钟 bar，"涨停锁死""停牌"在纯研究库路径上已自证 | 仍缺三件事：①在**真实** `market.duckdb` 上跑一次 sync + rebuild 并留下报告（本机没有该文件，只能证明逻辑，不能证明覆盖）；②生产库的 `security_status` 本身就是 0 行（`upsert_security_status` 零调用方），复制过来的也是空 → 这一路仍会报缺；③`daily_trade_status` 表**没有 `trade_status` 列** → 真实重建全量落 `unknown_trade_status`、0 条可训练（见 §1a）。第 ③ 条是数据层来源缺口，补齐前要单独决策，本轮不顺手改状态语义 |
 | 5 | 影子链路**当日重跑没有幂等键** | `week5_automation_service.py` 的夜间扫描有 `_idempotent_night_scan`，而调用尾盘影子那条没有；`write_trace` 固定落 `funnel_trace_<date>.json` | 覆盖是确定性的（同样输入同样结果），但"今天跑过几次"不可见；60 交易日影子统计开始前应补一个运行序号或运行哈希 |
 
 第 3 条决定了另一件必须说清的事：**影子链路目前是"必然 0 只"的状态**，直到有一份

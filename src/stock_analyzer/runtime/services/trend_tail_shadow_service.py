@@ -33,6 +33,7 @@ from stock_analyzer.contracts.trend_strategy import (
     TrendContractError,
     TrendStrategyContract,
     evaluate_tail_entry,
+    hard_gate_confirmation,
     rank_final_recommendations,
 )
 from stock_analyzer.research.funnel_trace import (
@@ -114,7 +115,7 @@ class TrendTailShadowService:
                     symbol=symbol,
                     trading_day=day,
                     minute_bars=bars,
-                    confirmation=_hard_gate_confirmation,
+                    confirmation=hard_gate_confirmation,
                     contract=contract,
                     quote_as_of=timestamp,
                     model_probabilities={NET_PROFIT_PROBABILITY_FIELD: prob_map[symbol]}
@@ -548,17 +549,6 @@ def _stage(
         if identity is not None else _feature_compute_version()[0],
         label_policy_id=getattr(identity, "label_policy_id", "") if identity else "",
     )
-
-
-def _hard_gate_confirmation(context: Any) -> tuple[bool, str]:
-    """确认谓词的默认实现：**只用硬门**。
-
-    新路径不让旧综合分/等级/分歧试探决定资格（计划 §3.4）；模型分只参与最终排序。
-    有确认可用的最新价即通过硬门复核，其余判定留给 ``rank_final_recommendations``。
-    """
-    if context.latest_price_raw is None:
-        return False, "no_completed_minute_bar"
-    return True, ""
 
 
 def _apply_cap(result: Any, affordable: int) -> Any:

@@ -361,6 +361,22 @@ class TailConfirmationContext:
     contract: TrendStrategyContract
 
 
+def hard_gate_confirmation(context: TailConfirmationContext) -> tuple[bool, str]:
+    """尾盘确认的默认谓词：**只用硬门** —— 线上与历史重建共用同一个函数（§3.4/§4）。
+
+    新路径不让旧综合分、S/A 等级、分歧试探决定资格，模型分只参与最终排序
+    （见 ``rank_final_recommendations``）。这里唯一要复核的是"这个确认时点有已完成的
+    最新价"；涨停锁死、停牌、报价陈旧度、资金与风险约束都由 ``evaluate_tail_entry``
+    和调用方的门负责，谓词本身不读 ``completed`` 之外的任何数据。
+
+    放在契约模块里而不是服务的私有函数里，是因为 §4 要求"相同输入下线上与历史产生
+    一致的筛选判定"—— 两边引用同一个对象才是结构上的保证，各写一份迟早会漂。
+    """
+    if context.latest_price_raw is None:
+        return False, "no_completed_minute_bar"
+    return True, ""
+
+
 @dataclass(frozen=True)
 class TailEntryDecision:
     symbol: str
@@ -1128,6 +1144,7 @@ __all__ = [
     "ModelIdentity",
     "RankedCandidate",
     "TailConfirmationContext",
+    "hard_gate_confirmation",
     "TailEntryDecision",
     "TailExitResult",
     "TrendContractError",
