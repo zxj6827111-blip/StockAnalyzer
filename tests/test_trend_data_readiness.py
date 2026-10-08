@@ -290,7 +290,9 @@ def test_cli_writes_the_report_and_returns_the_blocking_exit_code(tmp_path) -> N
         [sys.executable, str(root / "scripts" / "audit_trend_data_readiness.py"),
          "--db", str(db_path), "--out", str(out_path)],
         cwd=str(root), capture_output=True, text=True, check=False,
-        env={"PYTHONPATH": str(root / "src"), "PATH": "/usr/bin:/bin"},
+        # **不注入 PYTHONPATH**：文档里的命令就是 `python scripts/audit_...`，
+        # 脚本必须自己能找到 src/，否则照着清单做解锁的人第一跳就崩。
+        env={"PATH": "/usr/bin:/bin"},
     )
     assert result.returncode == 5, result.stdout + result.stderr
     report = json.loads(out_path.read_text(encoding="utf-8"))

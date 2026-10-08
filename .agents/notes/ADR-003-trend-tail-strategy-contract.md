@@ -200,6 +200,8 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库>
   （`--price-basis` / `--bar-time-semantics` 无默认值，读不到就退出码 5）
 - `scripts/audit_trend_data_readiness.py --minute-db` —— 就绪门多看一个来源，
   判定标准不变
+- `docs/trend_tail_acceptance_evidence.md` —— §4 验收证据：工程验收逐场景 → 测试名，
+  以及"选股质量验收 = blocked"的实测口径（本文件不产命中率数字）
 - 测试（2026-10-08 实测条数）：`test_trend_strategy_contract.py`(55)、
   `test_tail_net_profit_label.py`(19)、`test_trend_data_readiness.py`(13)、
   `test_funnel_trace.py`(16)、`test_tail_net_profit_trainer.py`(19)、

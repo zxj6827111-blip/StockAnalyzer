@@ -1,0 +1,120 @@
+# trend 尾盘链路：§4 验收证据（As-of 2026-10-08 @ HEAD `e37e2c9`）
+
+范围只覆盖选股质量改进计划第一轮落地到 trend 的这条链路：夜扫观察池 → 次日
+14:30–14:50 尾盘确认 → 最多 3 只最终推荐 → 成交与 5 交易日退出。monster 与旧
+`runtime/service.py::_final_signal_selector` 不在本文件的主张范围内。
+
+结论先说：**工程验收已通过（下表逐场景有测试钉住）；选股质量验收仍是
+`blocked`，本文件没有、也不会给出任何命中率数字。**
+
+---
+
+## 1. 工程验收：计划列出的 13 个场景逐条对应到真实测试
+
+| 场景 | 钉住它的测试 |
+| --- | --- |
+| 时区跨日 | `test_confirmation_datetimes_are_local_to_the_trading_day`、`test_cross_day_bars_do_not_leak_into_the_tail_window` |
+| 节假日 / 非交易日 | `test_holiday_and_non_trading_day_are_not_tail_days` |
+| 尾盘窗口边界 | `test_tail_window_slots_start_inclusive_end_exclusive`、`test_live_path_never_evaluates_a_slot_that_has_not_arrived_yet`、`test_stale_live_quote_blocks_confirmation_instead_of_using_old_bar` |
+| 确认后成交（下一根，不吃确认槽本身） | `test_fill_uses_the_next_completed_bar_after_confirmation_not_the_slot_bar`、`test_confirmation_never_reads_an_unfinished_bar` |
+| 涨 / 跌停 | `test_limit_up_locked_fill_is_no_fill`、`test_limit_up_locked_entry_is_recorded_as_no_fill`（链路级）、`test_unsellable_exit_day_defers_and_maturity_is_the_actual_exit`、`test_missing_price_or_limit_data_fails_closed_without_guessing` |
+| 停牌 | `test_suspended_fill_bar_is_no_fill_but_not_a_loss`、`test_halt_code_in_trade_status_blocks_the_buy`、`test_halted_exit_day_defers_instead_of_assuming_a_sell`、`test_missing_trade_status_is_not_read_as_suspension`、`test_missing_bar_is_not_reported_as_suspension` |
+| T+1 | `test_no_tp_or_sl_can_trigger_on_the_entry_day_because_of_t_plus_1`、`test_entry_on_or_before_decision_day_is_rejected` |
+| 跳空止损 | `test_gap_down_stop_exit_uses_the_open_not_the_stop_level` |
+| 同根双触发 | `test_double_trigger_same_bar_resolves_to_stop_loss_first` |
+| 未成熟 / 顺延 / 数据末尾 | `test_unsellable_exit_day_defers_and_maturity_is_the_actual_exit`、`test_defer_window_exhaustion_does_not_fake_a_successful_exit`、`test_series_end_before_plan_exit_is_uncertain_not_realized_profit`、`test_immature_exit_stays_uncertain_without_a_label`、`test_undeclared_trade_status_is_uncertain_fail_closed`、`test_uncalculable_corporate_action_is_uncertain` |
+| 最低佣金 / 申报数量 / 成本日期版本 | `test_minimum_commission_applies_on_a_10k_notional_order`、`test_reference_notional_below_one_lot_is_no_fill`、`test_cost_schedule_is_date_versioned_and_reports_provenance`、`test_net_return_charges_both_sides_of_cost`、`test_engine_and_label_share_one_cost_authority` |
+| 特征 / 数据缺失 | `test_missing_feature_snapshot_is_a_visible_caveat`、`test_missing_minute_bars_are_reported_not_replaced_by_open_price`、`test_malformed_probability_is_dropped_not_coerced_to_zero`、`test_missing_limit_prices_stay_visible_instead_of_being_filled`、`test_index_gap_is_insufficient_not_zero_filled` |
+| 模型身份异常 | `test_model_identity_violations_produce_zero_recommendations`、`test_missing_model_identity_fails_closed`、`test_serving_model_from_another_label_policy_is_not_usable`、`test_missing_serving_manifest_is_visible_not_defaulted` |
+
+**相同输入下线上与历史路径必须给出一致的筛选与交易判定**（对应发布清单 R15）分两层钉住：
+
+- 入场判定层：`test_live_and_history_paths_agree_on_identical_input`。
+- 链路层：`test_live_and_history_chain_paths_agree_on_identical_bars` —— 同一批分钟 bar
+  与同一组概率，比较 `final_symbols`、漏斗计数、拒绝原因、成交数量/金额/成交时刻；
+  显式**不**比 `trace_digest`，因为两条路径的数据时间本来就不同（线上=时钟 14:45，
+  历史=最后一根已完成 bar 14:44），这一点由
+  `test_history_mode_stamps_the_explicit_trade_date` 钉住。
+
+---
+
+## 2. 本轮真实执行过的命令与结果
+
+| 命令 | 结果 |
+| --- | --- |
+| `pytest tests/test_trend_strategy_contract.py tests/test_trend_tail_shadow_runtime.py tests/test_trend_tail_page_and_feedback.py tests/test_minute_bar_store.py tests/test_funnel_trace.py tests/test_tail_net_profit_label.py tests/test_trend_data_readiness.py tests/test_tail_net_profit_trainer.py tests/test_trend_candidate_contract.py -q` | **194 passed**（条数：55/19/25/15/16/19/13/19/13） |
+| `pytest tests -k "week5 or live_runtime or automation" -q` | **103 passed**（影子接线未破坏既有自动化链） |
+| `ruff check` 本分支 8 个源文件 + 3 个测试文件 | All checks passed |
+| `ruff check src tests`（仓库全量） | 48 errors —— 全部落在分支未触碰的文件，属既有基线 |
+| `mypy --python-version 3.12` 本分支 8 个源文件 | 剩 **2** errors，均在 `models/tail_net_profit_trainer.py:245/248` 的 LightGBM 注入点（运行时已由 `native booster trainer is unavailable` 硬门拦住，纯类型噪声）；本分支其余文件的 12 个已在本轮清掉 |
+| `python scripts/run_quality_gate.py --stage clean-scope --fail-on-error` | `blocking_failures = ["mypy_blocking"]`，**不是本分支引入**：报错是 `.venv` 里 numpy stub 的 `Type statement is only supported in Python 3.12 and greater`，而 `pyproject.toml` 钉 `python_version = "3.11"`，mypy 在检查任何项目文件之前就终止（"errors prevented further checking"）。同一命令加 `--python-version 3.12` 后，那 4 个目标文件（均非本分支文件）只剩 1 个既有 `var-annotated`。 |
+
+| `env -u PYTHONPATH python scripts/audit_trend_data_readiness.py --help` | 正常输出用法。本轮修掉了一个真实缺陷：该 CLI 缺 `src/` 路径自举，照本文件 §3 的命令去做解锁的人第一跳就是 `ModuleNotFoundError`；测试原来靠注入 `PYTHONPATH` 掩盖了它，现已改为不注入。 |
+
+未执行、因此不主张：`--stage full`、freeze、Production Preflight、任何生产部署。
+
+---
+
+## 3. 选股质量验收：当前状态 = blocked（不是"通过"，也不是"失败"）
+
+计划要求：按交易日滚动训练/校准/测试、标签在后续阶段开始前真实成熟、**≥4 个测试折**、
+净盈利率较匹配基线提升 ≥5pp 且分块 bootstrap CI 下界 > 0、平均净收益为正、尾部不明显
+恶化，然后 **≥60 个完整交易日 + ≥100 笔成熟模拟成交** 的未来影子验证。
+
+阻塞原因是数据可得性，不是代码：
+
+1. 落库的分钟行情只有日级聚合（`intraday_summary_1m/5m` 没有 bar 时刻列），
+   14:30–14:50 的逐 5 分钟确认与"确认后下一根成交"**无法从历史库重建**。
+   时刻信息在 vendor 分钟包里是存在的，是聚合步骤把它丢掉了 —— 所以这是持久化选择，
+   不是数据不可得。已补：`research/minute_bar_store.py` + `scripts/sync_tail_minute_bars.py`
+   + `audit_trend_data_readiness.py --minute-db`。
+2. 本机上没有任何真实 vendor 分钟包，因此**历史覆盖度至今未被测量过**。
+3. `p_net_profit_5d_tail` 目前**没有生产者**：影子链路逐日写下的阻塞原因是
+   `no_tail_probability_available` 与 `minute_bars_unavailable`，这是事实而非待填的空格。
+
+解锁顺序（每条命令都真实存在）：
+
+```bash
+# 1. 本地把带时刻的分钟行情落到独立研究库（不碰生产仓、不上 NAS 调度）
+python scripts/sync_tail_minute_bars.py --root <vendor 分钟包目录> \
+    --out artifacts/research/tail_minute_bars.duckdb \
+    --start 2024-01-01 --end 2026-09-30 \
+    --price-basis raw --bar-time-semantics bar_start
+
+# 2. 测量覆盖度；readiness 仍是 blocked 就不要往下走
+python scripts/audit_trend_data_readiness.py \
+    --db <market.duckdb> --minute-db artifacts/research/tail_minute_bars.duckdb
+
+# 3. 覆盖度达标后再谈折数与命中率
+```
+
+第 2 步未达标时的处理方式是计划里定死的：**尾盘策略验证明确记为阻塞、继续采集，
+不得用开盘价回测顶替**（`contracts/trend_strategy.py` 对
+`execution_price_basis != "raw"` 与开盘入场语义直接 raise）。
+
+---
+
+## 4. 本文件明确不主张的事
+
+- **0.60 是初始选股规则，不是已证明 60% 命中率。** 没有任何 observed 样本支撑该数字。
+- **bronze 样本占比没有被认定为当前生产模型的根因**；根因清单里它是假设，
+  见 `.agents/notes/NOTE-002-selection-quality-root-causes.md`。
+- 旧完整链路在同一天**没有可比成交样本**，因此"较旧链路提升 X pp"当前无法计算，
+  也不得伪造。
+- `runtime/service.py::_final_signal_selector`、`backtest/holding_curve.py` /
+  `AsofBacktestConfig` 仍是旧开盘口径，**未被尾盘链路背书**，也未接线。
+- 自动学习只产出 challenger；正式模型更新必须走验证 + 人工发布
+  （`tail_mature_feedback.py` 的 `promotion` 字段是写死的人工票据串）。
+
+---
+
+## 5. 当前完成度层级
+
+```text
+代码完成  ✔（含影子链路、契约、留档、页面、反馈）
+测试完成  ✔ 工程验收场景（194 + 103 passed，见 §2）
+业务验证  ✘ 选股质量验收 blocked（§3：历史分钟数据覆盖度未知，且无真实标签）
+Freeze Ready  ✘ 未执行
+Production Ready ✘ 未执行；旧路径仍在服务真实推送
+已部署生产    ✘ 本轮没有任何生产动作
+```

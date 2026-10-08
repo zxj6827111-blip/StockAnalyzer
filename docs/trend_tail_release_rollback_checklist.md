@@ -88,6 +88,8 @@ As-of: 2026-10-08 @ HEAD `6900e3a`（分支 `feat/stock-selection-quality-overha
   如实报 `baseline_has_no_fill_samples`，**不得伪造命中率**。
 - **成熟度**：逐 horizon 报 n；9 月下旬信号的 5/10 日持有期在数据不足时不得计入。
 - **上线判据**：见 §1 R11 + R12。证据不足就保持影子状态。
+- **当前实测状态**：R11/R12 **未执行**（历史分钟覆盖度未知），逐场景证据见
+  `docs/trend_tail_acceptance_evidence.md`。
 
 ## 5. 阈值 0.60 的说明
 

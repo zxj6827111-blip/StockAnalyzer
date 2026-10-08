@@ -2,6 +2,9 @@
 
 用途：在训练/回测之前先回答"这套数据能不能支撑 14:30-14:50 尾盘契约的成交模拟"。
 只读探测，不改任何库；退出码 0=ready / 3=insufficient / 5=blocked（真实退出码）。
+
+``--minute-db`` 指向 ``scripts/sync_tail_minute_bars.py`` 的产物：仓库里的分钟表只有
+日级聚合，尾盘窗口能不能重建取决于这个研究库里有没有带时刻的 bar。
 """
 
 from __future__ import annotations
@@ -13,7 +16,12 @@ from pathlib import Path
 
 import duckdb
 
-from stock_analyzer.research.trend_data_readiness import (
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_SRC = _PROJECT_ROOT / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+from stock_analyzer.research.trend_data_readiness import (  # noqa: E402
     audit_trend_data_readiness,
     format_blocking_gaps,
     readiness_exit_code,
