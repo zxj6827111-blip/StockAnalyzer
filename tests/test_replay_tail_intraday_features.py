@@ -144,6 +144,25 @@ def test_attribution_follows_contract_order_not_dict_insertion() -> None:
     assert turn_first["excluded_reasons"] == low_first["excluded_reasons"]
 
 
+def test_symbols_file_facts_records_the_universe_input_provenance(tmp_path: Path) -> None:
+    """`universe` 层的输入是这份符号清单，不是全市场 —— 必须能复现它是哪一份。
+
+    仓库里没有产生这份清单的代码，所以"全市场→硬性资格检查"这层无法追溯；
+    至少要记下路径、字节摘要与数量，否则整条链的输入不可复现。
+    """
+    import hashlib
+
+    file = tmp_path / "pool.txt"
+    file.write_text("# 注释行\n600000\n000001\n300750\n", encoding="utf-8")
+    facts = replay.symbols_file_facts(file)
+    assert facts["symbols_count"] == 3
+    assert facts["sha256"] == hashlib.sha256(file.read_bytes()).hexdigest()
+    assert facts["producer"] == "unknown_not_recorded_in_repo"
+    # 摘要必须随内容变：只记路径等于什么都没记（清单会被就地改）。
+    file.write_text("600000\n", encoding="utf-8")
+    assert replay.symbols_file_facts(file)["sha256"] != facts["sha256"]
+
+
 def test_every_name_the_replay_can_emit_is_a_declared_hard_rule() -> None:
     """重放真正会写进留档的名字（``daily_gates`` 的键 + PIT 原因）必须全在 HARD 词表里。
 

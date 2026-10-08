@@ -31,6 +31,7 @@ python scripts/replay_tail_candidate_pool.py \\
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from collections.abc import Iterable, Mapping, Sequence
@@ -277,6 +278,26 @@ def load_intraday_features(minute_db: str | Path, start: date, end: date) -> pd.
     return frame[["symbol", "date", "last30_volume_share", "tail_volatility_ratio"]]
 
 
+def symbols_file_facts(path: Path | str) -> dict[str, Any]:
+    """符号清单的**来源留痕**：漏斗 `universe` 层的输入就是这份清单，不是全市场。
+
+    仓库里没有产生它的代码（只有三个脚本消费它），所以"全市场→硬性资格检查"这层目前
+    无法追溯；至少要把"用的是哪 900 只、哪个字节内容"记进报告，否则整条链的输入不可复现。
+    """
+    file = Path(str(path)).expanduser()
+    raw = file.read_bytes()
+    symbols = [
+        line.strip() for line in raw.decode("utf-8").splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    return {
+        "path": str(file),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "symbols_count": len(symbols),
+        "producer": "unknown_not_recorded_in_repo",
+    }
+
+
 def _universe_fact(
     *,
     decision_date: date,
@@ -513,6 +534,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "feature_contract_version": TREND_FEATURE_CONTRACT_VERSION,
         "warehouse": str(warehouse),
+        "universe_input_provenance": symbols_file_facts(args.symbols_file),
         "benchmark_code": str(args.benchmark_code),
         "benchmark_available": bool(not benchmark.empty),
         "benchmark_last_date": (

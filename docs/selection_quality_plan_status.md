@@ -103,6 +103,14 @@ As-of: 2026-10-08 @ HEAD `b33b581`（分支 `feat/stock-selection-quality-overha
      "没有声明"，不是"没发生停牌"；§4 的"停牌"一项只能记为"代码路径+单测，历史无样本"。
      要补的是：按池内符号单独拉 `suspend_d` 的 S 类记录，或把 `ref_security_status`
      的上市/退市区间接进重放硬门；影子期则把线上判为停牌/停更的 symbol-day 攒起来反验。
+   - **漏斗第一层的输入不是全市场，且其来源不可复现**（本轮实测，见质量报告 §3e）：
+     归档 `universe` 层每天输入 894~900 只，而仓库里当天有行情的股票是 **5,135~5,186 只**；
+     那 900 只来自研究侧清单 `artifacts/research/tail_symbols.txt`，**仓库内没有产生它的代码**。
+     另有 229 个 symbol-day（94×900=84,600 与归档 84,371 之差）当天无 bar，既没算进输入
+     也没算进淘汰。所以 §2 的第一个问题"前置筛选是否过早淘汰"仍未回答。
+     本轮已做的：重放报告新增 `universe_input_provenance`（路径 + sha256 + 数量 +
+     `producer=unknown_not_recorded_in_repo`），并钉住"改一个字节摘要就变"。
+     要补的：换成可证的 PIT 全集（指数成分或 `stock_basic` 全量 + 上市区间）再重跑历史侧。
    - 带时刻的尾盘分钟行情与 `daily_trade_status` 两项**本轮已解决**：
      分钟 bar 从 vendor `Stock_1min_2000-now` 落进独立研究库（6,464,825 行 / 129 交易日），
      可交易状态由"当天确有成交的 RAW 日线"正向声明，精确涨跌停从 `stk_limit` 补采。
