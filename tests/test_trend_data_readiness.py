@@ -368,6 +368,15 @@ def _ready_conn() -> duckdb.DuckDBPyConnection:
     _seed_index(conn)
     _statuses(conn)
     _seed_minute_bars(conn)
+    # "已经就绪"的仓库必须有这两条硬门的输入列，而且列里要有横截面分布：
+    # 缺列 ⇒ 门根本跑不了；常数填充 ⇒ 门"在跑"却永不淘汰（2026-10-08 的
+    # float_market_cap=1.2e10 事故）。fixture 不该默认长成这两种坏样本。
+    conn.execute("ALTER TABLE daily_bars ADD COLUMN IF NOT EXISTS float_market_cap DOUBLE")
+    conn.execute("ALTER TABLE daily_bars ADD COLUMN IF NOT EXISTS turnover DOUBLE")
+    conn.execute(
+        "UPDATE daily_bars SET float_market_cap = 1e9 + (rowid % 400) * 2.5e7, "
+        "turnover = 1e7 + (rowid % 400) * 3.7e6"
+    )
     return conn
 
 
@@ -608,3 +617,38 @@ def test_truncated_name_history_stays_insufficient_with_a_reason(tmp_path) -> No
     assert "10,000" in check["note"]
     assert "security_status_intervals" in report["insufficient_items"]
     assert report["blocking_gaps"] == []
+
+
+def test_constant_filled_numeric_column_is_flagged_not_usable() -> None:
+    """常值填充不是缺失：只有取值集中度查得出来（2026-10-08 float_market_cap=1.2e10 事故）。
+
+    硬门阈值是按同一列取横截面分位算的，列被填成常数 ⇒ 阈值 = 众数 ⇒ 这条门那天
+    对任何行都不淘汰，留档却读起来像"没有一只票不达标"。
+    """
+    conn = _ready_conn()
+    conn.execute("UPDATE daily_bars SET float_market_cap = 12000000000")
+    report = audit_trend_data_readiness(connection=conn)
+    checks = _by_name(report)
+
+    flagged = checks["column_concentration_float_market_cap"]
+    assert flagged["status"] == "insufficient"
+    assert flagged["detail"]["days_over_modal_share"] > 0
+    assert flagged["detail"]["modal_value"] == 12000000000
+    assert flagged["detail"]["worst_modal_share"] == 1.0
+    assert "column_concentration_float_market_cap" in report["insufficient_items"]
+    # 同表里分布正常的列不该被牵连
+    assert checks["column_concentration_turnover"]["status"] == "ok"
+
+
+def test_column_concentration_check_stays_silent_when_the_column_is_absent() -> None:
+    """列缺失不在这里报：那条输入一缺，重放与硬门会直接报错，是响的。
+
+    这条检查专门抓**跑得动却永远不淘汰**的静默失效（常数填充），
+    所以只有列存在时才出结论；缺列由调用路径自己失败，不由这里替它下"不足"的判断。
+    """
+    conn = _ready_conn()
+    conn.execute("ALTER TABLE daily_bars DROP COLUMN float_market_cap")
+    report = audit_trend_data_readiness(connection=conn)
+    names = set(_by_name(report))
+    assert "column_concentration_float_market_cap" not in names
+    assert "column_concentration_turnover" in names

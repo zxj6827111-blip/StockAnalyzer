@@ -50,6 +50,14 @@ MIN_DAILY_ROWS_PER_DAY = 500
 #: 尾盘窗口需要覆盖到的分钟数：14:30-14:50 每 5 分钟一个确认点，成交还要窗口后一根。
 MIN_TAIL_BARS_PER_DAY = 4
 
+#: 单个交易日内，数值列被填成同一个常值的比例上限。超过它说明这条列那天**没有判别力**：
+#: 硬门阈值是按同一列取横截面分位算出来的，列成常数 ⇒ 阈值 = 众数 ⇒ 门"在跑"却永远不淘汰，
+#: 留档里读起来就像"没有一只票不达标"。2026-10-08 实测 `float_market_cap` 从 3 月中旬起
+#: 被填成 12,000,000,000（4 月 21/21 天、5 月 18/18 天 >90% 的行等于该值）就是这一类。
+#: 它是**非零常数**，所以所有防 NaN/防填零的逻辑都不会报警，必须单独查取值集中度。
+MAX_MODAL_VALUE_SHARE = 0.50
+CONCENTRATION_GUARDED_COLUMNS = ("float_market_cap", "turnover")
+
 BAR_TIME_COLUMNS = ("bar_time", "end_time", "datetime", "trade_time", "timestamp", "time")
 
 MINUTE_TABLES = {
@@ -103,6 +111,56 @@ class _Probe:
             return []
 
 
+def _audit_column_concentration(
+    probe: _Probe, table: str | None, *, max_share: float = MAX_MODAL_VALUE_SHARE
+) -> list[ReadinessCheck]:
+    """按列检查取值集中度：常数填充不是缺失，只有集中度查得出来。
+
+    只对**存在**的列出结论。列缺失不报这里：那条输入一旦缺了，重放与硬门会直接
+    KeyError / 报错，是响的；这条检查专门抓"跑得动但永远不淘汰"的静默失效。
+    """
+    if table is None:
+        return []
+    columns = probe.columns(table)
+    date_column = _pick(columns, ("date", "trade_date"))
+    checks: list[ReadinessCheck] = []
+    if date_column is None:
+        return []
+    for column in CONCENTRATION_GUARDED_COLUMNS:
+        name = f"column_concentration_{column}"
+        if column not in columns:
+            continue
+        days, over_threshold, worst = (probe.rows(
+            f"WITH per_value AS (SELECT {date_column} AS d, {column} AS v, COUNT(*) AS c "
+            f"FROM {table} WHERE {column} IS NOT NULL GROUP BY 1, 2), "
+            f"per_day AS (SELECT d, SUM(c) AS n, MAX(c) AS modal_c FROM per_value GROUP BY 1) "
+            f"SELECT COUNT(*), "
+            f"SUM(CASE WHEN modal_c * 1.0 / n > {max_share} THEN 1 ELSE 0 END), "
+            f"MAX(modal_c * 1.0 / n) FROM per_day"
+        ) or [((0, 0, None),)])[0]
+        modal_row = (probe.rows(
+            f"SELECT {column}, COUNT(*) AS c FROM {table} "
+            f"WHERE {column} IS NOT NULL GROUP BY 1 ORDER BY c DESC LIMIT 1"
+        ) or [((None, 0),)])[0]
+        detail = {
+            "table": table,
+            "column": column,
+            "trade_days": int(days or 0),
+            "days_over_modal_share": int(over_threshold or 0),
+            "worst_modal_share": round(float(worst), 4) if worst is not None else None,
+            "modal_value": modal_row[0],
+            "modal_share_limit": max_share,
+        }
+        checks.append(ReadinessCheck(
+            name,
+            STATUS_OK if not detail["days_over_modal_share"] else STATUS_INSUFFICIENT,
+            detail,
+            "超过上限的那天这条列没有判别力：以它为阈值的硬门不许被当成『已通过』，"
+            "以它为特征的列那天不算有效信息",
+        ))
+    return checks
+
+
 def _pick(existing: Mapping[str, Any] | set[str], candidates: tuple[str, ...]) -> str | None:
     for candidate in candidates:
         if candidate in existing:
@@ -150,6 +208,7 @@ def audit_trend_data_readiness(
                        if reference_connection is not None else None)
     bars_table = _pick(tables, ("daily_bars", "stock_daily", "daily"))
     checks.append(_audit_daily_bars(probe, bars_table, min_rows_per_day))
+    checks.extend(_audit_column_concentration(probe, bars_table))
     checks.append(_audit_price_mode(probe, bars_table, reference_probe))
     checks.append(_audit_limit_prices(probe, bars_table, tables))
     checks.append(_audit_trade_status(probe, bars_table, tables))
