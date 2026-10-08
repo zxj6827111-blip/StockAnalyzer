@@ -157,7 +157,7 @@ def build_features(panel: pd.DataFrame, benchmark: pd.DataFrame) -> pd.DataFrame
     )
     bench = bench_indexed
     groups = []
-    for symbol, rows in frame.groupby("symbol", sort=True):
+    for _symbol, rows in frame.groupby("symbol", sort=True):
         rows = rows.sort_values("date").reset_index(drop=True)
         close = rows["close"].astype(float)
         ret_1 = close.pct_change()
@@ -204,7 +204,8 @@ def build_features(panel: pd.DataFrame, benchmark: pd.DataFrame) -> pd.DataFrame
             rows["volume"].astype(float), 5
         ).mean()
         rows["avg_turnover_20"] = _rolling(rows["turnover"].astype(float), 20).mean()
-        rows["amount_to_float_cap"] = rows["turnover"] / rows["float_market_cap"].replace(0.0, np.nan)
+        cap = rows["float_market_cap"].replace(0.0, np.nan)
+        rows["amount_to_float_cap"] = rows["turnover"] / cap
         rows["positive_bar_ratio"] = _rolling((close > rows["open"]).astype(float), 20).mean()
         tr = (rows["high"] - rows["low"]).astype(float)
         rows["atr14_pct"] = _rolling(tr, 14).mean() / close
@@ -229,7 +230,9 @@ def trading_calendar(engineered: pd.DataFrame) -> list[date]:
     return sorted(set(engineered["date"].tolist()))
 
 
-def daily_gates(rows: pd.DataFrame, *, min_turnover: float, min_float_cap: float) -> dict[str, tuple[str, ...]]:
+def daily_gates(
+    rows: pd.DataFrame, *, min_turnover: float, min_float_cap: float
+) -> dict[str, tuple[str, ...]]:
     """只用契约里已登记为 hard_gate 的规则名。
 
     布尔列在仓库里可空：NULL 一律按"没有停牌/ST 声明"处理（不当真、也不报错），
