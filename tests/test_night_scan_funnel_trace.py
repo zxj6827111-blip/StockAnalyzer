@@ -256,6 +256,9 @@ def test_universe_layers_refuse_a_day_whose_gate_input_is_a_constant() -> None:
     assert len(build_universe_stage_traces(
         universe=universe, data_as_of="2026-04-01", contract=DEFAULT_TREND_CONTRACT,
     )) == 2
+
+
+def test_universe_layers_refuse_counts_only_inputs_and_merge_in_order() -> None:
     from stock_analyzer.research.night_scan_funnel_trace import (
         build_universe_stage_traces,
     )
