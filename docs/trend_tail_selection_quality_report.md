@@ -636,6 +636,17 @@ token 只按变量名从环境变量读、取值不落任何产物）：
 每条留档带 11 个判定输入列（`features_used`）与两条版本串
 （`feature_compute_version=trend_asof_v1`、`float_cap_interpretation=unproven_float_cap_placeholder_v1`）。
 
+把窗口铺到污染窗口整季（`mw_{mar,apr,may}_report.json`）：**58 个决策日全部落档、
+`verify_trace()` 0 失败**（3 月 21 天 / 4 月 20 天 / 5 月 17 天，
+`funnel_traces_marketwide_{mar,apr,may}/`）。按契约归因顺序聚合的第一条命中原因：
+`min_avg_turnover_20` 88,314、`min_float_market_cap` 6,831、
+`insufficient_history_at_asof` 2,101、`is_st` 1,738、`overextension_risk` 363、
+`board_eligibility` 24、`stale_market_data` 1 —— 5 月原本是全月只剩占位常数的那段，
+换上真值后市值门在 17 个决策日里逐只淘汰了 2,412 只（该月 `min_float_market_cap` 计数），
+不再出现"整天一个都不淘汰"。requests 侧同窗口产出 **17,400 条**
+（symbol/decision_date/entry_date/overnight_features/capture_mode=replayed_recompute），
+是全市场标签重建的输入。
+
 同一口径把三月整月跑通（`mw_mar_report.json`）：21 个决策日、
 `days_with_non_evaluable_gate_inputs` 为空、**21/21 天全部落档**
 （`funnel_traces_marketwide_mar/`），逐原因淘汰合计
