@@ -230,6 +230,46 @@ def trading_calendar(engineered: pd.DataFrame) -> list[date]:
     return sorted(set(engineered["date"].tolist()))
 
 
+#: 日内两列的真算口径：尾盘最后 30 分钟（14:30–15:00）相对全天的量占比与波动比。
+#: 这两列在契约里本来就有（volume_liquidity / volatility_overheat 两组），
+#: 此前只有日频源时**只能留 NaN**；分钟库就位后才第一次真的算得出来。
+_INTRADAY_FEATURE_SQL = """
+WITH bars AS (
+    SELECT symbol, trade_date, bar_time, volume, close,
+           LAG(close) OVER (PARTITION BY symbol, trade_date ORDER BY bar_time) AS prev_close,
+           CASE WHEN strftime(bar_time, '%H:%M') >= '14:30' THEN 1 ELSE 0 END AS is_tail
+    FROM minute_bars_1min
+    WHERE trade_date BETWEEN ? AND ?
+)
+SELECT symbol AS symbol,
+       trade_date AS date,
+       SUM(CASE WHEN is_tail = 1 THEN volume ELSE 0.0 END)
+         / NULLIF(SUM(volume), 0.0) AS last30_volume_share,
+       STDDEV_SAMP(CASE WHEN is_tail = 1 AND prev_close > 0 THEN close / prev_close - 1.0 END)
+         / NULLIF(STDDEV_SAMP(CASE WHEN prev_close > 0 THEN close / prev_close - 1.0 END), 0.0)
+           AS tail_volatility_ratio
+FROM bars
+GROUP BY symbol, trade_date
+"""
+
+
+def load_intraday_features(minute_db: str | Path, start: date, end: date) -> pd.DataFrame:
+    """从独立研究库的分钟 bar 聚合出日内两列；库不可用时返回空帧（调用方保持 NaN）。"""
+    path = Path(str(minute_db)).expanduser()
+    if not path.exists():
+        return pd.DataFrame()
+    con = duckdb.connect(str(path), read_only=True)
+    try:
+        frame = con.execute(_INTRADAY_FEATURE_SQL, [start, end]).fetch_df()
+    finally:
+        con.close()
+    if frame.empty:
+        return frame
+    frame["date"] = pd.to_datetime(frame["date"]).dt.date
+    frame["symbol"] = frame["symbol"].astype(str).str.split(".").str[0].str.zfill(6)
+    return frame[["symbol", "date", "last30_volume_share", "tail_volatility_ratio"]]
+
+
 def daily_gates(
     rows: pd.DataFrame, *, min_turnover: float, min_float_cap: float
 ) -> dict[str, tuple[str, ...]]:
@@ -277,6 +317,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise SystemExit("no daily bars in the requested window — 先确认符号清单与仓库路径")
     benchmark = load_benchmark(warehouse, args.benchmark_code, start, end)
     engineered = build_features(panel, benchmark)
+    # 日内两列：分钟库就位就真算，拿不到就整列不出现在帧里（不是填 0、也不是留 NaN 占位）。
+    engineered = engineered.drop(
+        columns=[name for name in NOT_REPRODUCIBLE_AT_DAILY if name in engineered.columns]
+    )
+    intraday = (
+        load_intraday_features(args.minute_db, start - timedelta(days=380), end)
+        if str(args.minute_db or "").strip()
+        else pd.DataFrame()
+    )
+    intraday_columns: list[str] = []
+    if not intraday.empty:
+        engineered = engineered.merge(intraday, on=["symbol", "date"], how="left")
+        intraday_columns = [
+            name for name in NOT_REPRODUCIBLE_AT_DAILY if name in engineered.columns
+        ]
     calendar = trading_calendar(engineered)
     availability_stale = benchmark.empty or (
         (end - benchmark["trade_date"].max()).days > args.max_benchmark_staleness_days
@@ -394,7 +449,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "overextension_range_position_60": OVEREXTENSION_RANGE_POSITION,
             "overextension_atr14_pct": OVEREXTENSION_ATR_PCT,
         },
-        "not_reproducible_at_daily": list(NOT_REPRODUCIBLE_AT_DAILY),
+        "not_reproducible_at_daily": [
+            name for name in NOT_REPRODUCIBLE_AT_DAILY if name not in intraday_columns
+        ],
+        "intraday_feature_columns": sorted(intraday_columns),
         "old_chain_ordering_available": False,
         "old_chain_ordering_note": (
             "历史归档里没有当时的 composite_score/等级，旧排序对照无法在重放段上做；"
@@ -416,6 +474,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--warehouse", required=True)
     parser.add_argument("--symbols-file", required=True)
+    parser.add_argument(
+        "--minute-db",
+        default="",
+        help="独立研究库（分钟 bar）；给了才能真算契约里的日内两列",
+    )
     parser.add_argument("--start", required=True, help="YYYY-MM-DD")
     parser.add_argument("--end", required=True, help="YYYY-MM-DD")
     parser.add_argument("--requests", required=True)

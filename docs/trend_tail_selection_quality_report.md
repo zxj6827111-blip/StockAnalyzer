@@ -17,6 +17,7 @@ As-of: 2026-10-08 @ HEAD `a53032a`（分支 `feat/stock-selection-quality-overha
 | 带时刻分钟 bar | vendor `Stock_1min_2000-now/2026-0{1..7}*.zip` → `minute_bars_1min` | **6,464,825 行 / 208 符号 / 129 交易日**，尾盘窗口 26,825/26,825 完整 |
 | 标签重建 | `scripts/rebuild_tail_labels.py` | 5,613 条标签记录（`capture_mode=replayed_recompute`） |
 | 样本拼装 | `scripts/assemble_tail_samples.py` | 5,613 条（特征快照 + 标签同一行） |
+| 四组特征真算 | `replay_tail_candidate_pool.py --minute-db` | 33 列全部由行情算出，日内两列来自分钟库；2,742 条已打标样本里 11 条（0.4%）取不到值被排除并留痕 |
 
 滚动验证由 `scripts/validate_tail_selection_quality.py` 执行；**折内训练与校准的
 真实判定见 §3**。
@@ -37,15 +38,30 @@ As-of: 2026-10-08 @ HEAD `a53032a`（分支 `feat/stock-selection-quality-overha
 
 ## 3. ≥4 折滚动训练：门在这里停机，不产出命中率
 
-`validate_tail_selection_quality.py`（LR 基线、4 折、独立校准段）：
+`validate_tail_selection_quality.py`（LR 基线、4 折、独立校准段）。
+这一轮四组特征**第一次全部真算得出来**：`replay_tail_candidate_pool.py --minute-db`
+从独立研究库的 1 分钟 bar 聚合出契约里的日内两列
+（`last30_volume_share` = 14:30 后成交量占全天比，`tail_volatility_ratio` = 尾盘 1 分钟
+收益标准差 / 全天标准差），此前这两列只能留 NaN，`volatility_overheat` 组因此跑不完。
 
-| 特征配置 | 校准窗口 raw AUC | 结果 |
-| --- | --- | --- |
-| 四组合并（30 列） | 0.4990 | `TailTrainingError` → 停机 |
-| market_relative | 0.3657 | 停机（方向为负） |
-| trend_position | 0.4629 | 停机 |
-| volume_liquidity | 0.4744 | 停机 |
-| volatility_overheat | — | 训练矩阵遇 null → `TypeError`（该组内 `close_position` 有 11 条空值，验证器拒绝填零） |
+| 特征配置 | 列数 | 校准窗口 raw AUC | 结果 |
+| --- | --- | --- | --- |
+| market_relative | 9 | 0.3657 | `TailTrainingError` 停机（方向为负） |
+| trend_position | 9 | 0.4629 | 停机（方向为负） |
+| volume_liquidity | 7 | 0.4462 | 停机（方向为负） |
+| volatility_overheat | 8 | 0.4996 | 停机（方向为负，此前会崩在 null 上） |
+| 四组合并 | 33 | 0.4680 | 停机（方向为负） |
+
+五个配置全部 < 0.5，即在同一批成熟标签上，这四类信息在校准窗里**不是没信号，
+而是方向反了**。这与 §2、§4 的读数一致：2026-01~05 这段窗口里，追强、追趋势位置、
+追流动性的排序平均净收益都是负的。
+
+**特征缺失的处理口径**（§4 工程验收"特征缺失"项）：33 列 × 2,742 条已打标样本里
+只有 11 条（0.4%）在 `close_position` / `tail_volatility_ratio` 上取不到值。
+训练器现在把这类样本**排除并留痕**，而不是崩栈、也不是填 0：
+`artifact["feature_completeness"] = {rows_excluded, rows_trainable, per_column, zero_filled: False}`；
+整列不可用（100% 缺失）才算数据源故障，直接 `raise`。修之前这两条路径都不成立——
+它在 `float(None)` 上抛裸 `TypeError`，既没有数字也没有归因。
 
 **这是 §3.3 要求的行为**："新模型原生训练或身份验证失败时停止，不静默切换替代模型"，
 训练器宁可不输出也不产出一个塌缩概率模型。因此本轮**没有** 4 折命中率数字，

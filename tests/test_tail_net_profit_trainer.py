@@ -218,6 +218,59 @@ def test_unlabelled_or_single_class_input_stops() -> None:
         )
 
 
+def test_feature_incomplete_rows_are_excluded_and_reported_never_zero_filled() -> None:
+    """特征缺失（计划 §4 工程验收项）：不进训练、不填 0，但每个缺失都要留痕。
+
+    修之前它崩在 ``float(None)`` 上抛裸 ``TypeError``，整段训练没有结果也没有归因；
+    填 0 更糟——0 会被模型当成真实观测值（§3.1「缺失不能被填零后当成有效信息」）。
+    """
+    days = _weekdays(90)
+    rows = _rows(days)
+    null_slots = set(range(0, len(rows), 37))
+    nan_slots = set(range(5, len(rows), 41))
+    for index in null_slots:
+        rows[index][FEATURES[1]] = None
+    for index in nan_slots:
+        rows[index][FEATURES[2]] = float("nan")
+
+    artifact = train_tail_net_profit_model(
+        rows=rows, feature_names=FEATURES, **_identity_kwargs(),
+    )
+
+    completeness = artifact["feature_completeness"]
+    assert completeness["zero_filled"] is False
+    assert completeness["rows_excluded"] == len(null_slots | nan_slots)
+    assert completeness["per_column"] == {FEATURES[1]: len(null_slots), FEATURES[2]: len(nan_slots)}
+    assert completeness["rows_trainable"] == len(rows) - len(null_slots | nan_slots)
+    # 排除不能只写在 completeness 里：测试段样本数必须真的少掉，否则等于没排除
+    assert artifact["metrics"]["overall"]["n"] <= completeness["rows_trainable"]
+
+
+def test_feature_source_totally_down_stops_with_a_column_breakdown() -> None:
+    """整列不可用是数据源故障，不是零星滞后——必须停下来并说清是谁缺。"""
+    rows = _rows(_weekdays(90))
+    for row in rows:
+        row[FEATURES[2]] = None
+
+    with pytest.raises(TailTrainingError, match="feature source is down") as caught:
+        train_tail_net_profit_model(rows=rows, feature_names=FEATURES, **_identity_kwargs())
+    assert str(caught.value).count(FEATURES[2]) >= 1
+
+
+def test_missing_value_outside_the_feature_contract_does_not_block() -> None:
+    """未进契约的列不参与训练，它的缺失不该把整次训练挡下来。"""
+    days = _weekdays(90)
+    rows = _rows(days)
+    for row in rows[::37]:
+        row["sector_momentum"] = None
+
+    artifact = train_tail_net_profit_model(
+        rows=rows, feature_names=FEATURES, **_identity_kwargs(),
+    )
+    assert artifact["kind"] == KIND_LOGISTIC
+    assert artifact["artifact_digest"]
+
+
 def test_booster_path_trains_with_the_frozen_production_params() -> None:
     seen: dict = {}
 

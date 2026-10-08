@@ -181,6 +181,39 @@ def _require_injected_split(
             )
 
 
+def _feature_missing(value: Any) -> bool:
+    """None / NaN / inf / 转不成数字都算这一列缺失。
+
+    这几种形态此前会在 ``float(row[f])`` 上抛裸 ``TypeError``，训练整段崩掉且不说明是谁缺。
+    """
+    if value is None:
+        return True
+    try:
+        return not np.isfinite(float(value))
+    except (TypeError, ValueError):
+        return True
+
+
+def _split_feature_incomplete(
+    rows: list[Mapping[str, Any]], feature_names: Sequence[str]
+) -> tuple[list[Mapping[str, Any]], dict[str, Any]]:
+    complete: list[Mapping[str, Any]] = []
+    per_column: dict[str, int] = {}
+    for row in rows:
+        missing = [name for name in feature_names if _feature_missing(row.get(name))]
+        if missing:
+            for name in missing:
+                per_column[name] = per_column.get(name, 0) + 1
+        else:
+            complete.append(row)
+    return complete, {
+        "rows_excluded": len(rows) - len(complete),
+        "rows_trainable": len(complete),
+        "per_column": dict(sorted(per_column.items())),
+        "zero_filled": False,
+    }
+
+
 def _auc(scores: Sequence[float], labels: Sequence[int]) -> float | None:
     pairs = [(float(value), int(label)) for value, label in zip(scores, labels, strict=True)]
     positives = [value for value, label in pairs if label == 1]
@@ -247,10 +280,18 @@ def train_tail_net_profit_model(
         row for row in rows
         if row.get(label_field) in (0, 1, 0.0, 1.0)
         and row.get(date_field) is not None
-        and all(name in row for name in feature_names)
     ]
     if not usable:
         raise TailTrainingError("no labelled rows: every candidate sample is untrained")
+
+    # 特征不完整的样本不进训练。两条同时成立：绝不填 0（0 会被当成真实观测，§3.1），
+    # 也不静默丢——按列计数进 artifact，"数据缺失影响多少样本"才还查得到（§2）。
+    usable, feature_exclusions = _split_feature_incomplete(usable, feature_names)
+    if not usable:
+        raise TailTrainingError(
+            "every labelled row is missing a contract feature: the feature source is down, "
+            f"not merely stale. rows per column: {feature_exclusions['per_column']}"
+        )
     dates = [row[date_field] for row in usable]
     if split is None:
         split = build_date_split(
@@ -326,6 +367,7 @@ def train_tail_net_profit_model(
         "contract_digest": contract.digest(),
         "probability_field": probability_field,
         "split": split.as_dict(),
+        "feature_completeness": feature_exclusions,
         "calibration_auc": calibration_auc,
         "metrics": metrics,
         "model": model,
