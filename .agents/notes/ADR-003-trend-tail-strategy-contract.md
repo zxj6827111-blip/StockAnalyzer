@@ -318,6 +318,12 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库> --reference-db <�
   退出码 0/3(标签未绑定)/4(契约摘要不一致)/5(身份不可证或自检失败)
 - `src/stock_analyzer/models/output_semantics.py` —— `net_profit_5d_tail` 语义登记
 - `src/stock_analyzer/research/trend_data_readiness.py` + `scripts/audit_trend_data_readiness.py`
+- `src/stock_analyzer/research/selection_funnel_view.py` +
+  `scripts/audit_selection_funnel.py` —— 把夜扫半段（``production_funnel`` 快照：只有成员
+  与计数）与尾盘半段（``funnel_trace``：原因/特征/身份/数据时间齐全）对成 §2 的九层视图；
+  **缺记录的层写 ``recorded=false``，绝不折算成"这层没淘汰股票"**，成员不是上层子集时
+  不落落差，并输出 §2 五个诊断问题各自"凭现有证据能不能回答"。
+  退出码 0=九层全有留档 / 3=有层缺记录 / 5=输入读不出或一条留档都没有
 - `src/stock_analyzer/research/record_time_semantics.py` —— 留档时间的带版本解释
   （旧记录原样保留但不给它发明时区；声明矛盾即撤销证据资格）
 - `src/stock_analyzer/research/funnel_trace.py` —— 分层留档与最终推荐留档；
@@ -363,7 +369,7 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库> --reference-db <�
   以及"选股质量验收 = blocked"的实测口径（本文件不产命中率数字）
 - 测试（2026-10-08 实测条数）：`test_trend_strategy_contract.py`(55)、
   `test_tail_net_profit_label.py`(22)、`test_trend_data_readiness.py`(22)、
-  `test_funnel_trace.py`(17)、`test_record_time_semantics.py`(6)、`test_tail_net_profit_trainer.py`(20)、
+  `test_funnel_trace.py`(17)、`test_record_time_semantics.py`(6)、`test_selection_funnel_view.py`(3)、`test_tail_net_profit_trainer.py`(20)、
   `test_trend_candidate_contract.py`(16)、`test_trend_tail_shadow_runtime.py`(29)、`test_tail_serving_manifest.py`(8)、`test_tail_model_artifact.py`(11)、
   `test_trend_tail_page_and_feedback.py`(26)、`test_minute_bar_store.py`(15)、
   `test_tail_walk_forward.py`(20)、`test_tail_exit_funnel.py`(14)、
