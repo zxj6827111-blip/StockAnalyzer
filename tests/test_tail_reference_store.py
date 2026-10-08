@@ -295,3 +295,50 @@ def test_cli_fails_visibly_on_an_unreadable_warehouse(tmp_path) -> None:
     assert result.returncode == 5, result.stdout + result.stderr
     assert "参考数据不可用" in result.stderr
     assert not (tmp_path / "ref.duckdb").exists()
+
+
+def test_vendor_daily_raw_source_declares_units_and_leaves_undeclared_flags_unknown(
+    tmp_path,
+) -> None:
+    """生产仓库声明不了 RAW 口径时，vendor 全A日K 是可证明口径的替代日线源。
+
+    数量倍率沿用 ``VendorZipOverlayProvider`` 的声明（手→股 ×100、千元→元 ×1000、
+    万元→元 ×10000）；源里没有的证券状态必须留空，因为"没声明"不等于"不是 ST"。
+    """
+    import zipfile
+    from datetime import date
+
+    from stock_analyzer.research.tail_reference_store import (
+        SOURCE_VENDOR_ZIP_DAILY,
+        TailReferenceStore,
+        read_vendor_daily_raw_frames,
+    )
+
+    root = tmp_path / "vendor"
+    daily = root / "全A日K"
+    daily.mkdir(parents=True)
+    header = "code,datetime,open,high,low,close,pre_close,change,pct_chg,volume,amount,circ_mv"
+    rows = [
+        "600000.SH,2025-12-31,10.0,10.2,9.9,10.1,10.0,0.1,1.0,1000.0,10000.0,200000.0",
+        "600000.SH,2026-01-05,10.1,10.5,10.0,10.4,10.1,0.3,2.9752,2000.0,21000.0,210000.0",
+        "600000.SH,2026-01-06,10.4,10.6,10.3,10.5,10.4,0.1,0.9615,3000.0,31500.0,315000.0",
+    ]
+    with zipfile.ZipFile(daily / "2026.zip", "w") as archive:
+        archive.writestr("2026/600000.SH.csv", f"{header}\n" + "\n".join(rows) + "\n")
+
+    frame = read_vendor_daily_raw_frames(root, start=date(2026, 1, 1), end=date(2026, 1, 31))
+
+    assert [str(item) for item in frame["symbol"]] == ["600000", "600000"]
+    assert frame["volume"].tolist() == [200000.0, 300000.0]
+    assert frame["turnover"].tolist() == [21_000_000.0, 31_500_000.0]
+    assert frame["float_market_cap"].tolist() == [2_100_000_000.0, 3_150_000_000.0]
+    assert set(frame["is_st"].to_numpy()) == {None}
+
+    with TailReferenceStore(tmp_path / "ref.duckdb") as store:
+        landed = store.upsert_daily_bars(
+            frame, price_basis="raw", source=SOURCE_VENDOR_ZIP_DAILY, as_of="2026-01-31"
+        )
+        coverage = store.coverage()
+    assert landed == 2
+    assert coverage["sources"]["daily_bars"]["rows"] == 2
+    assert "daily_bars_table_missing" not in coverage["gaps"]

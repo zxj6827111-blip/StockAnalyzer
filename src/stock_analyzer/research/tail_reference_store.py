@@ -50,6 +50,10 @@ WAREHOUSE_TABLES: dict[str, str] = {
 SOURCE_WAREHOUSE = "market_warehouse"
 SOURCE_WAREHOUSE_DERIVED = "market_warehouse_daily_bars_derived"
 SOURCE_STATIC_CALENDAR = "data.trading_calendar"
+#: vendor 离线包的全A日K 走的是**独立来源声明**：生产仓库 ``price_series_mode``
+#: 为 NULL 时无法声明口径，而这条来源的口径由包本身的结构保证（日K 是原始价，
+#: 复权因子单独成包），所以必须能和研究库里的仓库副本区分开。
+SOURCE_VENDOR_ZIP_DAILY = "vendor_zip_daily_raw"
 
 #: 默认与分钟库同文件：尾盘重建要同时读分钟 bar 与这些日级参考数据。
 REFERENCE_DB_DEFAULT = "artifacts/research/tail_minute_bars.duckdb"
@@ -800,6 +804,111 @@ def sync_reference_from_warehouse(
         ),
         "missing_sources": coverage["gaps"],
     }
+
+
+def _scaled(value: Any, factor: float) -> float | None:
+    """按声明的倍率换算数量；空值保持空，不折算成 0。"""
+    number = _number(value)
+    return None if number is None else number * float(factor)
+
+
+def read_vendor_daily_raw_frames(
+    root: Path | str,
+    *,
+    start: date,
+    end: date,
+    symbols: Sequence[str] | None = None,
+    daily_dir_name: str = "全A日K",
+) -> pd.DataFrame:
+    """从 vendor 离线包的**全A日K** 读未复权日线（改进计划 §3.1「补齐 RAW 行情」）。
+
+    口径不靠推断：这个包的日K 就是原始价，复权因子单独成包
+    （``复权因子/复权因子_前复权.zip``），所以这里不存在"这批行到底是 RAW 还是 QFQ"
+    的声明缺口 —— 而生产仓库 ``price_series_mode`` 为 NULL 时缺的正是这一条。
+    复用 ``build_vendor_zip_daily_index`` 做归档/成员发现（含同名包去重），
+    数量口径沿用 :class:`VendorZipOverlayProvider` 的类默认值而不是另立常数：
+    volume 手→股 ×100、amount 千元→元 ×1000、circ_mv 万元→元 ×10000。
+
+    ``is_st`` / ``is_delisting_risk`` 在这个源里**没有声明**，一律留 None：
+    把"没声明"写成"不是 ST"就是拿缺数据冒充有效信息。
+    """
+    import dataclasses
+    import zipfile
+
+    from stock_analyzer.data.vendor_zip_overlay import (
+        VendorZipOverlayProvider,
+        build_vendor_zip_daily_index,
+    )
+
+    source_root = Path(root).expanduser().resolve()
+    index = build_vendor_zip_daily_index(root=source_root, daily_dir_name=daily_dir_name)
+    wanted = (
+        {str(item).strip().split(".")[0].zfill(6) for item in symbols if str(item).strip()}
+        if symbols
+        else None
+    )
+    # ``VendorZipOverlayProvider`` 是 slots dataclass：类属性是 member_descriptor，
+    # 默认值只能从 fields() 取 —— 倍率仍以那里的声明为唯一出处，不在本模块重抄一遍。
+    provider_defaults = {
+        field.name: field.default for field in dataclasses.fields(VendorZipOverlayProvider)
+    }
+    volume_multiplier = float(provider_defaults["daily_volume_multiplier"])
+    turnover_multiplier = float(provider_defaults["daily_turnover_multiplier"])
+    rows: list[dict[str, Any]] = []
+    for raw_symbol, record in dict(index.get("symbols") or {}).items():
+        symbol = str(raw_symbol).strip().split(".")[0].zfill(6)
+        if wanted is not None and symbol not in wanted:
+            continue
+        for item in list((record or {}).get("entries") or []):
+            archive_path = source_root / str(item.get("zip", ""))
+            entry_name = str(item.get("entry", ""))
+            if not archive_path.exists() or not entry_name:
+                raise TailReferenceError(
+                    f"vendor daily archive unreadable: {archive_path}!{entry_name}"
+                )
+            try:
+                with zipfile.ZipFile(archive_path) as archive:
+                    with archive.open(entry_name) as stream:
+                        frame = pd.read_csv(stream, encoding="gbk")
+            except (KeyError, OSError, UnicodeDecodeError, pd.errors.ParserError) as exc:
+                raise TailReferenceError(
+                    f"vendor daily entry unreadable: {archive_path}!{entry_name}: "
+                    f"{type(exc).__name__}"
+                ) from exc
+            frame.columns = [
+                str(name).lstrip("\ufeff").strip().lower() for name in frame.columns
+            ]
+            day_column = next(
+                (name for name in ("datetime", "trade_date", "date") if name in frame.columns),
+                "",
+            )
+            if not day_column:
+                raise TailReferenceError(
+                    f"vendor daily file has no date column: {archive_path}!{entry_name}"
+                )
+            days = pd.to_datetime(frame[day_column], errors="coerce")
+            selected = frame.loc[(days >= pd.Timestamp(start)) & (days <= pd.Timestamp(end))]
+            if selected.empty:
+                continue
+            selected = selected.assign(date=days.loc[selected.index].dt.date)
+            for item_row in selected.to_dict("records"):
+                rows.append({
+                    "symbol": symbol,
+                    "date": item_row["date"],
+                    "open": _number(item_row.get("open")),
+                    "high": _number(item_row.get("high")),
+                    "low": _number(item_row.get("low")),
+                    "close": _number(item_row.get("close")),
+                    "volume": _scaled(item_row.get("volume"), volume_multiplier),
+                    "turnover": _scaled(item_row.get("amount"), turnover_multiplier),
+                    "float_market_cap": _scaled(item_row.get("circ_mv"), 10_000.0),
+                    "name": None,
+                    "is_st": None,
+                    "is_delisting_risk": None,
+                    "board": None,
+                    "source": SOURCE_VENDOR_ZIP_DAILY,
+                })
+    return pd.DataFrame(rows)
 
 
 __all__ = [

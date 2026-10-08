@@ -34,8 +34,11 @@ if str(_SRC) not in sys.path:
 
 from stock_analyzer.research.tail_reference_store import (  # noqa: E402
     REFERENCE_DB_DEFAULT,
+    REFERENCE_TABLES,
+    SOURCE_VENDOR_ZIP_DAILY,
     TailReferenceError,
     TailReferenceStore,
+    read_vendor_daily_raw_frames,
     read_warehouse_reference_frames,
     sync_reference_from_warehouse,
 )
@@ -63,6 +66,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--symbols", default="")
     parser.add_argument("--symbols-file", default="")
     parser.add_argument("--exchange", default="SSE")
+    parser.add_argument(
+        "--vendor-daily-root",
+        default="",
+        help="vendor 离线包根目录（其下需有 全A日K/*.zip）；仓库声明不了 RAW 口径时的替代日线源",
+    )
     parser.add_argument("--report", default="")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
@@ -84,6 +92,30 @@ def main(argv: list[str] | None = None) -> int:
         )
         with TailReferenceStore(args.out) as store:
             result = sync_reference_from_warehouse(store, reading, exchange=args.exchange)
+            if args.vendor_daily_root:
+                # 仓库那条来源声明不了 RAW 口径时，vendor 全A日K 是可证明口径的替代源；
+                # 它只补 daily_bars，其余四类仍以仓库为准。
+                frames = read_vendor_daily_raw_frames(
+                    args.vendor_daily_root, start=start, end=end, symbols=symbols,
+                )
+                report = {"root": str(args.vendor_daily_root), "rows": 0, "symbols": 0}
+                if not frames.empty:
+                    report["rows"] = store.upsert_daily_bars(
+                        frames,
+                        price_basis="raw",
+                        source=SOURCE_VENDOR_ZIP_DAILY,
+                        as_of=reading.as_of,
+                    )
+                    report["symbols"] = int(frames["symbol"].nunique())
+                    coverage = store.coverage()
+                    result["coverage"] = coverage
+                    result["landed_rows"]["daily_bars"] = report["rows"]
+                    result["sufficient_sources"] = sorted(
+                        name for name in REFERENCE_TABLES
+                        if int(coverage["sources"][name]["rows"]) > 0
+                    )
+                    result["missing_sources"] = coverage["gaps"]
+                result["vendor_daily_bars"] = report
     except (TailReferenceError, OSError, ValueError) as exc:
         print(f"参考数据不可用: {type(exc).__name__}: {exc}", file=sys.stderr)
         return RC_ERROR
