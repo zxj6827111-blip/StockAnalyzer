@@ -2,7 +2,7 @@
 
 Status: Draft
 
-As-of: 2026-10-08（D15 已补采真值、D16 新增：研究侧符号上限是自设的，不是数据缺失；台账 `docs/selection_quality_plan_status.md` §0 是当前交接面）
+As-of: 2026-10-08（D15 已补采真值、D16 覆盖面是自设参数已修；§2 新增全市场 91 决策日的特征判别力读数——第一轮特征集里两条反号项解释了四折验证为何全部卡在校准段。台账 `docs/selection_quality_plan_status.md` §0 是当前交接面）
 浮盈市值硬门因此整天失效；读侧带版本解释规则与防御见 ADR-004）
 
 回答的问题是改进计划 §2 的那句"整条链路在哪里损失选股质量"。本文只列**可核实的事实**
@@ -45,6 +45,20 @@ As-of: 2026-10-08（D15 已补采真值、D16 新增：研究侧符号上限是�
 - **项目自己的锁定 OOS 上限**：绝对命中率 43–45%、TopK 净收益为负
   （`docs/alpha_v2/M4H_Historical_Locked_OOS_Report.md:206,591`）。
   → 这是新概率的**现实参照**：0.60 阈值只是选股规则，不是已证明的命中率。
+- **全市场合格池上，第一轮四类信息的单特征时间外判别力是分层的不均匀的**（91 个决策日 /
+  19,550 笔成熟模拟成交，`scripts/measure_tail_feature_direction.py` →
+  `artifacts/research/mw_feature_direction_91d.json`，最后 15 日为时间外段）：
+  趋势位置 `range_position_60`=0.6082、`close_to_ma20`=0.5930、`ma20_slope`=0.5717；
+  市场相对强弱 `excess_ret_20`=0.5600、`relative_strength`=0.5541；
+  而量价/流动性 `avg_turnover_20`=**0.4672** 与波动/过热 `atr14_pct`=**0.4601** 是**反号**的
+  （`realized_vol_20`=0.4782 同向）。
+  → 已证实的是"这四条不能一起进线性模型"：第一轮特征集含两条反号项，
+    `validate_tail_selection_quality.py` 四种组合全部在第 1 折校准段 fail-closed
+    （raw AUC 0.4384 / 0.4691 / 0.4696 / 0.4720，退出码 5），四折测试段因此根本没跑。
+  → **还不足以定性**：这解释的是"为什么净盈利率改善没有数"，不是"净盈利率不会改善"。
+    单特征 AUC 的分段口径与 walk-forward 折定义不同，且成交率 0.7190 / 成交后净盈利率 0.4121
+    仍只是 `replayed_recompute` 总体，不能当 observed 命中率。
+    台账与读数见 `docs/trend_tail_selection_quality_report.md` §4.1。
 
 ## 3. 仍是假设（需要对照实验，不得当作结论使用）
 
@@ -87,5 +101,7 @@ As-of: 2026-10-08（D15 已补采真值、D16 新增：研究侧符号上限是�
 - `scripts/audit_observed_signal_returns.py` —— §2 的 observed 队列复现入口
 - `src/stock_analyzer/research/float_cap_reference.py`、`scripts/collect_float_market_cap_history.py`、`scripts/load_float_market_cap_research.py` —— D15 的真值补采与读取侧接线
 - `scripts/sync_tail_minute_bars.py`、`scripts/sync_tail_reference_data.py` 的 `--symbols/--symbols-file` —— D16：覆盖面由调用参数决定，报告必须写清用了哪份清单
+- `scripts/measure_tail_feature_direction.py` + `artifacts/research/mw_feature_direction_91d.json` —— §2 特征判别力读数的唯一生产者（只读，不改标签不改排序）
+- `src/stock_analyzer/research/tail_walk_forward.py` 的校准段方向门（`calibration window direction is not positive`）—— 四种特征组合全部在这里 fail-closed，四折测试段不产出数字
 - `runtime/universe_candidate_selector.py::_gate_membership`、`research/night_scan_funnel_trace.py::live_universe_facts` —— 生产夜扫前两层留档
 - `docs/alpha_v2/M4H_Historical_Locked_OOS_Report.md` —— 锁定 OOS 上限参照

@@ -782,3 +782,78 @@ token 只按变量名从环境变量读、取值不落任何产物）：
 3. **特征契约里两列日内信息一直没填**：`last30_volume_share` / `tail_volatility_ratio`
    现在**有分钟数据可以真算**了（分钟库已就位），补进 as-of 计算后四组里
    最缺的"日内结构"才第一次真正参与检验。
+
+
+## 4.1 全市场 91 决策日的 §4 读数（2026-10-08，第一次跑出可算的部分）
+
+分钟补采这一轮把 1/2 月也铺成全市场（`ingest_marketwide_2026-01/02.json`，写侧
+`INSERT OR REPLACE` 打在 `PRIMARY KEY (symbol, bar_time)` 上，所以重灌只补符号、不产生重复行）。
+之前 1/2 月只有 208 只池内符号，标签覆盖率被这个洞压着。
+
+标签侧重灌后的真实数（`artifacts/research/mw_labels_91d.json`，capture_mode 全部是
+`replayed_recompute`，按 §3.3 的要求与 observed 分开报，不与任何观察样本混算）：
+
+| 量 | 值 |
+| --- | --- |
+| 请求 | 27,300 |
+| 生成标签记录 | 27,191 |
+| 数据不足而不出标签 | 109（`daily_bar_session_holes` 109、`entry_daily_bar` 9、`entry_minute_bars` 1） |
+| 成交并退出 | 19,550 |
+| **成交率** | **0.7190**（58 天窗口的旧读数是 0.5185，抬升来自 1/2 月补全，不是规则变松） |
+| 未成交·低于最小申报量 | 7,253 |
+| 未成交·涨停封死 | 388 |
+| **成交后净盈利率** | **0.4121**（8,057 / 19,550） |
+
+`trade_status_source_gap_symbols=0`：停复牌/证券状态这条链在全市场窗口上没有再出现"状态未知"的符号。
+
+**净盈利率改善没有被证明——而且卡在哪一层现在是有读数的。**
+`validate_tail_selection_quality.py` 在第 1 折的**校准段**就按 fail-closed 停住，四折测试段根本没跑：
+
+```
+tail_lr_marketwide_91d_v1（excess_ret_20, ma20_slope, avg_turnover_20, atr14_pct）→ raw AUC=0.4720
+trend_position 三条（range_position_60, close_to_ma20, ma20_slope）              → raw AUC=0.4384
+再加 market_relative 两条（+ excess_ret_20, relative_strength）                  → raw AUC=0.4696
+再加量价/波动两条（+ avg_turnover_20, atr14_pct）                                → raw AUC=0.4691
+```
+
+退出码 5（training/identity fail），四种特征组合无一例外。这不是脚本故障：合约要求校准段方向为正
+才允许产出概率，而它不为正，所以模型拒绝产出——按 §3.3「原生训练或身份验证失败时停止，不静默切换替代模型」。
+
+为了把"整体失败"拆成"哪一类信息有方向"，新增 `scripts/measure_tail_feature_direction.py`
+（只读，产出 `artifacts/research/mw_feature_direction_91d.json`），按最后 15 个决策日做时间外段：
+
+| 特征 | 组 | 校准段 AUC | 时间外 AUC |
+| --- | --- | --- | --- |
+| range_position_60 | trend_position | 0.5228 | **0.6082** |
+| close_to_ma20 | trend_position | 0.5060 | **0.5930** |
+| ma20_slope | trend_position | 0.5195 | **0.5717** |
+| excess_ret_20 | market_relative | 0.5114 | **0.5600** |
+| relative_strength | market_relative | 0.5223 | **0.5541** |
+| turnover | volume_liquidity | 0.5416 | 0.5157 |
+| gap_up_pct | volatility_overheat | 0.4985 | 0.5183 |
+| volume_ratio_5 | volume_liquidity | 0.5040 | 0.5388 |
+| realized_vol_20 | volatility_overheat | 0.5142 | 0.4782 |
+| atr14_pct | volatility_overheat | 0.5316 | **0.4601** |
+| avg_turnover_20 | volume_liquidity | 0.5295 | **0.4672** |
+
+读法（哪些是证据、哪些还不是）：
+
+1. 已证实：**趋势位置与市场相对强弱在全市场合格池上有时间外判别力**（0.55–0.61），
+   而 `avg_turnover_20`、`atr14_pct` 单独看是**反号**的（0.467/0.460）。第一轮特征集把这两条反号项
+   一起喂进线性模型，正好解释了整体 raw AUC=0.4720——弱项抵消了强项。
+2. 已证实：§3.2 要求的"只有时间外有效的特征进入正式候选"这条**可执行**，且它现在否决的是
+   四条里的两条，不是全部。
+3. 还不是结论：**这些单特征 AUC 不能当作"模型能上线"**。上表的分段是"前段训练 / 倒数 16-30 天校准 /
+   最后 15 天测试"，与 walk-forward 的折定义不同；fold 1 的校准段落在 2 月末—3 月，正好是单特征表里
+   判别力最弱的那一段。要证明 §4 的 ≥5pp，需要的是走完四折的净盈利率差值与交易日分块 bootstrap 下界，
+   现在**还没有这个数**。
+4. 三个对照臂的状态：同日同风格基线用 `avg_turnover_20` 排序，它是可复现的容量/风格代理，
+   **不是**旧综合分的替身（`mw_samples_91d.json.baseline_caveat` 已写明：全市场重放请求里根本没有
+   composite_score/等级字段，因为旧链路从未对这 300 只/天的全市场池打过综合分）。
+   "同一合格池的旧排序"因此**不可算**；"旧完整链路"在尾盘时刻没有成交样本，按 §4 如实报为无样本，
+   不折算命中率。
+5. 影子验证仍是 **0 个完整交易日 / 0 笔成熟模拟成交**（`shadow_readiness` 根本没产出，因为四折没跑完）。
+   阈值 0.60 依旧只是初始选股规则，不代表任何已证明的命中率。
+
+因此当前状态：**数据与契约层已到位、留档层已到位、生产夜扫两层已接线（仅本地测试，未部署）、
+§4 选股质量验收未通过（阻塞在模型校准方向）、影子验证未开始。**
