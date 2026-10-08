@@ -196,6 +196,7 @@
 | `pytest tests/ -k "trend or tail"` | **279 passed, 4029 deselected in 67.45s**，exit 0 |
 | `ruff check` 本轮触及的 1 个源文件 + 1 个 CLI + 1 个测试文件 | All checks passed；全量 `src tests` 48 / `scripts` 27，与基线同数 |
 | `mypy --python-version 3.12 research/trend_data_readiness.py` | 该文件自身 **0 error** |
+| `python scripts/run_quality_gate.py --stage clean-scope --fail-on-error` | 退出码 2：`ruff_clean_scope` **returncode 0**，唯一阻塞项仍是 `mypy_blocking` —— `.venv` 里 numpy stub 的 `Type statement is only supported in Python 3.12 and greater`，而 `pyproject.toml` 钉 `python_version = "3.11"`，mypy 在检查任何项目文件前就终止。加 `--python-version 3.12` 复跑那 4 个目标文件（**都不是本分支触碰过的文件**）只剩 1 个既有 `acceptance_service.py:1078 Need type annotation for "equity"`。结论：本轮改动没有给门新增失败，门本身为既有环境错配而红 |
 
 一处**既有行为被收紧**，写清楚：以前不传 `--reference-db` 时，只要生产仓库 + 分钟库达标就报
 `ready`；现在会多一条 `reference_copy_validated = insufficient`（退出码 3）。理由是
