@@ -159,10 +159,7 @@ def build_tail_serving_manifest(
             "stop_loss_pct": float(contract.stop_loss_pct),
             "execution_price_basis": contract.execution_price_basis,
         },
-        "features": {"feature_names": [str(n) for n in (
-            (split or {}).get("feature_names")
-            if split is not None else declared.get("feature_names")
-        ) or ()]},
+        "features": {"feature_names": [str(n) for n in (declared.get("feature_names") or ())]},
         "validation": {
             "split": dict(split or {}),
             "metrics": dict(metrics or {}),

@@ -197,7 +197,19 @@ As-of: 2026-10-08 @ HEAD `6c7079c` 之后的工作树（本 ADR 与 `contracts/t
   ③ 训练 commit 走 `resolve_runtime_code_identity()`（ADR-001 §7.2：CLI 不得自行解析
   git HEAD），不可证就不写文件。标签口径与契约摘要优先取**工件自己声明的**，避免发布
   动作重新解释历史样本。
-  影子服务的读取顺序随之确定：**专属清单存在 → 必须用它**（对不上就
+  - **模型工件也是可加载的**（`models/tail_model_artifact.py` +
+  `scripts/train_tail_net_profit_model.py`）：训练产物序列化成
+  ``tail_model_artifact.v1`` 后，加载回来的打分器复用**训练时那两个类本身**
+  （``LogisticProbModel`` / ``IsotonicCalibrator``，后者经新增的
+  ``from_state()`` 重建），而不是在工件侧再实现一遍 scaler 与阶梯契约。
+  加载门有四道，任一不过就抛错而不是降级打分：内容摘要重算比对（改一个权重就是
+  另一个模型）、契约摘要等于在服契约、标签口径是 v4 净盈利、概率字段是
+  ``p_net_profit_5d_tail``。**缺特征直接报 ``feature_missing:<名字>``，不填零** ——
+  填零会把"没有这个特征"伪装成"该特征等于 0"并被拿去排序。
+  LightGBM 只在原生库可用时开启，不可用就 ``lightgbm_unavailable`` 停住，
+  不静默换成逻辑回归（§3.3）。工件字段一律经 ``artifact_identity_view()`` 这一个
+  出口读，两个 CLI 不再各写一套取值顺序。
+- 影子服务的读取顺序随之确定：**专属清单存在 → 必须用它**（对不上就
   `tail_serving_manifest_unverified` ⇒ 0 只，绝不退回旧清单，因为那是静默换模型）；
   专属清单不存在 → 退回旧在服清单并留名 `tail_serving_manifest_absent`。
 - 参考数据的**消费侧**接通（改进计划 §3.1 "补齐后验证" 与 §4 "线上/历史一致"）：
@@ -284,6 +296,10 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库> --reference-db <�
   退出码 0=已绑定、3=未注册或对不上、5=registry 不可用
 - `src/stock_analyzer/models/tail_serving_manifest.py` —— 尾盘 challenger 在服清单的
   构造与复核（工件事实来自盘上文件，复核会重新哈希）
+- `src/stock_analyzer/models/tail_model_artifact.py` —— 工件序列化/加载打分器；
+  `artifact_field()` / `artifact_identity_view()` 是读工件分层的唯一出口
+- `scripts/train_tail_net_profit_model.py` —— 样本 JSONL → 工件（→ challenger 清单）；
+  退出码 0 / 3(训练按要求停止) / 5(身份不可证或写出失败)
 - `scripts/freeze_tail_model_candidate.py` —— 已训练工件 → challenger 清单；
   退出码 0/3(标签未绑定)/4(契约摘要不一致)/5(身份不可证或自检失败)
 - `src/stock_analyzer/models/output_semantics.py` —— `net_profit_5d_tail` 语义登记
@@ -331,7 +347,7 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库> --reference-db <�
 - 测试（2026-10-08 实测条数）：`test_trend_strategy_contract.py`(55)、
   `test_tail_net_profit_label.py`(22)、`test_trend_data_readiness.py`(22)、
   `test_funnel_trace.py`(17)、`test_tail_net_profit_trainer.py`(20)、
-  `test_trend_candidate_contract.py`(16)、`test_trend_tail_shadow_runtime.py`(29)、`test_tail_serving_manifest.py`(8)、
+  `test_trend_candidate_contract.py`(16)、`test_trend_tail_shadow_runtime.py`(29)、`test_tail_serving_manifest.py`(8)、`test_tail_model_artifact.py`(9)、
   `test_trend_tail_page_and_feedback.py`(26)、`test_minute_bar_store.py`(15)、
   `test_tail_walk_forward.py`(20)、`test_tail_exit_funnel.py`(14)、
   `test_tail_reference_store.py`(14)、`test_tail_rebuild.py`(18)

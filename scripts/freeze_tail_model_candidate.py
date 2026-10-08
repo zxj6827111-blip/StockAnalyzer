@@ -39,6 +39,9 @@ if str(_SRC) not in sys.path:
 
 from stock_analyzer.contracts.trend_strategy import DEFAULT_TREND_CONTRACT  # noqa: E402
 from stock_analyzer.labels.tail_net_profit import verify_tail_label_policy  # noqa: E402
+from stock_analyzer.models.tail_model_artifact import (  # noqa: E402
+    artifact_identity_view,
+)
 from stock_analyzer.models.tail_serving_manifest import (  # noqa: E402
     DEFAULT_TAIL_SERVING_MANIFEST_PATH,
     TailManifestError,
@@ -98,7 +101,7 @@ def main(argv: list[str] | None = None) -> int:
 
     contract = DEFAULT_TREND_CONTRACT
     try:
-        artifact = _load_artifact(args.artifact)
+        artifact = artifact_identity_view(_load_artifact(args.artifact))
     except (OSError, ValueError) as exc:
         print(f"工件读不出来: {type(exc).__name__}: {exc}", file=sys.stderr)
         return RC_IDENTITY_FAILED
@@ -138,7 +141,8 @@ def main(argv: list[str] | None = None) -> int:
             artifact=artifact,
             label_policy_id=label_policy_id,
             training_manifest_id=args.training_manifest_id or str(
-                artifact.get("dataset_manifest_id") or artifact.get("manifest_id") or ""
+                artifact.get("training_manifest_id")
+                or artifact.get("dataset_manifest_id") or ""
             ),
             feature_compute_version=artifact.get("feature_compute_version", ""),
             probability_field=str(artifact.get("probability_field") or ""),
