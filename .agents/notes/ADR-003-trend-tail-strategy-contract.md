@@ -337,6 +337,10 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库> --reference-db <�
   （旧记录原样保留但不给它发明时区；声明矛盾即撤销证据资格）
 - `src/stock_analyzer/research/funnel_trace.py` —— 分层留档与最终推荐留档；
   `read_trace()` 附带 `time_interpretation`（只加字段，不改原值）；
+  `verify_trace()` 是**读侧**自检（计数闭合 / 契约摘要 = 在服契约 / 内容与存储摘要一致），
+  写侧 `StageTrace.__post_init__` 只保证落盘那一刻没撒谎，而留档是影子验证唯一的证据来源，
+  会被编辑、截断写、换目录复制，所以读侧必须自己再判一次；`scripts/audit_selection_funnel.py`
+  任一条留档不过就退 5，不拿不可信的证据下诊断结论（发布清单 R10 的可判形式）；
   `write_trace(..., suffix=)` 让"成交与退出"这层落到**另一个文件**，不回头覆盖入场那天的留档
 - `src/stock_analyzer/models/tail_net_profit_trainer.py` —— 日期切分 +  embargo、
   LR 基线 / 既有 LightGBM 参数、独立校准段、5pp 分块 bootstrap 判定，
@@ -378,7 +382,7 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库> --reference-db <�
   以及"选股质量验收 = blocked"的实测口径（本文件不产命中率数字）
 - 测试（2026-10-08 实测条数）：`test_trend_strategy_contract.py`(55)、
   `test_tail_net_profit_label.py`(22)、`test_trend_data_readiness.py`(22)、
-  `test_funnel_trace.py`(17)、`test_record_time_semantics.py`(6)、`test_selection_funnel_view.py`(3)、`test_night_scan_funnel_trace.py`(6)、`test_tail_net_profit_trainer.py`(20)、
+  `test_funnel_trace.py`(17)、`test_record_time_semantics.py`(6)、`test_selection_funnel_view.py`(3)、`test_night_scan_funnel_trace.py`(6)、`test_funnel_trace_verification.py`(7)、`test_tail_net_profit_trainer.py`(20)、
   `test_trend_candidate_contract.py`(16)、`test_trend_tail_shadow_runtime.py`(29)、`test_tail_serving_manifest.py`(8)、`test_tail_model_artifact.py`(11)、
   `test_trend_tail_page_and_feedback.py`(26)、`test_minute_bar_store.py`(15)、
   `test_tail_walk_forward.py`(20)、`test_tail_exit_funnel.py`(14)、

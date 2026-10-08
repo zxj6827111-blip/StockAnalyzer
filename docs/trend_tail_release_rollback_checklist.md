@@ -1,6 +1,6 @@
 # trend 尾盘净盈利概率链路：发布与回滚清单 / 影子验证方案
 
-As-of: 2026-10-08 @ HEAD `535ecfc`（分支 `feat/stock-selection-quality-overhaul`）
+As-of: 2026-10-08 @ HEAD `e70d84d`（分支 `feat/stock-selection-quality-overhaul`）
 
 配套决策见 `.agents/notes/ADR-003-trend-tail-strategy-contract.md`；
 根因与阻塞见 `.agents/notes/NOTE-002-selection-quality-root-causes.md`。
@@ -42,7 +42,7 @@ As-of: 2026-10-08 @ HEAD `535ecfc`（分支 `feat/stock-selection-quality-overha
 | R7 | 成交口径是 raw | 数据就绪报告 `raw_price_basis_declared == ok` |
 | R8 | 成本按日期冻结 | `cost_profile(date).source == "cost_schedule"`，且 `overridden` 集合被写进留档 |
 | R9 | 线上/历史判定一致 | 同一 `confirmation` 谓词 + 同一 bar 序列，`evaluate_tail_entry(quote_as_of=…)` 与 `evaluate_tail_entry(quote_as_of=None)` 结果相同（已有测试；发布前在真实数据上抽查一日） |
-| R10 | 漏斗留档完整 | 当日 `funnel_trace_*.json` 每层计数自洽、`model_identity.identity_recorded=true`、最终推荐每行 `caveats` 不含 `feature_snapshot_missing` |
+| R10 | 漏斗留档完整 | 当日 `funnel_trace_*.json` 每层计数自洽（**可判**：`scripts/audit_selection_funnel.py` 读侧跑 `verify_trace()`，计数不闭合 / 契约摘要不是当前契约 / 内容与存储摘要对不上 → 退 5，不拿不可信证据下结论）、`model_identity.identity_recorded=true`、最终推荐每行 `caveats` 不含 `feature_snapshot_missing` |
 | R11 | 质量验收门 | `evaluate_selection_quality(...).passed == True`（提升 ≥5pp、分块 CI 下界 >0、平均净收益 >0、尾部 p05 不明显恶化、折数 ≥4） |
 | R12 | 影子观察达标 | `shadow_readiness(observed_trade_days≥60, matured_simulated_fills≥100).ready_for_release_review == True` |
 | R13 | 页面不猜口径 | `page_view(report)` 在 `strategy / entry_window / min_net_profit_probability / contract_digest / reference_notional` 任一缺失时 raise；"尾盘确认"页与旧"推荐汇总"页各自读各自的接口，前端构建（`npm run build`）通过 |

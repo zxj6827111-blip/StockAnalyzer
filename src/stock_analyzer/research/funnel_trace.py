@@ -370,6 +370,73 @@ def read_trace(
     )
 
 
+_STAGE_CONSTRUCTOR_FIELDS = (
+    "stage", "kind", "inputs", "advanced", "rejected", "advanced_symbols",
+    "rejected_symbols", "features_used", "raw_predictions",
+    "calibrated_probabilities", "model_identity", "data_as_of",
+    "feature_compute_version", "contract_digest", "label_policy_id", "notes",
+)
+_ROW_CONSTRUCTOR_FIELDS = (
+    "symbol", "rank", "probability", "reference_notional", "strategy",
+    "contract_version", "contract_digest", "probability_field", "data_as_of",
+    "model_identity", "feature_snapshot", "fill", "caveats",
+)
+
+
+def verify_trace(
+    payload: Mapping[str, Any], *, contract: TrendStrategyContract = DEFAULT_TREND_CONTRACT
+) -> tuple[str, ...]:
+    """读侧复核一份留档：**计数自洽 + 契约摘要一致 + 摘要可对上**，返回失败清单（空=可信）。
+
+    写侧的恒等式（``StageTrace.__post_init__``）只保证"落盘那一刻"没撒谎。留档是影子
+    验证唯一的证据来源，会被人工编辑、被截断写、被换目录复制——发布清单 R10 要的是
+    "每层计数自洽"这件事**可查**，所以读侧必须自己再判一次，而不是默认放行。
+    改名/改一个符号但保持计数不变也算篡改：那由 ``digest`` 兜住。
+    """
+    failures: list[str] = []
+    if str(payload.get("contract_digest", "")) != contract.digest():
+        failures.append("trace_contract_digest_mismatch")
+
+    stages: list[StageTrace] = []
+    for index, row in enumerate(payload.get("stages") or ()):
+        if not isinstance(row, Mapping):
+            failures.append(f"trace_stage_not_an_object:{index}")
+            continue
+        try:
+            stages.append(StageTrace(**{
+                key: row[key] for key in _STAGE_CONSTRUCTOR_FIELDS if key in row
+            }))
+        except (FunnelTraceError, TypeError) as exc:
+            failures.append(f"trace_stage_inconsistent:{index}:{exc}")
+
+    rows: list[FinalRecommendationRow] = []
+    for index, row in enumerate(payload.get("final_recommendations") or ()):
+        if not isinstance(row, Mapping):
+            failures.append(f"trace_final_row_not_an_object:{index}")
+            continue
+        try:
+            rows.append(FinalRecommendationRow(**{
+                key: row[key] for key in _ROW_CONSTRUCTOR_FIELDS if key in row
+            }))
+        except (TypeError, ValueError) as exc:
+            failures.append(f"trace_final_row_incomplete:{index}:{type(exc).__name__}")
+
+    if failures:
+        # 结构已经不成立，重算摘要只会给出一串跟着错的数字，不如先报第一个。
+        return tuple(failures)
+    rebuilt = build_funnel_trace(
+        trade_date=str(payload.get("trade_date", "")),
+        stages=stages,
+        final_recommendations=rows,
+        rejected_final=[dict(item) for item in (payload.get("rejected_final") or ())],
+        blocking_reason=str(payload.get("blocking_reason", "") or ""),
+        contract=contract,
+    )
+    if str(payload.get("digest", "")) != rebuilt.digest():
+        failures.append("trace_digest_mismatch")
+    return tuple(failures)
+
+
 def diagnose_funnel(traces: Iterable[FunnelTrace]) -> dict[str, Any]:
     """跨日聚合每层的淘汰率与拒绝原因，定位质量损失发生在哪一层。
 
@@ -500,5 +567,6 @@ __all__ = [
     "diagnose_funnel",
     "read_trace",
     "record_stage",
+    "verify_trace",
     "write_trace",
 ]
