@@ -79,6 +79,19 @@
    契约时区（Asia/Shanghai）的带偏移时刻并附 `written_at_timezone`。钉住：
    `test_written_at_is_the_contract_timezone_not_the_host_clock`。
 
+4. **§3.1"补齐并校验…在独立研究库补齐后验证"的另一半**：研究库原先只有分钟表，
+   日历 / RAW 日线 / 精确涨跌停 / 停复牌 / 证券历史状态只能读生产仓库。现在
+   `research/tail_reference_store.py` + `scripts/sync_tail_reference_data.py` 把这五类
+   **只读**复制进同一个研究库。钉住：
+   `test_only_raw_daily_bars_are_landed_and_deduplicated`、
+   `test_adjusted_basis_is_refused_rather_than_rescaled`、
+   `test_missing_reference_rows_stay_missing`（缺就是不填 0、不猜 normal）、
+   `test_approximated_limit_prices_are_not_usable_by_default`、
+   `test_calendar_flags_rows_the_authority_disputes`（日历用
+   `data/trading_calendar.is_open_trading_date` 交叉核对，不让行情自我证明）、
+   `test_missing_warehouse_tables_are_reported_as_gaps`、`test_row_level_provenance_beats_the_caller_default`、
+   以及 CLI 三条退出码测试。
+
 ---
 
 ## 1b. §2 的 9 层漏斗：谁在写、还差谁
@@ -100,12 +113,12 @@
 
 | 命令 | 结果 |
 | --- | --- |
-| `pytest tests/test_trend_strategy_contract.py tests/test_trend_tail_shadow_runtime.py tests/test_trend_tail_page_and_feedback.py tests/test_minute_bar_store.py tests/test_funnel_trace.py tests/test_tail_net_profit_label.py tests/test_trend_data_readiness.py tests/test_tail_net_profit_trainer.py tests/test_trend_candidate_contract.py tests/test_tail_walk_forward.py tests/test_tail_exit_funnel.py -q` | **237 passed**（条数：55/22/26/15/17/19/13/20/16/20/14） |
-| `pytest tests -k "trend or tail"` | **238 passed, 4029 deselected** |
+| `pytest tests/test_trend_strategy_contract.py tests/test_trend_tail_shadow_runtime.py tests/test_trend_tail_page_and_feedback.py tests/test_minute_bar_store.py tests/test_funnel_trace.py tests/test_tail_net_profit_label.py tests/test_trend_data_readiness.py tests/test_tail_net_profit_trainer.py tests/test_trend_candidate_contract.py tests/test_tail_walk_forward.py tests/test_tail_exit_funnel.py tests/test_tail_reference_store.py -q` | **251 passed**（条数：55/22/26/15/17/19/13/20/16/20/14/14） |
+| `pytest tests -k "trend or tail"` | **252 passed, 4029 deselected** |
 | `pytest tests -k "week5 or live_runtime or automation"` | **319 passed, 3948 deselected**（身份绑定改动没有破坏既有自动化链） |
-| `ruff check` 本轮触及的 5 个源文件 + 6 个测试文件 + 2 个 scripts CLI | All checks passed |
+| `ruff check` 本轮触及的 6 个源文件 + 7 个测试文件 + 3 个 scripts CLI | All checks passed |
 | `ruff check src tests`（仓库全量） | 48 errors —— 全部落在分支未触碰的文件，属既有基线 |
-| `mypy --python-version 3.12` 本分支源文件 | **4** errors，逐条用 `git show HEAD:<file>` 对照确认**都是既有噪声**：`research/funnel_trace.py:355`（HEAD 上是同一处，行号从 339 移到 355）、`research/tail_mature_feedback.py:313`、`models/tail_net_profit_trainer.py:293/296`（LightGBM 注入点，运行时已由 `native booster trainer is unavailable` 硬门拦住）。本轮新增代码没有带来新的类型错误。 |
+| `mypy --python-version 3.12` 本分支源文件 | **4** errors，逐条用 `git show HEAD:<file>` 对照确认**都是既有噪声**：`research/funnel_trace.py:355`（HEAD 上是同一处，行号从 339 移到 355）、`research/tail_mature_feedback.py:313`、`models/tail_net_profit_trainer.py:293/296`（LightGBM 注入点，运行时已由 `native booster trainer is unavailable` 硬门拦住）。新增的 `research/tail_reference_store.py` 本轮实测 **0 error**。 |
 | `python scripts/run_quality_gate.py --stage clean-scope --fail-on-error` | `blocking_failures = ["mypy_blocking"]`，**不是本分支引入**：报错是 `.venv` 里 numpy stub 的 `Type statement is only supported in Python 3.12 and greater`，而 `pyproject.toml` 钉 `python_version = "3.11"`，mypy 在检查任何项目文件之前就终止（"errors prevented further checking"）。同一命令加 `--python-version 3.12` 后，那 4 个目标文件（均非本分支文件）只剩 1 个既有 `var-annotated`。 |
 
 | `env -u PYTHONPATH python scripts/audit_trend_data_readiness.py --help` | 正常输出用法。本轮修掉了一个真实缺陷：该 CLI 缺 `src/` 路径自举，照本文件 §3 的命令去做解锁的人第一跳就是 `ModuleNotFoundError`；测试原来靠注入 `PYTHONPATH` 掩盖了它，现已改为不注入。 |
@@ -140,11 +153,20 @@ python scripts/sync_tail_minute_bars.py --root <vendor 分钟包目录> \
     --start 2024-01-01 --end 2026-09-30 \
     --price-basis raw --bar-time-semantics bar_start
 
-# 2. 测量覆盖度；readiness 仍是 blocked 就不要往下走
+# 2. 把日级参考数据复制进同一个研究库（日历 / RAW 日线 / 精确涨跌停 / 停复牌 / 证券状态）
+python scripts/sync_tail_reference_data.py \
+    --warehouse <market.duckdb> \
+    --out artifacts/research/tail_minute_bars.duckdb \
+    --start 2025-01-02 --end 2026-09-30 \
+    --symbols-file artifacts/research/tail_symbols.txt
+# 退出码：0=五类来源都补齐 / 3=有来源缺失（如实记为不足，继续采集）/ 5=仓库不可读
+# 生产仓库只以 read_only 打开；缺表会报 <source>_table_missing，不会补 0 冒充已补齐
+
+# 3. 测量覆盖度；readiness 仍是 blocked 就不要往下走
 python scripts/audit_trend_data_readiness.py \
     --db <market.duckdb> --minute-db artifacts/research/tail_minute_bars.duckdb
 
-# 3. 覆盖度达标后跑滚动验证：≥4 折、匹配基线对照、真实退出码
+# 4. 覆盖度达标后跑滚动验证：≥4 折、匹配基线对照、真实退出码
 python scripts/validate_tail_selection_quality.py \
     --samples artifacts/research/tail_samples.jsonl \
     --features excess_ret_20,ma20_slope,avg_turnover_20,atr14_pct --model-id <id> \
@@ -153,9 +175,9 @@ python scripts/validate_tail_selection_quality.py \
 # 退出码：0=质量门通过 / 3=样本不足 blocked / 4=跑完但门不过 / 5=训练或身份失败
 ```
 
-第 3 步的编排已经存在（`research/tail_walk_forward.py`：折边界、注入 split 的
+第 4 步的编排已经存在（`research/tail_walk_forward.py`：折边界、注入 split 的
 embargo 核对、observed/replayed 分开计数、身份不通过就整轮不成立；20 条测试见
-`tests/test_tail_walk_forward.py`），缺的只是第 1、2 步落出来的真实数据。
+`tests/test_tail_walk_forward.py`），缺的只是第 1~3 步在真实仓库上落出来的数据。
 **这套编排至今只在合成样本上跑通过，没有在真实历史数据上跑过 —— 因此本文件
 不为任何真实命中率背书。**
 
@@ -185,7 +207,7 @@ embargo 核对、observed/replayed 分开计数、身份不通过就整轮不成
 
 ```text
 代码完成  ✔（含影子链路、契约、留档、页面、反馈）
-测试完成  ✔ 工程验收场景（237 + 319 passed，见 §2）
+测试完成  ✔ 工程验收场景（251 + 319 passed，见 §2）
 业务验证  ✘ 选股质量验收 blocked（§3：历史分钟数据覆盖度未知，且无真实标签）
 Freeze Ready  ✘ 未执行
 Production Ready ✘ 未执行；旧路径仍在服务真实推送
@@ -204,7 +226,7 @@ Production Ready ✘ 未执行；旧路径仍在服务真实推送
 | 1 | v4 净盈利标签策略**没有任何 runtime/CLI 注册入口** | `labels/tail_net_profit.py:74 tail_label_policy_record()` 的 docstring 写着"供 ``LabelPolicyRegistry.register`` 落库"，但 `grep -rn tail_label_policy_record src/` 只命中定义文件本身，调用方只有测试 | 训练与留档里的 `label_policy_id` 只能由外部给定；"新增独立标签"还没进 registry |
 | 2 | **没有按版本解释旧记录的读取器** | `scripts/record_tail_exit_funnel.py` 对 `contract_digest` 不一致直接退 5；`TailLabelRecord.from_dict` 缺任一字段即 raise；`funnel_trace.read_trace()` 是裸 JSON | 对**新**记录这是对的（不接受别的口径写证据），但计划要求的"旧记录保留原始值 + 带版本解释规则兼容"目前只有 `label_policy_v4_*` 这个名字，没有实现 |
 | 3 | `model_serving_manifest.v1` 里**没有 code commit 字段** | `build_serving_manifest` 的 payload 顶层只有 `schema`/`generated_at`/`source`/`serving`/`registry`/`authority`/`research_fail_closed`，其中不含 commit | 对着**真实**清单，尾盘身份必然 `training_commit_unknown` ⇒ 0 只（fail-closed，行为正确但链路是黑的）。要打通得先扩清单 schema —— 那是 ADR-001 的信任边界变更，需单独决策，不在本轮顺手改 |
-| 4 | 研究侧的**参考数据没有写入通路**，分钟库里的涨跌停/交易状态列恒为 NULL | `security_status` 表由 `data/market_warehouse.py:502` 建、`:1137 upsert_security_status()` 写，但这个方法在 `src/` 与 `scripts/` 里**除定义外零调用**（现状已由既有证据记录：`scripts/alpha_v2_m4h_evidence_map.py:232` "security_status 表 0 行"）；`scripts/sync_tail_minute_bars.py` 全文没有出现过 `up_limit/down_limit/trade_status`，只把 vendor 帧交给 `upsert_frame`，所以分钟表这三列只能是 NULL | 计划 §3.1 要求"补齐并校验…在独立研究库补齐后验证"。涨跌停与停牌因此只能靠生产仓库的 `trade_status` 联结，历史重建没有独立可验的副本；§3.3 的"涨停锁死不记成交"在纯分钟库路径上无法自证 |
+| 4 | ~~研究侧的参考数据没有写入通路~~ → **本轮已建**（`research/tail_reference_store.py` + `scripts/sync_tail_reference_data.py`，14 条测试）：五类来源按主键幂等落进研究库，只认 raw 日线，缺表报 `<source>_table_missing`，比例推算的上下限默认不可用 | 仍缺三件事：①在**真实** `market.duckdb` 上跑一次并留下报告；②生产库的 `security_status` 本身就是 0 行（`upsert_security_status` 零调用方），复制过来的也是空 → 这一路仍会报缺；③消费侧还没接线 —— 标签与历史重建目前不读 `execution_inputs()`，所以"涨停锁死"在纯研究库路径上仍未自证 |
 | 5 | 影子链路**当日重跑没有幂等键** | `week5_automation_service.py` 的夜间扫描有 `_idempotent_night_scan`，而调用尾盘影子那条没有；`write_trace` 固定落 `funnel_trace_<date>.json` | 覆盖是确定性的（同样输入同样结果），但"今天跑过几次"不可见；60 交易日影子统计开始前应补一个运行序号或运行哈希 |
 
 第 3 条决定了另一件必须说清的事：**影子链路目前是"必然 0 只"的状态**，直到有一份

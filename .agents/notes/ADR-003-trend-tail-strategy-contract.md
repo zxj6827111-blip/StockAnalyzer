@@ -256,7 +256,8 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库>
   `test_funnel_trace.py`(17)、`test_tail_net_profit_trainer.py`(20)、
   `test_trend_candidate_contract.py`(16)、`test_trend_tail_shadow_runtime.py`(22)、
   `test_trend_tail_page_and_feedback.py`(26)、`test_minute_bar_store.py`(15)、
-  `test_tail_walk_forward.py`(20)、`test_tail_exit_funnel.py`(14)
+  `test_tail_walk_forward.py`(20)、`test_tail_exit_funnel.py`(14)、
+  `test_tail_reference_store.py`(14)
 
 ## 8. 尚未接线的调用方（升级 Accepted 前必须改完）
 
