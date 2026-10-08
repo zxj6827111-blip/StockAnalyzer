@@ -79,15 +79,62 @@ As-of: 2026-10-08 @ HEAD `a53032a`（分支 `feat/stock-selection-quality-overha
 | 读数 | 值 |
 | --- | --- |
 | 落档决策日 | **94 / 94**（`not_emitted` 为空，每条都过 `verify_trace()`） |
-| 全市场考虑集 | **84,371** 个 symbol-day（每日 896–900 只） |
-| 硬性资格检查晋级 | 每日 300–320 只 |
-| 逐原因淘汰（94 天合计） | `min_avg_turnover_20` **25,371**、`overextension_risk` 248、`is_st` 178、`min_float_market_cap` 132、`board_eligibility` 92、`insufficient_history_at_asof` 4 |
+| 全市场考虑集 | **84,371** 个 symbol-day（每日 894–900 只） |
+| 硬性资格检查晋级 | **58,346** 个 symbol-day（每日 301–873 只）|
+| 逐原因淘汰（94 天合计，**只记第一条原因**） | `min_avg_turnover_20` **25,371**、`overextension_risk` 248、`is_st` 178、`min_float_market_cap` 132、`board_eligibility` 92、`insufficient_history_at_asof` 4 |
 | 幸存者偏差口径 | 留在 notes 里：`survivorship_coverage=incomplete_or_unknown`、`delisting_coverage_verified=False` |
+
+晋级口径是"as_of 时点确实可能存在成交"（当天有 RAW bar），**不是** Quality300 的截断结果，
+所以日均由 620 只而不是 300 只进入下一层；`inputs = advanced + Σrejected`
+（84,371 = 58,346 + 26,025）逐日成立，这正是 `verify_trace()` 复核的那条恒等式。
 
 **这一层给 §2 的第一个诊断答案**：淘汰量几乎全部来自流动性下限，而它是
 `avg_turnover_20` 的**横截面 30 分位**——按构造就会削掉当日约三成，与"这批票不适合短期
 上涨"无关。它属于计划要求保留的资格/可成交硬门，但**阈值口径**（分位数 vs 绝对成交额）
 是下一轮该单独问的问题；本轮不改它，也不拿它当已证实的选股质量损失。
+
+### 3b.1 两套淘汰计数口径不可混读（同一份重放，两个不同的数）
+
+| 口径 | 出处 | 合计 | 用途 |
+| --- | --- | --- | --- |
+| **逐条规则各自计数**（一只票同一天被多条硬门淘汰时**每条都记一次**） | `tail_replay_report.json` 的 `gate_rejection_totals` | **34,627** 只次（turnover 25,549、float cap 8,527、overextension 281、is_st 178、board 92） | 看"这条规则一共触发过多少次" |
+| **第一条原因**（一只票只进一个桶） | `tail_universe_facts.jsonl` → 漏斗留档 | **26,025** 只次 | 看"谁被淘汰掉了"，且必须与 `inputs − advanced` 对得上 |
+
+两者都对但**不能互相校验**：`StageTrace` 的计数恒等式不许一只票进两个桶，所以留档只能用
+第一条原因。归因顺序不是某处 dict 的插入顺序，而是契约里登记的
+`HARD_GATE_ATTRIBUTION_ORDER`（`board_eligibility → is_st → is_delisting_risk → suspended →
+min_avg_turnover_20 → min_float_market_cap → stale_market_data → overextension_risk →
+insufficient_history_at_asof`），并且**写进了每条留档的 notes**，读侧能自己还原这个分布。
+差值最大的两项正是 `min_avg_turnover_20`（25,549 → 25,371）与 `min_float_market_cap`
+（8,527 → **132**）：**浮盈市值下限几乎从不"单独"淘汰任何股票**——它命中的 8,527 只次里
+只有 132 只次没被排在它前面的规则先分走。这不说明这条门没用，只说明"按第一条原因归因"
+这个口径下它的独立作用面很小；把它当成"这条门几乎不干活"就是误读。
+
+### 3b.2 留档词汇表闭合（本轮发现并修掉的真实缺陷）
+
+sidecar 给"as_of 前历史 bar 不够算特征"的票记的原因名 `insufficient_history_at_asof`
+起初**只在重放脚本里存在、没登记进** `feature/trend_candidate_contract._RULE_KIND`。
+后果不是崩溃而是留档说谎：`hard_eligibility` 这一层记了一条契约不认识的规则，
+§2 要求的"逐层移除/替换预测性规则做对照"（它按 `classify_rule()` 分组）看不见这条淘汰，
+线上与历史两侧的原因分布也不再是同一套语言。修法两步：
+
+1. 把 `insufficient_history_at_asof` 登记为 **HARD**（数据完整性硬门，与"缺 bar 不当停牌"
+   同源，不是预测规则）；
+2. `_universe_fact()` 落盘前做闭合校验：任何 `classify_rule(...) != HARD` 的名字
+   （例如 `composite_score_floor` 这类旧预测规则）一进 sidecar 就 `SystemExit`，
+   **宁可不落这两层，也不落一条会误导消融实验的留档**。
+
+`tests/test_replay_tail_intraday_features.py` 里四条测试钉住：真实会吐出的每个
+`daily_gates` 键 + PIT 原因都必须是 HARD（回退契约登记即红）、归因只认契约顺序而不认
+dict 键序（把两条门的书写顺序对调，归因结果不变）、first-reason 去重形状、未登记名字必须被拒。
+真实 94 天 sidecar 的原因集合现已全部落在 HARD 词表内，
+`record_replay_funnel_trace.py` 重跑后仍是 **94/94、0 条 `verify_trace()` 失败**，
+逐原因合计与改前一字不差（归因顺序就是按原实现顺序登记的，所以数没动）。
+
+**这一条的验证边界要写清**：本轮只重跑了留档写入器（读现有 sidecar），
+没有用新的 `_universe_fact` 重跑 94 天重放本身——`--start` 口径无法从产物里可靠还原，
+硬编一个窗口只会产出对不上的新数。所以"显式归因顺序"这条代码路径目前只有单测覆盖，
+下一次真实重放才给它生产证据。
 
 ## 3c. 时间外稳定性与信息重复度（`measure_tail_feature_stability.py`）
 

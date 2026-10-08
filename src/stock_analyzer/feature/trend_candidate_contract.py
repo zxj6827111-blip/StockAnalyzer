@@ -81,6 +81,10 @@ _RULE_KIND: dict[str, str] = {
     "min_float_market_cap": HARD,
     "suspended": HARD,
     "stale_market_data": HARD,
+    # as-of 那天之前的历史 bar 不够算特征：这是数据完整性硬门，不是预测规则。
+    # 历史重放（scripts/replay_tail_candidate_pool.py）用它给被淘汰的 symbol-day 记原因，
+    # 名字必须在这里登记，否则留档里会出现契约不认识的规则。
+    "insufficient_history_at_asof": HARD,
     "financial_trust_insufficient": HARD,
     "trade_date_not_current": HARD,
     "limit_up_locked": HARD,
@@ -101,6 +105,28 @@ _RULE_KIND: dict[str, str] = {
 }
 
 UNKNOWN_RULE_KIND = PREDICTIVE
+
+
+#: 硬性资格检查的**判定顺序**：一只票同一天同时踩中多条硬门时，留档只能记一条原因
+#: （``StageTrace`` 的恒等式不许一只票进两个桶），归因就按这个顺序取第一条命中项。
+#:
+#: 它必须是契约里写死的事实，而不是某处 dict 的插入顺序：留档里的"逐原因淘汰了多少只"
+#: 会随代码行序变化而悄悄改数。实测例子（94 个重放决策日）``min_float_market_cap``
+#: 一共命中 8,527 次，但排在前面的 ``min_avg_turnover_20`` 把绝大多数分走了，
+#: 归因表里只剩 132 次——两种读法都对，但不写出顺序就没法知道差值是构造出来的。
+#:
+#: 末位 ``insufficient_history_at_asof`` 是 PIT/历史长度出局，只在没有任何门命中时才记账。
+HARD_GATE_ATTRIBUTION_ORDER: tuple[str, ...] = (
+    "board_eligibility",
+    "is_st",
+    "is_delisting_risk",
+    "suspended",
+    "min_avg_turnover_20",
+    "min_float_market_cap",
+    "stale_market_data",
+    "overextension_risk",
+    "insufficient_history_at_asof",
+)
 
 
 def classify_rule(name: str) -> str:

@@ -88,6 +88,20 @@ def test_known_rule_split_covers_the_legacy_bonus_list() -> None:
             "overextension_risk"} <= set(declared_rules(HARD))
 
 
+def test_attribution_order_is_a_declared_hard_gate_vocabulary() -> None:
+    """漏斗留档的"第一条原因"归因顺序是契约事实，且每一项都必须是 HARD。
+
+    它不能是某处 dict 的插入顺序：那样换一行代码就会改每条规则的淘汰计数，
+    而 §2 的消融实验正是按这些原因分布来分组的。
+    """
+    from stock_analyzer.feature.trend_candidate_contract import HARD_GATE_ATTRIBUTION_ORDER
+
+    assert len(HARD_GATE_ATTRIBUTION_ORDER) == len(set(HARD_GATE_ATTRIBUTION_ORDER))
+    assert all(classify_rule(name) == HARD for name in HARD_GATE_ATTRIBUTION_ORDER)
+    # PIT/历史长度出局只在没有任何门命中时才记账，所以排在末位。
+    assert HARD_GATE_ATTRIBUTION_ORDER[-1] == "insufficient_history_at_asof"
+
+
 def test_advisory_bonus_rules_are_declared_and_never_hard_gates() -> None:
     """新闻/主题/completion/板块配额/探索样本只能做建议性加分，不得决定资格。"""
     hard = set(declared_rules(HARD))

@@ -26,6 +26,7 @@ from stock_analyzer.contracts.trend_strategy import (
     ModelIdentity,
     TrendStrategyContract,
 )
+from stock_analyzer.feature.trend_candidate_contract import HARD_GATE_ATTRIBUTION_ORDER
 from stock_analyzer.research.funnel_trace import (
     KIND_HARD_GATE,
     KIND_PREDICTIVE,
@@ -167,7 +168,11 @@ def build_universe_stage_traces(
         data_as_of=data_as_of,
         contract=contract,
         model_identity=model_identity,
-        notes="known_suspended 是 eligible 但窗口内无 bar，按契约不等于证明停牌",
+        notes=(
+            "known_suspended 是 eligible 但窗口内无 bar，按契约不等于证明停牌；"
+            "一只票同时踩中多条硬门时只记第一条，归因顺序来自契约："
+            f"{'|'.join(HARD_GATE_ATTRIBUTION_ORDER)}"
+        ),
     )
     return (universe_stage, eligibility_stage)
 

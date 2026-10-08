@@ -92,3 +92,74 @@ def test_missing_tail_window_is_absent_rather_than_zero_filled(minute_db: Path) 
 def test_unavailable_minute_db_yields_empty_frame_not_nan_columns(tmp_path: Path) -> None:
     frame = replay.load_intraday_features(tmp_path / "does_not_exist.duckdb", DAY, DAY)
     assert frame.empty
+
+
+# --- sidecar 事实：留档词汇表必须闭合 --------------------------------------------
+
+
+def _fact(**overrides):
+    kwargs = {
+        "decision_date": DAY, "warehouse": "market_copy.duckdb",
+        "considered": ["600000", "000001", "300750"], "advanced": ["600000", "000001"],
+        "rejected": {"min_avg_turnover_20": ["300750"], "is_st": ["300750"]},
+        "pit_excluded": [], "coverage": "incomplete_or_unknown", "delisting_verified": False,
+    }
+    kwargs.update(overrides)
+    return replay._universe_fact(**kwargs)
+
+
+def test_universe_fact_uses_only_declared_rule_names() -> None:
+    """写进 archive 的淘汰原因必须是契约登记的规则，否则 §2 的原因分布与线上不是一套语言。"""
+    from stock_analyzer.feature.trend_candidate_contract import is_declared_rule
+
+    fact = _fact()
+    assert all(is_declared_rule(reason) for reason in fact["excluded_reasons"].values())
+    # 一只票被两条硬门同时淘汰时只记一条：StageTrace 的计数恒等式不允许一只票进两个桶。
+    # 归因顺序来自契约的 HARD_GATE_ATTRIBUTION_ORDER（is_st 排在流动性下限之前），
+    # 不是 rejected 这个 dict 的插入顺序。
+    assert fact["excluded_reasons"] == {"300750": "is_st"}
+    assert fact["known_suspended_symbols"] == []
+    assert fact["delisting_coverage_verified"] is False
+
+
+def test_undeclared_gate_name_is_refused_not_recorded() -> None:
+    """契约不认的名字按 predictive 处理：悄悄落进硬门留档会让消融实验漏掉这条规则。"""
+    with pytest.raises(SystemExit) as caught:
+        _fact(rejected={"composite_score_floor": ["300750"]})
+    assert "composite_score_floor" in str(caught.value)
+
+
+def test_attribution_follows_contract_order_not_dict_insertion() -> None:
+    """``rejected`` 的键序换了，归因结果不许跟着换。
+
+    原因分布是 §2 消融实验的输入：它若取决于代码里 dict 的书写顺序，
+    换一行就会悄悄改每条规则的淘汰计数（``min_float_market_cap`` 命中 8,527 次
+    却只被归因 132 次，就是这条顺序的效果）。
+    """
+    low_first = _fact(rejected={
+        "min_float_market_cap": ["300750"], "min_avg_turnover_20": ["300750"]})
+    turn_first = _fact(rejected={
+        "min_avg_turnover_20": ["300750"], "min_float_market_cap": ["300750"]})
+    assert low_first["excluded_reasons"] == {"300750": "min_avg_turnover_20"}
+    assert turn_first["excluded_reasons"] == low_first["excluded_reasons"]
+
+
+def test_every_name_the_replay_can_emit_is_a_declared_hard_rule() -> None:
+    """重放真正会写进留档的名字（``daily_gates`` 的键 + PIT 原因）必须全在 HARD 词表里。
+
+    ``insufficient_history_at_asof`` 当初只在脚本里 invented、没登记进 ``_RULE_KIND``，
+    于是 §2 的原因分布里混进一条消融实验与线上都不认识的规则。
+    """
+    from stock_analyzer.feature.trend_candidate_contract import HARD, classify_rule
+
+    rows = pd.DataFrame({
+        "symbol": ["600000"], "date": [pd.Timestamp(DAY)], "prev_bar_date": [pd.Timestamp(DAY)],
+        "is_st": [1], "is_delisting_risk": [1], "suspended": [1],
+        "avg_turnover_20": [0.0], "float_market_cap": [0.0],
+        "ret_20_raw": [1.0], "range_position_60": [1.0], "atr14_pct": [1.0],
+    })
+    emitted = set(replay.daily_gates(rows, min_turnover=1.0, min_float_cap=1.0))
+    emitted.add(replay.PIT_REJECT_REASON)
+    assert len(emitted) >= 8
+    not_hard = sorted(name for name in emitted if classify_rule(name) != HARD)
+    assert not_hard == []

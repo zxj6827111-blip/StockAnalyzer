@@ -49,10 +49,13 @@ if str(_SRC) not in sys.path:
 
 from stock_analyzer.contracts.trend_strategy import DEFAULT_TREND_CONTRACT  # noqa: E402
 from stock_analyzer.feature.trend_candidate_contract import (  # noqa: E402
+    HARD,
+    HARD_GATE_ATTRIBUTION_ORDER,
     TREND_FEATURE_CONTRACT_VERSION,
     FeatureAvailability,
     apply_hard_gates,
     build_trend_feature_frame,
+    classify_rule,
     compute_then_truncate,
 )
 from stock_analyzer.research.tail_rebuild import RebuildRequest  # noqa: E402
@@ -293,11 +296,21 @@ def _universe_fact(
     一只票进两个桶会让留档自相矛盾，宁可不落。
     """
     first_reason: dict[str, str] = {}
-    for rule, symbols in rejected.items():
-        for symbol in symbols:
+    # 归因顺序来自契约，不来自 rejected 的插入顺序：换一行代码就改数会让留档说谎。
+    precedence = [name for name in HARD_GATE_ATTRIBUTION_ORDER if name in rejected]
+    precedence += sorted(set(str(name) for name in rejected) - set(precedence))
+    for rule in precedence:
+        for symbol in rejected[rule]:
             first_reason.setdefault(str(symbol), str(rule))
     for symbol in pit_excluded:
         first_reason.setdefault(str(symbol), PIT_REJECT_REASON)
+    undeclared = sorted({reason for reason in first_reason.values()
+                         if classify_rule(reason) != HARD})
+    if undeclared:
+        # 留档 vocabulary 必须闭合：这条层记的是**硬性资格检查**，写进未登记的名字
+        # （或被归为 predictive 的旧预测规则）会让 §2 的原因分布与线上不是一套语言，
+        # 消融实验也会漏掉它。
+        raise SystemExit(f"硬门留档里出现非 HARD 规则名: {undeclared}")
     universe = sorted(set(considered))
     return {
         "decision_date": decision_date.isoformat(),
