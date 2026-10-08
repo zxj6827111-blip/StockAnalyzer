@@ -56,20 +56,32 @@ As-of: 2026-10-08 @ HEAD `b33b581`（分支 `feat/stock-selection-quality-overha
 
 ## 3. 还缺什么（按性质分三类，不要混为一谈）
 
-1. **需要数据（不是代码缺陷，也不可绕过）**
-   - 带时刻的尾盘窗口分钟行情（14:30–14:50 每 5 分钟一根）；
-   - `daily_trade_status` 的 `trade_status` 列（现在没有该列 ⇒ 重建标签 0 条可训练）。
-   没有它们，§4 的 ≥4 折、+5pp 且分块 CI 下界 >0、60 天/100 笔**都不可达**。
-2. **需要一次确认的设计决策**
-   - `universe` / `hard_eligibility` 两层的**接线**：生产者已就位，但夜扫报告里的
-     `universe_snapshot` 只有计数与 ≤50 样本，没有 `eligible_symbols` 清单，
-     而 `StageTrace` 不许用计数冒充成员。补上要么让生产夜扫报告携带符号级名单
-     （报告体积与形状变化），要么在生产路径新增一份 sidecar 工件（新的生产 I/O）。
-     两条都超出"顺手改"的范围，需你点头。
-3. **需要远端授权**
-   - 推送分支 / 开 PR（8 个提交，全部只在本地）；
-   - 在 NAS 上实跑 `scripts/audit_trend_data_readiness.py`、`audit_selection_funnel.py`、
-     `audit_shadow_evidence.py` 拿到真实读数（尤其确认历史留档不会因 `digest()` 载荷变更被误判）。
+1. **需要一次确认的设计决策：`universe` / `hard_eligibility` 两层的接线**
+   生产者已就位且有测试，但**生产夜扫路径拿不到符号级事实**：
+   `runtime/universe_candidate_selector.py::_hard_filter` 只返回
+   `rejected: dict[str, int]`（逐原因**计数**，:447-575），夜扫报告里的
+   `universe_quality_selection` 因此也是计数；而 `StageTrace` 不许用计数冒充成员
+   （`night_scan_funnel_trace._universe_facts` 只有清单时才落这两层，:99-101）。
+   2026-10-08 在 NAS 上核实过：最新一份部署报告 `nr-20260930-01.json` 里
+   `universe_snapshot` / `universe_quality_selection` / `night_funnel_trace` **都是 0 hit**，
+   所以接线不仅没做，连"改完能对着真报告验一次"的条件也不具备。
+   要做只有两条路，都要你点头：
+   - 让 `_hard_filter` 一并导出被淘汰的符号清单（生产选择器改动 + 夜扫报告体积从计数
+     变成 ~数千个代码，形状变化）；
+   - 或在生产路径新增一份 sidecar 工件专门携带符号级快照（新的生产 I/O）。
+2. **需要时间，不需要代码**
+   - 影子验证 ≥60 个完整交易日且 ≥100 笔成熟模拟成交：**当前 0 天 / 0 笔**。
+     输入生产者与门槛判定都在（R12），但只能等真实尾盘观察逐日累积。
+   - §4 的 +5pp 与分块 CI：本轮已按 §3.3 停机（四组校准窗 AUC 全 < 0.5），
+     要拿到能过关的模型需要**新的信息源**或**制度翻转后的窗口**，不是再调参能解决的。
+3. **仍缺的数据源**
+   - `security_status` 源表在生产仓库里是**空的**（NAS `market.duckdb` 实测 rows=0），
+     退市/改名历史无法证明 ⇒ 幸存者偏差口径只能是 `incomplete_or_unknown`。
+     这不是代码缺陷，要的是数据（tushare `stock_basic` 的 list_status / `namechange`）。
+   - 带时刻的尾盘分钟行情与 `daily_trade_status` 两项**本轮已解决**：
+     分钟 bar 从 vendor `Stock_1min_2000-now` 落进独立研究库（6,464,825 行 / 129 交易日），
+     可交易状态由"当天确有成交的 RAW 日线"正向声明，精确涨跌停从 `stk_limit` 补采。
+4. **远端授权**：分支已推送，PR #105 已在（含本轮 `c1e1507`）。
 
 ## 4. 基线事实（避免把既有问题当成新引入）
 
