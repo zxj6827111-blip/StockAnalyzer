@@ -16,7 +16,11 @@ python scripts/audit_selection_funnel.py \
 
 - ``0`` 九层全部有留档
 - ``3`` 有层缺记录 → 对应诊断问题不可回答（这是 §2 根因清单的一部分，不是 bug 噪声）
-- ``5`` 输入读不出来，或一条尾盘留档都没有
+- ``5`` 输入读不出来、一条尾盘留档都没有，**或留档自身不自洽**（计数不闭合 / 契约摘要
+  不一致 / 与存储摘要对不上）：被编辑过或半写的证据不许支撑任何诊断结论
+
+留档读进来先过 ``verify_trace()``：写侧的 ``StageTrace`` 恒等式只保证落盘那一刻没撒谎，
+而留档是影子验证唯一的证据来源，读侧必须自己再判一次（发布清单 R10）。
 """
 
 from __future__ import annotations
@@ -31,7 +35,7 @@ _SRC = _PROJECT_ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from stock_analyzer.research.funnel_trace import read_trace  # noqa: E402
+from stock_analyzer.research.funnel_trace import read_trace, verify_trace  # noqa: E402
 from stock_analyzer.research.selection_funnel_view import (  # noqa: E402
     build_selection_funnel_view,
 )
@@ -68,7 +72,17 @@ def main(argv: list[str] | None = None) -> int:
         return RC_ERROR
 
     try:
-        traces = [read_trace(path) for path in paths]
+        traces = []
+        for path in paths:
+            payload = read_trace(path)
+            # 留档可信性先判再拼视图：计数不自洽或摘要对不上（人工编辑过、半写、被替换）
+            # 的证据不能进任何诊断结论——发布清单 R10 要的就是"每层计数自洽"可查。
+            failures = verify_trace(payload)
+            if failures:
+                print(f"留档不可信 {path.name}: {'; '.join(failures)[:400]}",
+                      file=sys.stderr)
+                return RC_ERROR
+            traces.append(payload)
         night = (json.loads(Path(args.night_funnel).read_text(encoding="utf-8"))
                  if args.night_funnel else None)
     except (OSError, ValueError) as exc:
