@@ -2,7 +2,7 @@
 
 Status: Draft
 
-As-of: 2026-10-08 @ HEAD `59c2d0f`
+As-of: 2026-10-08 @ HEAD `0fd393a`（新增 D14：九层留档覆盖判定）
 
 回答的问题是改进计划 §2 的那句"整条链路在哪里损失选股质量"。本文只列**可核实的事实**
 与**明确标注为假设的猜测**，不给因果结论——因果需要 §4 的对照实验
@@ -25,6 +25,7 @@ As-of: 2026-10-08 @ HEAD `59c2d0f`
 | D11 | Light100 层的行级拒绝**只留 `skipped_count`**，不记原因 | `runtime/service.py:6877-6903`、`:7100` | 无法回答"前置筛选是否过早淘汰了适合短期上涨的股票" |
 | D12 | 最终推荐没有独立留档，只有一个候选快照 | `runtime/service.py:6566` → `artifacts/runtime/universe_quality_snapshot.json` | "候选快照代表最终推荐"这个前提不成立（尾盘后的判定完全没落库） |
 | D13 | `soup_strategy.max_holdings` YAML 值是 1，而契约/新路径要求 3 | `default.yaml:257` | 声明与意图不一致，`audit_strategy_contract_conflicts()` 现在会报出来 |
+| D14 | §2 的九层漏斗留档**只有一半**：`universe` 与 `hard_eligibility` 没有任何生产者，夜扫半段三层（Quality300/Light100/Deep50）只有成员与计数、没有逐只原因 | `research/selection_funnel_view.py` 的 `coverage.layers_unrecorded` / `layers_without_reasons`；`scripts/audit_selection_funnel.py` 退出码 3 | "前置筛选是否过早淘汰了适合短期上涨的股票"这类问题只能靠印象回答；现在由视图机器判为"凭现有证据答不了"（缺记录不折算成零淘汰） |
 
 ## 2. 已实测、但还不足以定性为根因
 
