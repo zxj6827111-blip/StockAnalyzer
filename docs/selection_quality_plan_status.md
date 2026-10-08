@@ -1,7 +1,8 @@
 # 选股质量改进计划：交付状态与证据台账
 
-As-of: 2026-10-08 @ HEAD `ad7f588`（分支 `feat/stock-selection-quality-overhaul`，
-**已推送**；PR #105 OPEN 且 mergeable）
+As-of: 2026-10-08，分支 `feat/stock-selection-quality-overhaul` 已推送
+（本轮 5 个提交 `5de976b` → `6d336ab` → `ce19b76` → `7ecee08` → `ad7f588` → 本文件所在提交；
+PR #105 OPEN 且 mergeable。故意不把 As-of 写成单个 SHA：那会让这条事实每次改文档都过期一次）
 
 每条都按仓库规约的四级状态标注（AGENTS.md §9.1）：
 **代码完成 ≠ 测试完成 ≠ Freeze Ready ≠ Production Ready**。
@@ -9,7 +10,7 @@ As-of: 2026-10-08 @ HEAD `ad7f588`（分支 `feat/stock-selection-quality-overha
 
 ---
 
-## 0. 交接：剩下的四件事各自要什么（截至 `ad7f588`）
+## 0. 交接：剩下的四件事各自要什么
 
 | 还差什么 | 卡在哪 | 需要谁做什么 |
 | --- | --- | --- |
