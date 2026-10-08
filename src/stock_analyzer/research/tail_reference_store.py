@@ -292,6 +292,23 @@ class TailReferenceStore:
              "price_basis", "source", "as_of", _INGESTED),
         )
 
+    def suspended_symbol_days(self) -> set[tuple[str, date]]:
+        """已声明停牌的 ``(symbol, trade_date)``。
+
+        可交易声明（由"当天确有成交的 RAW 日线"推出）不得覆盖这些行 —— 覆盖了就是
+        把停牌说成能买，§3.1 的"不把缺 bar 当停牌"反过来同样成立。
+        """
+        rows = self._con.execute(
+            f"SELECT symbol, trade_date FROM {REFERENCE_TABLES['suspend_status']} "
+            "WHERE suspended"
+        ).fetchall()
+        declared: set[tuple[str, date]] = set()
+        for symbol, day in rows:
+            parsed = _day(day)
+            if parsed is not None and str(symbol).strip():
+                declared.add((str(symbol).strip(), parsed))
+        return declared
+
     def upsert_limit_prices(
         self,
         frame: pd.DataFrame,

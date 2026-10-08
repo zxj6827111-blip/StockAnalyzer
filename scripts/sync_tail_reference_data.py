@@ -114,6 +114,25 @@ def main(argv: list[str] | None = None) -> int:
                         as_of=reading.as_of,
                     )
                     report["symbols"] = int(frames["symbol"].nunique())
+                    # 可交易声明的落地：只有"当天确有 RAW 日线且成交量 > 0"才是
+                    # **正向观察**到在交易，据此声明 trade_status='trading'。
+                    # 缺 bar 的日子一律不写 —— 计划明令"不把缺 bar 当停牌"，
+                    # 反过来把缺 bar 说成"没停牌可交易"同样是凭空声明，同样禁止。
+                    trading = frames.loc[
+                        frames["volume"].fillna(0.0) > 0.0, ["symbol", "date"]
+                    ].copy()
+                    trading["trade_date"] = trading["date"]
+                    trading["suspended"] = False
+                    trading["suspend_type"] = None
+                    trading["trade_status"] = "trading"
+                    already = store.suspended_symbol_days()
+                    if already:
+                        trading = trading.loc[
+                            ~trading.set_index(["symbol", "trade_date"]).index.isin(already)
+                        ]
+                    report["trade_status_rows_landed"] = store.upsert_suspend_status(
+                        trading, source="vendor_daily_bar_volume", as_of=end.isoformat(),
+                    )
                     coverage = store.coverage()
                     result["coverage"] = coverage
                     result["landed_rows"]["daily_bars"] = report["rows"]
