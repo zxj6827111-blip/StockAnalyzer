@@ -146,21 +146,21 @@ def audit_trend_data_readiness(
         }
 
     checks: list[ReadinessCheck] = []
+    reference_probe = (_Probe(reference_connection)
+                       if reference_connection is not None else None)
     bars_table = _pick(tables, ("daily_bars", "stock_daily", "daily"))
     checks.append(_audit_daily_bars(probe, bars_table, min_rows_per_day))
-    checks.append(_audit_price_mode(probe, bars_table))
+    checks.append(_audit_price_mode(probe, bars_table, reference_probe))
     checks.append(_audit_limit_prices(probe, bars_table, tables))
     checks.append(_audit_trade_status(probe, bars_table, tables))
-    checks.append(_audit_security_status_intervals(probe, tables))
+    checks.append(_audit_security_status_intervals(probe, tables, reference_probe))
     checks.append(_audit_index_continuity(probe, bars_table, tables, benchmark_codes))
     checks.append(_audit_tail_minute_bars(
         probe, tables,
         minute_probe=(_Probe(minute_connection) if minute_connection is not None else None),
     ))
     checks.append(_audit_calendar(probe, bars_table))
-    checks.extend(_audit_reference_copy(
-        _Probe(reference_connection) if reference_connection is not None else None
-    ))
+    checks.extend(_audit_reference_copy(reference_probe))
 
     blocking = [check.name for check in checks if check.status == STATUS_BLOCKED]
     weak = [check.name for check in checks if check.status == STATUS_INSUFFICIENT]
@@ -216,19 +216,36 @@ def _audit_daily_bars(
     )
 
 
-def _audit_price_mode(probe: _Probe, table: str | None) -> ReadinessCheck:
-    """成交模拟必须用 raw；仓库若不带复权口径声明，就无法证明它是 raw。"""
+def _audit_price_mode(
+    probe: _Probe, table: str | None, reference_probe: _Probe | None = None
+) -> ReadinessCheck:
+    """成交模拟必须用 raw；仓库若不带复权口径声明，就无法证明它是 raw。
+
+    但**成交模拟真正读的是研究库那份 RAW 副本**（§3.1"在独立研究库补齐后验证"）。
+    副本存在且口径只有 raw 时，仓库那列缺失只是"源头没声明"，不该把整条尾盘验证判成阻塞；
+    此时把满足来源写清楚，不假装仓库自己声明过。
+    """
     name = "raw_price_basis_declared"
     if table is None:
         return ReadinessCheck(name, STATUS_BLOCKED, {}, "无日线表")
     columns = probe.columns(table)
     mode_column = _pick(columns, ("price_mode", "adjust_flag", "dividend_treatment"))
     if mode_column is None:
+        credited = _reference_copy_is_raw(reference_probe)
+        if credited:
+            return ReadinessCheck(
+                name, STATUS_OK,
+                {"table": table, "warehouse_mode_column": None,
+                 "satisfied_by": "reference_copy", "reference_rows": credited},
+                "生产仓库没声明复权口径；成交与出场读的是研究库里口径可证明为 raw 的"
+                "日线副本（sync_tail_reference_data.py 落的 ref_daily_bars_raw）",
+            )
         return ReadinessCheck(
             name, STATUS_BLOCKED,
             {"table": table, "looked_for": ["price_mode", "adjust_flag",
                                             "dividend_treatment"]},
-            "仓库未声明复权口径，不能用于成交模拟（QFQ 价只能进特征）",
+            "仓库未声明复权口径，且研究库没有可证明为 raw 的日线副本"
+            "（QFQ 价只能进特征，不能用于成交模拟）",
         )
     values = probe.rows(
         f"SELECT {mode_column}, COUNT(*) FROM {table} GROUP BY {mode_column}"
@@ -323,19 +340,51 @@ def _audit_trade_status(probe: _Probe, bars_table: str | None, tables: set[str])
     )
 
 
-def _audit_security_status_intervals(probe: _Probe, tables: set[str]) -> ReadinessCheck:
+def _reference_copy_is_raw(reference_probe: _Probe | None) -> int:
+    """研究库副本口径可证明为 raw 时返回它的行数，否则 0（0 就是"没资格替仓库说话"）。"""
+    if reference_probe is None:
+        return 0
+    table = REFERENCE_TABLES["daily_bars"]
+    try:
+        if table not in reference_probe.tables():
+            return 0
+        bases = {str(row[0]) for row in reference_probe.rows(
+            f"SELECT DISTINCT price_basis FROM {table}")}
+        rows = int(reference_probe.scalar(f"SELECT COUNT(*) FROM {table}") or 0)
+    except Exception:  # noqa: BLE001 - 读不到副本就是不满足，不该把审计炸掉
+        return 0
+    return rows if rows > 0 and bases == {"raw"} else 0
+
+
+def _audit_security_status_intervals(
+    probe: _Probe, tables: set[str], reference_probe: _Probe | None = None
+) -> ReadinessCheck:
     name = "security_status_intervals"
-    if "security_status" not in tables:
-        return ReadinessCheck(name, STATUS_BLOCKED, {},
-                              "无 PIT 证券状态区间表：ST/上市/退市无法按时间还原")
-    total = int(probe.scalar("SELECT COUNT(*) FROM security_status") or 0)
-    symbols = int(probe.scalar("SELECT COUNT(DISTINCT symbol) FROM security_status") or 0)
-    complete = int(probe.scalar(
-        "SELECT COUNT(*) FROM security_status WHERE coverage_complete"
-    ) or 0)
-    overlaps = probe.rows(
-        "SELECT a.symbol, a.effective_from, b.effective_from FROM security_status a "
-        "JOIN security_status b ON a.symbol = b.symbol AND a.status_type = b.status_type "
+    table = "security_status"
+    active_probe = probe if table in tables else None
+    if active_probe is None or int(active_probe.scalar(
+        f"SELECT COUNT(*) FROM {table}") or 0) == 0:
+        # 生产那张表本来就是 0 行；§3.1 要求的是"在独立研究库补齐后验证"，
+        # 所以副本里有区间就算这份能力存在，并把来源写清楚。
+        if reference_probe is not None and REFERENCE_TABLES["security_status"] in (
+            reference_probe.tables()
+        ):
+            active_probe, table = reference_probe, REFERENCE_TABLES["security_status"]
+            if int(active_probe.scalar(f"SELECT COUNT(*) FROM {table}") or 0) == 0:
+                return ReadinessCheck(name, STATUS_INSUFFICIENT,
+                                      {"source": "reference_copy", "rows": 0},
+                                      "研究库副本的证券状态区间表还没落数据")
+        else:
+            return ReadinessCheck(name, STATUS_BLOCKED, {},
+                                  "无 PIT 证券状态区间表：ST/上市/退市无法按时间还原")
+    total = int(active_probe.scalar(f"SELECT COUNT(*) FROM {table}") or 0)
+    symbols = int(active_probe.scalar(
+        f"SELECT COUNT(DISTINCT symbol) FROM {table}") or 0)
+    complete = int(active_probe.scalar(
+        f"SELECT COUNT(*) FROM {table} WHERE coverage_complete") or 0)
+    overlaps = active_probe.rows(
+        f"SELECT a.symbol, a.effective_from, b.effective_from FROM {table} a "
+        f"JOIN {table} b ON a.symbol = b.symbol AND a.status_type = b.status_type "
         "AND a.effective_from < b.effective_from "
         "AND (a.effective_to IS NULL OR a.effective_to >= b.effective_from) LIMIT 5"
     )
@@ -344,8 +393,13 @@ def _audit_security_status_intervals(probe: _Probe, tables: set[str]) -> Readine
         name,
         STATUS_OK if total and not overlaps and share >= MIN_TRADE_STATUS_COVERAGE
         else STATUS_INSUFFICIENT,
-        {"rows": total, "symbols": symbols, "coverage_complete_share": share,
+        {"rows": total, "symbols": symbols, "source_table": table,
+         "coverage_complete_share": share,
          "overlap_sample": [list(row) for row in overlaps]},
+        "" if (total and not overlaps
+               and share >= MIN_TRADE_STATUS_COVERAGE) else
+        "证券状态区间的 coverage_complete 份额不够：改名/ST 史受接口单次 10,000 行上限截断，"
+        "跨状态还原能力只能算不足",
     )
 
 

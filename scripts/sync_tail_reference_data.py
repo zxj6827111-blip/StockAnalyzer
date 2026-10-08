@@ -26,6 +26,7 @@ import json
 import sys
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -59,6 +60,59 @@ def _load_symbols(args: argparse.Namespace) -> list[str] | None:
     return None
 
 
+#: tushare 单次调用最多回这么多行；namechange 达到这个数就是**被截断**，不是拉全了。
+ROW_LIMIT = 10_000
+
+
+def _six(ts_code: Any) -> str:
+    return str(ts_code or "").split(".")[0].zfill(6)
+
+
+def _iso(value: Any) -> str | None:
+    """tushare 回的是 ``20260929`` 这种紧凑日期；落库口径统一成 ISO，空值保持空。"""
+    text = str(value or "").strip()
+    if len(text) == 8 and text.isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    return text[:10] or None
+
+
+def security_status_frame_from_payload(payload: dict[str, Any]) -> pd.DataFrame:
+    """``stock_basic(L/D)`` + ``namechange`` 的补采载荷 → 带日期的证券状态区间表。
+
+    - ``listing_period`` / ``delisting`` 给的是**存在区间**，退市史能证明就是证明了，
+      幸存者偏差口径因此可以从 unknown 升一级；
+    - ``name_change``（ST/*ST 史的载体）在被截断的响应里 coverage_complete 必须是 False：
+      "拉到了 1,150 条"不等于"改名史完整"，拿前者当后者就是计划禁止的假装有数据；
+    - symbol 一律压成 6 位代码，和研究库其它表同一口径。
+    """
+    truncated = int(payload.get("namechange_total") or 0) >= ROW_LIMIT
+    rows: list[dict[str, Any]] = []
+    for key, status_type in (("basic_L", "listing_period"), ("basic_D", "delisting")):
+        for item in (payload.get(key) or {}).get("rows") or []:
+            ts_code, _name, list_date, delist_date = (list(item) + [None] * 4)[:4]
+            rows.append({
+                "symbol": _six(ts_code),
+                "status_type": status_type,
+                "effective_from": _iso(list_date),
+                "effective_to": _iso(delist_date),
+                "status_value": str(_name or "") or None,
+                "exchange": str(ts_code or "").split(".")[-1].upper() or None,
+                "coverage_complete": True,
+            })
+    for item in (payload.get("namechange") or {}).get("rows") or []:
+        ts_code, name, start_date, end_date = (list(item) + [None] * 4)[:4]
+        rows.append({
+            "symbol": _six(ts_code),
+            "status_type": "name_change",
+            "effective_from": _iso(start_date),
+            "effective_to": _iso(end_date),
+            "status_value": str(name or "") or None,
+            "exchange": str(ts_code or "").split(".")[-1].upper() or None,
+            "coverage_complete": not truncated,
+        })
+    return pd.DataFrame(rows)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--warehouse", required=True, help="生产仓库 market.duckdb（只读）")
@@ -79,6 +133,11 @@ def main(argv: list[str] | None = None) -> int:
         "--limit-prices-csv",
         default="",
         help="tushare stk_limit 补采结果 CSV：trade_date,ts_code,up_limit,down_limit",
+    )
+    parser.add_argument(
+        "--security-status-json",
+        default="",
+        help="tushare stock_basic(L/D)+namechange 补采载荷 JSON：证券历史状态（退市/改名史）",
     )
     args = parser.parse_args(argv)
 
@@ -175,6 +234,41 @@ def main(argv: list[str] | None = None) -> int:
                     "rows_landed": landed_limit,
                     "dates_covered": int(frame["trade_date"].nunique()),
                     "symbols_covered": int(frame["symbol"].nunique()),
+                }
+            if args.security_status_json:
+                # 证券历史状态（计划 §3.1）：仓库 security_status 实测 0 行，退市/改名史
+                # 无从证明，幸存者偏差只能记 incomplete_or_unknown。这里落 tushare
+                # stock_basic(L/D) + namechange 的补采结果；**接口只回 10,000 行时
+                # namechange 是截断的**，那一类逐行 coverage_complete=False，
+                # 不拿"拉到了"冒充"拉全了"。
+                payload = json.loads(
+                    Path(args.security_status_json).expanduser().read_text(encoding="utf-8")
+                )
+                frame = security_status_frame_from_payload(payload)
+                landed_status = 0
+                if not frame.empty:
+                    landed_status = store.upsert_security_status(
+                        frame, source="tushare_stock_basic_namechange",
+                        as_of=end.isoformat(),
+                    )
+                coverage = store.coverage()
+                result["landed_rows"]["security_status"] = landed_status
+                result["coverage"] = coverage
+                result["sufficient_sources"] = sorted(
+                    name for name in REFERENCE_TABLES
+                    if int(coverage["sources"][name]["rows"]) > 0
+                )
+                result["missing_sources"] = coverage["gaps"]
+                result["security_status_backfill"] = {
+                    "json": str(args.security_status_json),
+                    "rows_landed": landed_status,
+                    "delisted_symbols": int((frame["status_type"] == "delisting").sum())
+                    if not frame.empty else 0,
+                    "listed_symbols": int((frame["status_type"] == "listing_period").sum())
+                    if not frame.empty else 0,
+                    "name_change_rows": int((frame["status_type"] == "name_change").sum())
+                    if not frame.empty else 0,
+                    "name_change_truncated": int(payload.get("namechange_total") or 0) >= 10_000,
                 }
     except (TailReferenceError, OSError, ValueError) as exc:
         print(f"参考数据不可用: {type(exc).__name__}: {exc}", file=sys.stderr)

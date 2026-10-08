@@ -78,11 +78,18 @@ As-of: 2026-10-08 @ HEAD `b33b581`（分支 `feat/stock-selection-quality-overha
 3. **仍缺的数据源**
    - `security_status` 源表在生产仓库里是**空的**（NAS `market.duckdb` 实测 rows=0），
      退市/改名历史无法证明 ⇒ 幸存者偏差口径只能是 `incomplete_or_unknown`。
-     这不是代码缺陷，要的是数据（tushare `stock_basic` 的 list_status / `namechange`）。
+     **本轮已补采并落库**：容器内 tushare `stock_basic(L/D)` + `namechange` → 7,061 行
+     证券状态区间（5,572 只在市 / 339 只退市带 delist_date / 1,150 条池内改名史），
+     入口是 `sync_tail_reference_data.py --security-status-json`。
+     但 `namechange` 响应正好 10,000 行 = **被接口单次上限截断**，那一类逐行
+     `coverage_complete=False`：退市覆盖算证明了，ST/改名覆盖没有。
+   - 就绪审计因此从 **blocked 翻成 insufficient**（`blocking_gaps == []`），其中还修掉两处误判：
+     仓库没声明复权口径时，只要研究库副本可证明为 raw 就不该判死（成交与出场读的就是那份副本）；
+     证券状态区间此前只查生产那张 0 行的表，不查副本。
    - 带时刻的尾盘分钟行情与 `daily_trade_status` 两项**本轮已解决**：
      分钟 bar 从 vendor `Stock_1min_2000-now` 落进独立研究库（6,464,825 行 / 129 交易日），
      可交易状态由"当天确有成交的 RAW 日线"正向声明，精确涨跌停从 `stk_limit` 补采。
-4. **远端授权**：分支已推送，PR #105 已在（含本轮 `c1e1507`）。
+4. **远端授权**：分支已推送，PR #105 已在（含本轮 `c1e1507` / `1651b5a` / `56fb598`）。
 
 ## 4. 基线事实（避免把既有问题当成新引入）
 
