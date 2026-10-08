@@ -109,3 +109,30 @@ bar 时刻语义是**实测判定**而不是猜的：09:30 是开盘集合竞价
 - 影子验证（60 天 / 100 笔）：**blocked（0 天 / 0 笔）**，且必须用未来真实观察，
   历史分钟数据再多也不能顶替（计划原文）。
 - 未部署、未改生产；本地 `artifacts/research/` 里的副本与中间产物不入库。
+
+---
+
+## 6. 本篇写完之后的落地进展（同一轮内，提交 `2a69d8a`）
+
+§4 第 1 条已不再只是"下一步"：`sync_tail_reference_data.py` 现在接受
+`--vendor-daily-root`，从 `全A日K/{2025,2026}.zip` 读**可证明口径**的原始价日线。
+成员发现复用 `build_vendor_zip_daily_index`（含同名包去重），数量倍率沿用
+`VendorZipOverlayProvider` 的声明而不是另抄常数（slots dataclass 的类属性是
+`member_descriptor`，默认值只能从 `dataclasses.fields()` 取 —— 代码里写明了这点，
+否则下一个人又会照着 `Provider.daily_volume_multiplier` 直接 float() 而炸在运行期）。
+
+本机实测（208 个请求符号，2026-01-01..2026-06-30）：
+
+| 项 | 结果 |
+| --- | --- |
+| `ref_daily_bars_raw` | **24,086 行 / 208 个符号 / 2026-01-05 → 2026-06-30** |
+| `source` / `price_basis` | `vendor_zip_daily_raw` / `raw` |
+| `daily_bars` 缺口 | 由 `daily_bars_table_missing` 变为 **sufficient** |
+| 剩余缺口 | 仅 `security_status_table_missing`（源表本身为空） |
+| 未声明的证券状态 | `is_st` / `is_delisting_risk` 留 NULL —— 没声明不等于"不是 ST" |
+| 回归测试 | `test_vendor_daily_raw_source_declares_units_and_leaves_undeclared_flags_unknown`（手→股 ×100、千元→元 ×1000、万元→元 ×10000 三条换算各自有断言） |
+
+单位换算与真实数据对得上是这次接线的关键判据：605081 在 2026-01-05 的
+`volume 30906.45 手 → 3.09M 股`、`amount 32908.135 千元 → 3.29 亿元`，
+按均价 10.6 元反算正好吻合；`circ_mv` 万元 ×10000 → 154 亿流通市值合理。
+所以倍率不是猜的，是和源数据一起被验证过的。
