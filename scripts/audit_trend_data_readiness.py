@@ -5,6 +5,12 @@
 
 ``--minute-db`` 指向 ``scripts/sync_tail_minute_bars.py`` 的产物：仓库里的分钟表只有
 日级聚合，尾盘窗口能不能重建取决于这个研究库里有没有带时刻的 bar。
+
+``--reference-db`` 指向同一研究库里的**日级参考数据副本**（默认就是分钟库那个文件，
+五类参考表和分钟表同库共存）。生产仓库有数据 ≠ 能重建标签：成交与出场判定吃的是这份
+副本，它没建、口径不是 raw、日历与行情互相矛盾、或没有显式交易状态声明，都会让重建
+单独记 ``insufficient_reference_data`` / ``unknown_trade_status``。不传这一项时报告会留
+一条 ``reference_copy_validated = insufficient``，免得把"没校验"当成"校验通过"。
 """
 
 from __future__ import annotations
@@ -21,11 +27,22 @@ _SRC = _PROJECT_ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+from stock_analyzer.research.tail_reference_store import (  # noqa: E402
+    REFERENCE_DB_DEFAULT,
+)
 from stock_analyzer.research.trend_data_readiness import (  # noqa: E402
     audit_trend_data_readiness,
     format_blocking_gaps,
     readiness_exit_code,
 )
+
+
+def _open_read_only(path: str):
+    """存在才打开；不存在返回 None，由审计报告把"没校验"如实写成一条检查项。"""
+    candidate = Path(path) if path else None
+    if candidate is None or not candidate.exists():
+        return None
+    return duckdb.connect(str(candidate), read_only=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -34,6 +51,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--minute-db", default="",
         help="带时刻的分钟研究库（scripts/sync_tail_minute_bars.py 产物，只读）",
+    )
+    parser.add_argument(
+        "--reference-db", default=REFERENCE_DB_DEFAULT,
+        help="研究库里的日级参考数据副本（默认与分钟库同文件，只读）",
     )
     parser.add_argument("--out", default="artifacts/research/trend_data_readiness.json")
     parser.add_argument("--quiet", action="store_true")
@@ -45,18 +66,18 @@ def main(argv: list[str] | None = None) -> int:
         return 5
 
     connection = duckdb.connect(str(db_path), read_only=True)
-    minute_connection = (
-        duckdb.connect(str(Path(args.minute_db)), read_only=True)
-        if args.minute_db and Path(args.minute_db).exists() else None
-    )
+    minute_connection = _open_read_only(args.minute_db)
+    reference_connection = _open_read_only(args.reference_db)
     try:
         report = audit_trend_data_readiness(
-            connection=connection, minute_connection=minute_connection
+            connection=connection, minute_connection=minute_connection,
+            reference_connection=reference_connection,
         )
     finally:
         connection.close()
-        if minute_connection is not None:
-            minute_connection.close()
+        for handle in (minute_connection, reference_connection):
+            if handle is not None:
+                handle.close()
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

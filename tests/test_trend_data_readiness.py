@@ -154,19 +154,21 @@ def test_summary_only_minute_table_blocks_tail_window_reconstruction() -> None:
     assert "不得用开盘回测代替" in format_blocking_gaps(report)
 
 
-def test_bar_timestamped_minute_table_lifts_the_block() -> None:
+def test_bar_timestamped_minute_table_lifts_the_block(tmp_path) -> None:
     conn = _connect()
     _seed_bars(conn)
     _seed_index(conn)
     _statuses(conn)
     _seed_minute_bars(conn)
-    report = audit_trend_data_readiness(connection=conn)
+    reference = _reference_db(tmp_path)
+    report = audit_trend_data_readiness(connection=conn, reference_connection=reference)
     checks = {item["name"]: item for item in report["checks"]}
     assert checks["tail_window_minute_bars"]["status"] == STATUS_OK
     assert checks["tail_window_minute_bars"]["detail"]["1min"][
         "tail_window_bar_rows"] > 0
     assert report["readiness"] == READINESS_READY
     assert readiness_exit_code(report) == 0
+    reference.close()
 
 
 def test_undeclared_price_basis_blocks_execution_simulation() -> None:
@@ -298,3 +300,227 @@ def test_cli_writes_the_report_and_returns_the_blocking_exit_code(tmp_path) -> N
     report = json.loads(out_path.read_text(encoding="utf-8"))
     assert report["readiness"] == READINESS_BLOCKED
     assert "tail_window_minute_bars" in report["blocking_gaps"]
+
+
+# --- 研究库参考数据副本：§3.1 的"补齐后验证" ------------------------------------
+
+_REF_SYMBOLS = SYMBOLS[:20]
+_AS_OF = "2026-10-08"
+
+
+def _reference_db(
+    tmp_path,
+    *,
+    declare_status: bool = True,
+    approximated: bool = False,
+    security: bool = True,
+    extra_bar_days=(),
+    days=None,
+):
+    """把研究库副本落到文件，返回**只读**连接（审计不该改被审计的库）。"""
+    import pandas as pd
+
+    from stock_analyzer.research.tail_reference_store import TailReferenceStore
+
+    days = list(days) if days is not None else list(DAYS)
+    bar_days = days + list(extra_bar_days)
+    path = tmp_path / "reference.duckdb"
+    with TailReferenceStore(path) as store:
+        store.upsert_calendar(days, as_of=_AS_OF)
+        store.upsert_daily_bars(
+            pd.DataFrame([
+                {"symbol": symbol, "date": day, "open": 10.0, "high": 10.2,
+                 "low": 9.9, "close": 10.1, "volume": 1e6}
+                for day in bar_days for symbol in _REF_SYMBOLS
+            ]),
+            price_basis="raw", as_of=_AS_OF,
+        )
+        store.upsert_limit_prices(
+            pd.DataFrame([
+                {"symbol": symbol, "trade_date": day, "up_limit": 11.1, "down_limit": 9.1}
+                for day in bar_days for symbol in _REF_SYMBOLS
+            ]),
+            as_of=_AS_OF, approximated=approximated,
+        )
+        statuses = [
+            {"symbol": symbol, "trade_date": day, "suspended": False}
+            for day in bar_days for symbol in _REF_SYMBOLS
+        ]
+        if declare_status:
+            for row in statuses:
+                row["trade_status"] = "normal"
+        store.upsert_suspend_status(pd.DataFrame(statuses), as_of=_AS_OF)
+        if security:
+            store.upsert_security_status(
+                pd.DataFrame([
+                    {"symbol": symbol, "effective_from": START, "status_type": "ST",
+                     "status_value": "N"}
+                    for symbol in _REF_SYMBOLS
+                ]),
+                as_of=_AS_OF,
+            )
+    return duckdb.connect(str(path), read_only=True)
+
+
+def _ready_conn() -> duckdb.DuckDBPyConnection:
+    conn = _connect()
+    _seed_bars(conn)
+    _seed_index(conn)
+    _statuses(conn)
+    _seed_minute_bars(conn)
+    return conn
+
+
+def _by_name(report) -> dict:
+    return {item["name"]: item for item in report["checks"]}
+
+
+def test_unvalidated_reference_copy_is_named_not_assumed(tmp_path) -> None:
+    """"仓库有数据"不等于"能重建标签"：副本没校验就不能报 ready。"""
+    report = audit_trend_data_readiness(connection=_ready_conn())
+    assert report["readiness"] == READINESS_INSUFFICIENT
+    assert "reference_copy_validated" in report["insufficient_items"]
+    assert "没有传 --reference-db" in _by_name(report)["reference_copy_validated"]["note"]
+    assert readiness_exit_code(report) == 3
+
+
+def test_validated_reference_copy_lifts_readiness_to_ready(tmp_path) -> None:
+    reference = _reference_db(tmp_path)
+    report = audit_trend_data_readiness(connection=_ready_conn(),
+                                       reference_connection=reference)
+    reference.close()
+    assert report["readiness"] == READINESS_READY, report["insufficient_items"]
+    assert [name for name in report["blocking_gaps"]] == []
+
+
+def test_missing_reference_sources_block_instead_of_reporting_zero_coverage(tmp_path) -> None:
+    """空文件里一张参考表都没有：这是"没建副本"，不是"覆盖率为 0"。"""
+    path = tmp_path / "empty.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE TABLE unrelated (x INT)")
+    conn.close()
+    report = audit_trend_data_readiness(
+        connection=_ready_conn(),
+        reference_connection=duckdb.connect(str(path), read_only=True),
+    )
+    checks = _by_name(report)
+    assert checks["reference_copy_present"]["status"] == STATUS_BLOCKED
+    assert "sync_tail_reference_data" in checks["reference_copy_present"]["note"]
+    assert set(checks["reference_copy_present"]["detail"]["missing_required_sources"]) == {
+        "trade_calendar", "daily_bars", "limit_prices", "suspend_status",
+    }
+    assert report["readiness"] == READINESS_BLOCKED
+
+
+def test_no_declared_trade_status_blocks_label_production(tmp_path) -> None:
+    """§3.3：状态未声明的日子出不来已实现盈亏 —— 一条都没有就是整条链阻塞。"""
+    reference = _reference_db(tmp_path, declare_status=False)
+    report = audit_trend_data_readiness(connection=_ready_conn(),
+                                       reference_connection=reference)
+    reference.close()
+    check = _by_name(report)["reference_copy_trade_status_declared"]
+    assert check["status"] == STATUS_BLOCKED
+    assert "unknown_trade_status" in check["note"]
+    assert check["detail"]["declared_trade_status_symbol_days"] == 0
+    assert report["readiness"] == READINESS_BLOCKED
+
+
+def test_approximated_limit_prices_are_not_counted_as_exact(tmp_path) -> None:
+    reference = _reference_db(tmp_path, approximated=True)
+    report = audit_trend_data_readiness(connection=_ready_conn(),
+                                       reference_connection=reference)
+    reference.close()
+    check = _by_name(report)["reference_copy_limit_prices_exact"]
+    assert check["status"] == "insufficient"
+    assert check["detail"]["exact_limit_price_symbol_days"] == 0
+    assert "entry_day_limit_prices" in check["note"]
+
+
+def test_calendar_conflict_inside_the_copy_blocks_the_rebuild(tmp_path) -> None:
+    """副本里出现权威日历说没开市的日子：第 5 个交易日会算错，不能带着矛盾出标签。"""
+    saturday = date(2026, 9, 5)
+    reference = _reference_db(tmp_path, extra_bar_days=[saturday])
+    report = audit_trend_data_readiness(connection=_ready_conn(),
+                                       reference_connection=reference)
+    reference.close()
+    check = _by_name(report)["reference_copy_calendar_consistent"]
+    assert check["status"] == STATUS_BLOCKED
+    assert str(saturday) in check["detail"]["conflicting_trade_dates"]
+
+
+def test_legacy_adjusted_rows_in_the_copy_are_refused(tmp_path) -> None:
+    """历史遗留的 qfq 行不能拿来做成交模拟（ADR-002）：口径混了就阻塞。"""
+    from stock_analyzer.research.tail_reference_store import REFERENCE_TABLES
+
+    reference = _reference_db(tmp_path)
+    reference.close()
+    copy_path = str(tmp_path / "reference.duckdb")
+    writable = duckdb.connect(copy_path)
+    writable.execute(
+        f"UPDATE {REFERENCE_TABLES['daily_bars']} SET price_basis = 'qfq' "
+        "WHERE symbol = ?", [_REF_SYMBOLS[0]]
+    )
+    writable.close()
+    report = audit_trend_data_readiness(
+        connection=_ready_conn(),
+        reference_connection=duckdb.connect(copy_path, read_only=True),
+    )
+    check = _by_name(report)["reference_copy_raw_only"]
+    assert check["status"] == STATUS_BLOCKED
+    assert set(check["detail"]["price_bases"]) == {"qfq", "raw"}
+    assert "ADR-002" in check["note"]
+
+
+def test_empty_security_status_is_insufficient_not_blocked(tmp_path) -> None:
+    """第五类来源没落地：影响资格判定的能力，但不阻塞单笔成交/出场。"""
+    reference = _reference_db(tmp_path, security=False)
+    report = audit_trend_data_readiness(connection=_ready_conn(),
+                                       reference_connection=reference)
+    reference.close()
+    check = _by_name(report)["reference_copy_present"]
+    assert check["status"] == "insufficient"
+    assert "ref_security_status" in check["note"]
+    assert report["readiness"] == READINESS_INSUFFICIENT
+
+
+def _run_cli(tmp_path, args) -> subprocess.CompletedProcess:
+    root = Path(__file__).resolve().parents[1]
+    return subprocess.run(
+        [sys.executable, str(root / "scripts" / "audit_trend_data_readiness.py"), *args],
+        cwd=str(tmp_path), capture_output=True, text=True, check=False,
+        # 不注入 PYTHONPATH：脚本必须自己找到 src/（与上面的 CLI 测试同一条理由）。
+        env={"PATH": "/usr/bin:/bin"},
+    )
+
+
+def _warehouse_file(tmp_path, *, with_bar_timestamps: bool) -> str:
+    path = tmp_path / "market.duckdb"
+    conn = duckdb.connect(str(path))
+    _seed_bars(conn)
+    _seed_index(conn)
+    _statuses(conn)
+    (_seed_minute_bars if with_bar_timestamps else _seed_minute_summary)(conn)
+    conn.close()
+    return str(path)
+
+
+def test_cli_reads_the_reference_copy_only_when_told_to(tmp_path) -> None:
+    """``--reference-db`` 是真的被读：不传就报"没校验"，传了才能报 ready。"""
+    warehouse = _warehouse_file(tmp_path, with_bar_timestamps=True)
+    _reference_db(tmp_path).close()  # 副本落到 tmp_path/reference.duckdb
+    reference_path = str(tmp_path / "reference.duckdb")
+
+    out = tmp_path / "readiness.json"
+    unvalidated = _run_cli(tmp_path, ["--db", warehouse, "--reference-db", "missing.duckdb",
+                                     "--out", str(out), "--quiet"])
+    assert unvalidated.returncode == 3, unvalidated.stdout + unvalidated.stderr
+    report = json.loads(out.read_text(encoding="utf-8"))
+    assert "reference_copy_validated" in report["insufficient_items"]
+
+    validated = _run_cli(tmp_path, ["--db", warehouse, "--reference-db", reference_path,
+                                    "--out", str(out), "--quiet"])
+    assert validated.returncode == 0, validated.stdout + validated.stderr
+    report = json.loads(out.read_text(encoding="utf-8"))
+    names = {item["name"] for item in report["checks"]}
+    assert {"reference_copy_present", "reference_copy_trade_status_declared"} <= names
+    assert report["readiness"] == READINESS_READY

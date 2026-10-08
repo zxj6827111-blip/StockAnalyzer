@@ -187,6 +187,12 @@ As-of: 2026-10-08 @ HEAD `e7023c1` 之后的工作树（本 ADR 与 `contracts/t
 - 确认谓词从服务的私有函数提升为契约的 `hard_gate_confirmation()`，线上影子链路与重建
   CLI 引用的是**同一个函数对象**（`test_live_service_and_contract_share_one_confirmation_object`
   钉住）。§4 要的一致性靠"共用一个对象"保证，不靠两边各写一份再对拍。
+- 就绪门现在也校验**研究库副本**（`scripts/audit_trend_data_readiness.py --reference-db`，
+  默认与分钟库同文件）：缺必要来源 / 混进非 raw 口径 / 副本内日历与行情互相矛盾 /
+  一条显式交易状态都没有 → **blocked**；精确涨跌停或状态声明覆盖不足、
+  `ref_security_status` 为空 → **insufficient**。不传这一项时报告会留一条
+  ``reference_copy_validated = insufficient``（"没校验"不能被读成"校验通过"）。
+  这组检查是只读探测，绝不建表 —— 审计动作不该改变被审计的库。
 - 数据侧新发现的真实缺口：生产仓库 `daily_trade_status` 表**没有 `trade_status` 列**
   （只有 `suspended` / `suspend_type`），而同步脚本把它同时当作涨跌停与停复牌的来源。
   因此从仓库同步来的研究库里 `trade_status` 恒为 NULL → 出场逐日判定必然
@@ -216,9 +222,10 @@ scripts/sync_tail_minute_bars.py   本地跑：vendor ZIP → artifacts/research
 research/minute_bar_store.py       按分钟存 bar；price_basis / bar_time_semantics
                                    必须显式声明；bars_for() 直接吐契约要的形状，
                                    非 raw 口径拒绝用于成交模拟
-scripts/audit_trend_data_readiness.py --minute-db <研究库>
+scripts/audit_trend_data_readiness.py --minute-db <研究库> --reference-db <研究库>
                                    只有研究库里真的有带时刻的 bar，
-                                   tail_window_minute_bars 才允许翻成 ok
+                                   tail_window_minute_bars 才允许翻成 ok；
+                                   日级参考副本另走一组 reference_copy_* 检查
 ```
 
 **仍然没解决的两件事**（所以 §4 的选股质量验收现在依旧不可执行）：
@@ -274,8 +281,9 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库>
   —— 滚动前推验证的**编排层**：折边界带 embargo、注入 split 由训练器复核、
   排序仍走 `rank_final_recommendations`（验证器不自带一套选股逻辑）；
   样本不足/身份不通过一律 `blocked`，不产命中率数字
-- `scripts/audit_trend_data_readiness.py --minute-db` —— 就绪门多看一个来源，
-  判定标准不变
+- `scripts/audit_trend_data_readiness.py --minute-db / --reference-db` —— 就绪门多看两个
+  来源（带时刻的分钟库、研究库里的日级参考副本），判定标准不变；`--reference-db`
+  默认与分钟库同文件，不传就如实留一条"没校验"的检查项而不是假装通过
 - `src/stock_analyzer/research/tail_rebuild.py` + `scripts/rebuild_tail_labels.py` ——
   历史重建的**消费侧**：研究库 → `day_limits` / `daily_bar_series` → 同一个
   `build_tail_net_profit_label`。参考数据缺口单独记 `insufficient_reference_data`
@@ -285,7 +293,7 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库>
 - `docs/trend_tail_acceptance_evidence.md` —— §4 验收证据：工程验收逐场景 → 测试名，
   以及"选股质量验收 = blocked"的实测口径（本文件不产命中率数字）
 - 测试（2026-10-08 实测条数）：`test_trend_strategy_contract.py`(55)、
-  `test_tail_net_profit_label.py`(19)、`test_trend_data_readiness.py`(13)、
+  `test_tail_net_profit_label.py`(19)、`test_trend_data_readiness.py`(22)、
   `test_funnel_trace.py`(17)、`test_tail_net_profit_trainer.py`(20)、
   `test_trend_candidate_contract.py`(16)、`test_trend_tail_shadow_runtime.py`(22)、
   `test_trend_tail_page_and_feedback.py`(26)、`test_minute_bar_store.py`(15)、

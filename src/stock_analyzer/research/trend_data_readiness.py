@@ -32,6 +32,7 @@ from stock_analyzer.contracts.trend_strategy import (
     DEFAULT_TREND_CONTRACT,
     TrendStrategyContract,
 )
+from stock_analyzer.research.tail_reference_store import REFERENCE_TABLES
 
 READINESS_READY = "ready"
 READINESS_INSUFFICIENT = "insufficient"
@@ -116,11 +117,17 @@ def audit_trend_data_readiness(
     benchmark_codes: tuple[str, ...] = ("000300", "399001"),
     min_rows_per_day: int = MIN_DAILY_ROWS_PER_DAY,
     minute_connection: Any | None = None,
+    reference_connection: Any | None = None,
 ) -> dict[str, Any]:
     """按尾盘策略契约的要求探测仓库数据，返回可审计的就绪报告。
 
     ``minute_connection`` 指向带时刻的分钟研究库（可选）：只有它真的非空，
     ``tail_window_minute_bars`` 才会从 blocked 翻成 ok。
+
+    ``reference_connection`` 指向研究库里的**日级参考数据副本**（同一文件的另一组表）。
+    成交与出场的判定要吃的就是这份副本，所以"生产仓库有数据"不等于"能重建标签"：
+    副本没建、口径不是 raw、日历矛盾、状态没声明，都会在重建时变成
+    ``insufficient_reference_data`` 或 ``unknown_trade_status``，而不是产出标签。
     """
     probe = _Probe(connection)
     try:
@@ -151,6 +158,9 @@ def audit_trend_data_readiness(
         minute_probe=(_Probe(minute_connection) if minute_connection is not None else None),
     ))
     checks.append(_audit_calendar(probe, bars_table))
+    checks.extend(_audit_reference_copy(
+        _Probe(reference_connection) if reference_connection is not None else None
+    ))
 
     blocking = [check.name for check in checks if check.status == STATUS_BLOCKED]
     weak = [check.name for check in checks if check.status == STATUS_INSUFFICIENT]
@@ -479,6 +489,149 @@ def _audit_calendar(probe: _Probe, bars_table: str | None) -> ReadinessCheck:
             "周末出现日线：日历被当成'非节假日的工作日即开市'，跨年样本会错位",
         )
     return ReadinessCheck(name, STATUS_OK, detail)
+
+
+#: 研究库副本里，判定成交与出场**必须**非空的四类来源。
+#: security_status 单独算：它是 §3.1 列的第五类，但不参与单笔成交/出场判定。
+_REFERENCE_REQUIRED = ("trade_calendar", "daily_bars", "limit_prices", "suspend_status")
+
+
+def _audit_reference_copy(reference_probe: _Probe | None) -> list[ReadinessCheck]:
+    """校验**研究库副本** —— §3.1 的"补齐后验证"，也是历史重建的取数入口。
+
+    生产仓库那一组检查回答"源头有没有数据"；这组回答的是"复制过来的东西能不能真的
+    拿来判成交与出场"。两者不能互相替代：副本没建，重建会在缺精确涨跌停的日子判
+    ``no_valid_price_data``，看起来像策略买不进，实际是我们的参考数据不足以判断。
+
+    逐项都是只读探测，绝不建表：审计动作本身不该改变被审计的库。
+    """
+    if reference_probe is None:
+        return [ReadinessCheck(
+            "reference_copy_validated", STATUS_INSUFFICIENT, {"connection": None},
+            "没有传 --reference-db：研究库里的五类参考数据没有被校验过。"
+            "历史重建与训练标签依赖这份副本，未校验就不能声称 §3.1 已验证"
+            "（scripts/sync_tail_reference_data.py → scripts/rebuild_tail_labels.py）",
+        )]
+    try:
+        tables = reference_probe.tables()
+    except Exception as exc:  # noqa: BLE001 - 打不开副本就是彻底没法校验
+        return [ReadinessCheck("reference_copy_validated", STATUS_BLOCKED,
+                               {"error": str(exc)}, "研究库副本不可读")]
+
+    checks: list[ReadinessCheck] = []
+    present = {name: REFERENCE_TABLES[name] for name in REFERENCE_TABLES
+               if REFERENCE_TABLES[name] in tables}
+    empty = {name: int(reference_probe.scalar(f"SELECT COUNT(*) FROM {table}") or 0)
+             for name, table in present.items()}
+    missing = [name for name in _REFERENCE_REQUIRED if empty.get(name, 0) <= 0]
+    detail: dict[str, Any] = {
+        "tables": {name: empty.get(name, 0) for name in REFERENCE_TABLES},
+        "missing_required_sources": sorted(missing),
+    }
+    if missing:
+        checks.append(ReadinessCheck(
+            "reference_copy_present", STATUS_BLOCKED, detail,
+            f"研究库副本缺必要来源 {sorted(missing)}：先跑 "
+            "scripts/sync_tail_reference_data.py 把五类参考数据只读复制进来",
+        ))
+    else:
+        status_note = ""
+        if not empty.get("security_status"):
+            # 证券历史状态是 §3.1 列的第五类，但不参与单笔成交/出场判定 → 算不足不算阻塞。
+            status_note = (
+                "证券历史状态（ref_security_status）为空或没有这张表：ST/退市风险的时点判定"
+                "只能靠日线里的 is_st 列，跨状态区间的能力还没有"
+                "（生产库该表本身就是 0 行，upsert_security_status 还没有调用方）"
+            )
+        checks.append(ReadinessCheck(
+            "reference_copy_present",
+            STATUS_INSUFFICIENT if status_note else STATUS_OK, detail, status_note,
+        ))
+
+    bars = REFERENCE_TABLES["daily_bars"]
+    bases = {str(row[0]) for row in reference_probe.rows(
+        f"SELECT DISTINCT price_basis FROM {bars}")} if bars in tables else set()
+    if bases and bases != {"raw"}:
+        checks.append(ReadinessCheck(
+            "reference_copy_raw_only", STATUS_BLOCKED, {"price_bases": sorted(bases)},
+            "研究库副本里出现非 raw 口径：复权价不得用于模拟成交与出场（ADR-002），"
+            "这份副本不能用于重建标签",
+        ))
+    else:
+        checks.append(ReadinessCheck(
+            "reference_copy_raw_only", STATUS_OK, {"price_bases": sorted(bases)}))
+
+    conflicts: list[str] = []
+    if bars in tables and REFERENCE_TABLES["trade_calendar"] in tables:
+        conflicts = [str(row[0]) for row in reference_probe.rows(
+            f"SELECT DISTINCT b.trade_date FROM {bars} b "
+            f"LEFT JOIN {REFERENCE_TABLES['trade_calendar']} c "
+            "ON b.trade_date = c.trade_date "
+            "WHERE c.trade_date IS NULL OR NOT c.is_open")]
+    if conflicts:
+        checks.append(ReadinessCheck(
+            "reference_copy_calendar_consistent", STATUS_BLOCKED,
+            {"conflicting_trade_dates": conflicts[:20], "count": len(conflicts)},
+            "副本里的日线日期与权威日历互相矛盾：'第 5 个交易日退出'会落在错误的日期上，"
+            "重建会把它判成 daily_bar_session_holes，不能带着矛盾继续算标签",
+        ))
+    else:
+        checks.append(ReadinessCheck("reference_copy_calendar_consistent", STATUS_OK, {}))
+
+    symbol_days = int(reference_probe.scalar(
+        f"SELECT COUNT(*) FROM {bars}") or 0) if bars in tables else 0
+    exact_days = int(reference_probe.scalar(
+        f"SELECT COUNT(*) FROM {bars} b JOIN {REFERENCE_TABLES['limit_prices']} l "
+        "ON b.symbol = l.symbol AND b.trade_date = l.trade_date "
+        "WHERE NOT l.approximated AND l.up_limit IS NOT NULL AND l.down_limit IS NOT NULL"
+    ) or 0) if symbol_days else 0
+    limit_share = (exact_days / symbol_days) if symbol_days else 0.0
+    limit_detail = {
+        "daily_bar_symbol_days": symbol_days,
+        "exact_limit_price_symbol_days": exact_days,
+        "share": round(limit_share, 4),
+        "threshold": MIN_LIMIT_PRICE_COVERAGE,
+    }
+    checks.append(ReadinessCheck(
+        "reference_copy_limit_prices_exact",
+        STATUS_OK if limit_share >= MIN_LIMIT_PRICE_COVERAGE else STATUS_INSUFFICIENT,
+        limit_detail,
+        "" if limit_share >= MIN_LIMIT_PRICE_COVERAGE else
+        "副本里可用的精确涨跌停覆盖不足：这些日子的涨停锁死/跌停卖不出判不了，"
+        "重建会单独记 entry_day_limit_prices（数据缺口），不能折算成未成交或亏损",
+    ))
+
+    declared = int(reference_probe.scalar(
+        f"SELECT COUNT(*) FROM {bars} b JOIN {REFERENCE_TABLES['suspend_status']} s "
+        "ON b.symbol = s.symbol AND b.trade_date = s.trade_date "
+        "WHERE s.trade_status IS NOT NULL"
+    ) or 0) if symbol_days else 0
+    status_share = (declared / symbol_days) if symbol_days else 0.0
+    status_detail = {
+        "daily_bar_symbol_days": symbol_days,
+        "declared_trade_status_symbol_days": declared,
+        "share": round(status_share, 4),
+    }
+    if status_share <= 0.0:
+        checks.append(ReadinessCheck(
+            "reference_copy_trade_status_declared", STATUS_BLOCKED, status_detail,
+            "副本里没有任何显式 trade_status 声明：出场逐日判定会全部落到 "
+            "unknown_trade_status，**一条已实现盈亏标签都产不出来**（§3.3）。"
+            "根因在生产仓库 —— daily_trade_status 表没有 trade_status 列"
+            "（data/market_warehouse.py 的 DDL 只有 suspended/suspend_type），"
+            "而同步把它同时当作涨跌停与停复牌来源。补齐来源属数据层决策，"
+            "不得在这里把未知状态补成 normal 冒充可交易",
+        ))
+    elif status_share < MIN_TRADE_STATUS_COVERAGE:
+        checks.append(ReadinessCheck(
+            "reference_copy_trade_status_declared", STATUS_INSUFFICIENT, status_detail,
+            "交易状态声明覆盖不足：未声明的那些日子不产出已实现盈亏标签，"
+            "样本量会低于表面看到的 symbol-day 数",
+        ))
+    else:
+        checks.append(ReadinessCheck(
+            "reference_copy_trade_status_declared", STATUS_OK, status_detail))
+    return checks
 
 
 def _median(values: list[int]) -> float | None:

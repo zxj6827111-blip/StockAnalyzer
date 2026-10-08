@@ -111,6 +111,23 @@
    `test_live_service_and_contract_share_one_confirmation_object`（确认谓词从服务私有函数
    提升为契约的 `hard_gate_confirmation`，两边引用同一个对象）。
 
+6. **就绪门现在校验研究库副本**（§3.1 "补齐后验证"里"验证"那一步）。生产仓库那一组
+   检查只回答"源头有没有数据"；副本那一组回答"复制过来的东西能不能真的拿来判成交与
+   出场"。缺必要来源、混进非 raw 口径、副本内日历与行情互相矛盾、一条显式
+   `trade_status` 都没有 → **blocked**；精确涨跌停或状态声明覆盖不足、
+   `ref_security_status` 空 → **insufficient**；不传 `--reference-db` 时留一条
+   `reference_copy_validated = insufficient`，免得把"没校验"读成"校验通过"。
+   探测全程只读，不建表。钉住：
+   `test_unvalidated_reference_copy_is_named_not_assumed`、
+   `test_validated_reference_copy_lifts_readiness_to_ready`、
+   `test_missing_reference_sources_block_instead_of_reporting_zero_coverage`、
+   `test_no_declared_trade_status_blocks_label_production`、
+   `test_approximated_limit_prices_are_not_counted_as_exact`、
+   `test_calendar_conflict_inside_the_copy_blocks_the_rebuild`、
+   `test_legacy_adjusted_rows_in_the_copy_are_refused`、
+   `test_empty_security_status_is_insufficient_not_blocked`、
+   `test_cli_reads_the_reference_copy_only_when_told_to`。
+
 ---
 
 ## 1a. 数据侧新查出的一个真实缺口（不是代码问题）
@@ -170,6 +187,22 @@
 | `mypy --python-version 3.12` 本轮 4 个源文件 | 这 4 个文件**自身 0 error**（其余报错来自被跟进导入的历史文件） |
 | `python -c "…_cost_side(config/default.yaml, 2026-03-09)"` | 冻结成本表可用：900 股 @10.05 买费 ¥5.09（最低佣金生效）、@10.60 卖费 ¥9.87（含印花税），trend 滑点 **0.0015**。这一步是必要的：`resolve_tail_slippage_ratio()` 的 `matcher` 参数要的是配置对象，先前误传 `ExecutionMatcher` 壳会**静默取到 0 滑点**，已改并留注释 |
 
+### 2c. 就绪门校验研究库副本那一轮
+
+| 命令 | 结果 |
+| --- | --- |
+| `pytest tests/test_trend_data_readiness.py --collect-only` | **22 tests collected**（原 13 条 + 副本校验 9 条） |
+| `pytest tests/test_trend_data_readiness.py tests/test_minute_bar_store.py` | **37 passed in 56.64s**（22 + 15；没有一条既有断言被放宽） |
+| `pytest tests/ -k "trend or tail"` | **279 passed, 4029 deselected in 67.45s**，exit 0 |
+| `ruff check` 本轮触及的 1 个源文件 + 1 个 CLI + 1 个测试文件 | All checks passed；全量 `src tests` 48 / `scripts` 27，与基线同数 |
+| `mypy --python-version 3.12 research/trend_data_readiness.py` | 该文件自身 **0 error** |
+
+一处**既有行为被收紧**，写清楚：以前不传 `--reference-db` 时，只要生产仓库 + 分钟库达标就报
+`ready`；现在会多一条 `reference_copy_validated = insufficient`（退出码 3）。理由是
+"没校验"不能占"校验通过"的位置。受影响的既有测试 `test_bar_timestamped_minute_table_lifts_the_block`
+已改为同时提供已校验副本，而不是把新检查降级。审计器在本仓库**没有任何 runtime/调度调用方**
+（只有这个 CLI 与测试），所以这次收紧不影响生产路径。
+
 ---
 
 ## 3. 选股质量验收：当前状态 = blocked（不是"通过"，也不是"失败"）
@@ -208,8 +241,11 @@ python scripts/sync_tail_reference_data.py \
 # 生产仓库只以 read_only 打开；缺表会报 <source>_table_missing，不会补 0 冒充已补齐
 
 # 3. 测量覆盖度；readiness 仍是 blocked 就不要往下走
+#    --reference-db 校验研究库里的日级参考副本（默认就是分钟库那个文件）；
+#    不传就只会得到 reference_copy_validated = insufficient（没校验 ≠ 校验通过）
 python scripts/audit_trend_data_readiness.py \
-    --db <market.duckdb> --minute-db artifacts/research/tail_minute_bars.duckdb
+    --db <market.duckdb> --minute-db artifacts/research/tail_minute_bars.duckdb \
+    --reference-db artifacts/research/tail_minute_bars.duckdb
 
 # 3b. 从研究库重建 replayed 样本（标签侧；特征侧由调用方按同一个 as-of 契约拼接）
 python scripts/rebuild_tail_labels.py \
