@@ -200,3 +200,34 @@ PR #105 OPEN 且 mergeable。故意不把 As-of 写成单个 SHA：那会让这�
 | §2 第二问（同一信息被反复使用？） | **有硬证据了**：`relative_strength` 与 `rank_ret_20` ρ=**1.0** 却分属两组；`rs_ma20`/`ma20` 0.9994、`rs_ma5`/`ma5` 0.9991；达阈值冗余对 22 个；四组列级时间外 AUC 均值 0.507~0.5141 | 报告 §4.11 / NOTE-002 D19。含义：组数≠独立证据数；下一轮若要把这四类当特征用，得先按 ρ 去重，而不是继续加分组 |
 | §2 五个诊断问现在都答上了吗 | 五个里**四个有实测答案**：过早淘汰=条件性（D18，跨月翻符号）；重复使用同一信息=成立（D19，ρ=1.0 且跨组）；偏向已大涨/高波动=成立、偏向难成交=不成立且方向相反（D20）；损失来自哪一层=预测与排序（§4.7.1 + §4.10 同向）。第五问里「数据缺失/滞后/降级影响多少只」只有分段读数（D17 的 5,464 条、17,491 行无真值、109 条 session holes），**没有一张合并的表** | 剩这一项是可做的本地工作：把已散在各报告里的数据质量数字合成一张表 |
 | §2 第 4 问（数据缺失/旧缓存/滞后/降级各影响多少）| **已合并成一张表**（报告 §4.13，`scripts/measure_data_quality_impact.py` → `mw_data_quality_impact.json`）：5,601 条请求出不了标签（涨跌停 5,464 为主）、占位常量 17,380 行无真值可替换（占比 30.10%→1.18%）、自写值与真值差 >1% 的 26,013 行、日内两列重放不可复现、概率模型 4 折产出 0 折 | 汇总时发现并修掉一个可审计性缺口：验证器遇训练/身份失败时**不留任何工件**，现在也写 status=blocked 的最小报告（退出码不变、20 条测试通过）|
+
+
+## 6. 完成度对账（2026-10-08，逐条对到工件；不看叙述看文件）
+
+状态只用这五个词：**已完成** / **已实现·测量未达标** / **阻塞（缺数据或缺授权）** / **未部署** / **待用户决策**。
+「分支已推送」不算完成度，所以单列在最后。
+
+| 计划条目 | 状态 | 可核对的证据 |
+| --- | --- | --- |
+| §1 范围与规则（trend、14:30–14:50、0–3 只、1 万元、+8%/−5%、5 交易日、monster 独立） | 已完成 | `src/stock_analyzer/contracts/trend_strategy.py` + `tests/test_trend_strategy_contract.py`（`test_contract_pins_first_round_business_terms`）；`docs/trend_tail_selection_quality_report.md` §1 |
+| §2 九层留档 | 已完成（夜扫逐只拒绝原因仍缺，见 D11） | `research/funnel_trace.py`、`night_scan_funnel_trace.py`；`artifacts/research/funnel_traces*`（污染窗 58/58、干净窗 19/19 过 `verify_trace()`） |
+| §2 诊断问 1 过早淘汰 | 已实现·测量未达标（答案条件性） | 报告 §4.9/§4.10；`ablate_pool_{apr,mar,may}_*`；NOTE-002 D18 |
+| §2 诊断问 2 同一信息反复使用 | 已完成（结论：成立） | 报告 §4.11；`mw_feature_stability_125d.json`（ρ=1.0 跨组、22 对冗余）；D19 |
+| §2 诊断问 3 偏向大涨/高波动/难成交 | 已完成（前两个成立、第三个相反） | 报告 §4.12；D20 |
+| §2 诊断问 4 缺失/旧缓存/滞后/降级各影响多少 | 已完成（合并表） | `scripts/measure_data_quality_impact.py` → `mw_data_quality_impact.json`；报告 §4.13 |
+| §2 诊断问 5 损失来自池/预测/排序/规则 | 已完成（指向预测与排序） | §4.7.1 + §4.10 + §4.12 三处一致 |
+| §2 逐层消融预测性规则 | 已完成（容量截断层）；夜扫三层仍不可归因 | `replay_tail_candidate_pool.py --pool-size`；D11 的 `night_truncation_reason_not_recorded` |
+| §3.1 时间语义 + 带版本解释规则 + 身份绑定 + 五类参考数据 + 指数链 | 已完成；6/7 月涨跌停**阻塞** | `contracts/trend_strategy.py`、`feature_contract_version`、`FLOAT_CAP_INTERPRETATION_VERSION`；D17 与 `mw_data_quality_impact.json` 的 5,464 行 |
+| §3.2 硬门保留 / 预测项分离 / 轻量特征前置 / 四组消融 / 新闻主题待独立证据 | 已完成；四组**均无跨段稳定方向**；第五类信息本地无可算输入 | `runtime/universe_candidate_selector.py::_gate_membership`、`measure_tail_feature_direction.py --rolling/--walk`、`mw_feature_direction_125d_rolling.json`；§4.3 |
+| §3.3 p_net_profit_5d_tail + LR/LightGBM 候选 + 独立校准 + observed/replayed 分开 | 已实现·**训练门未过**（4 折 0 折产出概率） | `tail_net_profit_label`、`tail_net_profit_trainer`、`mw_labels_125d.json`、`mw_validation_125d_first4_blocked.json`（status=blocked） |
+| §3.4 按新概率排序 + 0.60 + 上限 3 + 0 只不补 + 页面三分栏 + challenger-only | 已完成（代码与测试） | `rank_final_recommendations`、`trend_tail_shadow_service.py`、报告 §4.8 的测试映射表 |
+| §4 工程验收（13 类场景 + 线上历史同判定 + 静态检查 + clean-scope + Note/ADR） | 已完成 | 报告 §4.8（19 组 → 60 个测试名全部存在、243 测试通过）；`clean-scope` rc=2 唯一阻塞=基线 `mypy_blocking`；NOTE-002 / ADR-004 |
+| §4 选股质量验收（≥4 折 + ≥5pp + CI 下界>0 + 平均净收益为正 + 尾部不明显恶化） | **已实现·测量未达标**：四折从未进测试段 | `mw_validation_125d_*.json` 全部 `status=blocked`；报告 §4.7.1 |
+| §4 未来影子验证（≥60 完整交易日且 ≥100 笔成熟成交） | **阻塞**（只能等真实观察逐日累积） | 无 `shadow_readiness` 产出（验证未跑完），台账 §0 |
+| §5 六项分阶段交付物 | 已完成 | `NOTE-002`（根因清单 D1–D20）、`trend_tail_data_source_findings.md`（数据与契约）、`tail_net_profit_*`+`tail_serving_manifest`（候选模型）、`trend_tail_shadow_service.py`+页面（完整链路）、本报告 §4（验证报告）、`trend_tail_release_rollback_checklist.md`（发布回滚） |
+| §5 生产边界（独立库/模型目录、compose 守卫、不改历史 marker） | 已完成，且**未触碰生产** | 全程只写 `artifacts/research/*`；NAS 无新部署；`.mimosa/` 未动 |
+| 分支状态 | 本地 `feat/stock-selection-quality-overhaul` 领先 origin **26 个提交**，未推送 | `git status -sb`；PR #105 存在但对应旧提交 |
+
+**一句话完成度**：工程侧（契约、留档、诊断、审计、测试、文档）已达可交付；
+**目标本身（提高最终推荐的净盈利概率）尚未被证明**——缺的是时间外稳定方向的信息与更长真实历史，
+两者都要远端补采授权或真实观察天数，不能用调参或开盘回测顶替。
