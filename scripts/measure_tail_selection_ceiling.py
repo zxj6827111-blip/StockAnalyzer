@@ -120,6 +120,38 @@ def metrics(
     }
 
 
+def rank_within_day(
+    rows: Sequence[dict[str, Any]], fields: Sequence[str], signs: Sequence[int]
+) -> dict[str, list[dict[str, Any]]]:
+    """把多类信息在同一天内做秩，再按先验权重（这里就是等权）合成一个排序分。
+
+    权重是先验固定的（等权、符号来自训练段），不在评估段上拟合——否则这条规则
+    只是把评估段的噪声重新排列一遍，读出来的差值没有任何外推意义。
+    """
+    by_day = _day_groups(rows)
+    scored: dict[str, list[dict[str, Any]]] = {}
+    for day, pool in by_day.items():
+        ranks: list[list[float]] = []
+        for field in fields:
+            values = [float(r[field]) if isinstance(r.get(field), (int, float)) else None
+                      for r in pool]
+            present = sorted(v for v in values if v is not None)
+            position = {v: i for i, v in enumerate(present)}
+            total = max(1, len(present) - 1)
+            ranks.append([
+                position[v] / total if v is not None else 0.5 for v in values
+            ])
+        combined = [
+            sum(sign * ranks[k][i] for k, sign in enumerate(signs)) / len(signs)
+            for i in range(len(pool))
+        ]
+        ordered = sorted(
+            zip(pool, combined, strict=True), key=lambda pair: (-pair[1], str(pair[0]["symbol"]))
+        )
+        scored[day] = [row for row, _ in ordered[:DAILY_CAP]]
+    return scored
+
+
 def day_hit_series(picked: Sequence[dict[str, Any]]) -> dict[str, tuple[int, int]]:
     """按决策日聚合 (命中数, 推荐数)，分块 bootstrap 以交易日为重采样单位。"""
     per_day: dict[str, list[int]] = {}
@@ -163,12 +195,38 @@ def block_bootstrap_delta(
     }
 
 
+def _direction_from_sign_window(
+    rows: Sequence[dict[str, Any]], field: str
+) -> tuple[bool, float]:
+    """只用**前一段**决策日定方向：该列上半段的命中率高于下半段就取降序。
+
+    存在这条函数是为了修 §4.4 读数的方法学缺陷：那一轮把 desc 与 asc 两臂都摊在评估段上，
+    等于每个特征做了 2 次选择（11×2=22 臂）。这里方向先由数据外的另一段定死，
+    评估段只看一臂，差值才可解释。
+    """
+    values = [(float(r[field]), int(r[LABEL_FIELD])) for r in rows
+              if isinstance(r.get(field), (int, float))]
+    if len(values) < 40:
+        return True, float("nan")
+    values.sort(key=lambda pair: pair[0])
+    half = len(values) // 2
+    lower, upper = values[:half], values[half:]
+    rate_low = sum(label for _, label in lower) / len(lower)
+    rate_high = sum(label for _, label in upper) / len(upper)
+    return rate_high >= rate_low, round(rate_high - rate_low, 4)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--samples", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--test-days", type=int, default=40)
     parser.add_argument("--features", default="")
+    parser.add_argument(
+        "--pre-registered",
+        action="store_true",
+        help="方向只由前一段决策日定死，评估段只看一臂（修 §4.4 的 22 臂多重比较）",
+    )
     args = parser.parse_args(argv)
 
     rows = load_fills(Path(args.samples))
@@ -211,6 +269,89 @@ def main(argv: list[str] | None = None) -> int:
                 "delta_vs_pool": block_bootstrap_delta(day_hit_series(picked), pool_day_hits),
             }
             report["arms"].append(arm)
+
+    if args.pre_registered:
+        all_days = sorted(by_day)
+        need = 2 * len(test_days)
+        if len(all_days) < need:
+            report["pre_registered"] = {
+                "note": f"决策日只有 {len(all_days)} 个，不足两段 {need} 日，不做预登记方向"
+            }
+        else:
+            sign_days = all_days[-need:-len(test_days)]
+            sign_rows = [r for d in sign_days for r in by_day[d]]
+            eval_day_hits = day_hit_series(window)
+            directions: dict[str, int] = {}
+            pre_arms: list[dict[str, Any]] = []
+            for field in names:
+                desc, spread = _direction_from_sign_window(sign_rows, field)
+                directions[field] = 1 if desc else -1
+                picked = select_top3(
+                    window, field, descending=desc, days=len(test_days)
+                )
+                if not picked:
+                    continue
+                pre_arms.append({
+                    "field": field,
+                    "group": group_of.get(field, "unmapped"),
+                    "direction": "desc" if desc else "asc",
+                    "sign_window_spread": spread,
+                    "metrics": metrics(
+                        picked, candidate_days=len(test_days), all_fills=len(window)
+                    ),
+                    "delta_vs_pool": block_bootstrap_delta(
+                        day_hit_series(picked), eval_day_hits
+                    ),
+                })
+            composite_fields = ("turnover", "avg_turnover_20", "gap_up_pct")
+            by_day_picks = rank_within_day(
+                window, composite_fields, [directions.get(f, 1) for f in composite_fields]
+            )
+            composite_picked = [
+                row for day in test_days for row in by_day_picks.get(day, [])
+            ]
+            report["pre_registered"] = {
+                "sign_window": [sign_days[0], sign_days[-1]],
+                "eval_window": [test_days[0], test_days[-1]],
+                "directions_fixed_from_sign_window": {
+                    field: ("desc" if value > 0 else "asc")
+                    for field, value in sorted(directions.items())
+                },
+                "arms": pre_arms,
+                "composite_rule": {
+                    "fields": list(composite_fields),
+                    "signs": [directions.get(f, 1) for f in composite_fields],
+                    "weights": "等权，先验固定，不在评估段拟合",
+                    "metrics": metrics(
+                        composite_picked,
+                        candidate_days=len(test_days),
+                        all_fills=len(window),
+                    ),
+                    "delta_vs_pool": block_bootstrap_delta(
+                        day_hit_series(composite_picked), eval_day_hits
+                    ),
+                },
+            }
+            print("--- 预登记方向（方向只由前一段定，评估段只看一臂）---")
+            for arm in pre_arms:
+                m = arm["metrics"]
+                d = arm["delta_vs_pool"]
+                print(
+                    f"{arm['field']:<18} {arm['direction']:<5} sign_spread="
+                    f"{arm['sign_window_spread']} hit={m.get('hit_rate')} "
+                    f"delta={d.get('mean_delta_pp')} ci=[{d.get('ci_low_pp')}, "
+                    f"{d.get('ci_high_pp')}] ci_low>0={d.get('ci_low_above_zero')}"
+                )
+            cm = report["pre_registered"]["composite_rule"]
+            print(
+                f"composite {'|'.join(composite_fields)} signs="
+                f"{cm['signs']} hit={cm['metrics'].get('hit_rate')} "
+                f"mean_net={cm['metrics'].get('mean_net_return')} "
+                f"delta={cm['delta_vs_pool'].get('mean_delta_pp')} "
+                f"ci=[{cm['delta_vs_pool'].get('ci_low_pp')}, "
+                f"{cm['delta_vs_pool'].get('ci_high_pp')}] "
+                f"ci_low>0={cm['delta_vs_pool'].get('ci_low_above_zero')}"
+            )
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
