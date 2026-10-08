@@ -1,4 +1,4 @@
-# trend 尾盘链路：§4 验收证据（As-of 2026-10-08 @ HEAD `504859a`）
+# trend 尾盘链路：§4 验收证据（As-of 2026-10-08 @ HEAD `0c9f043`）
 
 范围只覆盖选股质量改进计划第一轮落地到 trend 的这条链路：夜扫观察池 → 次日
 14:30–14:50 尾盘确认 → 最多 3 只最终推荐 → 成交与 5 交易日退出。monster 与旧
@@ -38,13 +38,28 @@
 
 ---
 
+## 1b. §2 的 9 层漏斗：谁在写、还差谁
+
+`FUNNEL_LAYERS` 声明 9 层，本表说明**当前谁产出**（`grep` 可核对，不靠记忆）：
+
+| 层 | 生产者 | 状态 |
+| --- | --- | --- |
+| `universe` / `hard_eligibility` / `quality_300` / `light_100` / `deep_50` | `alpha_v2/validation/production_funnel.py`（夜扫 source evidence + counts + 防篡改哈希） | 由**既有 Alpha V2 证据链**负责，按计划与本契约保持独立；不并成一条 trace |
+| `night_watch_pool` / `tail_confirmation` / `final_recommendation` | `runtime/services/trend_tail_shadow_service.py` | 已产：逐层输入/晋级/拒绝原因/特征/身份/数据时间，最终推荐另存特征快照 |
+| `execution_exit` | `research/tail_mature_feedback.attach_exit_outcomes()` + `execution_exit_stage()`，由 `scripts/record_tail_exit_funnel.py` 落档 | 已产：退出**成熟后**写第二份留档（`funnel_trace_<date>_execution_exit.json`），不覆盖入场那份；未成交/不确定/未成熟/无标签记录都留在拒绝原因里 |
+
+代价说清楚：因为跨两条链，"一次查询看完整个漏斗"目前做不到，只能靠同一个
+`trade_date` + `contract_digest` 手工对齐。
+
+---
+
 ## 2. 本轮真实执行过的命令与结果
 
 | 命令 | 结果 |
 | --- | --- |
-| `pytest tests/test_trend_strategy_contract.py tests/test_trend_tail_shadow_runtime.py tests/test_trend_tail_page_and_feedback.py tests/test_minute_bar_store.py tests/test_funnel_trace.py tests/test_tail_net_profit_label.py tests/test_trend_data_readiness.py tests/test_tail_net_profit_trainer.py tests/test_trend_candidate_contract.py tests/test_tail_walk_forward.py -q` | **212 passed**（条数：55/19/25/15/16/19/13/19/13/18） |
-| `pytest tests -k "trend or tail"` | **214 passed, 4028 deselected** |
-| `pytest tests -k "week5 or live_runtime or automation" -q` | **103 passed**（影子接线未破坏既有自动化链） |
+| `pytest tests/test_trend_strategy_contract.py tests/test_trend_tail_shadow_runtime.py tests/test_trend_tail_page_and_feedback.py tests/test_minute_bar_store.py tests/test_funnel_trace.py tests/test_tail_net_profit_label.py tests/test_trend_data_readiness.py tests/test_tail_net_profit_trainer.py tests/test_trend_candidate_contract.py tests/test_tail_walk_forward.py tests/test_tail_exit_funnel.py -q` | **226 passed**（条数：55/19/25/15/16/19/13/19/13/18/14） |
+| `pytest tests -k "trend or tail"` | **228 passed, 4028 deselected** |
+| `pytest tests -k "week5 or live_runtime or automation"` | **319 passed, 3937 deselected**（影子接线未破坏既有自动化链） |
 | `ruff check` 本分支 8 个源文件 + 3 个测试文件 | All checks passed |
 | `ruff check src tests`（仓库全量） | 48 errors —— 全部落在分支未触碰的文件，属既有基线 |
 | `mypy --python-version 3.12` 本分支 8 个源文件 | 剩 **2** errors，均在 `models/tail_net_profit_trainer.py:245/248` 的 LightGBM 注入点（运行时已由 `native booster trainer is unavailable` 硬门拦住，纯类型噪声）；本分支其余文件的 12 个已在本轮清掉 |
@@ -125,7 +140,7 @@ embargo 核对、observed/replayed 分开计数、身份不通过就整轮不成
 
 ```text
 代码完成  ✔（含影子链路、契约、留档、页面、反馈）
-测试完成  ✔ 工程验收场景（194 + 103 passed，见 §2）
+测试完成  ✔ 工程验收场景（226 + 319 passed，见 §2）
 业务验证  ✘ 选股质量验收 blocked（§3：历史分钟数据覆盖度未知，且无真实标签）
 Freeze Ready  ✘ 未执行
 Production Ready ✘ 未执行；旧路径仍在服务真实推送

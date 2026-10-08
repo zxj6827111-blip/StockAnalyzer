@@ -2,7 +2,7 @@
 
 Status: Draft
 
-As-of: 2026-10-08 @ HEAD `504859a`（本 ADR 与 `contracts/trend_strategy.py`、
+As-of: 2026-10-08 @ HEAD `0c9f043`（本 ADR 与 `contracts/trend_strategy.py`、
 `labels/tail_net_profit.py`、`research/trend_data_readiness.py`、
 `research/funnel_trace.py`、`research/tail_mature_feedback.py` 同批演进）
 
@@ -180,7 +180,8 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库>
 - `src/stock_analyzer/labels/tail_net_profit.py` —— 净盈利标签构造与分组报告
 - `src/stock_analyzer/models/output_semantics.py` —— `net_profit_5d_tail` 语义登记
 - `src/stock_analyzer/research/trend_data_readiness.py` + `scripts/audit_trend_data_readiness.py`
-- `src/stock_analyzer/research/funnel_trace.py` —— 分层留档与最终推荐留档
+- `src/stock_analyzer/research/funnel_trace.py` —— 分层留档与最终推荐留档；
+  `write_trace(..., suffix=)` 让"成交与退出"这层落到**另一个文件**，不回头覆盖入场那天的留档
 - `src/stock_analyzer/models/tail_net_profit_trainer.py` —— 日期切分 +  embargo、
   LR 基线 / 既有 LightGBM 参数、独立校准段、5pp 分块 bootstrap 判定
 - `src/stock_analyzer/feature/trend_candidate_contract.py` —— 硬门/预测规则分类、
@@ -188,7 +189,12 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库>
 - `src/stock_analyzer/runtime/services/trend_tail_shadow_service.py` —— 影子链路 +
   `page_view()` / `tail_shadow_page()` / `tail_shadow_history()`
 - `src/stock_analyzer/research/tail_mature_feedback.py` —— 成熟结果按模型版本 /
-  市场状态 / 拒绝原因反馈，输出止于 challenger 建议
+  市场状态 / 拒绝原因反馈，输出止于 challenger 建议；`attach_exit_outcomes()` +
+  `execution_exit_stage()` 把"最终推荐 ↔ 后来的成熟退出"对上，产出 §2 漏斗最后一层
+  `execution_exit`（晋级=退出已实现且可归因；未成交/不确定/未成熟/无标签记录
+  一律留在拒绝原因里，净盈利率分母只含已实现样本）
+- `scripts/record_tail_exit_funnel.py` —— 从已归档的 shadow report + 标签留档
+  落这一层留档；契约摘要与在服契约不一致时直接退出码 5，不用另一套契约的口径写证据
 - `src/stock_analyzer/api/week5.py` —— `GET /week5/tail-shadow/latest|history`
   （只有读接口，没有手动 run 入口）
 - `frontend/src/pages/TailShadow.tsx` + `frontend/src/App.tsx` —— "尾盘确认"页：
@@ -211,7 +217,7 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库>
   `test_funnel_trace.py`(16)、`test_tail_net_profit_trainer.py`(19)、
   `test_trend_candidate_contract.py`(13)、`test_trend_tail_shadow_runtime.py`(19)、
   `test_trend_tail_page_and_feedback.py`(25)、`test_minute_bar_store.py`(15)、
-  `test_tail_walk_forward.py`(18)
+  `test_tail_walk_forward.py`(18)、`test_tail_exit_funnel.py`(14)
 
 ## 8. 尚未接线的调用方（升级 Accepted 前必须改完）
 
@@ -226,3 +232,12 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库>
 影子链路当前必然输出 0 只，原因是真实的：既没有 `p_net_profit_5d_tail` 的生产者
 （`no_tail_probability_available`），也没有带时刻的分钟行情
 （`minute_bars_unavailable`）。这两个原因都由留档写下来，不是静默空结果。
+
+§2 的 9 层漏斗里，trend 这条 trace 现在覆盖 4 层：`night_watch_pool`、
+`tail_confirmation`、`final_recommendation`（影子服务写的入场侧留档）与
+`execution_exit`（成熟后由 `record_tail_exit_funnel.py` 另写一份）。
+前 5 层（`universe` / `hard_eligibility` / `quality_300` / `light_100` / `deep_50`）
+仍由夜扫自己的生产漏斗证据链负责（`alpha_v2/validation/production_funnel.py`：
+source evidence + counts + 防篡改哈希）。按计划 Alpha V2 与本契约保持独立，
+所以这里**不**把它们并成一条 trace；跨链对齐靠同一个 `trade_date` 与
+`contract_digest`，代价是"一次查询看完整个漏斗"目前还做不到。

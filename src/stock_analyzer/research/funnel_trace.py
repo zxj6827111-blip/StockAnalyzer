@@ -319,10 +319,16 @@ def _to_date(value: date | str) -> date:
     return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
 
 
-def write_trace(trace: FunnelTrace, directory: Path | str) -> Path:
+def write_trace(trace: FunnelTrace, directory: Path | str, *, suffix: str = "") -> Path:
+    """落一条漏斗留档。
+
+    ``suffix`` 给"同一个交易日、不同时间成熟"的层用（例如成交与退出要等 5 个交易日
+    才知道结果）：它必须落到**另一个文件**，不能回头覆盖入场那天已经写好的留档。
+    """
     out_dir = Path(directory)
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"funnel_trace_{trace.trade_date.isoformat()}.json"
+    tag = f"_{suffix}" if str(suffix or "").strip() else ""
+    path = out_dir / f"funnel_trace_{trace.trade_date.isoformat()}{tag}.json"
     payload = dict(trace.as_dict(), written_at=datetime.now().isoformat(timespec="seconds"))
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str),
                     encoding="utf-8")

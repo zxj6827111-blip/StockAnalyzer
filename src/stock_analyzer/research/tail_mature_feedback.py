@@ -15,17 +15,23 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Any
 
 from stock_analyzer.contracts.trend_strategy import (
     DEFAULT_TREND_CONTRACT,
     STATUS_FILLED,
+    STATUS_NOT_FILLED,
     STATUS_UNCERTAIN,
     TrendStrategyContract,
 )
 from stock_analyzer.labels.tail_net_profit import (
     CAPTURE_OBSERVED,
     TailLabelRecord,
+)
+from stock_analyzer.research.funnel_trace import (
+    KIND_HARD_GATE,
+    record_stage,
 )
 
 #: 自动学习最多走到这一步；再往前是人工票据的事。
@@ -222,14 +228,185 @@ def reject_reason_feedback(
     return out
 
 
+# ---------------------------------------------------------------------------
+# 成交与退出：§2 漏斗最后一层（execution_exit）的证据
+# ---------------------------------------------------------------------------
+
+DISPOSITION_PROFIT = "net_profit"
+DISPOSITION_LOSS = "net_loss"
+DISPOSITION_UNCERTAIN = "uncertain_exit"
+DISPOSITION_PENDING = "exit_not_matured"
+DISPOSITION_NOT_FILLED = "not_filled"
+DISPOSITION_NO_RECORD = "no_label_record"
+#: 只有真正落到可归因盈亏的退出才算"走完这一层"；其余都必须留下原因。
+REALIZED_DISPOSITIONS = frozenset({DISPOSITION_PROFIT, DISPOSITION_LOSS})
+
+
+def _disposition_for(row: Mapping[str, Any], record: TailLabelRecord | None) -> dict[str, Any]:
+    symbol = str(row.get("symbol"))
+    probability = row.get("probability")
+    base = {"symbol": symbol, "probability": probability, "net_return": None,
+            "exit_date": None, "label_mature_time": None}
+    if record is None:
+        # 推荐留档里有、标签留档里没有：绝不能当成"没赚没亏"混过去。
+        return {**base, "disposition": DISPOSITION_NO_RECORD, "reason": "no_label_record"}
+    entry = {
+        "net_return": record.net_return,
+        "exit_date": (record.label_mature_time.date().isoformat()
+                      if record.label_mature_time else None),
+        "label_mature_time": (record.label_mature_time.isoformat()
+                              if record.label_mature_time else None),
+    }
+    if record.status == STATUS_NOT_FILLED or not record.filled:
+        return {**base, **entry, "disposition": DISPOSITION_NOT_FILLED,
+                "reason": record.reason or "not_filled"}
+    if record.status == STATUS_UNCERTAIN:
+        return {**base, **entry, "disposition": DISPOSITION_UNCERTAIN,
+                "reason": record.reason or "uncertain"}
+    if record.trainable and record.net_return is not None:
+        value = float(record.net_return)
+        return {**base, **entry,
+                "disposition": DISPOSITION_PROFIT if value > 0.0 else DISPOSITION_LOSS,
+                "reason": record.reason or ""}
+    return {**base, **entry, "disposition": DISPOSITION_PENDING,
+            "reason": record.reason or "holding_not_matured"}
+
+
+def attach_exit_outcomes(
+    *,
+    shadow_report: Mapping[str, Any],
+    records: Sequence[TailLabelRecord],
+    trade_date: date | str | None = None,
+) -> dict[str, Any]:
+    """把某日的最终推荐与其后的成熟退出对上，产出"成交与退出"层的证据。
+
+    ``trade_date`` 缺省时取留档自己的日期；显式给一个不一致的日期会直接报错——
+    把 A 日的推荐接到 B 日的退出上，产出的净盈利率是假的。
+    """
+    rows = [dict(item) for item in shadow_report.get("final_recommendations") or []]
+    archived = str(shadow_report.get("trade_date") or "")
+    day = str(trade_date)[:10] if trade_date else archived
+    if not day:
+        raise ValueError("execution_exit needs a trade_date (report or argument)")
+    if archived and day != archived:
+        raise ValueError(f"report is dated {archived}, not {day}")
+    parsed = date.fromisoformat(day)
+
+    by_symbol = {
+        str(record.symbol): record
+        for record in records if record.decision_date == parsed
+    }
+    dispositions = {
+        str(row.get("symbol")): _disposition_for(row, by_symbol.get(str(row.get("symbol"))))
+        for row in rows
+    }
+    realized = [
+        item for item in dispositions.values()
+        if item["disposition"] in REALIZED_DISPOSITIONS
+    ]
+    profits = [item for item in realized if item["disposition"] == DISPOSITION_PROFIT]
+    counts: dict[str, int] = {}
+    for item in dispositions.values():
+        counts[str(item["disposition"])] = counts.get(str(item["disposition"]), 0) + 1
+    identities = [row.get("model_identity") for row in rows if row.get("model_identity")]
+    identity = next(
+        (item for item in identities if item.get("identity_recorded")),
+        {"identity_recorded": False, "reason": "archived_identity_missing"},
+    )
+    moments = [
+        item["label_mature_time"] for item in dispositions.values() if item["label_mature_time"]
+    ]
+    caveats: list[str] = []
+    if not rows:
+        caveats.append("no_final_recommendations_archived")
+    if counts.get(DISPOSITION_NO_RECORD):
+        caveats.append("recommended_symbols_without_label_record")
+    if counts.get(DISPOSITION_PENDING):
+        caveats.append("exit_not_matured_yet")
+    return {
+        "trade_date": day,
+        "recommended": sorted(dispositions),
+        "dispositions": dispositions,
+        "counts": dict(sorted(counts.items())),
+        "realized": len(realized),
+        "net_profits": len(profits),
+        "net_profit_rate": (len(profits) / len(realized)) if realized else None,
+        "mean_net_return": (
+            sum(float(item["net_return"]) for item in realized) / len(realized)
+            if realized else None
+        ),
+        "maturity_pending": sorted(
+            symbol for symbol, item in dispositions.items()
+            if item["disposition"] in {DISPOSITION_PENDING, DISPOSITION_NO_RECORD}
+        ),
+        "model_identity": identity,
+        "data_as_of": max(moments) if moments else day,
+        "contract_digest": str(shadow_report.get("contract_digest") or ""),
+        "caveats": caveats,
+    }
+
+
+def execution_exit_stage(
+    *,
+    exits: Mapping[str, Any],
+    contract: TrendStrategyContract = DEFAULT_TREND_CONTRACT,
+) -> Any:
+    """把上面那份证据落成漏斗的一层（硬门：资金与可成交性，不是预测性规则）。"""
+    dispositions = dict(exits.get("dispositions") or {})
+    recommended = [str(symbol) for symbol in exits.get("recommended") or []]
+    advanced = [
+        symbol for symbol in recommended
+        if dispositions.get(symbol, {}).get("disposition") in REALIZED_DISPOSITIONS
+    ]
+    rejected: dict[str, list[str]] = {}
+    for symbol in recommended:
+        item = dispositions.get(symbol) or {}
+        disposition = str(item.get("disposition") or DISPOSITION_NO_RECORD)
+        if disposition in REALIZED_DISPOSITIONS:
+            continue
+        rejected.setdefault(disposition, []).append(symbol)
+    probabilities = {
+        symbol: float(dispositions[symbol]["probability"])
+        for symbol in recommended
+        if dispositions.get(symbol, {}).get("probability") is not None
+    }
+    identity = exits.get("model_identity")
+    return record_stage(
+        stage="execution_exit",
+        kind=KIND_HARD_GATE,
+        input_symbols=recommended,
+        advanced_symbols=advanced,
+        rejected=rejected,
+        calibrated_probabilities=probabilities,
+        model_identity=identity if identity and identity.get("identity_recorded") else None,
+        data_as_of=str(exits.get("data_as_of") or exits.get("trade_date")),
+        contract=contract,
+        label_policy_id=str((identity or {}).get("label_policy_id") or ""),
+        feature_compute_version=int((identity or {}).get("feature_compute_version") or 0),
+        notes=(
+            "晋级=退出已实现且可归因；未成交/不确定/未成熟都留在拒绝原因里，"
+            "净盈利率分母只含已实现样本"
+        ),
+    )
+
+
 __all__ = [
+    "DISPOSITION_LOSS",
+    "DISPOSITION_NO_RECORD",
+    "DISPOSITION_NOT_FILLED",
+    "DISPOSITION_PENDING",
+    "DISPOSITION_PROFIT",
+    "DISPOSITION_UNCERTAIN",
     "MIN_FEEDBACK_DAYS",
     "MIN_FEEDBACK_SAMPLES",
     "MIN_SUGGESTED_IMPROVEMENT_PP",
+    "REALIZED_DISPOSITIONS",
     "STATE_CHALLENGER_SUGGESTED",
     "STATE_KEEP_OBSERVING",
     "STATE_SHADOW_ONLY",
     "FeedbackSlice",
+    "attach_exit_outcomes",
+    "execution_exit_stage",
     "reject_reason_feedback",
     "summarize_mature_feedback",
 ]

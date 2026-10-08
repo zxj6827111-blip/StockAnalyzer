@@ -22,7 +22,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import date, datetime
 from typing import Any
 
@@ -210,6 +210,29 @@ class TailLabelRecord:
         }
 
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> TailLabelRecord:
+        """读回 ``to_dict()`` 的留档；业务字段缺失就报错，不用默认值补成"看起来能用"。
+
+        ``to_dict`` 会额外写 ``label_definition`` / ``label_policy_basis`` 这类诊断键，
+        它们不是数据类字段，按名剔除；反过来任一业务字段缺失必须抛错 —— 一条被截断
+        的留档若被默认值补全，就会伪装成正常样本混进反馈闭环与漏斗留档。
+        """
+        names = {item.name for item in fields(cls)}
+        known = {key: value for key, value in payload.items() if key in names}
+        defaulted = {"model_version", "market_state", "details"}
+        missing = sorted(names - defaulted - set(known))
+        if missing:
+            raise TailLabelError(f"archived tail label record is missing field(s) {missing}")
+        known["decision_date"] = _parse_day(known["decision_date"])
+        known["entry_date"] = (
+            None if known["entry_date"] in (None, "") else _parse_day(known["entry_date"])
+        )
+        for name in ("label_anchor_time", "label_mature_time", "confirmation_slot", "fill_time"):
+            known[name] = _parse_moment(known[name])
+        return cls(**known)
+
+
 def build_tail_net_profit_label(
     *,
     symbol: str,
@@ -301,6 +324,22 @@ def build_tail_net_profit_label(
 
 def _to_day(value: date | datetime) -> date:
     return value.date() if isinstance(value, datetime) else value
+
+
+def _parse_day(value: Any) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value)[:10])
+
+
+def _parse_moment(value: Any) -> datetime | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value
+    return datetime.fromisoformat(str(value))
 
 
 def _record(
