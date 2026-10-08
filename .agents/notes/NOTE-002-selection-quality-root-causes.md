@@ -2,7 +2,7 @@
 
 Status: Draft
 
-As-of: 2026-10-08 @ HEAD `ce19b76`（新增 D15：流通市值被 provider 兜底常量静默填充，
+As-of: 2026-10-08（D15 已补采真值、D16 新增：研究侧符号上限是自设的，不是数据缺失；台账 `docs/selection_quality_plan_status.md` §0 是当前交接面）
 浮盈市值硬门因此整天失效；读侧带版本解释规则与防御见 ADR-004）
 
 回答的问题是改进计划 §2 的那句"整条链路在哪里损失选股质量"。本文只列**可核实的事实**
@@ -29,6 +29,7 @@ As-of: 2026-10-08 @ HEAD `ce19b76`（新增 D15：流通市值被 provider 兜�
 | D14 | §2 的九层漏斗留档仍不完整。夜扫半段（Quality300/Light100/Deep50）自本提交起**有生产者**（`research/night_scan_funnel_trace.py`，夜扫落定后写 `funnel_trace_<date>_night.json`），但它记的是成员+落差+数据时间，**逐只截断原因仍缺**（全部挂 `night_truncation_reason_not_recorded`）；`universe` 与 `hard_eligibility` 的**生产者已就位**（`night_scan_funnel_trace.build_universe_stage_traces()`，从 `AsofUniverseSnapshot` 的符号级事实构造、原因逐只来自 `resolve_asof_universe`），但**尚未接线**：夜扫报告里的 `universe_snapshot` 是 `to_payload()`，只有计数与 ≤50 样本，没有 `eligible_symbols` 清单 | `research/selection_funnel_view.py` 的 `coverage.layers_from_trace` / `layers_without_reasons` / `layers_unrecorded`；`scripts/audit_selection_funnel.py` 退出码 3 | 前两层（全市场→硬性资格）没有留档，"前置筛选是否过早淘汰了适合短期上涨的股票"仍只能靠印象回答；视图机器判为"凭现有证据答不了"（缺记录不折算成零淘汰，占位原因也不算有原因）。补齐需要夜扫把每只被挡下的原因落成结构化记录；前两层的具体障碍是 `data/asof_universe.to_payload()` 只带**计数**与 ≤50 的 `excluded_reasons_sample`，**不带 eligible 符号清单**，而 `StageTrace` 的 `advanced == len(advanced_symbols)` 恒等式不允许用计数冒充成员——要落这两层必须先决定让夜扫报告携带符号级名单（改生产报告体积与形状），属需确认的设计决策，不是可顺手补的小改 |
 
 | D15 | 流通市值列被数据供应商的**兜底常量** 12,000,000,000.0 静默填进"取不到 `circ_mv`"的那些行：`tushare_provider.py:1677-1684` 的 `fillna(_DEFAULT_FLOAT_MARKET_CAP)`，而它依赖的 `daily_basic` 调用外面 `except Exception: basic = pd.DataFrame()`（`:708-719`）**把失败吞掉**。三个 provider 用同一个字面值（`tushare:23` / `akshare:20` / `efinance:18`），所以这个数就是"没测过"的指纹。库内实测：2026-04 99.7%、05 99.98%、**06 全月只剩这一个取值**、03/07 各约五成；2022-05 起每月 15~46 行、2025-09~2026-02 每月 2,511~5,608 行 | 质量报告 §3g.1（值对上代码）；检测：`trend_data_readiness.column_concentration_<col>`（`MAX_MODAL_VALUE_SHARE=0.50`）与重放侧 `degenerate_gate_inputs()`；读侧规则：`UNPROVEN_FLOAT_MARKET_CAP` / `FLOAT_CAP_INTERPRETATION_VERSION` / HARD 名 `unproven_float_market_cap`，见 ADR-004 | **不是数值不准，是硬门失效**：阈值按同一列取分位 ⇒ 列成常数时阈值=众数 ⇒ `value < threshold` 恒假 ⇒ 这条门那天对全市场一个都不淘汰，留档却读起来像"没有一只票市值不达标"。它不是 NaN/0，所以所有防填零检查都不报警。打上读侧解释规则后重测：污染窗口 310,142 个 symbol-day 里 **216,862（69.9%）"市值从未测过"**、60 天里 40 天整日无从判定、晋级只剩 212；干净窗口（2026-08）只有 1 行占位、门正常淘汰 1,242。真值已于 2026-10-08 补采进研究库（129 天 / 708,047 行，独立表 `float_market_cap_ref`，质量报告 §3j）：同一套规则换上真值后污染窗口的晋级从 212 变成 208,128，市值门按 10 分位每天淘汰 2.7% 的输入——这才是它本来在做的事。仓库那一列**仍未就地改写**（写侧改成 NULL 是跨 26 个文件的数据语义变更，需另开 ADR，ADR-004 §6.1）；另测出 1~3 月有 9%~18% 的非占位行与 `circ_mv` 差出 1% 以上，说明 `float_market_cap` 不是单一定义的序列 |
+| D16 | 研究侧「数据不够」这个结论有三次其实是我自己设的符号上限：分钟库只灌了 208 只、参考库 `ref_daily_bars_raw` 也只灌了 208 只，而 vendor 包本身是全市场的（2026-04 每个交易日 5,194 个逐票 CSV；日线包重灌后 718,796 行 / 5,190 只）。根因都是同一句：ingest/sync 脚本传了 `--symbols-file artifacts/research/tail_symbols.txt`（那份 900 只清单，仓库里没有产生它的代码） | 质量报告 §3l / §3n.1；`scripts/sync_tail_minute_bars.py`、`scripts/sync_tail_reference_data.py` 的 `--symbols/--symbols-file` 参数 | **已证实并已修**：四月分钟 bar 全市场重灌 26,305,150 行 / 109,150 个完整尾盘 symbol-day；日线参考重灌 718,796 行 / 5,190 只、`gaps=[]`。修好后 §3n 那 10,828 条缺 `entry_daily_bar` 的判不动样本才可能出标签。**教训**：说「数据不足」之前先证明限制来自数据源而不是调用参数，否则会把工程缺陷记成数据缺口并白白停摆 |
 
 ## 2. 已实测、但还不足以定性为根因
 
@@ -84,4 +85,7 @@ As-of: 2026-10-08 @ HEAD `ce19b76`（新增 D15：流通市值被 provider 兜�
 - `src/stock_analyzer/research/funnel_trace.py` —— 分层留档 / 最终推荐留档 / 对照
 - `src/stock_analyzer/labels/tail_net_profit.py` —— 净盈利标签（observed 与 replayed 分开）
 - `scripts/audit_observed_signal_returns.py` —— §2 的 observed 队列复现入口
+- `src/stock_analyzer/research/float_cap_reference.py`、`scripts/collect_float_market_cap_history.py`、`scripts/load_float_market_cap_research.py` —— D15 的真值补采与读取侧接线
+- `scripts/sync_tail_minute_bars.py`、`scripts/sync_tail_reference_data.py` 的 `--symbols/--symbols-file` —— D16：覆盖面由调用参数决定，报告必须写清用了哪份清单
+- `runtime/universe_candidate_selector.py::_gate_membership`、`research/night_scan_funnel_trace.py::live_universe_facts` —— 生产夜扫前两层留档
 - `docs/alpha_v2/M4H_Historical_Locked_OOS_Report.md` —— 锁定 OOS 上限参照
