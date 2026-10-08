@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import date, datetime
@@ -303,10 +304,23 @@ class TrendTailShadowService:
         """
         if not probabilities:
             return None, "no_tail_probability_available", ()
-        manifest, manifest_failures = _read_serving_manifest(self._service)
-        failures = list(manifest_failures)
-        if not manifest:
-            return None, "serving_manifest_missing", tuple(failures)
+        tail_manifest, tail_failures = _read_tail_serving_manifest(
+            self._service, self._contract)
+        if tail_manifest and tail_failures:
+            # 专属清单存在但对不上 = 模型无效，直接 0 只；退回旧在服清单等于
+            # 静默换一个模型（§3.3 明令禁止）。
+            return None, "tail_serving_manifest_unverified", tuple(tail_failures)
+        if tail_manifest:
+            manifest = tail_manifest
+            failures: list[str] = []
+        else:
+            # 没有尾盘专属清单时才回退到旧的在服清单，并把"回退了"这件事留名：
+            # 回退路径上的身份缺 commit 是可预期的，但排查时必须能看出用的是哪份文件。
+            manifest, manifest_failures = _read_serving_manifest(self._service)
+            failures = list(manifest_failures)
+            if not manifest:
+                return None, "serving_manifest_missing", tuple(failures)
+            failures.append("tail_serving_manifest_absent")
         label_policy_id = _manifest_field(manifest, "label_policy_id")
         if not label_policy_id.startswith("label_policy_v4_"):
             return None, "serving_model_is_not_tail_label_policy", tuple(failures)
@@ -318,10 +332,12 @@ class TrendTailShadowService:
             label_policy_id=label_policy_id, contract=self._contract,
         )
         failures.extend(policy_failures)
-        training_commit = _manifest_field(manifest, "code_commit", "commit", "training_commit")
+        training_commit = _manifest_field(
+            manifest, "code_commit", "commit", "training_commit", "training_code_commit")
         if not training_commit:
             failures.append("training_commit_absent_from_serving_manifest")
-        training_manifest_id = _manifest_field(manifest, "dataset_manifest_id", "manifest_id")
+        training_manifest_id = _manifest_field(
+            manifest, "dataset_manifest_id", "manifest_id", "training_manifest_id")
         if not training_manifest_id:
             failures.append("training_manifest_id_absent_from_serving_manifest")
         runtime_commit, runtime_failures = _runtime_commit(self._service)
@@ -630,7 +646,60 @@ def _read_serving_manifest(service: Any) -> tuple[dict[str, Any], tuple[str, ...
     return payload, ()
 
 
-_MANIFEST_SECTIONS = ("serving", "authority", "registry")
+_MANIFEST_SECTIONS = ("serving", "authority", "registry", "identity", "label", "contract")
+
+
+def _read_tail_serving_manifest(
+    service: Any, contract: TrendStrategyContract
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """读**尾盘专属**在服清单：存在就必须在服；不存在才允许走旧在服清单。
+
+    存在但对不上时把原因原样交回去（不吞、不退），因为"换一份清单就能跑"正是
+    §3.3 禁止的静默替代模型。
+    """
+    path = _tail_serving_manifest_path(service)
+    if not path:
+        return {}, ()
+    try:
+        from stock_analyzer.models.tail_serving_manifest import (
+            read_tail_serving_manifest,
+            verify_tail_serving_manifest,
+        )
+
+        resolved = getattr(service, "_resolve_evolution_path", lambda value: value)(path)
+        payload = dict(read_tail_serving_manifest(Path(resolved)) or {})
+    except Exception as exc:  # noqa: BLE001 - 读不到就是身份不明，交给上层 fail-closed
+        return {}, (f"tail_serving_manifest_read_failed:{type(exc).__name__}",)
+    if not payload:
+        return {}, ()
+    _, failures = verify_tail_serving_manifest(payload, contract=contract)
+    return payload, tuple(failures)
+
+
+def _tail_serving_manifest_path(service: Any) -> str:
+    """路径优先级：注入 > 配置声明 > 环境变量 > 研究区默认值。
+
+    故意**不**放进 ``TrendStrategyConfig``：那是契约字段表
+    （``contract_from_config`` 直接把整个块喂给 ``TrendStrategyContract``），
+    而"清单文件在哪"是部署事实，不是策略语义。
+    """
+    override = getattr(service, "_trend_tail_serving_manifest_path", None)
+    if callable(override):
+        return str(override() or "").strip()
+    if isinstance(override, str):
+        return override.strip()
+    config = getattr(service, "_config", None)
+    trend = getattr(getattr(config, "trend_strategy", None), "tail_serving_manifest_path", "")
+    if str(trend or "").strip():
+        return str(trend).strip()
+    env_value = str(os.environ.get("SA_TAIL_SERVING_MANIFEST_PATH") or "").strip()
+    if env_value:
+        return env_value
+    from stock_analyzer.models.tail_serving_manifest import (
+        DEFAULT_TAIL_SERVING_MANIFEST_PATH,
+    )
+
+    return DEFAULT_TAIL_SERVING_MANIFEST_PATH
 
 
 def _manifest_field(manifest: Mapping[str, Any], *names: str) -> str:

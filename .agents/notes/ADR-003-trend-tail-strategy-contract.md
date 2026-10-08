@@ -185,6 +185,21 @@ As-of: 2026-10-08 @ HEAD `6c7079c` 之后的工作树（本 ADR 与 `contracts/t
   尾盘身份必然 `training_commit_unknown` ⇒ 0 只。这是 fail-closed 的正确行为，但意味着
   影子验证在扩清单 schema（或另出带 commit 的 freeze manifest）之前不会开始累积成交；
   扩 schema 属于 ADR-001 的信任边界变更，需单独决策。
+  **2026-10-08 走的是"另出一份"这条路**：见下一条的尾盘专属 challenger 清单，
+  `model_serving_manifest.v1` 本身一个字段都没动。
+- **尾盘路径有自己的在服清单**（`models/tail_serving_manifest.py` +
+  `scripts/freeze_tail_model_candidate.py`，schema `tail_model_serving_manifest.v1`）：
+  旧在服清单没有 commit ⇒ 影子链路的身份永远读空，而扩它的 schema 是 ADR-001 的信任
+  边界变更。新清单只服务尾盘净盈利模型，且三条硬约束写进构造与复核两侧：
+  ① 工件事实（内容哈希 / 字节数 / mtime）**从盘上文件算**，复核时再算一次比对 ——
+  清单写着 `sha256:a`、文件是 `sha256:b` 就是工件被换过，不是"反正清单里有 id"；
+  ② 状态只允许 `challenger`，晋升仍是人工发布（§3.4"自动学习只生成 challenger"）；
+  ③ 训练 commit 走 `resolve_runtime_code_identity()`（ADR-001 §7.2：CLI 不得自行解析
+  git HEAD），不可证就不写文件。标签口径与契约摘要优先取**工件自己声明的**，避免发布
+  动作重新解释历史样本。
+  影子服务的读取顺序随之确定：**专属清单存在 → 必须用它**（对不上就
+  `tail_serving_manifest_unverified` ⇒ 0 只，绝不退回旧清单，因为那是静默换模型）；
+  专属清单不存在 → 退回旧在服清单并留名 `tail_serving_manifest_absent`。
 - 参考数据的**消费侧**接通（改进计划 §3.1 "补齐后验证" 与 §4 "线上/历史一致"）：
   `research/tail_rebuild.py` + `scripts/rebuild_tail_labels.py` 把研究库里的五类参考数据
   喂给同一个 `build_tail_net_profit_label`，判定仍然只有那一个出口。三件事写进代码：
@@ -267,6 +282,10 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库> --reference-db <�
   落库与复核出口（返回 `(记录, 失败原因)`，不抛异常也不猜）
 - `scripts/register_tail_label_policy.py` —— 显式注册 / `--verify-only` 只读核对，
   退出码 0=已绑定、3=未注册或对不上、5=registry 不可用
+- `src/stock_analyzer/models/tail_serving_manifest.py` —— 尾盘 challenger 在服清单的
+  构造与复核（工件事实来自盘上文件，复核会重新哈希）
+- `scripts/freeze_tail_model_candidate.py` —— 已训练工件 → challenger 清单；
+  退出码 0/3(标签未绑定)/4(契约摘要不一致)/5(身份不可证或自检失败)
 - `src/stock_analyzer/models/output_semantics.py` —— `net_profit_5d_tail` 语义登记
 - `src/stock_analyzer/research/trend_data_readiness.py` + `scripts/audit_trend_data_readiness.py`
 - `src/stock_analyzer/research/funnel_trace.py` —— 分层留档与最终推荐留档；
@@ -312,7 +331,7 @@ scripts/audit_trend_data_readiness.py --minute-db <研究库> --reference-db <�
 - 测试（2026-10-08 实测条数）：`test_trend_strategy_contract.py`(55)、
   `test_tail_net_profit_label.py`(22)、`test_trend_data_readiness.py`(22)、
   `test_funnel_trace.py`(17)、`test_tail_net_profit_trainer.py`(20)、
-  `test_trend_candidate_contract.py`(16)、`test_trend_tail_shadow_runtime.py`(26)、
+  `test_trend_candidate_contract.py`(16)、`test_trend_tail_shadow_runtime.py`(29)、`test_tail_serving_manifest.py`(8)、
   `test_trend_tail_page_and_feedback.py`(26)、`test_minute_bar_store.py`(15)、
   `test_tail_walk_forward.py`(20)、`test_tail_exit_funnel.py`(14)、
   `test_tail_reference_store.py`(14)、`test_tail_rebuild.py`(18)

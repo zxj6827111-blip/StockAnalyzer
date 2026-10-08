@@ -46,7 +46,7 @@ class FakeService:
     """
 
     def __init__(self, *, manifest: dict | None, tmp_path: Path, registry: object = "default",
-                 ) -> None:
+                 tail_manifest_path: str = "") -> None:
         self._manifest = manifest
         self._tmp = tmp_path
         self._config = type("C", (), {"training": type("T", (), {
@@ -55,6 +55,7 @@ class FakeService:
             registry = LabelPolicyRegistry(tmp_path / "learning_protocol.duckdb")
             register_tail_label_policy(registry)
         self._label_policy_registry = registry
+        self._trend_tail_serving_manifest_path = tail_manifest_path
 
     def _resolve_evolution_path(self, value):
         return str(self._tmp / str(value).replace("artifacts/", ""))
@@ -120,6 +121,33 @@ def _run(tmp_path, *, watch_pool, probabilities, bars=None, service=None, **kwar
     )
 
 
+def _tail_serving_manifest(tmp_path: Path, *, tamper_after: bool = False) -> str:
+    """按真实生产者（``freeze_tail_model_candidate``）的口径写一份 challenger 清单。"""
+    from stock_analyzer.models.tail_serving_manifest import (
+        build_tail_serving_manifest,
+        write_tail_serving_manifest,
+    )
+
+    artifact = tmp_path / "tail_artifact.json"
+    artifact.write_text(json.dumps({
+        "model_id": "trend-tail-lgbm-2026q4",
+        "label_policy_id": TAIL_POLICY_ID,
+        "contract_digest": CONTRACT.digest(),
+        "probability_field": NET_PROFIT_PROBABILITY_FIELD,
+        "feature_compute_version": 7,
+        "artifact_digest": "digest-from-trainer",
+    }), encoding="utf-8")
+    payload = build_tail_serving_manifest(
+        artifact_path=artifact, model_id="trend-tail-lgbm-2026q4",
+        training_code_commit="cafe123", training_manifest_id="dataset_manifest_v9",
+        artifact=json.loads(artifact.read_text(encoding="utf-8")),
+    )
+    path = write_tail_serving_manifest(tmp_path / "tail_model_serving_manifest.json", payload)
+    if tamper_after:
+        artifact.write_text('{"tampered": true}', encoding="utf-8")
+    return str(path)
+
+
 def test_no_tail_probability_yields_zero_and_says_why(tmp_path) -> None:
     report = _run(tmp_path, watch_pool=_pool(["600000.SH"]), probabilities={})
     assert report["mode"] == "shadow"
@@ -146,6 +174,42 @@ def test_serving_model_from_another_label_policy_is_not_usable(tmp_path) -> None
 def _policy_failures(report: dict) -> list[str]:
     return [item for item in report["model_identity"]["recording_failures"]
             if str(item).startswith("label_policy_")]
+
+
+def test_tail_serving_manifest_is_preferred_and_binds_a_real_commit(tmp_path) -> None:
+    """有专属 challenger 清单时不再退回旧在服清单：commit / 数据集清单都真绑上了。"""
+    service = FakeService(manifest=None, tmp_path=tmp_path,
+                          tail_manifest_path=_tail_serving_manifest(tmp_path))
+    report = _run(tmp_path, watch_pool=_pool(["600000.SH"]),
+                  probabilities={"600000.SH": 0.9}, service=service)
+    identity = report["model_identity"]
+    assert report["blocking_reason"] in (None, "")
+    assert report["final_symbols"] == ["600000.SH"]
+    assert identity["training_manifest_id"] == "dataset_manifest_v9"
+    assert "tail_serving_manifest_absent" not in identity["recording_failures"]
+    assert identity["label_policy_verified"] is True
+
+
+def test_tampered_tail_artifact_blocks_instead_of_falling_back(tmp_path) -> None:
+    """清单写着 sha256:a、盘上是 sha256:b ⇒ 模型无效，0 只。
+
+    退回旧在服清单在这里是**禁止**的行为：那等于静默换一个模型（§3.3）。
+    """
+    path = _tail_serving_manifest(tmp_path, tamper_after=True)
+    service = FakeService(manifest=_tail_manifest(), tmp_path=tmp_path,
+                          tail_manifest_path=path)
+    report = _run(tmp_path, watch_pool=_pool(["600000.SH"]),
+                  probabilities={"600000.SH": 0.9}, service=service)
+    assert report["blocking_reason"] == "tail_serving_manifest_unverified"
+    assert report["final_symbols"] == []
+    assert any(item.startswith("tail_serving_manifest_artifact_content_hash_mismatch")
+               for item in report["model_identity"]["recording_failures"])
+
+
+def test_absent_tail_manifest_falls_back_to_legacy_but_says_so(tmp_path) -> None:
+    report = _run(tmp_path, watch_pool=_pool(["600000.SH"]),
+                  probabilities={"600000.SH": 0.9})
+    assert "tail_serving_manifest_absent" in report["model_identity"]["recording_failures"]
 
 
 def test_registered_label_policy_is_positively_verified(tmp_path) -> None:
