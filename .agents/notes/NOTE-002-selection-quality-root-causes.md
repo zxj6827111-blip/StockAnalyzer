@@ -30,7 +30,7 @@ Status: Draft
 
 
 
-As-of: 2026-10-08（D15 补采真值、D16 覆盖面是调用参数、D17 6/7 月涨跌停只剩 209 只覆盖、D18 层消融跨月翻符号（条件性）、D19 relative_strength 与 rank_ret_20 是同一个秩（ρ=1.0）、**D20 新增：这层截断偏向已大涨与高波动（成立），偏向难成交（不成立，方向相反）**；§2 特征判别力读数已按 --rolling/--walk 三次更正。台账 docs/selection_quality_plan_status.md §0 是当前交接面）
+As-of: 2026-10-09 @ 3522cf8（D15 补采真值、D16 覆盖面是调用参数、**D17 根因更正为"同步输入用了池内 CSV"并已数据侧修复**（本地全市场 CSV 一直在，远端补采 201,893 行与它差集为 0 对）、D18 层消融跨月翻符号（条件性）、D19 relative_strength 与 rank_ret_20 是同一个秩（ρ=1.0）、D20 这层截断偏向已大涨与高波动（成立），偏向难成交（不成立，方向相反）；**2025 全市场重验证窗口已打开**（分钟 RAW 口径经 vendor 日线逐分对照证明、市值占位常量污染范围收窄到 2026 年、第五类信息 moneyflow/top_list 已按全市场符号面补采）；§2 特征判别力读数已按 --rolling/--walk 三次更正。台账 docs/selection_quality_plan_status.md §0 是当前交接面）
 
 
 
@@ -254,7 +254,7 @@ As-of: 2026-10-08（D15 补采真值、D16 覆盖面是调用参数、D17 6/7 �
 
 
 
-| D17 | 研究库 `ref_limit_prices` 的覆盖面在 6/7 月塌了：6 月 43,094 行 / 21 天（≈2,052 只/天），**7 月只有 4,793 行 / 209 个符号**，而同库 `ref_daily_bars_raw` 同期 5,182 / 5,176 只。2026-06-15 有 **4,957** 只在册股票没有涨跌停行 | 质量报告 §4.2；`scripts/sync_tail_reference_data.py` 的 `--limit-prices-csv`（唯一权威来源是 tushare `stk_limit`，doc_id=183）；`artifacts/research/tail_minute_bars.duckdb` 的 `ref_limit_prices` | **已证实**：125 决策日标签重跑因此退 3，`entry_day_limit_prices` 阻塞 5,464 条请求。本地补不了——`market_copy.duckdb` 里没有任何涨跌停表，只能远端补采；补采前这些日子的确认判定不得产出标签，也不得用开盘回测顶替 |
+| D17 | 研究库 `ref_limit_prices` 的覆盖面曾在 6/7 月塌方（7 月只剩 4,793 行 / 209 个符号，而 `ref_daily_bars_raw` 同期 5,176 只）。**根因判定已更正**：不是"本地没有涨跌停数据、只能远端补"，而是上一次同步把 `stk_limit_2026_pool.csv`（209 只）当成了输入，而全市场那份 `stk_limit_2026.csv`（776,108 行 / 5,633 只 / 2026-01..07）**一直躺在本地** —— 与 D16 同一形状的错误 | 质量报告 §4.14；`scripts/sync_tail_reference_data.py --limit-prices-csv`；`scripts/collect_stk_limit_history.py`（新，tushare `stk_limit` doc_id=183 的正规采集入口）；`artifacts/research/sync_d17_fix.json` | **数据侧已修并交叉验证**：重刷后 6 月 117,724 行 / 5,613 只、7 月 129,003 行 / 5,621 只，Jun/Jul 每日最少 5,603 只，`missing_sources=[]`。远端独立补采 2026-06-11..07-31 得 201,893 行，与本地 CSV 的 `(trade_date,ts_code)` 差集为 **0 对** ⇒ 本地覆盖本来就是全的。**尚未**跟着重跑 2026 的 124 决策日标签（`entry_day_limit_prices` 阻塞 5,464 条这个读数因此还是修复前的口径，不得当成已消除）；补采前那些日子的确认判定不得产出标签，也不得用开盘回测顶替 —— 这条约束不变 |
 
 
 
@@ -934,7 +934,8 @@ As-of: 2026-10-08（D15 补采真值、D16 覆盖面是调用参数、D17 6/7 �
 
 
 
-- `scripts/sync_tail_reference_data.py` 的 `--limit-prices-csv` —— D17：精确涨跌停的唯一来源是远端 stk_limit，本地仓库副本里没有涨跌停表，采集面塌了就只能远端补，不能用开盘价近似
+- `scripts/sync_tail_reference_data.py` 的 `--limit-prices-csv` —— D17：精确涨跌停的取值来源是 tushare `stk_limit`（doc_id=183），**但塌方的原因是这里传了池内那份 CSV**。教训和普通近似值禁令并列：采集面塌了先查**传进去的是哪份文件**，再谈远端补采；不能用开盘价近似
+- `scripts/collect_stk_limit_history.py` + `scripts/collect_market_events_history.py` —— 在生产容器内按交易日补采精确涨跌停 / 第五类信息（`moneyflow`、`top_list`）的两个入口；口径与市值补采器一致（token 只读变量名、正好 10,000 行按截断处理、失败日子非零退出、`--days` 与 `--start/--end` 两条腿至少有一条说得通），钉在 `tests/test_collect_stk_limit_history.py`（9 条）与 `tests/test_collect_market_events_history.py`（8 条）
 
 
 
