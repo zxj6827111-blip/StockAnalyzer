@@ -988,3 +988,5 @@ As-of: 2026-10-09 @ 3522cf8（D15 补采真值、D16 覆盖面是调用参数、
 `avg_turnover_20`（20/39，0.5224）方向过一半；`market_relative` / `trend_position` 两族
 在 **2025 与 2026 两段独立历史上都系统性 < 0.5**。⇒ §3.2 的分组加减实验收敛为：
 这四类里可预测尾盘 5 日净盈利的部分已被容量基线吃掉，继续调这四类的权重不构成对 §4 的可行路径。
+
+| D22 | 生产链路"接通了"不等于"读得到"：夜扫前两层在 2026-10-09 首跑里缺席，成员清单其实正常产出，但放在 `source_report/prefilter/universe_quality_selection/hard_gate_membership`，而消费端只认另两条路径 ⇒ 读空、静默跳过。本地 13 条测试全绿是因为 **fixture 按消费端假设造，不是按生产形状造** | 质量报告 §4.15；`MEMBERSHIP_PATHS` / `locate_hard_gate_membership()` / `universe_membership_status()`；`tests/test_night_scan_funnel_trace.py`（16 条，其中 `_production_shaped_report()` 从生产 JSON 抄形状）；部署 `2b0ab09` 后用当晚生产报告重放验证五层齐全 | **已修（数据侧无改动，纯消费端）**。行为约束新增两条：① 命中路径必须写进留档 notes；② 两层没落档时 `record_night_scan` 必须回显原因，禁止只让人数 `layers`。以后新增"生产链路留档"类改动，验收必须包含一次**用生产真实报告形状**的重放，不能只跑自造 fixture |

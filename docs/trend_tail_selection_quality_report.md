@@ -1508,3 +1508,33 @@ RAW 口径缺一个独立可证明来源，因此排在 2025 之后（要用 202
 | --- | --- | --- | --- |
 | 2026-01..07（125 决策日） | 未过（0.4696 / 0.4720） | 否 | 无命中率数字 |
 | 2025 全年（242 决策日） | 过（0.6299 / 0.5087 / 0.5441 / 0.6190） | **是** | **未通过**：−5.44pp、CI 跨 0、均值转负 |
+
+## 4.15 生产夜扫两层：第一次落档为什么失败、修成什么样、用什么证明（2026-10-09 夜）
+
+21:45 那跑（build `3522cf8`）作业本身 success，`verify_trace()` 也 OK，但留档里只有
+`quality_300 / light_100 / deep_50` —— `universe` 与 `hard_eligibility` 缺席。
+
+取证结论不是"数据没产出"。成员清单在同一份作业结果里就在场：
+`results[0]/payload/report/source_report/prefilter/universe_quality_selection/hard_gate_membership`
+（`considered 5,478 / advanced 3,676`）。是**消费端只认 `prefilter.hard_gate_membership` 和顶层那一条**，
+读到空 ⇒ 这两层被跳过。而本地 fixture 是按消费端的假设造的，所以 13 条测试全绿、生产读空 ——
+"fixture 不是生产形状"正是 §4 工程验收要防的那类偏差，这次的制造者是我。
+
+修法三条（`research/night_scan_funnel_trace.py` + 服务层，提交 `2b0ab09`）：
+
+1. 成员查找改成**声明式路径清单**（5 条，按序尝试），并把**命中的那条**写进 `universe` 层 notes
+   —— 读口径本身要可审计，将来形状再变能一眼看出断在哪一段；
+2. 新增 `universe_membership_status()`：`membership_path_not_found` /
+   `membership_has_no_symbol_lists` / `non_evaluable_gate_inputs` 三种跳过原因各自开口，
+   `record_night_scan` 的三条返回路径都带上它。只让 `layers` 少两个等于静默；
+3. 测试 fixture 改成**从生产 JSON 结构抄下来的形状**（不是假设），钉住命中路径留痕与三种原因。
+
+部署后验证没有等新数据，而是拿**今晚生产自己那份报告**在新代码上重放到临时目录：
+五层齐全、`verify_trace()` OK、`universe 5,478 → hard_eligibility 3,676`、
+命中路径留痕在 notes 里。生产证据目录未被这次验证写入。
+
+**顺带量到一条以前没有的事实**：线上 `hard_eligibility` 的淘汰里
+`roe_below_min` **1,309** + `debt_ratio_above_max` **162**，占当日硬门淘汰的绝大多数。
+⇒ §2 第 1 问"前置筛选是否过早淘汰"在**线上侧**必须先回答这两条门；而研究侧重放读的只有
+`close/volume_ratio_5/turnover/avg_turnover_20/float_market_cap/is_st/is_delisting_risk/suspended`
+八列 —— 两边口径**不同**，这条差异以后要单独对齐，不能拿研究侧结论直接替线上辩护。
