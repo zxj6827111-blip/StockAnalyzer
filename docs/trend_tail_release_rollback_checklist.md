@@ -1,12 +1,17 @@
 # trend 尾盘净盈利概率链路：发布与回滚清单 / 影子验证方案
 
-As-of: 2026-10-08 @ HEAD `e70d84d`（分支 `feat/stock-selection-quality-overhaul`）
+As-of: 2026-10-09 @ 分支 `feat/stock-selection-quality-overhaul`（部署记录见第 6 节）
 
 配套决策见 `.agents/notes/ADR-003-trend-tail-strategy-contract.md`；
 根因与阻塞见 `.agents/notes/NOTE-002-selection-quality-root-causes.md`。
 
 本清单**不是**"照做就能上线"的操作手册，而是把"现在还不能上线"的判据写清楚：
 第 0 节未通过，后面的节不必看。
+
+**2026-10-09 的一条必须分清的事实**：第 6 节记录的是"这版代码已经在生产容器里跑"，
+**不是**"策略已获准参与实盘选股"。第 0 节未通过 ⇒ 新概率仍然只是 challenger，
+夜扫新增的两层是**记录**（`_hard_filter` 只导出成员与原因，判定一字未改）。
+读到"已部署"就以为"已晋升"是本清单最想防的那类误读。
 
 ---
 
@@ -126,3 +131,20 @@ As-of: 2026-10-08 @ HEAD `e70d84d`（分支 `feat/stock-selection-quality-overha
 项目自身锁定 OOS 的绝对命中率区间是 43–45%（`docs/alpha_v2/M4H_Historical_Locked_OOS_Report.md:206,591`）。
 若影子期发现 0.60 长期筛不出股票（常见 0 只），那是要重新讨论准入规则的信号，
 不是把阈值调低的理由。
+
+---
+
+## 6. 2026-10-09 部署记录（分支代码进生产，晋升门未过）
+
+| 项 | 读数 |
+| --- | --- |
+| 部署前生产镜像提交 | `1eda512`（PR #102 合并点，2026-10-04 构建） |
+| 与分支的关系 | `git merge-base --is-ancestor 1eda512 HEAD` 为真 ⇒ **快进部署**，不是分叉 |
+| 部署入口 | `cd /vol1/docker/StockAnalyzer && bash scripts/nas_deploy_update.sh --branch feat/stock-selection-quality-overhaul`（仓库内唯一 sanctioned 入口；compose 组合由 `scripts/nas_compose_files.sh` 决定，没有手拼 `-f`，`SA_NAS_PRODUCTION_GUARD` 未被绕过） |
+| 第一次尝试 | 在 `[1/6]` 的 `git pull` 撞 GitHub `kex_exchange_identification` 断连，`set -euo pipefail` 直接中止 ⇒ **生产容器未被触碰**（当时 `docker ps` 仍是 Up 5 days）。这类失败不等于"部署弄坏了生产" |
+| 结果 | `build_commit=3522cf8`、`dirty=false`；api + scheduler-critical + scheduler-heavy 三个容器重建后均 Up，两份调度心跳当天且 `leader=True` |
+| 部署后自证 | `docker exec stock-analyzer-api python /app/scripts/verify_container_build_identity.py --manifest /app/build_manifest.json --build-commit-file /app/.build_commit --json` → `"verdict": "PASS"`、`problems=[]`；容器内 `LIVE_HARD_GATE_NAMES` 与 `LIVE_HARD_GATE_ATTRIBUTION_ORDER` 各 20 条，`live_universe_facts` / `build_universe_stage_traces` 可导入 |
+| 回滚资产 | 镜像 `stock-analyzer:rollback-pre-20261009044710`（就是 `1eda512` 那一版）；回滚动作 = `docker tag` 回 `stock-analyzer:latest` 后用同一 `nas_compose_files.sh` 组合 recreate 四个容器，**不要**手拼 `-f` |
+| 尚未验证的那件事 | 生产夜扫第一份**带 `universe` + `hard_eligibility` 两层**的留档。夜扫是 heavy 组 `week5_night_scan`（2026-10-08 实测 21:45 触发、约 21 分钟）；**不在盘中手动触发** —— `run_night_scan` 会写共享候选池，且当天已有状态时真实那一跑会被 `_idempotent_night_scan` 跳过 |
+| 明天要读的判据 | `/app/artifacts/runtime` 下当晚留档里这两层是否非空、`FunnelTrace.digest()` 是否通过 `verify_trace()`、排除清单是否为空。NAS 上改动前生成的旧留档若digest 口径不一致会被整份排除，**先看排除清单** |
+| 一处自伤，记下来防复发 | 补采任务原先用 `docker exec -d` 跑在容器 `/tmp` 并**把结果 CSV 也留在容器 `/tmp`**；部署重建容器后 `/tmp` 清空，`moneyflow`/`top_list` 两份 2025 CSV 随之丢失，只能重采。⇒ **凡在生产容器里跑的一次性任务，产物要么当场 `docker cp` 到宿主，要么直接写到持久卷**；容器 `/tmp` 不是存储 |
