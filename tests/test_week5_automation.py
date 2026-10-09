@@ -2080,8 +2080,9 @@ def test_night_scan_reports_why_the_trace_was_not_written(tmp_path: Path) -> Non
     )
 
     emitted = automation.latest_night_scan()["source_report"]["night_funnel_trace"]
-    assert emitted == {
-        "emitted": False,
-        "reason": "night_scan_report_has_no_funnel_members",
-    }
+    assert emitted["emitted"] is False
+    assert emitted["reason"] == "night_scan_report_has_no_funnel_members"
+    # 前两层为什么缺席要自己说出口，不能靠"layers 少了两个"反推
+    assert emitted["universe_layers"]["emitted"] is False
+    assert emitted["universe_layers"]["reason"] == "membership_path_not_found"
     assert not (tmp_path / "tail_shadow").exists()

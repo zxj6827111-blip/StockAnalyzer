@@ -105,6 +105,7 @@ def _universe_facts(universe: Any) -> dict[str, Any]:
         return {}
     return {
         "snapshot_id": str(fact("universe_snapshot_id") or ""),
+        "membership_source_path": str(fact("membership_source_path") or ""),
         "as_of": str(fact("as_of") or ""),
         "eligible": eligible,
         "expected_active": active,
@@ -123,6 +124,72 @@ def _universe_facts(universe: Any) -> dict[str, Any]:
     }
 
 
+#: 硬门成员清单在**生产夜扫报告**里的候选路径，按声明顺序尝试，命中的那条要写进留档。
+#:
+#: 2026-10-09 生产第一份夜扫留档只有 `quality_300/light_100/deep_50` 三层，`universe` 与
+#: ``hard_eligibility`` 缺席。事后取证：成员其实正常产出了，但放在
+#: ``source_report/prefilter/universe_quality_selection/hard_gate_membership``
+#: （5,478 考虑 / 3,676 晋级），而消费端只认 ``prefilter.hard_gate_membership`` 与顶层那一条 ——
+#: 于是读到空、这两层被跳过。本地 fixture 是按消费端假定的形状造的，所以测试全绿、生产读空。
+#: 这类"fixture 不是生产形状"的偏差由本清单 + 命中路径留痕来堵，而不是再靠猜。
+MEMBERSHIP_PATHS: tuple[tuple[str, ...], ...] = (
+    ("prefilter", "universe_quality_selection", "hard_gate_membership"),
+    ("prefilter", "hard_gate_membership"),
+    ("source_report", "prefilter", "universe_quality_selection", "hard_gate_membership"),
+    ("source_report", "prefilter", "hard_gate_membership"),
+    ("hard_gate_membership",),
+)
+
+
+def locate_hard_gate_membership(
+    report: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], str]:
+    """返回 ``(成员清单, 命中的路径)``；一条路径都没命中时返回 ``({}, "")``——不猜也不填。"""
+    for path in MEMBERSHIP_PATHS:
+        node: Any = report
+        for key in path:
+            if not isinstance(node, Mapping):
+                node = None
+                break
+            node = node.get(key)
+        if isinstance(node, Mapping) and node:
+            return node, ".".join(path)
+    return {}, ""
+
+
+def universe_membership_status(report: Mapping[str, Any]) -> dict[str, Any]:
+    """这两层到底落没落、为什么没落 —— 必须是一条读得到的事实。
+
+    改进计划 §2 要的是"哪一层没有留档"本身；只让 ``build_universe_stage_traces`` 返回空元组
+    等于把答案留给别人反推，那是这里明确禁止的静默。
+    """
+    membership, source_path = locate_hard_gate_membership(report)
+    if not membership:
+        return {
+            "emitted": False,
+            "reason": "membership_path_not_found",
+            "tried_paths": [".".join(path) for path in MEMBERSHIP_PATHS],
+        }
+    considered = list(membership.get("considered") or ())
+    advanced = list(membership.get("advanced") or ())
+    gates = [str(item) for item in (membership.get("non_evaluable_gates") or ())]
+    if not considered or not advanced:
+        return {
+            "emitted": False, "reason": "membership_has_no_symbol_lists",
+            "source_path": source_path,
+            "considered": len(considered), "advanced": len(advanced),
+        }
+    if gates:
+        return {
+            "emitted": False, "reason": "non_evaluable_gate_inputs",
+            "source_path": source_path, "non_evaluable_gates": gates,
+        }
+    return {
+        "emitted": True, "reason": "", "source_path": source_path,
+        "considered": len(considered), "advanced": len(advanced),
+    }
+
+
 def live_universe_facts(report: Mapping[str, Any]) -> dict[str, Any]:
     """把夜扫报告里的硬门**成员**读成留档层要的符号级事实。
 
@@ -131,10 +198,9 @@ def live_universe_facts(report: Mapping[str, Any]) -> dict[str, Any]:
     覆盖率写成 ``incomplete_or_unknown`` —— 不能因为规模像 5,000 只就当它是全集。
     报告里只有计数（旧形状）时返回空，这两层就不落档，与重放侧同一条规矩。
     """
-    prefilter = report.get("prefilter") or {}
-    membership = (
-        prefilter.get("hard_gate_membership") or report.get("hard_gate_membership") or {}
-    )
+    membership, source_path = locate_hard_gate_membership(report)
+    prefilter = report.get("prefilter")
+    prefilter = prefilter if isinstance(prefilter, Mapping) else {}
     considered = [str(symbol) for symbol in (membership.get("considered") or ())]
     advanced = [str(symbol) for symbol in (membership.get("advanced") or ())]
     if not considered or not advanced:
@@ -146,8 +212,12 @@ def live_universe_facts(report: Mapping[str, Any]) -> dict[str, Any]:
     }
     return {
         "universe_snapshot_id": str(
-            prefilter.get("selection_snapshot_id") or "night_scan_universe_selection"
+            prefilter.get("selection_snapshot_id")
+            or membership.get("selection_snapshot_id")
+            or "night_scan_universe_selection"
         ),
+        # 命中路径本身也是证据：读的是报告里哪一个键，将来形状再变时能一眼看出是哪条断了。
+        "membership_source_path": source_path,
         "as_of": str(report.get("data_as_of") or report.get("generated_at") or ""),
         "eligible_symbols": considered,
         "expected_active_symbols": advanced,
@@ -215,7 +285,9 @@ def build_universe_stage_traces(
         model_identity=model_identity,
         notes=(f"universe_snapshot_id={facts['snapshot_id']} "
                f"survivorship_coverage={facts['coverage']} "
-               f"delisting_coverage_verified={facts['delisting_verified']}"),
+               f"delisting_coverage_verified={facts['delisting_verified']}"
+               + (f" membership_source_path={facts['membership_source_path']}"
+                  if facts["membership_source_path"] else "")),
     )
     eligibility_stage = record_stage(
         stage="hard_eligibility",
@@ -303,9 +375,12 @@ def build_night_scan_funnel_trace(
 
 __all__ = [
     "LAYER_FIELDS",
+    "MEMBERSHIP_PATHS",
     "build_universe_stage_traces",
     "NIGHT_TRACE_SUFFIX",
     "NIGHT_UNATTRIBUTED_DROP",
     "build_night_scan_funnel_trace",
     "live_universe_facts",
+    "locate_hard_gate_membership",
+    "universe_membership_status",
 ]

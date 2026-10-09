@@ -50,6 +50,7 @@ from stock_analyzer.research.night_scan_funnel_trace import (
     NIGHT_TRACE_SUFFIX,
     build_night_scan_funnel_trace,
     live_universe_facts,
+    universe_membership_status,
 )
 from stock_analyzer.research.shadow_evidence import (
     CAPTURE_MODE_OBSERVED,
@@ -91,6 +92,8 @@ class TrendTailShadowService:
         "哪一层没有留档"本身就是改进计划 §2 要交付的根因事实。
         夜扫与尾盘是两个时刻，两份留档分文件（``_night`` 后缀），互不覆盖。
         """
+        # 前两层没落档时必须自己开口说原因，而不是让别人从"layers 少了两个"反推。
+        universe_status = universe_membership_status(report)
         try:
             trace = build_night_scan_funnel_trace(
                 report=report,
@@ -101,9 +104,11 @@ class TrendTailShadowService:
                 universe=live_universe_facts(report),
             )
         except Exception as exc:  # noqa: BLE001 - 证据留档不得炸掉夜扫
-            return {"emitted": False, "reason": f"night_trace_failed:{type(exc).__name__}"}
+            return {"emitted": False, "reason": f"night_trace_failed:{type(exc).__name__}",
+                    "universe_layers": universe_status}
         if trace is None:
-            return {"emitted": False, "reason": "night_scan_report_has_no_funnel_members"}
+            return {"emitted": False, "reason": "night_scan_report_has_no_funnel_members",
+                    "universe_layers": universe_status}
         path = write_trace(trace, self._report_dir, suffix=NIGHT_TRACE_SUFFIX,
                            contract=self._contract)
         return {
@@ -111,6 +116,7 @@ class TrendTailShadowService:
             "path": str(path),
             "trade_date": trace.trade_date.isoformat(),
             "layers": [item.stage for item in trace.stages],
+            "universe_layers": universe_status,
         }
 
     def shadow_readiness_summary(self) -> dict[str, Any]:

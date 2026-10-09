@@ -117,7 +117,11 @@ def test_service_writes_the_night_half_as_its_own_file(tmp_path: Path) -> None:
 
     # 报告里没成员时不写文件，但把原因回显出来，别让人以为留档成功了。
     quiet = service.record_night_scan({"prefilter": {}}, trade_date="2026-10-10")
-    assert quiet == {"emitted": False, "reason": "night_scan_report_has_no_funnel_members"}
+    assert quiet["emitted"] is False
+    assert quiet["reason"] == "night_scan_report_has_no_funnel_members"
+    # 前两层为什么没落，也必须同时出现在返回值里（不能只让人数 layers）
+    assert quiet["universe_layers"]["emitted"] is False
+    assert quiet["universe_layers"]["reason"] == "membership_path_not_found"
 
 
 def test_view_prefers_night_traces_and_still_flags_missing_reasons(tmp_path: Path) -> None:
@@ -444,3 +448,125 @@ def test_hard_filter_exports_per_symbol_first_reason_membership() -> None:
     assert counts == {k: len(v) for k, v in membership["rejected_symbols"].items()}
     assert membership["feature_contract_version"] == "trend_asof_v1"
     assert "float_market_cap" in membership["gate_input_columns"]
+
+def _membership_like_production() -> dict:
+    """键与 2026-10-09 生产作业结果逐字一致的缩微版成员清单。"""
+    return {
+        "considered": ["600000", "600001", "600002", "600003"],
+        "advanced": ["600000", "600001"],
+        "rejected_symbols": {
+            "out_of_board_scope": ["600002"],
+            "insufficient_history": ["600003"],
+        },
+        "attribution_order": ["invalid_code", "out_of_board_scope", "insufficient_history"],
+        "attribution_order_declared": [
+            "invalid_code", "out_of_board_scope", "insufficient_history",
+        ],
+        "gate_input_columns": ["avg_turnover_20", "float_market_cap"],
+        "feature_contract_version": "trend_asof_v1",
+        "float_cap_interpretation_version": "unproven_float_cap_placeholder_v1",
+        "unproven_float_market_cap_share": 0.0,
+        "non_evaluable_gates": [],
+    }
+
+
+def _production_shaped_report() -> dict:
+    """今晚真实形状：成员在 ``source_report/prefilter/universe_quality_selection`` 下面，
+    而 ``report["prefilter"]`` 只有 selected/shortlisted/deep_stage 那三个计数级键。
+
+    这条 fixture 是从生产 JSON 的结构抄下来的，不是按消费端的假设造的 —— 后者正是
+    2026-10-09 那份留档只有三层、测试却全绿的原因。
+    """
+    quality = ["600000", "600001", "600002", "600003"]
+    return {
+        "data_snapshot_id": "snap_2026-10-09_20261009T135500",
+        "prefilter": {
+            "universe_quality_selection": {"selected": _rows(quality)},
+            "shortlisted": _rows(quality[:3]),
+            "deep_stage": {"selected": _rows(quality[:2])},
+        },
+        "source_report": {
+            "prefilter": {
+                "universe_quality_selection": {
+                    "selected": _rows(quality),
+                    "hard_gate_membership": _membership_like_production(),
+                }
+            }
+        },
+    }
+
+
+def test_membership_resolves_at_the_shape_production_actually_uses() -> None:
+    from stock_analyzer.research.night_scan_funnel_trace import (
+        live_universe_facts,
+        locate_hard_gate_membership,
+    )
+
+    report = _production_shaped_report()
+    membership, source_path = locate_hard_gate_membership(report)
+    assert membership.get("considered")
+    assert source_path == (
+        "source_report.prefilter.universe_quality_selection.hard_gate_membership"
+    )
+
+    trace = build_night_scan_funnel_trace(
+        report=report, trade_date="2026-10-09", contract=CONTRACT,
+        features_used=("avg_turnover_20",), universe=live_universe_facts(report),
+    )
+    assert trace is not None
+    assert [item.stage for item in trace.stages] == [
+        "universe", "hard_eligibility", "quality_300", "light_100", "deep_50",
+    ]
+    universe, eligibility = trace.stages[0], trace.stages[1]
+    assert (universe.inputs, universe.advanced) == (4, 4)
+    assert (eligibility.inputs, eligibility.advanced) == (4, 2)
+    assert set(eligibility.rejected) == {"out_of_board_scope", "insufficient_history"}
+    # 读的是哪条路径必须留在证据里，将来形状再变能一眼看出断在哪
+    assert "membership_source_path=source_report.prefilter" in universe.notes
+
+
+def test_two_front_layers_announce_why_they_are_absent() -> None:
+    """缺成员时不能只让 layers 少两个：原因得自己说出口。"""
+    from stock_analyzer.research.night_scan_funnel_trace import universe_membership_status
+
+    status = universe_membership_status(_production_shaped_report())
+    assert status["emitted"] is True
+    assert status["considered"] == 4 and status["advanced"] == 2
+
+    silent = universe_membership_status(_report(["600000"], [], []))
+    assert silent["emitted"] is False
+    assert silent["reason"] == "membership_path_not_found"
+    assert len(silent["tried_paths"]) == 5
+
+    counts_only = universe_membership_status({
+        "prefilter": {"hard_gate_membership": {"considered": [], "advanced": []}},
+    })
+    assert counts_only["emitted"] is False
+    assert counts_only["reason"] == "membership_has_no_symbol_lists"
+
+    broken_gate = universe_membership_status({
+        "prefilter": {"hard_gate_membership": {
+            "considered": ["600000"], "advanced": ["600000"],
+            "non_evaluable_gates": ["min_float_market_cap"],
+        }},
+    })
+    assert broken_gate["emitted"] is False
+    assert broken_gate["reason"] == "non_evaluable_gate_inputs"
+
+
+def test_service_return_carries_the_universe_layer_status(tmp_path: Path) -> None:
+    """夜扫返回值里要能直接看到这两层的落档状态，不用去数 layers 少几个。"""
+    from stock_analyzer.runtime.services.trend_tail_shadow_service import (
+        TrendTailShadowService,
+    )
+
+    service = TrendTailShadowService(
+        service=object(), report_dir=tmp_path, contract=CONTRACT,
+    )
+    result = service.record_night_scan(
+        _production_shaped_report(), trade_date="2026-10-09",
+    )
+    assert result["emitted"] is True
+    assert result["universe_layers"]["emitted"] is True
+    assert result["universe_layers"]["source_path"].startswith("source_report.")
+    assert result["layers"][:2] == ["universe", "hard_eligibility"]
