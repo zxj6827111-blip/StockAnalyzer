@@ -1409,3 +1409,22 @@ RAW 口径缺一个独立可证明来源，因此排在 2025 之后（要用 202
 
 状态（AGENTS.md §9.1）：数据与契约侧**已完成并可复查**；2025 的 §4 命中率数字**尚未产出**
 （链路在跑，读数出来前不写任何百分比）。
+
+### 4.14.2 2025 全市场重放的第一份完整读数（2026-10-09）
+
+`artifacts/research/mw2025_report.json`（`replay_tail_candidate_pool.py`，退出码 0）：
+
+| 项 | 读数 |
+| --- | --- |
+| 决策日 | **242**（2025-01-02 ~ 2025-12-31；243 个开市日里第一天凑不满 20 日窗口） |
+| 考虑过的 symbol-day | **1,240,574**（输入清单 5,183 只，provenance 记 `build_tail_universe_symbols.py` + sha256） |
+| 重放请求 | **72,600**（`pool_size=300`/日，与 2026 各段同口径） |
+| 各硬门第一条命中淘汰 | `min_avg_turnover_20` 369,825、`min_float_market_cap` **117,682**、`is_st` 41,362、`overextension_risk` 978、`board_eligibility` 484、`unproven_float_market_cap` 489、`stale_market_data` 6、`suspended` 0、`is_delisting_risk` 0 |
+| 整日无从判定的门 | **`days_with_non_evaluable_gate_inputs=[]`** —— 2025 每个月的市值门都有判别力，与污染窗口 2026Q2"40 天整天判不了"形成对照 |
+| 基准 | `000300.SH` 可用至 2025-12-31 |
+| 旧排序对照 | `old_chain_ordering_available=false`，历史归档里没有当时的 `composite_score`/等级 ⇒ 按 §4 如实报"缺"，不拿流动性容量排序冒充旧排序 |
+
+`universe` + `hard_eligibility` 两层的 sidecar 同步产出 242 天
+（`artifacts/research/mw2025_universe_facts.jsonl`），§2 的前两层在 2025 段也是可查的。
+标签重建（72,600 条请求、300,431,082 根分钟 bar 的库）在写这一段时仍在跑，
+**跑完之前本节不写任何成交率或净盈利率数字**。
