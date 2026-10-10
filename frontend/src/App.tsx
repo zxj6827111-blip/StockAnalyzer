@@ -5,6 +5,7 @@ import {
   CalendarClock,
   ChevronDown,
   ChevronRight,
+  Clock3,
   Eye,
   LayoutDashboard,
   Newspaper,
@@ -25,6 +26,7 @@ import PortfolioPage from './pages/Portfolio';
 import RecommendationsPage from './pages/Recommendations';
 import RuntimeStagePage from './pages/RuntimeStage';
 import SystemOpsPage from './pages/SystemOps';
+import TailShadowPage from './pages/TailShadow';
 
 const researchPaths = ['/learning-overview', '/observation-pool', '/news', '/historical-backtest'];
 
@@ -47,6 +49,7 @@ function Sidebar(props: { onWarmLearningOverview: () => void }) {
     { path: '/runtime-stage', label: '系统阶段', icon: Activity },
     { path: '/portfolio', label: '持仓与实盘', icon: Briefcase },
     { path: '/recommendations', label: '推荐汇总', icon: Target },
+    { path: '/tail-shadow', label: '尾盘确认', icon: Clock3 },
     { path: '/ops', label: '系统与日志', icon: Settings },
   ];
   const researchNavItems = [
@@ -171,6 +174,7 @@ function MainLayout() {
           <Route path="/observation-pool" element={<ObservationPoolPage />} />
           <Route path="/portfolio" element={<PortfolioPage />} />
           <Route path="/recommendations" element={<RecommendationsPage />} />
+          <Route path="/tail-shadow" element={<TailShadowPage />} />
           <Route path="/news" element={<NewsPage />} />
           <Route path="/historical-backtest" element={<HistoricalBacktestPage />} />
           <Route path="/ops" element={<SystemOpsPage />} />

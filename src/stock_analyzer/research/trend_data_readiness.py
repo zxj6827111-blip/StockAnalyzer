@@ -1,0 +1,801 @@
+"""trend 尾盘链路的数据就绪审计：能算标签吗？算不了的话缺哪一样。
+
+改进计划 §3.1 要求"补齐并校验交易日历、RAW 行情、精确涨跌停、停复牌和证券历史
+状态""校验指数数据链路，确保相对强弱等特征真实计算，缺失不能被填零后当成有效
+信息"，并要求"数据无法证实时标记为不足"。§5 进一步明确：历史分钟行情不足时，
+尾盘策略验证**必须记为阻塞**，不能用开盘回测代替。
+
+本模块就是那条"记为阻塞"的实现：它只做只读探测，按表实际拥有的列来判定
+（不同代际的仓库列集合不一样，假设列存在会把缺数据错报成 0 覆盖率），并区分
+三种状态：
+
+``ok``            该项足以支撑尾盘契约的成交模拟；
+``insufficient``  项存在但覆盖不到门槛——相关特征必须标为不可用，不得填零；
+``blocked``       项根本不存在——尾盘策略验证整体不可执行，不得用开盘口径顶替。
+
+用法：::
+
+    from duckdb import connect
+    report = audit_trend_data_readiness(connect(path, read_only=True))
+    if report["readiness"] != "ready":  # 阻塞/不足都不能进入选股质量验收
+        ...
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any
+
+from stock_analyzer.contracts.trend_strategy import (
+    DEFAULT_TREND_CONTRACT,
+    TrendStrategyContract,
+)
+from stock_analyzer.research.tail_reference_store import REFERENCE_TABLES
+
+READINESS_READY = "ready"
+READINESS_INSUFFICIENT = "insufficient"
+READINESS_BLOCKED = "blocked"
+
+STATUS_OK = "ok"
+STATUS_INSUFFICIENT = "insufficient"
+STATUS_BLOCKED = "blocked"
+
+#: 判定"够用"的门槛。写成常量是为了让验收报告能引用同一组数字，而不是每次口头说。
+MIN_LIMIT_PRICE_COVERAGE = 0.90
+MIN_TRADE_STATUS_COVERAGE = 0.90
+MIN_INDEX_CONTINUITY = 0.95
+MIN_DAILY_ROWS_PER_DAY = 500
+#: 尾盘窗口需要覆盖到的分钟数：14:30-14:50 每 5 分钟一个确认点，成交还要窗口后一根。
+MIN_TAIL_BARS_PER_DAY = 4
+
+#: 单个交易日内，数值列被填成同一个常值的比例上限。超过它说明这条列那天**没有判别力**：
+#: 硬门阈值是按同一列取横截面分位算出来的，列成常数 ⇒ 阈值 = 众数 ⇒ 门"在跑"却永远不淘汰，
+#: 留档里读起来就像"没有一只票不达标"。2026-10-08 实测 `float_market_cap` 从 3 月中旬起
+#: 被填成 12,000,000,000（4 月 21/21 天、5 月 18/18 天 >90% 的行等于该值）就是这一类。
+#: 它是**非零常数**，所以所有防 NaN/防填零的逻辑都不会报警，必须单独查取值集中度。
+MAX_MODAL_VALUE_SHARE = 0.50
+CONCENTRATION_GUARDED_COLUMNS = ("float_market_cap", "turnover")
+
+BAR_TIME_COLUMNS = ("bar_time", "end_time", "datetime", "trade_time", "timestamp", "time")
+
+MINUTE_TABLES = {
+    "1min": ("intraday_summary_1m", "intraday_minute_bars", "minute_bars_1min"),
+    "5min": ("intraday_summary_5m", "intraday_minute_bars_5m", "minute_bars_5min"),
+}
+
+
+@dataclass
+class ReadinessCheck:
+    name: str
+    status: str
+    detail: dict[str, Any] = field(default_factory=dict)
+    note: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "status": self.status, "detail": self.detail,
+                "note": self.note}
+
+
+class _Probe:
+    """只读探测包装：表/列缺失返回 None，而不是抛错或当成空覆盖。"""
+
+    def __init__(self, connection: Any) -> None:
+        self._conn = connection
+
+    def tables(self) -> set[str]:
+        rows = self._conn.execute("SHOW TABLES").fetchall()
+        return {str(row[0]) for row in rows}
+
+    def columns(self, table: str) -> set[str]:
+        try:
+            rows = self._conn.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
+                [table],
+            ).fetchall()
+        except Exception:  # noqa: BLE001 - 探测失败就是"不知道"，不能当成有数据
+            return set()
+        return {str(row[0]).strip().lower() for row in rows}
+
+    def scalar(self, sql: str, params: list[Any] | None = None) -> Any:
+        try:
+            return self._conn.execute(sql, params or []).fetchone()[0]
+        except Exception:  # noqa: BLE001
+            return None
+
+    def rows(self, sql: str, params: list[Any] | None = None) -> list[tuple[Any, ...]]:
+        try:
+            return list(self._conn.execute(sql, params or []).fetchall())
+        except Exception:  # noqa: BLE001
+            return []
+
+
+def _audit_column_concentration(
+    probe: _Probe, table: str | None, *, max_share: float = MAX_MODAL_VALUE_SHARE
+) -> list[ReadinessCheck]:
+    """按列检查取值集中度：常数填充不是缺失，只有集中度查得出来。
+
+    只对**存在**的列出结论。列缺失不报这里：那条输入一旦缺了，重放与硬门会直接
+    KeyError / 报错，是响的；这条检查专门抓"跑得动但永远不淘汰"的静默失效。
+    """
+    if table is None:
+        return []
+    columns = probe.columns(table)
+    date_column = _pick(columns, ("date", "trade_date"))
+    checks: list[ReadinessCheck] = []
+    if date_column is None:
+        return []
+    for column in CONCENTRATION_GUARDED_COLUMNS:
+        name = f"column_concentration_{column}"
+        if column not in columns:
+            continue
+        days, over_threshold, worst = (probe.rows(
+            f"WITH per_value AS (SELECT {date_column} AS d, {column} AS v, COUNT(*) AS c "
+            f"FROM {table} WHERE {column} IS NOT NULL GROUP BY 1, 2), "
+            f"per_day AS (SELECT d, SUM(c) AS n, MAX(c) AS modal_c FROM per_value GROUP BY 1) "
+            f"SELECT COUNT(*), "
+            f"SUM(CASE WHEN modal_c * 1.0 / n > {max_share} THEN 1 ELSE 0 END), "
+            f"MAX(modal_c * 1.0 / n) FROM per_day"
+        ) or [((0, 0, None),)])[0]
+        modal_row = (probe.rows(
+            f"SELECT {column}, COUNT(*) AS c FROM {table} "
+            f"WHERE {column} IS NOT NULL GROUP BY 1 ORDER BY c DESC LIMIT 1"
+        ) or [((None, 0),)])[0]
+        detail = {
+            "table": table,
+            "column": column,
+            "trade_days": int(days or 0),
+            "days_over_modal_share": int(over_threshold or 0),
+            "worst_modal_share": round(float(worst), 4) if worst is not None else None,
+            "modal_value": modal_row[0],
+            "modal_share_limit": max_share,
+        }
+        checks.append(ReadinessCheck(
+            name,
+            STATUS_OK if not detail["days_over_modal_share"] else STATUS_INSUFFICIENT,
+            detail,
+            "超过上限的那天这条列没有判别力：以它为阈值的硬门不许被当成『已通过』，"
+            "以它为特征的列那天不算有效信息",
+        ))
+    return checks
+
+
+def _pick(existing: Mapping[str, Any] | set[str], candidates: tuple[str, ...]) -> str | None:
+    for candidate in candidates:
+        if candidate in existing:
+            return candidate
+    return None
+
+
+def audit_trend_data_readiness(
+    *,
+    connection: Any,
+    contract: TrendStrategyContract = DEFAULT_TREND_CONTRACT,
+    benchmark_codes: tuple[str, ...] = ("000300", "399001"),
+    min_rows_per_day: int = MIN_DAILY_ROWS_PER_DAY,
+    minute_connection: Any | None = None,
+    reference_connection: Any | None = None,
+) -> dict[str, Any]:
+    """按尾盘策略契约的要求探测仓库数据，返回可审计的就绪报告。
+
+    ``minute_connection`` 指向带时刻的分钟研究库（可选）：只有它真的非空，
+    ``tail_window_minute_bars`` 才会从 blocked 翻成 ok。
+
+    ``reference_connection`` 指向研究库里的**日级参考数据副本**（同一文件的另一组表）。
+    成交与出场的判定要吃的就是这份副本，所以"生产仓库有数据"不等于"能重建标签"：
+    副本没建、口径不是 raw、日历矛盾、状态没声明，都会在重建时变成
+    ``insufficient_reference_data`` 或 ``unknown_trade_status``，而不是产出标签。
+    """
+    probe = _Probe(connection)
+    try:
+        tables = probe.tables()
+    except Exception as exc:  # noqa: BLE001 - 连不上库就是彻底阻塞，不能报 ready
+        check = ReadinessCheck("warehouse", STATUS_BLOCKED, {"error": str(exc)},
+                               "无法读取仓库表清单")
+        return {
+            "readiness": READINESS_BLOCKED,
+            "checks": [check.as_dict()],
+            "blocking_gaps": [check.name],
+            "insufficient_items": [],
+            "contract_version": contract.contract_version,
+            "contract_digest": contract.digest(),
+            "checked_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    checks: list[ReadinessCheck] = []
+    reference_probe = (_Probe(reference_connection)
+                       if reference_connection is not None else None)
+    bars_table = _pick(tables, ("daily_bars", "stock_daily", "daily"))
+    checks.append(_audit_daily_bars(probe, bars_table, min_rows_per_day))
+    checks.extend(_audit_column_concentration(probe, bars_table))
+    checks.append(_audit_price_mode(probe, bars_table, reference_probe))
+    checks.append(_audit_limit_prices(probe, bars_table, tables))
+    checks.append(_audit_trade_status(probe, bars_table, tables))
+    checks.append(_audit_security_status_intervals(probe, tables, reference_probe))
+    checks.append(_audit_index_continuity(probe, bars_table, tables, benchmark_codes))
+    checks.append(_audit_tail_minute_bars(
+        probe, tables,
+        minute_probe=(_Probe(minute_connection) if minute_connection is not None else None),
+    ))
+    checks.append(_audit_calendar(probe, bars_table))
+    checks.extend(_audit_reference_copy(reference_probe))
+
+    blocking = [check.name for check in checks if check.status == STATUS_BLOCKED]
+    weak = [check.name for check in checks if check.status == STATUS_INSUFFICIENT]
+    readiness = (
+        READINESS_BLOCKED if blocking
+        else READINESS_INSUFFICIENT if weak
+        else READINESS_READY
+    )
+    return {
+        "readiness": readiness,
+        "checks": [check.as_dict() for check in checks],
+        "blocking_gaps": blocking,
+        "insufficient_items": weak,
+        "contract_version": contract.contract_version,
+        "contract_digest": contract.digest(),
+        "tail_entry_window": [contract.entry_window_start, contract.entry_window_end],
+        "checked_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def _audit_daily_bars(
+    probe: _Probe, table: str | None, min_rows_per_day: int
+) -> ReadinessCheck:
+    name = "daily_bars_coverage"
+    if table is None:
+        return ReadinessCheck(name, STATUS_BLOCKED, {}, "仓库里没有日线表")
+    rows = int(probe.scalar(f"SELECT COUNT(*) FROM {table}") or 0)
+    date_column = _pick(probe.columns(table), ("date", "trade_date"))
+    if rows == 0 or date_column is None:
+        return ReadinessCheck(name, STATUS_BLOCKED, {"rows": rows}, "日线表为空或缺日期列")
+    min_date = str(probe.scalar(f"SELECT MIN({date_column}) FROM {table}") or "")
+    max_date = str(probe.scalar(f"SELECT MAX({date_column}) FROM {table}") or "")
+    per_day = probe.rows(
+        f"SELECT COUNT(DISTINCT symbol), {date_column} FROM {table} "
+        f"GROUP BY {date_column} ORDER BY {date_column}"
+    )
+    thin_days = [str(day) for count, day in per_day if int(count or 0) < min_rows_per_day]
+    counts = [int(count or 0) for count, _ in per_day]
+    return ReadinessCheck(
+        name,
+        STATUS_OK if per_day and not thin_days else STATUS_INSUFFICIENT,
+        {
+            "table": table,
+            "rows": rows,
+            "trade_days": len(per_day),
+            "min_date": min_date,
+            "max_date": max_date,
+            "median_symbols_per_day": _median(counts),
+            "thin_day_count": len(thin_days),
+            "thin_day_sample": thin_days[:10],
+        },
+        "日覆盖不足的日子会被当成不可用样本，不补数据",
+    )
+
+
+def _audit_price_mode(
+    probe: _Probe, table: str | None, reference_probe: _Probe | None = None
+) -> ReadinessCheck:
+    """成交模拟必须用 raw；仓库若不带复权口径声明，就无法证明它是 raw。
+
+    但**成交模拟真正读的是研究库那份 RAW 副本**（§3.1"在独立研究库补齐后验证"）。
+    副本存在且口径只有 raw 时，仓库那列缺失只是"源头没声明"，不该把整条尾盘验证判成阻塞；
+    此时把满足来源写清楚，不假装仓库自己声明过。
+    """
+    name = "raw_price_basis_declared"
+    if table is None:
+        return ReadinessCheck(name, STATUS_BLOCKED, {}, "无日线表")
+    columns = probe.columns(table)
+    mode_column = _pick(columns, ("price_mode", "adjust_flag", "dividend_treatment"))
+    if mode_column is None:
+        credited = _reference_copy_is_raw(reference_probe)
+        if credited:
+            return ReadinessCheck(
+                name, STATUS_OK,
+                {"table": table, "warehouse_mode_column": None,
+                 "satisfied_by": "reference_copy", "reference_rows": credited},
+                "生产仓库没声明复权口径；成交与出场读的是研究库里口径可证明为 raw 的"
+                "日线副本（sync_tail_reference_data.py 落的 ref_daily_bars_raw）",
+            )
+        return ReadinessCheck(
+            name, STATUS_BLOCKED,
+            {"table": table, "looked_for": ["price_mode", "adjust_flag",
+                                            "dividend_treatment"]},
+            "仓库未声明复权口径，且研究库没有可证明为 raw 的日线副本"
+            "（QFQ 价只能进特征，不能用于成交模拟）",
+        )
+    values = probe.rows(
+        f"SELECT {mode_column}, COUNT(*) FROM {table} GROUP BY {mode_column}"
+    )
+    raw_rows = sum(int(count or 0) for value, count in values
+                   if str(value).strip().lower() in {"raw", "none", "0", "unadjusted"})
+    total = sum(int(count or 0) for _, count in values)
+    share = (raw_rows / total) if total else 0.0
+    return ReadinessCheck(
+        name,
+        STATUS_OK if share >= 0.99 else STATUS_BLOCKED if raw_rows == 0 else STATUS_INSUFFICIENT,
+        {"column": mode_column, "distinct": {str(v): int(c or 0) for v, c in values},
+         "raw_share": share},
+        "raw 占比不足时，成交与净收益只能标为不确定",
+    )
+
+
+def _audit_limit_prices(probe: _Probe, bars_table: str | None, tables: set[str]) -> ReadinessCheck:
+    """精确涨跌停：优先 stk_limit 落库值；缺失时只能用比例近似，覆盖率必须报出来。"""
+    name = "precise_limit_price_coverage"
+    status_table = "daily_trade_status" if "daily_trade_status" in tables else None
+    if status_table is not None:
+        total = int(probe.scalar(f"SELECT COUNT(*) FROM {status_table}") or 0)
+        with_limits = int(probe.scalar(
+            f"SELECT COUNT(*) FROM {status_table} "
+            "WHERE up_limit IS NOT NULL AND down_limit IS NOT NULL"
+        ) or 0)
+        sources = {str(row[0]): int(row[1] or 0) for row in probe.rows(
+            f"SELECT source, COUNT(*) FROM {status_table} GROUP BY source"
+        )}
+        complete = int(probe.scalar(
+            f"SELECT COUNT(*) FROM {status_table} WHERE coverage_complete"
+        ) or 0)
+        share = (with_limits / total) if total else 0.0
+        return ReadinessCheck(
+            name,
+            STATUS_OK if total and share >= MIN_LIMIT_PRICE_COVERAGE else STATUS_INSUFFICIENT,
+            {"table": status_table, "rows": total, "exact_limit_share": share,
+             "coverage_complete_share": (complete / total) if total else 0.0,
+             "sources": sources},
+            "tushare stk_limit(doc_id=183) 落库口径；不足的门禁日改用比例近似并计入不确定",
+        )
+    if bars_table is None:
+        return ReadinessCheck(name, STATUS_BLOCKED, {}, "既无 daily_trade_status 也无日线表")
+    columns = probe.columns(bars_table)
+    up = _pick(columns, ("up_limit", "limit_up", "high_limit"))
+    if up is None:
+        return ReadinessCheck(
+            name, STATUS_BLOCKED, {"table": bars_table},
+            "没有精确涨跌停字段：涨跌停判定只能按比例近似",
+        )
+    total = int(probe.scalar(f"SELECT COUNT(*) FROM {bars_table}") or 0)
+    filled = int(probe.scalar(f"SELECT COUNT({up}) FROM {bars_table}") or 0)
+    share = (filled / total) if total else 0.0
+    return ReadinessCheck(
+        name,
+        STATUS_OK if share >= MIN_LIMIT_PRICE_COVERAGE else STATUS_INSUFFICIENT,
+        {"table": bars_table, "column": up, "rows": total, "exact_limit_share": share},
+    )
+
+
+def _audit_trade_status(probe: _Probe, bars_table: str | None, tables: set[str]) -> ReadinessCheck:
+    """停复牌：缺 bar 不等于停牌，所以停牌标记必须是显式来源。"""
+    name = "suspension_flag_coverage"
+    candidate_tables = [t for t in (bars_table, "daily_trade_status") if t in tables]
+    evidence: dict[str, Any] = {}
+    any_ok = False
+    for table in candidate_tables:
+        columns = probe.columns(table)
+        column = _pick(columns, ("suspended", "is_suspended", "suspend"))
+        if column is None:
+            continue
+        total = int(probe.scalar(f"SELECT COUNT(*) FROM {table}") or 0)
+        declared = int(probe.scalar(
+            f"SELECT COUNT(*) FROM {table} WHERE {column} IS NOT NULL"
+        ) or 0)
+        flagged = int(probe.scalar(
+            f"SELECT COUNT(*) FROM {table} WHERE {column}"
+        ) or 0)
+        share = (declared / total) if total else 0.0
+        evidence[table] = {"column": column, "rows": total, "declared_share": share,
+                           "suspended_rows": flagged}
+        any_ok = any_ok or share >= MIN_TRADE_STATUS_COVERAGE
+    if not evidence:
+        return ReadinessCheck(
+            name, STATUS_BLOCKED, {},
+            "没有显式停牌字段：缺 bar 会被当成停牌，违反计划 §3.1",
+        )
+    return ReadinessCheck(
+        name, STATUS_OK if any_ok else STATUS_INSUFFICIENT, evidence,
+        "tushare suspend_d(doc_id=214) 与仓库 suspended 字段",
+    )
+
+
+def _reference_copy_is_raw(reference_probe: _Probe | None) -> int:
+    """研究库副本口径可证明为 raw 时返回它的行数，否则 0（0 就是"没资格替仓库说话"）。"""
+    if reference_probe is None:
+        return 0
+    table = REFERENCE_TABLES["daily_bars"]
+    try:
+        if table not in reference_probe.tables():
+            return 0
+        bases = {str(row[0]) for row in reference_probe.rows(
+            f"SELECT DISTINCT price_basis FROM {table}")}
+        rows = int(reference_probe.scalar(f"SELECT COUNT(*) FROM {table}") or 0)
+    except Exception:  # noqa: BLE001 - 读不到副本就是不满足，不该把审计炸掉
+        return 0
+    return rows if rows > 0 and bases == {"raw"} else 0
+
+
+def _audit_security_status_intervals(
+    probe: _Probe, tables: set[str], reference_probe: _Probe | None = None
+) -> ReadinessCheck:
+    name = "security_status_intervals"
+    table = "security_status"
+    active_probe = probe if table in tables else None
+    if active_probe is None or int(active_probe.scalar(
+        f"SELECT COUNT(*) FROM {table}") or 0) == 0:
+        # 生产那张表本来就是 0 行；§3.1 要求的是"在独立研究库补齐后验证"，
+        # 所以副本里有区间就算这份能力存在，并把来源写清楚。
+        if reference_probe is not None and REFERENCE_TABLES["security_status"] in (
+            reference_probe.tables()
+        ):
+            active_probe, table = reference_probe, REFERENCE_TABLES["security_status"]
+            if int(active_probe.scalar(f"SELECT COUNT(*) FROM {table}") or 0) == 0:
+                return ReadinessCheck(name, STATUS_INSUFFICIENT,
+                                      {"source": "reference_copy", "rows": 0},
+                                      "研究库副本的证券状态区间表还没落数据")
+        else:
+            return ReadinessCheck(name, STATUS_BLOCKED, {},
+                                  "无 PIT 证券状态区间表：ST/上市/退市无法按时间还原")
+    total = int(active_probe.scalar(f"SELECT COUNT(*) FROM {table}") or 0)
+    symbols = int(active_probe.scalar(
+        f"SELECT COUNT(DISTINCT symbol) FROM {table}") or 0)
+    complete = int(active_probe.scalar(
+        f"SELECT COUNT(*) FROM {table} WHERE coverage_complete") or 0)
+    overlaps = active_probe.rows(
+        f"SELECT a.symbol, a.effective_from, b.effective_from FROM {table} a "
+        f"JOIN {table} b ON a.symbol = b.symbol AND a.status_type = b.status_type "
+        "AND a.effective_from < b.effective_from "
+        "AND (a.effective_to IS NULL OR a.effective_to >= b.effective_from) LIMIT 5"
+    )
+    share = (complete / total) if total else 0.0
+    return ReadinessCheck(
+        name,
+        STATUS_OK if total and not overlaps and share >= MIN_TRADE_STATUS_COVERAGE
+        else STATUS_INSUFFICIENT,
+        {"rows": total, "symbols": symbols, "source_table": table,
+         "coverage_complete_share": share,
+         "overlap_sample": [list(row) for row in overlaps]},
+        "" if (total and not overlaps
+               and share >= MIN_TRADE_STATUS_COVERAGE) else
+        "证券状态区间的 coverage_complete 份额不够：改名/ST 史受接口单次 10,000 行上限截断，"
+        "跨状态还原能力只能算不足",
+    )
+
+
+def _audit_index_continuity(
+    probe: _Probe, bars_table: str | None, tables: set[str], benchmark_codes: tuple[str, ...]
+) -> ReadinessCheck:
+    """指数链路：缺失时必须显式不可用，相对强弱不能填零当成有效信息。"""
+    name = "benchmark_index_continuity"
+    if "index_daily" not in tables:
+        return ReadinessCheck(name, STATUS_BLOCKED, {},
+                              "无 index_daily：市场相对强弱族不可计算（不得填零）")
+    if bars_table is None:
+        return ReadinessCheck(name, STATUS_INSUFFICIENT, {}, "无日线表，无法比对交易日")
+    date_column = _pick(probe.columns(bars_table), ("date", "trade_date")) or "date"
+    bars_dates = [
+        str(row[0])
+        for row in probe.rows(
+            f"SELECT DISTINCT {date_column} FROM {bars_table} ORDER BY 1 DESC LIMIT 250"
+        )
+    ]
+    placeholders = ",".join("?" for _ in bars_dates)
+    per_code: dict[str, Any] = {}
+    best_share = 0.0
+    for code in benchmark_codes:
+        matched = int(probe.scalar(
+            f"SELECT COUNT(DISTINCT trade_date) FROM index_daily WHERE "
+            f"CAST(trade_date AS VARCHAR) IN ({placeholders}) AND "
+            "(index_code = ? OR index_code LIKE ?)",
+            [*bars_dates, code, f"{code}%"],
+        ) or 0)
+        max_date = str(probe.scalar(
+            "SELECT MAX(trade_date) FROM index_daily WHERE index_code = ? OR "
+            "index_code LIKE ?", [code, f"{code}%"]
+        ) or "")
+        share = (matched / len(bars_dates)) if bars_dates else 0.0
+        best_share = max(best_share, share)
+        per_code[code] = {"matched_trade_days": matched, "share_of_recent_bars": share,
+                          "max_date": max_date}
+    return ReadinessCheck(
+        name,
+        STATUS_OK if best_share >= MIN_INDEX_CONTINUITY else STATUS_INSUFFICIENT,
+        {"index_trade_days": per_code, "best_share": best_share,
+         "recent_bar_days": len(bars_dates)},
+        "份额不足时 rs/excess_* 特征必须标为不可用，而不是补 0",
+    )
+
+
+def _audit_tail_minute_bars(
+    probe: _Probe,
+    tables: set[str],
+    *,
+    minute_probe: _Probe | None = None,
+) -> ReadinessCheck:
+    """尾盘窗口能不能重建：需要**带时间戳的**分钟 bar，而不是日级汇总。
+
+    ``intraday_summary_1m/5m`` 只有 12 个日级聚合列（minute_count / last30_return
+    等），没有 bar 时刻列，因此 14:30–14:50 的逐 5 分钟确认与"确认后下一根成交"
+    无法从落库数据重建。这一项必须是 ``blocked``，且**不得**改用开盘价回测顶替。
+
+    ``minute_probe`` 是带时刻的**分钟研究库**（``research/minute_bar_store.py``
+    的产物）：它存在且非空时本项才允许翻成 ok，判定标准不变，只是多看一个来源。
+    """
+    name = "tail_window_minute_bars"
+    sources: list[tuple[str, _Probe, set[str]]] = [("warehouse", probe, tables)]
+    if minute_probe is not None:
+        sources.append(("research_minute", minute_probe, minute_probe.tables()))
+    looked: dict[str, Any] = {}
+    for label, active, available in sources:
+        for interval, candidates in MINUTE_TABLES.items():
+            table = _pick(available, candidates)
+            key = interval if label == "warehouse" else f"{label}:{interval}"
+            if table is None:
+                looked[key] = {"table": None, "candidates": list(candidates),
+                               "source": label}
+                continue
+            columns = active.columns(table)
+            time_column = _pick(columns, BAR_TIME_COLUMNS)
+            rows = int(active.scalar(f"SELECT COUNT(*) FROM {table}") or 0)
+            tail_bars = None
+            if time_column is not None:
+                tail_bars = active.scalar(
+                    f"SELECT COUNT(*) FROM {table} WHERE "
+                    f"date_part('hour', CAST({time_column} AS TIMESTAMP)) = 14 AND "
+                    f"date_part('minute', CAST({time_column} AS TIMESTAMP)) BETWEEN 30 AND 50"
+                )
+            looked[key] = {
+                "table": table,
+                "source": label,
+                "rows": rows,
+                "has_bar_time_column": time_column is not None,
+                "bar_time_column": time_column,
+                "tail_window_bar_rows": int(tail_bars or 0),
+                "columns": sorted(columns),
+            }
+    usable = any(
+        isinstance(info, dict) and info.get("has_bar_time_column") and info.get("rows")
+        for info in looked.values()
+    )
+    if usable:
+        return ReadinessCheck(name, STATUS_OK, looked)
+    return ReadinessCheck(
+        name,
+        STATUS_BLOCKED,
+        looked,
+        "落库的分钟表只有日级聚合、没有 bar 时刻列，14:30-14:50 确认与确认后成交无法重建；"
+        "尾盘策略验证记为阻塞，必须继续采集带时刻的分钟行情"
+        "（scripts/sync_tail_minute_bars.py → research/minute_bar_store.py），"
+        "不得用开盘回测代替",
+    )
+
+
+def _audit_calendar(probe: _Probe, bars_table: str | None) -> ReadinessCheck:
+    """日历完备性：用日线实际交易日做基准，并报告周末泄漏（应为 0）。"""
+    name = "trade_calendar_consistency"
+    if bars_table is None:
+        return ReadinessCheck(name, STATUS_BLOCKED, {}, "无日线表")
+    columns = probe.columns(bars_table)
+    date_column = _pick(columns, ("date", "trade_date"))
+    if date_column is None:
+        return ReadinessCheck(name, STATUS_BLOCKED, {}, "日线表无日期列")
+    weekend_days = probe.rows(
+        f"SELECT DISTINCT {date_column} FROM {bars_table} "
+        "WHERE dayofweek(CAST(" + date_column + " AS DATE)) IN (0, 6) LIMIT 10"
+    )
+    holiday_2026 = probe.rows(
+        f"SELECT DISTINCT {date_column} FROM {bars_table} WHERE "
+        "CAST(" + date_column + " AS DATE) BETWEEN DATE '2026-10-01' AND DATE '2026-10-08' "
+        "ORDER BY 1"
+    )
+    total_days = int(probe.scalar(
+        f"SELECT COUNT(DISTINCT {date_column}) FROM {bars_table}"
+    ) or 0)
+    detail = {
+        "distinct_trade_days": total_days,
+        "weekend_leakage": [str(row[0]) for row in weekend_days],
+        "national_day_window": [str(row[0]) for row in holiday_2026],
+    }
+    if weekend_days:
+        return ReadinessCheck(
+            name, STATUS_INSUFFICIENT, detail,
+            "周末出现日线：日历被当成'非节假日的工作日即开市'，跨年样本会错位",
+        )
+    return ReadinessCheck(name, STATUS_OK, detail)
+
+
+#: 研究库副本里，判定成交与出场**必须**非空的四类来源。
+#: security_status 单独算：它是 §3.1 列的第五类，但不参与单笔成交/出场判定。
+_REFERENCE_REQUIRED = ("trade_calendar", "daily_bars", "limit_prices", "suspend_status")
+
+
+def _audit_reference_copy(reference_probe: _Probe | None) -> list[ReadinessCheck]:
+    """校验**研究库副本** —— §3.1 的"补齐后验证"，也是历史重建的取数入口。
+
+    生产仓库那一组检查回答"源头有没有数据"；这组回答的是"复制过来的东西能不能真的
+    拿来判成交与出场"。两者不能互相替代：副本没建，重建会在缺精确涨跌停的日子判
+    ``no_valid_price_data``，看起来像策略买不进，实际是我们的参考数据不足以判断。
+
+    逐项都是只读探测，绝不建表：审计动作本身不该改变被审计的库。
+    """
+    if reference_probe is None:
+        return [ReadinessCheck(
+            "reference_copy_validated", STATUS_INSUFFICIENT, {"connection": None},
+            "没有传 --reference-db：研究库里的五类参考数据没有被校验过。"
+            "历史重建与训练标签依赖这份副本，未校验就不能声称 §3.1 已验证"
+            "（scripts/sync_tail_reference_data.py → scripts/rebuild_tail_labels.py）",
+        )]
+    try:
+        tables = reference_probe.tables()
+    except Exception as exc:  # noqa: BLE001 - 打不开副本就是彻底没法校验
+        return [ReadinessCheck("reference_copy_validated", STATUS_BLOCKED,
+                               {"error": str(exc)}, "研究库副本不可读")]
+
+    checks: list[ReadinessCheck] = []
+    present = {name: REFERENCE_TABLES[name] for name in REFERENCE_TABLES
+               if REFERENCE_TABLES[name] in tables}
+    empty = {name: int(reference_probe.scalar(f"SELECT COUNT(*) FROM {table}") or 0)
+             for name, table in present.items()}
+    missing = [name for name in _REFERENCE_REQUIRED if empty.get(name, 0) <= 0]
+    detail: dict[str, Any] = {
+        "tables": {name: empty.get(name, 0) for name in REFERENCE_TABLES},
+        "missing_required_sources": sorted(missing),
+    }
+    if missing:
+        checks.append(ReadinessCheck(
+            "reference_copy_present", STATUS_BLOCKED, detail,
+            f"研究库副本缺必要来源 {sorted(missing)}：先跑 "
+            "scripts/sync_tail_reference_data.py 把五类参考数据只读复制进来",
+        ))
+    else:
+        status_note = ""
+        if not empty.get("security_status"):
+            # 证券历史状态是 §3.1 列的第五类，但不参与单笔成交/出场判定 → 算不足不算阻塞。
+            status_note = (
+                "证券历史状态（ref_security_status）为空或没有这张表：ST/退市风险的时点判定"
+                "只能靠日线里的 is_st 列，跨状态区间的能力还没有"
+                "（生产库该表本身就是 0 行，upsert_security_status 还没有调用方）"
+            )
+        checks.append(ReadinessCheck(
+            "reference_copy_present",
+            STATUS_INSUFFICIENT if status_note else STATUS_OK, detail, status_note,
+        ))
+
+    bars = REFERENCE_TABLES["daily_bars"]
+    bases = {str(row[0]) for row in reference_probe.rows(
+        f"SELECT DISTINCT price_basis FROM {bars}")} if bars in tables else set()
+    if bases and bases != {"raw"}:
+        checks.append(ReadinessCheck(
+            "reference_copy_raw_only", STATUS_BLOCKED, {"price_bases": sorted(bases)},
+            "研究库副本里出现非 raw 口径：复权价不得用于模拟成交与出场（ADR-002），"
+            "这份副本不能用于重建标签",
+        ))
+    else:
+        checks.append(ReadinessCheck(
+            "reference_copy_raw_only", STATUS_OK, {"price_bases": sorted(bases)}))
+
+    conflicts: list[str] = []
+    if bars in tables and REFERENCE_TABLES["trade_calendar"] in tables:
+        conflicts = [str(row[0]) for row in reference_probe.rows(
+            f"SELECT DISTINCT b.trade_date FROM {bars} b "
+            f"LEFT JOIN {REFERENCE_TABLES['trade_calendar']} c "
+            "ON b.trade_date = c.trade_date "
+            "WHERE c.trade_date IS NULL OR NOT c.is_open")]
+    if conflicts:
+        checks.append(ReadinessCheck(
+            "reference_copy_calendar_consistent", STATUS_BLOCKED,
+            {"conflicting_trade_dates": conflicts[:20], "count": len(conflicts)},
+            "副本里的日线日期与权威日历互相矛盾：'第 5 个交易日退出'会落在错误的日期上，"
+            "重建会把它判成 daily_bar_session_holes，不能带着矛盾继续算标签",
+        ))
+    else:
+        checks.append(ReadinessCheck("reference_copy_calendar_consistent", STATUS_OK, {}))
+
+    symbol_days = int(reference_probe.scalar(
+        f"SELECT COUNT(*) FROM {bars}") or 0) if bars in tables else 0
+    exact_days = int(reference_probe.scalar(
+        f"SELECT COUNT(*) FROM {bars} b JOIN {REFERENCE_TABLES['limit_prices']} l "
+        "ON b.symbol = l.symbol AND b.trade_date = l.trade_date "
+        "WHERE NOT l.approximated AND l.up_limit IS NOT NULL AND l.down_limit IS NOT NULL"
+    ) or 0) if symbol_days else 0
+    limit_share = (exact_days / symbol_days) if symbol_days else 0.0
+    limit_detail = {
+        "daily_bar_symbol_days": symbol_days,
+        "exact_limit_price_symbol_days": exact_days,
+        "share": round(limit_share, 4),
+        "threshold": MIN_LIMIT_PRICE_COVERAGE,
+    }
+    checks.append(ReadinessCheck(
+        "reference_copy_limit_prices_exact",
+        STATUS_OK if limit_share >= MIN_LIMIT_PRICE_COVERAGE else STATUS_INSUFFICIENT,
+        limit_detail,
+        "" if limit_share >= MIN_LIMIT_PRICE_COVERAGE else
+        "副本里可用的精确涨跌停覆盖不足：这些日子的涨停锁死/跌停卖不出判不了，"
+        "重建会单独记 entry_day_limit_prices（数据缺口），不能折算成未成交或亏损",
+    ))
+
+    declared = int(reference_probe.scalar(
+        f"SELECT COUNT(*) FROM {bars} b JOIN {REFERENCE_TABLES['suspend_status']} s "
+        "ON b.symbol = s.symbol AND b.trade_date = s.trade_date "
+        "WHERE s.trade_status IS NOT NULL"
+    ) or 0) if symbol_days else 0
+    status_share = (declared / symbol_days) if symbol_days else 0.0
+    status_detail = {
+        "daily_bar_symbol_days": symbol_days,
+        "declared_trade_status_symbol_days": declared,
+        "share": round(status_share, 4),
+    }
+    if status_share <= 0.0:
+        checks.append(ReadinessCheck(
+            "reference_copy_trade_status_declared", STATUS_BLOCKED, status_detail,
+            "副本里没有任何显式 trade_status 声明：出场逐日判定会全部落到 "
+            "unknown_trade_status，**一条已实现盈亏标签都产不出来**（§3.3）。"
+            "根因在生产仓库 —— daily_trade_status 表没有 trade_status 列"
+            "（data/market_warehouse.py 的 DDL 只有 suspended/suspend_type），"
+            "而同步把它同时当作涨跌停与停复牌来源。补齐来源属数据层决策，"
+            "不得在这里把未知状态补成 normal 冒充可交易",
+        ))
+    elif status_share < MIN_TRADE_STATUS_COVERAGE:
+        checks.append(ReadinessCheck(
+            "reference_copy_trade_status_declared", STATUS_INSUFFICIENT, status_detail,
+            "交易状态声明覆盖不足：未声明的那些日子不产出已实现盈亏标签，"
+            "样本量会低于表面看到的 symbol-day 数",
+        ))
+    else:
+        checks.append(ReadinessCheck(
+            "reference_copy_trade_status_declared", STATUS_OK, status_detail))
+    return checks
+
+
+def _median(values: list[int]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return float(ordered[mid])
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def readiness_exit_code(report: Mapping[str, Any]) -> int:
+    """0 就绪 / 3 数据不足 / 5 阻塞。真实退出码，不靠文档声明。"""
+    readiness = str(report.get("readiness") or "")
+    if readiness == READINESS_BLOCKED:
+        return 5
+    if readiness == READINESS_INSUFFICIENT:
+        return 3
+    return 0
+
+
+def format_blocking_gaps(report: Mapping[str, Any]) -> str:
+    checks = {str(item["name"]): item for item in report.get("checks", [])}
+    lines: list[str] = []
+    for name in report.get("blocking_gaps", []):
+        check = checks.get(str(name), {})
+        note = str(check.get("note") or "") if isinstance(check, dict) else ""
+        lines.append(f"BLOCKED {name}: {note}")
+    for name in report.get("insufficient_items", []):
+        check = checks.get(str(name), {})
+        note = str(check.get("note") or "") if isinstance(check, dict) else ""
+        lines.append(f"INSUFFICIENT {name}: {note}")
+    return "\n".join(lines)
+
+
+__all__ = [
+    "BAR_TIME_COLUMNS",
+    "MIN_DAILY_ROWS_PER_DAY",
+    "MIN_INDEX_CONTINUITY",
+    "MIN_LIMIT_PRICE_COVERAGE",
+    "MIN_TAIL_BARS_PER_DAY",
+    "MIN_TRADE_STATUS_COVERAGE",
+    "READINESS_BLOCKED",
+    "READINESS_INSUFFICIENT",
+    "READINESS_READY",
+    "STATUS_BLOCKED",
+    "STATUS_INSUFFICIENT",
+    "STATUS_OK",
+    "ReadinessCheck",
+    "audit_trend_data_readiness",
+    "format_blocking_gaps",
+    "readiness_exit_code",
+]

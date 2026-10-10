@@ -269,6 +269,34 @@ soup_strategy:
   disagreement_probe_merged_min: 0.58
   disagreement_probe_max_position: 0.01
 
+# trend 尾盘策略契约（唯一声明）。消费方：src/stock_analyzer/contracts/trend_strategy.py
+# 的 contract_from_config()。线上推荐、训练标签、历史验证三方都从这里取口径，
+# 不再各自硬编码。审计函数会把仍与本页冲突的旧声明逐条列出来。
+trend_strategy:
+  contract_version: trend_tail_v1
+  strategy: trend
+  timezone: Asia/Shanghai
+  entry_window_start: "14:30"
+  entry_window_end: "14:50"
+  check_interval_minutes: 5
+  # 成交价取确认后第 N 根已完成分钟 bar；用确认时刻那根是 look-ahead。
+  fill_bar_offset: 1
+  reference_notional: 10000
+  take_profit_pct: 0.08
+  stop_loss_pct: 0.05
+  holding_days: 5
+  entry_day_counts_as_holding_day: true
+  same_bar_conflict_policy: stop_loss_first
+  exit_defer_max_sessions: 5
+  max_final_recommendations: 3
+  # 初始准入阈值，是选股规则而不是已证明的命中率。
+  min_net_profit_probability: 0.60
+  max_quote_age_seconds: 120
+  # 成交模拟必须用未复权价；qfq 只能进特征。
+  execution_price_basis: raw
+  cost_model_version: cost_schedule_v2
+  corporate_action_uncertain: true
+
 capital_curve:
   drawdown_alert: 5
   drawdown_reduce: 10

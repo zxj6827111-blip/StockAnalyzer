@@ -12,6 +12,10 @@ from stock_analyzer.api.models import (
     Week5AutomationRunRequest,
     Week5ScanRunRequest,
 )
+from stock_analyzer.runtime.services.trend_tail_shadow_service import (
+    tail_shadow_history,
+    tail_shadow_page,
+)
 
 router = APIRouter()
 
@@ -160,3 +164,20 @@ def week5_candidate_state(
     _auth: None = Depends(get_verify_api_auth()),
 ) -> dict[str, object]:
     return get_service().week5_candidate_state()
+
+
+@router.get("/week5/tail-shadow/latest")
+def week5_tail_shadow_latest(
+    trade_date: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    _auth: None = Depends(get_verify_api_auth()),
+) -> dict[str, object]:
+    """trend 尾盘影子链路：候选 / 最终推荐 / 成交状态分列，含概率口径与数据日期。"""
+    return tail_shadow_page(get_service(), trade_date=trade_date)
+
+
+@router.get("/week5/tail-shadow/history")
+def week5_tail_shadow_history(
+    limit: int = Query(default=20, ge=1, le=500),
+    _auth: None = Depends(get_verify_api_auth()),
+) -> dict[str, object]:
+    return tail_shadow_history(get_service(), limit=limit)
