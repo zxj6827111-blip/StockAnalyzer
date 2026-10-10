@@ -1362,9 +1362,13 @@ class RuntimeWeek5AutomationService:
         那是事实，不是待补的空格。
         """
         try:
-            report = self._trend_tail_shadow.run(
-                timestamp=now,
-                watch_pool=[dict(row) for row in pool_rows],
+            # 显式标注并复制一次：影子服务的返回在类型上是 Any，直接返回会让这个
+            # 声明返回 dict[str, object] 的函数带 no-any-return（CI 的 mypy_blocking 门卡它）。
+            report: dict[str, object] = dict(
+                self._trend_tail_shadow.run(
+                    timestamp=now,
+                    watch_pool=[dict(row) for row in pool_rows],
+                )
             )
         except Exception as exc:  # noqa: BLE001 - job 边界：失败可见但不中断主链
             report = {
