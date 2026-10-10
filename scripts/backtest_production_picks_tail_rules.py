@@ -62,6 +62,7 @@ def build_requests(
     *,
     strategies: tuple[str, ...],
     max_decision_date: date,
+    capture_modes: tuple[str, ...] = (),
 ) -> tuple[list[dict], dict]:
     """每行 (symbol, decision_date) 去重；entry_date = 决策日之后的第一个开市日。"""
     next_session: dict[date, date] = {}
@@ -72,11 +73,18 @@ def build_requests(
     requests: list[dict] = []
     skipped = {
         "no_next_session": 0, "after_cutoff": 0, "duplicate": 0, "other_strategy": 0,
+        "other_capture_mode": 0,
     }
     with _open_csv(csv_path) as handle:
         for row in csv.DictReader(handle):
             if str(row.get("strategy") or "") not in strategies:
                 skipped["other_strategy"] += 1
+                continue
+            # 口径必须**一次只跑一种**：标签行本身不带 capture_mode，
+            # 同一 (symbol, 决策日) 在两种口径下各有一条请求时无法回填区分，
+            # 混在一次运行里只能得到一个不可信的合并数（2026-10-10 就是这样错过一次）。
+            if capture_modes and str(row.get("capture_mode") or "") not in capture_modes:
+                skipped["other_capture_mode"] += 1
                 continue
             day_text = str(row.get("decision_date") or "")[:10]
             try:
@@ -195,14 +203,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--max-decision-date", default="2026-07-10")
     parser.add_argument("--strategies", default="trend,monster")
+    parser.add_argument("--capture-modes", default="",
+                        help="逗号分隔；一次只跑一种口径（标签行不带口径，混跑无法分段）")
     parser.add_argument("--label-script", default="scripts/rebuild_tail_labels.py")
+    parser.add_argument(
+        "--reuse-labels", action="store_true",
+        help="标签文件已存在时不重跑（聚合口径变了但标签没变时用，避免再花一小时）",
+    )
     args = parser.parse_args(argv)
 
     strategies = tuple(item.strip() for item in args.strategies.split(",") if item.strip())
     cutoff = date.fromisoformat(args.max_decision_date)
     sessions = load_sessions(args.minute_db, years=(2025, 2026))
+    modes = tuple(item.strip() for item in args.capture_modes.split(",") if item.strip())
     requests, stats = build_requests(
         Path(args.snapshots), sessions, strategies=strategies, max_decision_date=cutoff,
+        capture_modes=modes,
     )
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -214,37 +230,76 @@ def main(argv: list[str] | None = None) -> int:
 
     labels_path = out_dir / "prod_pick_labels.jsonl"
     report_path = out_dir / "prod_pick_labels.json"
-    command = [
-        sys.executable, args.label_script,
-        "--db", args.minute_db,
-        "--requests", str(requests_path),
-        "--labels", str(labels_path),
-        "--report", str(report_path),
-    ]
-    print("running: " + " ".join(command), flush=True)
-    completed = subprocess.run(command, check=False)
-    if completed.returncode != 0 or not labels_path.exists():
-        print(f"标签重建未产出（rc={completed.returncode}）", file=sys.stderr)
+    label_rc: int | None = None
+    if labels_path.exists() and report_path.exists() and args.reuse_labels:
+        print(f"复用已有标签：{labels_path}", flush=True)
+    else:
+        command = [
+            sys.executable, args.label_script,
+            "--db", args.minute_db,
+            "--requests", str(requests_path),
+            "--labels", str(labels_path),
+            "--report", str(report_path),
+        ]
+        print("running: " + " ".join(command), flush=True)
+        label_rc = subprocess.run(command, check=False).returncode
+    if not labels_path.exists():
+        print(f"标签重建未产出（rc={label_rc}）", file=sys.stderr)
         return 3
+    # rc=3 是 §3.1 的"参考数据不足 ⇒ 记为阻塞"，不是崩溃：它已经产出的成熟标签仍然可以
+    # 用来量"真实推荐过的票最后怎么样了"，但**必须把阻塞计数一起写进工件**，
+    # 否则这个数会被读成"全样本胜率"。这里的统计不构成 §4 的任何验收结论。
+    label_report: dict = {}
+    if report_path.exists():
+        label_report = json.loads(report_path.read_text(encoding="utf-8"))
+    blocked = bool(label_report.get("rebuild_blocked_on_reference_data")) or label_rc == 3
 
     # 把请求里的 strategy/capture_mode/p_meta 回填到标签行，才能分段统计。
+    # 注意方向：**以请求为准并覆盖标签行**。标签器会给自己写的每一行填一个整轮恒定的
+    # capture_mode（本轮实测为 replayed_recompute），用 setdefault 让它保留下来，
+    # observed / replayed 两种口径就会被并成一个数——那正是这库上"混算抬高胜率"的老坑。
     index = {}
     for item in requests:
         index[(item["symbol"], item["decision_date"])] = item
     merged = out_dir / "prod_pick_labels_enriched.jsonl"
+    unmatched = 0
     with merged.open("w", encoding="utf-8") as handle:
         for line in labels_path.open("r", encoding="utf-8"):
             if not line.strip():
                 continue
             row = json.loads(line)
-            origin = index.get((str(row.get("symbol")), str(row.get("decision_date"))[:10]), {})
-            row.setdefault("strategy", origin.get("strategy"))
-            row.setdefault("capture_mode", origin.get("capture_mode"))
-            row.setdefault("p_meta", origin.get("p_meta"))
+            origin = index.get((str(row.get("symbol")), str(row.get("decision_date"))[:10]))
+            if origin is None:
+                unmatched += 1
+            else:
+                for key in ("strategy", "capture_mode", "p_meta"):
+                    row[key] = origin.get(key)
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    if unmatched:
+        print(f"警告：{unmatched} 条标签行没匹配回请求，按未知口径处理（不并进任何分段）",
+              file=sys.stderr, flush=True)
 
     summary = {
         "built": stats,
+        "label_rebuild_rc": label_rc,
+        "blocked_on_reference_data": blocked,
+        "label_report": {
+            key: label_report.get(key)
+            for key in ("requests", "insufficient", "label_records", "filled",
+                        "fill_rate", "net_profits", "missing_reference_inputs",
+                        "status_reason_counts")
+            if key in label_report
+        },
+        "caveats": [
+            "本统计量的是**系统真实关注过的票**在尾盘规则下的成熟结果，不是 §4 的验收读数；"
+            "§4 要求的是同池可比重建 + 滚动四折，那部分仍未通过（2025 段 −5.44pp）。",
+            "observed_snapshot 与 replayed_recompute 分开报，不合并成一个胜率。",
+            "决策日窗口止于分钟数据末端（2026-07-17）之前的可成熟段；"
+            "此后的真实推荐没有分钟 bar，不能按尾盘规则回测。",
+        ] + ([
+            f"标签器按 §3.1 记为阻塞（rc=3，参考数据不足 {label_report.get('insufficient')} 条）；"
+            "本文件统计的是它已产出的成熟标签，不得读成全样本胜率。"
+        ] if blocked else []),
         "segments": group_labels(merged, requests),
         "score_quintiles": quintiles_by_score(merged),
         "artifacts": {
