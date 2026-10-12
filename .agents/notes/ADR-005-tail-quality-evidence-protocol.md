@@ -2,7 +2,7 @@
 
 Status: Draft
 
-As-of: 2026-10-12 @ HEAD `9abc8ee14ed678e49b1aac248f3816cc716f3d2b`（已补 live 14:45 分钟采集 producer 与来源接收时钟；首次 NAS 观察快照待部署后采集；271 字段仍无完整历史字段级证据；策略仍无合格候选）
+As-of: 2026-10-12 @ HEAD `1e02d342751584ee0ba52a7dd1926c1901e71790`（主线已部署 live 14:45 分钟 producer；运行时批量行情快照新增应用接收时钟和配置来源链标识，待 PR 合并部署后验证；271 字段仍无完整字段级 PIT 证据；策略仍无合格候选）
 
 ## 1. 决策范围
 
@@ -105,6 +105,14 @@ As-of: 2026-10-12 @ HEAD `9abc8ee14ed678e49b1aac248f3816cc716f3d2b`（已补 liv
   `full_chain_pit_evidence=false`；它不补历史字段时钟，不改变候选、策略或发布门。需要在 NAS 部署后
   检查第一份不可覆盖日快照。
 
+- **运行时批量行情快照来源时钟补充（待合并部署验证）**：`Week5MarketSnapshotService.capture()` 对本进程
+  完整收到的非空 provider 批量响应记录 `source_retrieved_at`；计划快照 `timestamp` 仍单独保留。该时钟
+  是应用接收时钟，不是供应商发布时间、逐字段时钟或每只证券独立响应时钟；若接收晚于决策截止，仍不能
+  作为该截止时点的可用证据。`ResilientProvider.status()` 暴露配置的 primary mode 及 primary/backup
+  实现类，修复包装后 `source_provider` 为空的问题；这是配置链身份，不证明某次请求实际由哪个 provider
+  返回，fallback 实际来源仍需单次响应级记录。以上只补来源元数据，不能替代 271 字段逐字段来源、版本、
+  可用时钟和采集时钟审计；全链路门继续 fail-closed。
+
 - **验证环境兼容已闭合**：本机原 Python 3.12 环境的 NumPy stub 与项目 mypy 目标 3.11 不兼容；
   使用已有 Python 3.11 解释器和隔离 uv 环境运行 `clean-scope --fail-on-error`，报告 `ok=true`、
   blocking/nonblocking failures 均为空。环境路径、命令与本轮报告记在
@@ -144,6 +152,10 @@ src/stock_analyzer/research/tail_observed_inputs.py
   immutable 14:45 observed input snapshot; minute-bar source/collection metadata; never full-chain PIT evidence
 src/stock_analyzer/runtime/services/week5_automation_service.py
   forward-only live 1-minute producer; same-day and decision-clock filtering; fail-closed late/missing capture
+src/stock_analyzer/runtime/services/week5_market_snapshot_service.py
+  批量行情快照计划时钟与应用响应接收时钟分离；注入数据不伪造 provider 接收时钟
+src/stock_analyzer/data/resilient_provider.py
+  配置 provider mode 与 primary/backup 实现类身份；不声明单次 fallback 的实际来源
 src/stock_analyzer/runtime/services/trend_tail_shadow_service.py
   observed source metadata persistence and contract-local quote clock
 tests/test_week5_automation.py / tests/test_trend_tail_shadow_runtime.py

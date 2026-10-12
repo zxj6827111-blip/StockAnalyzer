@@ -181,6 +181,13 @@ class ResilientProvider:
 
     def status(self) -> dict[str, object]:
         return {
+            # `provider_mode` identifies the configured primary path. Keep the
+            # concrete chain visible as well: downstream snapshots use this
+            # status to bind their source signature and must not silently write
+            # an empty source identity when wrapped by ResilientProvider.
+            "provider_mode": self.config.primary.strip().lower(),
+            "primary_provider": type(self.primary).__name__,
+            "backup_provider": type(self.backup).__name__ if self.backup is not None else "",
             "consecutive_failures": self.consecutive_failures,
             "degraded_mode": self.degraded_mode,
             "last_error": self.last_error,

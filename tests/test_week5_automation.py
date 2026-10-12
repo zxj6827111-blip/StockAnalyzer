@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 import stock_analyzer.runtime.services.week5_automation_service as automation_module
+import stock_analyzer.runtime.services.week5_market_snapshot_service as market_snapshot_module
 from stock_analyzer.runtime.services.week5_automation_service import (
     RuntimeWeek5AutomationService,
 )
@@ -905,6 +906,37 @@ def test_market_snapshot_timeout_fails_closed(tmp_path: Path) -> None:
     assert "market_snapshot_timeout" in result["errors"]
     assert overlapping["status"] == "unavailable"
     assert "market_snapshot_previous_fetch_in_progress" in overlapping["errors"]
+
+
+def test_market_snapshot_persists_actual_provider_receive_clock(
+    monkeypatch, tmp_path: Path
+) -> None:
+    service = FakeService(tmp_path)
+    snapshot_service = Week5MarketSnapshotService(service)
+    retrieved_at = datetime(2026, 8, 25, 9, 25, 7, tzinfo=ZoneInfo("Asia/Shanghai"))
+    frame = pd.DataFrame([{"代码": "600000", "最新价": 10.5}])
+    snapshot_service._fetch_batch_frame_with_timeout = lambda: (frame, "efinance", [])
+    monkeypatch.setattr(market_snapshot_module, "_market_now", lambda _: retrieved_at)
+
+    planned_at = datetime(2026, 8, 25, 9, 25, tzinfo=ZoneInfo("Asia/Shanghai"))
+    result = snapshot_service.capture(timestamp=planned_at)
+    persisted = snapshot_service.replay(str(result["snapshot_id"]))
+
+    assert result["timestamp"] == planned_at.isoformat()
+    assert result["source_retrieved_at"] == retrieved_at.isoformat()
+    assert persisted["source_retrieved_at"] == retrieved_at.isoformat()
+
+
+def test_injected_market_snapshot_does_not_claim_provider_receive_clock(tmp_path: Path) -> None:
+    service = FakeService(tmp_path)
+    snapshot_service = Week5MarketSnapshotService(service)
+
+    result = snapshot_service.capture(
+        timestamp=datetime(2026, 8, 25, 9, 25, tzinfo=ZoneInfo("Asia/Shanghai")),
+        frame=pd.DataFrame([{"代码": "600000", "最新价": 10.5}]),
+    )
+
+    assert result["source_retrieved_at"] is None
 
 
 def test_market_radar_timeout_cancels_late_worker_and_blocks_overlap(tmp_path: Path) -> None:
