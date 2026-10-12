@@ -188,6 +188,11 @@ def test_missing_minute_source_directory_fails_closed(
     with pytest.raises(FileNotFoundError, match="minute source directory is unavailable"):
         module._missing_minute_dates(tmp_path / "missing", date(2026, 9, 1))
 
+    empty_root = tmp_path / "empty"
+    empty_root.mkdir()
+    with pytest.raises(FileNotFoundError, match="no minute source ZIP archives found"):
+        module._missing_minute_dates(empty_root, date(2026, 9, 1))
+
 
 def _write_minute_source(zip_root: Path, interval: str, ymd: str = "20260915") -> None:
     import zipfile
