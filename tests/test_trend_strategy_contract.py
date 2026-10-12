@@ -192,14 +192,21 @@ def test_confirmation_never_reads_an_unfinished_bar() -> None:
         minute_bars=_bars({"14:29": 10.0, "14:30": 10.0, "14:44": 10.1, "14:46": 10.3}),
         confirmation=spy,
     )
-    assert seen == [2, 2, 2, 3]
+    # 14:35/14:40 have no fresh bar within max_quote_age_seconds, so the
+    # historical replay must not invoke a confirmation predicate on stale input.
+    assert seen == [2, 3]
 
 
 def test_not_confirmed_is_reported_as_not_filled_not_as_a_loss() -> None:
     decision = evaluate_tail_entry(
         symbol="600000.SH",
         trading_day=TRADE_DAY,
-        minute_bars=_bars({"14:30": 10.0, "14:31": 10.0}),
+        minute_bars=_bars({
+            "14:30": 10.0, "14:31": 10.0,
+            "14:35": 10.0, "14:36": 10.0,
+            "14:40": 10.0, "14:41": 10.0,
+            "14:45": 10.0, "14:46": 10.0,
+        }),
         confirmation=_never_confirm,
     )
     summary = summarize_tail_trade(entry=decision, exit_result=None)
@@ -236,6 +243,18 @@ def test_stale_live_quote_blocks_confirmation_instead_of_using_old_bar() -> None
     )
     assert decision.confirmed is False
     assert decision.reason == "realtime_snapshot_stale"
+
+
+def test_historical_replay_does_not_confirm_from_a_stale_pre_slot_bar() -> None:
+    decision = evaluate_tail_entry(
+        symbol="600000.SH",
+        trading_day=TRADE_DAY,
+        minute_bars=_bars({"14:20": 10.0}),
+        confirmation=_always_confirm,
+    )
+    assert decision.confirmed is False
+    assert decision.reason == "realtime_snapshot_stale"
+    assert decision.details["latest_bar_end"] == "2026-10-08T14:20:00"
 
 
 # ---------------------------------------------------------------------------
@@ -750,7 +769,7 @@ def test_audit_empty_when_every_block_matches_the_contract() -> None:
         trend_strategy=TrendStrategyConfig(),
         labels=LabelsConfig(take_profit_pct=0.08, stop_loss_pct=0.05, horizon_days=5,
                             primary="net_profit_5d_tail_v1",
-                            pnl_price_basis="tail_confirm_next_bar"),
+                            pnl_price_basis="tail_confirm_next_bar_raw_minute_exit_v2"),
         soup_strategy=SoupStrategyConfig(stop_loss=5.0, max_hold_days=5, max_holdings=3,
                                          entry_window=["14:30", "14:50"]),
         asof_backtest=AsofBacktestConfig(take_profit_pct=0.08, stop_loss_pct=0.05,

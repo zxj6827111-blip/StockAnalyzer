@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import subprocess
 import sys
@@ -15,6 +16,10 @@ from pathlib import Path
 
 import pytest
 
+from scripts.validate_tail_selection_quality import (
+    load_decision_calendar,
+    load_trading_calendar,
+)
 from stock_analyzer.contracts.trend_strategy import (
     DEFAULT_TREND_CONTRACT,
     NET_PROFIT_PROBABILITY_FIELD,
@@ -53,13 +58,14 @@ def _trade_days(count: int) -> list[date]:
     return days
 
 
-def _rows(*, days: int = 120, labelled: bool = True) -> list[dict]:
+def _rows(*, days: int = 186, labelled: bool = True) -> list[dict]:
     """每天 6 只：3 只高信号盈利、2 只低信号亏损、1 只未成交（无标签）。
 
     ``composite_score`` 与真实结果**反相关**，模拟"旧合成分排序"这个匹配基线。
     """
     out: list[dict] = []
-    for day in _trade_days(days):
+    sessions = _trade_days(days + 1)
+    for day, entry_day in zip(sessions[:-1], sessions[1:], strict=True):
         for index in range(6):
             unfilled = index == 5
             positive = index < 3
@@ -68,7 +74,7 @@ def _rows(*, days: int = 120, labelled: bool = True) -> list[dict]:
             out.append({
                 "symbol": f"{600000 + index}.SH",
                 "decision_date": day,
-                "entry_date": day + timedelta(days=1),
+                "entry_date": entry_day,
                 "ret_5": strength,
                 "close_position": 0.5,
                 "composite_score": 1.0 - strength,
@@ -90,11 +96,16 @@ def _identity_kwargs() -> dict:
         "training_commit": "cafe123",
         "runtime_commit": "cafe123",
         "feature_compute_version": 1,
-        "label_policy_id": "label_policy_v4_07335bbe3d3e",
+        "label_policy_id": "label_policy_v5_07335bbe3d3e",
     }
 
 
 def _run(rows: list[dict], **overrides) -> dict:
+    calendar = sorted({
+        day
+        for row in rows
+        for day in (row["decision_date"], row["entry_date"])
+    })
     kwargs = {
         "rows": rows,
         "feature_names": FEATURES,
@@ -104,6 +115,7 @@ def _run(rows: list[dict], **overrides) -> dict:
         "min_train_sessions": 40,
         "calibration_sessions": 12,
         "contract": CONTRACT,
+        "trading_calendar": calendar,
         **_identity_kwargs(),
     }
     kwargs.update(overrides)
@@ -170,7 +182,7 @@ def test_injected_split_without_embargo_is_rejected() -> None:
             rows=rows, feature_names=FEATURES, label_field="label",
             date_field="decision_date", contract=CONTRACT,
             model_id="m", training_commit="cafe123", feature_compute_version=1,
-            label_policy_id="label_policy_v4_x", split=tight,
+            label_policy_id="label_policy_v5_x", split=tight,
         )
 
 
@@ -183,7 +195,7 @@ def test_injected_split_with_a_real_embargo_trains() -> None:
             min_calibration_samples=30, min_test_samples=30,
         ),
         model_id="m", training_commit="cafe123", feature_compute_version=1,
-        label_policy_id="label_policy_v4_x", split=splits[0],
+        label_policy_id="label_policy_v5_x", split=splits[0],
     )
     assert artifact["split"]["test_dates"] == len(splits[0].test_dates)
     assert artifact["metrics"]["overall"]["test_auc"] is not None
@@ -211,6 +223,21 @@ def test_walk_forward_produces_four_folds_and_a_matched_baseline() -> None:
         > quality["baseline"]["net_profit_rate"]
     )
     assert all(item["artifact_digest"] for item in report["folds"])
+
+
+def test_stage2_walk_forward_deduplicates_and_round_trips_each_fold_artifact() -> None:
+    report = _run(
+        _rows(),
+        deduplicate_correlated_features=True,
+        correlation_threshold=0.95,
+        correlation_minimum_pair_rows=30,
+        verify_artifact_roundtrip=True,
+    )
+    assert report["status"] == STATUS_COMPLETED
+    assert all(item["feature_selection"]["scope"] == "current_fold_train_only"
+               for item in report["folds"])
+    assert all(item["artifact_roundtrip"]["verified"] for item in report["folds"])
+    assert all(item["artifact_roundtrip"]["rows_compared"] > 0 for item in report["folds"])
 
 
 def test_walk_forward_separates_observed_and_replayed_sample_counts() -> None:
@@ -275,9 +302,77 @@ def test_sufficiency_blockers_is_a_standalone_gate() -> None:
     rows = _rows(labelled=False)
     blockers = sufficiency_blockers(
         rows, date_field="decision_date", label_field="label", folds=4,
+        trade_dates=sorted({
+            day for row in rows for day in (row["decision_date"], row["entry_date"])
+        }),
         contract=CONTRACT, calibration_sessions=12, min_train_sessions=40,
     )
     assert blockers and blockers[0].startswith("no_labelled_samples")
+
+
+def test_only_replayed_development_may_run_below_confirmatory_session_floor() -> None:
+    rows = _rows(days=94)
+    dates = sorted({
+        day for row in rows for day in (row["decision_date"], row["entry_date"])
+    })
+    decision_dates = sorted({row["decision_date"] for row in rows})
+    kwargs = {
+        "rows": rows,
+        "date_field": "decision_date",
+        "label_field": "label",
+        "folds": 4,
+        "trade_dates": dates,
+        "contract": CONTRACT,
+        "calibration_sessions": 12,
+        "min_train_sessions": 45,
+        "decision_calendar": decision_dates,
+    }
+
+    strict = sufficiency_blockers(**kwargs)
+    exploratory = sufficiency_blockers(**kwargs, allow_underpowered_development=True)
+
+    assert any("complete_test_sessions=" in blocker for blocker in strict)
+    assert any("test_fold_1_sessions=" in blocker for blocker in strict)
+    assert exploratory == []
+    assert sufficiency_blockers(
+        **{**kwargs, "rows": [{**row, "capture_mode": "observed_snapshot"} for row in rows]},
+        allow_underpowered_development=True,
+    ) == ["underpowered_development_requires_replayed_samples_only"]
+
+
+def test_entry_only_final_session_does_not_become_a_zero_decision_day() -> None:
+    rows = _rows(days=100)
+    all_open_dates = sorted({
+        day for row in rows for day in (row["decision_date"], row["entry_date"])
+    })
+    decision_dates = sorted({row["decision_date"] for row in rows})
+    common = {
+        "rows": rows,
+        "date_field": "decision_date",
+        "label_field": "label",
+        "folds": 4,
+        "trade_dates": all_open_dates,
+        "contract": CONTRACT,
+        "calibration_sessions": 12,
+        "min_train_sessions": 45,
+    }
+
+    implicit = sufficiency_blockers(**common)
+    explicit = sufficiency_blockers(**common, decision_calendar=decision_dates)
+
+    assert any("test_fold_4_sessions=10" in blocker for blocker in implicit)
+    assert any("test_fold_4_sessions=9" in blocker for blocker in explicit)
+
+
+def test_cli_calendar_loader_reads_decision_coverage_column(tmp_path: Path) -> None:
+    calendar = tmp_path / "calendar.csv"
+    calendar.write_text(
+        "trade_date,is_open,is_decision_session\n"
+        "2026-05-28,1,1\n2026-05-29,1,0\n",
+        encoding="utf-8",
+    )
+    assert load_trading_calendar(calendar) == [date(2026, 5, 28), date(2026, 5, 29)]
+    assert load_decision_calendar(calendar) == [date(2026, 5, 28)]
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +392,7 @@ def test_score_rows_requires_a_calibrator_and_uses_it() -> None:
             min_calibration_samples=30, min_test_samples=30,
         ),
         model_id="m", training_commit="cafe123", feature_compute_version=1,
-        label_policy_id="label_policy_v4_x", split=splits[0],
+        label_policy_id="label_policy_v5_x", split=splits[0],
     )
     probabilities = score_rows(
         artifact,
@@ -343,6 +438,21 @@ def _write_samples(tmp_path: Path, rows: list[dict]) -> Path:
     return path
 
 
+def _write_calendar(tmp_path: Path, rows: list[dict]) -> Path:
+    path = tmp_path / "trading_calendar.csv"
+    decision_days = {row["decision_date"] for row in rows}
+    days = sorted({
+        day for row in rows for day in (row["decision_date"], row["entry_date"])
+    })
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["trade_date", "is_open", "is_decision_session"])
+        writer.writerows(
+            (day.isoformat(), "1", "1" if day in decision_days else "0") for day in days
+        )
+    return path
+
+
 def _cli(args: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(_CLI), *args],
@@ -351,11 +461,14 @@ def _cli(args: list[str]) -> subprocess.CompletedProcess:
 
 
 def test_cli_returns_blocked_exit_when_samples_have_no_labels(tmp_path) -> None:
-    samples = _write_samples(tmp_path, _rows(labelled=False))
+    rows = _rows(labelled=False)
+    samples = _write_samples(tmp_path, rows)
+    calendar = _write_calendar(tmp_path, rows)
     result = _cli([
-        "--samples", str(samples), "--features", "ret_5,close_position",
+        "--samples", str(samples), "--trading-calendar", str(calendar),
+        "--features", "ret_5,close_position",
         "--model-id", "m", "--training-commit", "cafe123", "--runtime-commit", "cafe123",
-        "--feature-compute-version", "1", "--label-policy-id", "label_policy_v4_x",
+        "--feature-compute-version", "1", "--label-policy-id", "label_policy_v5_x",
         "--out", str(tmp_path / "report.json"),
     ])
     assert result.returncode == 3, result.stdout + result.stderr
@@ -365,10 +478,13 @@ def test_cli_returns_blocked_exit_when_samples_have_no_labels(tmp_path) -> None:
 
 
 def test_cli_fails_visibly_on_an_unreadable_sample_file(tmp_path) -> None:
+    calendar = tmp_path / "trading_calendar.csv"
+    calendar.write_text("trade_date,is_open\n2024-01-02,1\n", encoding="utf-8")
     result = _cli([
-        "--samples", str(tmp_path / "missing.jsonl"), "--features", "ret_5",
+        "--samples", str(tmp_path / "missing.jsonl"), "--trading-calendar", str(calendar),
+        "--features", "ret_5",
         "--model-id", "m", "--training-commit", "cafe123", "--runtime-commit", "cafe123",
-        "--feature-compute-version", "1", "--label-policy-id", "label_policy_v4_x",
+        "--feature-compute-version", "1", "--label-policy-id", "label_policy_v5_x",
         "--out", str(tmp_path / "report.json"),
     ])
     assert result.returncode == 5, result.stdout + result.stderr
@@ -376,27 +492,38 @@ def test_cli_fails_visibly_on_an_unreadable_sample_file(tmp_path) -> None:
 
 
 def test_cli_runs_the_full_walk_forward_and_writes_a_report(tmp_path) -> None:
-    samples = _write_samples(tmp_path, _rows())
+    rows = _rows(days=187)
+    # The final test day has an otherwise tradeable row with a missing model input.
+    # It must fail closed for the model and remain visible in the comparison report.
+    rows[-6]["ret_5"] = None
+    samples = _write_samples(tmp_path, rows)
+    calendar = _write_calendar(tmp_path, rows)
     out = tmp_path / "report.json"
     result = _cli([
-        "--samples", str(samples), "--features", "ret_5,close_position",
+        "--samples", str(samples), "--trading-calendar", str(calendar),
+        "--features", "ret_5,close_position",
         "--model-id", "m", "--training-commit", "cafe123", "--runtime-commit", "cafe123",
-        "--feature-compute-version", "1", "--label-policy-id", "label_policy_v4_x",
+        "--feature-compute-version", "1", "--label-policy-id", "label_policy_v5_x",
         "--folds", "4", "--out", str(out),
     ])
     assert result.returncode in (0, 4), result.stdout + result.stderr
     payload = json.loads(out.read_text(encoding="utf-8"))
     assert payload["status"] == STATUS_COMPLETED
     assert payload["fold_count"] == 4
+    assert payload["arm_totals"][ARM_TREATMENT]["model_unscorable_rows"] == 1
+    assert payload["arm_totals"][ARM_BASELINE]["model_unscorable_rows"] == 0
     assert "0.60 是初始选股规则" in " ".join(payload["caveats"])
 
 
 def test_cli_refuses_illegal_features_before_reading_samples(tmp_path) -> None:
     """特征清单不合法时不必去解析样本文件：退出码要能区分"这条链根本不该训"。"""
+    calendar = tmp_path / "trading_calendar.csv"
+    calendar.write_text("trade_date,is_open\n2024-01-02,1\n", encoding="utf-8")
     result = _cli([
-        "--samples", str(tmp_path / "missing.jsonl"), "--features", "news_sentiment",
+        "--samples", str(tmp_path / "missing.jsonl"), "--trading-calendar", str(calendar),
+        "--features", "news_sentiment",
         "--model-id", "m", "--training-commit", "cafe123", "--runtime-commit", "cafe123",
-        "--feature-compute-version", "1", "--label-policy-id", "label_policy_v4_x",
+        "--feature-compute-version", "1", "--label-policy-id", "label_policy_v5_x",
         "--out", str(tmp_path / "report.json"),
     ])
     assert result.returncode == 5, result.stdout + result.stderr

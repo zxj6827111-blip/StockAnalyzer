@@ -11,6 +11,9 @@
 副本，它没建、口径不是 raw、日历与行情互相矛盾、或没有显式交易状态声明，都会让重建
 单独记 ``insufficient_reference_data`` / ``unknown_trade_status``。不传这一项时报告会留
 一条 ``reference_copy_validated = insufficient``，免得把"没校验"当成"校验通过"。
+
+``--float-cap-reference-db`` 可选地传入独立 Tushare 流通市值参考库；市值集中度检查会
+按 symbol + 日期覆盖仓库中的对应值，并记录匹配覆盖率。
 """
 
 from __future__ import annotations
@@ -56,6 +59,10 @@ def main(argv: list[str] | None = None) -> int:
         "--reference-db", default=REFERENCE_DB_DEFAULT,
         help="研究库里的日级参考数据副本（默认与分钟库同文件，只读）",
     )
+    parser.add_argument(
+        "--float-cap-reference-db", default="",
+        help="独立流通市值研究库（含 float_market_cap_ref，只读）",
+    )
     parser.add_argument("--out", default="artifacts/research/trend_data_readiness.json")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
@@ -64,18 +71,27 @@ def main(argv: list[str] | None = None) -> int:
     if not db_path.exists():
         print(f"数据库不存在: {db_path}", file=sys.stderr)
         return 5
+    if args.float_cap_reference_db and not Path(args.float_cap_reference_db).exists():
+        print(
+            f"流通市值参考库不存在: {args.float_cap_reference_db}", file=sys.stderr
+        )
+        return 5
 
     connection = duckdb.connect(str(db_path), read_only=True)
     minute_connection = _open_read_only(args.minute_db)
     reference_connection = _open_read_only(args.reference_db)
+    float_cap_reference_connection = _open_read_only(args.float_cap_reference_db)
     try:
         report = audit_trend_data_readiness(
             connection=connection, minute_connection=minute_connection,
             reference_connection=reference_connection,
+            float_cap_reference_connection=float_cap_reference_connection,
         )
     finally:
         connection.close()
-        for handle in (minute_connection, reference_connection):
+        for handle in (
+            minute_connection, reference_connection, float_cap_reference_connection
+        ):
             if handle is not None:
                 handle.close()
 

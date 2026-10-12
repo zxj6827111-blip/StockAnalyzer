@@ -19,6 +19,7 @@ from stock_analyzer.research.trend_data_readiness import (
     READINESS_INSUFFICIENT,
     READINESS_READY,
     STATUS_BLOCKED,
+    STATUS_INSUFFICIENT,
     STATUS_OK,
     audit_trend_data_readiness,
     format_blocking_gaps,
@@ -260,10 +261,75 @@ def test_overlapping_security_status_intervals_are_insufficient() -> None:
     assert "security_status_intervals" in report["insufficient_items"]
 
 
+def test_security_status_per_symbol_coverage_markers_must_cover_every_symbol() -> None:
+    conn = _full_ready_conn()
+    for symbol in SYMBOLS:
+        conn.execute(
+            "INSERT INTO security_status VALUES (?, ?, ?, 'name_change_coverage', true)",
+            [symbol, START, START],
+        )
+    report = audit_trend_data_readiness(connection=conn)
+    check = {item["name"]: item for item in report["checks"]}["security_status_intervals"]
+    assert check["status"] == STATUS_OK
+    assert check["detail"]["name_change_coverage_markers"] == len(SYMBOLS)
+    assert check["detail"]["name_change_coverage_complete_symbols"] == len(SYMBOLS)
+
+
+def test_incomplete_namechange_coverage_marker_blocks_security_status_readiness() -> None:
+    conn = _full_ready_conn()
+    for symbol in SYMBOLS:
+        conn.execute(
+            "INSERT INTO security_status VALUES (?, ?, ?, 'name_change_coverage', true)",
+            [symbol, START, START],
+        )
+    conn.execute(
+        "UPDATE security_status SET coverage_complete = false "
+        "WHERE symbol = ? AND status_type = 'name_change_coverage'",
+        [SYMBOLS[0]],
+    )
+    report = audit_trend_data_readiness(connection=conn)
+    check = {item["name"]: item for item in report["checks"]}["security_status_intervals"]
+    assert check["status"] == READINESS_INSUFFICIENT
+    assert check["detail"]["name_change_coverage_complete_symbols"] == len(SYMBOLS) - 1
+    assert "security_status_intervals" in report["insufficient_items"]
+
+
+def test_namechange_without_announcement_date_is_not_pit_ready() -> None:
+    conn = _full_ready_conn()
+    conn.execute("ALTER TABLE security_status ADD COLUMN announcement_date DATE")
+    conn.execute(
+        "INSERT INTO security_status "
+        "(symbol, effective_from, effective_to, status_type, coverage_complete, announcement_date) "
+        "VALUES (?, ?, NULL, 'name_change', true, NULL)",
+        [SYMBOLS[0], START],
+    )
+    report = audit_trend_data_readiness(connection=conn)
+    check = _by_name(report)["security_status_intervals"]
+    assert check["status"] == READINESS_INSUFFICIENT
+    assert check["detail"]["name_change_rows_missing_announcement_date"] == 1
+    assert "公告日期" in check["note"]
+
+
+def test_namechange_announced_after_effective_start_is_not_pit_ready() -> None:
+    conn = _full_ready_conn()
+    conn.execute("ALTER TABLE security_status ADD COLUMN announcement_date DATE")
+    conn.execute(
+        "INSERT INTO security_status "
+        "(symbol, effective_from, effective_to, status_type, coverage_complete, announcement_date) "
+        "VALUES (?, ?, NULL, 'name_change', true, ?)",
+        [SYMBOLS[0], START, START + timedelta(days=1)],
+    )
+    report = audit_trend_data_readiness(connection=conn)
+    check = _by_name(report)["security_status_intervals"]
+    assert check["status"] == READINESS_INSUFFICIENT
+    assert check["detail"]["name_change_rows_announced_after_effective_start"] == 1
+    assert "晚于生效日" in check["note"]
+
+
 def test_report_always_pins_the_contract_it_was_audited_against() -> None:
     report = audit_trend_data_readiness(connection=_full_ready_conn())
     assert report["contract_digest"]
-    assert report["contract_version"] == "trend_tail_v1"
+    assert report["contract_version"] == "trend_tail_v2"
     assert report["tail_entry_window"] == ["14:30", "14:50"]
 
 
@@ -513,6 +579,17 @@ def _warehouse_file(tmp_path, *, with_bar_timestamps: bool) -> str:
     return str(path)
 
 
+def test_cli_fails_closed_when_requested_float_cap_reference_is_missing(tmp_path) -> None:
+    warehouse = _warehouse_file(tmp_path, with_bar_timestamps=True)
+    result = _run_cli(
+        tmp_path,
+        ["--db", warehouse, "--float-cap-reference-db", "missing-float-cap.duckdb"],
+    )
+
+    assert result.returncode == 5
+    assert "流通市值参考库不存在" in result.stderr
+
+
 def test_cli_reads_the_reference_copy_only_when_told_to(tmp_path) -> None:
     """``--reference-db`` 是真的被读：不传就报"没校验"，传了才能报 ready。"""
     warehouse = _warehouse_file(tmp_path, with_bar_timestamps=True)
@@ -614,7 +691,7 @@ def test_truncated_name_history_stays_insufficient_with_a_reason(tmp_path) -> No
     check = _by_name(report)["security_status_intervals"]
     assert check["status"] == "insufficient"
     assert check["detail"]["coverage_complete_share"] == 0.0
-    assert "10,000" in check["note"]
+    assert "没有逐证券改名史覆盖证明" in check["note"]
     assert "security_status_intervals" in report["insufficient_items"]
     assert report["blocking_gaps"] == []
 
@@ -638,6 +715,86 @@ def test_constant_filled_numeric_column_is_flagged_not_usable() -> None:
     assert "column_concentration_float_market_cap" in report["insufficient_items"]
     # 同表里分布正常的列不该被牵连
     assert checks["column_concentration_turnover"]["status"] == "ok"
+
+
+def _float_cap_reference_conn(conn, *, symbols_per_day: int = len(SYMBOLS)):
+    reference = _connect()
+    reference.execute(
+        "CREATE TABLE float_market_cap_ref "
+        "(symbol VARCHAR, trade_date DATE, float_market_cap DOUBLE)"
+    )
+    pairs = conn.execute(
+        "SELECT symbol, date FROM daily_bars ORDER BY date, symbol"
+    ).fetchall()
+    symbol_order = {symbol: index for index, symbol in enumerate(SYMBOLS)}
+    reference.executemany(
+        "INSERT INTO float_market_cap_ref VALUES (?, ?, ?)",
+        [
+            (symbol, day, (symbol_order[symbol] + 1) * 1_000_000_000.0)
+            for symbol, day in pairs
+            if symbol_order[symbol] < symbols_per_day
+        ],
+    )
+    return reference
+
+
+def test_float_cap_reference_replaces_concentrated_warehouse_values() -> None:
+    conn = _ready_conn()
+    conn.execute("UPDATE daily_bars SET float_market_cap = 12000000000")
+    reference = _float_cap_reference_conn(conn)
+
+    report = audit_trend_data_readiness(
+        connection=conn, float_cap_reference_connection=reference,
+    )
+    reference.close()
+    check = _by_name(report)["column_concentration_float_market_cap"]
+
+    assert check["status"] == "ok"
+    assert check["detail"]["effective_source"] == "warehouse_plus_float_market_cap_ref"
+    assert check["detail"]["days_over_modal_share"] == 0
+    assert check["detail"]["rows_without_reference"] == 0
+    assert check["detail"]["reference_match_share"] == 1.0
+    assert check["detail"]["reference_pit_certified"] is False
+
+
+def test_float_cap_reference_does_not_hide_uncovered_concentrated_rows() -> None:
+    conn = _ready_conn()
+    conn.execute("UPDATE daily_bars SET float_market_cap = 12000000000")
+    reference = _float_cap_reference_conn(conn, symbols_per_day=100)
+
+    report = audit_trend_data_readiness(
+        connection=conn, float_cap_reference_connection=reference,
+    )
+    reference.close()
+    check = _by_name(report)["column_concentration_float_market_cap"]
+
+    assert check["status"] == STATUS_INSUFFICIENT
+    assert check["detail"]["days_over_modal_share"] == len(DAYS)
+    assert check["detail"]["rows_without_reference"] == len(DAYS) * (len(SYMBOLS) - 100)
+
+
+def test_float_cap_reference_with_duplicate_keys_fails_closed() -> None:
+    conn = _ready_conn()
+    conn.execute("UPDATE daily_bars SET float_market_cap = 12000000000")
+    reference = _connect()
+    reference.execute(
+        "CREATE TABLE float_market_cap_ref "
+        "(symbol VARCHAR, trade_date DATE, float_market_cap DOUBLE)"
+    )
+    reference.execute(
+        "INSERT INTO float_market_cap_ref VALUES ('600000.SH', DATE '2026-09-01', 1e9), "
+        "('600000.SH', DATE '2026-09-01', 2e9)"
+    )
+
+    report = audit_trend_data_readiness(
+        connection=conn, float_cap_reference_connection=reference,
+    )
+    reference.close()
+    check = _by_name(report)["column_concentration_float_market_cap"]
+
+    assert check["status"] == STATUS_INSUFFICIENT
+    assert check["detail"]["reference_status"] == "invalid"
+    assert "not unique" in check["detail"]["reference_error"]
 
 
 def test_column_concentration_check_stays_silent_when_the_column_is_absent() -> None:

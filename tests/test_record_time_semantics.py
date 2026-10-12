@@ -96,7 +96,7 @@ def test_read_trace_annotates_both_generations_without_rewriting(tmp_path: Path)
     identity = ModelIdentity(
         model_id="trend-tail-lgbm-1", artifact_content_hash="sha256:deadbeef",
         training_commit="eb691ed", runtime_commit="eb691ed", feature_compute_version=5,
-        label_policy_id="label_policy_v4_abc",
+        label_policy_id="label_policy_v5_abc",
         contract_digest=DEFAULT_TREND_CONTRACT.digest(),
     )
     stage = record_stage(
@@ -106,7 +106,7 @@ def test_read_trace_annotates_both_generations_without_rewriting(tmp_path: Path)
         rejected={"low_liquidity": ["600002.SH"]},
         data_as_of="2026-10-09T14:50:00", contract=DEFAULT_TREND_CONTRACT,
         model_identity=identity, feature_compute_version=5,
-        label_policy_id="label_policy_v4_abc", features_used=["avg_turnover_20"],
+        label_policy_id="label_policy_v5_abc", features_used=["avg_turnover_20"],
     )
     fresh = write_trace(build_funnel_trace(
         trade_date=datetime(2026, 10, 9).date(), stages=[stage],

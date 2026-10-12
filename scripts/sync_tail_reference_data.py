@@ -77,7 +77,7 @@ def _iso(value: Any) -> str | None:
 
 
 def security_status_frame_from_payload(payload: dict[str, Any]) -> pd.DataFrame:
-    """``stock_basic(L/D)`` + ``namechange`` 的补采载荷 → 带日期的证券状态区间表。
+    """``stock_basic(L/D/P)`` + ``namechange`` 的载荷 → 带日期的状态与覆盖证据。
 
     - ``listing_period`` / ``delisting`` 给的是**存在区间**，退市史能证明就是证明了，
       幸存者偏差口径因此可以从 unknown 升一级；
@@ -85,11 +85,30 @@ def security_status_frame_from_payload(payload: dict[str, Any]) -> pd.DataFrame:
       "拉到了 1,150 条"不等于"改名史完整"，拿前者当后者就是计划禁止的假装有数据；
     - symbol 一律压成 6 位代码，和研究库其它表同一口径。
     """
+    namechange_collection = payload.get("namechange_collection") or {}
+    coverage_by_symbol = namechange_collection.get("coverage_by_symbol")
+    per_symbol_coverage = (
+        coverage_by_symbol if isinstance(coverage_by_symbol, dict) else None
+    )
     truncated = int(payload.get("namechange_total") or 0) >= ROW_LIMIT
+    stock_basic_collection = payload.get("stock_basic_collection") or {}
+    basic_complete = stock_basic_collection.get("complete") is True
+
+    def row_values(item: Any, keys: tuple[str, ...]) -> list[Any]:
+        if isinstance(item, dict):
+            return [item.get(key) for key in keys]
+        return (list(item) + [None] * len(keys))[: len(keys)]
+
     rows: list[dict[str, Any]] = []
-    for key, status_type in (("basic_L", "listing_period"), ("basic_D", "delisting")):
+    for key, status_type in (
+        ("basic_L", "listing_period"),
+        ("basic_D", "delisting"),
+        ("basic_P", "suspended_listing"),
+    ):
         for item in (payload.get(key) or {}).get("rows") or []:
-            ts_code, _name, list_date, delist_date = (list(item) + [None] * 4)[:4]
+            ts_code, _name, list_date, delist_date = row_values(
+                item, ("ts_code", "name", "list_date", "delist_date")
+            )
             rows.append({
                 "symbol": _six(ts_code),
                 "status_type": status_type,
@@ -97,20 +116,46 @@ def security_status_frame_from_payload(payload: dict[str, Any]) -> pd.DataFrame:
                 "effective_to": _iso(delist_date),
                 "status_value": str(_name or "") or None,
                 "exchange": str(ts_code or "").split(".")[-1].upper() or None,
-                "coverage_complete": True,
+                "coverage_complete": basic_complete if stock_basic_collection else True,
             })
     for item in (payload.get("namechange") or {}).get("rows") or []:
-        ts_code, name, start_date, end_date = (list(item) + [None] * 4)[:4]
+        ts_code, name, start_date, end_date, announcement_date = row_values(
+            item, ("ts_code", "name", "start_date", "end_date", "ann_date")
+        )
+        code = str(ts_code or "").strip().upper()
+        complete = (
+            bool(per_symbol_coverage.get(code, False))
+            if per_symbol_coverage is not None
+            else not truncated
+        )
         rows.append({
             "symbol": _six(ts_code),
             "status_type": "name_change",
             "effective_from": _iso(start_date),
             "effective_to": _iso(end_date),
+            # 生效日和公告日是两个不同事实；PIT 回放只能在公告可得后使用该记录。
+            "announcement_date": _iso(announcement_date),
             "status_value": str(name or "") or None,
             "exchange": str(ts_code or "").split(".")[-1].upper() or None,
-            "coverage_complete": not truncated,
+            "coverage_complete": complete,
         })
-    return pd.DataFrame(rows)
+    if per_symbol_coverage is not None:
+        as_of_day = _iso(namechange_collection.get("as_of") or payload.get("as_of"))
+        for code, complete in sorted(per_symbol_coverage.items()):
+            rows.append({
+                "symbol": _six(code),
+                "status_type": "name_change_coverage",
+                "effective_from": as_of_day,
+                "effective_to": as_of_day,
+                "status_value": "complete" if complete else "incomplete",
+                "exchange": str(code).split(".")[-1].upper() or None,
+                "coverage_complete": bool(complete),
+            })
+    frame = pd.DataFrame(rows)
+    status_as_of = namechange_collection.get("as_of") or payload.get("as_of")
+    if status_as_of:
+        frame["as_of"] = str(status_as_of)
+    return frame
 
 
 def main(argv: list[str] | None = None) -> int:

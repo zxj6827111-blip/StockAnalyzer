@@ -30,7 +30,7 @@ Status: Draft
 
 
 
-As-of: 2026-10-09 @ 3522cf8（D15 补采真值、D16 覆盖面是调用参数、**D17 根因更正为"同步输入用了池内 CSV"并已数据侧修复**（本地全市场 CSV 一直在，远端补采 201,893 行与它差集为 0 对）、D18 层消融跨月翻符号（条件性）、D19 relative_strength 与 rank_ret_20 是同一个秩（ρ=1.0）、D20 这层截断偏向已大涨与高波动（成立），偏向难成交（不成立，方向相反）；**2025 全市场重验证窗口已打开**（分钟 RAW 口径经 vendor 日线逐分对照证明、市值占位常量污染范围收窄到 2026 年、第五类信息 moneyflow/top_list 已按全市场符号面补采）；§2 特征判别力读数已按 --rolling/--walk 三次更正。台账 docs/selection_quality_plan_status.md §0 是当前交接面）
+As-of: 2026-10-12 @ HEAD `c58da46eaf18defed3adf2ac6ec89ad668dcbf66`（D24–D35 已对照当前工作树、NAS 采集和隔离研究库；宽池 7 个原始 `adj_factor` 缺行均经严格全天停牌证据判定为不适用，三组有效覆盖 100%，未合成因子；证券名称区间经官方证据复核后无缺公告日/晚公告/重叠；流通市值参考扩至 2026-09-30，限定范围 readiness 为 ready，但历史发布时点未认证；资金流 / 龙虎榜历史文件仍未证明 PIT；夜扫留档改动与字段 PIT 审计代码已测，真实五层留档仍为 0、271 个链路字段没有完整 PIT 证据；无合格候选，本轮未部署。）
 
 
 
@@ -856,6 +856,26 @@ As-of: 2026-10-09 @ 3522cf8（D15 补采真值、D16 覆盖面是调用参数、
 
 ## 6. Implementation Locations
 
+2026-10-11 续接证据落点（D34）：
+
+- `src/stock_analyzer/runtime/universe_candidate_selector.py::UniverseCandidateSelector._build_report`
+- `src/stock_analyzer/runtime/service.py::_light_stage_from_snapshot` / `_deep_stage_from_snapshot`
+- `src/stock_analyzer/research/night_scan_funnel_trace.py::build_night_scan_funnel_trace`
+- `src/stock_analyzer/research/selection_funnel_view.py::_trace_layer_view`
+- `tests/test_night_selection_evidence.py`
+
+2026-10-12 字段 PIT 门证据落点（D35）：
+
+- `src/stock_analyzer/research/tail_field_pit.py`
+- `scripts/audit_tail_field_pit.py`
+- `scripts/validate_tail_independent_confirmation.py`
+- `src/stock_analyzer/research/tail_confirmatory.py`
+- `tests/test_tail_field_pit.py` / `tests/test_audit_tail_field_pit_cli.py`
+- `tests/test_tail_confirmatory.py` / `tests/test_tail_confirmatory_cli.py`
+- `artifacts/research/tail_pit_quality_20261012_v1/field_pit_gap_report.json`
+- `artifacts/research/tail_pit_quality_20261012_v1/verification_manifest_v4.json`
+
+
 
 
 
@@ -879,6 +899,10 @@ As-of: 2026-10-09 @ 3522cf8（D15 补采真值、D16 覆盖面是调用参数、
 
 
 - `src/stock_analyzer/research/trend_data_readiness.py`、`scripts/audit_trend_data_readiness.py`
+
+- `src/stock_analyzer/research/float_cap_reference.py`、`scripts/load_float_market_cap_research.py` —— 独立市值参考的导入、对账和读取侧覆盖
+
+- `scripts/reconcile_tail_security_status.py` —— hash-bound 官方证据复核与 canonical payload 生成
 
 
 
@@ -961,6 +985,19 @@ As-of: 2026-10-09 @ 3522cf8（D15 补采真值、D16 覆盖面是调用参数、
 
 - `runtime/universe_candidate_selector.py::_gate_membership`、`research/night_scan_funnel_trace.py::live_universe_facts` —— 生产夜扫前两层留档
 
+- `scripts/build_financial_pit_research_panel.py` / `tests/test_build_financial_pit_research_panel.py` —— 基于只读 `daily_bars` 与公告日期快照，生成不可覆盖的 PIT 财务研究侧车；异常报告期样本排除并记录
+
+- `scripts/collect_tail_security_status.py` / `tests/test_collect_tail_security_status.py` —— stock_basic L/D/P 全范围 + `namechange(ts_code=...)` 逐证券、可断点续跑的状态历史采集；token 只从环境变量读入客户端，不输出或写入采集证据
+
+- `scripts/audit_tail_pool_adj_factor_coverage.py` / `tests/test_audit_tail_pool_adj_factor_coverage.py` —— 按请求证券各自的最早入场日和 31 日因子回看、RAW 退出窗口及已证明上市日审计宽池因子覆盖；只读输入并拒绝覆盖证据输出
+
+- `scripts/collect_adj_factor_history.py` / `tests/test_collect_adj_factor_history.py` —— 逐证券因子采集支持绑定日期、证券清单、交易日历和采集器哈希的原子 checkpoint；默认复用已响应证券，可显式重采不完整响应
+
+- `scripts/sync_tail_adj_factor_history.py` / `tests/test_sync_tail_adj_factor_history.py` —— 导入校验每个证券的响应时间，并保留续跑批次的行级 `as_of`；只有报告与每行都一致时才接受单一批次时间
+
+- `scripts/sync_tail_reference_data.py::security_status_frame_from_payload`、`src/stock_analyzer/research/trend_data_readiness.py::_audit_security_status_intervals`、`tests/test_trend_data_readiness.py` —— 将逐证券 namechange 覆盖状态落为研究库审计标记，缺证券或不完整响应 fail-closed
+- `src/stock_analyzer/research/tail_reference_store.py`、`tests/test_tail_reference_store.py`、`tests/test_collect_tail_security_status.py` —— 持久化 `namechange.ann_date` 为独立 `announcement_date`，兼容迁移已有研究表并保留原始有效区间；PIT 审计同时报告公告日缺失、公告晚于生效日及区间重叠
+
 
 
 
@@ -990,3 +1027,35 @@ As-of: 2026-10-09 @ 3522cf8（D15 补采真值、D16 覆盖面是调用参数、
 这四类里可预测尾盘 5 日净盈利的部分已被容量基线吃掉，继续调这四类的权重不构成对 §4 的可行路径。
 
 | D22 | 生产链路"接通了"不等于"读得到"：夜扫前两层在 2026-10-09 首跑里缺席，成员清单其实正常产出，但放在 `source_report/prefilter/universe_quality_selection/hard_gate_membership`，而消费端只认另两条路径 ⇒ 读空、静默跳过。本地 13 条测试全绿是因为 **fixture 按消费端假设造，不是按生产形状造** | 质量报告 §4.15；`MEMBERSHIP_PATHS` / `locate_hard_gate_membership()` / `universe_membership_status()`；`tests/test_night_scan_funnel_trace.py`（16 条，其中 `_production_shaped_report()` 从生产 JSON 抄形状）；部署 `2b0ab09` 后用当晚生产报告重放验证五层齐全 | **已修（数据侧无改动，纯消费端）**。行为约束新增两条：① 命中路径必须写进留档 notes；② 两层没落档时 `record_night_scan` 必须回显原因，禁止只让人数 `layers`。以后新增"生产链路留档"类改动，验收必须包含一次**用生产真实报告形状**的重放，不能只跑自造 fixture |
+
+| D23 | 真实数据入口仍有来源不明的默认值 / 时点不明的回填：provider / TDX 离线包曾将缺失市值、背景量写成常数；TDX 报告期股本与财务、AKShare 最新快照曾贴到历史行；市值还可能从相邻日期向后填入早期决策 | 本次工作树修改：`data/{tushare_provider,akshare_provider,efinance_provider,background_adapter}.py`、`scripts/build_tdx_offline_package.py`、`runtime/universe_candidate_selector.py`；相关决策见 ADR-004 / ADR-005 | **代码已改，证据未验收**：新记录中的缺失值保留为 NaN；未验证时点的 TDX 背景值不再进入历史评分；缺项不再合成背景净额；TDX 缺失 OHLCV 不补零；TDX 报告期股本因缺公告有效时点而不再派生历史市值；缺公告有效时点的财务字段停用；市值硬门只读当日观测。尚未重建任何研究样本；`tail_rebuild` 的退出仍使用日线 OHLC，完整 RAW 分钟退出、公司行动账本、历史证券状态 PIT 与逐字段来源证明未完成。未跑测试、未部署；不得把旧样本判作已修复或产生新质量结论 |
+
+| D24 | CSV 中的六位证券代码曾被 pandas 推断成整数：`000001` 变成 `1`，导致 adj_factor 研究 join 少掉 115 只请求股票的历史因子；同类风险也适用于带数值裸码的离线源 | `upsert_adj_factors()` 现在优先用保留交易所后缀的 `ts_code` 规范化；同步 CLI 明确把 `symbol` / `ts_code` / `trade_date` 读成字符串；`test_adjustment_factor_prefers_qualified_symbol_to_preserve_leading_zeroes` | **修复已测、2026 子集已重建**：已按原文件 SHA-256 `73fb3696…8e7336` 重导入 78,622 个因子行；正确的排序 v4 子库已生成并用于 2026 RAW 标签重建。v2 不得用于收益结论；修复前后报告不能拼接 |
+
+### D24 后续核实与 D25–D27（2026-10-10）
+
+| 编号 | 缺陷 / 事实 | 证据 | 状态与可用范围 |
+| --- | --- | --- | --- |
+| D24 follow-up | 2026 v4 曾有 136 个请求被 62 个 symbol-day 日线缺口阻塞；缺口日中 57 天只有 241 根零成交量占位、5 天没有分钟记录，不能据此猜交易状态。v9 通过经过核实的来源修复后重建 28,200 条请求，0 个参考缺口、19,982 条成熟可训练；仍有 17 条停牌/分钟冲突保持不确定。 | `tail_rebuild_raw_v4_report.json`、`tail_rebuild_reference_gaps_raw_v4.jsonl`、`tail_rebuild_raw_v9_report.json`、`tail_rebuild_subset_2026jan_may_v5_minute_markers_manifest.json`；`scripts/augment_tail_daily_refs_from_minutes.py` | 旧 v4 是历史阻塞实测，当前 v9 的参考数据门已通过；0 个参考缺口不是收益验收通过。 |
+| D25 | 先前引用的 2025 全市场质量数字来自当前 RAW 分钟 / 公司行动账本修复之前的旧标签版本，不能作为本轮质量证据。2025 因子现已采集并导入 317,210 个逐证券日行；依据上市日为 688411 解释其上市前缺失前缀，其上市后日期逐日完整。修复 1,032 个 v1 缺口后，全量 v2 重建有 72,600 条标签、0 个参考缺口、62,941 条成熟可训练；51 条行动/退出/停牌冲突仍不确定。 | `tail_rebuild_2025_factor_coverage_audit.json`（历史基线）、`mw2025_adj_factor_collection_v2/import_report.json`、`tail_rebuild_raw_2025_v1_report.json`、`tail_rebuild_raw_2025_v2_report.json`、`tail_rebuild_raw_2025_repair_v3_report.json`；官方停牌证据目录 `official_suspension_evidence_688766_20251125_20251209/` | D21 的旧读数仅留历史诊断；新 RAW 标签可用于开发，但 2025 已查看，不能用于独立确认。未成交与不确定记录不得当亏损或盈利。 |
+| D26 | 2026 v9 的 12 臂仍无合格候选。2025 新 RAW 标签上的 12 臂也无候选：9 个价格臂首个校准窗 raw AUC < 0.5 而停；唯一跑完四折的 LR 臂至少一折没有成熟候选成交；2 个 `moneyflow` / `top_list` 臂因 PIT 可用时点未证明被阻塞。 | `tail_stage2_ablation_raw_v9.json`、`tail_stage2_ablation_raw_2025_v2.json`；242 个 2025 决策日；`candidate_selection=no_qualified_candidate` | **没有合格候选**。数据完整、四折训练或 LightGBM 可用都不单独表示质量通过。候选冻结后的三对照确认尚不能启动；已查看的 2025 / 2026 数据不能改称独立确认集，未来影子仍需真实观察。 |
+| D27 | 本地只读市场库中的历史 `roe` / `debt_ratio` 随日线行重复了未来财报快照，不能直接用于历史硬门或模型；证券状态名称历史全市场查询被 10,000 行上限截断。 | `scripts/build_financial_pit_research_panel.py`；`artifacts/research/financial_pit_2025_panel_20261010.duckdb`、`financial_pit_2026_panel_20261010.duckdb`；`artifacts/research/tail_data_readiness_full_market_20261010.json`；`scripts/collect_tail_security_status.py` | **局部 PIT 证据已补，完整 PIT 仍不足**：2025/2026 侧车分别有 1,245,745 / 949,026 个唯一证券日键，未来公告日和未来报告期均为 0；分别有 14,693 / 10,970 条同日公告行只具日期精度。2025 有 496、2026 有 98 行无可用快照；1 条 `end_date > ann_date` 的异常快照已从可用 join 排除并留证。全市场就绪报告仍为 `insufficient`：流通市值 2,611 个交易日中 80 天众数占比超过 50%，证券状态仅 83.713% 的行标为完整。逐证券采集器和 fail-closed 覆盖标记已在工作树实现并通过定向测试，但未能执行 Tushare 请求或更新研究库；不得将代码入口称为已补齐数据。 |
+| D28 | 宽池月度请求集的 RAW 标签输入被历史 `adj_factor` 覆盖不足阻塞；覆盖必须按每只证券自己的最早请求日回看 31 个自然日，不能把全组最早日期误套到所有证券。 | `scripts/audit_tail_pool_adj_factor_coverage.py`、`tests/test_audit_tail_pool_adj_factor_coverage.py`；`scripts/collect_adj_factor_history.py`、`tests/test_collect_adj_factor_history.py`；`scripts/sync_tail_adj_factor_history.py`、`tests/test_sync_tail_adj_factor_history.py`；`artifacts/research/tail_pool_adj_factor_audit_20261010_v3/tail_pool_adj_factor_coverage_report.json`、逐证券 CSV、采集 symbol/request/scope manifest；输入请求文件 SHA 与研究库大小、mtime 均记录在报告 | **已完成只读覆盖审计、采集输入准备和可续跑代码，真实采集未执行**：修正后的 2026 v4 因子子库每月仅有 698 只证券在各自 RAW 标签窗口内完整；3 月 3,897 只请求中 3,199 只不完整（18.4939% symbol-session 覆盖），4 月 3,768 中 3,070 只（19.1297%），5 月 3,705 中 3,007 只（19.2869%）；缺失集合并集为 3,526 只。合并清单含 157,075 条原始请求记录、覆盖 2026-01-31 至 2026-06-24；采集 checkpoint 校验请求范围、证券集合、日历与采集器 SHA，可在中断后复用已响应证券并显式重试不完整响应；hash-bound 导入按证券响应时间保留 `as_of`，避免续跑时伪造采集时间。旧版全组起始日审计输出已被 v2/v3 取代，不用于计数。Tushare 采集仍需可用 token；没有新增因子、RAW 标签或消融结果，阶段二宽池逐层消融仍阻塞。 |
+| D29 | 2025 `moneyflow` / `top_list` 原始文件有全年度日期覆盖，但文件覆盖不等于决策时点可用；龙虎榜同一股票日因多个上榜理由重复。 | `scripts/audit_tail_event_feature_provenance.py`、`tests/test_audit_tail_event_feature_provenance.py`；`artifacts/research/tail_event_pit_provenance_audit_20261011_v3.json`（含 2025 交易日历 SHA）；Tushare 官方接口文档：[`moneyflow`](https://tushare.pro/document/2?doc_id=170)、[`top_list`](https://tushare.pro/document/2?doc_id=106) | **正式阶段二事件臂仍阻塞**：交易日历 2025 全年 243 日与两个文件的日期集合完全相等；资金流 1,248,109 行、日期/代码键唯一；龙虎榜 18,033 行中有 1,616 个重复股票日键（1,681 条多余行，其中 1,609 个键包含多个不同理由、7 个键是同一理由重复）。两份采集报告均无失败、空日或报告的截断日，但没有逐日采集时间、逐响应哈希或历史源版本 / 发布截止证据；资金流缺行语义也未证明，不能填零。龙虎榜计数必须按唯一股票日计算。事后取得的当前历史值不能靠 `T-1` 滞后恢复其 2025 年决策时点版本。 |
+| D30 | 宽池 `adj_factor` 的 7 个证券日缺口是否来自凭证、逐证券接口或全市场响应截断。 | `scripts/collect_adj_factor_history.py`、`scripts/audit_tail_pool_adj_factor_coverage.py`；`artifacts/research/tail_pool_adj_factor_audit_20261011_v1/collection_attempt_missing7_v1/collection_evidence_manifest.json`、`collection_attempt_missing7_trade_date_20261011_v1/trade_date_probe_evidence_manifest.json`；Tushare [`adj_factor`](https://tushare.pro/document/2?doc_id=28) | **已排除凭证 / 全市场截断原因；原始缺行性质由 D33 续核**：3,526 证券逐证券响应中 3,519 完整、7 只都仅缺 2026-02-03；完整全市场日响应有 5,465 只证券、无截断或接口错误，但仍无这 7 只记录。7 只均有完整全天停牌状态，当日没有 RAW 日线，公司行动日覆盖完整且无事件，2 月 2 日与 4 日因子值相同。此项保留的是原始来源核验事实；适用性结论见 D33。 |
+| D31 | 全市场证券状态采集行数完整，但 Tushare `namechange.ann_date` 原先未落库，导入后又发现有效区间重叠。 | `scripts/sync_tail_reference_data.py`、`scripts/reconcile_tail_security_status.py`、`src/stock_analyzer/research/tail_reference_store.py`、`src/stock_analyzer/research/trend_data_readiness.py`；`tests/test_reconcile_tail_security_status.py`；`artifacts/research/tail_nas_collection_20261011_v1/security_status_namechange_v1/official_namechange_evidence_manifest.json`、`reconciled_v1/security_status_reconciliation_review_v1.json`、`reconciled_v1/security_status_reconciliation_report.json`；v6 独立库 | **PIT 区间问题已按证据解决**：官方公告及证据 SHA-256 绑定到 7 项复核决定；移除 6 条被证明为拟用名/非股票简称重复事件的重叠行，补入 689009.SH 公告日 2020-10-28。原始 payload/v5 均不变；v6 有 26,044 行、5,912 只证券，覆盖标记 100%，缺公告日/晚公告/重叠均为 0；完整 readiness 中 `security_status_intervals=ok`。 |
+| D32 | `daily_bars.float_market_cap` 中历史提供方兜底常数会让市值门失去横截面判别力；原始列必须留证，独立参考值应按 symbol-day 解释。 | `src/stock_analyzer/research/float_cap_reference.py`、`scripts/collect_float_market_cap_history.py`、`scripts/load_float_market_cap_research.py`、`src/stock_analyzer/research/trend_data_readiness.py`、`scripts/audit_trend_data_readiness.py`；`artifacts/research/float_cap_reference_20261011_v2/float_cap_collection_manifest.json`、`trend_data_readiness_post_cap_reference.json` | **集中度数据缺口已补、审计已接入；市值 PIT 与生产接入未认证**：NAS Tushare `daily_basic.circ_mv` 补采 2026-07-18..09-30，52 日 / 288,177 行，无失败、空值或截断。只在原参考库克隆 v2 追加，覆盖 2025-01-02..2026-09-30 共 2,310,122 行；与 2026-07..09 仓库可对账 281,798 个证券日，非占位行逐月一致率均为 100%。只读 readiness 按匹配的 symbol-day 覆盖后，2,611 个日线交易日中市值众数超 50% 的天数为 0、无阻塞/不足项；原始 `daily_bars` 与原参考库未变。历史 endpoint 查询没有逐日发布快照，不能据此认证 14:30–14:50 的特征可用性，也不能把 readiness `ready` 当作收益验收通过。 |
+| D33 | `adj_factor` 采集把区间级不完整状态传播到该证券区间内每条有效观测；同时，7 个真实缺失日是否可按有证据的无交易停牌日豁免尚未核实。 | `scripts/collect_adj_factor_history.py`、`scripts/sync_tail_adj_factor_history.py`、`scripts/reconcile_tail_adj_factor_observation_rows.py`、`scripts/audit_tail_pool_adj_factor_coverage.py`、`src/stock_analyzer/research/suspension_evidence.py`、`src/stock_analyzer/research/tail_reference_store.py`；`tests/test_collect_adj_factor_history.py`、`tests/test_sync_tail_adj_factor_history.py`、`tests/test_reconcile_tail_adj_factor_observation_rows.py`、`tests/test_audit_tail_pool_adj_factor_coverage.py`、`tests/test_suspension_evidence.py`、`tests/test_tail_reference_store.py`；`artifacts/research/tail_adj_factor_row_coverage_20261011_v1/` | **代码与限定请求范围审计已修复**：修正行级/区间级 coverage 语义；仅在隔离库把 637 条已存在且源响应 SHA 一致的观测标为行级有效，不增删因子值，7 个证券区间仍标不完整。7 个原始缺行均同时满足全天停牌、无 RAW 日线/分钟、公司行动覆盖完整且无行动、前后有效因子相等；规则只标明当天“不适用”，不合成因子。三组请求有效覆盖为 100%；3 月原始缺行 7 / 豁免 7 / 未解决 0，4 月和 5 月原始缺行均为 0。纠正后报告 SHA-256 `9f6bc0db…1a8bb469`。其他数据范围的收益标签仍须按该规则重建和核验；2026 阶段二仍因 58 个决策日短于 71 日、PIT 缺证而无候选。 |
+
+
+### D34（2026-10-11 续接，已证实）：完整输入池与部分归因的可见性
+
+| 编号 | 缺陷 / 事实 | 证据 | 状态与可用范围 |
+| --- | --- | --- | --- |
+| D34 | Quality 留档从已经入选的成员起算，漏掉硬门合格池到 Quality 的截断；Light/Deep 只记成员和部分计数；视图只要有一条真实原因，就把混有未归因记录的整层误标为原因齐全。 | `runtime/universe_candidate_selector.py`、`runtime/service.py`、`research/night_scan_funnel_trace.py`、`research/selection_funnel_view.py`（均在 `src/stock_analyzer/` 下）；`tests/test_night_selection_evidence.py`；ADR-004 §9；`artifacts/research/night_funnel_continuation_20261011_v1/` | 本轮代码与 119 个定向测试完成，未部署。筛选器同期输出版本化输入、逐证券原因与排序证据；消费者拒绝冲突/重复/非法载荷，旧报告和部分缺口继续保持未归因；模型降级 0.5 不冒充真实预测。NAS 仅有 2026-10-09 三层留档，真实五层有效观察日仍为 0。D11/D14 的历史证据未改写，完整生产归因、逐层质量消融和稳定观察期仍未验收；没有因此产生模型候选或收益通过结论。 |
+
+### D35（2026-10-12 新增，已证实）：独立确认入口原先缺少全链路字段 PIT 强制门
+
+| 编号 | 缺陷 / 事实 | 证据 | 状态与可用范围 |
+| --- | --- | --- | --- |
+| D35 | 独立确认统计入口原先能依据日历、折数、样本数及人的未开封声明计算 `release_eligible`，但不检查每个 hard gate、行情/事件/旧版特征字段的来源、覆盖与决策截止时点；统计函数结果可能被误读成全链路 PIT 已验证。 | `src/stock_analyzer/research/tail_confirmatory.py`、`src/stock_analyzer/research/tail_field_pit.py`、`scripts/validate_tail_independent_confirmation.py`、`scripts/audit_tail_field_pit.py`；四个定向测试文件；`artifacts/research/tail_pit_quality_20261012_v1/field_pit_gap_report.json`、`verification_manifest_v4.json` | **代码门已修、实际 PIT 仍阻塞**：全链路清单由当前代码生成 271 个字段，涵盖资格硬门、趋势/事件特征、旧版模型输出与原始快照；独立确认 CLI 要求输入 SHA、逐日逐臂观察快照、字段行数、零缺失/零未知填补、来源 SHA/版本及带时区的可用/采集/计算时钟，并拒绝重复 JSON 键。统计函数单独永不授予发布资格。20 个定向测试、Ruff 和四文件 mypy 通过；全仓研究工件没有符合该版本格式的字段级证据，故清单报告将 271 个字段全部 blocked。SHA 不等于供应商签名或可信时间戳；历史重新查询不能补造历史 PIT。无候选，独立确认仍未启动，本轮未部署。 |

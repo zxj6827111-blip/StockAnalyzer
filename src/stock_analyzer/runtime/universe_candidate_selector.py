@@ -1141,6 +1141,7 @@ class UniverseCandidateSelector:
     ) -> dict[str, object]:
         core_set = set(core_selected)
         exploration_set = set(exploration_selected)
+        selected_set = set(selected)
         # Build full component/reason lookup for selected.
         selected_rows = eligible_rows[eligible_rows["symbol"].isin(set(selected))].copy()
         selected_rows = selected_rows.set_index("symbol")
@@ -1193,6 +1194,24 @@ class UniverseCandidateSelector:
             "selected_by_board": selected_by_board,
             "score_distribution": score_distribution,
             "selected": selected_payload,
+            # 只从已经通过硬门的池记录预测性截断，不把硬门拒绝混进质量排序。
+            "selection_evidence": {
+                "version": 1,
+                "input_symbols": eligible_rows["symbol"].tolist(),
+                "rejected_by_reason": {
+                    "quality_rank_board_quota_exploration": [
+                        symbol for symbol in eligible_rows["symbol"].tolist()
+                        if symbol not in selected_set
+                    ],
+                },
+                "ranked_candidates": [
+                    {"symbol": str(row["symbol"]),
+                     "quality_score": _safe_float(row["quality_score"])}
+                    for row in eligible_rows.sort_values(
+                        ["quality_score", "symbol"], ascending=[False, True]
+                    ).to_dict("records")
+                ],
+            },
             "trade_date": trade_date,
             "reference_date": reference_date.isoformat() if reference_date else "",
             "ruleset_id": ruleset_id,
@@ -1320,11 +1339,11 @@ def _compute_quality_metrics(
     # cummax is O(n) per group vs rolling(len).max() which is O(n^2).
     work["_recent_high"] = grouped["close"].cummax()
 
-    # Never cross-fill between symbols and never synthesize market cap from turnover.
-    fmc = work.groupby("symbol")["float_market_cap"].transform(
-        lambda series: series.ffill().bfill()
-    )
-    work["_float_market_cap"] = fmc
+    # Use only the market-cap observation on that as-of row. Forward fill carries
+    # stale measurements; backfill leaks future values into earlier decisions.
+    work["_float_market_cap"] = pd.to_numeric(
+        work["float_market_cap"], errors="coerce"
+    ).replace([np.inf, -np.inf], np.nan)
 
     # Take the latest row per symbol.
     latest = work.groupby("symbol", sort=False).tail(1).copy()
@@ -1335,8 +1354,8 @@ def _compute_quality_metrics(
     ) & (valid_close > 0.0)
     history_days = valid_close_mask.groupby(work["symbol"]).sum()
     latest["history_days"] = history_days
-    # Drop the raw float_market_cap so the forward-filled _float_market_cap (renamed
-    # below) is the sole column — avoids duplicate-column ambiguity in _score_quality.
+    # Drop the raw field so the as-of _float_market_cap column is the sole source and
+    # avoids duplicate-column ambiguity in _score_quality.
     if "float_market_cap" in latest.columns and "_float_market_cap" in latest.columns:
         latest = latest.drop(columns=["float_market_cap"])
 

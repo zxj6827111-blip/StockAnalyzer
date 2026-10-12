@@ -46,10 +46,9 @@ from stock_analyzer.models.output_semantics import (
     output_semantics_for_basis,
 )
 
-DECISION_DAY = date(2026, 10, 8)   # 夜扫出观察池
-ENTRY_DAY = date(2026, 10, 9)      # 次日尾盘确认并成交
-DAYS = [ENTRY_DAY, date(2026, 10, 12), date(2026, 10, 13), date(2026, 10, 14),
-        date(2026, 10, 15)]
+DECISION_DAY = date(2026, 10, 8)  # 夜扫出观察池
+ENTRY_DAY = date(2026, 10, 9)  # 次日尾盘确认并成交
+DAYS = [ENTRY_DAY, date(2026, 10, 12), date(2026, 10, 13), date(2026, 10, 14), date(2026, 10, 15)]
 
 CONTRACT = DEFAULT_TREND_CONTRACT
 
@@ -64,44 +63,113 @@ def _reject(context) -> tuple[bool, str]:
 
 def _minute_bars(price: float = 10.0, *, day: date = ENTRY_DAY) -> list:
     return [
-        (datetime(day.year, day.month, day.day, 14, 30),
-         {"open": price, "high": price, "low": price, "close": price,
-          "up_limit": price * 1.1, "trade_status": "normal"}),
-        (datetime(day.year, day.month, day.day, 14, 31),
-         {"open": price, "high": price, "low": price, "close": price,
-          "up_limit": price * 1.1, "trade_status": "normal"}),
+        (
+            datetime(day.year, day.month, day.day, 14, minute),
+            {
+                "open": price,
+                "high": price,
+                "low": price,
+                "close": price,
+                "up_limit": price * 1.1,
+                "trade_status": "normal",
+            },
+        )
+        for minute in range(30, 51)
     ]
 
 
 def _locked_minute_bars(price: float = 10.0, *, day: date = ENTRY_DAY) -> list:
     """开盘价已达到涨停价：买不进（不假设排队成交）。"""
-    bar = {"open": price, "high": price, "low": price, "close": price,
-           "up_limit": price, "trade_status": "normal"}
+    bar = {
+        "open": price,
+        "high": price,
+        "low": price,
+        "close": price,
+        "up_limit": price,
+        "trade_status": "normal",
+    }
     return [
         (datetime(day.year, day.month, day.day, 14, 30), dict(bar)),
         (datetime(day.year, day.month, day.day, 14, 31), dict(bar)),
     ]
 
 
-def _daily(day: date, *, open_: float, high: float, low: float, close: float,
-           **extra) -> tuple:
-    return (day, {"open": open_, "high": high, "low": low, "close": close,
-                  "trade_status": "normal", **extra})
+def _daily(day: date, *, open_: float, high: float, low: float, close: float, **extra) -> tuple:
+    return (
+        day,
+        {
+            "open": open_,
+            "high": high,
+            "low": low,
+            "close": close,
+            "trade_status": "normal",
+            "exact_limits_complete": True,
+            "minute_session_complete": True,
+            **extra,
+        },
+    )
 
 
 def _flat_days(price: float = 10.0) -> list:
-    return [_daily(day, open_=price, high=price + 0.05, low=price - 0.05, close=price)
-            for day in DAYS]
+    return [
+        _daily(day, open_=price, high=price + 0.05, low=price - 0.05, close=price) for day in DAYS
+    ]
 
 
-def _build(*, confirmation=_confirm, daily_bars=None, cost_estimator=None,
-           capture_mode=CAPTURE_REPLAYED, **overrides) -> object:
+def _exit_minutes(daily_bars, *, entry_day: date = ENTRY_DAY) -> list:
+    """仅测试夹具：把每个测试日的指定场景编码到一根合成 1m bar。"""
+    out = []
+    for day_value, bar in daily_bars:
+        day = day_value.date() if isinstance(day_value, datetime) else day_value
+        if day == entry_day:
+            continue
+        out.append(
+            (
+                datetime(day.year, day.month, day.day, 9, 31),
+                {
+                    "open": bar["open"],
+                    "high": bar["high"],
+                    "low": bar["low"],
+                    "close": bar["close"],
+                    "down_limit": bar.get("down_limit", 1.0),
+                    "trade_status": bar.get("trade_status", "normal"),
+                },
+            )
+        )
+    return out
+
+
+def _action_coverage(daily_bars, *, entry_day: date = ENTRY_DAY) -> dict[str, dict[str, bool]]:
+    return {
+        (day_value.date() if isinstance(day_value, datetime) else day_value).isoformat(): {
+            "coverage_complete": True
+        }
+        for day_value, _bar in daily_bars
+        if (day_value.date() if isinstance(day_value, datetime) else day_value) > entry_day
+    }
+
+
+def _build(
+    *,
+    confirmation=_confirm,
+    daily_bars=None,
+    cost_estimator=None,
+    capture_mode=CAPTURE_REPLAYED,
+    **overrides,
+) -> object:
+    chosen_daily = daily_bars if daily_bars is not None else _flat_days()
+    exit_minutes = overrides.pop("exit_minute_bars", None)
+    action_coverage = overrides.pop("corporate_action_coverage", None)
     return build_tail_net_profit_label(
         symbol="600000.SH",
         decision_date=DECISION_DAY,
         entry_date=ENTRY_DAY,
         minute_bars=overrides.pop("minute_bars", None) or _minute_bars(),
-        daily_bars=daily_bars if daily_bars is not None else _flat_days(),
+        daily_bars=chosen_daily,
+        exit_minute_bars=(_exit_minutes(chosen_daily) if exit_minutes is None else exit_minutes),
+        corporate_action_coverage=(
+            _action_coverage(chosen_daily) if action_coverage is None else action_coverage
+        ),
         confirmation=confirmation,
         cost_estimator=cost_estimator,
         capture_mode=capture_mode,
@@ -115,15 +183,13 @@ def _build(*, confirmation=_confirm, daily_bars=None, cost_estimator=None,
 
 
 def test_new_basis_is_registered_as_event_probability() -> None:
-    assert output_semantics_for_basis(TAIL_NET_PROFIT_BASIS) == (
-        OUTPUT_SEMANTICS_EVENT_PROBABILITY
-    )
+    assert output_semantics_for_basis(TAIL_NET_PROFIT_BASIS) == (OUTPUT_SEMANTICS_EVENT_PROBABILITY)
 
 
 def test_policy_record_carries_tail_contract_identity() -> None:
     record = tail_label_policy_record()
-    assert record.schema_version == TAIL_SCHEMA_VERSION == "4"
-    assert record.price_basis == TAIL_PRICE_BASIS == "tail_confirm_next_bar"
+    assert record.schema_version == TAIL_SCHEMA_VERSION == "5"
+    assert record.price_basis == TAIL_PRICE_BASIS == "tail_confirm_next_bar_raw_minute_exit_v2"
     assert record.maturity_rule == TAIL_MATURITY_RULE
     assert record.horizon_days == 5
     assert record.take_profit_pct == pytest.approx(0.08)
@@ -131,7 +197,7 @@ def test_policy_record_carries_tail_contract_identity() -> None:
     # 止损优先是硬 0：不存在"半个正类"
     assert record.conflict_policy == "stop_loss_first"
     assert record.conflict_soft_label_value == 0.0
-    assert record.label_policy_id.startswith("label_policy_v4_")
+    assert record.label_policy_id.startswith("label_policy_v5_")
 
 
 def test_policy_identity_changes_when_the_contract_changes() -> None:
@@ -155,7 +221,7 @@ def test_profitable_exit_is_a_hard_positive_label() -> None:
     assert record.trainable is True
     assert record.label == LABEL_PROFIT
     assert record.take_profit_hit is True
-    assert record.label_mature_time == datetime(2026, 10, 12)
+    assert record.label_mature_time == datetime(2026, 10, 12, 9, 31)
     assert record.label_anchor_time == datetime(2026, 10, 9, 14, 31)
 
 
@@ -210,15 +276,16 @@ def test_costs_and_slippage_are_inside_the_labelled_return() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "entry_day", [DECISION_DAY, date(2026, 10, 7)]
-)
+@pytest.mark.parametrize("entry_day", [DECISION_DAY, date(2026, 10, 7)])
 def test_entry_on_or_before_decision_day_is_rejected(entry_day: date) -> None:
     """夜扫在 T 出池，确认成交只能发生在 T+1 的尾盘窗口。"""
     with pytest.raises(TailLabelError):
         build_tail_net_profit_label(
-            symbol="600000.SH", decision_date=DECISION_DAY, entry_date=entry_day,
-            minute_bars=_minute_bars(day=entry_day), daily_bars=_flat_days(),
+            symbol="600000.SH",
+            decision_date=DECISION_DAY,
+            entry_date=entry_day,
+            minute_bars=_minute_bars(day=entry_day),
+            daily_bars=_flat_days(),
             confirmation=_confirm,
         )
 
@@ -249,8 +316,7 @@ def _next(day: date, offset: int = 1) -> date:
     return day + timedelta(days=offset)
 
 
-def _synthetic(capture: str, *, profits: int, losses: int, not_filled: int,
-               uncertain: int) -> list:
+def _synthetic(capture: str, *, profits: int, losses: int, not_filled: int, uncertain: int) -> list:
     """造已实现/未成交/不确定三类样本，验证分组报告的分母口径。
 
     正负样本的价格动作必须发生在**入场日之后**的那根日线（T+1 才可卖），
@@ -258,8 +324,12 @@ def _synthetic(capture: str, *, profits: int, losses: int, not_filled: int,
     """
     records: list = []
     index = 0
-    for kind, count in (("profit", profits), ("loss", losses),
-                        ("not_filled", not_filled), ("uncertain", uncertain)):
+    for kind, count in (
+        ("profit", profits),
+        ("loss", losses),
+        ("not_filled", not_filled),
+        ("uncertain", uncertain),
+    ):
         for _ in range(count):
             index += 1
             day = date(2026, 10, 8) + timedelta(days=index)
@@ -270,14 +340,22 @@ def _synthetic(capture: str, *, profits: int, losses: int, not_filled: int,
             ]
             if kind in {"profit", "loss"}:
                 step = 10.9 if kind == "profit" else 9.4
-                bars = head + [
-                    _daily(_next(day, 2), open_=10.0, high=max(10.05, step),
-                           low=min(9.95, step), close=step)
-                ] + [
-                    _daily(_next(day, offset), open_=10.0, high=10.05, low=9.95,
-                           close=10.0)
-                    for offset in (3, 4, 5, 6)
-                ]
+                bars = (
+                    head
+                    + [
+                        _daily(
+                            _next(day, 2),
+                            open_=10.0,
+                            high=max(10.05, step),
+                            low=min(9.95, step),
+                            close=step,
+                        )
+                    ]
+                    + [
+                        _daily(_next(day, offset), open_=10.0, high=10.05, low=9.95, close=10.0)
+                        for offset in (3, 4, 5, 6)
+                    ]
+                )
                 minute = _minute_bars(day=entry)
                 confirmation = _confirm
             elif kind == "not_filled":
@@ -288,17 +366,24 @@ def _synthetic(capture: str, *, profits: int, losses: int, not_filled: int,
                 bars = head
                 minute = _minute_bars(day=entry)
                 confirmation = _confirm
-            records.append(build_tail_net_profit_label(
-                symbol="600000.SH", decision_date=day, entry_date=entry,
-                minute_bars=minute, daily_bars=bars,
-                confirmation=confirmation, capture_mode=capture,
-            ))
+            records.append(
+                build_tail_net_profit_label(
+                    symbol="600000.SH",
+                    decision_date=day,
+                    entry_date=entry,
+                    minute_bars=minute,
+                    daily_bars=bars,
+                    exit_minute_bars=_exit_minutes(bars, entry_day=entry),
+                    corporate_action_coverage=_action_coverage(bars, entry_day=entry),
+                    confirmation=confirmation,
+                    capture_mode=capture,
+                )
+            )
     return records
 
 
 def test_net_profit_rate_denominator_excludes_unfilled_and_uncertain() -> None:
-    records = _synthetic(CAPTURE_OBSERVED, profits=6, losses=4, not_filled=3,
-                         uncertain=2)
+    records = _synthetic(CAPTURE_OBSERVED, profits=6, losses=4, not_filled=3, uncertain=2)
     summary = summarize_tail_labels(records)
     group = summary["by_capture_mode"][CAPTURE_OBSERVED]
     assert group["n_candidates"] == 15
@@ -314,23 +399,18 @@ def test_net_profit_rate_denominator_excludes_unfilled_and_uncertain() -> None:
 
 
 def test_observed_and_replayed_samples_are_reported_separately() -> None:
-    records = _synthetic(CAPTURE_OBSERVED, profits=5, losses=5, not_filled=0,
-                         uncertain=0)
-    records += _synthetic(CAPTURE_REPLAYED, profits=9, losses=1, not_filled=0,
-                          uncertain=0)
+    records = _synthetic(CAPTURE_OBSERVED, profits=5, losses=5, not_filled=0, uncertain=0)
+    records += _synthetic(CAPTURE_REPLAYED, profits=9, losses=1, not_filled=0, uncertain=0)
     summary = summarize_tail_labels(records)
     assert summary["mixed_capture_mode"] is True
     assert set(summary["by_capture_mode"]) == {CAPTURE_OBSERVED, CAPTURE_REPLAYED}
-    assert summary["by_capture_mode"][CAPTURE_OBSERVED][
-        "net_profit_rate"] == pytest.approx(0.5)
-    assert summary["by_capture_mode"][CAPTURE_REPLAYED][
-        "net_profit_rate"] == pytest.approx(0.9)
+    assert summary["by_capture_mode"][CAPTURE_OBSERVED]["net_profit_rate"] == pytest.approx(0.5)
+    assert summary["by_capture_mode"][CAPTURE_REPLAYED]["net_profit_rate"] == pytest.approx(0.9)
     assert summary["total_records"] == 20
 
 
 def test_rejection_reasons_are_counted_for_funnel_diagnosis() -> None:
-    records = _synthetic(CAPTURE_OBSERVED, profits=1, losses=0, not_filled=0,
-                         uncertain=0)
+    records = _synthetic(CAPTURE_OBSERVED, profits=1, losses=0, not_filled=0, uncertain=0)
     group = summarize_tail_labels(records)["by_capture_mode"][CAPTURE_OBSERVED]
     assert group["confirm_rate"] == pytest.approx(1.0)
     assert group["decision_days"]
@@ -350,10 +430,13 @@ def test_slippage_falls_back_to_the_strategy_tier() -> None:
 
 
 def test_date_frozen_schedule_overrides_the_strategy_tier() -> None:
-    limit_rule = LimitRuleConfig(cost_schedule_by_date=[
-        CostScheduleEntry(**{"from": "2026-01-01", "stamp_tax_rate": 0.0005,
-                             "slippage_ratio": 0.0008}),
-    ])
+    limit_rule = LimitRuleConfig(
+        cost_schedule_by_date=[
+            CostScheduleEntry(
+                **{"from": "2026-01-01", "stamp_tax_rate": 0.0005, "slippage_ratio": 0.0008}
+            ),
+        ]
+    )
     matcher = BacktestMatcherConfig()
     assert resolve_tail_slippage_ratio(
         matcher=matcher, limit_rule=limit_rule, trade_date=DECISION_DAY
@@ -366,10 +449,14 @@ def test_date_frozen_schedule_overrides_the_strategy_tier() -> None:
 def test_engine_and_label_share_one_cost_authority() -> None:
     """同一笔下单价：契约侧估的成本必须与执行引擎逐元一致。"""
     engine = ExecutionEngine(BacktestMatcherConfig())
-    record = _build(cost_estimator=lambda side, price, quantity, when: engine.estimate_cost(
-        side, price, quantity, trade_date=when))
-    expected = engine.estimate_cost("buy", float(record.entry_price), record.quantity,
-                                    trade_date=ENTRY_DAY)
+    record = _build(
+        cost_estimator=lambda side, price, quantity, when: engine.estimate_cost(
+            side, price, quantity, trade_date=when
+        )
+    )
+    expected = engine.estimate_cost(
+        "buy", float(record.entry_price), record.quantity, trade_date=ENTRY_DAY
+    )
     assert record.buy_cost == pytest.approx(expected)
 
 
@@ -387,9 +474,7 @@ def _registry(tmp_path: Path):
 def test_registered_policy_verifies_field_by_field(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
     record = register_tail_label_policy(registry)
-    stored, failures = verify_tail_label_policy(
-        registry, label_policy_id=record.label_policy_id
-    )
+    stored, failures = verify_tail_label_policy(registry, label_policy_id=record.label_policy_id)
     assert failures == ()
     assert stored is not None and stored.label_policy_hash == record.label_policy_hash
     # 幂等：重复注册不产生第二条口径，registry 按 hash 去重后原样返回。
@@ -405,7 +490,7 @@ def test_verify_names_the_cause_instead_of_returning_a_bare_none(tmp_path: Path)
     assert missing is None
     assert failures[0].startswith("label_policy_not_registered:")
 
-    unwired, failures = verify_tail_label_policy(None, label_policy_id="label_policy_v4_x")
+    unwired, failures = verify_tail_label_policy(None, label_policy_id="label_policy_v5_x")
     assert unwired is None and failures == ("label_policy_registry_unavailable",)
 
     silent, failures = verify_tail_label_policy(registry, label_policy_id="")

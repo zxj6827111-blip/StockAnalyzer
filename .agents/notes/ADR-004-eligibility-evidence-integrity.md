@@ -2,7 +2,7 @@
 
 Status: Draft
 
-As-of: 2026-10-08 @ HEAD `ce19b76`
+As-of: 2026-10-12 @ HEAD `c58da46eaf18defed3adf2ac6ec89ad668dcbf66`（证券名称 v6 官方证据复核已完成；夜扫逐层 selection_evidence v1 与部分归因拒绝规则已对照工作树和定向测试；新增 271 字段 PIT 清单与 fail-closed 审计器，但尚无真实字段级历史时点证据；本轮改动未部署）
 
 本 ADR 管的是**资格层留档的可信度**，不是选股规则本身。它回答三个问题：
 
@@ -18,18 +18,20 @@ As-of: 2026-10-08 @ HEAD `ce19b76`
 
 ## 1. Status 为什么是 Draft
 
-读侧三条决定都已落地并有测试与生产产物背书；**写侧还有一处没决定**，
-线上侧也还剩三个未登记的原因名：
+读侧三条决定都已落地并有测试与生产产物背书。写侧开始按缺失值保留未知，
+但改动还没有覆盖所有历史消费路径，也未在数据上验收：
 
 ```text
 已定并已验：占位常量的带版本解释规则（§3）、归因顺序是契约事实（§4）、
             无判别力的门不落这两层（§5）——三层都有专属测试，
             且 2026-08 干净窗口的 19 份真实留档全部通过 verify_trace()。
-未定：      ingest 该不该停止写兜底常量、改写成 NULL（§6.1，跨模块数据语义变更）。
+工作树已改：tushare / akshare / efinance provider 与 TDX 离线包不再为缺失市值写 12B；
+            无公告可用时点的历史财务值和无来源背景占位值保留为缺失。
+未验收：    仓库落库和其它遗留消费路径、数据重建与 PIT 状态仍需核对（§6.1）。
 已闭合：    线上硬门的 20 个原因名已整体登记进 `_RULE_KIND`（`LIVE_HARD_GATE_NAMES`，全为 HARD）。
 ```
 
-§6.1 落地之后本 ADR 升 Accepted（§6.2 的原因名已于 2026-10-08 整体登记）。
+§6.1 完整收口并经数据验证之后本 ADR 才能升 Accepted（§6.2 的原因名已于 2026-10-08 整体登记）。
 
 ---
 
@@ -77,6 +79,10 @@ tushare 那条写入路径（`tushare_provider.py:1677-1684`）在 `daily_basic`
   那是本来就缺，由读取该列的门的既有语义处理。这里只抓"被填过"的那种，
   因为它**看起来像数据**。
 
+2026-10-09 工作树进一步停止在新 provider / TDX 离线包记录中写入该常数；无法证明
+公告有效时点的 TDX / AKShare 最新财务快照也不再贴到历史行情行上。该改动没有触碰
+历史库既有值，也没有部署。资格层还需确认其它落库与旧读侧不把 NULL 改写成默认值。
+
 ---
 
 ## 4. 归因顺序为什么必须是契约事实
@@ -113,16 +119,35 @@ tushare 那条写入路径（`tushare_provider.py:1677-1684`）在 `daily_basic`
 
 ## 6. 还没决定的两件事
 
-### 6.1 写侧：ingest 应不该继续写兜底常量
+### 6.1 写侧：ingest 缺失值保留与 PIT 输入
 
-方向明确（失败应当可见、缺值应当是 NULL），**没做的原因不是懒**：
-`src/` 下有 26 个文件出现 `float_market_cap`（生产夜扫、特征快照、PIT 数据集、
-Alpha V2 面板都在读它），把兜底常量换成 NULL 是一次跨模块数据语义变更，
-按 AGENTS.md §12 要单独立项。真要推，需要先回答：读 NULL 时这 26 个消费方各自
-是拒答（fail-closed）还是照常跑？现在还没有那份影响清单。
+方向已明确：失败应可见、缺值保留为 NULL，财务值只有带公告可用时间才能进入历史
+样本。2026-10-09 工作树已在 `tushare_provider.py`、`akshare_provider.py`、
+`efinance_provider.py` 与 `build_tdx_offline_package.py` 移除部分缺省占位；
+`universe_candidate_selector.py` 不再跨日期前向或后向填补市值。
 
-`daily_bars` 也没有能区分"测过 / 被填的"字段，所以补采之外还需要一个来源标记列——
-这也是同一份变更的范围。
+仍未收口：`src/` 下其他读取/落库路径需逐一确认 NULL 的处理；现有 `daily_bars` 没有
+字段级来源与公告可用时间；其它证券状态仍需 PIT 证明；旧评分支路还存在派生市值兜底。
+因此本 ADR 保持 Draft，不能据此声称所有新记录已满足 PIT / 来源证明。
+
+2026-10-10 的本地核查为历史财务值新增了隔离侧车：`build_financial_pit_research_panel.py`
+只读 `market_copy.duckdb`，以 `ann_date <= daily_bars.date` 选择最近快照，并拒绝覆盖已存在
+输出。2025/2026 侧车未发现未来公告日或未来报告期，但同日公告只有日期精度，不能证明盘中
+发布时间；它也没有接入完整生产候选重放。因此这是局部证据，不是对所有 selector 输入的 PIT
+验收。
+
+证券状态方面新增逐证券 `namechange` 采集器及 `name_change_coverage` 标记：每只证券成功返回
+空结果也会明确记录“该代码查询完整”；失败或达到行数上限的响应标为 incomplete。就绪审计
+在存在这类标记时要求全表每个证券都有完整标记。采集入口已通过模拟 API 测试，但真实接口
+数据尚未采回，当前 83.7% 的历史状态覆盖不能据此升级。
+
+**2026-10-11 数据更新**：NAS 上的 Tushare 采集器已为修正宽池的 58 个决策日逐日取回完整
+`stock_st(trade_date)` 全市场快照，共 11,811 条记录；每日日级响应都带行数、时间与响应哈希。
+`replay_tail_candidate_pool.py::apply_st_snapshot_overlay` 仅对这 58 个已覆盖日把旧面板的
+`is_st` 替换为来源列表，并在事实与报告中留存来源身份。复核显示旧留档有 2,397 个来源已确认
+的 ST 证券日仍晋级，修正重放为 0。该结果修复了这 58 天的 ST 硬门输入，不证明其它年份、其它
+证券状态字段或所有历史特征都满足 PIT；逐证券 `namechange` 全覆盖仍在 NAS 后台采集，因此
+本 ADR 继续保持 Draft。
 
 ### 6.2 线上侧还有三个契约不认识的原因名
 
@@ -179,12 +204,49 @@ scripts/measure_marketwide_gate_coverage.py
 src/stock_analyzer/research/night_scan_funnel_trace.py
   _universe_facts()（:83）/ build_universe_stage_traces()（:119，
   non_evaluable_gates 非空 ⇒ 返回空元组不落这两层）
+  _selection_evidence() / _evidence_symbols() / _evidence_predictions()
+  build_night_scan_funnel_trace()：Quality 输入从完整硬门合格池或当时输入清单起算；
+  新报告读取逐证券真实原因，旧报告及未覆盖的缺口继续明确标为未归因
+src/stock_analyzer/runtime/service.py
+  _prefilter_week5_from_snapshot_row() / _light_stage_from_snapshot()
+  _deep_stage_from_snapshot()：同一筛选调用输出 selection_evidence v1，不改排名或门槛
+src/stock_analyzer/runtime/universe_candidate_selector.py
+  UniverseCandidateSelector._build_report()：保留完整硬门合格池、排序分数与预测性截断名单
+src/stock_analyzer/research/selection_funnel_view.py
+  _trace_layer_view()：只要仍有未归因淘汰，整层 reasons_available=false
 src/stock_analyzer/research/trend_data_readiness.py
   MAX_MODAL_VALUE_SHARE（:58）/ CONCENTRATION_GUARDED_COLUMNS（:59）
-  _audit_column_concentration()（:114）
+  _audit_column_concentration()（:114）/ _audit_security_status_intervals()（逐证券改名史 marker 全覆盖检查）
 src/stock_analyzer/data/tushare_provider.py
-  :23 兜底常量 / :708-719 被吞掉的 daily_basic / :1677-1684 fillna 写入点
+  _normalize_tushare_daily()：保留缺失市值，不写 12B 兜底
+src/stock_analyzer/data/akshare_provider.py
+  AKShare / TX 行情缺失市值与未取数背景字段保留为 NaN；最新财务快照不贴历史 bar
+src/stock_analyzer/data/efinance_provider.py
+  缺失市值及未取数背景字段保留为 NaN
+src/stock_analyzer/data/background_adapter.py
+  无可靠逐日记录的 block trade / northbound / 龙虎榜缺值不填 0，并显式降级完整性
+src/stock_analyzer/research/tail_field_pit.py
+  从资格硬门、趋势特征、事件臂、旧版 FeatureEngineer 与原始快照列生成字段清单；
+  绑定输入摘要、逐字段覆盖、缺值/未知填补、来源版本与可用/采集/计算时钟
+scripts/audit_tail_field_pit.py
+  输出字段清单或绑定输入文件 SHA 的只读 PIT 审计；无证据时逐字段 blocked
+tests/test_tail_field_pit.py / tests/test_audit_tail_field_pit_cli.py
+  钉住范围绑定、字段覆盖、时钟顺序、哈希、路径约束、不可覆盖输出与 fail-closed 状态
+scripts/build_tdx_offline_package.py
+  TDX share counts 缺公告有效时点时不派生历史市值；缺市值、财务与背景字段不写默认数值
+src/stock_analyzer/runtime/universe_candidate_selector.py
+  `_float_market_cap` 仅取同日观测，缺失市值由既有无效市值硬门拒绝
 scripts/build_tail_universe_symbols.py（全市场清单 + provenance JSON 生产者）
+scripts/build_financial_pit_research_panel.py
+  只读财务快照按 ann_date 截止到日线日期，异常 end_date > ann_date 排除并写入 manifest
+scripts/collect_tail_security_status.py
+  stock_basic L/D/P + per-symbol namechange；checkpoint 与 manifest 不含凭据，失败证券保留 incomplete
+scripts/collect_tail_st_snapshots.py
+  按决策日采集完整 stock_st 快照；校验日期、行数、重复代码与逐日响应哈希
+scripts/replay_tail_candidate_pool.py::apply_st_snapshot_overlay
+  只在报告完整覆盖的日期替换 is_st，并为每个重放日留存来源哈希和覆盖事实
+scripts/sync_tail_reference_data.py::security_status_frame_from_payload
+  将 per-symbol namechange 覆盖 map 写成 name_change_coverage 研究参考行
 ```
 
 测试（各自钉住一条不变量）：
@@ -194,8 +256,13 @@ tests/test_trend_candidate_contract.py(17)
 tests/test_replay_tail_intraday_features.py(10)
 tests/test_measure_marketwide_gate_coverage.py(5)
 tests/test_night_scan_funnel_trace.py(9)
+tests/test_night_selection_evidence.py（真实筛选器到留档、生产包装、部分归因与损坏载荷）
 tests/test_trend_data_readiness.py
 tests/test_record_replay_funnel_trace.py(3)
+tests/test_build_financial_pit_research_panel.py(3)
+tests/test_collect_tail_security_status.py
+tests/test_collect_tail_st_snapshots.py
+tests/test_replay_tail_intraday_features.py（stock_st 覆盖与哈希拒绝路径）
 ```
 
 证据产物与文档：
@@ -222,3 +289,47 @@ artifacts/research/funnel_traces_marketwide_aug/（19 份，读侧解释规则�
    事后无法复现当时是哪一版。
 5. 本节所有"已通过"措辞都只描述**资格判定**，不代表 §4 的选股质量验收达标
    （四组特征时间外 AUC 仍 < 0.5，影子验证仍 0 天 / 0 笔）。
+
+
+## 9. 夜扫预测层的输入与逐证券归因（2026-10-11 续接）
+
+`selection_evidence.version=1` 由实际筛选调用同步输出 `input_symbols`、
+`rejected_by_reason` 和 `ranked_candidates`。Quality 的输入是硬门合格池，
+而不是已经被截断后的 300 只；被截断者归因为质量排名/板块配额/确定性探索的联合选择规则，
+不额外声称是低分或某个单独配额导致。
+
+Light 按现有短路顺序记录停牌、ST、退市风险、板块范围及排名容量原因。
+这些资格复核条件仍是硬门；层名属于预测性排序层不表示消融时可以删除这些条件。
+Deep 区分缺特征快照和排名容量，交叉复核结果继续作为真实诊断字段，
+不把现有实现未用来淘汰的条件伪造为淘汰原因。各层选择集合与原排名公式保持一致。
+
+旧报告缺原因时继续保留 `night_truncation_reason_not_recorded`。当新报告只覆盖部分淘汰、
+或实际上游成员超出该层输入清单时，余下缺口仍记为未归因，
+视图必须判整层 `reasons_available=false`，不能只因存在一条已归因记录就宣布完整。
+输入重复、同票多因、晋级与拒绝冲突、拒绝不属于输入、来源包装成员不一致、
+无法识别的输入行或非法预测均导致留档失败；夜扫返回可见失败状态，不生成伪造的完整证据。
+
+Deep 的真实原始输出仅来自支持 `predict_rows_with_raw()` 的预测器，
+`raw_predictions` 记录 `raw_blend`，`calibrated_probabilities` 记录 `meta`，语义写进 notes。
+模型降级后的默认 0.5 不写成真实预测。未绑定模型身份、字段 PIT 或无真实对照的报告，
+即使计数通过，也不构成收益证据或正式影子日。
+
+本轮 72 个留档/筛选/快照测试与 47 个漏斗策略/历史重放/夜扫接线测试通过。
+`clean-scope` 只有既有 `mypy_blocking` 阻塞，日志与续接前完全相同。
+NAS 运行版本仍为 `2b0ab09`，只有 2026-10-09 的三层历史留档；当前增量未部署。
+
+## 10. 全链路字段 PIT 清单与证据边界（2026-10-12）
+
+`tail_field_pit.py` 从当前代码生成 `full_chain` 清单，包含资格硬门、趋势模型特征、事件臂、
+旧版 `FeatureEngineer` 输出和原始快照字段。当前去重后为 271 个字段。字段审计要求每个
+决策日/实验臂都留存完整输入行数、零缺失/零未知填补、输入快照 SHA、来源文件 SHA 与版本、
+来源可用时刻、采集时刻、字段最新输入时刻、计算时刻及带时区的决策截止时刻；输入集合必须
+与实际确认 JSONL 的 `(trade_date, arm_id)` 完全一致。重放数据不能冒充观察快照。
+
+SHA-256 校验只证明留存文件与声明摘要一致，不提供供应商签名或独立可信时间戳；生产者填写的
+可用/采集时钟仍是声明事实。因此该审计器只能检查完整性和时钟关系，不能让事后获取的历史
+数据自动获得 PIT 资格。仓库 `artifacts/research` JSON/JSONL 文件中没有该版本的字段 PIT 证据。
+2026-10-12 的逐字段缺口报告为
+`artifacts/research/tail_pit_quality_20261012_v1/field_pit_gap_report.json`；271 个字段全部
+blocked。定向验证和源文件摘要见同目录 `verification_manifest_v4.json`。审计代码已通过定向测试，
+但历史数据尚未补齐，不构成阶段一 PIT 验收。

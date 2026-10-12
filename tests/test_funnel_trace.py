@@ -42,7 +42,7 @@ def _identity() -> ModelIdentity:
         training_commit="eb691ed",
         runtime_commit="eb691ed",
         feature_compute_version=5,
-        label_policy_id="label_policy_v4_abc",
+        label_policy_id="label_policy_v5_abc",
         contract_digest=CONTRACT.digest(),
     )
 
@@ -62,7 +62,7 @@ def _stage(stage="hard_eligibility", kind=KIND_HARD_GATE, *, inputs=5, advanced=
         "contract": CONTRACT,
         "model_identity": _identity(),
         "feature_compute_version": 5,
-        "label_policy_id": "label_policy_v4_abc",
+        "label_policy_id": "label_policy_v5_abc",
         "features_used": ["avg_turnover_20", "float_market_cap"],
     }
     payload.update(overrides)

@@ -6,9 +6,8 @@
 
 只记**报告里真的存在**的东西，三条不糊弄的规矩：
 
-1. 逐只拒绝原因夜扫确实没记（NOTE-002 D11），被淘汰的股票统一挂在
-   ``night_truncation_reason_not_recorded`` 下。这不是补齐，是把缺口以可读形式留在证据里；
-   视图据此仍判这层"原因不可用"，不会假装能回答原因分布。
+1. 新报告读取筛选器当时产生的 ``selection_evidence``；旧报告缺逐只原因时仍挂在
+   ``night_truncation_reason_not_recorded`` 下，不根据后来看到的分数补编历史原因。
 2. 下一层成员不是上一层子集时（板块配额 pinned 注入会造成），不谎称上层规模：
    ``inputs`` 取**两层成员并集**，``notes`` 里点名越界符号。计数恒等式
    ``inputs == advanced + dropped`` 因此仍成立，且每个数都有明确定义。
@@ -18,6 +17,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime
 from typing import Any
@@ -31,6 +31,7 @@ from stock_analyzer.research.funnel_trace import (
     KIND_HARD_GATE,
     KIND_PREDICTIVE,
     FunnelTrace,
+    FunnelTraceError,
     build_funnel_trace,
     record_stage,
 )
@@ -45,6 +46,55 @@ LAYER_FIELDS = (
     ("deep_50", ("deep_stage", "selected")),
 )
 NIGHT_TRACE_SUFFIX = "night"
+
+
+def _evidence_symbols(value: Any, *, layer: str) -> list[str]:
+    """新格式必须保留唯一证券键；错误载荷不能被去重后伪装成有效证据。"""
+    if (not isinstance(value, Sequence) or isinstance(value, (str, bytes))
+            or any(not isinstance(s, str) or not s.strip() for s in value)):
+        raise FunnelTraceError(f"{layer}: invalid selection evidence symbol list")
+    symbols = [s.strip() for s in value]
+    if len(symbols) != len(set(symbols)):
+        raise FunnelTraceError(f"{layer}: duplicate selection evidence symbol")
+    return symbols
+
+
+def _selection_evidence(report: Mapping[str, Any], *, layer: str) -> Mapping[str, Any]:
+    """兼容生产包装后的 source_report；来源与外层成员不一致时拒绝留档。"""
+    for scan in (report, report.get("source_report")):
+        if not isinstance(scan, Mapping):
+            continue
+        node: Any = scan.get("prefilter")
+        for key in dict(LAYER_FIELDS)[layer][:-1]:
+            node = node.get(key) if isinstance(node, Mapping) else None
+        if not isinstance(node, Mapping) or "selection_evidence" not in node:
+            continue
+        evidence = node["selection_evidence"]
+        if not isinstance(evidence, Mapping) or evidence.get("version") != 1:
+            raise FunnelTraceError(f"{layer}: unsupported selection evidence version")
+        if int(evidence.get("unidentified_input_rows", 0)):
+            raise FunnelTraceError(f"{layer}: unidentified selection evidence input")
+        if scan is not report and set(_layer_symbols(scan["prefilter"], layer)) != set(
+            _layer_symbols(report["prefilter"], layer)
+        ):
+            raise FunnelTraceError(f"{layer}: source_report membership mismatch")
+        return evidence
+    return {}
+
+
+def _evidence_predictions(
+    evidence: Mapping[str, Any], key: str, *, layer: str, inputs: set[str],
+) -> dict[str, float]:
+    values = evidence.get(key, {})
+    if not isinstance(values, Mapping):
+        raise FunnelTraceError(f"{layer}: invalid {key}")
+    predictions: dict[str, float] = {}
+    for symbol, value in values.items():
+        probability = float(value)
+        if symbol not in inputs or not math.isfinite(probability) or not 0 <= probability <= 1:
+            raise FunnelTraceError(f"{layer}: invalid {key} for {symbol}")
+        predictions[str(symbol)] = probability
+    return predictions
 
 
 def _symbols(value: Any) -> list[str]:
@@ -328,46 +378,81 @@ def build_night_scan_funnel_trace(
     if not isinstance(prefilter, Mapping):
         return None
     members = {layer: _layer_symbols(prefilter, layer) for layer, _ in LAYER_FIELDS}
-    if not any(members.values()):
-        return None
 
     day = _as_day(trade_date)
     data_as_of = str(report.get("data_snapshot_id") or report.get("timestamp")
                      or report.get("scan_completed_at") or day.isoformat())
     features = tuple(str(name) for name in features_used)
 
+    universe_stages = build_universe_stage_traces(
+        universe=universe, data_as_of=data_as_of, contract=contract,
+        model_identity=model_identity,
+    )
+    evidence_by_layer = {
+        layer: _selection_evidence(report, layer=layer) for layer, _ in LAYER_FIELDS
+    }
+    if (not any(members.values()) and not universe_stages
+            and not any(e.get("input_symbols") for e in evidence_by_layer.values())):
+        return None
     stages = []
-    previous: list[str] = []
+    previous = list(universe_stages[-1].advanced_symbols) if universe_stages else []
     for layer, _ in LAYER_FIELDS:
+        evidence = evidence_by_layer[layer]
+        recorded_inputs = (
+            _evidence_symbols(evidence.get("input_symbols"), layer=layer) if evidence else []
+        )
         current = members[layer]
         current_set = set(current)
-        dropped = [symbol for symbol in previous if symbol not in current_set]
         outside = sorted(symbol for symbol in current if symbol not in set(previous))
-        # 第一层没有上一层可比，inputs 就是本层成员（没有淘汰可记）。
-        pool = sorted(set(previous) | set(current)) if previous else current
+        # Quality 的上游是完整硬门合格池，不能从已经截断后的 300 只开始计数。
+        pool = sorted(set(previous) | set(recorded_inputs) | current_set)
+        dropped = set(pool) - current_set
+        rejected: dict[str, list[str]] = {}
+        attributed: set[str] = set()
+        raw_rejected = evidence.get("rejected_by_reason", {})
+        if not isinstance(raw_rejected, Mapping):
+            raise FunnelTraceError(f"{layer}: invalid rejection evidence")
+        for reason, values in raw_rejected.items():
+            symbols = _evidence_symbols(values, layer=layer)
+            if not str(reason).strip() or not set(symbols).issubset(set(recorded_inputs)):
+                raise FunnelTraceError(f"{layer}: rejection outside recorded inputs")
+            if set(symbols) & current_set or set(symbols) & attributed:
+                raise FunnelTraceError(f"{layer}: contradictory rejection evidence")
+            if symbols:
+                rejected[str(reason)] = symbols
+                attributed.update(symbols)
+        missing = sorted(dropped - attributed)
+        if missing:
+            rejected[NIGHT_UNATTRIBUTED_DROP] = missing
         notes = ""
         if previous and outside:
             notes = (
                 f"membership_not_nested: {','.join(outside)[:400]} 不在上一层成员里"
                 "（板块配额/pinned 注入）；inputs 已按两层成员并集计"
             )
+        if evidence:
+            notes += " selection_evidence_version=1"
+            if evidence.get("prediction_semantics"):
+                notes += f" {evidence['prediction_semantics']}"
         stages.append(record_stage(
             stage=layer,
             kind=KIND_PREDICTIVE,
             input_symbols=pool,
             advanced_symbols=current,
-            rejected={NIGHT_UNATTRIBUTED_DROP: dropped} if dropped else {},
+            rejected=rejected,
             features_used=features,
+            raw_predictions=_evidence_predictions(
+                evidence, "raw_predictions", layer=layer, inputs=set(recorded_inputs),
+            ),
+            calibrated_probabilities=_evidence_predictions(
+                evidence, "calibrated_probabilities", layer=layer, inputs=set(recorded_inputs),
+            ),
             data_as_of=data_as_of,
             contract=contract,
             model_identity=model_identity,
             notes=notes,
         ))
         previous = current
-    universe_stages = build_universe_stage_traces(
-        universe=universe, data_as_of=data_as_of, contract=contract,
-        model_identity=model_identity,
-    )
     return build_funnel_trace(
         trade_date=day, stages=[*universe_stages, *stages], contract=contract
     )

@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import date, timedelta
@@ -99,6 +100,137 @@ FEATURE_COLUMNS: tuple[str, ...] = (
 
 def _parse_date(value: str) -> date:
     return date.fromisoformat(str(value).strip())
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def apply_st_snapshot_overlay(
+    panel: pd.DataFrame,
+    *,
+    snapshots_path: Path | str,
+    report_path: Path | str,
+    decision_days: Iterable[date],
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Use complete, hash-bound daily Tushare ST snapshots for the covered sessions.
+
+    The source rows are full-market snapshots. On covered dates they replace the
+    panel's historical ``is_st`` bit exactly; outside the declared dates the source
+    panel remains untouched. Neither input file or source database is modified.
+    """
+    rows_path = Path(str(snapshots_path)).expanduser().resolve()
+    report_file = Path(str(report_path)).expanduser().resolve()
+    if not rows_path.is_file() or not report_file.is_file():
+        raise ValueError("ST snapshots and collection report must both exist")
+    report = json.loads(report_file.read_text(encoding="utf-8"))
+    if (
+        report.get("schema") != "tail_st_snapshot_collection.v1"
+        or report.get("source") != "tushare_stock_st_trade_date"
+        or report.get("coverage_complete") is not True
+    ):
+        raise ValueError("ST snapshot report is unsupported or incomplete")
+    if _sha256_file(rows_path) != str(report.get("output_sha256") or ""):
+        raise ValueError("ST snapshot output hash differs from its report")
+
+    raw_days = report.get("decision_days")
+    date_responses = report.get("date_responses")
+    if not isinstance(raw_days, list) or not isinstance(date_responses, dict):
+        raise ValueError("ST snapshot report is missing date-level evidence")
+    report_days = [str(item) for item in raw_days]
+    if report_days != sorted(set(report_days)) or set(date_responses) != set(report_days):
+        raise ValueError("ST snapshot report dates are malformed")
+    expected_days = {item.strftime("%Y%m%d") for item in decision_days}
+    if not expected_days or not expected_days <= set(report_days):
+        raise ValueError("ST snapshots do not cover every replay decision session")
+    for day, response in date_responses.items():
+        if not isinstance(response, dict) or response.get("complete") is not True:
+            raise ValueError(f"ST snapshot date is incomplete: {day}")
+        response_hash = str(response.get("response_sha256") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", response_hash):
+            raise ValueError(f"ST snapshot response hash is malformed: {day}")
+        if not 0 <= int(response.get("rows_returned", -1)) < 1_000:
+            raise ValueError(f"ST snapshot response row count is invalid: {day}")
+        if response.get("error") not in (None, ""):
+            raise ValueError(f"ST snapshot date has an error: {day}")
+
+    snapshots = pd.read_csv(
+        rows_path,
+        dtype={
+            "symbol": "string", "ts_code": "string", "trade_date": "string",
+            "source": "string", "as_of": "string", "response_sha256": "string",
+        },
+        keep_default_na=False,
+    )
+    required = {
+        "symbol", "ts_code", "trade_date", "source", "as_of", "response_sha256"
+    }
+    if not required <= set(snapshots.columns):
+        raise ValueError("ST snapshot CSV is missing required fields")
+    snapshots["symbol"] = snapshots["symbol"].astype(str).str.zfill(6)
+    if snapshots.duplicated(["symbol", "trade_date"]).any():
+        raise ValueError("ST snapshot CSV contains duplicate symbol dates")
+    if not snapshots["symbol"].str.fullmatch(r"\d{6}").all():
+        raise ValueError("ST snapshot CSV contains invalid symbols")
+    if not snapshots["ts_code"].str.fullmatch(r"\d{6}\.(?:SH|SZ|BJ)").all():
+        raise ValueError("ST snapshot CSV contains invalid Tushare codes")
+    if not snapshots.apply(
+        lambda row: row["ts_code"].split(".", 1)[0] == row["symbol"], axis=1
+    ).all():
+        raise ValueError("ST snapshot symbol and Tushare code disagree")
+    if not snapshots["source"].eq("tushare_stock_st_trade_date").all():
+        raise ValueError("ST snapshot CSV contains an unexpected source")
+    if not snapshots["trade_date"].isin(report_days).all():
+        raise ValueError("ST snapshot CSV contains an out-of-scope date")
+    for day, group in snapshots.groupby("trade_date", sort=False):
+        response = date_responses[str(day)]
+        if len(group) != int(response["rows_returned"]):
+            raise ValueError(f"ST snapshot row count differs from report: {day}")
+        if not group["response_sha256"].eq(response["response_sha256"]).all():
+            raise ValueError(f"ST snapshot response hash differs from report: {day}")
+        if not group["as_of"].eq(response["as_of"]).all():
+            raise ValueError(f"ST snapshot response time differs from report: {day}")
+    returned_counts = snapshots.groupby("trade_date").size().to_dict()
+    for day, response in date_responses.items():
+        if int(response["rows_returned"]) != int(returned_counts.get(day, 0)):
+            raise ValueError(f"ST snapshot date row count differs from report: {day}")
+
+    result = panel.copy()
+    result["date"] = pd.to_datetime(result["date"]).dt.date
+    overlay_days = {date.fromisoformat(day[:4] + "-" + day[4:6] + "-" + day[6:])
+                    for day in expected_days}
+    st_by_day = {
+        day: set(group["symbol"].astype(str))
+        for day, group in snapshots.loc[
+            snapshots["trade_date"].isin(expected_days)
+        ].groupby("trade_date", sort=False)
+    }
+    covered = result["date"].isin(overlay_days)
+    covered_symbols = result.loc[covered, "symbol"]
+    covered_dates = result.loc[covered, "date"]
+    result.loc[covered, "is_st"] = [
+        str(symbol).split(".")[0].zfill(6) in st_by_day.get(day.strftime("%Y%m%d"), set())
+        for symbol, day in zip(covered_symbols, covered_dates, strict=True)
+    ]
+    provenance = {
+        "source": report["source"],
+        "collector_sha256": report.get("collector_sha256"),
+        "snapshots_path": str(rows_path),
+        "snapshots_sha256": _sha256_file(rows_path),
+        "report_path": str(report_file),
+        "report_sha256": _sha256_file(report_file),
+        "request_sha256": report.get("requests_sha256"),
+        "calendar_sha256": report.get("calendar_sha256"),
+        "decision_days": sorted(expected_days),
+        "snapshot_rows": int(len(snapshots)),
+        "panel_rows_overlaid": int(covered.sum()),
+        "date_responses": {day: date_responses[day] for day in sorted(expected_days)},
+    }
+    return result, provenance
 
 
 def _suffix(symbol: str) -> str:
@@ -373,6 +505,7 @@ def _universe_fact(
     delisting_verified: bool,
     non_evaluable_gates: Sequence[str] = (),
     rules_run: Sequence[str] = (),
+    security_status_evidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """一个决策日的**符号级** universe / hard_eligibility 事实（计划 §2 前两层）。
 
@@ -398,7 +531,7 @@ def _universe_fact(
         # 消融实验也会漏掉它。
         raise SystemExit(f"硬门留档里出现非 HARD 规则名: {undeclared}")
     universe = sorted(set(considered))
-    return {
+    result = {
         "decision_date": decision_date.isoformat(),
         "as_of": decision_date.isoformat(),
         "universe_snapshot_id": f"replay:{Path(str(warehouse)).name}:{decision_date.isoformat()}",
@@ -420,6 +553,9 @@ def _universe_fact(
         "feature_contract_version": TREND_FEATURE_CONTRACT_VERSION,
         "float_cap_interpretation_version": FLOAT_CAP_INTERPRETATION_VERSION,
     }
+    if security_status_evidence is not None:
+        result["security_status_evidence"] = dict(security_status_evidence)
+    return result
 
 
 def daily_gates(
@@ -480,6 +616,51 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         panel, cap_reference = apply_float_cap_reference(panel, args.float_cap_ref_db)
     if panel.empty:
         raise SystemExit("no daily bars in the requested window — 先确认符号清单与仓库路径")
+    st_snapshots = str(getattr(args, "st_snapshots", "") or "").strip()
+    st_report = str(getattr(args, "st_report", "") or "").strip()
+    if bool(st_snapshots) != bool(st_report):
+        raise SystemExit("--st-snapshots and --st-report must be provided together")
+    st_provenance: dict[str, Any] = {}
+    st_decision_days: list[date] = []
+    if st_snapshots:
+        available_panel_days = {
+            item for item in panel.loc[
+                (panel["date"] >= start) & (panel["date"] <= end), "date"
+            ]
+        }
+        try:
+            st_report_payload = json.loads(
+                Path(st_report).expanduser().read_text(encoding="utf-8")
+            )
+            raw_status_days = st_report_payload.get("decision_days")
+            if not isinstance(raw_status_days, list):
+                raise ValueError("ST report has no decision-day list")
+            st_decision_days = [
+                date.fromisoformat(f"{item[:4]}-{item[4:6]}-{item[6:]}")
+                for item in raw_status_days
+                if isinstance(item, str)
+                and re.fullmatch(r"\d{8}", item)
+                and start <= date.fromisoformat(f"{item[:4]}-{item[4:6]}-{item[6:]}") <= end
+            ]
+            if not st_decision_days or len(st_decision_days) != len(set(st_decision_days)):
+                raise ValueError("ST report has no unique decision days in replay range")
+            missing_status_days = sorted(set(st_decision_days) - available_panel_days)
+            if missing_status_days:
+                raise ValueError(
+                    "ST decision days have no market rows: "
+                    + ",".join(item.isoformat() for item in missing_status_days)
+                )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"ST snapshot scope rejected: {exc}") from exc
+        try:
+            panel, st_provenance = apply_st_snapshot_overlay(
+                panel,
+                snapshots_path=st_snapshots,
+                report_path=st_report,
+                decision_days=st_decision_days,
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"ST snapshot overlay rejected: {exc}") from exc
     benchmark = load_benchmark(warehouse, args.benchmark_code, start, end)
     engineered = build_features(panel, benchmark)
     # 日内两列：分钟库就位就真算，拿不到就整列不出现在帧里（不是填 0、也不是留 NaN 占位）。
@@ -533,7 +714,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     gate_totals: dict[str, int] = {}
     day_stats: list[dict[str, Any]] = []
     universe_facts: list[dict[str, Any]] = []
-    dates = [item for item in calendar if start <= item <= end]
+    st_date_set = set(st_decision_days)
+    dates = [item for item in calendar if start <= item <= end
+             and (not st_provenance or item in st_date_set)]
+    if st_provenance and set(dates) != st_date_set:
+        raise SystemExit("ST snapshot sessions do not align with replay decision sessions")
     date_index = {item: position for position, item in enumerate(calendar)}
     for decision_date in dates:
         rows = engineered.loc[engineered["date"] == decision_date].copy()
@@ -602,6 +787,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             rules_run=list(gates) + ([PIT_REJECT_REASON] if pit_excluded else []),
             coverage=str(args.survivorship_coverage),
             delisting_verified=bool(int(args.delisting_coverage_verified)),
+            security_status_evidence=(
+                {
+                    "source": st_provenance["source"],
+                    "snapshots_sha256": st_provenance["snapshots_sha256"],
+                    "report_sha256": st_provenance["report_sha256"],
+                    "response": st_provenance["date_responses"][
+                        decision_date.strftime("%Y%m%d")
+                    ],
+                }
+                if st_provenance else None
+            ),
         ))
 
     if not requests:
@@ -630,6 +826,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "feature_contract_version": TREND_FEATURE_CONTRACT_VERSION,
         "warehouse": str(warehouse),
         "universe_input_provenance": symbols_file_facts(args.symbols_file),
+        "security_status_overlay": st_provenance,
         "float_cap_reference": cap_reference,
         "benchmark_code": str(args.benchmark_code),
         "benchmark_available": bool(not benchmark.empty),
@@ -708,6 +905,16 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="独立补采的市值真值库（float_market_cap_ref）；不给就按仓库原值跑，"
              "占位行会被记成 unproven_float_market_cap 并让这两天不落档",
+    )
+    parser.add_argument(
+        "--st-snapshots",
+        default="",
+        help="完整 Tushare stock_st(trade_date) CSV；给出时按覆盖日期替换历史 is_st 位",
+    )
+    parser.add_argument(
+        "--st-report",
+        default="",
+        help="与 --st-snapshots 配套的 hash-bound collector report.json",
     )
     parser.add_argument("--report", default="artifacts/research/tail_replay_report.json")
     parser.add_argument("--benchmark-code", default="000300.SH")

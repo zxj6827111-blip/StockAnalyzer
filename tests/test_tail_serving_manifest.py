@@ -100,7 +100,7 @@ def test_build_refuses_unverifiable_identity_inputs(tmp_path: Path) -> None:
         _manifest(tmp_path, artifact_path=tmp_path / "gone.json")
     with pytest.raises(TailManifestError, match="challenger"):
         _manifest(tmp_path, status="champion")
-    with pytest.raises(TailManifestError, match="label_policy_v4"):
+    with pytest.raises(TailManifestError, match="label_policy_v5"):
         _manifest(tmp_path, artifact=_artifact(tmp_path, label_policy_id="label_policy_v2_soup"))
     # 工件是按另一套 TP/SL 训练的，就不是这条链路的模型。
     other = TrendStrategyContract(take_profit_pct=0.10)
@@ -133,7 +133,7 @@ def test_verify_names_every_kind_of_identity_break(tmp_path: Path) -> None:
         "model_id": ({"identity": {"training_code_commit": COMMIT}}, "model_id_missing"),
         "commit": ({"identity": {"model_id": "m", "training_code_commit": "unknown"}},
                    "training_commit_unverified"),
-        "label": ({"label": {"label_policy_id": "label_policy_v1_x"}}, "label_policy_not_v4"),
+        "label": ({"label": {"label_policy_id": "label_policy_v1_x"}}, "label_policy_not_v5"),
         "probability": ({"serving": {"probability_field": "p_meta"}},
                         "probability_field_mismatch"),
     }

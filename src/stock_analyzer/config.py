@@ -379,7 +379,7 @@ class TrendStrategyConfig(_StrictModel):
     由 ``contract_from_config()`` 直接构造；契约自身做 fail-closed 校验。
     """
 
-    contract_version: str = "trend_tail_v1"
+    contract_version: str = "trend_tail_v2"
     strategy: str = "trend"
     timezone: str = "Asia/Shanghai"
     entry_window_start: str = "14:30"

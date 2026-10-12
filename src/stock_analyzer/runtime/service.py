@@ -6877,6 +6877,8 @@ class StockAnalyzerService:
     def _prefilter_week5_from_snapshot_row(
         self,
         row: object,
+        *,
+        rejection_reasons: list[str] | None = None,
     ) -> dict[str, object] | None:
         """Light-stage scoring from one feature-snapshot row.
 
@@ -6889,17 +6891,27 @@ class StockAnalyzerService:
             # 避免每行重建 pd.Series 的开销。
             data = row if isinstance(row, dict) else pd.Series(row)
         except Exception:
+            if rejection_reasons is not None:
+                rejection_reasons.append("snapshot_row_invalid")
             return None
         symbol = str(data.get("symbol", "")).strip()
         normalized = _normalize_a_share_symbol(symbol)
         if not normalized:
+            if rejection_reasons is not None:
+                rejection_reasons.append("invalid_symbol")
             return None
         exchange = _exchange_from_a_share_symbol(normalized)
         if _coerce_bool(data.get("suspended", False)):
+            if rejection_reasons is not None:
+                rejection_reasons.append("suspended")
             return None
         if _coerce_bool(data.get("is_st", False)) or _coerce_bool(
             data.get("is_delisting_risk", False)
         ):
+            if rejection_reasons is not None:
+                rejection_reasons.append(
+                    "is_st" if _coerce_bool(data.get("is_st", False)) else "is_delisting_risk"
+                )
             return None
 
         latest_close = _as_float(data.get("latest_close"), default=0.0)
@@ -7070,16 +7082,34 @@ class StockAnalyzerService:
         """Funnel light stage: rank the snapshot universe by baseline score."""
         candidates: list[dict[str, object]] = []
         skipped = 0
+        input_symbols: list[str] = []
+        rejected_by_reason: dict[str, list[str]] = {}
+        unidentified_input_rows = 0
         # records 顺序稳定迭代（DataFrame 行序），dict 直达避免 iterrows 的
         # 每行 pd.Series 装箱开销；评分公式/舍入/排序键与旧实现完全一致。
         for row in frame.to_dict("records"):
-            candidate = self._prefilter_week5_from_snapshot_row(row)
+            raw_value = row.get("symbol", "")
+            raw_symbol = "" if pd.isna(raw_value) else str(raw_value).strip()
+            symbol = _normalize_a_share_symbol(raw_symbol) or raw_symbol
+            if symbol:
+                input_symbols.append(symbol)
+            else:
+                unidentified_input_rows += 1
+            rejection_reasons: list[str] = []
+            candidate = self._prefilter_week5_from_snapshot_row(
+                row, rejection_reasons=rejection_reasons,
+            )
             if candidate is None:
                 skipped += 1
+                if symbol:
+                    rejected_by_reason.setdefault(
+                        rejection_reasons[0] if rejection_reasons else "snapshot_score_unavailable", []
+                    ).append(symbol)
                 continue
             exchange = str(candidate.get("exchange", "")).strip()
             if allowed_exchanges and exchange and exchange not in allowed_exchanges:
                 skipped += 1
+                rejected_by_reason.setdefault("out_of_board_scope", []).append(symbol)
                 continue
             candidates.append(candidate)
         ranked = sorted(
@@ -7091,6 +7121,9 @@ class StockAnalyzerService:
             ),
         )
         shortlisted = ranked[: max(1, int(target))]
+        rejected_by_reason["light_rank_capacity"] = [
+            str(item["symbol"]) for item in ranked[len(shortlisted):]
+        ]
         return {
             "enabled": True,
             "applied": True,
@@ -7100,6 +7133,13 @@ class StockAnalyzerService:
             "skipped_count": skipped,
             "shortlisted_count": len(shortlisted),
             "shortlisted": shortlisted,
+            "selection_evidence": {
+                "version": 1,
+                "input_symbols": input_symbols,
+                "unidentified_input_rows": unidentified_input_rows,
+                "rejected_by_reason": rejected_by_reason,
+                "ranked_candidates": ranked,
+            },
         }
 
     def _deep_stage_from_snapshot(
@@ -7124,6 +7164,10 @@ class StockAnalyzerService:
                 "light_shortlist_count": 0,
                 "snapshot_match_rows": 0,
                 "model_prediction_degraded": False,
+                "selection_evidence": {
+                    "version": 1, "input_symbols": [], "rejected_by_reason": {},
+                    "ranked_candidates": [],
+                },
             }
         symbols = [
             str(item.get("symbol", "")).strip() for item in shortlisted if str(item.get("symbol"))
@@ -7144,6 +7188,7 @@ class StockAnalyzerService:
         ]
         probabilities: dict[str, list[float]] | None = None
         raw_probabilities: dict[str, list[float]] | None = None
+        raw_outputs_recorded = False
         predictor = getattr(self._pipeline, "_predictor", None)
         if predictor is not None and callable(getattr(predictor, "predict_rows", None)):
             try:
@@ -7153,6 +7198,7 @@ class StockAnalyzerService:
                     probabilities = {
                         key: raw_probabilities[key] for key in ("lgbm", "xgb", "meta")
                     }
+                    raw_outputs_recorded = True
                 else:
                     # 旧接口 predictor：两族同值，effective_source 会退回 calibrated。
                     probabilities = predictor.predict_rows(rows[feature_columns])
@@ -7187,6 +7233,8 @@ class StockAnalyzerService:
 
         selected: list[dict[str, object]] = []
         cross_review_passed = 0
+        raw_predictions: dict[str, float] = {}
+        calibrated_probabilities: dict[str, float] = {}
         # 预构建行位置映射：predict_rows 行序与 rows 输入行序严格一致，
         # 用 dict 查找替代循环内 list(rows.index).index 的 O(n²) 扫描。
         # setdefault 保证重复索引取首次命中，与旧 list.index() 行为完全一致。
@@ -7198,12 +7246,17 @@ class StockAnalyzerService:
             light = by_symbol.get(symbol)
             if light is None:
                 continue
+            position = position_by_index[index]
             lgbm = xgb = meta = 0.5
             if probabilities is not None:
-                position = position_by_index[index]
                 lgbm = float(probabilities["lgbm"][position])
                 xgb = float(probabilities["xgb"][position])
                 meta = float(probabilities["meta"][position])
+                calibrated_probabilities[symbol] = meta
+            # 降级到默认 0.5 不是模型预测；旧接口也不能冒充校准前输出。
+            if (raw_outputs_recorded and raw_probabilities is not None
+                    and "raw_blend" in raw_probabilities):
+                raw_predictions[symbol] = float(raw_probabilities["raw_blend"][position])
             cross_review = evaluate_cross_review(
                 lgbm_prob=lgbm,
                 xgb_prob=xgb,
@@ -7250,6 +7303,7 @@ class StockAnalyzerService:
             )
         )
         capped = selected[: max(1, int(target))]
+        matched_symbols = {str(item["symbol"]) for item in selected}
         return {
             "applied": True,
             "mode": "snapshot_deep",
@@ -7262,6 +7316,22 @@ class StockAnalyzerService:
             "light_shortlist_count": len(shortlisted),
             "snapshot_match_rows": len(rows),
             "model_prediction_degraded": probabilities is None,
+            "selection_evidence": {
+                "version": 1,
+                "input_symbols": symbols,
+                "rejected_by_reason": {
+                    "feature_snapshot_missing": [
+                        symbol for symbol in symbols if symbol not in matched_symbols
+                    ],
+                    "deep_rank_capacity": [
+                        str(item["symbol"]) for item in selected[len(capped):]
+                    ],
+                },
+                "ranked_candidates": selected,
+                "raw_predictions": raw_predictions,
+                "calibrated_probabilities": calibrated_probabilities,
+                "prediction_semantics": "raw=raw_blend; calibrated=meta; fallback_not_a_prediction",
+            },
         }
 
     def _final_signal_selector(

@@ -40,6 +40,7 @@ def test_placeholder_rows_get_real_caps_and_uncovered_rows_keep_their_value(tmp_
     assert out["float_market_cap"].tolist() == [5e9, 5e9, PLACEHOLDER]
     assert list(out.columns) == ["symbol", "date", "float_market_cap"]
     assert stats["rows_with_reference"] == 2
+    assert stats["pit_status"] == "not_certified"
     assert stats["rows_replaced_from_placeholder"] == 1
     assert stats["rows_left_placeholder_without_reference"] == 1
     # 门能否判定看占位比例：替换前 2/3、替换后 1/3，这个翻转就是"市值门重新判得动"的形式。

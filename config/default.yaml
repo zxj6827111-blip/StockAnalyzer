@@ -273,7 +273,7 @@ soup_strategy:
 # 的 contract_from_config()。线上推荐、训练标签、历史验证三方都从这里取口径，
 # 不再各自硬编码。审计函数会把仍与本页冲突的旧声明逐条列出来。
 trend_strategy:
-  contract_version: trend_tail_v1
+  contract_version: trend_tail_v2
   strategy: trend
   timezone: Asia/Shanghai
   entry_window_start: "14:30"

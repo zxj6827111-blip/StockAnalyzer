@@ -28,6 +28,7 @@ from stock_analyzer.research.minute_bar_store import MinuteBarStore
 from stock_analyzer.research.tail_rebuild import (
     RebuildRequest,
     TailRebuildError,
+    TailRebuildOutcome,
     rebuild_tail_label,
     rebuild_tail_labels,
     summarize_rebuild,
@@ -46,9 +47,9 @@ ALWAYS_CONFIRM = lambda context: (True, "")  # noqa: E731
 
 
 def _minute_frame(*, fill_open: float = 10.05) -> pd.DataFrame:
-    """入场日 14:25–14:35 的 1 分钟 bar（bar 终点即完成时刻）。"""
+    """入场日 14:25–14:50 的 1 分钟 bar（bar 终点即完成时刻）。"""
     rows = []
-    for minute in range(25, 36):
+    for minute in range(25, 51):
         price = 10.00 if minute <= 30 else fill_open
         rows.append({
             "symbol": _SYMBOL,
@@ -56,6 +57,29 @@ def _minute_frame(*, fill_open: float = 10.05) -> pd.DataFrame:
             "open": price, "high": price + 0.02, "low": price - 0.02, "close": price,
             "volume": 1e5, "amount": price * 1e5,
         })
+    return pd.DataFrame(rows)
+
+
+def _exit_minute_frame() -> pd.DataFrame:
+    """完整的 vendor bar_end 交易日，用于验证出场只消费 RAW 分钟价。"""
+    times = [datetime(2000, 1, 1, 9, 30)]
+    times.extend(datetime(2000, 1, 1, 9, minute) for minute in range(31, 60))
+    times.extend(datetime(2000, 1, 1, 10, minute) for minute in range(60))
+    times.extend(datetime(2000, 1, 1, 11, minute) for minute in range(31))
+    times.extend(datetime(2000, 1, 1, 13, minute) for minute in range(1, 60))
+    times.extend(datetime(2000, 1, 1, 14, minute) for minute in range(60))
+    times.append(datetime(2000, 1, 1, 15, 0))
+    prices = {SESSIONS[1]: 10.20, SESSIONS[2]: 10.30,
+              SESSIONS[3]: 10.45, SESSIONS[4]: 10.60}
+    rows = []
+    for day, price in prices.items():
+        for stamp in times:
+            bar_time = datetime(day.year, day.month, day.day, stamp.hour, stamp.minute)
+            rows.append({
+                "symbol": _SYMBOL, "bar_time": bar_time,
+                "open": price, "high": price, "low": price, "close": price,
+                "volume": 1e5, "amount": price * 1e5,
+            })
     return pd.DataFrame(rows)
 
 
@@ -69,11 +93,12 @@ def _seed(
     approximated: bool = False,
     declare_status: bool = True,
     fill_open: float = 10.05,
+    action_coverage: bool = True,
 ) -> Path:
     """写一个"五类参考数据齐 + 分钟齐"的研究库，按需抽掉某一样来触发不足分支。"""
     path = tmp_path / "research.duckdb"
     with TailReferenceStore(path) as store:
-        store.upsert_calendar(SESSIONS, as_of=_AS_OF)
+        store.upsert_calendar([DECISION, *SESSIONS], as_of=_AS_OF)
         if bars:
             days = [day for day in SESSIONS if day != drop_day]
             # 逐日抬价：入场 10.05，第 5 日收盘 10.60 → 未触及 +8% / -5%。
@@ -108,10 +133,26 @@ def _seed(
             for row in statuses:
                 row["trade_status"] = "normal"
         store.upsert_suspend_status(pd.DataFrame(statuses), as_of=_AS_OF)
+        if action_coverage:
+            store.upsert_corporate_action_coverage(
+                pd.DataFrame([
+                    {"ex_date": day, "coverage_complete": True,
+                     "rows_returned": 0, "truncated": False}
+                    for day in SESSIONS
+                ]),
+                source="test_fixture", as_of=_AS_OF,
+            )
+        store.upsert_adj_factors(pd.DataFrame([
+            {"symbol": _SYMBOL, "trade_date": day, "adj_factor": 1.0,
+             "coverage_complete": True}
+            for day in [DECISION, *SESSIONS]
+        ]), source="test_adj_factor", as_of=_AS_OF)
     if minutes:
         with MinuteBarStore(path) as store:
             store.upsert_frame(
-                _minute_frame(fill_open=fill_open), interval="1m",
+                pd.concat([
+                    _minute_frame(fill_open=fill_open), _exit_minute_frame(),
+                ], ignore_index=True), interval="1m",
                 price_basis="raw", bar_time_semantics="bar_end", source="vendor_zip",
             )
     return path
@@ -168,6 +209,103 @@ def test_suspend_flag_from_the_reference_store_blocks_the_fill(tmp_path) -> None
     assert record.filled is False and record.reason == "suspended"
 
 
+def test_verified_suspension_with_zero_volume_vendor_rows_is_not_a_minute_conflict(
+    tmp_path,
+) -> None:
+    path = _seed(tmp_path)
+    zero_volume_rows = _exit_minute_frame()
+    zero_volume_rows = zero_volume_rows.loc[
+        pd.to_datetime(zero_volume_rows["bar_time"]).dt.date == SESSIONS[1]
+    ].copy()
+    zero_volume_rows["volume"] = 0.0
+    zero_volume_rows["amount"] = 0.0
+    with MinuteBarStore(path) as store:
+        store.upsert_frame(
+            zero_volume_rows, interval="1m", price_basis="raw",
+            bar_time_semantics="bar_end", source="vendor_zip",
+        )
+    with TailReferenceStore(path) as store:
+        store.upsert_suspend_status(
+            pd.DataFrame([{
+                "symbol": _SYMBOL,
+                "trade_date": SESSIONS[1],
+                "suspended": True,
+                "suspend_type": "S",
+                "trade_status": "suspended",
+                "coverage_complete": True,
+            }]),
+            source="tushare_suspend_d",
+            as_of=_AS_OF,
+        )
+
+    outcome = _rebuild(path)
+
+    assert outcome.sufficient is True
+    assert outcome.record is not None
+    assert outcome.record.status == "filled_and_exited"
+    assert outcome.record.reason == ""
+    assert outcome.record.details["suspended_zero_volume_placeholder_days"] == [
+        SESSIONS[1].isoformat()
+    ]
+    assert outcome.detail["raw_minute_session_coverage"][SESSIONS[1].isoformat()][
+        "zero_volume_placeholder"
+    ] is True
+
+
+def test_verified_full_day_suspension_resolves_missing_entry_prices_as_no_fill(tmp_path) -> None:
+    path = _seed(tmp_path, bars=False, minutes=False, limits=False)
+    with TailReferenceStore(path) as store:
+        store.upsert_suspend_status(
+            pd.DataFrame([{
+                "symbol": _SYMBOL,
+                "trade_date": ENTRY,
+                "suspended": True,
+                "suspend_type": "S",
+                "trade_status": "suspended",
+                "coverage_complete": True,
+            }]),
+            source="tushare_suspend_d",
+            as_of=_AS_OF,
+        )
+
+    outcome = _rebuild(path)
+    assert outcome.sufficient is True
+    assert outcome.missing == ()
+    assert outcome.minute_bar_count == 0
+    assert outcome.detail["entry_day_status"] == "verified_full_day_suspension"
+    assert outcome.record is not None
+    assert outcome.record.status == "not_filled"
+    assert outcome.record.reason == "suspended"
+    assert outcome.record.confirmed is False
+    assert outcome.record.filled is False
+    assert outcome.record.trainable is False
+    assert outcome.record.label is None
+    assert outcome.record.net_return is None
+
+
+def test_generic_or_incomplete_suspension_does_not_resolve_entry_price_gap(tmp_path) -> None:
+    path = _seed(tmp_path, bars=False, minutes=False, limits=False)
+    with TailReferenceStore(path) as store:
+        store.upsert_suspend_status(
+            pd.DataFrame([{
+                "symbol": _SYMBOL,
+                "trade_date": ENTRY,
+                "suspended": True,
+                "suspend_type": "S",
+                "trade_status": "suspended",
+                "coverage_complete": False,
+            }]),
+            source="warehouse",
+            as_of=_AS_OF,
+        )
+
+    outcome = _rebuild(path)
+    assert outcome.sufficient is False
+    assert "entry_daily_bar" in outcome.missing
+    assert "entry_day_limit_prices" in outcome.missing
+    assert "entry_minute_bars" in outcome.missing
+
+
 def test_trade_status_from_the_source_is_not_masked_by_a_default(tmp_path) -> None:
     """回归钉：分钟 bar 缺状态列时不能自己填 "normal"，否则日级 "S" 会被吞掉。"""
     path = _seed(tmp_path)
@@ -196,6 +334,32 @@ def test_missing_minute_bars_are_insufficient_and_never_an_open_price_backtest(
     assert outcome.missing == ("entry_minute_bars",)
     assert outcome.record is None          # 连未成交都不算，更不产出盈亏
     assert outcome.minute_bar_count == 0
+
+
+def test_missing_next_bar_inside_entry_window_is_insufficient(tmp_path) -> None:
+    path = _seed(tmp_path, minutes=False)
+    with MinuteBarStore(path) as minutes:
+        frame = _minute_frame().loc[
+            lambda value: value["bar_time"] != datetime(2026, 3, 9, 14, 31)
+        ]
+        minutes.upsert_frame(
+            frame, interval="1m", price_basis="raw", bar_time_semantics="bar_end",
+            source="vendor_zip",
+        )
+    outcome = _rebuild(path)
+    assert outcome.sufficient is False
+    assert outcome.missing == ("entry_minute_window_incomplete",)
+    assert outcome.detail["entry_minute_window_coverage"]["missing_times"] == ["14:31"]
+
+
+def test_missing_corporate_action_coverage_never_emits_a_realized_label(tmp_path) -> None:
+    outcome = _rebuild(_seed(tmp_path, action_coverage=False))
+    record = outcome.record
+    assert outcome.sufficient
+    assert record is not None
+    assert record.status == "uncertain"
+    assert record.trainable is False and record.label is None
+    assert record.reason == "corporate_action_coverage_incomplete"
 
 
 @pytest.mark.parametrize("kwargs,expected", [
@@ -254,10 +418,25 @@ def test_live_and_rebuild_paths_agree_on_identical_bars(tmp_path) -> None:
         bars = minutes.bars_for(
             _SYMBOL, ENTRY, day_limits=reference.day_limits(_SYMBOL, ENTRY)
         )
+        from stock_analyzer.research.tail_rebuild import _load_exit_minute_window
+
+        session_series = reference.daily_bar_series(
+            _SYMBOL, ENTRY, SESSIONS[-1]
+        )
+        exit_bars, exit_sessions, _detail, action_data = _load_exit_minute_window(
+            reference=reference, minutes=minutes,
+            request=RebuildRequest(symbol=_SYMBOL, decision_date=DECISION, entry_date=ENTRY),
+            sessions=session_series["sessions"],
+            missing_limit_days=session_series["missing_limit_price_days"],
+            end=SESSIONS[-1], interval="1m",
+        )
         live = build_tail_net_profit_label(
             symbol=_SYMBOL, decision_date=DECISION, entry_date=ENTRY,
             minute_bars=bars,
-            daily_bars=reference.daily_bar_series(_SYMBOL, ENTRY, SESSIONS[-1])["sessions"],
+            daily_bars=exit_sessions,
+            exit_minute_bars=exit_bars,
+            corporate_actions=action_data["actions"],
+            corporate_action_coverage=action_data["coverage_by_day"],
             confirmation=ALWAYS_CONFIRM,
             # 线上时钟：14:32，此时 14:31 那根已完成且不陈旧（契约 120 秒）。
             quote_as_of=datetime(2026, 3, 9, 14, 32),
@@ -273,6 +452,31 @@ def test_live_and_rebuild_paths_agree_on_identical_bars(tmp_path) -> None:
 def test_request_rejects_an_entry_day_that_is_not_the_next_session(tmp_path) -> None:
     with pytest.raises(TailRebuildError, match="must be after"):
         RebuildRequest(symbol=_SYMBOL, decision_date=ENTRY, entry_date=DECISION)
+
+
+def test_batch_rebuild_uses_symbol_order_internally_but_preserves_result_order(
+    monkeypatch,
+) -> None:
+    from stock_analyzer.research import tail_rebuild
+
+    first = RebuildRequest("600000", date(2026, 3, 9), date(2026, 3, 10))
+    second = RebuildRequest("000001", date(2026, 3, 6), date(2026, 3, 9))
+    third = RebuildRequest("600000", date(2026, 3, 6), date(2026, 3, 9))
+    execution_order: list[RebuildRequest] = []
+
+    def fake_rebuild(**kwargs):
+        request = kwargs["request"]
+        execution_order.append(request)
+        return TailRebuildOutcome(request, True, (), None, 0, 0)
+
+    monkeypatch.setattr(tail_rebuild, "rebuild_tail_label", fake_rebuild)
+    results = rebuild_tail_labels(
+        reference=object(), minutes=object(), requests=[first, second, third],
+        confirmation=ALWAYS_CONFIRM,
+    )
+
+    assert execution_order == [second, third, first]
+    assert [item.request for item in results] == [first, second, third]
 
 
 def test_summary_keeps_gaps_fill_rate_and_labels_apart(tmp_path) -> None:
@@ -299,6 +503,36 @@ def test_summary_keeps_gaps_fill_rate_and_labels_apart(tmp_path) -> None:
     assert summary["fill_rate"] == pytest.approx(0.5)
     assert summary["net_profits"] == 1
     assert summary["rebuild_blocked_on_reference_data"] is True
+
+
+def test_summary_distinguishes_trade_status_gap_requests_symbols_and_days() -> None:
+    requests = [
+        RebuildRequest("000001", date(2026, 3, 2), date(2026, 3, 3)),
+        RebuildRequest("000001", date(2026, 3, 3), date(2026, 3, 4)),
+        RebuildRequest("600000", date(2026, 3, 2), date(2026, 3, 3)),
+    ]
+    undeclared_days = [
+        ["2026-03-05"],
+        ["2026-03-05", "2026-03-06"],
+        ["2026-03-05"],
+    ]
+    outcomes = [
+        TailRebuildOutcome(
+            request=request, sufficient=True, missing=(), record=None,
+            minute_bar_count=0, session_days=0,
+            detail={
+                "trade_status_source_gap": True,
+                "undeclared_trade_status_days": days,
+            },
+        )
+        for request, days in zip(requests, undeclared_days, strict=True)
+    ]
+
+    summary = summarize_rebuild(outcomes)
+
+    assert summary["trade_status_source_gap_requests"] == 3
+    assert summary["trade_status_source_gap_symbols"] == 2
+    assert summary["trade_status_source_gap_symbol_days"] == 3
 
 
 def test_contract_digest_is_recorded_on_every_rebuilt_label(tmp_path) -> None:
@@ -356,15 +590,45 @@ def test_cli_writes_labels_and_exits_zero_when_reference_is_complete(tmp_path) -
     assert payload["confirmation_predicate"].endswith("hard_gate_confirmation")
 
 
+def test_cli_exports_trade_status_source_gaps_separately(tmp_path) -> None:
+    db = _seed(tmp_path, declare_status=False)
+    requests = _requests_file(tmp_path, [{
+        "symbol": _SYMBOL, "decision_date": DECISION.isoformat(),
+        "entry_date": ENTRY.isoformat(),
+    }])
+    labels = tmp_path / "labels.jsonl"
+    status_gaps = tmp_path / "status_gaps.jsonl"
+    report = tmp_path / "report.json"
+    result = _run_cli(
+        tmp_path,
+        ["--requests", str(requests), "--labels", str(labels),
+         "--status-gaps", str(status_gaps), "--report", str(report),
+         "--zero-cost", "--quiet"],
+        db=db,
+    )
+
+    assert result.returncode == 0, result.stderr
+    gap_rows = [json.loads(line) for line in status_gaps.read_text(encoding="utf-8").splitlines()]
+    assert len(gap_rows) == 1
+    assert gap_rows[0]["detail"]["trade_status_source_gap"] is True
+    assert gap_rows[0]["detail"]["undeclared_trade_status_days"]
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    assert payload["reference_gap_records"] == 0
+    assert payload["trade_status_source_gap_records"] == 1
+    assert payload["trade_status_source_gap_output"] == str(status_gaps)
+
+
 def test_cli_exits_three_when_reference_data_is_insufficient(tmp_path) -> None:
     db = _seed(tmp_path, minutes=False)
     requests = _requests_file(tmp_path, [{
         "symbol": _SYMBOL, "decision_date": DECISION.isoformat(), "entry_date": ENTRY.isoformat(),
     }])
     labels = tmp_path / "labels.jsonl"
+    gaps = tmp_path / "gaps.jsonl"
     report = tmp_path / "report.json"
     result = _run_cli(
         tmp_path, ["--requests", str(requests), "--labels", str(labels),
+                   "--gaps", str(gaps),
                    "--report", str(report), "--zero-cost", "--quiet"],
         db=db,
     )
@@ -372,9 +636,13 @@ def test_cli_exits_three_when_reference_data_is_insufficient(tmp_path) -> None:
     assert "参考数据不足" in result.stdout
     # 不足的单列进报告，不进样本流：样本文件必须是空的，而不是"一条未成交"。
     assert labels.read_text(encoding="utf-8").strip() == ""
+    gap_rows = [json.loads(line) for line in gaps.read_text(encoding="utf-8").splitlines()]
+    assert len(gap_rows) == 1
+    assert gap_rows[0]["missing_reference_inputs"] == ["entry_minute_bars"]
     payload = json.loads(report.read_text(encoding="utf-8"))
     assert payload["missing_reference_inputs"] == {"entry_minute_bars": 1}
     assert payload["label_records"] == 0
+    assert payload["reference_gap_records"] == 1
 
 
 def test_cli_rejects_a_malformed_request_line(tmp_path) -> None:

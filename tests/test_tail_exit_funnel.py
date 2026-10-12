@@ -68,7 +68,7 @@ def _record(**overrides) -> TailLabelRecord:
         "contract_version": CONTRACT.contract_version,
         "contract_digest": CONTRACT.digest(),
         "cost_model_version": CONTRACT.cost_model_version,
-        "price_basis": "tail_confirm_next_bar",
+        "price_basis": "tail_confirm_next_bar_raw_minute_exit_v2",
         "holding_days": CONTRACT.holding_days,
         "take_profit_pct": CONTRACT.take_profit_pct,
         "stop_loss_pct": CONTRACT.stop_loss_pct,
@@ -99,7 +99,7 @@ def _row(symbol: str, probability: float = 0.8) -> dict:
         "symbol": symbol,
         "rank": 1,
         "probability": probability,
-        "model_identity": {"identity_recorded": True, "label_policy_id": "label_policy_v4_x",
+        "model_identity": {"identity_recorded": True, "label_policy_id": "label_policy_v5_x",
                            "feature_compute_version": 3},
         "fill": {"filled": True},
     }
@@ -285,7 +285,7 @@ class FakeService:
             "model_id": "trend-tail-lgbm-2026q4",
             "artifact_content_hash": "sha256:abcdef",
             "code_commit": "cafe123",
-            "label_policy_id": "label_policy_v4_07335bbe3d3e",
+            "label_policy_id": "label_policy_v5_07335bbe3d3e",
         }
 
     def _runtime_code_commit(self):

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import math
 from datetime import date
@@ -172,6 +173,83 @@ def test_symbols_file_facts_reads_the_sibling_provenance(tmp_path: Path) -> None
         '{"producer": "build_tail_universe_symbols.py"}', encoding="utf-8")
     assert replay.symbols_file_facts(file)["producer"].startswith(
         "build_tail_universe_symbols.py (provenance=")
+
+
+def _st_snapshot_inputs(tmp_path: Path) -> tuple[Path, Path, str]:
+    import json
+
+    rows_path = tmp_path / "st_snapshots.csv"
+    response_hash = "a" * 64
+    pd.DataFrame([{
+        "symbol": "000001", "ts_code": "000001.SZ", "trade_date": "20260302",
+        "source": "tushare_stock_st_trade_date", "as_of": "2026-10-11T00:16:04+00:00",
+        "response_sha256": response_hash,
+    }]).to_csv(rows_path, index=False)
+    report_path = tmp_path / "report.json"
+    report_path.write_text(json.dumps({
+        "schema": "tail_st_snapshot_collection.v1",
+        "source": "tushare_stock_st_trade_date",
+        "coverage_complete": True,
+        "decision_days": ["20260302"],
+        "date_responses": {
+            "20260302": {
+                "complete": True, "rows_returned": 1, "error": "",
+                "response_sha256": response_hash,
+                "as_of": "2026-10-11T00:16:04+00:00",
+            }
+        },
+        "output_sha256": hashlib.sha256(rows_path.read_bytes()).hexdigest(),
+    }), encoding="utf-8")
+    return rows_path, report_path, response_hash
+
+
+def test_full_st_snapshot_overrides_historical_is_st_only_on_covered_dates(
+    tmp_path: Path,
+) -> None:
+    rows_path, report_path, _response_hash = _st_snapshot_inputs(tmp_path)
+    panel = pd.DataFrame({
+        "symbol": ["600000", "000001", "600000"],
+        "date": [DAY, DAY, date(2026, 3, 3)],
+        # On the covered date, the full-market source must both set and clear stale bits.
+        "is_st": [True, False, True],
+    })
+
+    result, provenance = replay.apply_st_snapshot_overlay(
+        panel,
+        snapshots_path=rows_path,
+        report_path=report_path,
+        decision_days=[DAY],
+    )
+
+    assert result["is_st"].tolist() == [False, True, True]
+    assert provenance["snapshot_rows"] == 1
+    assert provenance["panel_rows_overlaid"] == 2
+    assert provenance["source"] == "tushare_stock_st_trade_date"
+
+
+def test_st_snapshot_overlay_fails_closed_when_one_decision_day_is_missing(
+    tmp_path: Path,
+) -> None:
+    rows_path, report_path, _response_hash = _st_snapshot_inputs(tmp_path)
+    with pytest.raises(ValueError, match="do not cover every replay decision session"):
+        replay.apply_st_snapshot_overlay(
+            pd.DataFrame({"symbol": ["600000"], "date": [DAY], "is_st": [False]}),
+            snapshots_path=rows_path,
+            report_path=report_path,
+            decision_days=[DAY, date(2026, 3, 3)],
+        )
+
+
+def test_st_snapshot_overlay_rejects_modified_csv_hash(tmp_path: Path) -> None:
+    rows_path, report_path, _response_hash = _st_snapshot_inputs(tmp_path)
+    rows_path.write_text(rows_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="output hash differs from its report"):
+        replay.apply_st_snapshot_overlay(
+            pd.DataFrame({"symbol": ["600000"], "date": [DAY], "is_st": [False]}),
+            snapshots_path=rows_path,
+            report_path=report_path,
+            decision_days=[DAY],
+        )
 
 
 def test_every_name_the_replay_can_emit_is_a_declared_hard_rule() -> None:

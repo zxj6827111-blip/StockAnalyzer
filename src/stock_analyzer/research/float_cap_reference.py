@@ -10,6 +10,10 @@
 ``scripts/load_float_market_cap_research.py`` 写入），仓库那些占位行原地不动 ——
 §3.1 要求旧记录保留原始值，占位行本身是缺陷的证据。
 
+这张历史参考表没有保存逐交易日当时的 Tushare 发布快照或可用时间证明。它可用于
+核验占位值和横截面分布；不能单凭该表证明特征在尾盘决策时点可得，也不能据此给
+历史回测宣称完成 PIT 认证。
+
 这里只提供一个动作：把 frame 的 ``float_market_cap`` 在**能对上的 symbol-day** 上换成真值，
 并把"换了多少、对不上多少、两边都声称测过却差出 1% 的有多少"如实返回。
 对不上的行保留原值，不装作有数据。
@@ -87,6 +91,11 @@ def apply_float_cap_reference(
     stats: dict[str, Any] = {
         "ref_db": str(ref_db),
         "source": SOURCE_LABEL,
+        "pit_status": "not_certified",
+        "pit_limit": (
+            "historical daily_basic values were collected after their trade dates; "
+            "per-date publication snapshots and decision-time availability are not recorded"
+        ),
         "rows_total": int(len(merged)),
         "rows_with_reference": int(hit.sum()),
         "rows_replaced_from_placeholder": int((hit & placeholder_before).sum()),

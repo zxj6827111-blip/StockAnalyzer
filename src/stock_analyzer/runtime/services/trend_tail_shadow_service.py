@@ -58,6 +58,7 @@ from stock_analyzer.research.shadow_evidence import (
     summarize_shadow_evidence,
     trace_paths,
 )
+from stock_analyzer.research.tail_observed_inputs import write_tail_observed_input_snapshot
 
 REPORT_DIR_DEFAULT = "artifacts/runtime/trend_tail_shadow"
 
@@ -185,6 +186,25 @@ class TrendTailShadowService:
         rows = [dict(row) for row in watch_pool if str(row.get("symbol", "")).strip()]
         bar_map = dict(minute_bars or {})
         prob_map = dict(probabilities or {})
+        observed_input: dict[str, Any] | None = None
+        if write_artifacts:
+            try:
+                # 先留存传入的原始决策输入，再做模型加载与逐只确认；后续耗时或失败
+                # 不会让 14:45 的唯一有效输入被 14:55 的日报覆盖。
+                observed_input = write_tail_observed_input_snapshot(
+                    self._report_dir,
+                    timestamp=timestamp,
+                    trade_date=day,
+                    contract=contract,
+                    watch_pool=rows,
+                    minute_bars=bar_map,
+                )
+            except OSError as exc:
+                # 快照写失败要进入报告，但不能打断只读影子任务或其旧输出。
+                observed_input = {
+                    "status": "failed",
+                    "reason": f"snapshot_write_failed:{type(exc).__name__}",
+                }
 
         # 专属清单只读一次：打分与身份绑定必须看同一份文件，不能各读各的。
         tail_manifest, tail_failures = _read_tail_serving_manifest(self._service, contract)
@@ -394,6 +414,8 @@ class TrendTailShadowService:
             "trace_digest": trace.digest(),
         }
         if write_artifacts:
+            if observed_input is not None:
+                report["observed_input_snapshot"] = observed_input
             report["artifact_paths"] = self._write(trace, report)
         return report
 
@@ -471,7 +493,7 @@ class TrendTailShadowService:
                 return None, "serving_manifest_missing", tuple(failures)
             failures.append("tail_serving_manifest_absent")
         label_policy_id = _manifest_field(manifest, "label_policy_id")
-        if not label_policy_id.startswith("label_policy_v4_"):
+        if not label_policy_id.startswith("label_policy_v5_"):
             return None, "serving_model_is_not_tail_label_policy", tuple(failures)
         # 清单里写着一个 id 不等于这个 id 存在。registry 才是标签契约的落库处，
         # 所以拿它逐字段核对一次：查不到、或者查到的是另一套 TP/SL/持有期/价格口径，

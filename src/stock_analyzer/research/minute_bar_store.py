@@ -21,7 +21,8 @@
 from __future__ import annotations
 
 import zipfile
-from collections.abc import Iterable, Mapping
+from collections import OrderedDict
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -124,6 +125,14 @@ class MinuteBarStore:
             raise MinuteStoreError(f"minute store does not exist: {self.path}")
         self._conn = duckdb.connect(database=str(self.path), read_only=read_only)
         self._read_only = read_only
+        # Label rebuilds walk overlapping holding windows. Keep a small, bounded cache
+        # of raw day rows so adjacent requests for the same symbol reuse exit bars.
+        # The rebuild caller groups requests by symbol/date, so this stays small while
+        # avoiding repeated DuckDB scans of the same day.
+        self._bar_rows_cache: OrderedDict[
+            tuple[str, date, str], tuple[tuple[Any, ...], ...]
+        ] = OrderedDict()
+        self._bar_rows_cache_capacity = 16
         if not read_only:
             for table in MINUTE_TABLES.values():
                 self._conn.execute(_ddl(table))
@@ -211,6 +220,8 @@ class MinuteBarStore:
             )
         finally:
             self._conn.unregister(staging_view)
+        # A previously read day can be replaced by this upsert.
+        self._bar_rows_cache.clear()
         return len(rows)
 
     # --- 读取 -------------------------------------------------------------
@@ -239,12 +250,20 @@ class MinuteBarStore:
         if table is None:
             raise MinuteStoreError(f"unsupported interval {interval!r}")
         day = trading_day.date() if isinstance(trading_day, datetime) else trading_day
-        rows = self._conn.execute(
-            f"SELECT bar_time, open, high, low, close, volume, amount, up_limit,"
-            f" down_limit, trade_status, price_basis FROM {table} "
-            f"WHERE symbol = ? AND trade_date = ? ORDER BY bar_time",
-            [str(symbol), day],
-        ).fetchall()
+        cache_key = (str(symbol), day, str(interval))
+        if cache_key in self._bar_rows_cache:
+            rows = self._bar_rows_cache.pop(cache_key)
+            self._bar_rows_cache[cache_key] = rows
+        else:
+            rows = tuple(self._conn.execute(
+                f"SELECT bar_time, open, high, low, close, volume, amount, up_limit,"
+                f" down_limit, trade_status, price_basis, bar_time_semantics FROM {table} "
+                f"WHERE symbol = ? AND trade_date = ? ORDER BY bar_time",
+                [str(symbol), day],
+            ).fetchall())
+            self._bar_rows_cache[cache_key] = rows
+            if len(self._bar_rows_cache) > self._bar_rows_cache_capacity:
+                self._bar_rows_cache.popitem(last=False)
         if not rows:
             return []
         bases = {str(row[10]) for row in rows}
@@ -258,6 +277,7 @@ class MinuteBarStore:
             bar: dict[str, Any] = {
                 "open": row[1], "high": row[2], "low": row[3], "close": row[4],
                 "volume": row[5], "amount": row[6],
+                "source_bar_time_semantics": str(row[11]),
             }
             # 状态列没有就**留空**：填 "normal" 等于把"不知道"说成"可交易"，
             # 而且 setdefault 会让 day_limits 里来自 suspend_d 的权威状态永远进不来。
@@ -272,6 +292,131 @@ class MinuteBarStore:
                     bar.setdefault(str(key), value)
             out.append((_as_datetime(row[0]) or datetime.min, bar))
         return out
+
+    @staticmethod
+    def entry_window_coverage(
+        bars: Sequence[tuple[datetime, Mapping[str, Any]]],
+        *,
+        trading_day: date,
+        contract: TrendStrategyContract = DEFAULT_TREND_CONTRACT,
+        interval: str = "1m",
+    ) -> dict[str, Any]:
+        """Prove every minute used by historical confirmation and its fill is present.
+
+        Historical replay sees the whole day at once. Without this check, a missing bar
+        after a confirmation slot shifts ``fill_bar_offset=1`` to a later bar and silently
+        changes the assumed execution price.
+        """
+        step = interval_minutes(interval)
+        if not bars:
+            return {
+                "complete": False, "reason": "entry_minute_window_empty",
+                "expected_count": 0, "actual_count": 0, "missing_times": [],
+            }
+        semantics = {
+            str(bar.get("source_bar_time_semantics") or "") for _moment, bar in bars
+        }
+        if len(semantics) != 1 or not semantics.issubset(BAR_TIME_SEMANTICS):
+            return {
+                "complete": False, "reason": "minute_time_semantics_missing_or_mixed",
+                "expected_count": 0, "actual_count": len(bars), "missing_times": [],
+            }
+        first_slot = _minute_of(contract.confirmation_slots[0])
+        last_slot = _minute_of(contract.confirmation_slots[-1])
+        last_required = last_slot + step * int(contract.fill_bar_offset)
+        expected = set(range(first_slot, last_required + 1, step))
+        selected = [
+            (moment, bar) for moment, bar in bars
+            if moment.date() == trading_day
+            and first_slot <= moment.hour * 60 + moment.minute <= last_required
+        ]
+        actual = [moment.hour * 60 + moment.minute for moment, _bar in selected]
+        actual_set = set(actual)
+        missing = sorted(expected - actual_set)
+        duplicates = len(actual) != len(actual_set)
+        invalid_prices: list[str] = []
+        for moment, bar in selected:
+            prices = [_num(bar.get(key)) for key in ("open", "high", "low", "close")]
+            if any(value is None or value <= 0 for value in prices):
+                invalid_prices.append(moment.strftime("%H:%M"))
+                continue
+            open_, high, low, close = (float(value) for value in prices)
+            if high < max(open_, close) or low > min(open_, close) or high < low:
+                invalid_prices.append(moment.strftime("%H:%M"))
+        return {
+            "complete": not missing and not duplicates and not invalid_prices,
+            "reason": "" if not missing and not duplicates and not invalid_prices
+                      else "entry_minute_window_incomplete_or_invalid",
+            "source_bar_time_semantics": next(iter(semantics)),
+            "expected_count": len(expected),
+            "actual_count": len(actual),
+            "missing_times": [f"{value // 60:02d}:{value % 60:02d}" for value in missing],
+            "duplicate_timestamps": duplicates,
+            "invalid_price_times": invalid_prices,
+        }
+
+    @staticmethod
+    def minute_session_coverage(
+        bars: Sequence[tuple[datetime, Mapping[str, Any]]],
+        *,
+        trading_day: date,
+        interval: str = "1m",
+    ) -> dict[str, Any]:
+        """证明一整天 RAW 分钟 bar 没有内部缺口；尾盘确认覆盖不等于持仓期覆盖。"""
+        if str(interval) != "1m":
+            return {
+                "complete": False, "reason": "exit_requires_one_minute_bars",
+                "expected_count": 0, "actual_count": len(bars), "missing_times": [],
+            }
+        semantics = {
+            str(bar.get("source_bar_time_semantics") or "") for _moment, bar in bars
+        }
+        if not bars or len(semantics) != 1 or not semantics.issubset(BAR_TIME_SEMANTICS):
+            return {
+                "complete": False, "reason": "minute_time_semantics_missing_or_mixed",
+                "expected_count": 0, "actual_count": len(bars), "missing_times": [],
+            }
+        semantics_value = next(iter(semantics))
+        # 已对照 vendor 包实测：bar_end 包含 09:30 集合竞价 bar，之后 09:31..11:30、
+        # 13:01..15:00；bar_start 在写入时已加 1 分钟，只含 240 根连续交易分钟。
+        expected = []
+        if semantics_value == BAR_TIME_BAR_END:
+            expected.append(time(9, 30))
+        expected.extend(time(hour, minute) for hour, minute in (
+            [(hour, minute) for hour in (9, 10) for minute in range(60)]
+            + [(11, minute) for minute in range(31)]
+        ) if time(hour, minute) >= time(9, 31) and time(hour, minute) <= time(11, 30))
+        expected.extend(time(hour, minute) for hour, minute in (
+            [(hour, minute) for hour in (13, 14) for minute in range(60)]
+            + [(15, 0)]
+        ) if time(hour, minute) >= time(13, 1) and time(hour, minute) <= time(15, 0))
+        actual = [moment.time().replace(second=0, microsecond=0) for moment, _bar in bars]
+        expected_set = set(expected)
+        actual_set = set(actual)
+        missing = sorted(expected_set - actual_set)
+        duplicates = len(actual) != len(actual_set)
+        invalid_prices = []
+        for moment, bar in bars:
+            values = [_num(bar.get(key)) for key in ("open", "high", "low", "close")]
+            if any(value is None or value <= 0 for value in values):
+                invalid_prices.append(moment.strftime("%H:%M"))
+                continue
+            open_, high, low, close = (float(value) for value in values)
+            if high < max(open_, close) or low > min(open_, close) or high < low:
+                invalid_prices.append(moment.strftime("%H:%M"))
+        unexpected = sorted(actual_set - expected_set)
+        return {
+            "complete": not missing and not duplicates and not invalid_prices and not unexpected,
+            "reason": "" if not missing and not duplicates and not invalid_prices and not unexpected
+                      else "minute_session_incomplete_or_invalid",
+            "source_bar_time_semantics": semantics_value,
+            "expected_count": len(expected_set),
+            "actual_count": len(actual),
+            "missing_times": [value.strftime("%H:%M") for value in missing[:20]],
+            "unexpected_times": [value.strftime("%H:%M") for value in unexpected[:20]],
+            "duplicate_timestamps": duplicates,
+            "invalid_price_times": invalid_prices[:20],
+        }
 
     def days_with_bars(self, *, interval: str = "1m") -> list[date]:
         table = MINUTE_TABLES[str(interval)]

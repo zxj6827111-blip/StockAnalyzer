@@ -32,8 +32,14 @@ _SYMBOL = "600000.SH"
 _CLI = Path(__file__).resolve().parents[1] / "scripts" / "sync_tail_reference_data.py"
 
 
-def _warehouse(tmp_path: Path, *, days=(MON, TUE), bars: bool = True,
-               status: bool = True, security: bool = True) -> Path:
+def _warehouse(
+    tmp_path: Path,
+    *,
+    days=(MON, TUE),
+    bars: bool = True,
+    status: bool = True,
+    security: bool = True,
+) -> Path:
     """造一个形状与 ``data/market_warehouse.py`` 的 DDL 一致的生产仓库夹具。"""
     path = tmp_path / "market.duckdb"
     con = duckdb.connect(str(path))
@@ -51,9 +57,22 @@ def _warehouse(tmp_path: Path, *, days=(MON, TUE), bars: bool = True,
                     factor = 1.0 if mode == "raw" else 0.5
                     con.execute(
                         "INSERT INTO daily_bars VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                        [_SYMBOL, day, 10.0 * factor, 10.5 * factor, 9.8 * factor,
-                         10.2 * factor, 1e6, 1.02e7, 5e9, "测试股", False, False, "main",
-                         mode],
+                        [
+                            _SYMBOL,
+                            day,
+                            10.0 * factor,
+                            10.5 * factor,
+                            9.8 * factor,
+                            10.2 * factor,
+                            1e6,
+                            1.02e7,
+                            5e9,
+                            "测试股",
+                            False,
+                            False,
+                            "main",
+                            mode,
+                        ],
                     )
         if status:
             con.execute(
@@ -64,8 +83,7 @@ def _warehouse(tmp_path: Path, *, days=(MON, TUE), bars: bool = True,
             )
             con.execute(
                 "INSERT INTO daily_trade_status VALUES (?,?,?,?,?,?,?,?,?)",
-                [_SYMBOL, MON, 11.22, 8.82, False, "", "tushare_stk_limit",
-                 "2026-03-02", True],
+                [_SYMBOL, MON, 11.22, 8.82, False, "", "tushare_stk_limit", "2026-03-02", True],
             )
         if security:
             con.execute(
@@ -76,16 +94,25 @@ def _warehouse(tmp_path: Path, *, days=(MON, TUE), bars: bool = True,
             )
             con.execute(
                 "INSERT INTO security_status VALUES (?,?,?,?,?,?,?,?,?,?)",
-                [_SYMBOL, MON, None, "ST", "N", "main", "SSE", "tushare_namechange",
-                 "2026-03-02", True],
+                [
+                    _SYMBOL,
+                    MON,
+                    None,
+                    "ST",
+                    "N",
+                    "main",
+                    "SSE",
+                    "tushare_namechange",
+                    "2026-03-02",
+                    True,
+                ],
             )
     finally:
         con.close()
     return path
 
 
-def _sync(tmp_path: Path, store_path: Path, warehouse: Path,
-          *, end: date = TUE) -> dict:
+def _sync(tmp_path: Path, store_path: Path, warehouse: Path, *, end: date = TUE) -> dict:
     reading = read_warehouse_reference_frames(warehouse, start=MON, end=end)
     with TailReferenceStore(store_path) as store:
         return sync_reference_from_warehouse(store, reading)
@@ -109,7 +136,9 @@ def _rows(store_path: Path, name: str) -> list[dict]:
 def test_reference_tables_start_empty_and_say_so(tmp_path) -> None:
     with TailReferenceStore(tmp_path / "ref.duckdb") as store:
         coverage = store.coverage()
-    assert coverage["gaps"] == sorted(f"{name}_table_missing" for name in REFERENCE_TABLES)
+    assert coverage["gaps"] == sorted(
+        f"{name}_table_missing" for name in REFERENCE_TABLES if name != "suspend_evidence"
+    )
     assert all(entry["rows"] == 0 for entry in coverage["sources"].values())
 
 
@@ -128,8 +157,9 @@ def test_only_raw_daily_bars_are_landed_and_deduplicated(tmp_path) -> None:
 
 
 def test_adjusted_basis_is_refused_rather_than_rescaled(tmp_path) -> None:
-    frame = pd.DataFrame([{"symbol": _SYMBOL, "date": MON, "open": 5.0, "high": 5.2,
-                           "low": 4.9, "close": 5.1}])
+    frame = pd.DataFrame(
+        [{"symbol": _SYMBOL, "date": MON, "open": 5.0, "high": 5.2, "low": 4.9, "close": 5.1}]
+    )
     with TailReferenceStore(tmp_path / "ref.duckdb") as store:
         with pytest.raises(TailReferenceError, match="raw"):
             store.upsert_daily_bars(frame, price_basis="qfq", as_of="2026-03-02")
@@ -140,14 +170,78 @@ def test_adjusted_basis_is_refused_rather_than_rescaled(tmp_path) -> None:
 def test_frames_missing_required_columns_are_refused(tmp_path) -> None:
     with TailReferenceStore(tmp_path / "ref.duckdb") as store:
         with pytest.raises(TailReferenceError, match="missing column"):
-            store.upsert_daily_bars(pd.DataFrame([{"symbol": _SYMBOL}]),
-                                    price_basis="raw", as_of="2026-03-02")
+            store.upsert_daily_bars(
+                pd.DataFrame([{"symbol": _SYMBOL}]), price_basis="raw", as_of="2026-03-02"
+            )
         with pytest.raises(TailReferenceError, match="explicit as_of"):
             store.upsert_daily_bars(
-                pd.DataFrame([{"symbol": _SYMBOL, "date": MON, "open": 1.0, "high": 1.0,
-                              "low": 1.0, "close": 1.0}]),
-                price_basis="raw", as_of="",
+                pd.DataFrame(
+                    [
+                        {
+                            "symbol": _SYMBOL,
+                            "date": MON,
+                            "open": 1.0,
+                            "high": 1.0,
+                            "low": 1.0,
+                            "close": 1.0,
+                        }
+                    ]
+                ),
+                price_basis="raw",
+                as_of="",
             )
+
+
+def test_security_status_round_trip_preserves_announcement_date(tmp_path) -> None:
+    store_path = tmp_path / "ref.duckdb"
+    with TailReferenceStore(store_path) as store:
+        landed = store.upsert_security_status(
+            pd.DataFrame(
+                [
+                    {
+                        "symbol": "000001",
+                        "effective_from": "2026-09-29",
+                        "effective_to": None,
+                        "announcement_date": "2026-09-08",
+                        "status_type": "name_change",
+                        "status_value": "平安银行",
+                    }
+                ]
+            ),
+            as_of="2026-10-11",
+        )
+        assert landed == 1
+    rows = _rows(store_path, "security_status")
+    assert rows[0]["announcement_date"] == date(2026, 9, 8)
+
+
+def test_old_security_status_schema_migrates_without_dropping_rows(tmp_path) -> None:
+    store_path = tmp_path / "old_ref.duckdb"
+    conn = duckdb.connect(str(store_path))
+    conn.execute(
+        "CREATE TABLE ref_security_status ("
+        "symbol VARCHAR NOT NULL, effective_from DATE NOT NULL, effective_to DATE, "
+        "status_type VARCHAR NOT NULL, status_value VARCHAR, board VARCHAR, exchange VARCHAR, "
+        "source VARCHAR NOT NULL, as_of VARCHAR NOT NULL, coverage_complete BOOLEAN NOT NULL, "
+        "ingested_at TIMESTAMP NOT NULL, PRIMARY KEY (symbol, effective_from, status_type))"
+    )
+    conn.execute(
+        "INSERT INTO ref_security_status VALUES "
+        "('000001', '2026-09-29', NULL, 'name_change', '平安银行', NULL, 'SZ', "
+        "'tushare', '2026-10-11', true, current_timestamp)"
+    )
+    conn.close()
+
+    with TailReferenceStore(store_path) as store:
+        columns = store._con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'ref_security_status'"
+        ).fetchall()
+        rows = store._con.execute(
+            "SELECT symbol, announcement_date FROM ref_security_status"
+        ).fetchall()
+    assert "announcement_date" in {row[0] for row in columns}
+    assert rows == [("000001", None)]
 
 
 # ---------------------------------------------------------------------------
@@ -176,8 +270,9 @@ def test_missing_reference_rows_stay_missing(tmp_path) -> None:
 
 
 def test_approximated_limit_prices_are_not_usable_by_default(tmp_path) -> None:
-    frame = pd.DataFrame([{"symbol": _SYMBOL, "trade_date": MON, "up_limit": 11.0,
-                           "down_limit": 9.0}])
+    frame = pd.DataFrame(
+        [{"symbol": _SYMBOL, "trade_date": MON, "up_limit": 11.0, "down_limit": 9.0}]
+    )
     store_path = tmp_path / "ref.duckdb"
     with TailReferenceStore(store_path) as store:
         store.upsert_limit_prices(frame, as_of="2026-03-02", approximated=True)
@@ -199,9 +294,20 @@ def test_calendar_flags_rows_the_authority_disputes(tmp_path) -> None:
     with TailReferenceStore(tmp_path / "ref.duckdb") as store:
         store.upsert_calendar([MON, TUE, SAT], as_of="2026-03-07")
         store.upsert_daily_bars(
-            pd.DataFrame([{"symbol": _SYMBOL, "date": SAT, "open": 10.0, "high": 10.0,
-                           "low": 10.0, "close": 10.0}]),
-            price_basis="raw", as_of="2026-03-07",
+            pd.DataFrame(
+                [
+                    {
+                        "symbol": _SYMBOL,
+                        "date": SAT,
+                        "open": 10.0,
+                        "high": 10.0,
+                        "low": 10.0,
+                        "close": 10.0,
+                    }
+                ]
+            ),
+            price_basis="raw",
+            as_of="2026-03-07",
         )
         assert store.calendar(MON, TUE) == [MON, TUE]
         assert store.calendar_conflicts() == ["2026-03-07"]
@@ -227,6 +333,366 @@ def test_row_level_provenance_beats_the_caller_default(tmp_path) -> None:
     assert _rows(store_path, "daily_bars")[0]["source"] == "market_warehouse"
 
 
+def test_tushare_compact_dates_import_as_auditable_corporate_actions(tmp_path) -> None:
+    """Tushare 回传 YYYYMMDD；事件和零事件覆盖必须落到同一交易日。"""
+    store_path = tmp_path / "ref.duckdb"
+    event = {
+        "ts_code": _SYMBOL,
+        "end_date": "20251231",
+        "ann_date": "20260301",
+        "div_proc": "实施",
+        "stk_div": 0.0,
+        "stk_bo_rate": 0.0,
+        "stk_co_rate": 0.0,
+        "cash_div": 0.5,
+        "cash_div_tax": 0.6,
+        "record_date": "20260302",
+        "ex_date": "20260303",
+        "pay_date": "20260306",
+        "div_listdate": "",
+        "imp_ann_date": "20260301",
+    }
+    coverage = {
+        "ex_date": "20260303",
+        "rows_returned": 1,
+        "coverage_complete": True,
+        "truncated": False,
+        "response_sha256": "a" * 64,
+    }
+    duplicate_event = {**event, "ann_date": "20260228"}
+    with TailReferenceStore(store_path) as store:
+        store.upsert_calendar([MON, TUE], as_of="2026-03-03")
+        store.upsert_corporate_actions(
+            pd.DataFrame([event, duplicate_event]),
+            source="tushare_dividend_ex_date",
+            as_of="2026-03-03",
+        )
+        store.upsert_corporate_action_coverage(
+            pd.DataFrame([coverage]),
+            source="tushare_dividend_ex_date",
+            as_of="2026-03-03",
+        )
+        store.upsert_adj_factors(
+            pd.DataFrame(
+                [
+                    {
+                        "symbol": "600000",
+                        "ts_code": _SYMBOL,
+                        "trade_date": "20260302",
+                        "adj_factor": 1.0,
+                        "coverage_complete": True,
+                    },
+                    {
+                        "symbol": "600000",
+                        "ts_code": _SYMBOL,
+                        "trade_date": "20260303",
+                        "adj_factor": 1.05,
+                        "coverage_complete": True,
+                    },
+                ]
+            ),
+            source="tushare_adj_factor_symbol_history",
+            as_of="2026-03-03",
+        )
+        # Research/minute samples use bare six-digit codes; Tushare source rows carry
+        # exchange suffixes. The ledger join must normalize the key without dropping raw source.
+        window = store.corporate_action_window("600000", TUE, TUE)
+    assert window["coverage_complete"] is True
+    assert window["missing_coverage_days"] == []
+    assert window["actions"][0]["ex_date"] == TUE
+    assert window["actions"][0]["symbol"] == "600000"
+    assert window["actions"][0]["cash_dividend_per_share_after_tax"] == pytest.approx(0.5)
+    assert window["actions"][0]["cash_dividend_per_share_before_tax"] == pytest.approx(0.6)
+    assert window["actions"][0]["implementation_status"] == "实施"
+    assert len(window["actions"]) == 1
+    assert len(window["duplicate_action_groups"]) == 1
+    assert window["duplicate_action_groups"][0]["collapsed_count"] == 1
+    assert window["actions"][0]["duplicate_action_ids"]
+
+
+def test_official_corporate_action_reconciliation_is_retained_in_row_provenance(tmp_path) -> None:
+    store_path = tmp_path / "ref.duckdb"
+    event = {
+        "ts_code": "688448.SH",
+        "end_date": "20251231",
+        "ann_date": "20260512",
+        "div_proc": "实施",
+        "stk_div": 0.35,
+        "stk_bo_rate": 0.0,
+        "stk_co_rate": 0.35,
+        "cash_div": 0.0,
+        "cash_div_tax": 0.0,
+        "record_date": "20260601",
+        "ex_date": "20260602",
+        "pay_date": "",
+        "div_listdate": "20260602",
+        "imp_ann_date": "20260526",
+        "record_source": "tushare_dividend_ex_date+cninfo_official",
+        "official_reconciliation_evidence_json": json.dumps(
+            {
+                "source": "cninfo_official_disclosure",
+                "official_reconciliation": {
+                    "implementation_status": "实施",
+                    "cash_dividend_per_share_before_tax": 0.0,
+                    "cash_dividend_per_share_after_tax": 0.0,
+                    "stock_distribution_per_share": 0.35,
+                    "bonus_shares_per_share": 0.0,
+                    "transfer_shares_per_share": 0.35,
+                },
+                "documents": [
+                    {
+                        "url": "https://static.cninfo.com.cn/finalpage/2026-05-26/official.PDF",
+                        "sha256": "a" * 64,
+                    }
+                ],
+            }
+        ),
+    }
+    with TailReferenceStore(store_path) as store:
+        store.upsert_corporate_actions(
+            pd.DataFrame([event]),
+            source="tushare_dividend_ex_date",
+            as_of="2026-10-11",
+        )
+        row = store._con.execute(
+            "SELECT source, cash_dividend_per_share_before_tax, raw_payload "
+            "FROM ref_corporate_actions"
+        ).fetchone()
+    assert row[0] == "tushare_dividend_ex_date+cninfo_official"
+    assert row[1] == pytest.approx(0.0)
+    assert (
+        json.loads(row[2])["official_reconciliation_evidence"]["documents"][0]["sha256"] == "a" * 64
+    )
+
+
+def test_official_reconciliation_marker_without_evidence_is_rejected(tmp_path) -> None:
+    event = {
+        "ts_code": "688448.SH",
+        "end_date": "20251231",
+        "ann_date": "20260512",
+        "div_proc": "实施",
+        "stk_div": 0.35,
+        "stk_bo_rate": 0.0,
+        "stk_co_rate": 0.35,
+        "cash_div": 0.0,
+        "cash_div_tax": 0.0,
+        "record_date": "20260601",
+        "ex_date": "20260602",
+        "record_source": "tushare_dividend_ex_date+cninfo_official",
+    }
+    with TailReferenceStore(tmp_path / "ref.duckdb") as store:
+        with pytest.raises(TailReferenceError, match="requires its verified evidence payload"):
+            store.upsert_corporate_actions(
+                pd.DataFrame([event]),
+                source="tushare_dividend_ex_date",
+                as_of="2026-10-11",
+            )
+
+
+def test_official_reconciliation_rejects_non_object_evidence(tmp_path) -> None:
+    event = {
+        "ts_code": "688448.SH",
+        "end_date": "20251231",
+        "ann_date": "20260512",
+        "div_proc": "实施",
+        "stk_div": 0.35,
+        "stk_bo_rate": 0.0,
+        "stk_co_rate": 0.35,
+        "cash_div": 0.0,
+        "cash_div_tax": 0.0,
+        "record_date": "20260601",
+        "ex_date": "20260602",
+        "record_source": "tushare_dividend_ex_date+cninfo_official",
+        "official_reconciliation_evidence_json": "[]",
+    }
+    with TailReferenceStore(tmp_path / "ref.duckdb") as store:
+        with pytest.raises(TailReferenceError, match="payload must be an object"):
+            store.upsert_corporate_actions(
+                pd.DataFrame([event]),
+                source="tushare_dividend_ex_date",
+                as_of="2026-10-11",
+            )
+
+
+def test_adjustment_factor_prefers_qualified_symbol_to_preserve_leading_zeroes(tmp_path) -> None:
+    with TailReferenceStore(tmp_path / "reference.duckdb") as store:
+        store.upsert_adj_factors(
+            pd.DataFrame(
+                [
+                    {
+                        "symbol": 1,
+                        "ts_code": "000001.SZ",
+                        "trade_date": "20260105",
+                        "adj_factor": 1.0,
+                        "coverage_complete": True,
+                    }
+                ]
+            ),
+            source="tushare_adj_factor_symbol_history",
+            as_of="2026-10-10",
+        )
+        row = store._con.execute("SELECT symbol FROM ref_adj_factor_history").fetchone()
+    assert row == ("000001",)
+
+
+def test_corporate_action_csv_null_error_does_not_mark_coverage_incomplete(tmp_path) -> None:
+    """pandas reads a blank CSV error as NaN; null must stay null, not become the text 'nan'."""
+    store_path = tmp_path / "ref.duckdb"
+    coverage = pd.DataFrame(
+        [
+            {
+                "ex_date": "20260303",
+                "rows_returned": 0,
+                "coverage_complete": True,
+                "truncated": False,
+                "error": float("nan"),
+            }
+        ]
+    )
+    with TailReferenceStore(store_path) as store:
+        store.upsert_calendar([MON, TUE], as_of="2026-03-03")
+        store.upsert_corporate_action_coverage(
+            coverage,
+            source="tushare_dividend_ex_date",
+            as_of="2026-03-03",
+        )
+        store.upsert_adj_factors(
+            pd.DataFrame(
+                [
+                    {
+                        "symbol": "600000",
+                        "ts_code": _SYMBOL,
+                        "trade_date": "20260302",
+                        "adj_factor": 1.0,
+                        "coverage_complete": True,
+                    },
+                    {
+                        "symbol": "600000",
+                        "ts_code": _SYMBOL,
+                        "trade_date": "20260303",
+                        "adj_factor": 1.0,
+                        "coverage_complete": True,
+                    },
+                ]
+            ),
+            source="tushare_adj_factor_symbol_history",
+            as_of="2026-03-03",
+        )
+        window = store.corporate_action_window(_SYMBOL, TUE, TUE)
+        readiness = store.coverage()["sources"]["corporate_action_coverage"]
+    assert window["coverage_complete"] is True
+    assert window["incomplete_coverage_days"] == []
+    assert readiness == {
+        "table": "ref_corporate_action_coverage",
+        "rows": 1,
+        "complete_dates": 1,
+    }
+
+
+def test_unmatched_adjustment_factor_change_blocks_action_coverage(tmp_path) -> None:
+    store_path = tmp_path / "ref.duckdb"
+    coverage = pd.DataFrame(
+        [
+            {
+                "ex_date": "20260303",
+                "rows_returned": 0,
+                "coverage_complete": True,
+                "truncated": False,
+            }
+        ]
+    )
+    with TailReferenceStore(store_path) as store:
+        store.upsert_calendar([MON, TUE], as_of="2026-03-03")
+        store.upsert_corporate_action_coverage(
+            coverage,
+            source="tushare_dividend_ex_date",
+            as_of="2026-03-03",
+        )
+        store.upsert_adj_factors(
+            pd.DataFrame(
+                [
+                    {
+                        "symbol": "600000",
+                        "trade_date": "20260302",
+                        "adj_factor": 1.0,
+                        "coverage_complete": True,
+                    },
+                    {
+                        "symbol": "600000",
+                        "trade_date": "20260303",
+                        "adj_factor": 1.1,
+                        "coverage_complete": True,
+                    },
+                ]
+            ),
+            source="tushare_adj_factor_symbol_history",
+            as_of="2026-03-03",
+        )
+        window = store.corporate_action_window("600000", TUE, TUE)
+    assert window["coverage_complete"] is False
+    assert window["unmatched_adj_factor_change_days"] == [TUE.isoformat()]
+    assert window["coverage_by_day"][TUE.isoformat()]["coverage_complete"] is False
+
+
+def test_proven_full_day_suspension_factor_gap_is_listed_without_imputation(tmp_path) -> None:
+    store_path = tmp_path / "suspended_factor_gap.duckdb"
+    wed = date(2026, 3, 4)
+    coverage = pd.DataFrame(
+        [{
+            "ex_date": TUE,
+            "rows_returned": 0,
+            "coverage_complete": True,
+            "truncated": False,
+            "error": "",
+        }]
+    )
+    with TailReferenceStore(store_path) as store:
+        store.upsert_calendar([MON, TUE, wed], as_of="2026-03-04")
+        store.upsert_corporate_action_coverage(
+            coverage,
+            source="tushare_dividend_ex_date",
+            as_of="2026-03-04",
+        )
+        store.upsert_suspend_status(
+            pd.DataFrame(
+                [{
+                    "symbol": "600000",
+                    "trade_date": TUE,
+                    "suspended": True,
+                    "suspend_type": "S",
+                    "trade_status": "suspended",
+                    "source": "tushare_suspend_d",
+                    "coverage_complete": True,
+                }]
+            ),
+            as_of="2026-03-04",
+        )
+        store.upsert_adj_factors(
+            pd.DataFrame(
+                [
+                    {"symbol": "600000", "trade_date": MON, "adj_factor": 1.25,
+                     "coverage_complete": True},
+                    {"symbol": "600000", "trade_date": wed, "adj_factor": 1.25,
+                     "coverage_complete": True},
+                ]
+            ),
+            source="tushare_adj_factor_history",
+            as_of="2026-03-04",
+        )
+        store._con.execute(
+            "CREATE TABLE minute_bars_1min (symbol VARCHAR, trade_date DATE)"
+        )
+        window = store.corporate_action_window("600000", TUE, TUE)
+
+    assert window["coverage_complete"] is True
+    assert window["adj_factor_missing_days"] == [TUE.isoformat()]
+    assert window["adj_factor_suspension_exempt_days"] == [TUE.isoformat()]
+    assert window["adj_factor_unresolved_missing_days"] == []
+    assert window["coverage_by_day"][TUE.isoformat()]["adj_factor_row_present"] is False
+    assert window["coverage_by_day"][TUE.isoformat()]["adj_factor"] is None
+    assert window["coverage_by_day"][TUE.isoformat()]["adj_factor_suspension_exempt"] is True
+
+
 # ---------------------------------------------------------------------------
 # 缺表要报缺，不能报"已补齐"
 # ---------------------------------------------------------------------------
@@ -236,13 +702,17 @@ def test_missing_warehouse_tables_are_reported_as_gaps(tmp_path) -> None:
     warehouse = _warehouse(tmp_path, status=False, security=False)
     reading = read_warehouse_reference_frames(warehouse, start=MON, end=TUE)
     assert set(reading.gaps) == {
-        "daily_trade_status_table_missing", "suspend_status_source_table_missing",
+        "daily_trade_status_table_missing",
+        "suspend_status_source_table_missing",
         "security_status_table_missing",
     }
     assert "daily_bars" in reading.frames
     result = _sync(tmp_path, tmp_path / "ref.duckdb", warehouse)
     assert set(result["missing_sources"]) == {
-        "limit_prices_table_missing", "security_status_table_missing",
+        "corporate_action_coverage_table_missing",
+        "corporate_actions_table_missing",
+        "limit_prices_table_missing",
+        "security_status_table_missing",
         "suspend_status_table_missing",
     }
     assert result["sufficient_sources"] == ["daily_bars", "trade_calendar"]
@@ -261,24 +731,37 @@ def test_unreadable_warehouse_is_a_visible_error(tmp_path) -> None:
 def _cli(args: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(_CLI), *args],
-        capture_output=True, text=True, check=False, env={"PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+        check=False,
+        env={"PATH": "/usr/bin:/bin"},
     )
 
 
 def _cli_args(tmp_path, warehouse, out) -> list[str]:
-    return ["--warehouse", str(warehouse), "--out", str(out),
-            "--start", MON.isoformat(), "--end", TUE.isoformat(), "--quiet"]
+    return [
+        "--warehouse",
+        str(warehouse),
+        "--out",
+        str(out),
+        "--start",
+        MON.isoformat(),
+        "--end",
+        TUE.isoformat(),
+        "--quiet",
+    ]
 
 
-def test_cli_lands_every_source_and_exits_zero(tmp_path) -> None:
+def test_warehouse_sync_reports_external_corporate_action_source_as_missing(tmp_path) -> None:
     out = tmp_path / "ref.duckdb"
     report = tmp_path / "report.json"
-    result = _cli(_cli_args(tmp_path, _warehouse(tmp_path), out)
-                  + ["--report", str(report)])
-    assert result.returncode == 0, result.stdout + result.stderr
+    result = _cli(_cli_args(tmp_path, _warehouse(tmp_path), out) + ["--report", str(report)])
+    assert result.returncode == 3, result.stdout + result.stderr
     payload = json.loads(report.read_text(encoding="utf-8"))
-    assert payload["missing_sources"] == []
-    assert sorted(payload["sufficient_sources"]) == sorted(REFERENCE_TABLES)
+    assert set(payload["missing_sources"]) == {
+        "corporate_action_coverage_table_missing",
+        "corporate_actions_table_missing",
+    }
     with TailReferenceStore(out) as store:
         assert store.coverage()["sources"]["limit_prices"]["rows"] == 1
 

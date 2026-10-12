@@ -10,6 +10,7 @@ import ast
 import json
 from datetime import date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -246,7 +247,7 @@ def test_label_policy_with_other_tp_sl_is_drift_not_a_match(tmp_path) -> None:
     """
     other = build_label_policy_record(
         label_name="net_profit_5d_tail_tp10_sl5", take_profit_pct=0.10,
-        stop_loss_pct=0.05, horizon_days=5, price_basis="tail_confirm_next_bar",
+        stop_loss_pct=0.05, horizon_days=5, price_basis="tail_confirm_next_bar_raw_minute_exit_v2",
         exclude_untradable=True, conflict_policy="stop_loss_first",
         conflict_soft_label_value=0.0, schema_version=TAIL_SCHEMA_VERSION,
     )
@@ -516,6 +517,29 @@ def test_live_and_history_chain_paths_agree_on_identical_bars(tmp_path) -> None:
     assert live["final_symbols"] == ["600000.SH", "600001.SH"]
     assert live["data_as_of"] == "2026-10-09T14:45:00"
     assert history["data_as_of"] == "2026-09-18T14:44:00"
+
+
+def test_live_latest_confirmation_slot_archives_immutable_input_snapshot(tmp_path) -> None:
+    decision_time = datetime(2026, 10, 9, 14, 45, 12, tzinfo=ZoneInfo("Asia/Shanghai"))
+    report = _run(
+        tmp_path,
+        watch_pool=_pool(["600000.SH"]),
+        probabilities={"600000.SH": 0.9},
+        bars={},
+        timestamp=decision_time,
+    )
+
+    capture = report["observed_input_snapshot"]
+    assert capture["status"] == "captured"
+    assert capture["full_chain_pit_evidence"] is False
+    path = Path(capture["path"])
+    assert path == tmp_path / "shadow" / "observed_inputs" / "2026-10-09" / (
+        "tail_observed_input_1445.json"
+    )
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["decision_at"] == decision_time.isoformat(timespec="microseconds")
+    assert saved["input_symbol_count"] == 1
+    assert saved["minute_bars"] == {}
 
 
 # ---------------------------------------------------------------------------

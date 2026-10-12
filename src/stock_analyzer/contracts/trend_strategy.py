@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from typing import Any
 
-TREND_STRATEGY_CONTRACT_VERSION = "trend_tail_v1"
+TREND_STRATEGY_CONTRACT_VERSION = "trend_tail_v2"
 NET_PROFIT_PROBABILITY_FIELD = "p_net_profit_5d_tail"
 
 #: 观察池 / 尾盘确认 / 最终推荐 / 成交与退出——漏斗各层的稳定层名（含新增层）。
@@ -116,6 +116,10 @@ class TrendStrategyContract:
     cost_model_version: str = "cost_schedule_v2"
     #: 无法核算的公司行动 → 不确定样本。
     corporate_action_uncertain: bool = True
+    #: 个人短期持仓分红税按税前金额的最高 20% 估算，避免高估收益。
+    cash_dividend_tax_rate: float = 0.20
+    #: 出场标签语义版本：RAW 1 分钟 bar + 公司行动现金/股数账本。
+    exit_policy_id: str = "raw_1m_company_action_ledger_v4"
 
     def __post_init__(self) -> None:
         if str(self.strategy).strip().lower() != "trend":
@@ -161,6 +165,8 @@ class TrendStrategyContract:
             raise TrendContractError("min_net_profit_probability must be in (0, 1)")
         if int(self.max_quote_age_seconds) <= 0:
             raise TrendContractError("max_quote_age_seconds must be > 0")
+        if not (0.0 <= float(self.cash_dividend_tax_rate) <= 1.0):
+            raise TrendContractError("cash_dividend_tax_rate must be in [0, 1]")
 
     @property
     def confirmation_slots(self) -> tuple[str, ...]:
@@ -219,6 +225,8 @@ class TrendStrategyContract:
             "execution_price_basis": self.execution_price_basis,
             "cost_model_version": self.cost_model_version,
             "corporate_action_uncertain": bool(self.corporate_action_uncertain),
+            "cash_dividend_tax_rate": float(self.cash_dividend_tax_rate),
+            "exit_policy_id": str(self.exit_policy_id),
             "confirmation_slots": list(self.confirmation_slots),
         }
         return payload
@@ -296,6 +304,30 @@ def _positive_float(bar: Mapping[str, Any], *keys: str) -> float | None:
         if math.isfinite(value) and value > 0:
             return value
     return None
+
+
+def is_zero_volume_placeholder_session(
+    bars: Sequence[tuple[datetime, Mapping[str, Any]]],
+) -> bool:
+    """Whether every supplied minute row explicitly declares zero volume.
+
+    This is only meaningful together with a separately declared suspended
+    session. Missing, malformed, non-finite, or positive volume keeps the
+    session in the conflict path.
+    """
+    if not bars:
+        return False
+    for _moment, bar in bars:
+        raw_volume = bar.get("volume")
+        if raw_volume is None:
+            return False
+        try:
+            volume = float(raw_volume)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(volume) or volume != 0.0:
+            return False
+    return True
 
 
 #: 明确表示"这段时间不能交易"的状态码；缺失或 unknown 不算停牌（走未知状态分支）。
@@ -465,6 +497,18 @@ def evaluate_tail_entry(
             if slot > quote_as_of:
                 break
         completed = [(end, bar) for end, bar in eligible if end <= slot]
+        if quote_as_of is None and completed:
+            latest_end = completed[-1][0]
+            if (slot - latest_end).total_seconds() > contract.max_quote_age_seconds:
+                last = TailEntryDecision(
+                    symbol=symbol, confirmed=False, reason="realtime_snapshot_stale",
+                    confirmation_slot=slot,
+                    details={
+                        "confirmation_slot": slot.isoformat(),
+                        "latest_bar_end": latest_end.isoformat(),
+                    },
+                )
+                continue
         latest_price = _positive_float(completed[-1][1], "close", "price") if completed else None
         confirmed, reason = confirmation(
             TailConfirmationContext(
@@ -594,6 +638,7 @@ def _uncertain_exit(
     sessions_held: int = 0,
     deferred_sessions: int = 0,
     corporate_action_uncertain: bool = False,
+    details: Mapping[str, Any] | None = None,
 ) -> TailExitResult:
     return TailExitResult(
         symbol=symbol,
@@ -613,7 +658,323 @@ def _uncertain_exit(
         sessions_held=int(sessions_held),
         deferred_sessions=int(deferred_sessions),
         corporate_action_uncertain=bool(corporate_action_uncertain),
+        details=dict(details or {}),
     )
+
+
+def simulate_tail_exit_raw_minutes(
+    *,
+    symbol: str,
+    entry_date: date | datetime,
+    entry_price: float,
+    quantity: int,
+    buy_cost: float,
+    minute_bars: Sequence[tuple[datetime, Mapping[str, Any]]],
+    session_bars: Sequence[tuple[date | datetime, Mapping[str, Any]]],
+    corporate_actions: Sequence[Mapping[str, Any]] = (),
+    corporate_action_coverage: Mapping[str, Mapping[str, Any]] | None = None,
+    contract: TrendStrategyContract = DEFAULT_TREND_CONTRACT,
+    cost_estimator: Callable[[str, float, int, datetime], float] | None = None,
+    price_ticker: Callable[[float, str], float] | None = None,
+) -> TailExitResult:
+    """按 RAW 分钟 bar 与逐项公司行动账本模拟退出。
+
+    ``session_bars`` 只提供权威开市日、交易状态、精确涨跌停和分钟覆盖证明；其 OHLC
+    不参与止盈、止损或退出价判断。正常交易日必须带
+    ``minute_session_complete=True``，公司行动源必须为每个已处理交易日明确证明覆盖。
+    现金分红按契约税率从税前金额估算应收，送转按每股股数比例记账；不能解释的行一律
+    变成不确定标签。分钟级信号在触发后锁定，无法卖出的订单顺延，不会因后续反弹而撤销。
+    """
+    entry_dt = _to_datetime(entry_date)
+    if entry_price <= 0 or quantity <= 0:
+        raise TrendContractError("entry_price and quantity must be > 0 to simulate exit")
+    if int(quantity) % 100 != 0:
+        raise TrendContractError("entry quantity must be an integral 100-share lot")
+
+    ordered_sessions = sorted(
+        ((_to_datetime(day).date(), _to_datetime(day), dict(bar))
+         for day, bar in session_bars),
+        key=lambda item: item[0],
+    )
+    sessions = [(day, dt, bar) for day, dt, bar in ordered_sessions if day >= entry_dt.date()]
+    if not sessions or sessions[0][0] != entry_dt.date():
+        return _uncertain_exit(
+            symbol=symbol, entry_date=entry_dt, entry_price=entry_price, quantity=quantity,
+            buy_cost=buy_cost, reason="entry_session_missing",
+        )
+
+    minute_groups: dict[date, list[tuple[datetime, Mapping[str, Any]]]] = {}
+    for moment, bar in normalize_bars(minute_bars):
+        minute_groups.setdefault(moment.date(), []).append((moment, bar))
+    actions_by_ex_date: dict[date, list[Mapping[str, Any]]] = {}
+    for action in corporate_actions:
+        ex_day = action.get("ex_date")
+        if isinstance(ex_day, str):
+            try:
+                ex_day = date.fromisoformat(ex_day[:10])
+            except ValueError:
+                ex_day = None
+        elif isinstance(ex_day, datetime):
+            ex_day = ex_day.date()
+        if not isinstance(ex_day, date):
+            return _uncertain_exit(
+                symbol=symbol, entry_date=entry_dt, entry_price=entry_price,
+                quantity=quantity, buy_cost=buy_cost,
+                reason="corporate_action_missing_ex_date", corporate_action_uncertain=True,
+            )
+        actions_by_ex_date.setdefault(ex_day, []).append(action)
+
+    coverage = dict(corporate_action_coverage or {})
+    initial_shares = int(quantity)
+    shares = int(quantity)
+    cash_receivable = 0.0
+    share_available_from = entry_dt.date()
+    ledger: list[dict[str, Any]] = []
+    initial_value = float(entry_price) * initial_shares
+    invested = initial_value + float(buy_cost)
+    base_tp_value = initial_value * (1.0 + float(contract.take_profit_pct))
+    base_sl_value = initial_value * (1.0 - float(contract.stop_loss_pct))
+    pending: dict[str, Any] | None = None
+    pending_since_index: int | None = None
+    deferred = 0
+    last_consumed_index = 0
+    suspended_zero_volume_placeholder_days: list[str] = []
+
+    def _uncertain(reason: str, index: int, *, ca: bool = False) -> TailExitResult:
+        return _uncertain_exit(
+            symbol=symbol, entry_date=entry_dt, entry_price=entry_price,
+            quantity=initial_shares, buy_cost=buy_cost, reason=reason,
+            sessions_held=index, deferred_sessions=deferred,
+            corporate_action_uncertain=ca,
+            details={
+                "exit_price_basis": "raw_1m",
+                "initial_shares": initial_shares,
+                "shares_after_actions": shares,
+                "cash_dividend_receivable": round(cash_receivable, 8),
+                "company_action_ledger": list(ledger),
+                "suspended_zero_volume_placeholder_days": list(
+                    suspended_zero_volume_placeholder_days
+                ),
+            },
+        )
+
+    def _realize(
+        *, moment: datetime, price_raw: float, signal: str, tp: bool = False,
+        sl: bool = False, ambiguous: bool = False, gap: bool = False,
+        session_index: int,
+    ) -> TailExitResult:
+        price = price_ticker(price_raw, "sell") if price_ticker else round(price_raw, 2)
+        proceeds = float(price) * shares
+        sell_cost = (
+            float(cost_estimator("sell", float(price), shares, moment))
+            if cost_estimator else 0.0
+        )
+        net_return = (proceeds + cash_receivable - sell_cost) / invested - 1.0
+        gross_return = (proceeds + cash_receivable) / initial_value - 1.0
+        paid_by_exit = sum(
+            float(item["cash_receivable"])
+            for item in ledger
+            if item.get("pay_date") and str(item["pay_date"])[:10] <= moment.date().isoformat()
+        )
+        return TailExitResult(
+            symbol=symbol, status=STATUS_FILLED, realized=True,
+            net_profit=bool(net_return > 0), net_return=float(net_return),
+            gross_return=float(gross_return), entry_date=entry_dt, exit_date=moment,
+            entry_price=float(entry_price), exit_price=float(price), quantity=int(shares),
+            buy_cost=float(buy_cost), sell_cost=float(sell_cost), reason="",
+            take_profit_hit=bool(tp), stop_loss_hit=bool(sl),
+            ambiguous_same_bar=bool(ambiguous), gap_exit=bool(gap),
+            deferred_sessions=int(max(0, deferred)),
+            sessions_held=int(session_index + 1), corporate_action_uncertain=False,
+            details={
+                "exit_price_basis": "raw_1m",
+                "exit_signal": signal,
+                "initial_shares": initial_shares,
+                "final_shares": shares,
+                "cash_dividend_receivable": round(cash_receivable, 8),
+                "cash_dividend_paid_by_exit": round(paid_by_exit, 8),
+                "cash_dividend_unpaid_receivable": round(cash_receivable - paid_by_exit, 8),
+                "sale_proceeds": round(proceeds, 8),
+                "company_action_ledger": list(ledger),
+                "suspended_zero_volume_placeholder_days": list(
+                    suspended_zero_volume_placeholder_days
+                ),
+            },
+        )
+
+    for index, (day, _day_dt, session) in enumerate(sessions):
+        last_consumed_index = index
+        if index == 0:
+            continue  # 入场日受 T+1 约束，不监控退出。
+
+        coverage_row = coverage.get(day.isoformat())
+        if not coverage_row or not bool(coverage_row.get("coverage_complete")):
+            return _uncertain("corporate_action_coverage_incomplete", index, ca=True)
+        if not _trade_status_declared(session):
+            return _uncertain(UNKNOWN_TRADE_STATUS, index)
+
+        for action in actions_by_ex_date.get(day, []):
+            if not bool(action.get("coverage_complete", True)):
+                return _uncertain("corporate_action_row_incomplete", index, ca=True)
+            record_day = action.get("record_date")
+            if isinstance(record_day, str):
+                try:
+                    record_day = date.fromisoformat(record_day[:10])
+                except ValueError:
+                    record_day = None
+            elif isinstance(record_day, datetime):
+                record_day = record_day.date()
+            if not isinstance(record_day, date):
+                return _uncertain("corporate_action_record_date_unknown", index, ca=True)
+            if record_day < entry_dt.date():
+                continue  # 买入发生在登记日后，没有这次分配的权益。
+            status = str(action.get("implementation_status") or "").strip()
+            if status != "实施":
+                return _uncertain("corporate_action_not_confirmed_implemented", index, ca=True)
+            cash_per_share_before_tax = action.get("cash_dividend_per_share_before_tax")
+            total_ratio = action.get("stock_distribution_per_share")
+            bonus_ratio = action.get("bonus_shares_per_share")
+            transfer_ratio = action.get("transfer_shares_per_share")
+            try:
+                cash_per_share_before_tax = float(cash_per_share_before_tax)
+                total_ratio = float(total_ratio)
+                bonus_ratio = float(bonus_ratio)
+                transfer_ratio = float(transfer_ratio)
+            except (TypeError, ValueError):
+                return _uncertain("corporate_action_amount_or_share_ratio_unknown", index, ca=True)
+            if not all(math.isfinite(v) and v >= 0 for v in (
+                cash_per_share_before_tax, total_ratio, bonus_ratio, transfer_ratio,
+            )) or not math.isclose(total_ratio, bonus_ratio + transfer_ratio, abs_tol=1e-6):
+                return _uncertain("corporate_action_share_ratio_mismatch", index, ca=True)
+            cash_per_share = cash_per_share_before_tax * (
+                1.0 - float(contract.cash_dividend_tax_rate)
+            )
+            old_shares = shares
+            additional_shares = old_shares * total_ratio
+            rounded_shares = round(additional_shares)
+            if not math.isclose(additional_shares, rounded_shares, abs_tol=1e-6):
+                return _uncertain("corporate_action_fractional_share_unmodeled", index, ca=True)
+            list_day = action.get("stock_listing_date")
+            if isinstance(list_day, str) and list_day.strip():
+                try:
+                    list_day = date.fromisoformat(list_day[:10])
+                except ValueError:
+                    list_day = None
+            elif isinstance(list_day, datetime):
+                list_day = list_day.date()
+            if rounded_shares and not isinstance(list_day, date):
+                return _uncertain("corporate_action_stock_listing_date_unknown", index, ca=True)
+            dividend = old_shares * cash_per_share
+            shares += int(rounded_shares)
+            cash_receivable += dividend
+            if rounded_shares and list_day > share_available_from:
+                share_available_from = list_day
+            ledger.append({
+                "action_id": str(action.get("action_id") or ""),
+                "ex_date": day.isoformat(),
+                "record_date": record_day.isoformat(),
+                "pay_date": str(action.get("pay_date") or "") or None,
+                "stock_listing_date": list_day.isoformat() if isinstance(list_day, date) else None,
+                "shares_before": old_shares,
+                "shares_added": int(rounded_shares),
+                "shares_after": shares,
+                "cash_dividend_per_share_before_tax": cash_per_share_before_tax,
+                "cash_dividend_tax_rate": float(contract.cash_dividend_tax_rate),
+                "cash_dividend_per_share_after_tax": cash_per_share,
+                "cash_receivable": round(dividend, 8),
+                "source": str(action.get("source") or ""),
+                "as_of": str(action.get("as_of") or ""),
+            })
+
+        day_bars = minute_groups.get(day, [])
+        if _is_suspended(session):
+            if day_bars and not is_zero_volume_placeholder_session(day_bars):
+                return _uncertain("suspension_minute_bar_conflict", index)
+            if day_bars:
+                suspended_zero_volume_placeholder_days.append(day.isoformat())
+            if pending is not None:
+                deferred = max(deferred, index - int(pending_since_index or index))
+                if deferred > int(contract.exit_defer_max_sessions):
+                    return _uncertain("exit_not_executable", index)
+            elif index >= contract.exit_attempt_index:
+                pending = {"signal": "holding_period_exit", "tp": False, "sl": False}
+                pending_since_index = index
+            continue
+        if not bool(session.get("exact_limits_complete")):
+            return _uncertain("exact_exit_limit_missing", index)
+        if not bool(session.get("minute_session_complete")):
+            return _uncertain("raw_minute_session_incomplete", index)
+        if not day_bars:
+            return _uncertain("raw_minute_bars_missing", index)
+
+        day_bars = sorted(day_bars, key=lambda item: item[0])
+        for bar_offset, (moment, bar) in enumerate(day_bars):
+            open_price = _positive_float(bar, "open")
+            high_price = _positive_float(bar, "high")
+            low_price = _positive_float(bar, "low")
+            close_price = _positive_float(bar, "close")
+            if None in (open_price, high_price, low_price, close_price):
+                return _uncertain("raw_minute_price_missing", index)
+
+            if pending is not None:
+                if day < share_available_from:
+                    continue
+                if _is_sellable(bar):
+                    deferred = max(deferred, index - int(pending_since_index or index))
+                    if deferred > int(contract.exit_defer_max_sessions):
+                        return _uncertain("exit_not_executable", index)
+                    return _realize(
+                        moment=moment, price_raw=float(open_price),
+                        signal=str(pending["signal"]), tp=bool(pending["tp"]),
+                        sl=bool(pending["sl"]), ambiguous=bool(pending.get("ambiguous")),
+                        gap=True, session_index=index,
+                    )
+                continue
+
+            stop_level = max(0.0, (base_sl_value - cash_receivable) / shares)
+            target_level = max(0.0, (base_tp_value - cash_receivable) / shares)
+            stop_hit = float(low_price) <= stop_level
+            target_hit = float(high_price) >= target_level
+            ambiguous = bool(stop_hit and target_hit)
+            if ambiguous:
+                target_hit = False
+
+            if stop_hit or target_hit:
+                is_stop = bool(stop_hit)
+                level = stop_level if is_stop else target_level
+                gap = (float(open_price) <= level) if is_stop else (float(open_price) >= level)
+                execution_price = float(open_price) if gap else level
+                pending = {
+                    "signal": "stop_loss" if is_stop else "take_profit",
+                    "tp": not is_stop, "sl": is_stop, "ambiguous": ambiguous,
+                }
+                pending_since_index = index
+                if day >= share_available_from and _is_sellable(bar):
+                    return _realize(
+                        moment=moment, price_raw=execution_price,
+                        signal=str(pending["signal"]), tp=bool(pending["tp"]),
+                        sl=bool(pending["sl"]), ambiguous=ambiguous,
+                        gap=bool(gap), session_index=index,
+                    )
+                continue
+
+            if index >= contract.exit_attempt_index and bar_offset == len(day_bars) - 1:
+                pending = {"signal": "holding_period_exit", "tp": False, "sl": False}
+                pending_since_index = index
+                if day >= share_available_from and _is_sellable(bar):
+                    return _realize(
+                        moment=moment, price_raw=float(close_price),
+                        signal="holding_period_exit", session_index=index,
+                    )
+
+        if pending is not None and index > int(pending_since_index or index):
+            deferred = max(deferred, index - int(pending_since_index or index))
+            if deferred > int(contract.exit_defer_max_sessions):
+                return _uncertain("exit_not_executable", index)
+
+    if pending is not None:
+        return _uncertain("insufficient_data_at_series_end", last_consumed_index)
+    return _uncertain("insufficient_data_at_series_end", max(0, len(sessions) - 1))
 
 
 def simulate_tail_exit(
@@ -628,7 +989,10 @@ def simulate_tail_exit(
     cost_estimator: Callable[[str, float, int, datetime], float] | None = None,
     price_ticker: Callable[[float, str], float] | None = None,
 ) -> TailExitResult:
-    """按契约跑出场：T+1、跳空、止损优先、第 ``holding_days`` 日退出、不可卖则顺延。
+    """Legacy 日线 OHLC 近似模拟器，仅供历史兼容与旧单元测试使用。
+
+    新尾盘标签与研究重建必须调用 ``simulate_tail_exit_raw_minutes``；日线 OHLC
+    不具备分钟触发顺序，不能证明本契约的真实退出价格，因此不得用于新收益证据。
 
     ``daily_bars`` 必须是 raw 日线并**包含入场日那根**（它决定第 1 日的位置）；
     顺序不要求有序，函数自行按日期排序。净收益口径：
@@ -1145,6 +1509,7 @@ __all__ = [
     "RankedCandidate",
     "TailConfirmationContext",
     "hard_gate_confirmation",
+    "is_zero_volume_placeholder_session",
     "TailEntryDecision",
     "TailExitResult",
     "TrendContractError",
@@ -1159,5 +1524,6 @@ __all__ = [
     "normalize_bars",
     "rank_final_recommendations",
     "simulate_tail_exit",
+    "simulate_tail_exit_raw_minutes",
     "summarize_tail_trade",
 ]

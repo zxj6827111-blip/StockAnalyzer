@@ -113,21 +113,25 @@ def _trace_layer_view(stage: Mapping[str, Any], *, source: str) -> dict[str, Any
         str(reason): list(symbols)
         for reason, symbols in (stage.get("rejected_symbols") or {}).items()
     }
-    attributed = {
-        reason: symbols
-        for reason, symbols in rejected_symbols.items()
-        if reason not in UNATTRIBUTED_REASONS
-    }
+    has_unattributed = any(
+        symbols for reason, symbols in rejected_symbols.items()
+        if reason in UNATTRIBUTED_REASONS
+    )
     inputs = int(stage.get("inputs", 0) or 0)
     advanced = int(stage.get("advanced", 0) or 0)
     kept = [str(symbol) for symbol in (stage.get("advanced_symbols") or ())]
+    dropped = [symbol for symbols in rejected_symbols.values() for symbol in symbols]
+    reasons_complete = (
+        not has_unattributed and len(dropped) == inputs - advanced
+        and len(dropped) == len(set(dropped)) and set(dropped).isdisjoint(kept)
+    )
     return {
         "layer": str(stage.get("stage", "")),
         "source": source,
         "recorded": True,
         # "没有原因"有三种：这层没淘汰任何股票（不是缺口）、淘汰了只挂了占位原因
         # （是缺口，D11）、淘汰了且原因齐全。只有最后一种能回答原因分布。
-        "reasons_available": bool(attributed) or inputs == advanced,
+        "reasons_available": reasons_complete,
         "inputs": inputs,
         "advanced": advanced,
         "advanced_symbols": kept,
@@ -140,8 +144,7 @@ def _trace_layer_view(stage: Mapping[str, Any], *, source: str) -> dict[str, Any
         "data_as_of": str(stage.get("data_as_of", "") or ""),
         "drop_rate": float(stage.get("drop_rate", 0.0) or 0.0),
         "notes": str(stage.get("notes", "") or ""),
-        "gaps": ([] if bool(attributed) or inputs == advanced
-                 else ["truncation_reason_not_recorded"]),
+        "gaps": ([] if reasons_complete else ["truncation_reason_not_recorded"]),
     }
 
 

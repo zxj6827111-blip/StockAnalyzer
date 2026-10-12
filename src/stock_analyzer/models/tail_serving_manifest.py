@@ -118,9 +118,9 @@ def build_tail_serving_manifest(
     resolved_label_policy_id = str(
         label_policy_id or declared.get("label_policy_id") or ""
     ).strip()
-    if not resolved_label_policy_id.startswith("label_policy_v4_"):
+    if not resolved_label_policy_id.startswith("label_policy_v5_"):
         raise TailManifestError(
-            f"清单必须绑定净盈利尾盘标签口径（label_policy_v4_*），收到 "
+            f"清单必须绑定 RAW 分钟退出标签口径（label_policy_v5_*），收到 "
             f"{resolved_label_policy_id!r}"
         )
     declared_digest = str(declared.get("contract_digest") or "").strip()
@@ -227,9 +227,9 @@ def verify_tail_serving_manifest(
     if not _COMMIT_RE.match(commit):
         failures.append(f"tail_serving_manifest_training_commit_unverified:{commit or 'none'}")
     label_policy_id = str(label.get("label_policy_id") or "").strip()
-    if not label_policy_id.startswith("label_policy_v4_"):
+    if not label_policy_id.startswith("label_policy_v5_"):
         failures.append(
-            f"tail_serving_manifest_label_policy_not_v4:{label_policy_id or 'none'}"
+            f"tail_serving_manifest_label_policy_not_v5:{label_policy_id or 'none'}"
         )
     recorded_digest = str(contract_block.get("contract_digest") or "").strip()
     if recorded_digest != contract.digest():

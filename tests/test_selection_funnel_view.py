@@ -35,7 +35,7 @@ def _identity() -> ModelIdentity:
     return ModelIdentity(
         model_id="trend-tail-lgbm-1", artifact_content_hash="sha256:deadbeef",
         training_commit="eb691ed", runtime_commit="eb691ed", feature_compute_version=5,
-        label_policy_id="label_policy_v4_abc", contract_digest=CONTRACT.digest(),
+        label_policy_id="label_policy_v5_abc", contract_digest=CONTRACT.digest(),
     )
 
 
@@ -48,7 +48,7 @@ def _stage(name: str, kind: str, *, inputs: int, kept: list[str],
         advanced_symbols=kept, rejected=rejected or {},
         data_as_of="2026-10-09T14:50:00", contract=CONTRACT,
         model_identity=_identity(), feature_compute_version=5,
-        label_policy_id="label_policy_v4_abc", features_used=list(features),
+        label_policy_id="label_policy_v5_abc", features_used=list(features),
     )
 
 

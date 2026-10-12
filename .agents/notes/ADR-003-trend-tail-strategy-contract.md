@@ -1,8 +1,15 @@
 # ADR-003 trend 尾盘策略契约（线上 / 标签 / 回测共用）
 
-Status: Draft
+Status: Superseded
 
-As-of: 2026-10-08 @ HEAD `e90b5de` 之后的工作树（本 ADR 与 `contracts/trend_strategy.py`、
+As-of: 2026-10-10 @ HEAD `c58da46eaf18defed3adf2ac6ec89ad668dcbf66`
+
+Superseded-by: ADR-006
+
+历史范围说明：本 ADR 保留此前的策略入口和影子路径决策；RAW 分钟退出、公司行动、成熟时刻
+以及研究证据状态的新契约以后续 ADR-006 为准。
+
+原 As-of: 2026-10-08 @ HEAD `e90b5de` 之后的工作树（本 ADR 与 `contracts/trend_strategy.py`、
 `labels/tail_net_profit.py`、`research/trend_data_readiness.py`、
 `research/funnel_trace.py`、`research/tail_mature_feedback.py`、
 `research/tail_reference_store.py`、`research/tail_rebuild.py`、

@@ -20,9 +20,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +33,11 @@ import pandas as pd
 
 from stock_analyzer.data.trading_calendar import is_open_trading_date
 from stock_analyzer.research.minute_bar_store import PRICE_BASES, PRICE_BASIS_RAW
+from stock_analyzer.research.suspension_evidence import (
+    SSE_OFFICIAL_SUSPENSION_SOURCE,
+    is_verified_full_day_suspension,
+    is_verified_no_trade_adj_factor_gap,
+)
 
 #: 研究库里参考数据的表名。刻意加 ``ref_`` 前缀，避免与生产仓库同名造成误读。
 REFERENCE_TABLES: dict[str, str] = {
@@ -37,8 +45,13 @@ REFERENCE_TABLES: dict[str, str] = {
     "daily_bars": "ref_daily_bars_raw",
     "limit_prices": "ref_limit_prices",
     "suspend_status": "ref_suspend_status",
+    "suspend_evidence": "ref_suspend_evidence",
     "security_status": "ref_security_status",
+    "corporate_actions": "ref_corporate_actions",
+    "corporate_action_coverage": "ref_corporate_action_coverage",
 }
+
+ADJ_FACTOR_TABLE = "ref_adj_factor_history"
 
 #: 生产仓库里对应的来源表（``data/market_warehouse.py`` 的 DDL）。
 WAREHOUSE_TABLES: dict[str, str] = {
@@ -123,11 +136,69 @@ def _ddl(table: str) -> str:
                 PRIMARY KEY (symbol, trade_date)
             )
         """
+    if table == REFERENCE_TABLES["suspend_evidence"]:
+        return f"""
+            CREATE TABLE IF NOT EXISTS {table} (
+                symbol VARCHAR NOT NULL,
+                trade_date DATE NOT NULL,
+                source VARCHAR NOT NULL,
+                evidence_url VARCHAR NOT NULL,
+                evidence_title VARCHAR NOT NULL,
+                evidence_document_date DATE NOT NULL,
+                evidence_sha256 VARCHAR NOT NULL,
+                evidence_full_day BOOLEAN NOT NULL,
+                evidence_as_of VARCHAR NOT NULL,
+                raw_payload JSON NOT NULL,
+                {_INGESTED} TIMESTAMP NOT NULL,
+                PRIMARY KEY (symbol, trade_date, source)
+            )
+        """
+    if table == REFERENCE_TABLES["corporate_actions"]:
+        return f"""
+            CREATE TABLE IF NOT EXISTS {table} (
+                action_id VARCHAR PRIMARY KEY,
+                symbol VARCHAR NOT NULL,
+                report_end_date DATE,
+                announcement_date DATE,
+                implementation_announcement_date DATE,
+                record_date DATE,
+                ex_date DATE NOT NULL,
+                pay_date DATE,
+                stock_listing_date DATE,
+                implementation_status VARCHAR,
+                cash_dividend_per_share_after_tax DOUBLE,
+                cash_dividend_per_share_before_tax DOUBLE,
+                stock_distribution_per_share DOUBLE,
+                bonus_shares_per_share DOUBLE,
+                transfer_shares_per_share DOUBLE,
+                source VARCHAR NOT NULL,
+                as_of VARCHAR NOT NULL,
+                coverage_complete BOOLEAN NOT NULL,
+                raw_payload JSON NOT NULL,
+                {_INGESTED} TIMESTAMP NOT NULL
+            )
+        """
+    if table == REFERENCE_TABLES["corporate_action_coverage"]:
+        return f"""
+            CREATE TABLE IF NOT EXISTS {table} (
+                ex_date DATE NOT NULL,
+                source VARCHAR NOT NULL,
+                as_of VARCHAR NOT NULL,
+                rows_returned INTEGER NOT NULL,
+                coverage_complete BOOLEAN NOT NULL,
+                truncated BOOLEAN NOT NULL,
+                error VARCHAR,
+                response_sha256 VARCHAR,
+                {_INGESTED} TIMESTAMP NOT NULL,
+                PRIMARY KEY (ex_date, source)
+            )
+        """
     return f"""
         CREATE TABLE IF NOT EXISTS {table} (
             symbol VARCHAR NOT NULL,
             effective_from DATE NOT NULL,
             effective_to DATE,
+            announcement_date DATE,
             status_type VARCHAR NOT NULL,
             status_value VARCHAR,
             board VARCHAR,
@@ -141,6 +212,112 @@ def _ddl(table: str) -> str:
     """
 
 
+def _corporate_action_economic_key(action: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Return the complete economic identity used to collapse exact vendor duplicates.
+
+    ``ann_date`` is intentionally excluded: Tushare can return both an earlier plan row
+    and a later implementation row for one action. The action dates, record date, status,
+    cash/share amounts, listing date, and coverage must all agree before those rows can
+    be treated as duplicate disclosures.
+    """
+    date_fields = (
+        "report_end_date",
+        "record_date",
+        "ex_date",
+        "pay_date",
+        "stock_listing_date",
+    )
+    number_fields = (
+        "cash_dividend_per_share_after_tax",
+        "cash_dividend_per_share_before_tax",
+        "stock_distribution_per_share",
+        "bonus_shares_per_share",
+        "transfer_shares_per_share",
+    )
+    dates = tuple(
+        _day(action.get(name)).isoformat() if _day(action.get(name)) is not None else None
+        for name in date_fields
+    )
+    numbers = tuple(
+        round(value, 12) if (value := _number(action.get(name))) is not None else None
+        for name in number_fields
+    )
+    return (
+        str(action.get("symbol") or ""),
+        *dates,
+        str(action.get("implementation_status") or ""),
+        *numbers,
+        bool(action.get("coverage_complete")),
+    )
+
+
+def _deduplicate_identical_corporate_actions(
+    action_rows: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Collapse only exact economic duplicates and return a visible alias audit."""
+    grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for raw in action_rows:
+        action = dict(raw)
+        grouped.setdefault(_corporate_action_economic_key(action), []).append(action)
+
+    unique: list[dict[str, Any]] = []
+    duplicate_groups: list[dict[str, Any]] = []
+    for rows in grouped.values():
+        # Prefer the latest disclosure, then the latest implementation notice. The
+        # economic key already guarantees that these dates cannot change the action.
+        rows.sort(
+            key=lambda row: (
+                _day(row.get("announcement_date")) or date.min,
+                _day(row.get("implementation_announcement_date")) or date.min,
+                str(row.get("action_id") or ""),
+            ),
+        )
+        canonical = rows[-1]
+        unique.append(canonical)
+        if len(rows) == 1:
+            continue
+        aliases = [str(row.get("action_id") or "") for row in rows[:-1]]
+        canonical["duplicate_action_ids"] = aliases
+        duplicate_groups.append(
+            {
+                "canonical_action_id": str(canonical.get("action_id") or ""),
+                "duplicate_action_ids": aliases,
+                "symbol": str(canonical.get("symbol") or ""),
+                "ex_date": (
+                    _day(canonical.get("ex_date")).isoformat()
+                    if _day(canonical.get("ex_date")) is not None
+                    else ""
+                ),
+                "collapsed_count": len(rows) - 1,
+                "reason": "exact_economic_identity_across_disclosure_rows",
+            }
+        )
+    unique.sort(
+        key=lambda row: (
+            _day(row.get("ex_date")) or date.min,
+            str(row.get("action_id") or ""),
+        )
+    )
+    duplicate_groups.sort(key=lambda row: (row["ex_date"], row["symbol"]))
+    return unique, duplicate_groups
+
+
+def _adj_factor_ddl() -> str:
+    return f"""
+        CREATE TABLE IF NOT EXISTS {ADJ_FACTOR_TABLE} (
+            symbol VARCHAR NOT NULL,
+            trade_date DATE NOT NULL,
+            adj_factor DOUBLE,
+            source VARCHAR NOT NULL,
+            as_of VARCHAR NOT NULL,
+            coverage_complete BOOLEAN NOT NULL,
+            response_sha256 VARCHAR,
+            {_INGESTED} TIMESTAMP NOT NULL,
+            PRIMARY KEY (symbol, trade_date)
+        )
+    """
+
+
 def _day(value: Any) -> date | None:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
@@ -150,13 +327,42 @@ def _day(value: Any) -> date | None:
         return value
     text = str(value).strip()[:10]
     try:
+        if len(text) == 8 and text.isdigit():
+            return datetime.strptime(text, "%Y%m%d").date()
         return date.fromisoformat(text)
     except ValueError:
         return None
 
 
+def _research_symbol(value: Any) -> str:
+    """Match research tables' bare-code convention while accepting Tushare ts_code.
+
+    Daily/minute research stores use six-digit codes (for example ``600000``), while
+    Tushare returns ``600000.SH``. Keep the full source row in ``raw_payload``; only the
+    join key is normalized.
+    """
+    text = str(value or "").strip().upper()
+    for suffix in (".SH", ".SZ", ".BJ"):
+        if text.endswith(suffix):
+            return text[: -len(suffix)]
+    return text
+
+
 def _flag(value: Any) -> bool:
     return bool(value) and str(value).lower() not in ("false", "0", "none", "")
+
+
+def _nullable_text(value: Any) -> str | None:
+    """Normalize CSV / pandas nulls before turning optional text into a string."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    return text or None
 
 
 def _provenance(item: Mapping[Any, Any], default: str, *, field: str = "source") -> str:
@@ -183,6 +389,12 @@ class TailReferenceStore:
         self._con = duckdb.connect(str(self.path))
         for table in REFERENCE_TABLES.values():
             self._con.execute(_ddl(table))
+        # 旧研究库需要保留原内容并增量迁移；PIT 公告时间缺失时由就绪审计阻断。
+        self._con.execute(
+            f"ALTER TABLE {REFERENCE_TABLES['security_status']} "
+            "ADD COLUMN IF NOT EXISTS announcement_date DATE"
+        )
+        self._con.execute(_adj_factor_ddl())
 
     def close(self) -> None:
         self._con.close()
@@ -235,10 +447,12 @@ class TailReferenceStore:
             day = _day(value)
             if day is None:
                 continue
-            rows.append((day, is_open_trading_date(day), str(exchange), str(source),
-                         str(as_of), now))
+            rows.append(
+                (day, is_open_trading_date(day), str(exchange), str(source), str(as_of), now)
+            )
         return self._write(
-            REFERENCE_TABLES["trade_calendar"], rows,
+            REFERENCE_TABLES["trade_calendar"],
+            rows,
             ("trade_date", "is_open", "exchange", "source", "as_of", _INGESTED),
         )
 
@@ -273,23 +487,49 @@ class TailReferenceStore:
             symbol = str(item.get("symbol") or "").strip()
             if day is None or not symbol:
                 continue
-            rows.append((
-                symbol, day,
-                _number(item.get("open")), _number(item.get("high")),
-                _number(item.get("low")), _number(item.get("close")),
-                _number(item.get("volume")), _number(item.get("turnover")),
-                _number(item.get("float_market_cap")),
-                str(item.get("name") or "") or None,
-                _optional_flag(item.get("is_st")), _optional_flag(item.get("is_delisting_risk")),
-                str(item.get("board") or "") or None,
-                PRICE_BASIS_RAW, _provenance(item, source),
-                _provenance(item, str(as_of), field="as_of"), now,
-            ))
+            rows.append(
+                (
+                    symbol,
+                    day,
+                    _number(item.get("open")),
+                    _number(item.get("high")),
+                    _number(item.get("low")),
+                    _number(item.get("close")),
+                    _number(item.get("volume")),
+                    _number(item.get("turnover")),
+                    _number(item.get("float_market_cap")),
+                    str(item.get("name") or "") or None,
+                    _optional_flag(item.get("is_st")),
+                    _optional_flag(item.get("is_delisting_risk")),
+                    str(item.get("board") or "") or None,
+                    PRICE_BASIS_RAW,
+                    _provenance(item, source),
+                    _provenance(item, str(as_of), field="as_of"),
+                    now,
+                )
+            )
         return self._write(
-            REFERENCE_TABLES["daily_bars"], rows,
-            ("symbol", "trade_date", "open", "high", "low", "close", "volume", "turnover",
-             "float_market_cap", "name", "is_st", "is_delisting_risk", "board",
-             "price_basis", "source", "as_of", _INGESTED),
+            REFERENCE_TABLES["daily_bars"],
+            rows,
+            (
+                "symbol",
+                "trade_date",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "turnover",
+                "float_market_cap",
+                "name",
+                "is_st",
+                "is_delisting_risk",
+                "board",
+                "price_basis",
+                "source",
+                "as_of",
+                _INGESTED,
+            ),
         )
 
     def suspended_symbol_days(self) -> set[tuple[str, date]]:
@@ -299,8 +539,7 @@ class TailReferenceStore:
         把停牌说成能买，§3.1 的"不把缺 bar 当停牌"反过来同样成立。
         """
         rows = self._con.execute(
-            f"SELECT symbol, trade_date FROM {REFERENCE_TABLES['suspend_status']} "
-            "WHERE suspended"
+            f"SELECT symbol, trade_date FROM {REFERENCE_TABLES['suspend_status']} WHERE suspended"
         ).fetchall()
         declared: set[tuple[str, date]] = set()
         for symbol, day in rows:
@@ -336,13 +575,33 @@ class TailReferenceStore:
                 continue
             up = _number(item.get("up_limit"))
             down = _number(item.get("down_limit"))
-            rows.append((symbol, day, up, down, bool(approximated), _provenance(item, source),
-                         _provenance(item, str(as_of), field="as_of"),
-                         _coverage(item, up is not None and down is not None), now))
+            rows.append(
+                (
+                    symbol,
+                    day,
+                    up,
+                    down,
+                    bool(approximated),
+                    _provenance(item, source),
+                    _provenance(item, str(as_of), field="as_of"),
+                    _coverage(item, up is not None and down is not None),
+                    now,
+                )
+            )
         return self._write(
-            REFERENCE_TABLES["limit_prices"], rows,
-            ("symbol", "trade_date", "up_limit", "down_limit", "approximated", "source",
-             "as_of", "coverage_complete", _INGESTED),
+            REFERENCE_TABLES["limit_prices"],
+            rows,
+            (
+                "symbol",
+                "trade_date",
+                "up_limit",
+                "down_limit",
+                "approximated",
+                "source",
+                "as_of",
+                "coverage_complete",
+                _INGESTED,
+            ),
         )
 
     def upsert_suspend_status(
@@ -359,8 +618,9 @@ class TailReferenceStore:
         """
         if not str(as_of or "").strip():
             raise TailReferenceError("suspend rows need an explicit as_of")
-        missing = [name for name in ("symbol", "trade_date", "suspended")
-                   if name not in frame.columns]
+        missing = [
+            name for name in ("symbol", "trade_date", "suspended") if name not in frame.columns
+        ]
         if missing:
             raise TailReferenceError(f"suspend frame is missing column(s) {missing}")
         now = datetime.now()
@@ -371,17 +631,531 @@ class TailReferenceStore:
             if day is None or not symbol:
                 continue
             status = str(item.get("trade_status") or "").strip() or None
-            rows.append((
-                symbol, day, _flag(item.get("suspended")),
-                str(item.get("suspend_type") or "") or None, status,
-                _provenance(item, source), _provenance(item, str(as_of), field="as_of"),
-                _coverage(item, status is not None), now,
-            ))
+            rows.append(
+                (
+                    symbol,
+                    day,
+                    _flag(item.get("suspended")),
+                    str(item.get("suspend_type") or "") or None,
+                    status,
+                    _provenance(item, source),
+                    _provenance(item, str(as_of), field="as_of"),
+                    _coverage(item, status is not None),
+                    now,
+                )
+            )
         return self._write(
-            REFERENCE_TABLES["suspend_status"], rows,
-            ("symbol", "trade_date", "suspended", "suspend_type", "trade_status", "source",
-             "as_of", "coverage_complete", _INGESTED),
+            REFERENCE_TABLES["suspend_status"],
+            rows,
+            (
+                "symbol",
+                "trade_date",
+                "suspended",
+                "suspend_type",
+                "trade_status",
+                "source",
+                "as_of",
+                "coverage_complete",
+                _INGESTED,
+            ),
         )
+
+    def upsert_corporate_actions(
+        self,
+        frame: pd.DataFrame,
+        *,
+        source: str,
+        as_of: str,
+    ) -> int:
+        """导入已实施的公司行动原始事实，单位按每股保存，保留源行供复核。
+
+        这里不把缺失金额或比例改成 0，除非调用方携带 reconcile CLI 生成的哈希绑定官方证据。
+        是否可用于账本由逐条标签门判定；来源行始终保留。
+        ``action_id`` 不含数值字段，供应商更正同一行动时会按同一键替换为最新披露值。
+        """
+        if not str(source or "").strip() or not str(as_of or "").strip():
+            raise TailReferenceError("corporate-action rows need explicit source and as_of")
+        if frame is None or frame.empty:
+            return 0
+        rows: list[tuple[Any, ...]] = []
+        now = datetime.now()
+        for raw in frame.to_dict("records"):
+            source_symbol = str(raw.get("ts_code") or raw.get("symbol") or "").strip()
+            symbol = _research_symbol(source_symbol)
+            ex_date = _day(raw.get("ex_date"))
+            if not symbol or ex_date is None:
+                raise TailReferenceError("corporate-action row requires symbol and ex_date")
+            report_end = _day(raw.get("end_date"))
+            announcement = _day(raw.get("ann_date"))
+            normalized = {
+                # The source identity stays fully qualified so an upsert replaces the
+                # earlier qualified-key row after the research join key is normalized.
+                "symbol": source_symbol.upper(),
+                "end_date": raw.get("end_date"),
+                "ann_date": raw.get("ann_date"),
+            }
+            action_id = hashlib.sha256(
+                json.dumps(normalized, sort_keys=True, ensure_ascii=False, default=str).encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+            row_source = str(source)
+            payload = dict(raw)
+            evidence_raw = _nullable_text(raw.get("official_reconciliation_evidence_json"))
+            record_source = str(raw.get("record_source") or "").strip()
+            if record_source:
+                if record_source != "tushare_dividend_ex_date+cninfo_official" or not evidence_raw:
+                    raise TailReferenceError(
+                        "official corporate-action reconciliation requires "
+                        "its verified evidence payload"
+                    )
+                try:
+                    evidence = json.loads(evidence_raw)
+                except json.JSONDecodeError as exc:
+                    raise TailReferenceError(
+                        "official corporate-action evidence JSON is malformed"
+                    ) from exc
+                if not isinstance(evidence, Mapping):
+                    raise TailReferenceError(
+                        "official corporate-action evidence payload must be an object"
+                    )
+                documents = evidence.get("documents")
+                official = evidence.get("official_reconciliation")
+                if (
+                    evidence.get("source") != "cninfo_official_disclosure"
+                    or not isinstance(documents, list)
+                    or not documents
+                    or not isinstance(official, Mapping)
+                    or official.get("implementation_status") != "实施"
+                ):
+                    raise TailReferenceError(
+                        "official corporate-action evidence payload is incomplete"
+                    )
+                for document in documents:
+                    if not isinstance(document, Mapping):
+                        raise TailReferenceError(
+                            "official corporate-action document evidence is malformed"
+                        )
+                    evidence_hash = str(document.get("sha256") or "")
+                    if len(evidence_hash) != 64 or any(
+                        c not in "0123456789abcdef" for c in evidence_hash
+                    ):
+                        raise TailReferenceError(
+                            "official corporate-action evidence has an invalid SHA-256"
+                        )
+                    evidence_url = str(document.get("url") or "")
+                    host = (
+                        evidence_url.split("/", 3)[2:3]
+                        if evidence_url.startswith("https://")
+                        else []
+                    )
+                    if not host or host[0] not in {
+                        "static.cninfo.com.cn",
+                        "dataclouds.cninfo.com.cn",
+                    }:
+                        raise TailReferenceError(
+                            "official corporate-action evidence URL is not a CNINFO host"
+                        )
+                for source_field, official_field in (
+                    ("cash_div", "cash_dividend_per_share_before_tax"),
+                    ("cash_div_tax", "cash_dividend_per_share_after_tax"),
+                    ("stk_div", "stock_distribution_per_share"),
+                    ("stk_bo_rate", "bonus_shares_per_share"),
+                    ("stk_co_rate", "transfer_shares_per_share"),
+                ):
+                    actual = _number(raw.get(source_field))
+                    declared = _number(official.get(official_field))
+                    if (
+                        actual is None
+                        or declared is None
+                        or not math.isclose(
+                            actual,
+                            declared,
+                            rel_tol=0.0,
+                            abs_tol=1e-10,
+                        )
+                    ):
+                        raise TailReferenceError(
+                            f"official corporate-action evidence does not match {source_field}"
+                        )
+                payload["official_reconciliation_evidence"] = evidence
+                row_source = record_source
+            total_ratio = _number(raw.get("stk_div"))
+            bonus_ratio = _number(raw.get("stk_bo_rate"))
+            transfer_ratio = _number(raw.get("stk_co_rate"))
+            # Tushare exposes the total and its two components. A missing component is
+            # provably zero only when the declared total is zero or equals the other
+            # declared component; otherwise preserve NULL and let the execution gate fail closed.
+            if total_ratio is not None and math.isclose(total_ratio, 0.0, abs_tol=1e-12):
+                bonus_ratio = transfer_ratio = 0.0
+            elif total_ratio is not None and bonus_ratio is None and transfer_ratio is not None:
+                if math.isclose(total_ratio, transfer_ratio, abs_tol=1e-6):
+                    bonus_ratio = 0.0
+            elif total_ratio is not None and transfer_ratio is None and bonus_ratio is not None:
+                if math.isclose(total_ratio, bonus_ratio, abs_tol=1e-6):
+                    transfer_ratio = 0.0
+            rows.append(
+                (
+                    action_id,
+                    symbol,
+                    report_end,
+                    announcement,
+                    _day(raw.get("imp_ann_date")),
+                    _day(raw.get("record_date")),
+                    ex_date,
+                    _day(raw.get("pay_date")),
+                    _day(raw.get("div_listdate")),
+                    _provenance(raw, "", field="div_proc") or None,
+                    _number(raw.get("cash_div")),
+                    _number(raw.get("cash_div_tax")),
+                    total_ratio,
+                    bonus_ratio,
+                    transfer_ratio,
+                    row_source,
+                    str(as_of),
+                    _coverage(raw, True),
+                    json.dumps(payload, ensure_ascii=False, default=str),
+                    now,
+                )
+            )
+        columns = (
+            "action_id",
+            "symbol",
+            "report_end_date",
+            "announcement_date",
+            "implementation_announcement_date",
+            "record_date",
+            "ex_date",
+            "pay_date",
+            "stock_listing_date",
+            "implementation_status",
+            "cash_dividend_per_share_after_tax",
+            "cash_dividend_per_share_before_tax",
+            "stock_distribution_per_share",
+            "bonus_shares_per_share",
+            "transfer_shares_per_share",
+            "source",
+            "as_of",
+            "coverage_complete",
+            "raw_payload",
+            _INGESTED,
+        )
+        return self._write(REFERENCE_TABLES["corporate_actions"], rows, columns)
+
+    def upsert_corporate_action_coverage(
+        self,
+        frame: pd.DataFrame,
+        *,
+        source: str,
+        as_of: str,
+    ) -> int:
+        """每个交易日都必须有一条来源覆盖记录，连零事件日也不能省略。"""
+        if not str(source or "").strip() or not str(as_of or "").strip():
+            raise TailReferenceError("corporate-action coverage needs explicit source and as_of")
+        if frame is None or frame.empty:
+            return 0
+        rows: list[tuple[Any, ...]] = []
+        now = datetime.now()
+        for raw in frame.to_dict("records"):
+            ex_date = _day(raw.get("ex_date"))
+            if ex_date is None:
+                raise TailReferenceError("corporate-action coverage row requires ex_date")
+            coverage_as_of = str(raw.get("as_of") or as_of)
+            coverage_source = str(raw.get("source") or source)
+            error = _nullable_text(raw.get("error"))
+            truncated = _flag(raw.get("truncated"))
+            complete = _flag(raw.get("coverage_complete")) and not truncated and error is None
+            rows.append(
+                (
+                    ex_date,
+                    coverage_source,
+                    coverage_as_of,
+                    int(_number(raw.get("rows_returned")) or 0),
+                    complete,
+                    truncated,
+                    error,
+                    _nullable_text(raw.get("response_sha256")),
+                    now,
+                )
+            )
+        return self._write(
+            REFERENCE_TABLES["corporate_action_coverage"],
+            rows,
+            (
+                "ex_date",
+                "source",
+                "as_of",
+                "rows_returned",
+                "coverage_complete",
+                "truncated",
+                "error",
+                "response_sha256",
+                _INGESTED,
+            ),
+        )
+
+    def upsert_adj_factors(self, frame: pd.DataFrame, *, source: str, as_of: str) -> int:
+        """Load per-symbol factor observations used only to cross-check action coverage."""
+        if not str(source or "").strip() or not str(as_of or "").strip():
+            raise TailReferenceError("adjustment-factor rows need explicit source and as_of")
+        if frame is None or frame.empty:
+            return 0
+        required = ("trade_date", "adj_factor")
+        missing = [name for name in required if name not in frame.columns]
+        if missing:
+            raise TailReferenceError(f"adjustment-factor frame is missing column(s) {missing}")
+        now = datetime.now()
+        rows: list[tuple[Any, ...]] = []
+        for raw in frame.to_dict("records"):
+            # Prefer the fully qualified code when the source also carries it. CSV
+            # readers commonly infer a bare code such as 000001 as integer 1, losing
+            # leading zeroes before this normalization point.
+            symbol = _research_symbol(raw.get("ts_code") or raw.get("symbol"))
+            day = _day(raw.get("trade_date"))
+            if not symbol or day is None:
+                raise TailReferenceError("adjustment-factor row requires symbol and trade_date")
+            value = _number(raw.get("adj_factor"))
+            complete = _flag(raw.get("coverage_complete")) and value is not None and value > 0
+            rows.append(
+                (
+                    symbol,
+                    day,
+                    value,
+                    _provenance(raw, source),
+                    _provenance(raw, as_of, field="as_of"),
+                    complete,
+                    _nullable_text(raw.get("response_sha256")),
+                    now,
+                )
+            )
+        written = self._write(
+            ADJ_FACTOR_TABLE,
+            rows,
+            (
+                "symbol",
+                "trade_date",
+                "adj_factor",
+                "source",
+                "as_of",
+                "coverage_complete",
+                "response_sha256",
+                _INGESTED,
+            ),
+        )
+        self._con.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{ADJ_FACTOR_TABLE}_lookup "
+            f"ON {ADJ_FACTOR_TABLE} (symbol, trade_date)"
+        )
+        return written
+
+    def corporate_action_window(
+        self,
+        symbol: str,
+        start: date,
+        end: date,
+    ) -> dict[str, Any]:
+        """取持仓窗口公司行动，并逐开市日核对全市场采集覆盖。"""
+        factor_start = start - timedelta(days=31)
+        following_sessions = self.calendar(end + timedelta(days=1), end + timedelta(days=31))
+        factor_validation_end = following_sessions[0] if following_sessions else end
+        expected = self.calendar(start, end)
+        coverage_rows = self._rows(
+            f"SELECT ex_date, source, as_of, rows_returned, coverage_complete, truncated, error "
+            f"FROM {REFERENCE_TABLES['corporate_action_coverage']} "
+            "WHERE ex_date BETWEEN ? AND ? ORDER BY ex_date, source",
+            [factor_start, factor_validation_end],
+        )
+        coverage_by_day = {
+            _day(item["ex_date"]): item
+            for item in coverage_rows
+            if _day(item["ex_date"]) is not None
+        }
+        missing_days = [day.isoformat() for day in expected if day not in coverage_by_day]
+        incomplete_days = [
+            day.isoformat()
+            for day in expected
+            if day in coverage_by_day and not bool(coverage_by_day[day]["coverage_complete"])
+        ]
+        action_rows = self._rows(
+            f"SELECT action_id, symbol, report_end_date, announcement_date, "
+            f"implementation_announcement_date, record_date, ex_date, pay_date, "
+            f"stock_listing_date, implementation_status, "
+            f"cash_dividend_per_share_after_tax, cash_dividend_per_share_before_tax, "
+            f"stock_distribution_per_share, bonus_shares_per_share, "
+            f"transfer_shares_per_share, source, as_of, coverage_complete, raw_payload "
+            f"FROM {REFERENCE_TABLES['corporate_actions']} "
+            "WHERE symbol = ? AND ex_date BETWEEN ? AND ? ORDER BY ex_date, action_id",
+            [_research_symbol(symbol), factor_start, factor_validation_end],
+        )
+        all_economic_actions, duplicate_action_groups = _deduplicate_identical_corporate_actions(
+            action_rows
+        )
+        economic_actions = [
+            action for action in all_economic_actions
+            if start <= (_day(action.get("ex_date")) or date.min) <= end
+        ]
+        actions_by_day: dict[date, list[dict[str, Any]]] = {}
+        for action in all_economic_actions:
+            action_day = _day(action.get("ex_date"))
+            if action_day is not None:
+                actions_by_day.setdefault(action_day, []).append(action)
+        factor_rows = self._rows(
+            f"SELECT trade_date, adj_factor, coverage_complete FROM {ADJ_FACTOR_TABLE} "
+            "WHERE symbol = ? AND trade_date BETWEEN ? AND ? ORDER BY trade_date",
+            [_research_symbol(symbol), factor_start, factor_validation_end],
+        )
+        factors = {
+            _day(item["trade_date"]): item
+            for item in factor_rows
+            if _day(item["trade_date"]) is not None
+        }
+
+        def valid_factor(day: date) -> float | None:
+            row = factors.get(day)
+            value = _number(row.get("adj_factor")) if row is not None else None
+            if row is None or not bool(row["coverage_complete"]) or value is None or value <= 0:
+                return None
+            return float(value)
+
+        minute_table_exists = bool(self._scalar(
+            "SELECT COUNT(*) FROM information_schema.tables "
+            "WHERE table_name = 'minute_bars_1min'"
+        ) or 0)
+
+        def proven_no_trade_factor_gap(day: date) -> bool:
+            if day in factors:
+                return False
+            factor_days = sorted(factors)
+            previous_days = [
+                item for item in factor_days if item < day and valid_factor(item) is not None
+            ]
+            next_days = [
+                item for item in factor_days if item > day and valid_factor(item) is not None
+            ]
+            if not previous_days or not next_days or not minute_table_exists:
+                return False
+            action_coverage = coverage_by_day.get(day)
+            action_coverage_complete = bool(
+                action_coverage
+                and action_coverage.get("source") == "tushare_dividend_ex_date"
+                and action_coverage.get("coverage_complete")
+                and not action_coverage.get("truncated")
+                and not str(action_coverage.get("error") or "").strip()
+            )
+            raw_daily_exists = bool(self._scalar(
+                f"SELECT COUNT(*) FROM {REFERENCE_TABLES['daily_bars']} "
+                "WHERE symbol = ? AND trade_date = ?",
+                [_research_symbol(symbol), day],
+            ) or 0)
+            minute_bar_count = int(self._scalar(
+                "SELECT COUNT(*) FROM minute_bars_1min WHERE symbol = ? AND trade_date = ?",
+                [_research_symbol(symbol), day],
+            ) or 0)
+            return is_verified_no_trade_adj_factor_gap(
+                self.verified_full_day_suspension(symbol, day),
+                has_raw_daily_bar=raw_daily_exists,
+                raw_minute_bar_count=minute_bar_count,
+                action_coverage_complete=action_coverage_complete,
+                has_corporate_action=day in actions_by_day,
+                previous_factor=valid_factor(previous_days[-1]),
+                next_factor=valid_factor(next_days[0]),
+            )
+
+        prior_days = self.calendar(factor_start, start - timedelta(days=1))
+        prior_suspension_exempt_days = [
+            day for day in prior_days
+            if valid_factor(day) is None and proven_no_trade_factor_gap(day)
+        ]
+        prior_missing_days = [
+            day for day in prior_days
+            if valid_factor(day) is None and day not in prior_suspension_exempt_days
+        ]
+        prior_valid_days = [day for day in prior_days if valid_factor(day) is not None]
+        prior_day = prior_valid_days[-1] if prior_valid_days else None
+        previous_factor = valid_factor(prior_day) if prior_day is not None else None
+        factor_previous_missing = not prior_valid_days or bool(prior_missing_days)
+        factor_missing_days = [
+            day.isoformat()
+            for day in expected
+            if valid_factor(day) is None
+        ]
+        factor_gap_exemptions: list[str] = [
+            day.isoformat() for day in prior_suspension_exempt_days
+        ]
+        unmatched_factor_changes: list[str] = []
+        actions_without_factor_change: list[str] = []
+        if factor_previous_missing:
+            previous_factor = None
+        for day in expected:
+            current = factors.get(day)
+            current_factor = valid_factor(day)
+            if current_factor is not None and current_factor > 0 and previous_factor is not None:
+                changed = not math.isclose(
+                    current_factor / previous_factor,
+                    1.0,
+                    rel_tol=1e-8,
+                    abs_tol=1e-10,
+                )
+                if changed and day not in actions_by_day:
+                    unmatched_factor_changes.append(day.isoformat())
+                if not changed and day in actions_by_day:
+                    actions_without_factor_change.append(day.isoformat())
+                previous_factor = float(current_factor)
+            else:
+                if current is None and proven_no_trade_factor_gap(day):
+                    factor_gap_exemptions.append(day.isoformat())
+                else:
+                    previous_factor = None
+
+        combined_coverage: dict[str, dict[str, Any]] = {}
+        incomplete_combined: list[str] = []
+        for day in expected:
+            base = coverage_by_day.get(day, {})
+            factor_row = factors.get(day)
+            factor_complete = (
+                valid_factor(day) is not None
+                and day.isoformat() not in unmatched_factor_changes
+            )
+            suspension_exempt = day.isoformat() in factor_gap_exemptions
+            effective_factor_complete = factor_complete or suspension_exempt
+            complete = bool(base.get("coverage_complete")) and effective_factor_complete
+            if not complete:
+                incomplete_combined.append(day.isoformat())
+            combined_coverage[day.isoformat()] = {
+                **base,
+                "coverage_complete": complete,
+                "dividend_source_coverage_complete": bool(base.get("coverage_complete")),
+                "adj_factor_row_present": factor_row is not None,
+                "adj_factor_coverage_complete": effective_factor_complete,
+                "adj_factor_suspension_exempt": suspension_exempt,
+                "adj_factor": (
+                    float(factor_row["adj_factor"])
+                    if factor_row is not None and factor_row["adj_factor"] is not None
+                    else None
+                ),
+            }
+        return {
+            "symbol": str(symbol),
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "actions": economic_actions,
+            "duplicate_action_groups": duplicate_action_groups,
+            "coverage_by_day": combined_coverage,
+            "missing_coverage_days": missing_days,
+            "incomplete_coverage_days": sorted(set(incomplete_days + incomplete_combined)),
+            "adj_factor_missing_days": factor_missing_days,
+            "adj_factor_suspension_exempt_days": factor_gap_exemptions,
+            "adj_factor_unresolved_missing_days": sorted(
+                set(factor_missing_days) - set(factor_gap_exemptions)
+            ),
+            "adj_factor_previous_session_missing": factor_previous_missing,
+            "unmatched_adj_factor_change_days": unmatched_factor_changes,
+            "actions_without_adj_factor_change_days": actions_without_factor_change,
+            "coverage_complete": bool(expected)
+            and not missing_days
+            and not incomplete_combined
+            and not factor_previous_missing,
+        }
 
     def upsert_security_status(
         self,
@@ -393,8 +1167,11 @@ class TailReferenceStore:
         """证券历史状态是**带日期的区间**，压成当日布尔值就丢了 ST/退市风险的时点。"""
         if not str(as_of or "").strip():
             raise TailReferenceError("security status rows need an explicit as_of")
-        missing = [name for name in ("symbol", "effective_from", "status_type")
-                   if name not in frame.columns]
+        missing = [
+            name
+            for name in ("symbol", "effective_from", "status_type")
+            if name not in frame.columns
+        ]
         if missing:
             raise TailReferenceError(f"security status frame is missing column(s) {missing}")
         now = datetime.now()
@@ -405,18 +1182,39 @@ class TailReferenceStore:
             status_type = str(item.get("status_type") or "").strip()
             if start is None or not symbol or not status_type:
                 continue
-            rows.append((
-                symbol, start, _day(item.get("effective_to")), status_type,
-                str(item.get("status_value") or "") or None,
-                str(item.get("board") or "") or None,
-                str(item.get("exchange") or "") or None,
-                _provenance(item, source), _provenance(item, str(as_of), field="as_of"),
-                _coverage(item, True), now,
-            ))
+            rows.append(
+                (
+                    symbol,
+                    start,
+                    _day(item.get("effective_to")),
+                    _day(item.get("announcement_date")),
+                    status_type,
+                    str(item.get("status_value") or "") or None,
+                    str(item.get("board") or "") or None,
+                    str(item.get("exchange") or "") or None,
+                    _provenance(item, source),
+                    _provenance(item, str(as_of), field="as_of"),
+                    _coverage(item, True),
+                    now,
+                )
+            )
         return self._write(
-            REFERENCE_TABLES["security_status"], rows,
-            ("symbol", "effective_from", "effective_to", "status_type", "status_value",
-             "board", "exchange", "source", "as_of", "coverage_complete", _INGESTED),
+            REFERENCE_TABLES["security_status"],
+            rows,
+            (
+                "symbol",
+                "effective_from",
+                "effective_to",
+                "announcement_date",
+                "status_type",
+                "status_value",
+                "board",
+                "exchange",
+                "source",
+                "as_of",
+                "coverage_complete",
+                _INGESTED,
+            ),
         )
 
     # -- 读取 ----------------------------------------------------------------
@@ -486,21 +1284,30 @@ class TailReferenceStore:
         approximated = bool(limit.get("approximated"))
         usable_limits = {} if (approximated and limit_prices_require_exact) else limit
         missing = [
-            name for name, present in (
+            name
+            for name, present in (
                 ("daily_bar", bool(bars)),
-                ("limit_prices", bool(limits)
-                 and not (approximated and limit_prices_require_exact)),
+                (
+                    "limit_prices",
+                    bool(limits) and not (approximated and limit_prices_require_exact),
+                ),
                 ("suspend_status", bool(suspends)),
                 ("trade_status", status.get("trade_status") is not None),
-            ) if not present
+            )
+            if not present
         ]
         return {
             "symbol": str(symbol),
             "trade_date": trade_date.isoformat(),
-            "open": bar.get("open"), "high": bar.get("high"), "low": bar.get("low"),
-            "close": bar.get("close"), "volume": bar.get("volume"),
-            "turnover": bar.get("turnover"), "float_market_cap": bar.get("float_market_cap"),
-            "is_st": bar.get("is_st"), "is_delisting_risk": bar.get("is_delisting_risk"),
+            "open": bar.get("open"),
+            "high": bar.get("high"),
+            "low": bar.get("low"),
+            "close": bar.get("close"),
+            "volume": bar.get("volume"),
+            "turnover": bar.get("turnover"),
+            "float_market_cap": bar.get("float_market_cap"),
+            "is_st": bar.get("is_st"),
+            "is_delisting_risk": bar.get("is_delisting_risk"),
             "board": bar.get("board"),
             "price_basis": bar.get("price_basis"),
             "up_limit": usable_limits.get("up_limit"),
@@ -533,6 +1340,148 @@ class TailReferenceStore:
             for key in ("up_limit", "down_limit", "suspended", "suspend_type", "trade_status")
             if inputs.get(key) is not None
         }
+
+    def verified_full_day_suspension(
+        self,
+        symbol: str,
+        trade_date: date,
+    ) -> dict[str, Any] | None:
+        """Return only source-validated full-day Tushare or official SSE evidence.
+
+        ``sync_tail_trade_references`` validates the complete ``suspend_d`` event list,
+        rejects intraday/resume mixtures, and rejects positive-volume RAW daily conflicts
+        before persisting Tushare rows. Official SSE rows must also have a hash-checked,
+        date-matched document in ``ref_suspend_evidence``. A generic ``suspended`` flag is
+        not enough to skip missing entry prices during a historical rebuild.
+        """
+        rows = self._rows(
+            f"SELECT suspended, suspend_type, trade_status, source, as_of, coverage_complete "
+            f"FROM {REFERENCE_TABLES['suspend_status']} "
+            "WHERE symbol = ? AND trade_date = ?",
+            [str(symbol), trade_date],
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        row["trade_date"] = trade_date.isoformat()
+        if str(row.get("source") or "").strip() == SSE_OFFICIAL_SUSPENSION_SOURCE:
+            proof_rows = self._rows(
+                f"SELECT evidence_url, evidence_title, evidence_document_date, "
+                f"evidence_sha256, evidence_full_day, evidence_as_of, raw_payload "
+                f"FROM {REFERENCE_TABLES['suspend_evidence']} "
+                "WHERE symbol = ? AND trade_date = ? AND source = ?",
+                [str(symbol), trade_date, SSE_OFFICIAL_SUSPENSION_SOURCE],
+            )
+            if not proof_rows:
+                return None
+            proof = proof_rows[0]
+            try:
+                evidence_payload = json.loads(str(proof["raw_payload"]))
+            except (TypeError, json.JSONDecodeError):
+                return None
+            row.update(
+                {
+                    "evidence_url": proof["evidence_url"],
+                    "evidence_title": proof["evidence_title"],
+                    "evidence_document_date": str(_day(proof["evidence_document_date"])),
+                    "evidence_sha256": proof["evidence_sha256"],
+                    "evidence_full_day": proof["evidence_full_day"],
+                    "evidence_as_of": proof["evidence_as_of"],
+                    "evidence_start_date": evidence_payload.get("evidence_start_date"),
+                    "evidence_end_date": evidence_payload.get("evidence_end_date"),
+                }
+            )
+        if not is_verified_full_day_suspension(row):
+            return None
+        return dict(row)
+
+    def upsert_official_suspension_evidence(
+        self,
+        frame: pd.DataFrame,
+        *,
+        as_of: str,
+    ) -> int:
+        """Persist hash-verified official exchange documents for full-day suspensions."""
+        required = {
+            "symbol",
+            "trade_date",
+            "source",
+            "evidence_url",
+            "evidence_title",
+            "evidence_document_date",
+            "evidence_sha256",
+            "evidence_full_day",
+        }
+        missing = sorted(required - set(frame.columns))
+        if missing:
+            raise TailReferenceError(f"suspension evidence is missing column(s) {missing}")
+        if not str(as_of or "").strip():
+            raise TailReferenceError("suspension evidence needs an explicit as_of")
+        now = datetime.now()
+        rows: list[tuple[Any, ...]] = []
+        for item in frame.to_dict("records"):
+            day = _day(item.get("trade_date"))
+            symbol = str(item.get("symbol") or "").strip()
+            if day is None or not symbol:
+                raise TailReferenceError("suspension evidence needs symbol and trade_date")
+            payload = {
+                **item,
+                "as_of": str(as_of),
+                "suspended": True,
+                "suspend_type": "S",
+                "trade_status": "suspended",
+                "coverage_complete": True,
+            }
+            period_start = item.get("evidence_start_date")
+            period_end = item.get("evidence_end_date")
+            if (period_start is None) != (period_end is None):
+                raise TailReferenceError("official suspension evidence has a partial date range")
+            if period_start is not None and period_end is not None:
+                payload["evidence_start_date"] = _day(period_start)
+                payload["evidence_end_date"] = _day(period_end)
+            if not is_verified_full_day_suspension(
+                {
+                    **payload,
+                    "as_of": str(as_of),
+                    "evidence_as_of": str(as_of),
+                    "evidence_full_day": bool(item.get("evidence_full_day")),
+                    "evidence_document_date": str(_day(item.get("evidence_document_date"))),
+                    "trade_date": day.isoformat(),
+                }
+            ):
+                raise TailReferenceError("official suspension evidence is invalid")
+            rows.append(
+                (
+                    symbol,
+                    day,
+                    SSE_OFFICIAL_SUSPENSION_SOURCE,
+                    str(item["evidence_url"]).strip(),
+                    str(item["evidence_title"]).strip(),
+                    _day(item["evidence_document_date"]),
+                    str(item["evidence_sha256"]).strip().lower(),
+                    True,
+                    str(as_of),
+                    json.dumps(payload, ensure_ascii=False, default=str),
+                    now,
+                )
+            )
+        return self._write(
+            REFERENCE_TABLES["suspend_evidence"],
+            rows,
+            (
+                "symbol",
+                "trade_date",
+                "source",
+                "evidence_url",
+                "evidence_title",
+                "evidence_document_date",
+                "evidence_sha256",
+                "evidence_full_day",
+                "evidence_as_of",
+                "raw_payload",
+                _INGESTED,
+            ),
+        )
 
     def daily_bar_series(
         self,
@@ -581,18 +1530,37 @@ class TailReferenceStore:
             if _day(row["trade_date"]) is not None
         }
 
+        daily_by_day = {
+            _day(item["trade_date"]): item for item in bars if _day(item["trade_date"]) is not None
+        }
         sessions: list[tuple[date, dict[str, Any]]] = []
         missing_limits_days: list[str] = []
         undeclared_status_days: list[str] = []
-        for item in bars:
-            day = _day(item["trade_date"])
-            if day is None:
-                continue
-            bar: dict[str, Any] = {
-                "open": item["open"], "high": item["high"], "low": item["low"],
-                "close": item["close"], "volume": item["volume"],
-                "price_basis": item["price_basis"],
-            }
+        explicitly_suspended: set[str] = {
+            "s",
+            "suspend",
+            "suspended",
+            "halt",
+            "halted",
+            "h",
+            "p",
+            "停牌",
+            "暂停交易",
+        }
+        for day in self.calendar(start, end):
+            item = daily_by_day.get(day)
+            bar: dict[str, Any] = {}
+            if item is not None:
+                bar.update(
+                    {
+                        "open": item["open"],
+                        "high": item["high"],
+                        "low": item["low"],
+                        "close": item["close"],
+                        "volume": item["volume"],
+                        "price_basis": item["price_basis"],
+                    }
+                )
             limit = limits.get(day) or {}
             approximated = bool(limit.get("approximated"))
             usable = bool(limit) and not (approximated and limit_prices_require_exact)
@@ -603,8 +1571,6 @@ class TailReferenceStore:
             if down_limit is not None:
                 bar["down_limit"] = down_limit
             # 入场要 up_limit、出场要 down_limit：任一个不可用，这天就判不出涨跌停锁死。
-            if up_limit is None or down_limit is None:
-                missing_limits_days.append(day.isoformat())
             declared = False
             row = status.get(day)
             if row is not None:
@@ -612,8 +1578,16 @@ class TailReferenceStore:
                     if row.get(key) is not None:
                         bar[key] = row[key]
                 declared = row.get("trade_status") is not None
+            raw_status = str((row or {}).get("trade_status") or "").strip().lower()
+            suspended = _flag((row or {}).get("suspended")) or raw_status in explicitly_suspended
+            if suspended:
+                bar["suspended"] = True
             if not declared:
                 undeclared_status_days.append(day.isoformat())
+            if item is None and not suspended:
+                continue
+            if not suspended and (up_limit is None or down_limit is None):
+                missing_limits_days.append(day.isoformat())
             sessions.append((day, bar))
 
         expected = self.calendar(start, end)
@@ -629,6 +1603,7 @@ class TailReferenceStore:
             "missing_session_days": missing_session_days,
             "missing_limit_price_days": missing_limits_days,
             "undeclared_status_days": undeclared_status_days,
+            "daily_bar_days": sorted(day.isoformat() for day in daily_by_day),
         }
 
     def coverage(self) -> dict[str, Any]:
@@ -645,21 +1620,44 @@ class TailReferenceStore:
                 entry["symbols"] = int(
                     self._scalar(f"SELECT COUNT(DISTINCT symbol) FROM {table}") or 0
                 )
-            else:
+            elif table in {
+                REFERENCE_TABLES["corporate_actions"],
+                REFERENCE_TABLES["suspend_status"],
+                REFERENCE_TABLES["daily_bars"],
+                REFERENCE_TABLES["limit_prices"],
+            }:
                 entry["symbols"] = int(
                     self._scalar(f"SELECT COUNT(DISTINCT symbol) FROM {table}") or 0
                 )
+            elif table == REFERENCE_TABLES["corporate_action_coverage"]:
+                entry["complete_dates"] = int(
+                    self._scalar(f"SELECT COUNT(*) FROM {table} WHERE coverage_complete") or 0
+                )
             per_source[name] = entry
+        factor_rows = int(self._scalar(f"SELECT COUNT(*) FROM {ADJ_FACTOR_TABLE}") or 0)
+        per_source["adj_factor_history"] = {
+            "table": ADJ_FACTOR_TABLE,
+            "rows": factor_rows,
+            "symbols": int(
+                self._scalar(f"SELECT COUNT(DISTINCT symbol) FROM {ADJ_FACTOR_TABLE}") or 0
+            ),
+            "complete_rows": int(
+                self._scalar(f"SELECT COUNT(*) FROM {ADJ_FACTOR_TABLE} WHERE coverage_complete")
+                or 0
+            ),
+        }
         approximated = int(
             self._scalar(
                 f"SELECT COUNT(*) FROM {REFERENCE_TABLES['limit_prices']} WHERE approximated"
-            ) or 0
+            )
+            or 0
         )
         unknown_status = int(
             self._scalar(
                 f"SELECT COUNT(*) FROM {REFERENCE_TABLES['suspend_status']} "
                 "WHERE trade_status IS NULL"
-            ) or 0
+            )
+            or 0
         )
         return {
             "path": str(self.path),
@@ -672,9 +1670,11 @@ class TailReferenceStore:
 
     @staticmethod
     def gaps(sources: Mapping[str, Any]) -> list[str]:
+        required_sources = set(REFERENCE_TABLES) - {"suspend_evidence"}
         found = {
-            f"{name}_table_missing" for name, entry in sources.items()
-            if int(entry["rows"]) == 0
+            f"{name}_table_missing"
+            for name, entry in sources.items()
+            if name in required_sources and int(entry["rows"]) == 0
         }
         return sorted(found)
 
@@ -716,9 +1716,15 @@ class WarehouseReading:
 
 
 def _table_exists(con: Any, table: str) -> bool:
-    return int(con.execute(
-        "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?", [table]
-    ).fetchone()[0] or 0) > 0
+    return (
+        int(
+            con.execute(
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?", [table]
+            ).fetchone()[0]
+            or 0
+        )
+        > 0
+    )
 
 
 def read_warehouse_reference_frames(
@@ -773,8 +1779,22 @@ def read_warehouse_reference_frames(
             gaps.append("suspend_status_source_table_missing")
 
         if _table_exists(con, WAREHOUSE_TABLES["security_status"]):
+            status_columns = {
+                str(row[0]).strip().lower()
+                for row in con.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = ?",
+                    [WAREHOUSE_TABLES["security_status"]],
+                ).fetchall()
+            }
+            announcement_date_select = (
+                "announcement_date"
+                if "announcement_date" in status_columns
+                else "NULL::DATE AS announcement_date"
+            )
             frames["security_status"] = con.execute(
-                "SELECT symbol, effective_from, effective_to, status_type, status_value, "
+                "SELECT symbol, effective_from, effective_to, "
+                f"{announcement_date_select}, status_type, status_value, "
                 "board, exchange, source, as_of, coverage_complete "
                 f"FROM {WAREHOUSE_TABLES['security_status']}"
             ).fetch_df()
@@ -808,8 +1828,9 @@ def sync_reference_from_warehouse(
     bars = reading.frames.get("daily_bars")
     if bars is not None and not bars.empty:
         # 仓库里的 raw 日线口径由 price_series_mode='raw' 过滤保证，这里显式声明。
-        landed["daily_bars"] = store.upsert_daily_bars(bars, price_basis=PRICE_BASIS_RAW,
-                                                       as_of=reading.as_of)
+        landed["daily_bars"] = store.upsert_daily_bars(
+            bars, price_basis=PRICE_BASIS_RAW, as_of=reading.as_of
+        )
     status = reading.frames.get("limit_prices")
     if status is not None and not status.empty:
         landed["limit_prices"] = store.upsert_limit_prices(status, as_of=reading.as_of)
@@ -823,8 +1844,7 @@ def sync_reference_from_warehouse(
         "read_gaps": list(reading.gaps),
         "coverage": coverage,
         "sufficient_sources": sorted(
-            name for name in REFERENCE_TABLES
-            if int(coverage["sources"][name]["rows"]) > 0
+            name for name in REFERENCE_TABLES if int(coverage["sources"][name]["rows"]) > 0
         ),
         "missing_sources": coverage["gaps"],
     }
@@ -899,9 +1919,7 @@ def read_vendor_daily_raw_frames(
                     f"vendor daily entry unreadable: {archive_path}!{entry_name}: "
                     f"{type(exc).__name__}"
                 ) from exc
-            frame.columns = [
-                str(name).lstrip("\ufeff").strip().lower() for name in frame.columns
-            ]
+            frame.columns = [str(name).lstrip("\ufeff").strip().lower() for name in frame.columns]
             day_column = next(
                 (name for name in ("datetime", "trade_date", "date") if name in frame.columns),
                 "",
@@ -916,22 +1934,24 @@ def read_vendor_daily_raw_frames(
                 continue
             selected = selected.assign(date=days.loc[selected.index].dt.date)
             for item_row in selected.to_dict("records"):
-                rows.append({
-                    "symbol": symbol,
-                    "date": item_row["date"],
-                    "open": _number(item_row.get("open")),
-                    "high": _number(item_row.get("high")),
-                    "low": _number(item_row.get("low")),
-                    "close": _number(item_row.get("close")),
-                    "volume": _scaled(item_row.get("volume"), volume_multiplier),
-                    "turnover": _scaled(item_row.get("amount"), turnover_multiplier),
-                    "float_market_cap": _scaled(item_row.get("circ_mv"), 10_000.0),
-                    "name": None,
-                    "is_st": None,
-                    "is_delisting_risk": None,
-                    "board": None,
-                    "source": SOURCE_VENDOR_ZIP_DAILY,
-                })
+                rows.append(
+                    {
+                        "symbol": symbol,
+                        "date": item_row["date"],
+                        "open": _number(item_row.get("open")),
+                        "high": _number(item_row.get("high")),
+                        "low": _number(item_row.get("low")),
+                        "close": _number(item_row.get("close")),
+                        "volume": _scaled(item_row.get("volume"), volume_multiplier),
+                        "turnover": _scaled(item_row.get("amount"), turnover_multiplier),
+                        "float_market_cap": _scaled(item_row.get("circ_mv"), 10_000.0),
+                        "name": None,
+                        "is_st": None,
+                        "is_delisting_risk": None,
+                        "board": None,
+                        "source": SOURCE_VENDOR_ZIP_DAILY,
+                    }
+                )
     return pd.DataFrame(rows)
 
 

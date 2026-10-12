@@ -36,19 +36,20 @@ from stock_analyzer.contracts.trend_strategy import (
     TailExitResult,
     TrendStrategyContract,
     evaluate_tail_entry,
-    simulate_tail_exit,
+    simulate_tail_exit_raw_minutes,
 )
 from stock_analyzer.data.limit_rule import resolve_cost_profile
 from stock_analyzer.learning.label_policy_registry import (
     LabelPolicyRecord,
     build_label_policy_record,
 )
+from stock_analyzer.research.suspension_evidence import is_verified_full_day_suspension
 
 TAIL_NET_PROFIT_BASIS = "net_profit_5d_tail"
 TAIL_NET_PROFIT_OUTPUT_FIELD = NET_PROFIT_PROBABILITY_FIELD
-TAIL_PRICE_BASIS = "tail_confirm_next_bar"
-TAIL_MATURITY_RULE = "label_mature_time_tail_exit_v1"
-TAIL_SCHEMA_VERSION = "4"
+TAIL_PRICE_BASIS = "tail_confirm_next_bar_raw_minute_exit_v2"
+TAIL_MATURITY_RULE = "label_mature_time_raw_minute_exit_v2"
+TAIL_SCHEMA_VERSION = "5"
 
 CAPTURE_OBSERVED = "observed_snapshot"
 CAPTURE_REPLAYED = "replayed_recompute"
@@ -250,6 +251,7 @@ class TailLabelRecord:
             "gap_exit": self.gap_exit,
             "deferred_sessions": self.deferred_sessions,
             "corporate_action_uncertain": self.corporate_action_uncertain,
+            "details": dict(self.details),
             "model_version": self.model_version,
             "market_state": self.market_state,
             "label_definition": (
@@ -257,7 +259,9 @@ class TailLabelRecord:
                 f"尾盘窗口确认后以参考金额 {self.reference_notional:.0f} 元成交，"
                 f"持有至多 {self.holding_days} 个交易日（入场日为第 1 日）、"
                 f"止盈 +{self.take_profit_pct:.0%}/止损 -{self.stop_loss_pct:.0%}"
-                "（同日双触发止损优先），扣佣金/最低佣金/过户费/印花税/滑点后"
+                "（RAW 分钟监控、同一分钟双触发止损优先、公司行动现金/股数逐项入账，"
+                "分红按税前金额的保守税率估算），"
+                "扣佣金/最低佣金/过户费/印花税/滑点后"
                 "净收益 > 0 记为正类；未成交与不确定样本不生成盈亏标签。"
             ),
         }
@@ -293,6 +297,9 @@ def build_tail_net_profit_label(
     entry_date: date | datetime,
     minute_bars: Sequence[tuple[datetime, Mapping[str, Any]]],
     daily_bars: Sequence[tuple[date | datetime, Mapping[str, Any]]],
+    exit_minute_bars: Sequence[tuple[datetime, Mapping[str, Any]]] = (),
+    corporate_actions: Sequence[Mapping[str, Any]] = (),
+    corporate_action_coverage: Mapping[str, Mapping[str, Any]] | None = None,
     confirmation: Callable[..., tuple[bool, str]],
     contract: TrendStrategyContract = DEFAULT_TREND_CONTRACT,
     cost_estimator: Callable[[str, float, int, datetime], float] | None = None,
@@ -307,9 +314,9 @@ def build_tail_net_profit_label(
 ) -> TailLabelRecord:
     """观察池决策日 ``decision_date`` 的样本，在次日 ``entry_date`` 尾盘确认并成交。
 
-    ``daily_bars`` 必须含 ``entry_date`` 那根 raw 日线；``minute_bars`` 必须是
-    ``entry_date`` 当天的分钟行情（以区间终点标注）。历史重建调用不传 ``quote_as_of``，
-    线上实时调用传当前时钟——两条路径共用本函数，判定必然一致。
+    ``daily_bars`` 只声明交易日、状态与精确限价，绝不用于退出价格判断；``minute_bars``
+    是入场日行情，``exit_minute_bars`` 是入场后的 RAW 分钟序列。退出缺分钟或公司行动
+    覆盖证据时不回退到日线 OHLC。历史重建与未来观察共用本函数。
     """
     decision_day = _to_day(decision_date)
     entry_day = _to_day(entry_date)
@@ -347,13 +354,16 @@ def build_tail_net_profit_label(
             trainable=False, model_version=model_version, market_state=market_state,
         )
 
-    exit_result = simulate_tail_exit(
+    exit_result = simulate_tail_exit_raw_minutes(
         symbol=symbol,
         entry_date=entry_day,
         entry_price=float(entry.net_fill_price or 0.0),
         quantity=int(entry.quantity),
         buy_cost=float(entry.buy_cost),
-        daily_bars=daily_bars,
+        minute_bars=exit_minute_bars,
+        session_bars=daily_bars,
+        corporate_actions=corporate_actions,
+        corporate_action_coverage=corporate_action_coverage,
         contract=contract,
         cost_estimator=cost_estimator,
         price_ticker=price_ticker,
@@ -372,6 +382,56 @@ def build_tail_net_profit_label(
         gross_return=exit_result.gross_return if trainable else None,
         capture_mode=capture_mode, contract=contract, trainable=trainable,
         model_version=model_version, market_state=market_state,
+    )
+
+
+def build_verified_suspension_no_fill_label(
+    *,
+    symbol: str,
+    decision_date: date | datetime,
+    entry_date: date | datetime,
+    evidence: Mapping[str, Any],
+    contract: TrendStrategyContract = DEFAULT_TREND_CONTRACT,
+    model_version: str = "",
+    market_state: str = "",
+) -> TailLabelRecord:
+    """Record a candidate as unfilled when audited evidence proves full-day suspension.
+
+    This path deliberately emits no probability target or realized return. Evidence must
+    come from the strict ``suspend_d`` importer: intraday suspensions, resume events,
+    generic warehouse flags, and incomplete coverage are rejected.
+    """
+    decision_day = _to_day(decision_date)
+    entry_day = _to_day(entry_date)
+    if entry_day <= decision_day:
+        raise TailLabelError(
+            f"entry_date {entry_day} must be after decision_date {decision_day}"
+        )
+    if not is_verified_full_day_suspension(evidence):
+        raise TailLabelError("full-day suspension evidence is not verified")
+
+    details: dict[str, Any] = {
+        "entry_day_status_source": str(evidence["source"]),
+        "entry_day_status_as_of": str(evidence["as_of"]),
+        "entry_day_status": "verified_full_day_suspension",
+    }
+    if str(evidence["source"]) == "sse_official_suspension_notice":
+        details.update({
+            "suspension_evidence_url": str(evidence["evidence_url"]),
+            "suspension_evidence_title": str(evidence["evidence_title"]),
+            "suspension_evidence_document_date": str(evidence["evidence_document_date"]),
+            "suspension_evidence_sha256": str(evidence["evidence_sha256"]),
+        })
+    entry = TailEntryDecision(
+        symbol=str(symbol), confirmed=False, reason="suspended",
+        details=details,
+    )
+    return _record(
+        symbol=str(symbol), decision_day=decision_day, entry_day=entry_day,
+        status=STATUS_NOT_FILLED, reason="suspended", entry=entry, exit_result=None,
+        label=None, net_return=None, gross_return=None, capture_mode=CAPTURE_REPLAYED,
+        contract=contract, trainable=False, model_version=model_version,
+        market_state=market_state,
     )
 
 
@@ -450,7 +510,10 @@ def _record(
         corporate_action_uncertain=(
             bool(exit_result.corporate_action_uncertain) if exit_result else False
         ),
-        details=dict(entry.details),
+        details={
+            **dict(entry.details),
+            **(dict(exit_result.details) if exit_result else {}),
+        },
         model_version=model_version,
         market_state=market_state,
     )
@@ -570,6 +633,7 @@ __all__ = [
     "TailLabelError",
     "TailLabelRecord",
     "build_tail_net_profit_label",
+    "build_verified_suspension_no_fill_label",
     "register_tail_label_policy",
     "resolve_tail_slippage_ratio",
     "summarize_tail_labels",

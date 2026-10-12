@@ -123,6 +123,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--db", default=REFERENCE_DB_DEFAULT, help="研究库（分钟 + 参考数据）")
     parser.add_argument("--requests", required=True)
     parser.add_argument("--labels", default="", help="标签记录 JSONL 输出（仅判得动的样本）")
+    parser.add_argument(
+        "--gaps", default="",
+        help="参考数据不足记录 JSONL 输出，包含每条请求的缺失输入与日期细节",
+    )
+    parser.add_argument(
+        "--status-gaps", default="",
+        help="交易状态来源缺口 JSONL 输出；单独记录未声明的证券-交易日，不计作参考不足",
+    )
     parser.add_argument("--report", default="")
     parser.add_argument("--config", default=str(_DEFAULT_CONFIG))
     parser.add_argument("--interval", default="1m")
@@ -174,12 +182,32 @@ def main(argv: list[str] | None = None) -> int:
     summary["slippage_ratio"] = slippage_ratio
 
     records = [item.record.to_dict() for item in outcomes if item.record is not None]
+    gaps = [item.as_dict() for item in outcomes if not item.sufficient]
+    status_gaps = [
+        item.as_dict() for item in outcomes if item.detail.get("trade_status_source_gap")
+    ]
+    summary["reference_gap_records"] = len(gaps)
+    summary["trade_status_source_gap_records"] = len(status_gaps)
     if args.labels:
         out = Path(args.labels)
         out.parent.mkdir(parents=True, exist_ok=True)
         with out.open("w", encoding="utf-8") as handle:
             for record in records:
                 handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    if args.gaps:
+        gap_path = Path(args.gaps)
+        gap_path.parent.mkdir(parents=True, exist_ok=True)
+        with gap_path.open("w", encoding="utf-8") as handle:
+            for gap in gaps:
+                handle.write(json.dumps(gap, ensure_ascii=False, default=str) + "\n")
+        summary["reference_gap_output"] = str(gap_path)
+    if args.status_gaps:
+        status_gap_path = Path(args.status_gaps)
+        status_gap_path.parent.mkdir(parents=True, exist_ok=True)
+        with status_gap_path.open("w", encoding="utf-8") as handle:
+            for status_gap in status_gaps:
+                handle.write(json.dumps(status_gap, ensure_ascii=False, default=str) + "\n")
+        summary["trade_status_source_gap_output"] = str(status_gap_path)
     if args.report:
         Path(args.report).parent.mkdir(parents=True, exist_ok=True)
         Path(args.report).write_text(

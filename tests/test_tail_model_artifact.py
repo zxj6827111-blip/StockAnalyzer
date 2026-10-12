@@ -122,7 +122,7 @@ def test_load_detects_tampering_and_foreign_meaning(tmp_path: Path) -> None:
         load_tail_model_predictor(artifact,
                                   contract=TrendStrategyContract(take_profit_pct=0.10))
     for key, pattern in (
-        (("identity", "label_policy_id"), "label_policy_not_v4"),
+        (("identity", "label_policy_id"), "label_policy_not_v5"),
         (("identity", "probability_field"), "probability_field_mismatch"),
         (("identity", "training_code_commit"), "training_commit_missing"),
     ):

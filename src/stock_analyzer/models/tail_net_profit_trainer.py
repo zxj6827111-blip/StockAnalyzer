@@ -55,6 +55,13 @@ MIN_IMPROVEMENT_PP = 0.05
 MIN_SHADOW_TRADE_DAYS = 60
 MIN_SHADOW_MATURED_FILLS = 100
 MIN_TEST_FOLDS = 4
+MIN_CONFIRMATORY_TEST_SESSIONS = 120
+MIN_CONFIRMATORY_SESSIONS_PER_FOLD = 30
+MIN_MATURED_FILLS_PER_ARM = 300
+QUALITY_BOOTSTRAP_DRAWS = 20_000
+QUALITY_BOOTSTRAP_SEED = 20261010
+QUALITY_BOOTSTRAP_BLOCK_LENGTH = 10
+QUALITY_BOOTSTRAP_SENSITIVITY_BLOCK_LENGTHS = (5, 20)
 
 
 class TailTrainingError(RuntimeError):
@@ -463,6 +470,13 @@ class DayOutcome:
     matured_fills: int
     net_profits: int
     net_returns: tuple[float, ...]
+    #: Real fold/session identities are supplied by the walk-forward splitter.
+    #: Missing identities make the interval unavailable; folds are never inferred
+    #: from test-day counts.
+    fold_id: int | None = None
+    session_index: int | None = None
+    #: Candidate rows that could not be scored because a required model feature was absent.
+    model_unscorable_rows: int = 0
 
     @property
     def net_profit_rate(self) -> float | None:
@@ -480,8 +494,8 @@ def evaluate_selection_quality(
     baseline_arm: str,
     treatment_arm: str,
     min_improvement_pp: float = MIN_IMPROVEMENT_PP,
-    bootstrap_draws: int = 2000,
-    seed: int = 42,
+    bootstrap_draws: int = QUALITY_BOOTSTRAP_DRAWS,
+    seed: int = QUALITY_BOOTSTRAP_SEED,
     tail_loss_tolerance_pp: float = 0.02,
 ) -> dict[str, Any]:
     """净盈利率 / 净收益 / 成交率 / 尾部亏损 / 覆盖率 / 资金占用的联合判定。
@@ -491,10 +505,12 @@ def evaluate_selection_quality(
     平均净收益 > 0、尾部亏损（p05）不明显恶化、测试折 ≥ 4。
     """
     days = sorted({outcome.trade_date for outcome in outcomes})
-    grid = {
-        (outcome.trade_date, outcome.arm): outcome
-        for outcome in outcomes
-    }
+    grid: dict[tuple[date, str], DayOutcome] = {}
+    for outcome in outcomes:
+        key = (outcome.trade_date, outcome.arm)
+        if key in grid:
+            raise ValueError(f"duplicate day outcome for {outcome.trade_date} / {outcome.arm}")
+        grid[key] = outcome
     base = [grid.get((day, baseline_arm)) for day in days]
     treat = [grid.get((day, treatment_arm)) for day in days]
     paired = [
@@ -502,6 +518,10 @@ def evaluate_selection_quality(
     ]
     if not paired:
         raise ValueError("no paired day outcomes between baseline and treatment arms")
+    unpaired_days = [
+        day for day, base_item, treatment_item in zip(days, base, treat, strict=True)
+        if base_item is None or treatment_item is None
+    ]
 
     base_matured = sum(item.matured_fills for item, _ in paired)
     treat_matured = sum(item.matured_fills for _, item in paired)
@@ -513,23 +533,29 @@ def evaluate_selection_quality(
     if base_rate is not None and treat_rate is not None:
         improvement = treat_rate - base_rate
 
-    # 分块 bootstrap：重抽的是"交易日"，不是笔。同日推荐彼此相关，逐笔重抽会低估方差。
-    rng = np.random.default_rng(seed)
-    deltas: list[float] = []
-    per_day_delta = [
-        (item.net_profit_rate - first.net_profit_rate)
-        for first, item in paired
-        if first.matured_fills and item.matured_fills and first.net_profit_rate is not None
-        and item.net_profit_rate is not None
-    ]
-    if per_day_delta:
-        array = np.asarray(per_day_delta)
-        for _ in range(int(bootstrap_draws)):
-            sample = rng.choice(array, size=array.size, replace=True)
-            deltas.append(float(sample.mean()))
-    deltas.sort()
-    ci_low = deltas[int(0.025 * len(deltas))] if deltas else None
-    ci_high = deltas[int(0.975 * len(deltas))] if deltas else None
+    fold_ids = {
+        item.fold_id
+        for pair in paired for item in pair
+        if item.fold_id is not None
+    }
+    fold_metadata_complete = all(
+        item.fold_id is not None and item.session_index is not None
+        for pair in paired for item in pair
+    )
+    main_bootstrap = _paired_moving_block_bootstrap(
+        paired,
+        block_length=QUALITY_BOOTSTRAP_BLOCK_LENGTH,
+        draws=bootstrap_draws,
+        seed=seed,
+    ) if fold_metadata_complete else None
+    sensitivity = {
+        str(length): _paired_moving_block_bootstrap(
+            paired, block_length=length, draws=bootstrap_draws, seed=seed,
+        ) if fold_metadata_complete else None
+        for length in QUALITY_BOOTSTRAP_SENSITIVITY_BLOCK_LENGTHS
+    }
+    ci_low = main_bootstrap.get("ci_low") if main_bootstrap else None
+    ci_high = main_bootstrap.get("ci_high") if main_bootstrap else None
 
     treat_returns = [value for _, item in paired for value in item.net_returns]
     base_returns = [value for item, _ in paired for value in item.net_returns]
@@ -539,7 +565,12 @@ def evaluate_selection_quality(
     fills = sum(item.fills for _, item in paired)
     recommendations = sum(item.recommendations for _, item in paired)
     days_with_recommendation = sum(1 for _, item in paired if item.recommendations > 0)
-    folds = _fold_count(days)
+    folds = len(fold_ids) if fold_metadata_complete else 0
+    fold_session_counts: dict[int, int] = {}
+    if fold_metadata_complete:
+        for item in (pair[0] for pair in paired):
+            assert item.fold_id is not None
+            fold_session_counts[item.fold_id] = fold_session_counts.get(item.fold_id, 0) + 1
 
     reasons: list[str] = []
     if improvement is None:
@@ -549,6 +580,16 @@ def evaluate_selection_quality(
             reasons.append("improvement_below_5pp")
         if ci_low is None or ci_low <= 0.0:
             reasons.append("block_bootstrap_ci_lower_bound_not_positive")
+        if not fold_metadata_complete:
+            reasons.append("real_fold_and_session_metadata_missing")
+        if main_bootstrap and main_bootstrap.get("blockers"):
+            reasons.append("moving_block_bootstrap_not_estimable")
+        for length, report in sensitivity.items():
+            if report is None or report.get("ci_low") is None:
+                reasons.append(f"bootstrap_sensitivity_block_{length}_not_estimable")
+            elif ci_low is not None and ci_low > 0.0:
+                if float(report["ci_low"]) <= 0.0:
+                    reasons.append(f"bootstrap_sensitivity_block_{length}_conflicts_with_main")
     if mean_net_return is None or mean_net_return <= 0:
         reasons.append("mean_net_return_not_positive")
     if tail_loss is None or (base_tail_loss is not None
@@ -558,13 +599,55 @@ def evaluate_selection_quality(
         reasons.append(f"fewer_than_{MIN_TEST_FOLDS}_test_folds")
     if base_matured == 0:
         reasons.append("baseline_has_no_fill_samples")
+    if unpaired_days:
+        reasons.append("one_or_more_test_sessions_missing_an_arm_outcome")
+    if len(paired) < MIN_CONFIRMATORY_TEST_SESSIONS:
+        reasons.append(
+            f"complete_test_sessions_below_{MIN_CONFIRMATORY_TEST_SESSIONS}"
+        )
+    short_folds = {
+        fold_id: count for fold_id, count in fold_session_counts.items()
+        if count < MIN_CONFIRMATORY_SESSIONS_PER_FOLD
+    }
+    if not fold_metadata_complete or short_folds:
+        reasons.append(
+            f"test_fold_sessions_below_{MIN_CONFIRMATORY_SESSIONS_PER_FOLD}"
+        )
+    if base_matured < MIN_MATURED_FILLS_PER_ARM:
+        reasons.append(f"baseline_matured_fills_below_{MIN_MATURED_FILLS_PER_ARM}")
+    if treat_matured < MIN_MATURED_FILLS_PER_ARM:
+        reasons.append(f"treatment_matured_fills_below_{MIN_MATURED_FILLS_PER_ARM}")
 
+    sample_insufficient = bool(
+        unpaired_days
+        or not fold_metadata_complete
+        or folds < MIN_TEST_FOLDS
+        or len(paired) < MIN_CONFIRMATORY_TEST_SESSIONS
+        or short_folds
+        or base_matured < MIN_MATURED_FILLS_PER_ARM
+        or treat_matured < MIN_MATURED_FILLS_PER_ARM
+        or main_bootstrap is None
+        or bool(main_bootstrap.get("blockers"))
+        or any(
+            report is None or report.get("ci_low") is None
+            for report in sensitivity.values()
+        )
+    )
     return {
         "passed": not reasons,
+        "state": (
+            "sample_insufficient"
+            if sample_insufficient
+            else ("quality_passed" if not reasons else "quality_failed")
+        ),
         "failed_gates": reasons,
         "trade_days": len(days),
         "paired_days": len(paired),
+        "unpaired_days": [day.isoformat() for day in unpaired_days],
         "test_folds": folds,
+        "test_fold_ids": sorted(fold_ids) if fold_metadata_complete else [],
+        "test_sessions_per_fold": fold_session_counts,
+        "short_test_folds": short_folds,
         "candidate_days": int(candidate_days),
         "recommendation_coverage": (days_with_recommendation / len(days)) if days else None,
         "baseline": {
@@ -587,19 +670,127 @@ def evaluate_selection_quality(
         "block_bootstrap": {
             "draws": int(bootstrap_draws),
             "seed": int(seed),
+            "bit_generator": "PCG64",
+            "method": "paired_moving_block",
+            "block_length_sessions": QUALITY_BOOTSTRAP_BLOCK_LENGTH,
             "ci_low": ci_low,
             "ci_high": ci_high,
-            "unit": "trade_day",
+            "main": main_bootstrap,
+            "unit": "pooled_matured_trade_profitability_rate_difference",
+            "sensitivity": sensitivity,
+            "estimand": "resampled wins / resampled matured fills, pooled within sampled sessions",
         },
-        "note": "旧链路没有成交样本时如实报 baseline_has_no_fill_samples，不得伪造命中率",
+        "scope": "development_pairwise_only",
+        "release_eligible": False,
+        "release_blockers": [
+            "confirmatory_protocol_requires_development_based_80_percent_power_analysis",
+            "confirmatory_protocol_requires_one_frozen_candidate_and_three_controls",
+            "confirmatory_protocol_requires_cash_and_holdings_ledger",
+            "confirmatory_protocol_requires_eight_pre_registered_one_sided_tests_with_holm_adjustment",
+            "confirmatory_protocol_requires_unopened_independent_data",
+            "labels_require_raw_minute_exit_and_corporate_action_ledger",
+            "shadow_requires_60_complete_sessions_and_100_matured_fills",
+        ],
+        "note": "本结果仅用于两臂开发验证；真实折缺失、样本不完整或区间不可估时 fail closed。",
     }
 
 
-def _fold_count(days: Sequence[date]) -> int:
-    """把测试期按连续 20 个交易日算折数（不足 20 天的一截也计入但会缩短）。"""
-    if not days:
-        return 0
-    return max(1, int(math.ceil(len(days) / 20.0)))
+def _paired_moving_block_bootstrap(
+    paired: Sequence[tuple[DayOutcome, DayOutcome]],
+    *,
+    block_length: int,
+    draws: int,
+    seed: int,
+) -> dict[str, Any]:
+    """Resample paired contiguous session blocks, preserving the pooled-rate estimand.
+
+    Blocks are sampled separately inside each real fold and each uninterrupted
+    session run. The same sampled row indices are applied to both arms. Within
+    every replicate the net-profit rates are recomputed from total wins / total
+    mature fills, so the interval matches the pooled point estimate.
+    """
+    if block_length < 1 or draws < 1:
+        return {"blockers": ["block_length_and_draws_must_be_positive"]}
+    ordered = sorted(paired, key=lambda pair: pair[0].trade_date)
+    segments: list[list[tuple[DayOutcome, DayOutcome]]] = []
+    for pair in ordered:
+        base, treatment = pair
+        if (base.fold_id != treatment.fold_id
+                or base.session_index != treatment.session_index):
+            return {"blockers": ["paired_arm_fold_or_session_identity_mismatch"]}
+        if not segments:
+            segments.append([pair])
+            continue
+        prev = segments[-1][-1][0]
+        contiguous = (
+            prev.fold_id == base.fold_id
+            and prev.session_index is not None
+            and base.session_index == prev.session_index + 1
+        )
+        if contiguous:
+            segments[-1].append(pair)
+        else:
+            segments.append([pair])
+    short = [len(segment) for segment in segments if len(segment) < block_length]
+    if short:
+        return {
+            "blockers": [f"contiguous_segment_shorter_than_block_{block_length}"],
+            "segment_lengths": [len(segment) for segment in segments],
+        }
+
+    rng = np.random.Generator(np.random.PCG64(seed))
+    deltas: list[float] = []
+    for _ in range(int(draws)):
+        sampled_pairs: list[tuple[DayOutcome, DayOutcome]] = []
+        for segment in segments:
+            starts = np.arange(len(segment) - block_length + 1, dtype=np.int64)
+            sampled: list[int] = []
+            while len(sampled) < len(segment):
+                start = int(rng.choice(starts))
+                sampled.extend(range(start, start + block_length))
+            sampled_pairs.extend(segment[index] for index in sampled[:len(segment)])
+        base_matured = sum(base.matured_fills for base, _ in sampled_pairs)
+        treatment_matured = sum(treatment.matured_fills for _, treatment in sampled_pairs)
+        if not base_matured or not treatment_matured:
+            continue
+        base_rate = sum(base.net_profits for base, _ in sampled_pairs) / base_matured
+        treatment_rate = (
+            sum(treatment.net_profits for _, treatment in sampled_pairs) / treatment_matured
+        )
+        deltas.append(float(treatment_rate - base_rate))
+    if not deltas:
+        return {"blockers": ["no_bootstrap_replicate_has_mature_fills_in_both_arms"]}
+    if len(deltas) != int(draws):
+        return {
+            "blockers": ["bootstrap_replicates_with_empty_arm_were_not_estimable"],
+            "draws": len(deltas),
+            "requested_draws": int(draws),
+            "seed": int(seed),
+            "bit_generator": "PCG64",
+            "block_length_sessions": int(block_length),
+            "segment_lengths": [len(segment) for segment in segments],
+        }
+    quantiles = np.quantile(np.asarray(deltas), [0.025, 0.975], method="linear")
+    observed_base = sum(base.net_profits for base, _ in paired) / sum(
+        base.matured_fills for base, _ in paired
+    )
+    observed_treatment = sum(treatment.net_profits for _, treatment in paired) / sum(
+        treatment.matured_fills for _, treatment in paired
+    )
+    p_one_sided = (1 + sum(delta <= 0.0 for delta in deltas)) / (len(deltas) + 1)
+    return {
+        "draws": len(deltas),
+        "requested_draws": int(draws),
+        "seed": int(seed),
+        "bit_generator": "PCG64",
+        "block_length_sessions": int(block_length),
+        "segment_lengths": [len(segment) for segment in segments],
+        "ci_low": float(quantiles[0]),
+        "ci_high": float(quantiles[1]),
+        "effect_estimate": float(observed_treatment - observed_base),
+        "p_one_sided_gt_zero": float(p_one_sided),
+        "unit": "pooled_matured_trade_profitability_rate_difference",
+    }
 
 
 def shadow_readiness(
@@ -640,6 +831,9 @@ __all__ = [
     "MIN_SHADOW_MATURED_FILLS",
     "MIN_SHADOW_TRADE_DAYS",
     "MIN_TEST_FOLDS",
+    "MIN_CONFIRMATORY_TEST_SESSIONS",
+    "MIN_CONFIRMATORY_SESSIONS_PER_FOLD",
+    "MIN_MATURED_FILLS_PER_ARM",
     "DateSplit",
     "DayOutcome",
     "TailModelSpec",

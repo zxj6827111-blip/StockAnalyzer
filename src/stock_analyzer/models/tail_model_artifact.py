@@ -303,8 +303,8 @@ def load_tail_model_predictor(
             f"{contract_block.get('contract_digest')!r} != 在服 {contract.digest()!r}"
         )
     label_policy_id = str(identity.get("label_policy_id") or "")
-    if not label_policy_id.startswith("label_policy_v4_"):
-        raise TailArtifactError(f"artifact_label_policy_not_v4:{label_policy_id or 'none'}")
+    if not label_policy_id.startswith("label_policy_v5_"):
+        raise TailArtifactError(f"artifact_label_policy_not_v5:{label_policy_id or 'none'}")
     if str(identity.get("probability_field") or "") != NET_PROFIT_PROBABILITY_FIELD:
         raise TailArtifactError(
             f"artifact_probability_field_mismatch:{identity.get('probability_field')!r}"

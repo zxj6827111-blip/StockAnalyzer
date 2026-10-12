@@ -28,18 +28,20 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from stock_analyzer.contracts.trend_strategy import (
     DEFAULT_TREND_CONTRACT,
     TrendStrategyContract,
+    is_zero_volume_placeholder_session,
 )
 from stock_analyzer.labels.tail_net_profit import (
     CAPTURE_REPLAYED,
     LABEL_PROFIT,
     TailLabelRecord,
     build_tail_net_profit_label,
+    build_verified_suspension_no_fill_label,
 )
 from stock_analyzer.research.minute_bar_store import MinuteBarStore, MinuteStoreError
 from stock_analyzer.research.tail_reference_store import TailReferenceStore
@@ -126,6 +128,7 @@ def _entry_minute_bars(
     *,
     interval: str,
     day_limits: Mapping[str, Any],
+    contract: TrendStrategyContract,
 ) -> tuple[list[Any], list[str], dict[str, Any]]:
     """读入场日分钟 bar；口径不纯直接判缺，不把异常抛给整批重建。"""
     try:
@@ -138,7 +141,117 @@ def _entry_minute_bars(
     if not bars:
         # 缺 bar 就是缺 bar：不回落到开盘价，也不把它当成停牌。
         return [], ["entry_minute_bars"], {}
-    return bars, [], {}
+    coverage = MinuteBarStore.entry_window_coverage(
+        bars, trading_day=request.entry_date, contract=contract, interval=interval,
+    )
+    if not coverage["complete"]:
+        return [], ["entry_minute_window_incomplete"], {
+            "entry_minute_window_coverage": coverage,
+        }
+    return bars, [], {"entry_minute_window_coverage": coverage}
+
+
+def _load_exit_minute_window(
+    *,
+    reference: TailReferenceStore,
+    minutes: MinuteBarStore,
+    request: RebuildRequest,
+    sessions: Sequence[tuple[date | datetime, Mapping[str, Any]]],
+    missing_limit_days: Sequence[str],
+    end: date,
+    interval: str,
+) -> tuple[list[Any], list[tuple[date, dict[str, Any]]], dict[str, Any], dict[str, Any]]:
+    """加载持有期 RAW 分钟 bar，并给每个交易日附覆盖与精确限价证据。"""
+    exit_bars: list[Any] = []
+    enriched: list[tuple[date, dict[str, Any]]] = []
+    session_coverage: dict[str, Any] = {}
+    minute_detail: dict[str, Any] = {}
+    limits_missing = set(str(item) for item in missing_limit_days)
+    for day_value, original in sessions:
+        day = day_value.date() if isinstance(day_value, datetime) else day_value
+        session = dict(original)
+        session["exact_limits_complete"] = day.isoformat() not in limits_missing
+        if day == request.entry_date:
+            session["minute_session_complete"] = True
+            enriched.append((day, session))
+            continue
+
+        is_suspended = bool(session.get("suspended")) or str(
+            session.get("trade_status") or ""
+        ).strip().lower() in {
+            "s", "suspend", "suspended", "halt", "halted", "h", "p", "停牌", "暂停交易",
+        }
+        try:
+            bars = minutes.bars_for(
+                request.symbol, day, interval=interval,
+                day_limits={
+                    key: session[key] for key in (
+                        "up_limit", "down_limit", "suspended", "suspend_type", "trade_status",
+                    ) if session.get(key) is not None
+                },
+            )
+        except MinuteStoreError as exc:
+            bars = []
+            minute_detail[day.isoformat()] = {
+                "error": str(exc), "complete": False,
+            }
+        if is_suspended:
+            zero_volume_placeholders = is_zero_volume_placeholder_session(bars)
+            complete = not bars or zero_volume_placeholders
+            coverage = {
+                "complete": complete,
+                "reason": "" if complete else "suspension_minute_bar_conflict",
+                "expected_count": 0,
+                "actual_count": len(bars),
+                "zero_volume_placeholder": zero_volume_placeholders,
+            }
+        else:
+            coverage = MinuteBarStore.minute_session_coverage(
+                bars, trading_day=day, interval=interval,
+            )
+            complete = bool(coverage["complete"])
+        session["minute_session_complete"] = complete
+        session["exact_limits_complete"] = bool(session["exact_limits_complete"])
+        if coverage.get("reason") or coverage.get("zero_volume_placeholder"):
+            minute_detail.setdefault(day.isoformat(), {}).update(coverage)
+        if day > request.entry_date:
+            exit_bars.extend(bars)
+            enriched.append((day, session))
+
+    action_window = reference.corporate_action_window(
+        request.symbol, request.entry_date, end,
+    )
+    session_coverage.update(action_window.get("coverage_by_day") or {})
+    return (
+        exit_bars,
+        enriched,
+        {
+            "corporate_action_missing_coverage_days": action_window.get(
+                "missing_coverage_days", []
+            ),
+            "corporate_action_incomplete_coverage_days": action_window.get(
+                "incomplete_coverage_days", []
+            ),
+            "corporate_action_coverage_complete": action_window.get("coverage_complete", False),
+            "adj_factor_missing_coverage_days": action_window.get(
+                "adj_factor_missing_days", []
+            ),
+            "adj_factor_previous_session_missing": action_window.get(
+                "adj_factor_previous_session_missing", True
+            ),
+            "unmatched_adj_factor_change_days": action_window.get(
+                "unmatched_adj_factor_change_days", []
+            ),
+            "actions_without_adj_factor_change_days": action_window.get(
+                "actions_without_adj_factor_change_days", []
+            ),
+            "raw_minute_session_coverage": minute_detail,
+        },
+        {
+            "actions": action_window.get("actions", []),
+            "coverage_by_day": session_coverage,
+        },
+    )
 
 
 def rebuild_tail_label(
@@ -161,11 +274,37 @@ def rebuild_tail_label(
     历史产生一致的筛选判定，这一点靠"两边共用同一个函数"来保证，不靠两边各写一份。
     """
     day_limits = reference.day_limits(request.symbol, request.entry_date)
+    suspension_evidence = reference.verified_full_day_suspension(
+        request.symbol, request.entry_date,
+    )
+    if suspension_evidence is not None:
+        record = build_verified_suspension_no_fill_label(
+            symbol=request.symbol,
+            decision_date=request.decision_date,
+            entry_date=request.entry_date,
+            evidence=suspension_evidence,
+            contract=contract,
+            model_version=model_version,
+            market_state=market_state,
+        )
+        return TailRebuildOutcome(
+            request=request, sufficient=True, missing=(), record=record,
+            minute_bar_count=0, session_days=0,
+            detail={
+                "entry_day_status": "verified_full_day_suspension",
+                "entry_day_status_source": suspension_evidence["source"],
+                "entry_day_status_as_of": suspension_evidence["as_of"],
+                "entry_day_daily_bar_required": False,
+                "entry_day_minute_bars_required": False,
+            },
+        )
+
     series = reference.daily_bar_series(
         request.symbol, request.entry_date, exit_window_end(request.entry_date, contract)
     )
+    window_end = exit_window_end(request.entry_date, contract)
     session_days = [day for day, _bar in series["sessions"]]
-    has_entry_bar = request.entry_date in session_days
+    has_entry_bar = request.entry_date.isoformat() in series.get("daily_bar_days", [])
 
     missing: list[str] = []
     detail: dict[str, Any] = {}
@@ -178,7 +317,7 @@ def rebuild_tail_label(
         missing.append("entry_day_limit_prices")
 
     bars, minute_missing, minute_detail = _entry_minute_bars(
-        minutes, request, interval=interval, day_limits=day_limits
+        minutes, request, interval=interval, day_limits=day_limits, contract=contract,
     )
     missing.extend(minute_missing)
     detail.update(minute_detail)
@@ -208,12 +347,26 @@ def rebuild_tail_label(
             minute_bar_count=len(bars), session_days=len(session_days), detail=detail,
         )
 
+    exit_minute_bars, exit_sessions, exit_data_detail, action_data = _load_exit_minute_window(
+        reference=reference,
+        minutes=minutes,
+        request=request,
+        sessions=series["sessions"],
+        missing_limit_days=series["missing_limit_price_days"],
+        end=window_end,
+        interval=interval,
+    )
+    detail.update(exit_data_detail)
+
     record = build_tail_net_profit_label(
         symbol=request.symbol,
         decision_date=request.decision_date,
         entry_date=request.entry_date,
         minute_bars=bars,
-        daily_bars=series["sessions"],
+        daily_bars=exit_sessions,
+        exit_minute_bars=exit_minute_bars,
+        corporate_actions=action_data["actions"],
+        corporate_action_coverage=action_data["coverage_by_day"],
         confirmation=confirmation,
         contract=contract,
         cost_estimator=cost_estimator,
@@ -253,16 +406,24 @@ def rebuild_tail_labels(
     market_state: str = "",
 ) -> list[TailRebuildOutcome]:
     """批量重建。单条请求的参考数据缺口不中断整批（缺口计数见 ``summarize``）。"""
-    return [
-        rebuild_tail_label(
+    # Exit windows overlap heavily for adjacent decisions on the same symbol. Process
+    # each symbol chronologically so MinuteBarStore's bounded day cache can reuse those
+    # RAW bars. Restore caller order before returning; output identity is independent of
+    # this execution optimization.
+    ordered = sorted(
+        enumerate(requests),
+        key=lambda item: (str(item[1].symbol), item[1].entry_date, item[0]),
+    )
+    outcomes: list[TailRebuildOutcome | None] = [None] * len(requests)
+    for index, request in ordered:
+        outcomes[index] = rebuild_tail_label(
             reference=reference, minutes=minutes, request=request,
             confirmation=confirmation, contract=contract, interval=interval,
             cost_estimator=cost_estimator, price_ticker=price_ticker,
             slippage_ratio=slippage_ratio, model_version=model_version,
             market_state=market_state,
         )
-        for request in requests
-    ]
+    return [item for item in outcomes if item is not None]
 
 
 def summarize_rebuild(outcomes: Sequence[TailRebuildOutcome]) -> dict[str, Any]:
@@ -279,6 +440,14 @@ def summarize_rebuild(outcomes: Sequence[TailRebuildOutcome]) -> dict[str, Any]:
     for record in records:
         key = f"{record.status}:{record.reason}" if record.reason else record.status
         status_counts[key] = status_counts.get(key, 0) + 1
+    trade_status_gap_outcomes = [
+        item for item in outcomes if item.detail.get("trade_status_source_gap")
+    ]
+    trade_status_gap_symbol_days = {
+        (item.request.symbol, str(day))
+        for item in trade_status_gap_outcomes
+        for day in item.detail.get("undeclared_trade_status_days", [])
+    }
     return {
         "requests": len(outcomes),
         "insufficient": len(insufficient),
@@ -293,9 +462,11 @@ def summarize_rebuild(outcomes: Sequence[TailRebuildOutcome]) -> dict[str, Any]:
             1 for record in records if record.trainable and record.label == LABEL_PROFIT
         ),
         "status_reason_counts": dict(sorted(status_counts.items())),
-        "trade_status_source_gap_symbols": sum(
-            1 for item in outcomes if item.detail.get("trade_status_source_gap")
-        ),
+        "trade_status_source_gap_requests": len(trade_status_gap_outcomes),
+        "trade_status_source_gap_symbols": len({
+            item.request.symbol for item in trade_status_gap_outcomes
+        }),
+        "trade_status_source_gap_symbol_days": len(trade_status_gap_symbol_days),
         "capture_mode": CAPTURE_REPLAYED,
     }
 

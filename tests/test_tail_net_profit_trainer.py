@@ -71,7 +71,7 @@ def _identity_kwargs() -> dict:
         "model_id": "trend-tail-lgbm-2026q4",
         "training_commit": "1f970ac",
         "feature_compute_version": 5,
-        "label_policy_id": "label_policy_v4_abc",
+        "label_policy_id": "label_policy_v5_abc",
     }
 
 
@@ -156,7 +156,7 @@ def test_logistic_baseline_produces_auditable_artifact() -> None:
     assert artifact["kind"] == KIND_LOGISTIC
     assert artifact["contract_digest"] == CONTRACT.digest()
     assert artifact["probability_field"] == "p_net_profit_5d_tail"
-    assert artifact["label_policy_id"] == "label_policy_v4_abc"
+    assert artifact["label_policy_id"] == "label_policy_v5_abc"
     assert artifact["feature_compute_version"] == 5
     assert artifact["calibration_auc"] is not None and artifact["calibration_auc"] > 0.5
     assert artifact["artifact_digest"]
@@ -302,14 +302,16 @@ def _outcomes(days: list[date], *, treatment_rate: float, baseline_rate: float,
               recommendations: int = 20, fills: int = 12,
               matured: int = 10) -> list[DayOutcome]:
     out: list[DayOutcome] = []
-    for day in days:
+    fold_size = max(1, (len(days) + 3) // 4)
+    for session_index, day in enumerate(days):
+        fold_id = min(4, session_index // fold_size + 1)
         for arm, rate in (("baseline", baseline_rate), ("tail", treatment_rate)):
             wins = int(round(matured * rate))
             returns = tuple([0.05 if i < wins else -0.02 for i in range(matured)])
             out.append(DayOutcome(
                 trade_date=day, arm=arm, recommendations=recommendations,
                 fills=fills, matured_fills=matured, net_profits=wins,
-                net_returns=returns,
+                net_returns=returns, fold_id=fold_id, session_index=session_index,
             ))
     return out
 
@@ -325,17 +327,19 @@ def _verdict(days: list[date], **kwargs) -> dict:
 
 
 def test_acceptance_passes_only_with_5pp_and_positive_ci_and_folds() -> None:
-    days = _weekdays(90)
+    days = _weekdays(120)
     result = _verdict(days, rates={"treatment_rate": 0.58, "baseline_rate": 0.50})
     assert result["passed"] is True, result["failed_gates"]
     # round(10*0.58)=6 → 0.6 vs round(10*0.50)=5 → 0.5
     assert result["improvement_pp"] == pytest.approx(0.10)
     assert result["block_bootstrap"]["ci_low"] > 0.0
-    assert result["block_bootstrap"]["unit"] == "trade_day"
+    assert result["block_bootstrap"]["unit"] == (
+        "pooled_matured_trade_profitability_rate_difference"
+    )
     assert result["test_folds"] >= 4
     assert result["treatment"]["fill_rate"] == pytest.approx(0.6)
     assert result["treatment"]["capital_employed_cny"] == pytest.approx(
-        20 * 90 * CONTRACT.reference_notional
+        20 * 120 * CONTRACT.reference_notional
     )
 
 
@@ -360,10 +364,10 @@ def test_acceptance_reports_missing_baseline_fills_instead_of_faking_a_hit_rate(
     assert result["baseline"]["net_profit_rate"] is None
 
 
-def test_acceptance_blocks_when_there_are_too_few_test_folds() -> None:
+def test_acceptance_blocks_when_test_folds_are_too_short() -> None:
     result = _verdict(_weekdays(30), rates={"treatment_rate": 0.7, "baseline_rate": 0.5})
-    assert result["test_folds"] < 4
-    assert any("test_folds" in gate for gate in result["failed_gates"])
+    assert result["test_folds"] == 4
+    assert "test_fold_sessions_below_30" in result["failed_gates"]
 
 
 def test_acceptance_rejects_worse_tail_loss() -> None:

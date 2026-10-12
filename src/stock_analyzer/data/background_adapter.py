@@ -96,15 +96,23 @@ class AkshareBackgroundAdapter:
         background_missing_fields = ",".join(
             [*missing_core, *(f"optional:{name}" for name in missing_optional)]
         )
-        background_data_complete = not missing_core
+        background_data_complete = pd.DataFrame(
+            {
+                "block_trade_net": block_series.reindex(index),
+                "margin_financing_balance": financing_series.reindex(index),
+                "northbound_net": northbound_series.reindex(index),
+                "dragon_tiger_flag": dragon_series.reindex(index),
+            },
+            index=index,
+        ).notna().all(axis=1) & (not missing_core)
         background = pd.DataFrame(
             {
-                "holder_count": holder_series.reindex(index).ffill(),
-                "block_trade_net": block_series.reindex(index).fillna(0.0),
-                "financing_balance": financing_series.reindex(index).ffill(),
-                "margin_financing_balance": financing_series.reindex(index).ffill(),
-                "northbound_net": northbound_series.reindex(index).fillna(0.0),
-                "dragon_tiger_flag": dragon_series.reindex(index).fillna(0.0),
+                "holder_count": holder_series.reindex(index),
+                "block_trade_net": block_series.reindex(index),
+                "financing_balance": financing_series.reindex(index),
+                "margin_financing_balance": financing_series.reindex(index),
+                "northbound_net": northbound_series.reindex(index),
+                "dragon_tiger_flag": dragon_series.reindex(index),
                 "background_data_source": source_text,
                 "background_data_complete": background_data_complete,
                 "background_missing_fields": background_missing_fields,
@@ -341,13 +349,16 @@ def _extract_block_trade_series(
         sell_col = _pick_column(parsed.columns, ("卖出", "卖方", "sell"))
         if buy_col is None or sell_col is None:
             return None
-        buy = pd.to_numeric(parsed[buy_col], errors="coerce").fillna(0.0)
-        sell = pd.to_numeric(parsed[sell_col], errors="coerce").fillna(0.0)
+        buy = pd.to_numeric(parsed[buy_col], errors="coerce")
+        sell = pd.to_numeric(parsed[sell_col], errors="coerce")
         net = buy - sell
     data = pd.DataFrame({"date": dates, "value": net}).dropna(subset=["date"])
     if data.empty:
         return None
-    grouped = data.groupby(data["date"].dt.normalize(), as_index=True)["value"].sum()
+    daily_values = data.groupby(data["date"].dt.normalize(), as_index=True)["value"]
+    grouped = daily_values.sum(min_count=1).where(
+        daily_values.count() == daily_values.size()
+    )
     grouped_index = pd.DatetimeIndex(grouped.index)
     mask = (grouped_index.date >= start) & (grouped_index.date <= end)
     return pd.Series(grouped.loc[mask], copy=False)

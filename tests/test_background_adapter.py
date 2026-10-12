@@ -81,14 +81,16 @@ def test_background_adapter_enriches_daily_series() -> None:
     assert "margin_financing_balance" in enriched.columns
     assert "northbound_net" in enriched.columns
     assert "dragon_tiger_flag" in enriched.columns
-    assert float(enriched.iloc[-1]["holder_count"]) == 95_000
+    assert float(enriched.iloc[1]["holder_count"]) == 95_000
     assert float(enriched.iloc[1]["block_trade_net"]) == 2_000_000
     assert float(enriched.iloc[1]["dragon_tiger_flag"]) == 1.0
-    assert bool(enriched.iloc[-1]["background_data_complete"]) is True
+    assert bool(enriched.iloc[1]["background_data_complete"]) is True
+    # Sparse provider responses do not make dates with no row appear complete.
+    assert bool(enriched.iloc[-1]["background_data_complete"]) is False
 
 
 def test_background_adapter_complete_requires_all_core_fields() -> None:
-    """分级完整性：五个核心来源（大宗/两融/北向/龙虎榜）齐全才 True；
+    """分级完整性：四个核心来源（大宗/两融/北向/龙虎榜）齐全才 True；
     holder_count 提供时 missing 清单为空。"""
     index = pd.bdate_range("2026-01-02", periods=3)
     bars = pd.DataFrame(
@@ -108,9 +110,9 @@ def test_background_adapter_complete_requires_all_core_fields() -> None:
     adapter = AkshareBackgroundAdapter(cache_ttl_sec=3600, ak_module=_FakeBackgroundAk())
     enriched = adapter.enrich_bars(symbol="600000", bars=bars)
 
-    # 五核心齐全（fake 全量提供），complete=True。
-    assert bool(enriched.iloc[-1]["background_data_complete"]) is True
-    missing = str(enriched.iloc[-1]["background_missing_fields"])
+    # 2026-01-05 四个核心字段都有数据；其他日期缺行，保持 incomplete。
+    assert bool(enriched.iloc[1]["background_data_complete"]) is True
+    missing = str(enriched.iloc[1]["background_missing_fields"])
     assert missing == ""
 
 
@@ -146,8 +148,8 @@ def test_background_adapter_optional_missing_keeps_complete() -> None:
     )
     enriched = adapter.enrich_bars(symbol="600000", bars=bars)
 
-    assert bool(enriched.iloc[-1]["background_data_complete"]) is True
-    missing = str(enriched.iloc[-1]["background_missing_fields"])
+    assert bool(enriched.iloc[1]["background_data_complete"]) is True
+    missing = str(enriched.iloc[1]["background_missing_fields"])
     assert "optional:holder_count" in missing
     for core in (
         "block_trade_net",

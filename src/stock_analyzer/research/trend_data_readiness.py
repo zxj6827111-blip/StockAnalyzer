@@ -112,7 +112,8 @@ class _Probe:
 
 
 def _audit_column_concentration(
-    probe: _Probe, table: str | None, *, max_share: float = MAX_MODAL_VALUE_SHARE
+    probe: _Probe, table: str | None, *, max_share: float = MAX_MODAL_VALUE_SHARE,
+    float_cap_reference_probe: _Probe | None = None,
 ) -> list[ReadinessCheck]:
     """按列检查取值集中度：常数填充不是缺失，只有集中度查得出来。
 
@@ -129,6 +130,12 @@ def _audit_column_concentration(
     for column in CONCENTRATION_GUARDED_COLUMNS:
         name = f"column_concentration_{column}"
         if column not in columns:
+            continue
+        if column == "float_market_cap" and float_cap_reference_probe is not None:
+            checks.append(_audit_effective_float_cap_concentration(
+                probe, float_cap_reference_probe, table, date_column,
+                max_share=max_share,
+            ))
             continue
         days, over_threshold, worst = (probe.rows(
             f"WITH per_value AS (SELECT {date_column} AS d, {column} AS v, COUNT(*) AS c "
@@ -161,6 +168,155 @@ def _audit_column_concentration(
     return checks
 
 
+def _audit_effective_float_cap_concentration(
+    warehouse_probe: _Probe,
+    reference_probe: _Probe,
+    table: str,
+    date_column: str,
+    *,
+    max_share: float,
+) -> ReadinessCheck:
+    """按独立 Tushare 参考值覆盖仓库占位值后，再审计市值横截面分布。
+
+    仓库保留原始记录作为事故证据；读取侧以 ``symbol + trade_date`` 对齐参考表。
+    参考表无效或键不唯一时 fail-closed，不能把原始占位值误报为有效市值。
+    """
+    name = "column_concentration_float_market_cap"
+    reference_table = "float_market_cap_ref"
+    detail: dict[str, Any] = {
+        "table": table,
+        "column": "float_market_cap",
+        "effective_source": "warehouse_plus_float_market_cap_ref",
+        "reference_pit_certified": False,
+        "reference_time_scope": (
+            "historical daily_basic values have no per-date publication snapshot; "
+            "this overlay supports concentration audit only, not decision-time PIT proof"
+        ),
+        "reference_table": reference_table,
+        "modal_share_limit": max_share,
+    }
+    required_warehouse = {"symbol", date_column, "float_market_cap"}
+    required_reference = {"symbol", "trade_date", "float_market_cap"}
+    try:
+        reference_tables = reference_probe.tables()
+        reference_columns = reference_probe.columns(reference_table)
+        if reference_table not in reference_tables:
+            raise ValueError("reference table is missing")
+        if not required_reference.issubset(reference_columns):
+            raise ValueError("reference table has missing required columns")
+        if not required_warehouse.issubset(warehouse_probe.columns(table)):
+            raise ValueError("warehouse lacks symbol/date/float_market_cap columns")
+        reference_rows = reference_probe.scalar(
+            f"SELECT COUNT(*) FROM {reference_table}"
+        )
+        duplicate_keys = reference_probe.scalar(
+            f"SELECT COUNT(*) - COUNT(DISTINCT (symbol, trade_date)) "
+            f"FROM {reference_table}"
+        )
+        if reference_rows is None or int(reference_rows) == 0:
+            raise ValueError("reference table is empty or unreadable")
+        if duplicate_keys is None or int(duplicate_keys) != 0:
+            raise ValueError("reference symbol + trade_date keys are not unique")
+    except Exception as exc:  # noqa: BLE001 - unavailable evidence must fail closed
+        detail["reference_status"] = "invalid"
+        detail["reference_error"] = str(exc)
+        return ReadinessCheck(
+            name, STATUS_INSUFFICIENT, detail,
+            "独立流通市值参考表缺失、无效或键不唯一，无法证明市值门有判别力",
+        )
+
+    detail["reference_status"] = "valid"
+    detail["reference_rows"] = int(reference_rows)
+    reference_relation = reference_table
+    try:
+        source_path = reference_probe.scalar(
+            "SELECT path FROM duckdb_databases() "
+            "WHERE database_name NOT IN ('system', 'temp') LIMIT 1"
+        )
+        warehouse_path = warehouse_probe.scalar(
+            "SELECT path FROM duckdb_databases() "
+            "WHERE database_name NOT IN ('system', 'temp') LIMIT 1"
+        )
+        if source_path and source_path == warehouse_path:
+            reference_relation = reference_table
+        elif source_path:
+            alias = "sa_float_cap_reference"
+            attached = warehouse_probe.rows(
+                "SELECT 1 FROM duckdb_databases() WHERE database_name = ?", [alias]
+            )
+            if not attached:
+                safe_path = str(source_path).replace("'", "''")
+                warehouse_probe._conn.execute(
+                    f"ATTACH '{safe_path}' AS {alias} (READ_ONLY)"
+                )
+            reference_relation = f"{alias}.{reference_table}"
+        else:
+            # In-memory research connections (including unit fixtures) have no path to ATTACH.
+            # Copy only the reference relation into a temporary table on the audit connection.
+            frame = reference_probe._conn.execute(
+                f"SELECT symbol, trade_date, float_market_cap FROM {reference_table}"
+            ).fetch_df()
+            warehouse_probe._conn.register("_sa_float_cap_reference_source", frame)
+            warehouse_probe._conn.execute(
+                "CREATE OR REPLACE TEMP TABLE _sa_float_cap_reference_snapshot AS "
+                "SELECT * FROM _sa_float_cap_reference_source"
+            )
+            warehouse_probe._conn.unregister("_sa_float_cap_reference_source")
+            reference_relation = "_sa_float_cap_reference_snapshot"
+    except Exception as exc:  # noqa: BLE001 - unable to join evidence means insufficient
+        detail["reference_status"] = "unreadable"
+        detail["reference_error"] = str(exc)
+        return ReadinessCheck(
+            name, STATUS_INSUFFICIENT, detail,
+            "无法只读连接独立参考表与仓库，不能将市值门判为有效",
+        )
+    rows = warehouse_probe.rows(
+        f"WITH effective AS ("
+        f"SELECT b.{date_column} AS d, "
+        f"COALESCE(r.float_market_cap, b.float_market_cap) AS v, "
+        f"(r.symbol IS NOT NULL) AS has_ref "
+        f"FROM {table} AS b LEFT JOIN {reference_relation} AS r "
+        f"ON b.symbol = r.symbol AND CAST(b.{date_column} AS DATE) = r.trade_date"
+        f"), per_value AS ("
+        f"SELECT d, v, COUNT(*) AS c FROM effective WHERE v IS NOT NULL GROUP BY 1, 2"
+        f"), per_day AS ("
+        f"SELECT d, SUM(c) AS n, MAX(c) AS modal_c FROM per_value GROUP BY 1"
+        f") SELECT (SELECT COUNT(*) FROM per_day), "
+        f"(SELECT COUNT(*) FROM per_day WHERE modal_c * 1.0 / n > {max_share}), "
+        f"(SELECT MAX(modal_c * 1.0 / n) FROM per_day), "
+        f"(SELECT v FROM effective WHERE v IS NOT NULL GROUP BY v "
+        f"ORDER BY COUNT(*) DESC LIMIT 1), "
+        f"(SELECT COUNT(*) FROM effective), "
+        f"(SELECT COUNT(*) FROM effective WHERE has_ref)"
+    )
+    if not rows:
+        detail["reference_status"] = "unreadable"
+        return ReadinessCheck(
+            name, STATUS_INSUFFICIENT, detail,
+            "参考市值覆盖后的横截面审计查询失败，不能将市值门判为有效",
+        )
+    days, over_threshold, worst, modal_value, warehouse_rows, matched_rows = rows[0]
+    detail.update({
+        "trade_days": int(days or 0),
+        "days_over_modal_share": int(over_threshold or 0),
+        "worst_modal_share": round(float(worst), 4) if worst is not None else None,
+        "modal_value": modal_value,
+        "warehouse_rows": int(warehouse_rows or 0),
+        "rows_with_reference": int(matched_rows or 0),
+        "rows_without_reference": int((warehouse_rows or 0) - (matched_rows or 0)),
+        "reference_match_share": round(
+            float(matched_rows or 0) / int(warehouse_rows), 6
+        ) if warehouse_rows else 0.0,
+    })
+    return ReadinessCheck(
+        name,
+        STATUS_OK if not detail["days_over_modal_share"] else STATUS_INSUFFICIENT,
+        detail,
+        "按 symbol + trade_date 覆盖后检查市值分布；参考值仅用于集中度审计，"
+        "未匹配行保留仓库值，且不构成决策时点 PIT 证明",
+    )
+
+
 def _pick(existing: Mapping[str, Any] | set[str], candidates: tuple[str, ...]) -> str | None:
     for candidate in candidates:
         if candidate in existing:
@@ -176,6 +332,7 @@ def audit_trend_data_readiness(
     min_rows_per_day: int = MIN_DAILY_ROWS_PER_DAY,
     minute_connection: Any | None = None,
     reference_connection: Any | None = None,
+    float_cap_reference_connection: Any | None = None,
 ) -> dict[str, Any]:
     """按尾盘策略契约的要求探测仓库数据，返回可审计的就绪报告。
 
@@ -186,6 +343,9 @@ def audit_trend_data_readiness(
     成交与出场的判定要吃的就是这份副本，所以"生产仓库有数据"不等于"能重建标签"：
     副本没建、口径不是 raw、日历矛盾、状态没声明，都会在重建时变成
     ``insufficient_reference_data`` 或 ``unknown_trade_status``，而不是产出标签。
+
+    ``float_cap_reference_connection`` 可选地指向独立流通市值研究库；提供后，市值集中度
+    检查按 ``symbol + trade_date`` 覆盖仓库值，并验证参考表唯一键。仓库本身仍只读。
     """
     probe = _Probe(connection)
     try:
@@ -206,9 +366,15 @@ def audit_trend_data_readiness(
     checks: list[ReadinessCheck] = []
     reference_probe = (_Probe(reference_connection)
                        if reference_connection is not None else None)
+    float_cap_reference_probe = (
+        _Probe(float_cap_reference_connection)
+        if float_cap_reference_connection is not None else None
+    )
     bars_table = _pick(tables, ("daily_bars", "stock_daily", "daily"))
     checks.append(_audit_daily_bars(probe, bars_table, min_rows_per_day))
-    checks.extend(_audit_column_concentration(probe, bars_table))
+    checks.extend(_audit_column_concentration(
+        probe, bars_table, float_cap_reference_probe=float_cap_reference_probe,
+    ))
     checks.append(_audit_price_mode(probe, bars_table, reference_probe))
     checks.append(_audit_limit_prices(probe, bars_table, tables))
     checks.append(_audit_trade_status(probe, bars_table, tables))
@@ -441,6 +607,33 @@ def _audit_security_status_intervals(
         f"SELECT COUNT(DISTINCT symbol) FROM {table}") or 0)
     complete = int(active_probe.scalar(
         f"SELECT COUNT(*) FROM {table} WHERE coverage_complete") or 0)
+    marker_table = (
+        f"WITH latest AS (SELECT symbol, coverage_complete, "
+        f"ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY effective_from DESC) AS rn "
+        f"FROM {table} WHERE status_type = 'name_change_coverage') "
+        "SELECT COUNT(*), COALESCE(SUM(CASE WHEN coverage_complete THEN 1 ELSE 0 END), 0) "
+        "FROM latest WHERE rn = 1"
+    )
+    marker_row = active_probe.rows(marker_table)
+    marker_symbols = int(marker_row[0][0] or 0) if marker_row else 0
+    marker_complete_symbols = int(marker_row[0][1] or 0) if marker_row else 0
+    status_columns = active_probe.columns(table)
+    name_change_rows = int(active_probe.scalar(
+        f"SELECT COUNT(*) FROM {table} WHERE status_type = 'name_change'"
+    ) or 0)
+    if "announcement_date" in status_columns:
+        missing_announcement_dates = int(active_probe.scalar(
+            f"SELECT COUNT(*) FROM {table} WHERE status_type = 'name_change' "
+            "AND announcement_date IS NULL"
+        ) or 0)
+        announcement_after_effective_start = int(active_probe.scalar(
+            f"SELECT COUNT(*) FROM {table} WHERE status_type = 'name_change' "
+            "AND announcement_date > effective_from"
+        ) or 0)
+    else:
+        # 旧表没有公告时间列时，不能把每条改名记录当成决策日可得。
+        missing_announcement_dates = name_change_rows
+        announcement_after_effective_start = 0
     overlaps = active_probe.rows(
         f"SELECT a.symbol, a.effective_from, b.effective_from FROM {table} a "
         f"JOIN {table} b ON a.symbol = b.symbol AND a.status_type = b.status_type "
@@ -448,17 +641,40 @@ def _audit_security_status_intervals(
         "AND (a.effective_to IS NULL OR a.effective_to >= b.effective_from) LIMIT 5"
     )
     share = (complete / total) if total else 0.0
+    marker_share = marker_complete_symbols / symbols if symbols else 0.0
+    marker_coverage_proven = (
+        marker_symbols == symbols and marker_complete_symbols == symbols
+    ) if marker_symbols else share >= MIN_TRADE_STATUS_COVERAGE
+    notes: list[str] = []
+    if marker_symbols and not marker_coverage_proven:
+        notes.append("逐证券改名史覆盖标记未覆盖全部证券或存在不完整响应")
+    elif not marker_symbols and share < MIN_TRADE_STATUS_COVERAGE:
+        notes.append("证券状态区间 coverage_complete 份额不够；没有逐证券改名史覆盖证明")
+    if missing_announcement_dates:
+        notes.append("改名记录缺少公告日期，无法证明该名称在历史决策时点已可得")
+    if announcement_after_effective_start:
+        notes.append("改名公告晚于生效日，历史决策时点可用性无法证明")
+    if overlaps:
+        notes.append("证券状态区间存在重叠")
+    status_ok = bool(
+        total
+        and not overlaps
+        and marker_coverage_proven
+        and not missing_announcement_dates
+        and not announcement_after_effective_start
+    )
     return ReadinessCheck(
         name,
-        STATUS_OK if total and not overlaps and share >= MIN_TRADE_STATUS_COVERAGE
-        else STATUS_INSUFFICIENT,
+        STATUS_OK if status_ok else STATUS_INSUFFICIENT,
         {"rows": total, "symbols": symbols, "source_table": table,
          "coverage_complete_share": share,
+         "name_change_coverage_markers": marker_symbols,
+         "name_change_coverage_complete_symbols": marker_complete_symbols,
+         "name_change_coverage_share": round(marker_share, 6),
+         "name_change_rows_missing_announcement_date": missing_announcement_dates,
+         "name_change_rows_announced_after_effective_start": announcement_after_effective_start,
          "overlap_sample": [list(row) for row in overlaps]},
-        "" if (total and not overlaps
-               and share >= MIN_TRADE_STATUS_COVERAGE) else
-        "证券状态区间的 coverage_complete 份额不够：改名/ST 史受接口单次 10,000 行上限截断，"
-        "跨状态还原能力只能算不足",
+        "" if status_ok else "；".join(notes or ["证券状态区间没有有效记录"]),
     )
 
 

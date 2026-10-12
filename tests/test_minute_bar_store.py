@@ -88,6 +88,19 @@ def test_round_trip_keeps_every_bar_time(tmp_path) -> None:
         store.close()
 
 
+def test_upsert_invalidates_cached_day_rows(tmp_path) -> None:
+    store = _store(tmp_path)
+    try:
+        _ingest(store, _zip(tmp_path, csv_text=_csv(price=10.0)))
+        assert store.bars_for(SYMBOL, DAY)[0][1]["close"] == pytest.approx(10.0)
+
+        _ingest(store, _zip(tmp_path, csv_text=_csv(price=11.0)))
+
+        assert store.bars_for(SYMBOL, DAY)[0][1]["close"] == pytest.approx(11.0)
+    finally:
+        store.close()
+
+
 def test_bar_start_semantics_is_shifted_into_completion_time(tmp_path) -> None:
     archive = _zip(tmp_path)
     store = _store(tmp_path)
@@ -160,6 +173,25 @@ def test_tail_window_coverage_counts_complete_symbol_days(tmp_path) -> None:
         assert report["table"] == "minute_bars_1min"
         assert report["first_day"] == "2026-10-09"
         assert report["tail_window"]["complete_symbol_days"] == 1
+    finally:
+        store.close()
+
+
+def test_entry_window_coverage_requires_confirmation_and_following_fill_minutes(
+    tmp_path,
+) -> None:
+    store = _store(tmp_path)
+    try:
+        _ingest(store, _zip(tmp_path))
+        bars = store.bars_for(SYMBOL, DAY)
+        coverage = store.entry_window_coverage(bars, trading_day=DAY)
+        assert coverage["complete"] is True
+        assert coverage["expected_count"] == 17  # 14:30 through final 14:46 fill bar
+
+        missing_fill = [item for item in bars if item[0] != datetime(2026, 10, 9, 14, 31)]
+        incomplete = store.entry_window_coverage(missing_fill, trading_day=DAY)
+        assert incomplete["complete"] is False
+        assert incomplete["missing_times"] == ["14:31"]
     finally:
         store.close()
 

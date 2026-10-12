@@ -72,13 +72,32 @@ def main(argv: list[str] | None = None) -> int:
     try:
         requests = _read_jsonl(Path(args.requests))
         labels = _read_jsonl(Path(args.labels))
-    except (OSError, SystemExit) as exc:
+        by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in requests:
+            key = (
+                str(row.get("symbol") or "").strip(),
+                str(row.get("decision_date") or ""),
+            )
+            if not key[0]:
+                raise ValueError("request is missing symbol")
+            if key in by_key:
+                raise ValueError(f"duplicate request decision key {key}")
+            by_key[key] = row
+        seen_label_keys: set[tuple[str, str]] = set()
+        for row in labels:
+            key = (
+                str(row.get("symbol") or "").strip(),
+                str(row.get("decision_date") or ""),
+            )
+            if not key[0]:
+                raise ValueError("label is missing symbol")
+            if key in seen_label_keys:
+                raise ValueError(f"duplicate label decision key {key}")
+            seen_label_keys.add(key)
+    except (OSError, SystemExit, ValueError) as exc:
         print(f"assemble blocked: {exc}", file=sys.stderr)
         return _RC_ERROR
 
-    by_key = {
-        (str(row.get("symbol")), str(row.get("decision_date"))): row for row in requests
-    }
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     written = 0
