@@ -867,3 +867,34 @@ NAS API 容器从 Tushare `daily_basic.circ_mv` 补采 2026-07-18 至 2026-09-30
    imputation 记录以及全市场硬门输入，才可能满足 full-chain PIT 审计。
 
 当前级别：**本地输入快照写入器与定向验证完成；NAS 生产启用待单独审查；全链路 PIT、候选训练、独立确认、正式影子与 Production Ready 仍未完成。**
+
+
+## 19. 2026-10-12 续接：分支提交与 PR 验证
+
+本节更新 §18 之后的状态；§18 的“未提交”描述是当时记录，不代表当前分支状态。
+
+### 本轮完成
+
+- 将选股质量整改工作树中 112 个源代码、测试、脚本与决策文档文件提交到
+  `feat/stock-selection-quality-overhaul`，提交为
+  `232f8578b443d34a30c340e31ef4a41b843f5309`，并推送到同名远端分支。
+- 该分支已有开放 PR #105（目标 `main`），因此将新提交推入既有 PR，没有创建重复 PR。
+- 本地验证了 48 个变更测试文件；pytest 以退出码 0 完成。104 个变更 Python 文件的
+  `ruff check` 通过，`git diff --check` 通过。
+- 全仓 `ruff check src tests scripts` 报告 75 个问题；仅对变更 Python 文件的 Ruff 检查
+  通过。全仓命令结果不视为 CI 通过，合并仍以 PR 的必需 GitHub 检查为准。
+- `.mimosa/` 本机审查记录及 `src/stock_analyzer.egg-info/` 生成元数据没有进入提交；
+  NAS 状态、数据库、marker、模型和 artifacts 本轮均未写入，未部署或重启。
+
+### 当前状态与剩余任务
+
+1. PR #105 指向 `main`，head 为上述提交；截至本节记录时，两个 `quality` 检查仍在运行。
+   只有所有必需检查通过后才合并。若检查失败，应先修复并等待新 head 的检查完成。
+2. 代码发布后仍需在部署前重新核对 NAS 当前 commit / image、四个服务和 scheduler，
+   评估本次 trend contract v2 对运行时的影响并确定回滚镜像；没有完成这些核查前不得部署。
+3. 全链路 PIT 证据仍缺失：271 个字段的当前历史证据报告全部 blocked；阶段二仍无合格候选，
+   阶段三独立确认和阶段四正式影子尚未启动。因此“CI 全绿”只表示代码检查通过，
+   不等同于策略验收或 Production Ready。
+
+当前级别：**代码已提交并推送到 PR；本地变更测试和变更范围 Ruff 通过；PR CI 尚未完成；
+质量晋升门仍 blocked；尚未合并、部署或达到 Production Ready。**
