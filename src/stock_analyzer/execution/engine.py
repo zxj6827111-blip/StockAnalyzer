@@ -15,7 +15,11 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 
 from stock_analyzer.config import BacktestMatcherConfig, LimitRuleConfig
-from stock_analyzer.data.limit_rule import build_price_limits, resolve_stamp_tax_rate
+from stock_analyzer.data.limit_rule import (
+    FrozenCostProfile,
+    build_price_limits,
+    resolve_cost_profile,
+)
 
 
 @dataclass(slots=True)
@@ -204,6 +208,14 @@ class ExecutionEngine:
             return 100
         return 1
 
+    def cost_profile(self, trade_date: datetime | date | None = None) -> FrozenCostProfile:
+        """该交易日生效的冻结成本口径（成本表覆盖到的字段优先，其余取静态值）。"""
+        return resolve_cost_profile(
+            limit_rule=self._limit_rule,
+            matcher=self._config,
+            trade_date=trade_date,
+        )
+
     def estimate_cost(
         self,
         side: str,
@@ -212,19 +224,12 @@ class ExecutionEngine:
         trade_date: datetime | date | None = None,
     ) -> float:
         amount = price * float(quantity)
-        commission = max(
-            self._config.min_commission_per_order,
-            amount * self._config.commission_rate,
-        )
-        transfer_fee = amount * self._config.transfer_fee_rate
+        profile = self.cost_profile(trade_date)
+        commission = max(profile.min_commission_per_order, amount * profile.commission_rate)
+        transfer_fee = amount * profile.transfer_fee_rate
         stamp_tax = 0.0
         if side.lower() == "sell" and self._config.stamp_tax_apply_on == "sell_only":
-            stamp_rate = resolve_stamp_tax_rate(
-                config=self._limit_rule,
-                trade_date=trade_date,
-                default_rate=self._config.stamp_tax_rate,
-            )
-            stamp_tax = amount * stamp_rate
+            stamp_tax = amount * profile.stamp_tax_rate
         return float(commission + transfer_fee + stamp_tax)
 
     def _apply_share_rounding(self, quantity: int) -> int:

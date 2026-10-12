@@ -20,7 +20,6 @@ import pandas as pd
 from stock_analyzer.data.financial_pit import normalize_fina_indicator_rows
 from stock_analyzer.data.provider import DataSourceError
 
-_DEFAULT_FLOAT_MARKET_CAP = 12_000_000_000.0
 _SYMBOL_RE = re.compile(r"(\d{6})")
 
 # Client errors that never warrant retry: bad parameters, auth/permission
@@ -1674,14 +1673,24 @@ def _normalize_tushare_daily(
     frame = frame.sort_values("date").drop_duplicates(subset=["date"], keep="last")
     frame, adjust_meta = _apply_price_adjust(frame, adj=adj, price_series_mode=price_series_mode)
 
-    if "circ_mv" in frame.columns:
-        circ = pd.to_numeric(frame["circ_mv"], errors="coerce") * 10000.0
-        frame["float_market_cap"] = circ.fillna(_DEFAULT_FLOAT_MARKET_CAP)
-    elif "turnover_rate" in frame.columns:
-        rate = pd.to_numeric(frame["turnover_rate"], errors="coerce").replace(0, np.nan) / 100.0
-        frame["float_market_cap"] = (frame["turnover"] / rate).fillna(_DEFAULT_FLOAT_MARKET_CAP)
-    else:
-        frame["float_market_cap"] = _DEFAULT_FLOAT_MARKET_CAP
+    circ = (
+        pd.to_numeric(frame["circ_mv"], errors="coerce") * 10000.0
+        if "circ_mv" in frame.columns else pd.Series(np.nan, index=frame.index)
+    )
+    estimated_from_turnover = pd.Series(np.nan, index=frame.index, dtype=float)
+    if "turnover_rate" in frame.columns:
+        rate = (
+            pd.to_numeric(frame["turnover_rate"], errors="coerce")
+            .replace(0, np.nan) / 100.0
+        )
+        estimated_from_turnover = frame["turnover"] / rate
+    circ = circ.where(np.isfinite(circ) & (circ > 0.0))
+    estimated_from_turnover = estimated_from_turnover.where(
+        np.isfinite(estimated_from_turnover) & (estimated_from_turnover > 0.0)
+    )
+    # 缺市值就保留缺失。12B 是数据源失效时曾用的占位值，会让按同列分位计算的
+    # 硬门恒通过；不得把它写入新记录。
+    frame["float_market_cap"] = circ.fillna(estimated_from_turnover)
 
     is_st = "ST" in name.upper() if name else False
     is_delisting = any(token in name for token in ("退", "*ST")) if name else False

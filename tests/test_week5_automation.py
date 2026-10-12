@@ -1992,3 +1992,97 @@ def test_radar_budgets_sit_above_measured_p90() -> None:
 
     assert config.market_radar_timeout_sec > _RADAR_MEASURED_P90_SEC
     assert config.market_radar_slow_run_sec > _RADAR_MEASURED_P90_SEC
+
+
+def _night_funnel_rows(symbols: list[str]) -> list[dict]:
+    return [{"symbol": symbol, "shortlist_score": 80.0} for symbol in symbols]
+
+
+def _night_funnel_report() -> dict:
+    """一份带 Quality300/Light100/Deep50 成员原文的夜扫报告（形状取自真实 prefilter）。"""
+    rows = _night_funnel_rows
+    return {
+        "status": "ok",
+        "data_version": "snapshot-v1",
+        "timestamp": "2026-08-24T21:45:00+08:00",
+        "data_gate": {"status": "ok", "reasons": []},
+        "prefilter": {
+            "universe_count": 4,
+            "eligible_count": 4,
+            "batch_coverage_ratio": 1.0,
+            "intraday_freshness": {"fresh_ratio": 1.0},
+            "universe_quality_selection": {
+                "selected": rows(["600000", "600001", "600002", "600003"]),
+            },
+            "shortlisted": rows(["600000", "600001", "600002"]),
+            "deep_stage": {"selected": rows(["600000", "600001"])},
+        },
+        "signal_pool": {"candidates": rows(["600000", "600001"])},
+        "funnel": {"final_selection": {"final_signals": []}},
+    }
+
+
+def _shadow_path_resolver(service, tmp_path: Path):
+    """只把尾盘留档目录挪进 tmp_path：同一个 resolver 也服务于候选状态文件，不能整体替换。"""
+    original = service._resolve_evolution_path
+
+    def resolve(raw: str):
+        if "trend_tail_shadow" in str(raw):
+            return tmp_path / "tail_shadow"
+        return original(raw)
+
+    return resolve
+
+
+def test_night_scan_writes_the_night_half_funnel_trace(tmp_path: Path) -> None:
+    """接线要有牙：夜扫跑完必须真的落下与尾盘半段同构的留档，且落盘即自洽。
+
+    只测 ``record_night_scan()`` 本身不够——调用点在 ``run_night_scan`` 里，重构时
+    很容易整段丢掉，而 §2 的九层留档依赖这一半。
+    """
+    from stock_analyzer.research.funnel_trace import read_trace, verify_trace
+
+    service = FakeService(tmp_path)
+    # 留档目录必须由服务解析出来：否则测试会往仓库的 artifacts/ 里写。
+    service._resolve_evolution_path = _shadow_path_resolver(service, tmp_path)
+    service.scan_report = _night_funnel_report()
+    automation = RuntimeWeek5AutomationService(service)
+
+    automation.run_night_scan(
+        timestamp=datetime(2026, 8, 24, 21, 45, tzinfo=UTC),
+        sync_watchlist=False,
+    )
+
+    report = automation.latest_night_scan()["source_report"]
+    emitted = report["night_funnel_trace"]
+    assert emitted["emitted"] is True, emitted
+    assert emitted["layers"] == ["quality_300", "light_100", "deep_50"]
+    trace = read_trace(Path(emitted["path"]))
+    # 落盘即自洽：读侧自检通过，证据链不留"写了但不敢用"的留档。
+    assert verify_trace(trace) == ()
+    assert trace["stages"][1]["rejected_symbols"] == {
+        "night_truncation_reason_not_recorded": ["600003"]
+    }
+
+
+def test_night_scan_reports_why_the_trace_was_not_written(tmp_path: Path) -> None:
+    """报告里没有成员时不许静默：不写文件，但把原因留在报告里可查。"""
+    service = FakeService(tmp_path)
+    service._resolve_evolution_path = _shadow_path_resolver(service, tmp_path)
+    report = _night_funnel_report()
+    report["prefilter"] = {"universe_count": 300, "eligible_count": 300}
+    service.scan_report = report
+    automation = RuntimeWeek5AutomationService(service)
+
+    automation.run_night_scan(
+        timestamp=datetime(2026, 8, 24, 21, 46, tzinfo=UTC),
+        sync_watchlist=False,
+    )
+
+    emitted = automation.latest_night_scan()["source_report"]["night_funnel_trace"]
+    assert emitted["emitted"] is False
+    assert emitted["reason"] == "night_scan_report_has_no_funnel_members"
+    # 前两层为什么缺席要自己说出口，不能靠"layers 少了两个"反推
+    assert emitted["universe_layers"]["emitted"] is False
+    assert emitted["universe_layers"]["reason"] == "membership_path_not_found"
+    assert not (tmp_path / "tail_shadow").exists()

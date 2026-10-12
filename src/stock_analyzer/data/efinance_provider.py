@@ -15,10 +15,6 @@ import pandas as pd
 
 from stock_analyzer.data.provider import DataSourceError
 
-_DEFAULT_FLOAT_MARKET_CAP = 12_000_000_000.0
-_DEFAULT_HOLDER_COUNT = 60_000.0
-_DEFAULT_FINANCING_BALANCE = 2_500_000_000.0
-
 
 class _EfinanceStockApi(Protocol):
     def get_quote_history(
@@ -94,18 +90,19 @@ class EfinanceProvider:
         trimmed["roe"] = np.nan
         trimmed["debt_ratio"] = np.nan
         trimmed["financial_data_complete"] = False
-        trimmed["financial_missing_fields"] = "roe,debt_ratio"
-        trimmed["financial_source"] = "efinance_default"
+        trimmed["financial_missing_fields"] = "roe,debt_ratio,announcement_effective_date"
+        trimmed["financial_source"] = "efinance_missing"
         trimmed["financial_report_date"] = ""
+        trimmed["financial_as_of"] = ""
         trimmed["financial_trust_level"] = "missing"
-        trimmed["holder_count"] = _DEFAULT_HOLDER_COUNT
-        trimmed["block_trade_net"] = 0.0
-        trimmed["financing_balance"] = _DEFAULT_FINANCING_BALANCE
-        trimmed["margin_financing_balance"] = _DEFAULT_FINANCING_BALANCE
-        trimmed["northbound_net"] = 0.0
-        trimmed["dragon_tiger_flag"] = 0.0
-        trimmed["background_data_source"] = "efinance_default"
-        trimmed["background_data_complete"] = True
+        trimmed["holder_count"] = np.nan
+        trimmed["block_trade_net"] = np.nan
+        trimmed["financing_balance"] = np.nan
+        trimmed["margin_financing_balance"] = np.nan
+        trimmed["northbound_net"] = np.nan
+        trimmed["dragon_tiger_flag"] = np.nan
+        trimmed["background_data_source"] = "missing"
+        trimmed["background_data_complete"] = False
         trimmed["board"] = _infer_board(symbol)
         selected = trimmed[
             [
@@ -126,6 +123,7 @@ class EfinanceProvider:
                 "financial_missing_fields",
                 "financial_source",
                 "financial_report_date",
+                "financial_as_of",
                 "financial_trust_level",
                 "holder_count",
                 "block_trade_net",
@@ -324,9 +322,8 @@ def _normalize_quote_frame(frame: pd.DataFrame) -> pd.DataFrame:
         turnover_rate = turnover_rate.where(turnover_rate <= 1.0, turnover_rate / 100.0)
         turnover_rate = turnover_rate.replace(0.0, np.nan)
     estimated_market_cap = cleaned["turnover"] / turnover_rate
-    cleaned["float_market_cap"] = estimated_market_cap.replace([np.inf, -np.inf], np.nan).fillna(
-        _DEFAULT_FLOAT_MARKET_CAP
-    )
+    cleaned["float_market_cap"] = estimated_market_cap.replace([np.inf, -np.inf], np.nan)
+    cleaned.loc[cleaned["float_market_cap"] <= 0.0, "float_market_cap"] = np.nan
     return cleaned
 
 

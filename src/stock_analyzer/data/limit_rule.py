@@ -1,8 +1,9 @@
-"""Date-versioned A-share limit and stamp-tax rule helpers."""
+"""Date-versioned A-share limit-price and trading-cost rule helpers."""
 
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
@@ -105,21 +106,109 @@ def resolve_stamp_tax_rate(
     trade_date: date | datetime | None,
     default_rate: float,
 ) -> float:
-    if not config.cost_schedule_by_date:
-        return default_rate
+    return resolve_cost_profile(
+        limit_rule=config,
+        matcher=None,
+        trade_date=trade_date,
+        static_defaults={"stamp_tax_rate": float(default_rate)},
+    ).stamp_tax_rate
+
+
+@dataclass(frozen=True)
+class FrozenCostProfile:
+    """某一交易日生效的冻结成本口径。
+
+    ``overridden`` 记录哪些字段真的来自 ``limit_rule.cost_schedule_by_date``，
+    其余沿用 ``backtest_matcher`` 的静态值。留档必须带上这个集合，否则事后无法
+    判断某笔收益是按冻结历史成本算的、还是按当前静态成本补的。
+    """
+
+    commission_rate: float
+    min_commission_per_order: float
+    transfer_fee_rate: float
+    stamp_tax_rate: float
+    slippage_ratio: float | None
+    effective_from: date | None
+    overridden: frozenset[str] = frozenset()
+
+    @property
+    def source(self) -> str:
+        return "cost_schedule" if self.overridden else "static_matcher"
+
+
+_COST_FIELDS = (
+    "commission_rate",
+    "min_commission_per_order",
+    "transfer_fee_rate",
+    "stamp_tax_rate",
+    "slippage_ratio",
+)
+
+
+def resolve_cost_profile(
+    *,
+    limit_rule: LimitRuleConfig | None,
+    matcher: Any | None,
+    trade_date: date | datetime | None,
+    static_defaults: Mapping[str, Any] | None = None,
+) -> FrozenCostProfile:
+    """按日期把冻结成本表与静态值合并；表里没覆盖的字段取静态值。
+
+    选取规则与涨跌停规则表一致：取 ``from <= trade_date`` 中 ``from`` 最大的那一档。
+    无法解析的 ``from`` 直接跳过（不把坏数据当成 0 费率）。
+    """
+    statics = dict(static_defaults or {})
+    if matcher is not None:
+        for field_name in _COST_FIELDS:
+            if field_name in statics:
+                continue
+            value = getattr(matcher, field_name, None)
+            if value is not None:
+                statics[field_name] = value
+
+    resolved = {
+        "commission_rate": float(statics.get("commission_rate", 0.0003)),
+        "min_commission_per_order": float(statics.get("min_commission_per_order", 5.0)),
+        "transfer_fee_rate": float(statics.get("transfer_fee_rate", 0.00001)),
+        "stamp_tax_rate": float(statics.get("stamp_tax_rate", 0.0005)),
+        "slippage_ratio": (
+            float(statics["slippage_ratio"])
+            if statics.get("slippage_ratio") is not None
+            else None
+        ),
+    }
     day = _to_date(trade_date)
-    selected_rate = default_rate
-    selected_from = date.min
-    for row in config.cost_schedule_by_date:
+    schedule = list(getattr(limit_rule, "cost_schedule_by_date", []) or [])
+    selected_row: Any | None = None
+    selected_from: date | None = None
+    for row in schedule:
         from_day = _parse_iso_date(row.from_date)
         if from_day is None:
             continue
         if day is not None and from_day > day:
             continue
-        if from_day >= selected_from:
+        if selected_from is None or from_day >= selected_from:
             selected_from = from_day
-            selected_rate = float(row.stamp_tax_rate)
-    return selected_rate
+            selected_row = row
+
+    overridden: set[str] = set()
+    if selected_row is not None:
+        for field_name in _COST_FIELDS:
+            value = getattr(selected_row, field_name, None)
+            if value is None:
+                continue
+            resolved[field_name] = float(value)
+            overridden.add(field_name)
+
+    return FrozenCostProfile(
+        commission_rate=resolved["commission_rate"],
+        min_commission_per_order=resolved["min_commission_per_order"],
+        transfer_fee_rate=resolved["transfer_fee_rate"],
+        stamp_tax_rate=resolved["stamp_tax_rate"],
+        slippage_ratio=resolved["slippage_ratio"],
+        effective_from=selected_from,
+        overridden=frozenset(overridden),
+    )
 
 
 def _schedule_pct(config: LimitRuleConfig, board: str, trade_date: date | None) -> float | None:

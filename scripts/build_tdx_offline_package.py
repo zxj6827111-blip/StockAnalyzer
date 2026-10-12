@@ -20,7 +20,6 @@ import re
 import time
 import urllib.request
 import zipfile
-from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -59,6 +58,8 @@ OUTPUT_COLUMNS = [
     "volume",
     "turnover",
     "float_market_cap",
+    "float_market_cap_source",
+    "float_market_cap_as_of",
     "suspended",
     "name",
     "is_st",
@@ -69,6 +70,8 @@ OUTPUT_COLUMNS = [
     "financial_missing_fields",
     "financial_source",
     "financial_report_date",
+    "financial_as_of",
+    "financial_trust_level",
     "holder_count",
     "block_trade_net",
     "financing_balance",
@@ -80,11 +83,6 @@ OUTPUT_COLUMNS = [
     "board",
 ]
 
-DEFAULT_FLOAT_MARKET_CAP = 12_000_000_000.0
-DEFAULT_ROE = 0.08
-DEFAULT_DEBT_RATIO = 0.55
-DEFAULT_HOLDER_COUNT = 60_000.0
-DEFAULT_FINANCING_BALANCE = 2_500_000_000.0
 _TDXFIN_TOTAL_SHARES_COLUMN = "col238"
 _TDXFIN_FLOAT_SHARES_COLUMN = "col239"
 
@@ -151,7 +149,7 @@ def main() -> None:
         fin_zip_path=fin_zip_path,
         output_root=output_root,
     )
-    share_history_by_symbol, share_history_summary = _load_share_history_from_tdxfin(
+    share_history_summary = _summarize_share_history_from_tdxfin(
         fin_zip_path=fin_zip_path,
         symbols={item.symbol for item in day_files},
     )
@@ -189,7 +187,6 @@ def main() -> None:
                 bars=bars,
                 gp_features=gp_features,
                 stock_name=stock_name,
-                share_history=share_history_by_symbol.get(item.symbol),
                 spot_snapshot=spot_snapshot_by_symbol.get(item.symbol),
             )
             final.to_csv(bars_root / f"{item.symbol}.csv", index_label="date")
@@ -437,7 +434,7 @@ def _read_gp_features(
     result["roe_raw"] = _series_from_pivot(pivot, _GP_FLAG_ROE)
     result["northbound_net_raw"] = _series_from_pivot(pivot, _GP_FLAG_NORTHBOUND)
     dragon = _series_from_pivot(pivot, _GP_FLAG_DRAGON_TIGER)
-    result["dragon_tiger_raw"] = dragon.where(dragon.notna(), 0.0)
+    result["dragon_tiger_raw"] = dragon
     return result
 
 
@@ -447,56 +444,17 @@ def _series_from_pivot(pivot: pd.DataFrame, flag: int) -> pd.Series:
     return pd.to_numeric(pivot[flag], errors="coerce")
 
 
-def _prepare_share_frame(
-    *,
-    bars: pd.DataFrame,
-    share_history: pd.DataFrame | None,
-    spot_snapshot: dict[str, object] | None,
-) -> pd.DataFrame:
-    frame = pd.DataFrame(index=bars.index)
-    history = share_history.copy() if isinstance(share_history, pd.DataFrame) else pd.DataFrame()
-    if not history.empty:
-        if not isinstance(history.index, pd.DatetimeIndex):
-            history.index = pd.to_datetime(history.index, errors="coerce")
-        history = history[history.index.notna()].sort_index()
-    if not history.empty:
-        for column in ("float_shares", "total_shares"):
-            if column in history.columns:
-                frame[column] = pd.to_numeric(history[column], errors="coerce")
-
-    snapshot = dict(spot_snapshot) if isinstance(spot_snapshot, dict) else {}
-    snapshot_date = bars.index.max()
-    if isinstance(snapshot_date, pd.Timestamp) and not snapshot_date.tzinfo:
-        if snapshot:
-            snapshot_row = pd.DataFrame(
-                {
-                    "float_shares": [pd.to_numeric(snapshot.get("float_shares"), errors="coerce")],
-                    "total_shares": [pd.to_numeric(snapshot.get("total_shares"), errors="coerce")],
-                },
-                index=pd.DatetimeIndex([snapshot_date]),
-            )
-            frame = pd.concat([frame, snapshot_row], axis=0)
-            frame = frame[~frame.index.duplicated(keep="last")]
-
-    if frame.empty:
-        return frame
-    frame = frame.sort_index()
-    for column in ("float_shares", "total_shares"):
-        if column in frame.columns:
-            frame[column] = pd.to_numeric(frame[column], errors="coerce").ffill().bfill()
-    return frame.reindex(bars.index).ffill().bfill()
-
-
-def _load_share_history_from_tdxfin(
+def _summarize_share_history_from_tdxfin(
     *,
     fin_zip_path: Path,
     symbols: set[str],
-) -> tuple[dict[str, pd.DataFrame], dict[str, object]]:
+) -> dict[str, object]:
     if not fin_zip_path.exists():
-        return {}, {"exists": False}
+        return {"exists": False}
 
-    per_symbol_rows: dict[str, list[tuple[pd.Timestamp, float, float]]] = defaultdict(list)
     parsed_reports = 0
+    symbols_with_share_history: set[str] = set()
+    total_symbol_rows = 0
     with zipfile.ZipFile(fin_zip_path) as zf:
         entries = sorted(
             (
@@ -536,44 +494,19 @@ def _load_share_history_from_tdxfin(
             if subset.empty:
                 continue
             parsed_reports += 1
-            for row in subset.itertuples(index=False):
-                code = str(row.code).strip()
-                if not code:
-                    continue
-                total_value = (
-                    float(row.total_shares) if pd.notna(row.total_shares) else float("nan")
-                )
-                float_value = (
-                    float(row.float_shares) if pd.notna(row.float_shares) else float("nan")
-                )
-                per_symbol_rows[code].append(
-                    (pd.Timestamp(row.report_date), total_value, float_value)
-                )
+            subset = subset.drop_duplicates(subset=["code", "report_date"], keep="last")
+            float_shares = pd.to_numeric(subset["float_shares"], errors="coerce")
+            total_shares = pd.to_numeric(subset["total_shares"], errors="coerce")
+            has_shares = (float_shares > 0.0) | (total_shares > 0.0)
+            usable = subset.loc[has_shares]
+            symbols_with_share_history.update(usable["code"].astype(str))
+            total_symbol_rows += len(usable)
 
-    share_history: dict[str, pd.DataFrame] = {}
-    for symbol, items in per_symbol_rows.items():
-        frame = pd.DataFrame(items, columns=["report_date", "total_shares", "float_shares"])
-        frame = frame.dropna(subset=["report_date"])
-        if frame.empty:
-            continue
-        frame["total_shares"] = pd.to_numeric(frame["total_shares"], errors="coerce")
-        frame["float_shares"] = pd.to_numeric(frame["float_shares"], errors="coerce")
-        frame["float_shares"] = frame["float_shares"].where(
-            frame["float_shares"] > 0.0,
-            frame["total_shares"],
-        )
-        frame = frame.sort_values("report_date").drop_duplicates(
-            subset=["report_date"],
-            keep="last",
-        )
-        frame = frame.set_index("report_date")
-        share_history[symbol] = frame
-
-    return share_history, {
+    return {
         "exists": True,
         "reports_parsed": parsed_reports,
-        "symbols_with_share_history": len(share_history),
-        "total_symbol_rows": sum(len(frame) for frame in share_history.values()),
+        "symbols_with_share_history": len(symbols_with_share_history),
+        "total_symbol_rows": total_symbol_rows,
         "source_columns": {
             "total_shares": _TDXFIN_TOTAL_SHARES_COLUMN,
             "float_shares": _TDXFIN_FLOAT_SHARES_COLUMN,
@@ -665,57 +598,27 @@ def _build_output_frame(
     bars: pd.DataFrame,
     gp_features: pd.DataFrame,
     stock_name: str,
-    share_history: pd.DataFrame | None,
     spot_snapshot: dict[str, object] | None,
 ) -> pd.DataFrame:
     data = bars.copy()
-    if not gp_features.empty:
-        data = data.join(gp_features, how="left")
-        data[gp_features.columns] = data[gp_features.columns].ffill()
-
-    share_frame = _prepare_share_frame(
-        bars=bars,
-        share_history=share_history,
-        spot_snapshot=spot_snapshot,
+    # TDX GP rows expose report-period dates, not announcement-effective dates.
+    # Do not attach them to historical decision rows without field-level PIT proof.
+    roe = pd.Series(np.nan, index=data.index, dtype=float)
+    debt_ratio = pd.Series(np.nan, index=data.index, dtype=float)
+    financial_source = (
+        "tdxgp_report_date_without_announcement_date"
+        if not gp_features.empty else "missing"
     )
-    if not share_frame.empty:
-        data = data.join(share_frame, how="left")
-        for column in ("float_shares", "total_shares"):
-            if column in data.columns:
-                data[column] = pd.to_numeric(data[column], errors="coerce").ffill().bfill()
+    financial_missing_fields = "roe,debt_ratio,announcement_effective_date"
 
-    holder_count = _numeric_column(
-        data=data,
-        column="holder_count_raw",
-    ).fillna(DEFAULT_HOLDER_COUNT)
-    block_trade_net = _numeric_column(data=data, column="block_trade_net_raw").fillna(0.0)
-    financing_balance = _numeric_column(data=data, column="financing_balance_raw").fillna(
-        DEFAULT_FINANCING_BALANCE
-    )
-    northbound_net = _numeric_column(data=data, column="northbound_net_raw").fillna(0.0)
-    dragon_tiger_flag = (
-        _numeric_column(data=data, column="dragon_tiger_raw").fillna(0.0).abs() > 0
-    ).astype(float)
-
-    roe_raw = _numeric_column(data=data, column="roe_raw")
-    debt_raw = _numeric_column(data=data, column="debt_ratio_raw")
-    roe = _normalize_ratio_series(roe_raw).fillna(DEFAULT_ROE)
-    debt_ratio = (
-        _normalize_ratio_series(debt_raw)
-        .clip(lower=0.0, upper=1.5)
-        .fillna(DEFAULT_DEBT_RATIO)
-    )
-
-    roe_missing = roe_raw.isna()
-    debt_missing = debt_raw.isna()
-    missing_fields = _missing_field_series(roe_missing=roe_missing, debt_missing=debt_missing)
-
-    report_date = ""
-    if not gp_features.empty:
-        metric_mask = gp_features["roe_raw"].notna() | gp_features["debt_ratio_raw"].notna()
-        metric_dates = gp_features.index[metric_mask]
-        if len(metric_dates) > 0:
-            report_date = metric_dates.max().strftime("%Y-%m-%d")
+    # TDX GP feature dates are not proven field-availability timestamps. Keep these
+    # values out of both hard gates and ranking scores until their PIT meaning is
+    # verified; in particular, do not forward-fill report-period rows across bars.
+    holder_count = pd.Series(np.nan, index=data.index, dtype=float)
+    block_trade_net = pd.Series(np.nan, index=data.index, dtype=float)
+    financing_balance = pd.Series(np.nan, index=data.index, dtype=float)
+    northbound_net = pd.Series(np.nan, index=data.index, dtype=float)
+    dragon_tiger_flag = pd.Series(np.nan, index=data.index, dtype=float)
 
     snapshot_name = ""
     if isinstance(spot_snapshot, dict):
@@ -724,39 +627,33 @@ def _build_output_frame(
     is_st = _contains_st(name_clean)
     is_delisting = _contains_delisting_risk(name_clean)
     board = _infer_board(symbol)
-    float_shares = _numeric_column(data=data, column="float_shares")
-    total_shares = _numeric_column(data=data, column="total_shares")
-    share_basis = float_shares.where(
-        float_shares > 0.0,
-        total_shares.where(total_shares > 0.0, np.nan),
-    )
-    float_market_cap = (
-        pd.to_numeric(data["close"], errors="coerce").fillna(0.0) * share_basis
-    ).replace([np.inf, -np.inf], np.nan)
-    float_market_cap = float_market_cap.fillna(DEFAULT_FLOAT_MARKET_CAP)
+    # TDX share history is keyed by report period, not announcement-effective date;
+    # spot shares are current-only. Neither proves shares outstanding at each history
+    # bar, so this package does not manufacture a historical float market cap.
+    float_market_cap = pd.Series(np.nan, index=data.index, dtype=float)
 
     output = pd.DataFrame(index=data.index)
-    output["open"] = pd.to_numeric(data["open"], errors="coerce").fillna(0.0)
-    output["high"] = pd.to_numeric(data["high"], errors="coerce").fillna(0.0)
-    output["low"] = pd.to_numeric(data["low"], errors="coerce").fillna(0.0)
-    output["close"] = pd.to_numeric(data["close"], errors="coerce").fillna(0.0)
-    output["volume"] = pd.to_numeric(data["volume"], errors="coerce").fillna(0.0)
-    output["turnover"] = pd.to_numeric(data["turnover"], errors="coerce").fillna(0.0)
+    output["open"] = pd.to_numeric(data["open"], errors="coerce")
+    output["high"] = pd.to_numeric(data["high"], errors="coerce")
+    output["low"] = pd.to_numeric(data["low"], errors="coerce")
+    output["close"] = pd.to_numeric(data["close"], errors="coerce")
+    output["volume"] = pd.to_numeric(data["volume"], errors="coerce")
+    output["turnover"] = pd.to_numeric(data["turnover"], errors="coerce")
     output["float_market_cap"] = float_market_cap
+    output["float_market_cap_source"] = "missing_tdx_share_announcement_date"
+    output["float_market_cap_as_of"] = ""
     output["suspended"] = False
     output["name"] = name_clean
     output["is_st"] = is_st
     output["is_delisting_risk"] = is_delisting
     output["roe"] = roe
     output["debt_ratio"] = debt_ratio
-    output["financial_data_complete"] = True
-    output["financial_missing_fields"] = missing_fields
-    output["financial_source"] = np.where(
-        roe_missing | debt_missing,
-        "tdxgp_heuristic+default",
-        "tdxgp_heuristic",
-    )
-    output["financial_report_date"] = report_date
+    output["financial_data_complete"] = False
+    output["financial_missing_fields"] = financial_missing_fields
+    output["financial_source"] = financial_source
+    output["financial_report_date"] = ""
+    output["financial_as_of"] = ""
+    output["financial_trust_level"] = "missing"
     output["holder_count"] = holder_count
     output["block_trade_net"] = block_trade_net
     output["financing_balance"] = financing_balance
@@ -765,43 +662,17 @@ def _build_output_frame(
     output["dragon_tiger_flag"] = dragon_tiger_flag
     output["background_data_source"] = np.where(
         gp_features.empty,
-        "tdx_default",
-        "tdxgp_heuristic",
+        "missing",
+        "tdxgp_unverified_asof",
     )
-    output["background_data_complete"] = True
+    # Values without a field-level availability time are not proven PIT inputs.
+    output["background_data_complete"] = False
     output["board"] = board
 
     output = output.sort_index()
     output = output[~output.index.duplicated(keep="last")]
     output.index.name = "date"
     return output[OUTPUT_COLUMNS]
-
-
-def _normalize_ratio_series(series: pd.Series | None) -> pd.Series:
-    if not isinstance(series, pd.Series):
-        return pd.Series(dtype=float)
-    values = pd.to_numeric(series, errors="coerce")
-    normalized = values.copy()
-    mask = normalized.abs() > 1.0
-    normalized.loc[mask] = normalized.loc[mask] / 100.0
-    return normalized
-
-
-def _numeric_column(data: pd.DataFrame, column: str) -> pd.Series:
-    if column not in data.columns:
-        return pd.Series(np.nan, index=data.index, dtype=float)
-    return pd.to_numeric(data[column], errors="coerce")
-
-
-def _missing_field_series(roe_missing: pd.Series, debt_missing: pd.Series) -> pd.Series:
-    output = pd.Series("", index=roe_missing.index, dtype=object)
-    both = roe_missing & debt_missing
-    only_roe = roe_missing & (~debt_missing)
-    only_debt = (~roe_missing) & debt_missing
-    output.loc[both] = "roe,debt_ratio"
-    output.loc[only_roe] = "roe"
-    output.loc[only_debt] = "debt_ratio"
-    return output
 
 
 def _contains_st(name: str) -> bool:

@@ -17,10 +17,6 @@ from stock_analyzer.data.background_adapter import AkshareBackgroundAdapter
 from stock_analyzer.data.financial_adapter import AkshareFinancialAdapter
 from stock_analyzer.data.provider import DataSourceError
 
-_DEFAULT_FLOAT_MARKET_CAP = 12_000_000_000.0
-_DEFAULT_HOLDER_COUNT = 60_000.0
-_DEFAULT_FINANCING_BALANCE = 2_500_000_000.0
-
 
 class _AkshareModule(Protocol):
     def stock_zh_a_hist(
@@ -144,34 +140,31 @@ class AkshareProvider:
 
         if "turnover_rate" in frame.columns:
             turnover_rate = (
-                pd.to_numeric(frame["turnover_rate"], errors="coerce").fillna(0.0) / 100.0
+                pd.to_numeric(frame["turnover_rate"], errors="coerce") / 100.0
             )
             estimated_market_cap = frame["turnover"] / turnover_rate.replace(0, pd.NA)
-            frame["float_market_cap"] = estimated_market_cap.fillna(_DEFAULT_FLOAT_MARKET_CAP)
+            frame["float_market_cap"] = estimated_market_cap.where(
+                np.isfinite(estimated_market_cap) & (estimated_market_cap > 0.0), np.nan
+            )
         else:
-            frame["float_market_cap"] = _DEFAULT_FLOAT_MARKET_CAP
+            frame["float_market_cap"] = np.nan
 
         financial = self._financial_adapter.fetch_snapshot(symbol=symbol)
         frame["suspended"] = False
         frame["name"] = str(financial.get("name", ""))
         frame["is_st"] = bool(financial.get("is_st", False))
         frame["is_delisting_risk"] = bool(financial.get("is_delisting_risk", False))
-        frame["roe"] = pd.to_numeric(
-            pd.Series([financial.get("roe", np.nan)] * len(frame), index=frame.index),
-            errors="coerce",
-        )
-        frame["debt_ratio"] = pd.to_numeric(
-            pd.Series([financial.get("debt_ratio", np.nan)] * len(frame), index=frame.index),
-            errors="coerce",
-        )
-        frame["financial_data_complete"] = bool(financial.get("financial_data_complete", False))
-        missing_fields_raw = financial.get("missing_fields", [])
-        missing_fields = missing_fields_raw if isinstance(missing_fields_raw, list) else []
-        frame["financial_missing_fields"] = ",".join(
-            str(item) for item in missing_fields if str(item).strip()
-        )
-        frame["financial_source"] = str(financial.get("source", "fallback"))
-        frame["financial_report_date"] = str(financial.get("latest_report_date", ""))
+        # The adapter returns a current/latest snapshot without a proven
+        # announcement-effective timestamp. Do not smear it across historical
+        # bars; only financial_pit's ann_date as-of join may populate these fields.
+        frame["roe"] = np.nan
+        frame["debt_ratio"] = np.nan
+        frame["financial_data_complete"] = False
+        frame["financial_missing_fields"] = "roe,debt_ratio,announcement_effective_date"
+        frame["financial_source"] = "akshare_latest_snapshot_not_pit"
+        frame["financial_report_date"] = ""
+        frame["financial_as_of"] = ""
+        frame["financial_trust_level"] = "missing"
         frame["board"] = _infer_board(symbol)
         frame = self._background_adapter.enrich_bars(symbol=symbol, bars=frame)
         return _select_output_columns(frame)
@@ -298,7 +291,7 @@ def _normalize_tx_hist_frame(
     frame.index.name = "date"
 
     frame["turnover"] = frame["close"] * frame["volume"] * 100.0
-    frame["float_market_cap"] = _DEFAULT_FLOAT_MARKET_CAP
+    frame["float_market_cap"] = np.nan
     frame["suspended"] = False
     frame["name"] = ""
     frame["is_st"] = False
@@ -306,18 +299,19 @@ def _normalize_tx_hist_frame(
     frame["roe"] = np.nan
     frame["debt_ratio"] = np.nan
     frame["financial_data_complete"] = False
-    frame["financial_missing_fields"] = "roe,debt_ratio"
-    frame["financial_source"] = "akshare_tx_default"
+    frame["financial_missing_fields"] = "roe,debt_ratio,announcement_effective_date"
+    frame["financial_source"] = "akshare_tx_missing"
     frame["financial_report_date"] = ""
+    frame["financial_as_of"] = ""
     frame["financial_trust_level"] = "missing"
-    frame["holder_count"] = _DEFAULT_HOLDER_COUNT
-    frame["block_trade_net"] = 0.0
-    frame["financing_balance"] = _DEFAULT_FINANCING_BALANCE
-    frame["margin_financing_balance"] = _DEFAULT_FINANCING_BALANCE
-    frame["northbound_net"] = 0.0
-    frame["dragon_tiger_flag"] = 0.0
-    frame["background_data_source"] = "akshare_tx_default"
-    frame["background_data_complete"] = True
+    frame["holder_count"] = np.nan
+    frame["block_trade_net"] = np.nan
+    frame["financing_balance"] = np.nan
+    frame["margin_financing_balance"] = np.nan
+    frame["northbound_net"] = np.nan
+    frame["dragon_tiger_flag"] = np.nan
+    frame["background_data_source"] = "missing"
+    frame["background_data_complete"] = False
     frame["board"] = _infer_board(symbol)
     return _select_output_columns(frame)
 
@@ -342,6 +336,7 @@ def _select_output_columns(frame: pd.DataFrame) -> pd.DataFrame:
             "financial_missing_fields",
             "financial_source",
             "financial_report_date",
+            "financial_as_of",
             "financial_trust_level",
             "holder_count",
             "block_trade_net",

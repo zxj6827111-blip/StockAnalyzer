@@ -8,7 +8,7 @@ state, snapshot replay, stage separation and signal-only safety.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, tzinfo
 from queue import Empty, Queue
 from threading import Event, Lock, Thread
@@ -20,6 +20,9 @@ import pandas as pd
 
 from stock_analyzer.feature.snapshot import load_feature_snapshot, snapshot_is_current
 from stock_analyzer.ops.nightly_readiness import check_nightly_readiness
+from stock_analyzer.runtime.services.trend_tail_shadow_service import (
+    TrendTailShadowService,
+)
 from stock_analyzer.runtime.services.week5_candidate_state import CandidateStateStore
 from stock_analyzer.runtime.services.week5_market_snapshot_service import (
     Week5MarketSnapshotService,
@@ -52,6 +55,8 @@ class RuntimeWeek5AutomationService:
         )
 
         self._live_shadow_cycle = LiveShadowCycleService(service)
+        # trend 尾盘影子链路：算自己的最终推荐并留档，不改 actionable_signals。
+        self._trend_tail_shadow = TrendTailShadowService(service)
         self._market_radar_lock = Lock()
         self._market_radar_active = False
         self._market_radar_worker: Thread | None = None
@@ -217,6 +222,12 @@ class RuntimeWeek5AutomationService:
         # 具体 flag 判定与工件写入由 live_shadow_cycle_service 承担。
         self._live_shadow_cycle.emit_funnel_from_scan_report(
             report=report, trade_date=now, trace_id=trace_id
+        )
+        # §2 收口（NOTE-002 D14）：夜扫半段同步落成与尾盘半段**同构**的漏斗留档，
+        # 让 Quality300/Light100/Deep50 的输入/晋级/落差/数据时间进入同一条证据链。
+        # 只写证据目录，不参与本轮选股；落档结果写进报告，失败可见而非静默。
+        report["night_funnel_trace"] = self._trend_tail_shadow.record_night_scan(
+            report, trade_date=now
         )
         rows = self._night_candidate_rows(report)
         rows = self._select_night_pool(rows)
@@ -1312,6 +1323,10 @@ class RuntimeWeek5AutomationService:
             "notify_enabled": bool(notify_enabled),
             "signal_only": True,
         }
+        report["trend_tail_shadow"] = self._trend_tail_shadow_report(
+            pool_rows=pool_rows,
+            now=now,
+        )
         self._emit_actionable_notifications(
             report,
             notify_enabled=notify_enabled,
@@ -1329,6 +1344,43 @@ class RuntimeWeek5AutomationService:
             updated_at=now,
             trade_date=now.date().isoformat(),
         )
+        return report
+
+    def _trend_tail_shadow_report(
+        self,
+        *,
+        pool_rows: Sequence[Mapping[str, Any]],
+        now: datetime,
+    ) -> dict[str, object]:
+        """跑一次尾盘影子链路。
+
+        失败不静默吞掉：异常转成报告里的 ``ok=false`` + 错误串，既不让 job 挂掉，
+        也不留下"看起来正常"的空白（计划 §3.1「记录失败必须可见」）。
+        调用方**不传概率**：``p_net_profit_5d_tail`` 由影子服务从已核验的 challenger
+        工件自己算（``models/tail_model_artifact``），所以这里传什么分数都不该改变
+        排序口径。分钟行情的生产者还没有，因此当前每一轮仍会是 0 只并写明阻塞原因 ——
+        那是事实，不是待补的空格。
+        """
+        try:
+            # 显式标注并复制一次：影子服务的返回在类型上是 Any，直接返回会让这个
+            # 声明返回 dict[str, object] 的函数带 no-any-return（CI 的 mypy_blocking 门卡它）。
+            report: dict[str, object] = dict(
+                self._trend_tail_shadow.run(
+                    timestamp=now,
+                    watch_pool=[dict(row) for row in pool_rows],
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - job 边界：失败可见但不中断主链
+            report = {
+                "ok": False,
+                "mode": "shadow",
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+                "final_symbols": [],
+            }
+        # R12 的门槛输入跟着留档一起进报告：影子进行到哪一步不该只躺在命令行里，
+        # 也不该由人脑估。只读，不影响本轮任何判定。
+        report["shadow_readiness"] = self._trend_tail_shadow.shadow_readiness_summary()
         return report
 
     def latest_live_runtime(self) -> dict[str, object]:

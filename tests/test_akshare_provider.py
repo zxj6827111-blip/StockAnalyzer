@@ -118,6 +118,10 @@ def test_akshare_provider_falls_back_to_tx_history() -> None:
     assert len(bars) == 2
     assert bars.index.name == "date"
     assert bars["turnover"].iloc[-1] == 10.5 * 150_000.0 * 100.0
-    assert bars["financial_source"].iloc[-1] == "akshare_tx_default"
-    assert bars["background_data_source"].iloc[-1] == "akshare_tx_default"
+    assert bars["financial_source"].iloc[-1] == "akshare_tx_missing"
+    assert pd.isna(bars["roe"].iloc[-1])
+    assert pd.isna(bars["debt_ratio"].iloc[-1])
+    assert bool(bars["financial_data_complete"].iloc[-1]) is False
+    assert bars["background_data_source"].iloc[-1] == "missing"
+    assert bool(bars["background_data_complete"].iloc[-1]) is False
     assert bars["board"].iloc[-1] == "main"

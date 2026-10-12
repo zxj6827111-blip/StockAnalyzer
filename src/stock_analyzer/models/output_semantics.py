@@ -37,6 +37,9 @@ OUTPUT_SEMANTICS_RANKING_SCORE = "ranking_score"
 _BASIS_TO_SEMANTICS: dict[str, str] = {
     "soup": OUTPUT_SEMANTICS_EVENT_PROBABILITY,
     "soup_5d_tp5_before_sl5": OUTPUT_SEMANTICS_EVENT_PROBABILITY,
+    # trend 尾盘净盈利标签：正类是"按契约成交且扣费后净收益>0"，是货真价实的
+    # 事件概率，可用 Brier / logloss / 概率阈值；不是横截面分位。
+    "net_profit_5d_tail": OUTPUT_SEMANTICS_EVENT_PROBABILITY,
     "return_rank": OUTPUT_SEMANTICS_RANK_QUANTILE,
     "rank": OUTPUT_SEMANTICS_RANK_QUANTILE,
     "ranking_score": OUTPUT_SEMANTICS_RANKING_SCORE,

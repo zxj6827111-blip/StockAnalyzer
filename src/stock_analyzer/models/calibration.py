@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TypeAlias
 
@@ -35,6 +36,22 @@ class IsotonicCalibrator:
     def __init__(self) -> None:
         self._x_right: FloatArray | None = None
         self._y_hat: FloatArray | None = None
+
+    @classmethod
+    def from_state(cls, x_right: Sequence[float], y_hat: Sequence[float]) -> IsotonicCalibrator:
+        """从已冻结的阶梯重建校准器（加载工件时用它，不再第二处实现区间契约）。"""
+        left = np.asarray(x_right, dtype=float)
+        right = np.asarray(y_hat, dtype=float)
+        if left.ndim != 1 or right.ndim != 1 or left.shape != right.shape or left.size == 0:
+            raise ValueError("isotonic state must be two equal-length non-empty 1D arrays")
+        if np.any(np.diff(left) <= 0.0):
+            raise ValueError("isotonic x_right must be strictly increasing")
+        if np.any((right < 0.0) | (right > 1.0)):
+            raise ValueError("isotonic y_hat must be within [0, 1]")
+        calibrator = cls()
+        calibrator._x_right = left
+        calibrator._y_hat = right
+        return calibrator
 
     def fit(self, scores: FloatArray, labels: FloatArray) -> None:
         if scores.ndim != 1 or labels.ndim != 1:
