@@ -898,3 +898,52 @@ NAS API 容器从 Tushare `daily_basic.circ_mv` 补采 2026-07-18 至 2026-09-30
 
 当前级别：**代码已提交并推送到 PR；本地变更测试和变更范围 Ruff 通过；PR CI 尚未完成；
 质量晋升门仍 blocked；尚未合并、部署或达到 Production Ready。**
+
+
+## 20. 2026-10-12 合并、NAS 部署与数据复核
+
+本节记录 §19 之后的发布事实。§19 保留当时的 PR / 部署前状态，不作为当前发布状态。
+
+### 发布与运行验收
+
+- PR #105 已合并到 `main`，合并提交为
+  `7eeaba86add36d2f9c193109b6b0d44fc78f9439`。PR 的必需检查通过；该 main 提交的质量门、
+  全量测试与覆盖率上传工作流均为成功。
+- NAS `/vol1/docker/StockAnalyzer` 当前分支为 `main`，HEAD 与 `.build_commit` 均为上述合并提交，
+  tracked 工作树干净。生产镜像 `stock-analyzer:latest` revision 匹配该提交，镜像 ID 为
+  `sha256:9a6a326765e604bb6bd73afa14e013a53386a8ba844b7981d9520708e0954982`。
+- `api`、`scheduler-critical`、`scheduler-heavy` 和 `redis` 均在运行。API `/health` 报告
+  `status=ok`、`trusted=true`、`advisory_only=true`、`training_enabled=false`；两个 scheduler
+  的新鲜心跳均报告同一可信提交。
+- `/app/artifacts` 仍挂载到 NAS 持久卷 `stock_analyzer_runtime_artifacts`，读写挂载已现场核实。
+  原有 `.rollback_image` 和 NAS 上其他未跟踪文件均保留；本次回滚镜像另记在
+  `.rollback_image.codex-20261012095731-2049648`，不覆盖用户原文件。
+
+### 历史数据核查结论
+
+- NAS 有历史 PIT 命名 Parquet、`features_light` 快照、日级分钟聚合，以及按日分区的原始分钟 CSV。
+  这些是可用的研究 / 回放材料，但当前不能证明完整链路字段在 14:45 决策时已可用。
+- `phase2/pit_dataset/pit_2026-08.parquet` 有 103,352 行、213 列；时间相关列只有
+  `trade_date` 与 `label_mature_trade_date`，Parquet 元数据只有 Arrow / pandas schema 信息，
+  没有逐字段来源版本、发布时间、采集时间或计算时间。
+- `features_light/current.json` 指向交易日 `2026-10-09`、构建时刻
+  `2026-10-11T14:01:02+00:00` 的快照。`market_features.parquet` 没有逐字段可用 / 发布 / 采集时钟；
+  `tails.parquet` 虽含 `financial_as_of`、`background_as_of` 等日期字段，也不含这些时钟。
+  同一个 `trade_date=2026-10-09` 有多个构建目录，其中两个在 10 月 10 日和 11 日构建；这些
+  目录没有逐字段来源时钟，不能证明曾在 14:45 留存决策输入。
+- 原始分钟 CSV 中存在 2026-10-12 分区，但目录最后修改时刻为当天 17:34（NAS 本地时区），
+  晚于 14:45；回读它只能用于 replay，不能回填成 `observed_snapshot`。生产 `market.duckdb` 的
+  `intraday_summary_1m/5m` 是日级聚合表，不保存可还原决策点的逐分钟序列。
+- 新代码的写入器在交易日 14:45 将真实传入的 `watch_pool` 和 `minute_bars` 保存到持久卷下的
+  独立日快照；当前 live runtime 调用方只传 `watch_pool`，分钟 bars 的生产者尚未接入。因此，
+  首次未来快照即使按时生成，也不等于 271 字段 full-chain PIT 证据。NAS 在本次验收时还没有
+  `runtime/trend_tail_shadow/observed_inputs/` 新快照目录。
+
+### 当前级别与后续门槛
+
+- 部署完成表示生产代码已更新，不表示策略通过质量晋升。271 个完整链路字段仍缺少真实可用时钟证据；
+  阶段二无合格候选，阶段三独立确认与阶段四正式影子均未启动。当前仍为 advisory-only，训练关闭，
+  **不是 Production Ready**。
+- 下一次符合交易日条件的 14:45 live runtime 应在 NAS 持久卷形成第一份新格式观察快照；需复核其
+  运行日期、决策时刻、输入哈希及实际 bars 数量。后续仍须为全链路字段接入真实来源版本、可用 / 采集 /
+  计算时钟和缺失 / 插补记录，才能重跑 271 字段 PIT 审计。不得从文件 mtime 或事后重算补造历史时钟。
