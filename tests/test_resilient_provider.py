@@ -75,6 +75,20 @@ def test_resilient_provider_enters_degraded_mode_and_uses_backup() -> None:
     assert provider.degraded_mode is True
 
 
+def test_resilient_provider_status_reports_configured_source_chain() -> None:
+    provider = ResilientProvider(
+        primary=AlwaysFailProvider(),
+        backup=SyntheticProvider(),
+        config=DataSourceConfig(primary="vendor_zip_overlay"),
+    )
+
+    status = provider.status()
+
+    assert status["provider_mode"] == "vendor_zip_overlay"
+    assert status["primary_provider"] == "AlwaysFailProvider"
+    assert status["backup_provider"] == "SyntheticProvider"
+
+
 def test_resilient_provider_resets_degraded_mode_after_success() -> None:
     config = DataSourceConfig(
         primary="akshare",

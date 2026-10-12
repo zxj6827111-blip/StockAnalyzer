@@ -54,8 +54,14 @@ class Week5MarketSnapshotService:
         now = timestamp or _market_now(self._service)
         source = "injected"
         errors: list[str] = []
+        source_retrieved_at: str | None = None
         if frame is None:
             frame, source, errors = self._fetch_batch_frame_with_timeout()
+            # This is the time the complete provider response reached this
+            # process, not the vendor's publication time. Injected frames have
+            # no trustworthy source receipt clock, so leave it unknown.
+            if source != "unavailable" and not frame.empty:
+                source_retrieved_at = _market_now(self._service).isoformat()
         normalized = normalize_market_snapshot_frame(frame, timestamp=now, source=source)
         if normalized.empty:
             return {
@@ -64,6 +70,7 @@ class Week5MarketSnapshotService:
                 "snapshot_id": "",
                 "timestamp": now.isoformat(),
                 "source": source,
+                "source_retrieved_at": source_retrieved_at,
                 "row_count": 0,
                 "errors": errors or ["empty_market_snapshot"],
             }
@@ -74,6 +81,7 @@ class Week5MarketSnapshotService:
             "snapshot_id": resolved_id,
             "timestamp": now.isoformat(),
             "source": source,
+            "source_retrieved_at": source_retrieved_at,
             "row_count": len(normalized),
             "columns": list(normalized.columns),
             "rows": _frame_rows(normalized),

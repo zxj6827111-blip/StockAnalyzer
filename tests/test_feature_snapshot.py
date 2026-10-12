@@ -983,7 +983,9 @@ def test_snapshot_wrapper_chain_without_date_capability_falls_back(
     service, _root = _make_service(tmp_path)
     inner = _AdvancingProviderNoDates(advance=False)
     resilient = ResilientProvider(
-        primary=inner, config=DataSourceConfig(), backup=None
+        primary=inner,
+        config=DataSourceConfig(primary=service._config.data_source.primary),
+        backup=None,
     )
     cache = InMemoryCache()
     provider = CachedProvider(
