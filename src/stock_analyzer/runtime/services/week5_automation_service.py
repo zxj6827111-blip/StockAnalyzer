@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime, tzinfo
 from queue import Empty, Queue
 from threading import Event, Lock, Thread
@@ -18,6 +19,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from stock_analyzer.data.intraday_summary import fetch_sina_minute_bars
 from stock_analyzer.feature.snapshot import load_feature_snapshot, snapshot_is_current
 from stock_analyzer.ops.nightly_readiness import check_nightly_readiness
 from stock_analyzer.runtime.services.trend_tail_shadow_service import (
@@ -33,6 +35,24 @@ from stock_analyzer.runtime.services.week5_market_snapshot_service import (
 # （抓取期间产生）晚于它属正常时延，再叠加少量时钟偏差。超过该幅度
 # 的未来时间戳视为不可核实（时区误解释/时钟回拨），fail-closed。
 _SNAPSHOT_FUTURE_TOLERANCE_SEC = 60.0
+
+
+def _minute_capture_summary(capture: Mapping[str, Any]) -> dict[str, object]:
+    sources = capture.get("minute_bar_sources", {})
+    source_map = sources if isinstance(sources, Mapping) else {}
+    bars = capture.get("minute_bars", {})
+    bar_map = bars if isinstance(bars, Mapping) else {}
+    capture_time = capture.get("capture_time")
+    return {
+        "status": str(capture.get("status", "unknown")),
+        "reason": str(capture.get("reason", "")),
+        "capture_time": capture_time.isoformat() if isinstance(capture_time, datetime) else "",
+        "capture_role": str(capture.get("capture_role", "none")),
+        "source": "sina_minute_api",
+        "source_symbol_count": len(source_map),
+        "minute_bar_symbol_count": len(bar_map),
+        "full_chain_pit_evidence": False,
+    }
 
 
 class RuntimeWeek5AutomationService:
@@ -1259,6 +1279,11 @@ class RuntimeWeek5AutomationService:
         now = self._automation_now(timestamp)
         state = self.candidate_state()
         pool_rows = self._live_runtime_pool(state, now)
+        # 尾盘行情在耗时 pipeline 之前取样，14:45 留决策快照，后续窗口只供成交评估。
+        minute_capture = self._collect_tail_shadow_minute_inputs(
+            pool_rows=pool_rows,
+            scheduled_at=now,
+        )
         candidates = [
             str(row.get("symbol", "")).strip()
             for row in pool_rows
@@ -1325,7 +1350,10 @@ class RuntimeWeek5AutomationService:
         }
         report["trend_tail_shadow"] = self._trend_tail_shadow_report(
             pool_rows=pool_rows,
-            now=now,
+            now=minute_capture["capture_time"],
+            minute_bars=minute_capture["minute_bars"],
+            minute_bar_sources=minute_capture["minute_bar_sources"],
+            minute_capture_summary=minute_capture["summary"],
         )
         self._emit_actionable_notifications(
             report,
@@ -1346,20 +1374,226 @@ class RuntimeWeek5AutomationService:
         )
         return report
 
+    def _collect_tail_shadow_minute_inputs(
+        self,
+        *,
+        pool_rows: Sequence[Mapping[str, Any]],
+        scheduled_at: datetime,
+    ) -> dict[str, Any]:
+        """只在尾盘确认窗口抓取当天 1 分钟线，并按接收时钟做保守截断。
+
+        新浪 K 线时间戳的区间端点语义尚未在项目数据契约里核实，因此丢弃决策分钟本身，
+        14:45 只留下标签早于该决策时钟的行。其它窗口运行只供影子评估成交，不写成决策快照；
+        历史/盘后文件不进入该路径。
+        """
+        contract = self._trend_tail_shadow._contract
+        zone = ZoneInfo(str(contract.timezone))
+        requested = scheduled_at.astimezone(zone)
+        decision_clock = str(contract.latest_confirmation_clock)
+        requested_clock = requested.strftime("%H:%M")
+        window_start = str(contract.entry_window_start)
+        window_end = str(contract.entry_window_end)
+        if not window_start <= requested_clock <= window_end:
+            outside = {
+                "status": "not_in_window",
+                "reason": "scheduled_time_outside_tail_entry_window",
+                "capture_time": requested,
+                "capture_role": "none",
+                "minute_bars": {},
+                "minute_bar_sources": {},
+            }
+            return {**outside, "summary": _minute_capture_summary(outside)}
+
+        capture_role = "decision_input" if requested_clock == decision_clock else "evaluation_only"
+        empty: dict[str, Any] = {
+            "status": "not_decision_slot",
+            "reason": "scheduled_time_not_in_live_capture_window",
+            "capture_time": requested,
+            "capture_role": capture_role,
+            "minute_bars": {},
+            "minute_bar_sources": {},
+        }
+
+        # 任务只能在原计划分钟采集；延迟后启动不能冒充原计划观察时钟。
+        capture_time = datetime.now(zone)
+        if (
+            capture_time.date() != requested.date()
+            or capture_time.strftime("%H:%M") != requested_clock
+        ):
+            blocked = {
+                **empty,
+                "status": "blocked",
+                "reason": "capture_started_outside_scheduled_minute",
+                "capture_time": capture_time,
+            }
+            return {**blocked, "summary": _minute_capture_summary(blocked)}
+
+        symbols = sorted(
+            {
+                str(row.get("symbol", "")).strip()
+                for row in pool_rows
+                if str(row.get("symbol", "")).strip()
+            }
+        )
+
+        def fetch_one(symbol: str) -> tuple[str, pd.DataFrame, datetime | None, str]:
+            try:
+                frame = fetch_sina_minute_bars(
+                    symbol=symbol,
+                    interval="1m",
+                    timeout_sec=5,
+                )
+            except Exception as exc:  # noqa: BLE001 - 单票故障要留痕，不中断整轮
+                return (
+                    symbol,
+                    pd.DataFrame(),
+                    datetime.now(zone),
+                    f"provider_error:{type(exc).__name__}",
+                )
+            if not isinstance(frame, pd.DataFrame):
+                return symbol, pd.DataFrame(), datetime.now(zone), "invalid_provider_response"
+            return symbol, frame, datetime.now(zone), ""
+
+        fetched: dict[str, tuple[pd.DataFrame, datetime | None, str]] = {}
+        if symbols:
+            with ThreadPoolExecutor(max_workers=min(4, len(symbols))) as executor:
+                futures = [executor.submit(fetch_one, symbol) for symbol in symbols]
+                for future in as_completed(futures):
+                    symbol, frame, retrieved_at, error = future.result()
+                    fetched[symbol] = (frame, retrieved_at, error)
+
+        # 抓取完成时钟作为采集时钟；如已经跨分钟，整批分钟线都不用于本轮影子评估。
+        capture_time = datetime.now(zone)
+        if (
+            capture_time.date() != requested.date()
+            or capture_time.strftime("%H:%M") != requested_clock
+        ):
+            blocked = {
+                **empty,
+                "status": "blocked",
+                "reason": "capture_completed_outside_scheduled_minute",
+                "capture_time": capture_time,
+            }
+            return {**blocked, "summary": _minute_capture_summary(blocked)}
+
+        cutoff = capture_time.replace(second=0, microsecond=0)
+        minute_bars: dict[str, list[tuple[datetime, dict[str, Any]]]] = {}
+        minute_bar_sources: dict[str, dict[str, Any]] = {}
+        for symbol in symbols:
+            frame, retrieved_at, fetch_error = fetched.get(
+                symbol, (pd.DataFrame(), None, "provider_result_missing")
+            )
+            if frame.empty or retrieved_at is None:
+                minute_bar_sources[symbol] = {
+                    "provider": "sina_minute_api",
+                    "interval": "1m",
+                    "status": "unavailable",
+                    "reason": fetch_error or "empty_provider_response",
+                    **({"source_retrieved_at": retrieved_at} if retrieved_at else {}),
+                }
+                continue
+
+            observed: list[tuple[datetime, dict[str, Any]]] = []
+            for index, row in frame.sort_index().iterrows():
+                try:
+                    stamp = pd.Timestamp(str(index))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if pd.isna(stamp):
+                    continue
+                if stamp.tzinfo is None:
+                    stamp = stamp.tz_localize(zone)
+                else:
+                    stamp = stamp.tz_convert(zone)
+                local_stamp = stamp.to_pydatetime()
+                # 同日且标签早于决策分钟，排除未完成的 14:45 bar 与任何未来行。
+                if local_stamp.date() != requested.date() or local_stamp >= cutoff:
+                    continue
+                if local_stamp > capture_time:
+                    continue
+                bar: dict[str, Any] = {}
+                for field in ("open", "high", "low", "close", "volume", "amount"):
+                    value = row.get(field)
+                    if value is None or pd.isna(value):
+                        continue
+                    try:
+                        bar[field] = float(value)
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                if all(field in bar for field in ("open", "high", "low", "close")):
+                    # 契约确认槽使用市场本地 naive datetime；时区保存在来源元数据中。
+                    observed.append((local_stamp.replace(tzinfo=None), bar))
+
+            observed.sort(key=lambda item: item[0])
+            if not observed:
+                minute_bar_sources[symbol] = {
+                    "provider": "sina_minute_api",
+                    "interval": "1m",
+                    "status": "unavailable",
+                    "reason": "no_same_day_completed_bars_before_decision_clock",
+                    "source_retrieved_at": retrieved_at,
+                }
+                continue
+            latest = observed[-1][0]
+            age_sec = (capture_time.replace(tzinfo=None) - latest).total_seconds()
+            if age_sec < 0 or age_sec > int(contract.max_quote_age_seconds):
+                minute_bar_sources[symbol] = {
+                    "provider": "sina_minute_api",
+                    "interval": "1m",
+                    "status": "stale",
+                    "reason": "latest_bar_exceeds_contract_quote_age",
+                    "latest_bar_time": latest,
+                    "source_retrieved_at": retrieved_at,
+                    "age_seconds": age_sec,
+                }
+                continue
+            minute_bars[symbol] = observed
+            minute_bar_sources[symbol] = {
+                "provider": "sina_minute_api",
+                "provider_version": "unversioned_api",
+                "price_basis": "unverified",
+                "interval": "1m",
+                "timezone": str(contract.timezone),
+                "timestamp_semantics": "provider_minute_label_unverified_same_minute_excluded",
+                "status": "captured",
+                "latest_bar_time": latest,
+                "source_retrieved_at": retrieved_at,
+                "age_seconds": age_sec,
+            }
+
+        if not minute_bars:
+            capture_status = "empty"
+        elif len(minute_bars) == len(symbols):
+            capture_status = "captured" if capture_role == "decision_input" else "evaluation_only"
+        else:
+            capture_status = "partial" if capture_role == "decision_input" else "evaluation_partial"
+        result = {
+            "status": capture_status,
+            "reason": "" if minute_bars else "no_fresh_minute_bars",
+            "capture_time": capture_time,
+            "capture_role": capture_role,
+            "minute_bars": minute_bars,
+            "minute_bar_sources": minute_bar_sources,
+        }
+        return {**result, "summary": _minute_capture_summary(result)}
+
     def _trend_tail_shadow_report(
         self,
         *,
         pool_rows: Sequence[Mapping[str, Any]],
         now: datetime,
+        minute_bars: Mapping[str, Sequence[tuple[datetime, Mapping[str, Any]]]] | None = None,
+        minute_bar_sources: Mapping[str, Mapping[str, Any]] | None = None,
+        minute_capture_summary: Mapping[str, Any] | None = None,
     ) -> dict[str, object]:
-        """跑一次尾盘影子链路。
+        """跑一次尾盘影子链路，使用本轮实时取得的分钟输入。
 
         失败不静默吞掉：异常转成报告里的 ``ok=false`` + 错误串，既不让 job 挂掉，
         也不留下"看起来正常"的空白（计划 §3.1「记录失败必须可见」）。
         调用方**不传概率**：``p_net_profit_5d_tail`` 由影子服务从已核验的 challenger
         工件自己算（``models/tail_model_artifact``），所以这里传什么分数都不该改变
-        排序口径。分钟行情的生产者还没有，因此当前每一轮仍会是 0 只并写明阻塞原因 ——
-        那是事实，不是待补的空格。
+        排序口径。分钟线只在真实 14:45 窗口采集；历史/盘后文件、决策分钟内未完成的 bar
+        和陈旧响应都不会补成实时证据。
         """
         try:
             # 显式标注并复制一次：影子服务的返回在类型上是 Any，直接返回会让这个
@@ -1368,6 +1602,8 @@ class RuntimeWeek5AutomationService:
                 self._trend_tail_shadow.run(
                     timestamp=now,
                     watch_pool=[dict(row) for row in pool_rows],
+                    minute_bars=minute_bars or {},
+                    minute_bar_sources=minute_bar_sources or {},
                 )
             )
         except Exception as exc:  # noqa: BLE001 - job 边界：失败可见但不中断主链
@@ -1381,6 +1617,7 @@ class RuntimeWeek5AutomationService:
         # R12 的门槛输入跟着留档一起进报告：影子进行到哪一步不该只躺在命令行里，
         # 也不该由人脑估。只读，不影响本轮任何判定。
         report["shadow_readiness"] = self._trend_tail_shadow.shadow_readiness_summary()
+        report["minute_input_capture"] = dict(minute_capture_summary or {})
         return report
 
     def latest_live_runtime(self) -> dict[str, object]:

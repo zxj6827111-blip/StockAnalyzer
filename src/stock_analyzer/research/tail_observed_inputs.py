@@ -54,6 +54,7 @@ def write_tail_observed_input_snapshot(
     contract: Any,
     watch_pool: Sequence[Mapping[str, Any]],
     minute_bars: Mapping[str, Any],
+    minute_bar_sources: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """在最后一个确认时点写一次不可覆盖的输入快照。
 
@@ -89,7 +90,7 @@ def write_tail_observed_input_snapshot(
         "trade_date": trade_date.isoformat(),
         "decision_at": local.isoformat(timespec="microseconds"),
         "captured_at": local.isoformat(timespec="microseconds"),
-        "capture_clock_source": "runtime_scheduler_timestamp",
+        "capture_clock_source": "runtime_observation_capture_clock",
         "contract": {
             "version": str(contract.contract_version),
             "digest": str(contract.digest()),
@@ -101,6 +102,7 @@ def write_tail_observed_input_snapshot(
         "symbols": symbols,
         "watch_pool": _json_value(watch_pool),
         "minute_bars": normalized_bars,
+        "minute_bar_sources": _json_value(minute_bar_sources or {}),
         "limitations": [
             "does_not_include_the_full_market_candidate_universe",
             "does_not_attest_per_field_source_availability_or_imputation_history",
