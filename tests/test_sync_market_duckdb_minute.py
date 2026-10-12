@@ -49,6 +49,13 @@ def _make_db(path: Path, dates: list[str], *, table: str | None = None) -> None:
         con.close()
 
 
+def _set_target_dbs(
+    module, monkeypatch, market_db: Path, delta_db: Path | None = None
+) -> None:
+    monkeypatch.setattr(module, "MARKET_DB", str(market_db))
+    monkeypatch.setattr(module, "DELTA_DB", str(delta_db or market_db))
+
+
 def test_half_written_date_is_still_a_gap(tmp_path: Path, monkeypatch) -> None:
     """1m 有、5m 缺的日期必须仍算缺口。
 
@@ -58,10 +65,11 @@ def test_half_written_date_is_still_a_gap(tmp_path: Path, monkeypatch) -> None:
     module = _load_module()
     db = tmp_path / "market.duckdb"
     _make_db(db, ["2026-09-15"], table="intraday_summary_1m")  # 只有 1m
-    monkeypatch.setattr(module, "MARKET_DB", str(db))
+    _set_target_dbs(module, monkeypatch, db)
     zip_root = tmp_path / "minute_raw"
     zip_root.mkdir()
-    (zip_root / "minute_1m_20260915.zip").write_bytes(b"")
+    _write_minute_source(zip_root, "1m")
+    _write_minute_source(zip_root, "5m")
 
     assert module._missing_minute_dates(zip_root, date(2026, 9, 1)) == [date(2026, 9, 15)]
 
@@ -76,10 +84,11 @@ def test_fully_written_date_is_not_a_gap(tmp_path: Path, monkeypatch) -> None:
         con.execute("INSERT INTO intraday_summary_5m VALUES ('600000', '2026-09-15')")
     finally:
         con.close()
-    monkeypatch.setattr(module, "MARKET_DB", str(db))
+    _set_target_dbs(module, monkeypatch, db)
     zip_root = tmp_path / "minute_raw"
     zip_root.mkdir()
-    (zip_root / "minute_1m_20260915.zip").write_bytes(b"")
+    _write_minute_source(zip_root, "1m")
+    _write_minute_source(zip_root, "5m")
 
     assert module._missing_minute_dates(zip_root, date(2026, 9, 1)) == []
 
@@ -99,11 +108,13 @@ def test_missing_minute_dates_is_zip_dates_minus_db(tmp_path: Path, monkeypatch)
     db = tmp_path / "market.duckdb"
     # 8/27、8/28 库里已有（zip 里也有）→ 不应出现在缺口里；只有 9/15 是缺口
     _make_db(db, ["2026-08-27", "2026-08-28"])
-    monkeypatch.setattr(module, "MARKET_DB", str(db))
+    _set_target_dbs(module, monkeypatch, db)
     zip_root = tmp_path / "minute_raw"
     zip_root.mkdir()
     for name in ("minute_1m_20260827.zip", "minute_1m_20260828.zip", "minute_1m_20260915.zip"):
-        (zip_root / name).write_bytes(b"")
+        ymd = name.removeprefix("minute_1m_").removesuffix(".zip")
+        _write_minute_source(zip_root, "1m", ymd)
+        _write_minute_source(zip_root, "5m", ymd)
     (zip_root / "minute_1m_20260916").mkdir()  # 目录不算 zip 日期
     (zip_root / "unrelated.txt").write_text("x", encoding="utf-8")
 
@@ -119,8 +130,121 @@ def test_sync_minute_reports_source_when_no_gap(tmp_path: Path, monkeypatch) -> 
     module = _load_module()
     db = tmp_path / "market.duckdb"
     _make_db(db, ["2026-09-15"])
-    monkeypatch.setattr(module, "MARKET_DB", str(db))
+    _set_target_dbs(module, monkeypatch, db)
     zip_root = tmp_path / "minute_raw"
     zip_root.mkdir()
-    (zip_root / "minute_1m_20260915.zip").write_bytes(b"")
+    _write_minute_source(zip_root, "1m")
+    _write_minute_source(zip_root, "5m")
     assert module._sync_minute(zip_root=zip_root, since=date(2026, 9, 1)) == 0
+
+
+@pytest.mark.parametrize("missing_target", ["market", "delta"])
+def test_missing_minute_dates_checks_both_databases(
+    tmp_path: Path, monkeypatch, missing_target: str
+) -> None:
+    module = _load_module()
+    market_db = tmp_path / "market.duckdb"
+    delta_db = tmp_path / "delta.duckdb"
+    complete_dates = ["2026-09-15"]
+    _make_db(market_db, [] if missing_target == "market" else complete_dates)
+    _make_db(delta_db, [] if missing_target == "delta" else complete_dates)
+    _set_target_dbs(module, monkeypatch, market_db, delta_db)
+
+    zip_root = tmp_path / "minute_raw"
+    zip_root.mkdir()
+    _write_minute_source(zip_root, "1m")
+    _write_minute_source(zip_root, "5m")
+
+    assert module._missing_minute_dates(zip_root, date(2026, 9, 1)) == [
+        date(2026, 9, 15)
+    ]
+
+
+def _write_minute_source(zip_root: Path, interval: str, ymd: str = "20260915") -> None:
+    import zipfile
+
+    trade_date = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}"
+    payload = (
+        "date,time,open,high,low,close,volume\n"
+        f"{trade_date},09:30:00,10,10.2,9.8,10.1,100\n"
+        f"{trade_date},09:31:00,10.1,10.3,10,10.2,120\n"
+    )
+    with zipfile.ZipFile(zip_root / f"minute_{interval}_{ymd}.zip", "w") as archive:
+        archive.writestr("SH#600000.csv", payload)
+
+
+def _make_warehouse_db(module, path: Path, package_root: Path) -> None:
+    module.MarketWarehouse(
+        db_path=path,
+        package_root=package_root,
+        package_writes_enabled=False,
+    ).ensure_schema()
+
+
+def test_sync_minute_writes_same_summaries_to_market_and_delta(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = _load_module()
+    market_db = tmp_path / "market.duckdb"
+    delta_db = tmp_path / "delta.duckdb"
+    for path in (market_db, delta_db):
+        _make_warehouse_db(module, path, tmp_path / "package")
+    _set_target_dbs(module, monkeypatch, market_db, delta_db)
+
+    zip_root = tmp_path / "minute_raw"
+    zip_root.mkdir()
+    _write_minute_source(zip_root, "1m")
+    _write_minute_source(zip_root, "5m")
+
+    assert module._sync_minute(zip_root=zip_root, since=date(2026, 9, 1)) == 4
+    for path in (market_db, delta_db):
+        con = duckdb.connect(str(path), read_only=True)
+        try:
+            for table in ("intraday_summary_1m", "intraday_summary_5m"):
+                count = con.execute(
+                    f"SELECT COUNT(*) FROM {table} "
+                    "WHERE symbol='600000' AND date='2026-09-15'"
+                ).fetchone()[0]
+                assert count == 1
+        finally:
+            con.close()
+
+
+def test_partial_target_failure_is_nonzero_and_remains_retryable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = _load_module()
+    market_db = tmp_path / "market.duckdb"
+    delta_db = tmp_path / "delta.duckdb"
+    for path in (market_db, delta_db):
+        _make_warehouse_db(module, path, tmp_path / "package")
+    _set_target_dbs(module, monkeypatch, market_db, delta_db)
+
+    zip_root = tmp_path / "minute_raw"
+    zip_root.mkdir()
+    _write_minute_source(zip_root, "1m")
+    _write_minute_source(zip_root, "5m")
+
+    real_warehouse = module.MarketWarehouse
+
+    class FailingDeltaWarehouse:
+        def __init__(self, *, db_path, package_root, package_writes_enabled):
+            self.db_path = str(db_path)
+            self.inner = real_warehouse(
+                db_path=db_path,
+                package_root=package_root,
+                package_writes_enabled=package_writes_enabled,
+            )
+
+        def upsert_intraday_summaries(self, *, interval, frame):
+            if self.db_path == str(delta_db):
+                raise RuntimeError("simulated delta write failure")
+            return self.inner.upsert_intraday_summaries(interval=interval, frame=frame)
+
+    monkeypatch.setattr(module, "MarketWarehouse", FailingDeltaWarehouse)
+    with pytest.raises(SystemExit, match="incomplete synchronization"):
+        module._sync_minute(zip_root=zip_root, since=date(2026, 9, 1))
+
+    assert module._missing_minute_dates(zip_root, date(2026, 9, 1)) == [
+        date(2026, 9, 15)
+    ]
