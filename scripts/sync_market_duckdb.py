@@ -339,6 +339,7 @@ def _sync_minute(zip_root: Path, since: date_type) -> int:
                 failures.append(failure)
                 continue
             rows: list[pd.DataFrame] = []
+            source_symbols: set[str] = set()
             try:
                 with zipfile.ZipFile(zip_path) as archive:
                     for member in archive.namelist():
@@ -347,6 +348,7 @@ def _sync_minute(zip_root: Path, since: date_type) -> int:
                         symbol = _qq_symbol(member)
                         if not symbol:
                             continue
+                        source_symbols.add(symbol)
                         try:
                             frame = _load_symbol_frame(archive.read(member))
                         except Exception:  # noqa: BLE001 - 单票损坏不阻塞其他股票
@@ -374,6 +376,15 @@ def _sync_minute(zip_root: Path, since: date_type) -> int:
                 continue
             batch = pd.concat(rows, axis=0, ignore_index=True, sort=False)
             batch["date"] = pd.to_datetime(batch["date"], errors="coerce").dt.date
+            missing_symbols = source_symbols - set(batch["symbol"].astype(str))
+            if missing_symbols:
+                sample = ", ".join(sorted(missing_symbols)[:10])
+                failure = (
+                    f"{zip_path.name}: {len(missing_symbols)} source symbol(s) "
+                    f"have no valid summary (sample: {sample})"
+                )
+                print(f"[minute][error] {failure}", flush=True)
+                failures.append(failure)
             batches[interval] = batch
 
         for interval, batch in batches.items():

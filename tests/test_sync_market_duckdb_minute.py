@@ -248,3 +248,31 @@ def test_partial_target_failure_is_nonzero_and_remains_retryable(
     assert module._missing_minute_dates(zip_root, date(2026, 9, 1)) == [
         date(2026, 9, 15)
     ]
+
+
+def test_invalid_source_symbol_is_nonzero_and_remains_retryable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import zipfile
+
+    module = _load_module()
+    market_db = tmp_path / "market.duckdb"
+    delta_db = tmp_path / "delta.duckdb"
+    for path in (market_db, delta_db):
+        _make_warehouse_db(module, path, tmp_path / "package")
+    _set_target_dbs(module, monkeypatch, market_db, delta_db)
+
+    zip_root = tmp_path / "minute_raw"
+    zip_root.mkdir()
+    _write_minute_source(zip_root, "1m")
+    _write_minute_source(zip_root, "5m")
+    with zipfile.ZipFile(zip_root / "minute_1m_20260915.zip", "a") as archive:
+        archive.writestr("SH#600001.csv", "date,time,open,high,low,close,volume\n")
+
+    with pytest.raises(SystemExit, match="incomplete synchronization"):
+        module._sync_minute(zip_root=zip_root, since=date(2026, 9, 1))
+
+    # 600000 同步成功，但 600001 缺少有效分钟行，因此日期仍会重试。
+    assert module._missing_minute_dates(zip_root, date(2026, 9, 1)) == [
+        date(2026, 9, 15)
+    ]
