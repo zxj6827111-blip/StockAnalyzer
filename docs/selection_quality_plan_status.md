@@ -1,6 +1,6 @@
 # 选股质量改进计划：交付状态与证据台账
 
-As-of: 2026-10-12（§0–§9 保留原时间点记录；数据证据见 §10–§14；系统错误后的续接见 §15，本轮最新工程验证及尚未完成任务见 §16）
+As-of: 2026-10-13（§0–§21 保留各自记录时点；本轮 NAS 只读跟进与当前待决数据写入边界见 §22）
 
 历史状态（2026-10-09）：分支 `feat/stock-selection-quality-overhaul` 已推送（到 `3522cf8`）
 （PR #105 OPEN。故意不把 As-of 写成单个 SHA：那会让这条事实每次改文档都过期一次。
@@ -984,3 +984,29 @@ NAS API 容器从 Tushare `daily_basic.circ_mv` 补采 2026-07-18 至 2026-09-30
 - 271 个完整链路字段仍缺少真实来源版本、可用 / 采集 / 计算时钟及缺失 / 插补记录；阶段二无合格候选，
   阶段三独立确认与阶段四正式影子均未启动。补齐逐字段证据后才能重跑 271 字段 PIT 审计；不得从文件
   mtime 或事后重算补造历史时钟。
+
+
+## 22. 2026-10-13 NAS 只读跟进：前向采集、分钟摘要与调度状态
+
+本节读数来自 NAS 本地时间 `2026-10-13 00:17` 的只读检查。没有修改 NAS 数据、容器、调度状态或数据库。
+
+### 前向观察快照
+
+- `runtime/trend_tail_shadow/observed_inputs/` 仍没有 `tail_observed_input_1445.json`。此时尚未开市，缺少 10 月 13 日样本是预期状态；首个可验证样本应来自今天真实的 14:45 live-runtime 运行。
+- NAS 已有 10 月 12 日盘后每日分钟 ZIP，但它们只能用于事后回放，不能补成 14:45 observed snapshot。历史逐字段 PIT 仍维持 blocked；本轮不从这些文件推造来源时钟。
+
+### 生产实际使用的分钟数据路径
+
+- API 当前配置为 `vendor_zip_overlay`、`intraday_runtime_mode=duckdb_required`、`intraday_zip_fallback_enabled=false`。基线摘要文件覆盖到 2026-07-17；活动 feature delta 的 1m / 5m 最大日期为 2026-10-09。
+- 10 月 12 日原始分钟源已在 `/app/artifacts/warehouse/market.duckdb` 写入 1m 与 5m 摘要，各 4,539 个符号日；活动 `/app/artifacts/vendor_delta/market_delta.duckdb` 中 10 月 12 日两张表均为 0 行。API provider 配置使用 feature delta 与基线摘要，没有读取前述 `market.duckdb` 中 10 月 12 日的分钟行。
+- NAS cron 在工作日 23:00 执行 `sync_market_duckdb.py --minute`，该脚本的分钟写入目标是 `market.duckdb`，不会更新活动 feature delta。源 CSV 没有 `amount` 列；当前同步器按既有约定用典型价乘成交量生成近似 amount，因此不能把该字段描述为供应商原始成交额。
+- 这是分钟数据落点与活动 provider 之间的同步缺口。是否把该源同步到活动 feature delta 会改变生产特征数据来源；本节记录读数，不擅自改写数据库或部署同步行为，需按用户决定再实现。
+
+### scheduler 旧状态复核
+
+- `factor_ic_decay_report` 的 scheduler 状态仍显示 9 月 30 日失败、连续失败 15 次，失败原因为拒绝 label policy schema v3。该失败发生在当前部署之前；schema v3 标签修复已包含在部署提交祖先中。NAS 上的最新 `ic_decay_report_latest.json` 修改于 10 月 9 日，`status=ok`、绑定 `label_policy_v3_b0b3724553b5`，覆盖 10,510 行与 6 个因子。因此已有 v3 成功报告，但月度 scheduler 记录尚未被下一次月末运行刷新。
+- 实际运行配置 `full_market_automation_enabled=true`。旧 `premarket_scan`、`auction_report`、`week5_first_board_*` 名称的状态停在 8 月 26 日，与全市场自动化模式下停用旧任务的代码一致；替代的 `week5_automation_auction` 和五个 `week5_automation_market_radar_*` 作业在 10 月 12 日均为 success。旧条目的时间戳不能当成当前调度故障。
+
+### 当前级别
+
+- PR #107 / #108 已按前文合并、部署及 CI 记录完成；系统仍不是 Production Ready。当前待处理项包括：今天真实 14:45 前向快照、271 字段 PIT 与策略晋升门，以及上文所述活动分钟 delta 的同步目标决策。
