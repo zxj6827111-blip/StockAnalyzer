@@ -395,6 +395,7 @@ def _sync_minute(zip_root: Path, since: date_type) -> int:
             batches[interval] = batch
 
         for interval, batch in batches.items():
+            expected_rows = int(batch["symbol"].astype(str).nunique())
             for db_path, warehouse in warehouses:
                 try:
                     result = warehouse.upsert_intraday_summaries(
@@ -406,8 +407,11 @@ def _sync_minute(zip_root: Path, since: date_type) -> int:
                         f"[minute] {target} {interval}: {db_path} upserted {rows_written} rows",
                         flush=True,
                     )
-                    if rows_written == 0:
-                        failure = f"{target} {interval} -> {db_path}: upsert wrote zero rows"
+                    if rows_written != expected_rows:
+                        failure = (
+                            f"{target} {interval} -> {db_path}: upsert wrote "
+                            f"{rows_written} rows; expected {expected_rows} source symbols"
+                        )
                         print(f"[minute][error] {failure}", flush=True)
                         failures.append(failure)
                 except Exception as exc:  # noqa: BLE001 - 另一库仍可成功，失败库下次重试

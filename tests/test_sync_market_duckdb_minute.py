@@ -279,6 +279,55 @@ def test_partial_target_failure_is_nonzero_and_remains_retryable(
     ]
 
 
+def test_partial_target_write_is_nonzero_and_remains_retryable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import zipfile
+
+    module = _load_module()
+    market_db = tmp_path / "market.duckdb"
+    delta_db = tmp_path / "delta.duckdb"
+    for path in (market_db, delta_db):
+        _make_warehouse_db(module, path, tmp_path / "package")
+    _set_target_dbs(module, monkeypatch, market_db, delta_db)
+
+    zip_root = tmp_path / "minute_raw"
+    zip_root.mkdir()
+    payload = (
+        "date,time,open,high,low,close,volume\n"
+        "2026-09-15,09:30:00,10,10.2,9.8,10.1,100\n"
+        "2026-09-15,09:31:00,10.1,10.3,10,10.2,120\n"
+    )
+    for interval in ("1m", "5m"):
+        _write_minute_source(zip_root, interval)
+        with zipfile.ZipFile(zip_root / f"minute_{interval}_20260915.zip", "a") as archive:
+            archive.writestr("SH#600001.csv", payload)
+
+    real_warehouse = module.MarketWarehouse
+
+    class PartialDeltaWarehouse:
+        def __init__(self, *, db_path, package_root, package_writes_enabled):
+            self.db_path = str(db_path)
+            self.inner = real_warehouse(
+                db_path=db_path,
+                package_root=package_root,
+                package_writes_enabled=package_writes_enabled,
+            )
+
+        def upsert_intraday_summaries(self, *, interval, frame):
+            if self.db_path == str(delta_db):
+                frame = frame.iloc[:1]
+            return self.inner.upsert_intraday_summaries(interval=interval, frame=frame)
+
+    monkeypatch.setattr(module, "MarketWarehouse", PartialDeltaWarehouse)
+    with pytest.raises(SystemExit, match="incomplete synchronization"):
+        module._sync_minute(zip_root=zip_root, since=date(2026, 9, 1))
+
+    assert module._missing_minute_dates(zip_root, date(2026, 9, 1)) == [
+        date(2026, 9, 15)
+    ]
+
+
 def test_invalid_source_symbol_is_nonzero_and_remains_retryable(
     tmp_path: Path, monkeypatch
 ) -> None:
