@@ -1010,3 +1010,52 @@ NAS API 容器从 Tushare `daily_basic.circ_mv` 补采 2026-07-18 至 2026-09-30
 ### 当前级别
 
 - PR #107 / #108 已按前文合并、部署及 CI 记录完成；系统仍不是 Production Ready。当前待处理项包括：今天真实 14:45 前向快照、271 字段 PIT 与策略晋升门，以及上文所述活动分钟 delta 的同步目标决策。
+
+
+## 23. 2026-10-13 PR #110 合并、NAS 部署与分钟 delta 补齐
+
+本节更新 §22 的“活动分钟 delta 同步待决定”状态。用户授权保持严格 271 字段 PIT 合约，并同意将 QQ 分钟摘要同步到活动 feature delta；分钟历史数据仅用于生产特征读取和回放，不当作历史 14:45 PIT 证据。
+
+### 发布与运行验收
+
+- PR #110 已合并到 `main`。最终 head 为
+  `298616764583a8976f0a2727e083572a15912bfb`，合并提交为
+  `fe3a0e98f454d272ed69c15070e98b495b9c4cc8`。push run `38292742796` 与 PR run
+  `38292748589` 均通过，包含分层质量门、全量测试与覆盖率上传、slow test report。
+- NAS 使用官方入口 `bash scripts/nas_deploy_update.sh --branch main` 部署并以退出码 0 完成。
+  NAS `main` HEAD 与镜像 build commit 均为 `fe3a0e98f454d272ed69c15070e98b495b9c4cc8`；
+  `stock-analyzer:latest` 镜像 ID 为
+  `sha256:92ffc926522026cd1f87090053cd2ef96ab514c60ca3b46711e561dc2a47d011`。
+- 复核时 `api`、两个 scheduler 与 redis 均在运行；容器内 API `/health` 为 `ok`，构建身份
+  `trusted=true` 且 commit 匹配，`advisory_only=true`、`training_enabled=false`。两个 scheduler
+  的新鲜心跳状态均为 `ok`、身份可信且 commit 匹配。
+- `factor_ic_decay_report` 子任务仍显示 9 月 30 日旧失败（连续 15 次，v3 label policy schema
+  不兼容）；同一心跳中的失败详情时间为 9 月 30 日，仓库此前记录的 10 月 9 日最新 v3 报告
+  为 `status=ok`。这是未刷新的月度 scheduler 状态，不代表本次部署后 API 或 scheduler 身份失败；
+  后续月末调度应刷新该项。
+
+### 分钟摘要补齐证据
+
+- 在 NAS 容器内执行
+  `python3 /app/scripts/sync_market_duckdb.py --minute --since 2026-07-31`，命令成功结束，累计
+  `762,946` 行 upsert。同步器将每个来源交易日和 1m / 5m 证券集合写入并核对
+  `market.duckdb` 与活动 `market_delta.duckdb`；重跑同一命令后返回
+  `no missing dates (source=/data/qq_minute_raw)`。
+- 活动 delta 库当前 1m / 5m 总行数分别为 `191,333` / `192,387`，最大日期均为
+  `2026-10-12`；该日两个区间均为 `4,539` 行及 `4,539` 个证券。基线 market 库总量为
+  `580,149` / `279,779` 行，10 月 12 日各为 `4,539` 行；本轮改变量主要落在活动 delta。
+- 原始 QQ CSV 不含供应商 amount 字段；摘要仍按现行口径用典型价 × 成交量近似 amount，不能称为
+  供应商原始成交额。数据均留在 NAS 持久卷。分钟 upsert 成功和覆盖为零缺口不证明供应商原始
+  发布时钟，也不构成 271 字段 observed snapshot。
+
+### 未完成事项与完成级别
+
+- §22 所列 delta 同步缺口已解决，活动 provider 配置使用的 delta 库已补齐；本轮核实了落库和覆盖，
+  没有单独发起完整选股请求来验证每个新摘要行都被策略实际消费。
+- 用户确认严格保留完整 271 字段范围。PIT 审计仍为 blocked：原始历史文件缺逐字段来源版本、
+  可用 / 采集 / 计算时钟及插补记录，不能把本次历史 upsert 回填成 observed evidence。
+- 10 月 13 日真实 14:45 前向采集仍须单独核对实际运行产物及供应商 bar 时间语义；单独的尾盘池
+  与分钟 bars 快照仍不覆盖完整 271 字段。阶段二尚无合格候选，独立确认、正式影子及 Production
+  Ready 仍未完成。
+- **PR #110 已全绿合并并部署，NAS 分钟摘要覆盖无缺口；代码 / 部署及分钟同步这一子项完成，完整
+  PIT、策略质量验收和 Production Ready 未完成。**
