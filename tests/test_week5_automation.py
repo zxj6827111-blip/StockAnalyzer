@@ -97,6 +97,102 @@ def _automation(tmp_path: Path) -> RuntimeWeek5AutomationService:
     return RuntimeWeek5AutomationService(FakeService(tmp_path))
 
 
+def test_tail_minute_capture_uses_only_completed_same_day_sina_bars(tmp_path, monkeypatch) -> None:
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            zone = tz or ZoneInfo("Asia/Shanghai")
+            return cls(2026, 10, 9, 14, 45, 12, tzinfo=zone)
+
+    frame = pd.DataFrame(
+        [
+            {"open": 10.0, "high": 10.1, "low": 9.9, "close": 10.0, "volume": 100},
+            {"open": 10.0, "high": 10.2, "low": 9.9, "close": 10.1, "volume": 120},
+            {"open": 10.1, "high": 10.2, "low": 10.0, "close": 10.1, "volume": 130},
+            {"open": 10.1, "high": 10.3, "low": 10.0, "close": 10.2, "volume": 140},
+        ],
+        index=pd.to_datetime(
+            ["2026-10-08 14:44", "2026-10-09 14:44", "2026-10-09 14:45", "2026-10-09 14:46"]
+        ),
+    )
+    calls: list[dict[str, object]] = []
+
+    def fetch(**kwargs):
+        calls.append(kwargs)
+        return frame
+
+    monkeypatch.setattr(automation_module, "datetime", FrozenDateTime)
+    monkeypatch.setattr(automation_module, "fetch_sina_minute_bars", fetch)
+    automation = _automation(tmp_path)
+    capture = automation._collect_tail_shadow_minute_inputs(
+        pool_rows=[{"symbol": "600000.SH"}],
+        scheduled_at=datetime(2026, 10, 9, 14, 45, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert calls == [{"symbol": "600000.SH", "interval": "1m", "timeout_sec": 5}]
+    assert capture["status"] == "captured"
+    assert [moment for moment, _bar in capture["minute_bars"]["600000.SH"]] == [
+        datetime(2026, 10, 9, 14, 44)
+    ]
+    source = capture["minute_bar_sources"]["600000.SH"]
+    assert source["provider"] == "sina_minute_api"
+    assert source["timestamp_semantics"].endswith("same_minute_excluded")
+    assert source["source_retrieved_at"].isoformat() == "2026-10-09T14:45:12+08:00"
+    assert capture["summary"]["full_chain_pit_evidence"] is False
+
+
+def test_tail_minute_capture_fails_closed_when_collection_misses_scheduled_minute(
+    tmp_path, monkeypatch
+) -> None:
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            zone = tz or ZoneInfo("Asia/Shanghai")
+            return cls(2026, 10, 9, 14, 46, 1, tzinfo=zone)
+
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(automation_module, "datetime", FrozenDateTime)
+    monkeypatch.setattr(
+        automation_module,
+        "fetch_sina_minute_bars",
+        lambda **kwargs: calls.append(kwargs) or pd.DataFrame(),
+    )
+    capture = _automation(tmp_path)._collect_tail_shadow_minute_inputs(
+        pool_rows=[{"symbol": "600000.SH"}],
+        scheduled_at=datetime(2026, 10, 9, 14, 45, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert capture["status"] == "blocked"
+    assert capture["reason"] == "capture_started_outside_scheduled_minute"
+    assert capture["minute_bars"] == {}
+    assert calls == []
+
+
+def test_post_decision_minute_capture_is_evaluation_only(tmp_path, monkeypatch) -> None:
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            zone = tz or ZoneInfo("Asia/Shanghai")
+            return cls(2026, 10, 9, 14, 50, 12, tzinfo=zone)
+
+    frame = pd.DataFrame(
+        [{"open": 10.0, "high": 10.1, "low": 9.9, "close": 10.0, "volume": 100}],
+        index=pd.to_datetime(["2026-10-09 14:49"]),
+    )
+    monkeypatch.setattr(automation_module, "datetime", FrozenDateTime)
+    monkeypatch.setattr(automation_module, "fetch_sina_minute_bars", lambda **_kwargs: frame)
+    capture = _automation(tmp_path)._collect_tail_shadow_minute_inputs(
+        pool_rows=[{"symbol": "600000.SH"}],
+        scheduled_at=datetime(2026, 10, 9, 14, 50, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+
+    assert capture["status"] == "evaluation_only"
+    assert capture["summary"]["capture_role"] == "evaluation_only"
+    assert [moment for moment, _bar in capture["minute_bars"]["600000.SH"]] == [
+        datetime(2026, 10, 9, 14, 49)
+    ]
+
+
 def _stub_live_snapshot(
     automation: RuntimeWeek5AutomationService,
     timestamp: datetime,

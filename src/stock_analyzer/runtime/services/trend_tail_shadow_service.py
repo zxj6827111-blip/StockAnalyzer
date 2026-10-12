@@ -8,7 +8,7 @@
 绝不改用开盘价顶替：
 
 - 在服模型身份无法验证（缺 hash / commit 不一致 / 不是本契约的 label policy）；
-- 观察池当日没有带时刻的分钟行情（本项目当前的真实状态）；
+- 观察池当日缺少可信、足够新鲜的分钟行情；
 - 行情快照陈旧、停牌、涨停锁死、风险不允许；
 - 没有一只达到准入阈值。
 
@@ -24,6 +24,7 @@ from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from stock_analyzer.contracts.trend_strategy import (
     DEFAULT_TREND_CONTRACT,
@@ -162,6 +163,7 @@ class TrendTailShadowService:
         timestamp: datetime | None,
         watch_pool: Sequence[Mapping[str, Any]],
         minute_bars: Mapping[str, Sequence[tuple[datetime, Mapping[str, Any]]]] | None = None,
+        minute_bar_sources: Mapping[str, Mapping[str, Any]] | None = None,
         probabilities: Mapping[str, float] | None = None,
         capital_budget: float | None = None,
         cost_estimator: Any | None = None,
@@ -186,6 +188,13 @@ class TrendTailShadowService:
         rows = [dict(row) for row in watch_pool if str(row.get("symbol", "")).strip()]
         bar_map = dict(minute_bars or {})
         prob_map = dict(probabilities or {})
+        quote_as_of = timestamp
+        if timestamp is not None and timestamp.tzinfo is not None:
+            # 契约确认槽和 bar 终点使用市场本地墙钟；先换到契约时区再剥离时区，
+            # 避免 aware/naive 混比，同时保持同一绝对时刻的解释。
+            quote_as_of = timestamp.astimezone(ZoneInfo(str(contract.timezone))).replace(
+                tzinfo=None
+            )
         observed_input: dict[str, Any] | None = None
         if write_artifacts:
             try:
@@ -198,6 +207,7 @@ class TrendTailShadowService:
                     contract=contract,
                     watch_pool=rows,
                     minute_bars=bar_map,
+                    minute_bar_sources=minute_bar_sources or {},
                 )
             except OSError as exc:
                 # 快照写失败要进入报告，但不能打断只读影子任务或其旧输出。
@@ -241,7 +251,7 @@ class TrendTailShadowService:
                     minute_bars=bars,
                     confirmation=hard_gate_confirmation,
                     contract=contract,
-                    quote_as_of=timestamp,
+                    quote_as_of=quote_as_of,
                     model_probabilities={NET_PROFIT_PROBABILITY_FIELD: prob_map[symbol]}
                     if symbol in prob_map
                     else None,

@@ -542,6 +542,35 @@ def test_live_latest_confirmation_slot_archives_immutable_input_snapshot(tmp_pat
     assert saved["minute_bars"] == {}
 
 
+def test_aware_runtime_clock_records_minute_source_and_matches_local_confirmation_slots(
+    tmp_path,
+) -> None:
+    decision_time = datetime(2026, 10, 9, 14, 45, 12, tzinfo=ZoneInfo("Asia/Shanghai"))
+    source = {
+        "600000.SH": {
+            "provider": "sina_minute_api",
+            "interval": "1m",
+            "timezone": "Asia/Shanghai",
+            "status": "captured",
+        }
+    }
+    report = _run(
+        tmp_path,
+        watch_pool=_pool(["600000.SH"]),
+        probabilities={"600000.SH": 0.9},
+        bars={"600000.SH": _bars(day=decision_time.date())},
+        timestamp=decision_time,
+        minute_bar_sources=source,
+    )
+
+    assert report["ok"] is True
+    capture = report["observed_input_snapshot"]
+    assert capture["status"] == "captured"
+    saved = json.loads(Path(capture["path"]).read_text(encoding="utf-8"))
+    assert saved["capture_clock_source"] == "runtime_observation_capture_clock"
+    assert saved["minute_bar_sources"] == source
+
+
 # ---------------------------------------------------------------------------
 # 接线守卫：影子链路必须在 live runtime 里被调用，且不动 actionable_signals
 # ---------------------------------------------------------------------------
@@ -566,6 +595,7 @@ def test_live_runtime_calls_the_tail_shadow_service() -> None:
     body = _function_source("run_live_runtime")
     assert "_trend_tail_shadow_report(" in body
     assert '"trend_tail_shadow"' in body
+    assert body.index("_collect_tail_shadow_minute_inputs(") < body.index("service.run_pipeline(")
 
 
 def test_tail_shadow_never_touches_the_legacy_actionable_list() -> None:

@@ -2,7 +2,7 @@
 
 Status: Draft
 
-As-of: 2026-10-12 @ HEAD `c58da46eaf18defed3adf2ac6ec89ad668dcbf66`（2025 RAW v3、2026 ST 修正 / 公司行动 v5 开发重跑和 2025 资金流 / 龙虎榜 PIT 来源审计已完成；新增 271 字段 PIT 审计及独立确认强制门，但没有可用历史字段级证据；2025 未校准 raw-score 高低分探索未支持反转排序；未部署）
+As-of: 2026-10-12 @ HEAD `9abc8ee14ed678e49b1aac248f3816cc716f3d2b`（已补 live 14:45 分钟采集 producer 与来源接收时钟；首次 NAS 观察快照待部署后采集；271 字段仍无完整历史字段级证据；策略仍无合格候选）
 
 ## 1. 决策范围
 
@@ -98,6 +98,13 @@ As-of: 2026-10-12 @ HEAD `c58da46eaf18defed3adf2ac6ec89ad668dcbf66`（2025 RAW v
   未开封、功效及统计门全部通过后才可能置为 true。当前清单报告中 271 个字段全部 blocked，
   因而这项代码修复并未产生候选或真实确认结果。
 
+- **前向分钟观察采集已接线，尚待 NAS 首次运行验证**：`Week5AutomationService` 在尾盘确认窗口
+  请求 Sina 1 分钟线，记录每只票的来源、响应接收时钟与最新 bar；决策分钟、跨日、未来和超出策略
+  陈旧度门的数据均被排除。14:45 快照只留存真实观察池的决策输入，其它窗口的行情只供影子评估成交。
+  供应商 K 线标签的区间端点语义仍未核实，故有意排除 14:45 标签本身。快照明确标记
+  `full_chain_pit_evidence=false`；它不补历史字段时钟，不改变候选、策略或发布门。需要在 NAS 部署后
+  检查第一份不可覆盖日快照。
+
 - **验证环境兼容已闭合**：本机原 Python 3.12 环境的 NumPy stub 与项目 mypy 目标 3.11 不兼容；
   使用已有 Python 3.11 解释器和隔离 uv 环境运行 `clean-scope --fail-on-error`，报告 `ok=true`、
   blocking/nonblocking failures 均为空。环境路径、命令与本轮报告记在
@@ -133,6 +140,14 @@ src/stock_analyzer/research/tail_field_pit.py
   code-derived field inventory and input-bound PIT coverage/source/clock audit
 scripts/audit_tail_field_pit.py
   field inventory and fail-closed PIT report command
+src/stock_analyzer/research/tail_observed_inputs.py
+  immutable 14:45 observed input snapshot; minute-bar source/collection metadata; never full-chain PIT evidence
+src/stock_analyzer/runtime/services/week5_automation_service.py
+  forward-only live 1-minute producer; same-day and decision-clock filtering; fail-closed late/missing capture
+src/stock_analyzer/runtime/services/trend_tail_shadow_service.py
+  observed source metadata persistence and contract-local quote clock
+tests/test_week5_automation.py / tests/test_trend_tail_shadow_runtime.py
+  live capture filtering, late-window rejection, source metadata persistence, and timezone comparison
 src/stock_analyzer/research/tail_score_direction.py
   same-pool daily high/low raw-score Top-K selection and paired moving-block comparison
 scripts/audit_tail_score_direction.py
