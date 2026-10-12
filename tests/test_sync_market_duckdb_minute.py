@@ -160,6 +160,35 @@ def test_missing_minute_dates_checks_both_databases(
     ]
 
 
+def test_five_minute_only_archive_keeps_date_retryable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = _load_module()
+    db = tmp_path / "market.duckdb"
+    _make_db(db, ["2026-09-15"])
+    _set_target_dbs(module, monkeypatch, db)
+
+    zip_root = tmp_path / "minute_raw"
+    zip_root.mkdir()
+    _write_minute_source(zip_root, "5m")
+
+    assert module._missing_minute_dates(zip_root, date(2026, 9, 1)) == [
+        date(2026, 9, 15)
+    ]
+
+
+def test_missing_minute_source_directory_fails_closed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = _load_module()
+    db = tmp_path / "market.duckdb"
+    _make_db(db, [])
+    _set_target_dbs(module, monkeypatch, db)
+
+    with pytest.raises(FileNotFoundError, match="minute source directory is unavailable"):
+        module._missing_minute_dates(tmp_path / "missing", date(2026, 9, 1))
+
+
 def _write_minute_source(zip_root: Path, interval: str, ymd: str = "20260915") -> None:
     import zipfile
 

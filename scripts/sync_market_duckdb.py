@@ -51,7 +51,7 @@ _DAILY_SNAPSHOT_COLS = [
     "board",
 ]
 _QQ_SYMBOL_RE = re.compile(r"([A-Za-z]{1,3})#?(\d{6})")
-_ZIP_DATE_RE = re.compile(r"minute_1m_(\d{8})\.zip$")
+_ZIP_DATE_RE = re.compile(r"minute_(?:1m|5m)_(\d{8})\.zip$")
 # 分钟汇总的目标表集合：缺口检测与写入必须对同一组表——
 # "写 2 张、只查 1 张"会让部分缺失静默留存（2026-09-16 修）。
 MINUTE_SUMMARY_TABLES = ("intraday_summary_1m", "intraday_summary_5m")
@@ -202,19 +202,26 @@ def _missing_minute_dates(zip_root: Path, since: date_type) -> list[date_type]:
     1m/5m ZIP 中的股票集合分别核对两个目标库，缺一行就重放整日并 upsert
     到两个库；缺少或损坏的 5m ZIP 也会保持为缺口，最终让同步以非零退出。
     """
+    if not zip_root.is_dir():
+        raise FileNotFoundError(f"minute source directory is unavailable: {zip_root}")
     zip_dates: set[date_type] = set()
-    if zip_root.exists():
-        for entry in zip_root.iterdir():
-            match = _ZIP_DATE_RE.search(entry.name)
-            if match is None:
-                continue
-            parsed = date_type(
-                int(match.group(1)[:4]),
-                int(match.group(1)[4:6]),
-                int(match.group(1)[6:8]),
-            )
-            if parsed >= since:
-                zip_dates.add(parsed)
+    found_source_zip = False
+    for entry in zip_root.iterdir():
+        if not entry.is_file():
+            continue
+        match = _ZIP_DATE_RE.search(entry.name)
+        if match is None:
+            continue
+        found_source_zip = True
+        parsed = date_type(
+            int(match.group(1)[:4]),
+            int(match.group(1)[4:6]),
+            int(match.group(1)[6:8]),
+        )
+        if parsed >= since:
+            zip_dates.add(parsed)
+    if not found_source_zip:
+        raise FileNotFoundError(f"no minute source ZIP archives found under: {zip_root}")
     source_symbols: dict[date_type, dict[str, set[str]]] = {}
     missing_source_dates: set[date_type] = set()
     table_by_interval = dict(zip(("1m", "5m"), MINUTE_SUMMARY_TABLES, strict=True))
