@@ -1,4 +1,4 @@
-"""每日增量：把 tushare 日线（delta 库）与 QQ 分钟（每日 zip）同步进 market.duckdb。
+"""每日增量：把 tushare 日线与 QQ 分钟（每日 zip）同步进生产消费库。
 
 背景：回测与生产共用的消费库 ``market.duckdb``（daily_bars + intraday_summary_1m/5m）
 有两条上游供给线——tushare 日线（updater 每日更新 ZIP 与 delta 库）与 QQ 自建分钟
@@ -8,9 +8,9 @@ market.duckdb（2026-07/08 的断档即由此而来）。本脚本作为两者�
 
 - ``--daily``：行级对比 delta 库与 market.duckdb 的 daily_bars，缺失行按
   「ZIP raw 价格 + delta 快照/量列」组装补入（口径与存量 legacy raw 一致）。
-- ``--minute``：对比 minute_raw 目录 zip 日期与 market.duckdb 的
-  intraday_summary_1m 已有日期，缺失日期逐 zip 用
-  ``summarize_minute_bars``（与读取端同一聚合代码）计算后 upsert。
+- ``--minute``：对比 minute_raw 目录 zip 日期与 ``market.duckdb``、活动
+  ``market_delta.duckdb`` 的 1m/5m 汇总覆盖；任一目标库缺日期时，逐 zip 用
+  ``summarize_minute_bars``（与读取端同一聚合代码）计算，并幂等 upsert 到两个库。
 
 两个模式均幂等（按 symbol+date DELETE+INSERT）且**自动找缺口**：任何一天漏跑，
 后续运行会自动补齐；``--since`` 限制扫描起点防止历史意外差异产生巨量缺口。
@@ -19,7 +19,7 @@ market.duckdb（2026-07/08 的断档即由此而来）。本脚本作为两者�
   docker exec stock-analyzer-api python3 /app/scripts/sync_market_duckdb.py --daily
   docker exec stock-analyzer-api python3 /app/scripts/sync_market_duckdb.py --minute
   （QQ CSV 无 amount 字段，分钟侧以典型价×成交量合成近似——与 2026-08-30 的
-  手工回填口径一致。）
+  手工回填口径一致；该值不是供应商原始成交额。）
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ _DAILY_SNAPSHOT_COLS = [
     "board",
 ]
 _QQ_SYMBOL_RE = re.compile(r"([A-Za-z]{1,3})#?(\d{6})")
-_ZIP_DATE_RE = re.compile(r"minute_1m_(\d{8})\.zip$")
+_ZIP_DATE_RE = re.compile(r"minute_(?:1m|5m)_(\d{8})\.zip$")
 # 分钟汇总的目标表集合：缺口检测与写入必须对同一组表——
 # "写 2 张、只查 1 张"会让部分缺失静默留存（2026-09-16 修）。
 MINUTE_SUMMARY_TABLES = ("intraday_summary_1m", "intraday_summary_5m")
@@ -196,44 +196,78 @@ def _sync_daily(
 
 
 def _missing_minute_dates(zip_root: Path, since: date_type) -> list[date_type]:
-    """minute_raw 目录有 zip、而 market.duckdb 的**任一**目标表缺失的日期。
+    """返回任一目标库缺少 QQ 源股票日摘要的日期。
 
-    "任一"是 2026-09-16 修的口径：原实现只拿 ``intraday_summary_1m`` 判缺口，于是
-    "1m 有、5m 缺"的日期永远不会被检出也不会被修——又一次"部分缺失被静默当成完整"。
-    写入端本来就逐日写 1m+5m，缺口检测也必须对两张表取并集，口径才对得上。
+    不能只看日期是否有任意行：同一天可能只写入了部分股票。这里以每个
+    1m/5m ZIP 中的股票集合分别核对两个目标库，缺一行就重放整日并 upsert
+    到两个库；缺少或损坏的 5m ZIP 也会保持为缺口，最终让同步以非零退出。
     """
+    if not zip_root.is_dir():
+        raise FileNotFoundError(f"minute source directory is unavailable: {zip_root}")
     zip_dates: set[date_type] = set()
-    if zip_root.exists():
-        for entry in zip_root.iterdir():
-            match = _ZIP_DATE_RE.search(entry.name)
-            if match is None:
+    found_source_zip = False
+    for entry in zip_root.iterdir():
+        if not entry.is_file():
+            continue
+        match = _ZIP_DATE_RE.search(entry.name)
+        if match is None:
+            continue
+        found_source_zip = True
+        parsed = date_type(
+            int(match.group(1)[:4]),
+            int(match.group(1)[4:6]),
+            int(match.group(1)[6:8]),
+        )
+        if parsed >= since:
+            zip_dates.add(parsed)
+    if not found_source_zip:
+        raise FileNotFoundError(f"no minute source ZIP archives found under: {zip_root}")
+    source_symbols: dict[date_type, dict[str, set[str]]] = {}
+    missing_source_dates: set[date_type] = set()
+    table_by_interval = dict(zip(("1m", "5m"), MINUTE_SUMMARY_TABLES, strict=True))
+    for trade_date in zip_dates:
+        source_symbols[trade_date] = {}
+        ymd = trade_date.strftime("%Y%m%d")
+        for interval in ("1m", "5m"):
+            zip_path = zip_root / f"minute_{interval}_{ymd}.zip"
+            if not zip_path.is_file():
+                missing_source_dates.add(trade_date)
                 continue
-            parsed = date_type(
-                int(match.group(1)[:4]),
-                int(match.group(1)[4:6]),
-                int(match.group(1)[6:8]),
-            )
-            if parsed >= since:
-                zip_dates.add(parsed)
-    con = duckdb.connect(MARKET_DB, read_only=True)
-    try:
-        # **交集**语义：一个日期只有在**所有**目标表里都存在才算完成。用并集会把
-        # "1m 有、5m 缺"的半写日期当成完整的——那正是要修的那类静默缺失。
-        per_table: list[set[date_type]] = []
-        for table in MINUTE_SUMMARY_TABLES:
-            per_table.append(
-                {
-                    row[0]
-                    for row in con.execute(
-                        f"SELECT DISTINCT date FROM {table} WHERE date >= ?",
-                        [since],
-                    ).fetchall()
-                }
-            )
-        have: set[date_type] = set.intersection(*per_table) if per_table else set()
-    finally:
-        con.close()
-    return sorted(zip_dates - have)
+            try:
+                with zipfile.ZipFile(zip_path) as archive:
+                    symbols = {
+                        symbol
+                        for member in archive.namelist()
+                        if member.lower().endswith(".csv")
+                        and (symbol := _qq_symbol(member))
+                    }
+            except Exception:  # noqa: BLE001 - 同步阶段会报告损坏源并以非零退出
+                missing_source_dates.add(trade_date)
+                continue
+            if not symbols:
+                missing_source_dates.add(trade_date)
+                continue
+            source_symbols[trade_date][table_by_interval[interval]] = symbols
+
+    incomplete_dates = set(missing_source_dates)
+    target_db_paths = tuple(dict.fromkeys((str(MARKET_DB), str(DELTA_DB))))
+    for db_path in target_db_paths:
+        con = duckdb.connect(db_path, read_only=True)
+        try:
+            for trade_date, symbols_by_table in source_symbols.items():
+                for table, expected_symbols in symbols_by_table.items():
+                    existing_symbols = {
+                        row[0]
+                        for row in con.execute(
+                            f"SELECT DISTINCT symbol FROM {table} WHERE date = ?",
+                            [trade_date],
+                        ).fetchall()
+                    }
+                    if not expected_symbols.issubset(existing_symbols):
+                        incomplete_dates.add(trade_date)
+        finally:
+            con.close()
+    return sorted(incomplete_dates)
 
 
 def _qq_symbol(name: str) -> str:
@@ -257,6 +291,7 @@ def _load_symbol_frame(raw: bytes) -> pd.DataFrame | None:
     frame = frame.dropna(subset=["open", "high", "low", "close"])
     if frame.empty:
         return None
+    # QQ 的 CSV 不含 amount；按既有项目口径近似，不能当作供应商原始成交额。
     typical = (frame["open"] + frame["high"] + frame["low"] + frame["close"]) / 4.0
     frame["amount"] = typical * frame["volume"].fillna(0.0)
     return frame[["open", "high", "low", "close", "volume", "amount"]]
@@ -281,50 +316,118 @@ def _sync_minute(zip_root: Path, since: date_type) -> int:
         print(f"[minute] no missing dates (source={zip_root})", flush=True)
         return 0
     print(f"[minute] missing dates: {[d.isoformat() for d in missing]}", flush=True)
-
-    warehouse = MarketWarehouse(
-        db_path=MARKET_DB,
-        package_root=str(Path(MARKET_DB).parent / "package"),
-        package_writes_enabled=False,
+    print(
+        "[minute] QQ source has no amount field; amount uses typical-price × volume estimate",
+        flush=True,
     )
+
+    target_db_paths = tuple(dict.fromkeys((str(MARKET_DB), str(DELTA_DB))))
+    warehouses = [
+        (
+            db_path,
+            MarketWarehouse(
+                db_path=db_path,
+                package_root=str(Path(db_path).parent / "package"),
+                package_writes_enabled=False,
+            ),
+        )
+        for db_path in target_db_paths
+    ]
     total = 0
+    failures: list[str] = []
     for target in missing:
         ymd = target.strftime("%Y%m%d")
+        batches: dict[str, pd.DataFrame] = {}
         for interval in ("1m", "5m"):
             zip_path = zip_root / f"minute_{interval}_{ymd}.zip"
             if not zip_path.exists():
-                print(f"[minute] {zip_path.name}: not found, skip", flush=True)
+                failure = f"{zip_path.name}: source zip not found"
+                print(f"[minute][error] {failure}", flush=True)
+                failures.append(failure)
                 continue
             rows: list[pd.DataFrame] = []
-            with zipfile.ZipFile(zip_path) as archive:
-                for member in archive.namelist():
-                    if not member.lower().endswith(".csv"):
-                        continue
-                    symbol = _qq_symbol(member)
-                    if not symbol:
-                        continue
-                    try:
-                        frame = _load_symbol_frame(archive.read(member))
-                    except Exception:  # noqa: BLE001
-                        continue
-                    if frame is None or frame.empty:
-                        continue
-                    summary = summarize_minute_bars(frame, interval=interval)
-                    if summary.empty:
-                        continue
-                    summary = summary.reset_index()
-                    summary = summary[summary["date"] == pd.Timestamp(target)]
-                    if summary.empty:
-                        continue
-                    summary.insert(0, "symbol", symbol)
-                    rows.append(summary)
+            source_symbols: set[str] = set()
+            try:
+                with zipfile.ZipFile(zip_path) as archive:
+                    for member in archive.namelist():
+                        if not member.lower().endswith(".csv"):
+                            continue
+                        symbol = _qq_symbol(member)
+                        if not symbol:
+                            continue
+                        source_symbols.add(symbol)
+                        try:
+                            frame = _load_symbol_frame(archive.read(member))
+                        except Exception:  # noqa: BLE001 - 单票损坏不阻塞其他股票
+                            continue
+                        if frame is None or frame.empty:
+                            continue
+                        summary = summarize_minute_bars(frame, interval=interval)
+                        if summary.empty:
+                            continue
+                        summary = summary.reset_index()
+                        summary = summary[summary["date"] == pd.Timestamp(target)]
+                        if summary.empty:
+                            continue
+                        summary.insert(0, "symbol", symbol)
+                        rows.append(summary)
+            except Exception as exc:  # noqa: BLE001 - 继续尝试其他目标库和日期
+                failure = f"{zip_path.name}: {type(exc).__name__}: {exc}"
+                print(f"[minute][error] {failure}", flush=True)
+                failures.append(failure)
+                continue
             if not rows:
+                failure = f"{zip_path.name}: no valid summary rows"
+                print(f"[minute][error] {failure}", flush=True)
+                failures.append(failure)
                 continue
             batch = pd.concat(rows, axis=0, ignore_index=True, sort=False)
             batch["date"] = pd.to_datetime(batch["date"], errors="coerce").dt.date
-            result = warehouse.upsert_intraday_summaries(interval=interval, frame=batch)
-            total += int(result.get("rows", 0))
+            missing_symbols = source_symbols - set(batch["symbol"].astype(str))
+            if missing_symbols:
+                sample = ", ".join(sorted(missing_symbols)[:10])
+                failure = (
+                    f"{zip_path.name}: {len(missing_symbols)} source symbol(s) "
+                    f"have no valid summary (sample: {sample})"
+                )
+                print(f"[minute][error] {failure}", flush=True)
+                failures.append(failure)
+            batches[interval] = batch
+
+        for interval, batch in batches.items():
+            expected_rows = int(batch["symbol"].astype(str).nunique())
+            for db_path, warehouse in warehouses:
+                try:
+                    result = warehouse.upsert_intraday_summaries(
+                        interval=interval, frame=batch
+                    )
+                    rows_written = int(result.get("rows", 0))
+                    total += rows_written
+                    print(
+                        f"[minute] {target} {interval}: {db_path} upserted {rows_written} rows",
+                        flush=True,
+                    )
+                    if rows_written != expected_rows:
+                        failure = (
+                            f"{target} {interval} -> {db_path}: upsert wrote "
+                            f"{rows_written} rows; expected {expected_rows} source symbols"
+                        )
+                        print(f"[minute][error] {failure}", flush=True)
+                        failures.append(failure)
+                except Exception as exc:  # noqa: BLE001 - 另一库仍可成功，失败库下次重试
+                    failure = (
+                        f"{target} {interval} -> {db_path}: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    print(f"[minute][error] {failure}", flush=True)
+                    failures.append(failure)
         print(f"[minute] {target}: done", flush=True)
+
+    if failures:
+        raise SystemExit(
+            f"[minute] incomplete synchronization: {len(failures)} failure(s); "
+            "the remaining gap will be retried on the next run"
+        )
     print(f"[minute] upserted rows: {total}", flush=True)
     return total
 
