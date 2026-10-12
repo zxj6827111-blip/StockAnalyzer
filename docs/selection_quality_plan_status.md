@@ -934,16 +934,53 @@ NAS API 容器从 Tushare `daily_basic.circ_mv` 补采 2026-07-18 至 2026-09-30
 - 原始分钟 CSV 中存在 2026-10-12 分区，但目录最后修改时刻为当天 17:34（NAS 本地时区），
   晚于 14:45；回读它只能用于 replay，不能回填成 `observed_snapshot`。生产 `market.duckdb` 的
   `intraday_summary_1m/5m` 是日级聚合表，不保存可还原决策点的逐分钟序列。
-- 新代码的写入器在交易日 14:45 将真实传入的 `watch_pool` 和 `minute_bars` 保存到持久卷下的
-  独立日快照；当前 live runtime 调用方只传 `watch_pool`，分钟 bars 的生产者尚未接入。因此，
-  首次未来快照即使按时生成，也不等于 271 字段 full-chain PIT 证据。NAS 在本次验收时还没有
-  `runtime/trend_tail_shadow/observed_inputs/` 新快照目录。
+- 当时新代码的写入器虽然支持留存 `watch_pool` 和 `minute_bars`，但分钟 bars 生产者尚未接入；
+  这一状态由 PR #107 后续补齐，部署与当前采集状态见 §21。即使产生该窄范围快照，也不等于
+  271 字段 full-chain PIT 证据。
+
+
+## 21. 2026-10-12 PR #107 前向采集合并与 NAS 部署
+
+本节更新 §20 中“分钟 bars 生产者尚未接入”的状态，并记录本轮发布证据。
+
+### 发布与运行验收
+
+- PR #107（`feat(shadow): capture observed tail minute inputs`）已合并到 `main`，合并提交为
+  `47ddc996a7780e9cdeeca4b15adb71a1c7bcb5ed`。PR 检查及 main push workflow
+  `38264105200` 均成功：分层质量门、全量测试与覆盖率上传、slow test report 全部通过。
+- NAS 通过官方入口 `bash scripts/nas_deploy_update.sh --branch main` 更新。脚本的
+  advisory/vendor-overlay fail-closed compose 校验通过，容器 build manifest 与 commit 身份复核
+  均为 `PASS`。部署后 NAS HEAD、`.build_commit` 和镜像 revision 均为上述提交；镜像 ID 为
+  `sha256:0b74806799134792a74d44f90b59ec332b7f472c1803bae79a81a3bbf777890e`。
+- `api`、`scheduler-critical`、`scheduler-heavy`、`redis` 均在运行。API `/health` 为
+  `status=ok`、`trusted=true`、`advisory_only=true`、`training_enabled=false`、
+  `week5_enabled=true`；两个 scheduler 的新鲜心跳均为 `status=ok` 且 build commit 匹配。
+- `/app/artifacts` 仍映射到 NAS 持久化 artifacts 卷，现场确认读写挂载。原 `.rollback_image`
+  内容已原样恢复；本次旧镜像 tag 另存于
+  `.rollback_image.codex-deploy-20261012145351-2221226`。先前 NAS 未跟踪数据和暂停的
+  `sa-tail-adj-*` 辅助容器均保留，tracked 工作树干净。
+- 部署健康门早期遇到 API connection reset 和一次 heavy scheduler runtime-state lock timeout；
+  在预留健康窗口内恢复，最终两个 scheduler 心跳通过，当前 lock 文件不存在。未触发回滚。
+
+### 前向快照状态与边界
+
+- 本次部署发生在 2026-10-12 市场收盘之后。部署后的 artifacts 中尚无新格式
+  `tail_observed_input_1445.json`；因此首份生产观察快照仍待下一有效交易日 14:45 运行。
+  production live-runtime 计划覆盖 14:00–14:57、每 5 分钟一次，其中包括 14:45；迟到运行
+  不得冒充 14:45 观察。
+- 生产写入器现在会在慢 pipeline 前把当轮 `watch_pool`、实际分钟 bars 和来源/接收时钟信息
+  写到 `artifacts/runtime/trend_tail_shadow/observed_inputs/<交易日>/` 的不可覆盖快照。
+  采集范围仍只覆盖尾盘影子输入池；新浪价格口径和 bar 时间标签语义未独立核实，快照明确为
+  `full_chain_pit_evidence=false`，不能通过 271 字段 full-chain PIT 审计。
+- 部署脚本对现有 intraday summary 的只读校验为 `reusable=true`，所以未重建或覆盖数据库；
+  其中 1m / 5m 数据最新日期为 `2026-07-17`。该陈旧数据及上游归档桥接问题仍需单独处理。
 
 ### 当前级别与后续门槛
 
-- 部署完成表示生产代码已更新，不表示策略通过质量晋升。271 个完整链路字段仍缺少真实可用时钟证据；
-  阶段二无合格候选，阶段三独立确认与阶段四正式影子均未启动。当前仍为 advisory-only，训练关闭，
-  **不是 Production Ready**。
-- 下一次符合交易日条件的 14:45 live runtime 应在 NAS 持久卷形成第一份新格式观察快照；需复核其
-  运行日期、决策时刻、输入哈希及实际 bars 数量。后续仍须为全链路字段接入真实来源版本、可用 / 采集 /
-  计算时钟和缺失 / 插补记录，才能重跑 271 字段 PIT 审计。不得从文件 mtime 或事后重算补造历史时钟。
+- **PR #107 已全绿合并并部署，生产 API 与 scheduler 身份、健康门通过；系统仍为 advisory-only、训练关闭，
+  不是 Production Ready。**
+- 首份新格式观察快照仍待下一有效交易日 14:45 live runtime。生成后需核对运行日期、决策时刻、输入哈希、
+  实际 bars 数量、供应商时间语义和接收时钟。迟到运行或盘后回读不能补作 14:45 观察。
+- 271 个完整链路字段仍缺少真实来源版本、可用 / 采集 / 计算时钟及缺失 / 插补记录；阶段二无合格候选，
+  阶段三独立确认与阶段四正式影子均未启动。补齐逐字段证据后才能重跑 271 字段 PIT 审计；不得从文件
+  mtime 或事后重算补造历史时钟。
