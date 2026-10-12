@@ -109,9 +109,10 @@ As-of: 2026-10-12 @ HEAD `1e02d342751584ee0ba52a7dd1926c1901e71790`（主线已�
   完整收到的非空 provider 批量响应记录 `source_retrieved_at`；计划快照 `timestamp` 仍单独保留。该时钟
   是应用接收时钟，不是供应商发布时间、逐字段时钟或每只证券独立响应时钟；若接收晚于决策截止，仍不能
   作为该截止时点的可用证据。`ResilientProvider.status()` 暴露配置的 primary mode 及 primary/backup
-  实现类，修复包装后 `source_provider` 为空的问题；这是配置链身份，不证明某次请求实际由哪个 provider
-  返回，fallback 实际来源仍需单次响应级记录。以上只补来源元数据，不能替代 271 字段逐字段来源、版本、
-  可用时钟和采集时钟审计；全链路门继续 fail-closed。
+  实现类；`snapshot.py` 的来源签名在无 status 时回退到配置的 primary mode，使构建时身份与后续新鲜度检查
+  一致，避免 wrapper 快照每次被误判为过期。这是配置链身份，不证明某次请求实际由哪个 provider 返回，
+  fallback 实际来源仍需单次响应级记录。以上只补来源元数据，不能替代 271 字段逐字段来源、版本、可用时钟
+  和采集时钟审计；全链路门继续 fail-closed。
 
 - **验证环境兼容已闭合**：本机原 Python 3.12 环境的 NumPy stub 与项目 mypy 目标 3.11 不兼容；
   使用已有 Python 3.11 解释器和隔离 uv 环境运行 `clean-scope --fail-on-error`，报告 `ok=true`、
@@ -156,6 +157,8 @@ src/stock_analyzer/runtime/services/week5_market_snapshot_service.py
   批量行情快照计划时钟与应用响应接收时钟分离；注入数据不伪造 provider 接收时钟
 src/stock_analyzer/data/resilient_provider.py
   配置 provider mode 与 primary/backup 实现类身份；不声明单次 fallback 的实际来源
+src/stock_analyzer/feature/snapshot.py
+  feature snapshot 来源签名使用配置 provider mode 回退值，保证构建与新鲜度校验一致
 src/stock_analyzer/runtime/services/trend_tail_shadow_service.py
   observed source metadata persistence and contract-local quote clock
 tests/test_week5_automation.py / tests/test_trend_tail_shadow_runtime.py

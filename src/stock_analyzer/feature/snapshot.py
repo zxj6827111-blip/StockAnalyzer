@@ -220,7 +220,12 @@ def compute_source_signature(
     """
     status = provider_status or {}
     parts = [
-        str(status.get("provider_key", status.get("provider_mode", ""))),
+        str(
+            status.get(
+                "provider_key",
+                status.get("provider_mode", config.data_source.primary),
+            )
+        ),
         str(config.evolution.code_commit_id or ""),
         _data_root_layout_fingerprint(config),
     ]
