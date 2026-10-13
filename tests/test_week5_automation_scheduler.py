@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 from stock_analyzer.config import load_config
 from stock_analyzer.runtime.scheduler_supervisor import scheduler_group_for_job
@@ -104,3 +106,22 @@ def test_full_market_automation_scheduler_preserves_success_report() -> None:
 
     assert result["_scheduler_success"] is True
     assert result["_scheduler_detail"] == "week5_automation:empty"
+
+
+def test_live_runtime_scheduler_requests_forward_pit_capture() -> None:
+    service = StockAnalyzerService.__new__(StockAnalyzerService)
+    service._config = SimpleNamespace(week5=SimpleNamespace(auto_notify=False))
+    service._job_now = lambda: datetime(2026, 10, 9, 14, 45)
+    received: dict[str, object] = {}
+
+    def run_live_runtime(**kwargs: object) -> dict[str, object]:
+        received.update(kwargs)
+        return {"ok": True, "status": "ok"}
+
+    service.run_week5_automation_live_runtime = run_live_runtime
+
+    result = service._job_week5_automation_live_runtime()
+
+    assert received["capture_pit_inputs"] is True
+    assert received["timestamp"] == datetime(2026, 10, 9, 14, 45)
+    assert result["_scheduler_success"] is True

@@ -9,7 +9,7 @@ from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from contextvars import ContextVar
 from copy import deepcopy
-from datetime import date, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from time import perf_counter, perf_counter_ns
 from typing import Protocol, TypedDict, cast
@@ -27,7 +27,7 @@ from stock_analyzer.data.provider import (
     fetch_intraday_summaries_compat,
 )
 from stock_analyzer.data.provider_factory import build_runtime_provider
-from stock_analyzer.feature.engineer import FeatureEngineer
+from stock_analyzer.feature.engineer import FEATURE_COMPUTE_VERSION, FeatureEngineer
 from stock_analyzer.feature.market_context import build_market_relative_frame
 from stock_analyzer.filter.fall_then_rise import FallThenRiseFilter
 from stock_analyzer.filter.financial import FinancialRiskFilter
@@ -92,6 +92,7 @@ class SymbolTransformInputs(TypedDict):
     market_index: pd.DataFrame | None
     feature_prepare_ms: float
     provider_status: dict[str, object]
+    pit_inputs_available_at: str
 
 
 class SymbolTransformResult(TypedDict):
@@ -332,6 +333,8 @@ class AnalyzerPipeline:
         self._last_symbol_stage_ms: list[SymbolStageTiming] = []
         # post_scan_enrichment 捕获开关（默认关闭，week5 monster 扫描显式开启）。
         self._capture_post_scan_enrichment = False
+        # 仅尾盘决策轮显式开启；普通 pipeline 不增加报告体积。
+        self._capture_pit_inputs = False
         self._last_parallel_transform: dict[str, object] = {
             "enabled": False,
             "configured_workers": 1,
@@ -382,6 +385,7 @@ class AnalyzerPipeline:
         on_symbol_progress: Callable[[str, int, int, bool], None] | None = None,
         transform_max_workers: int = 1,
         capture_post_scan_enrichment: bool = False,
+        capture_pit_inputs: bool = False,
         as_of: date | None = None,
     ) -> PipelineReport:
         """Run one signal-generation pass.
@@ -426,6 +430,7 @@ class AnalyzerPipeline:
                 on_symbol_progress=on_symbol_progress,
                 transform_max_workers=transform_max_workers,
                 capture_post_scan_enrichment=capture_post_scan_enrichment,
+                capture_pit_inputs=capture_pit_inputs,
                 as_of=as_of,
             )
         finally:
@@ -441,6 +446,7 @@ class AnalyzerPipeline:
         on_symbol_progress: Callable[[str, int, int, bool], None] | None = None,
         transform_max_workers: int = 1,
         capture_post_scan_enrichment: bool = False,
+        capture_pit_inputs: bool = False,
         as_of: date | None = None,
     ) -> PipelineReport:
         trace_id = uuid4().hex[:16]
@@ -448,6 +454,7 @@ class AnalyzerPipeline:
         # 本次运行是否捕获 post_scan_enrichment（first-board/anomaly 复用 bars，
         # 避免二次拉取）。通用路径默认关闭，week5 monster 扫描显式开启。
         self._capture_post_scan_enrichment = bool(capture_post_scan_enrichment)
+        self._capture_pit_inputs = bool(capture_pit_inputs)
         self._stage_ms_accum = {
             "fetch_bars_ms": 0.0,
             "feature_engine_ms": 0.0,
@@ -1500,6 +1507,9 @@ class AnalyzerPipeline:
                 "market_index": market_index,
                 "feature_prepare_ms": feature_prepare_ms,
                 "provider_status": provider_status,
+                # 这是应用拿到这一只证券全部 pipeline 输入（daily/intraday/market
+                # context）的时钟，不等于供应商发布时间或独立可信时间戳。
+                "pit_inputs_available_at": datetime.now(UTC).isoformat(),
             },
         )
 
@@ -1893,6 +1903,42 @@ class AnalyzerPipeline:
                 "target_position": round(decision.target_position, 4),
             },
         }
+
+        if self._capture_pit_inputs:
+            # 保存模型实际收到的最新特征行，便于后续将特征和输入源做逐字段对账。
+            # 这只是应用观察到的输入副本；配置链身份不能证明本次 fallback 的实际来源，
+            # 也不替代逐字段来源文件 SHA 与供应商发布时间。
+            feature_columns = [str(column) for column in features.columns]
+            feature_row = (
+                json.loads(features.tail(1).to_json(orient="records", date_format="iso"))[0]
+                if not features.empty
+                else {}
+            )
+            provider_source = inputs["provider_status"]
+            decision_trace["pit_input_capture"] = {
+                "schema": "tail_pipeline_input_capture.v1",
+                "scope": "legacy_feature_engineer_latest_row",
+                "input_available_at": inputs["pit_inputs_available_at"],
+                "computed_at": datetime.now(UTC).isoformat(),
+                "feature_compute_version": FEATURE_COMPUTE_VERSION,
+                "feature_columns": feature_columns,
+                "feature_columns_sha256": hashlib.sha256(
+                    "\n".join(feature_columns).encode("utf-8")
+                ).hexdigest(),
+                "features": feature_row,
+                "provider_chain": {
+                    key: provider_source.get(key)
+                    for key in (
+                        "provider_mode",
+                        "primary_provider",
+                        "backup_provider",
+                        "degraded_mode",
+                        "last_error",
+                    )
+                    if key in provider_source
+                },
+                "source_identity_status": "configured_chain_only_actual_response_not_attested",
+            }
 
         learning_persist_started = perf_counter()
         learning_protocol_ref = self._persist_learning_snapshot(

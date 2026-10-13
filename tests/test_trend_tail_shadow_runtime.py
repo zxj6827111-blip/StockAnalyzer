@@ -521,12 +521,17 @@ def test_live_and_history_chain_paths_agree_on_identical_bars(tmp_path) -> None:
 
 def test_live_latest_confirmation_slot_archives_immutable_input_snapshot(tmp_path) -> None:
     decision_time = datetime(2026, 10, 9, 14, 45, 12, tzinfo=ZoneInfo("Asia/Shanghai"))
+    runtime_context = {
+        "schema": "tail_live_runtime_context.v1",
+        "pipeline_report": {"trace_id": "pipeline-1445"},
+    }
     report = _run(
         tmp_path,
         watch_pool=_pool(["600000.SH"]),
         probabilities={"600000.SH": 0.9},
         bars={},
         timestamp=decision_time,
+        runtime_context=runtime_context,
     )
 
     capture = report["observed_input_snapshot"]
@@ -540,6 +545,8 @@ def test_live_latest_confirmation_slot_archives_immutable_input_snapshot(tmp_pat
     assert saved["decision_at"] == decision_time.isoformat(timespec="microseconds")
     assert saved["input_symbol_count"] == 1
     assert saved["minute_bars"] == {}
+    assert saved["runtime_context"] == runtime_context
+    assert saved["capture_scope"] == "tail_shadow_watch_pool_minute_and_runtime_context"
 
 
 def test_aware_runtime_clock_records_minute_source_and_matches_local_confirmation_slots(
