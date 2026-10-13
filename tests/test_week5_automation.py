@@ -737,6 +737,84 @@ def test_live_runtime_enables_capture_only_for_scheduled_decision_slot(
     assert result["pit_runtime_capture"]["full_chain_pit_evidence"] is False
 
 
+def test_live_runtime_skips_pipeline_capture_when_minute_collection_started_late(
+    tmp_path: Path,
+) -> None:
+    service = FakeService(tmp_path)
+    automation = RuntimeWeek5AutomationService(service)
+    scheduled_at = datetime(2026, 10, 9, 14, 45, tzinfo=ZoneInfo("Asia/Shanghai"))
+    automation._candidate_state.update(
+        {
+            "dynamic_candidate_pool": [{"symbol": "600000.SH", "radar_score": 100}],
+            "dynamic_candidate_pool_trade_date": "2026-10-09",
+        },
+        updated_at=scheduled_at,
+    )
+    _stub_live_snapshot(automation, scheduled_at, ["600000.SH"])
+    automation._collect_tail_shadow_minute_inputs = lambda **_: {
+        "status": "blocked",
+        "capture_role": "decision_input",
+        "capture_time": datetime(2026, 10, 9, 14, 46, tzinfo=scheduled_at.tzinfo),
+        "minute_bars": {},
+        "minute_bar_sources": {},
+        "summary": {"reason": "capture_started_outside_scheduled_minute"},
+    }
+    automation._trend_tail_shadow_report = lambda **_: {"status": "not_captured"}
+
+    automation.run_live_runtime(timestamp=scheduled_at, capture_pit_inputs=True)
+
+    assert "capture_pit_inputs" not in service.pipeline_calls[0]
+    assert "capture_post_scan_enrichment" not in service.pipeline_calls[0]
+
+
+def test_live_runtime_reports_when_pipeline_finishes_after_decision_minute(
+    tmp_path: Path, monkeypatch
+) -> None:
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            zone = tz or ZoneInfo("Asia/Shanghai")
+            return cls(2026, 10, 9, 14, 46, 5, tzinfo=zone)
+
+    monkeypatch.setattr(automation_module, "datetime", FrozenDateTime)
+    service = FakeService(tmp_path)
+    automation = RuntimeWeek5AutomationService(service)
+    scheduled_at = datetime(2026, 10, 9, 14, 45, tzinfo=ZoneInfo("Asia/Shanghai"))
+    automation._candidate_state.update(
+        {
+            "dynamic_candidate_pool": [{"symbol": "600000.SH", "radar_score": 100}],
+            "dynamic_candidate_pool_trade_date": "2026-10-09",
+        },
+        updated_at=scheduled_at,
+    )
+    _stub_live_snapshot(automation, scheduled_at, ["600000.SH"])
+    automation._collect_tail_shadow_minute_inputs = lambda **_: {
+        "status": "captured",
+        "capture_role": "decision_input",
+        "capture_time": FrozenDateTime(
+            2026, 10, 9, 14, 45, 15, tzinfo=scheduled_at.tzinfo
+        ),
+        "minute_bars": {"600000.SH": []},
+        "minute_bar_sources": {},
+        "summary": {},
+    }
+    automation._trend_tail_shadow_report = lambda **_: {
+        "observed_input_snapshot": None,
+    }
+
+    result = automation.run_live_runtime(
+        timestamp=scheduled_at,
+        capture_pit_inputs=True,
+    )
+
+    assert service.pipeline_calls[0]["capture_pit_inputs"] is True
+    assert result["pit_runtime_capture"]["status"] == "not_persisted"
+    assert (
+        result["pit_runtime_capture"]["reason"]
+        == "pipeline_completed_outside_decision_minute"
+    )
+
+
 def test_market_radar_full_market_flag_blocks_manual_run(tmp_path: Path) -> None:
     service = FakeService(tmp_path)
     service._config.week5.market_radar_full_market_enabled = False

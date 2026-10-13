@@ -1286,9 +1286,22 @@ class RuntimeWeek5AutomationService:
             pool_rows=pool_rows,
             scheduled_at=scheduled_at,
         )
+        raw_capture_time = minute_capture.get("capture_time")
+        capture_time_in_scheduled_minute = False
+        if (
+            isinstance(raw_capture_time, datetime)
+            and raw_capture_time.tzinfo is not None
+            and scheduled_at.tzinfo is not None
+        ):
+            observed_capture_time = raw_capture_time.astimezone(scheduled_at.tzinfo)
+            capture_time_in_scheduled_minute = (
+                observed_capture_time.date() == scheduled_at.date()
+                and observed_capture_time.strftime("%H:%M") == scheduled_at.strftime("%H:%M")
+            )
         runtime_capture_requested = bool(
             capture_pit_inputs
             and minute_capture.get("capture_role") == "decision_input"
+            and capture_time_in_scheduled_minute
         )
         candidates = [
             str(row.get("symbol", "")).strip()
