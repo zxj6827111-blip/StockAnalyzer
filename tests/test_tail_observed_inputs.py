@@ -80,3 +80,29 @@ def test_snapshot_rejects_trade_date_mismatch(tmp_path: Path) -> None:
     )
     assert result is None
     assert not (tmp_path / "observed_inputs").exists()
+
+
+def test_runtime_context_is_saved_but_keeps_candidate_scope_limitation(tmp_path: Path) -> None:
+    timestamp = datetime(2026, 10, 9, 14, 45, 20, tzinfo=ZoneInfo("Asia/Shanghai"))
+    context = {
+        "schema": "tail_live_runtime_context.v1",
+        "symbols": ["600000.SH"],
+        "pipeline_report": {"signals": [{"symbol": "600000.SH"}]},
+    }
+
+    result = write_tail_observed_input_snapshot(
+        tmp_path,
+        timestamp=timestamp,
+        trade_date=date(2026, 10, 9),
+        contract=DEFAULT_TREND_CONTRACT,
+        watch_pool=[{"symbol": "600000.SH"}],
+        minute_bars={},
+        runtime_context=context,
+    )
+
+    assert result is not None and result["status"] == "captured"
+    assert result["capture_scope"] == "tail_shadow_watch_pool_minute_and_runtime_context"
+    payload = json.loads(Path(result["path"]).read_text(encoding="utf-8"))
+    assert payload["runtime_context"] == context
+    assert "runtime_context_is_not_per_field_pit_evidence" in payload["limitations"]
+    assert payload["full_chain_pit_evidence"] is False

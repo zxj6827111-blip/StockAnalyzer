@@ -148,6 +148,7 @@ class _StaticPipeline:
         on_symbol_progress: object | None = None,
         transform_max_workers: int = 1,
         capture_post_scan_enrichment: bool = False,
+        capture_pit_inputs: bool = False,
     ) -> PipelineReport:
         _ = (
             symbols,
@@ -156,6 +157,7 @@ class _StaticPipeline:
             on_symbol_progress,
             transform_max_workers,
             capture_post_scan_enrichment,
+            capture_pit_inputs,
         )
         return self._report
 

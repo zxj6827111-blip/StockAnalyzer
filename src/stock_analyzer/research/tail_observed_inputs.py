@@ -55,6 +55,7 @@ def write_tail_observed_input_snapshot(
     watch_pool: Sequence[Mapping[str, Any]],
     minute_bars: Mapping[str, Any],
     minute_bar_sources: Mapping[str, Any] | None = None,
+    runtime_context: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """在最后一个确认时点写一次不可覆盖的输入快照。
 
@@ -83,10 +84,16 @@ def write_tail_observed_input_snapshot(
             for bar_time, bar in bars
         ]
 
+    capture_scope = (
+        "tail_shadow_watch_pool_minute_and_runtime_context"
+        if runtime_context is not None
+        else "tail_shadow_watch_pool_and_minute_inputs_only"
+    )
     payload = {
         "schema": SCHEMA,
         "capture_mode": "observed_snapshot",
-        "capture_scope": "tail_shadow_watch_pool_and_minute_inputs_only",
+        "capture_scope": capture_scope,
+        "full_chain_pit_evidence": False,
         "trade_date": trade_date.isoformat(),
         "decision_at": local.isoformat(timespec="microseconds"),
         "captured_at": local.isoformat(timespec="microseconds"),
@@ -103,9 +110,11 @@ def write_tail_observed_input_snapshot(
         "watch_pool": _json_value(watch_pool),
         "minute_bars": normalized_bars,
         "minute_bar_sources": _json_value(minute_bar_sources or {}),
+        "runtime_context": _json_value(runtime_context) if runtime_context is not None else None,
         "limitations": [
             "does_not_include_the_full_market_candidate_universe",
             "does_not_attest_per_field_source_availability_or_imputation_history",
+            "runtime_context_is_not_per_field_pit_evidence",
             "does_not_pass_full_chain_field_pit_audit_by_itself",
         ],
     }

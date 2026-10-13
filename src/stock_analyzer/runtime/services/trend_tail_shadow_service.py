@@ -171,6 +171,7 @@ class TrendTailShadowService:
         slippage_ratio: float = 0.0,
         write_artifacts: bool = True,
         trade_date: date | str | None = None,
+        runtime_context: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """跑一次尾盘确认。
 
@@ -208,6 +209,7 @@ class TrendTailShadowService:
                     watch_pool=rows,
                     minute_bars=bar_map,
                     minute_bar_sources=minute_bar_sources or {},
+                    runtime_context=runtime_context,
                 )
             except OSError as exc:
                 # 快照写失败要进入报告，但不能打断只读影子任务或其旧输出。

@@ -1254,3 +1254,31 @@ def test_post_scan_enrichment_uses_gate_pre_raw_bars() -> None:
     assert isinstance(rows, list) and rows
     # 反序列化后的最新收盘 == gate 前原始最新收盘（含被 time-gate 丢弃的行）。
     assert float(rows[-1]["close"]) == pytest.approx(provider.original_latest_close["600000"])
+
+
+def test_pit_capture_records_latest_feature_row_and_separate_clocks() -> None:
+    config = _load_test_config()
+    service = _new_service(config)
+    pipeline = cast(AnalyzerPipeline, service._pipeline)
+
+    report = pipeline.run_once(
+        symbols=["600000"],
+        strategy="trend",
+        current_equity=1.0,
+        capture_pit_inputs=True,
+    )
+
+    capture = _as_mapping(report.signals[0].decision_trace["pit_input_capture"])
+    assert capture["schema"] == "tail_pipeline_input_capture.v1"
+    assert capture["scope"] == "legacy_feature_engineer_latest_row"
+    assert capture["feature_columns"]
+    assert set(capture["feature_columns"]) == set(capture["features"])
+    available_at = datetime.fromisoformat(str(capture["input_available_at"]))
+    computed_at = datetime.fromisoformat(str(capture["computed_at"]))
+    assert available_at.tzinfo is not None
+    assert computed_at.tzinfo is not None
+    assert computed_at >= available_at
+    assert (
+        capture["source_identity_status"]
+        == "configured_chain_only_actual_response_not_attested"
+    )

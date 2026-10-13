@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict
 from datetime import UTC, datetime, tzinfo
 from queue import Empty, Queue
 from threading import Event, Lock, Thread
@@ -1274,15 +1275,33 @@ class RuntimeWeek5AutomationService:
         *,
         timestamp: datetime | None = None,
         notify_enabled: bool = False,
+        capture_pit_inputs: bool = False,
     ) -> dict[str, object]:
         service = self._service
-        now = self._automation_now(timestamp)
+        scheduled_at = self._automation_now(timestamp)
         state = self.candidate_state()
-        pool_rows = self._live_runtime_pool(state, now)
+        pool_rows = self._live_runtime_pool(state, scheduled_at)
         # 尾盘行情在耗时 pipeline 之前取样，14:45 留决策快照，后续窗口只供成交评估。
         minute_capture = self._collect_tail_shadow_minute_inputs(
             pool_rows=pool_rows,
-            scheduled_at=now,
+            scheduled_at=scheduled_at,
+        )
+        raw_capture_time = minute_capture.get("capture_time")
+        capture_time_in_scheduled_minute = False
+        if (
+            isinstance(raw_capture_time, datetime)
+            and raw_capture_time.tzinfo is not None
+            and scheduled_at.tzinfo is not None
+        ):
+            observed_capture_time = raw_capture_time.astimezone(scheduled_at.tzinfo)
+            capture_time_in_scheduled_minute = (
+                observed_capture_time.date() == scheduled_at.date()
+                and observed_capture_time.strftime("%H:%M") == scheduled_at.strftime("%H:%M")
+            )
+        runtime_capture_requested = bool(
+            capture_pit_inputs
+            and minute_capture.get("capture_role") == "decision_input"
+            and capture_time_in_scheduled_minute
         )
         candidates = [
             str(row.get("symbol", "")).strip()
@@ -1292,16 +1311,38 @@ class RuntimeWeek5AutomationService:
         pipeline_report: dict[str, object] = {}
         snapshot: dict[str, object] = {"status": "not_requested"}
         if candidates:
-            snapshot = self._market_snapshots.capture(timestamp=now)
-            pipeline_report = service.run_pipeline(
-                symbols=candidates,
-                strategy="trend",
-                current_equity=service._state.current_equity,
-                use_live_runtime=True,
-                dry_run_execution=True,
-                notify_enabled=notify_enabled,
-                notify_in_dry_run=notify_enabled,
-                job_name="week5_live_runtime_signal_only",
+            snapshot = self._market_snapshots.capture(timestamp=scheduled_at)
+            pipeline_kwargs: dict[str, Any] = {
+                "symbols": candidates,
+                "strategy": "trend",
+                "current_equity": service._state.current_equity,
+                "use_live_runtime": True,
+                "dry_run_execution": True,
+                "notify_enabled": notify_enabled,
+                "notify_in_dry_run": notify_enabled,
+                "job_name": "week5_live_runtime_signal_only",
+            }
+            if runtime_capture_requested:
+                pipeline_kwargs.update(
+                    capture_post_scan_enrichment=True,
+                    capture_pit_inputs=True,
+                )
+            pipeline_report = service.run_pipeline(**pipeline_kwargs)
+
+        # scheduler 传入的 timestamp 是计划时钟；只有显式生产采集轮次才用真实
+        # pipeline 完成时钟作为决策时钟。回放/手工调用保持原有时钟语义。
+        decision_at = scheduled_at
+        if runtime_capture_requested:
+            decision_at = datetime.now(scheduled_at.tzinfo or UTC)
+
+        runtime_context: dict[str, Any] | None = None
+        if runtime_capture_requested:
+            runtime_context = self._build_tail_runtime_context(
+                scheduled_at=scheduled_at,
+                decision_at=decision_at,
+                candidates=candidates,
+                market_snapshot=snapshot,
+                pipeline_report=pipeline_report,
             )
         actionable = _filter_actionable_rows(
             _mapping_list(pipeline_report.get("actionable_signals"))[:5],
@@ -1310,7 +1351,7 @@ class RuntimeWeek5AutomationService:
         live_signals = _mapping_list(pipeline_report.get("signals"))
         live_financial_trust = _financial_trust_from_rows(live_signals or actionable)
         snapshot_rows = _mapping_list(snapshot.get("rows")) if candidates else []
-        live_age_sec = _snapshot_age_sec(snapshot_rows, now, symbols=set(candidates))
+        live_age_sec = _snapshot_age_sec(snapshot_rows, decision_at, symbols=set(candidates))
         live_gate_reasons: list[str] = []
         if live_financial_trust not in {"reported", "derived"}:
             live_gate_reasons.append("financial_trust_insufficient")
@@ -1323,7 +1364,9 @@ class RuntimeWeek5AutomationService:
         report: dict[str, object] = {
             "ok": True,
             "status": "ok" if candidates else "empty",
-            "timestamp": now.isoformat(),
+            "timestamp": scheduled_at.isoformat(),
+            "scheduled_at": scheduled_at.isoformat(),
+            "decision_at": decision_at.isoformat(),
             "symbols": candidates,
             "symbol_count": len(candidates),
             "live_runtime_cap": self._cfg_int("live_runtime_max_symbols", 8),
@@ -1350,11 +1393,37 @@ class RuntimeWeek5AutomationService:
         }
         report["trend_tail_shadow"] = self._trend_tail_shadow_report(
             pool_rows=pool_rows,
-            now=minute_capture["capture_time"],
+            now=(
+                decision_at
+                if runtime_capture_requested
+                else minute_capture["capture_time"]
+            ),
             minute_bars=minute_capture["minute_bars"],
             minute_bar_sources=minute_capture["minute_bar_sources"],
             minute_capture_summary=minute_capture["summary"],
+            runtime_context=runtime_context,
         )
+        if runtime_capture_requested:
+            capture_report = _mapping(
+                _mapping(report.get("trend_tail_shadow")).get("observed_input_snapshot")
+            )
+            capture_in_slot = (
+                decision_at.date() == scheduled_at.date()
+                and decision_at.strftime("%H:%M")
+                == str(self._trend_tail_shadow._contract.latest_confirmation_clock)
+            )
+            report["pit_runtime_capture"] = {
+                "status": str(capture_report.get("status", "not_persisted")),
+                "reason": (
+                    str(capture_report.get("reason", ""))
+                    if capture_in_slot
+                    else "pipeline_completed_outside_decision_minute"
+                ),
+                "decision_at": decision_at.isoformat(),
+                "scheduled_at": scheduled_at.isoformat(),
+                "symbol_count": len(candidates),
+                "full_chain_pit_evidence": False,
+            }
         self._emit_actionable_notifications(
             report,
             notify_enabled=notify_enabled,
@@ -1366,13 +1435,92 @@ class RuntimeWeek5AutomationService:
                 # 驻留计时永远归零、保护条件永远无法满足。行级持久化保证
                 # 现任成员的驻留跨轮连续。
                 "live_runtime": pool_rows,
-                "live_runtime_trade_date": now.date().isoformat(),
+                "live_runtime_trade_date": scheduled_at.date().isoformat(),
                 "latest_live_runtime": report,
             },
-            updated_at=now,
-            trade_date=now.date().isoformat(),
+            updated_at=scheduled_at,
+            trade_date=scheduled_at.date().isoformat(),
         )
         return report
+
+    def _build_tail_runtime_context(
+        self,
+        *,
+        scheduled_at: datetime,
+        decision_at: datetime,
+        candidates: Sequence[str],
+        market_snapshot: Mapping[str, Any],
+        pipeline_report: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """保存候选级运行上下文；此副本仍不构成逐字段 PIT 来源证明。"""
+        candidate_set = {str(symbol).strip() for symbol in candidates if str(symbol).strip()}
+        snapshot_rows = [
+            row
+            for row in _mapping_list(market_snapshot.get("rows"))
+            if str(row.get("symbol", "")).strip() in candidate_set
+        ]
+        feature_context: dict[str, Any] = {
+            "status": "unavailable",
+            "source_role": "context_only_not_attested_as_pipeline_input",
+            "rows": {},
+        }
+        try:
+            manifest, frame = load_feature_snapshot(self._service._config)
+            if manifest is None or frame is None:
+                feature_context["reason"] = "feature_snapshot_missing_or_unreadable"
+            else:
+                indexed_symbols = {str(symbol): symbol for symbol in frame.index}
+                feature_rows = {
+                    symbol: frame.loc[indexed_symbols[symbol]].to_dict()
+                    for symbol in sorted(candidate_set)
+                    if symbol in indexed_symbols
+                }
+                manifest_payload = asdict(manifest)
+                per_symbol = manifest_payload.pop("per_symbol", {})
+                manifest_payload["candidate_symbols"] = {
+                    symbol: per_symbol[symbol]
+                    for symbol in sorted(candidate_set)
+                    if isinstance(per_symbol, Mapping) and symbol in per_symbol
+                }
+                feature_context.update(
+                    {
+                        "status": "loaded",
+                        "is_current": snapshot_is_current(
+                            manifest, self._service._config, decision_at
+                        ),
+                        "manifest": manifest_payload,
+                        "candidate_row_count": len(feature_rows),
+                        "rows": feature_rows,
+                    }
+                )
+        except Exception as exc:  # noqa: BLE001 - context capture must not stop signal-only run
+            feature_context["status"] = "error"
+            feature_context["reason"] = type(exc).__name__
+
+        return {
+            "schema": "tail_live_runtime_context.v1",
+            "capture_scope": "live_runtime_candidates_only",
+            "scheduled_at": scheduled_at,
+            "decision_at": decision_at,
+            "symbol_count": len(candidate_set),
+            "symbols": sorted(candidate_set),
+            "market_snapshot": {
+                "snapshot_id": str(market_snapshot.get("snapshot_id", "")),
+                "status": str(market_snapshot.get("status", "unknown")),
+                "timestamp": market_snapshot.get("timestamp"),
+                "source_retrieved_at": market_snapshot.get("source_retrieved_at"),
+                "candidate_rows": snapshot_rows,
+            },
+            "pipeline_report": dict(pipeline_report),
+            "feature_snapshot": feature_context,
+            "limitations": [
+                "candidate_scope_only_not_full_market_universe",
+                "feature_snapshot_is_context_not_attested_as_pipeline_input",
+                "configured_provider_chain_does_not_attest_actual_response_source",
+                "does_not_include_per_field_vendor_publication_time_or_raw_source_hash",
+                "not_full_chain_271_field_pit_evidence",
+            ],
+        }
 
     def _collect_tail_shadow_minute_inputs(
         self,
@@ -1585,6 +1733,7 @@ class RuntimeWeek5AutomationService:
         minute_bars: Mapping[str, Sequence[tuple[datetime, Mapping[str, Any]]]] | None = None,
         minute_bar_sources: Mapping[str, Mapping[str, Any]] | None = None,
         minute_capture_summary: Mapping[str, Any] | None = None,
+        runtime_context: Mapping[str, Any] | None = None,
     ) -> dict[str, object]:
         """跑一次尾盘影子链路，使用本轮实时取得的分钟输入。
 
@@ -1604,6 +1753,7 @@ class RuntimeWeek5AutomationService:
                     watch_pool=[dict(row) for row in pool_rows],
                     minute_bars=minute_bars or {},
                     minute_bar_sources=minute_bar_sources or {},
+                    runtime_context=runtime_context,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - job 边界：失败可见但不中断主链

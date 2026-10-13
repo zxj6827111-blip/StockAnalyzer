@@ -4556,6 +4556,7 @@ class StockAnalyzerService:
         on_symbol_progress: Callable[[str, int, int, bool], None] | None = None,
         transform_max_workers: int = 1,
         capture_post_scan_enrichment: bool = False,
+        capture_pit_inputs: bool = False,
     ) -> dict[str, object]:
         advisory_only_mode = bool(self._config.app.advisory_only)
         execution_dry_run = bool(dry_run_execution)
@@ -4656,6 +4657,7 @@ class StockAnalyzerService:
                 on_symbol_progress=on_symbol_progress,
                 transform_max_workers=max(1, int(transform_max_workers)),
                 capture_post_scan_enrichment=capture_post_scan_enrichment,
+                capture_pit_inputs=capture_pit_inputs,
             )
             pipeline_stage_ms = getattr(pipeline, "_last_pipeline_stage_ms", None)
             pipeline_symbol_ms = getattr(pipeline, "_last_symbol_stage_ms", None)
@@ -16802,10 +16804,12 @@ class StockAnalyzerService:
         *,
         timestamp: datetime | None = None,
         notify_enabled: bool = False,
+        capture_pit_inputs: bool = False,
     ) -> dict[str, object]:
         return self._week5_automation_service.run_live_runtime(
             timestamp=timestamp,
             notify_enabled=notify_enabled,
+            capture_pit_inputs=capture_pit_inputs,
         )
 
     def latest_week5_automation_live_runtime(self) -> dict[str, object]:
@@ -20730,6 +20734,7 @@ class StockAnalyzerService:
             self.run_week5_automation_live_runtime(
                 timestamp=current,
                 notify_enabled=self._config.week5.auto_notify,
+                capture_pit_inputs=True,
             )
         )
 

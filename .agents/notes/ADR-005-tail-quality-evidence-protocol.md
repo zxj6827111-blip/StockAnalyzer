@@ -2,7 +2,7 @@
 
 Status: Draft
 
-As-of: 2026-10-12 @ HEAD `1e02d342751584ee0ba52a7dd1926c1901e71790`（主线已部署 live 14:45 分钟 producer；运行时批量行情快照新增应用接收时钟和配置来源链标识，待 PR 合并部署后验证；271 字段仍无完整字段级 PIT 证据；策略仍无合格候选）
+As-of: 2026-10-12 @ HEAD `5e4fe71fd8962b1bd57271979abb85caf1d52dab`（已核对主 pipeline 的 14:45 候选级运行上下文捕获实现、迟到拒收和定向验证；该提交待 PR / NAS 验证；271 字段仍无完整字段级 PIT 证据；策略仍无合格候选）
 
 ## 1. 决策范围
 
@@ -114,6 +114,15 @@ As-of: 2026-10-12 @ HEAD `1e02d342751584ee0ba52a7dd1926c1901e71790`（主线已�
   fallback 实际来源仍需单次响应级记录。以上只补来源元数据，不能替代 271 字段逐字段来源、版本、可用时钟
   和采集时钟审计；全链路门继续 fail-closed。
 
+- **14:45 主 pipeline 运行上下文前向捕获（代码已实现，待 PR / NAS 首次运行验证）**：只有生产调度的
+  `decision_input` 槽会开启捕获。主 pipeline 为每个候选信号留存 legacy `FeatureEngineer` 最新特征行、
+  特征版本和列摘要，并记录应用拿到全部 pipeline 输入的时钟与特征计算时钟；不可覆盖快照另存本轮
+  pipeline 报告、候选对应的批量行情行，以及明确标成“上下文”的 `features_light` 候选行。`scheduled_at`
+  与 pipeline 完成后的 `decision_at` 分开，实时行情陈旧度按实际决策时钟计算。若 pipeline 完成时已离开
+  14:45 分钟，采集报告会标为未留档，不把晚到数据伪装成该槽输入。此捕获仍限候选池；provider 仅记录配置链，
+  不证明单次响应的实际 fallback 来源；仍缺逐字段供应商发布时间、来源文件 SHA 和字段级可用时钟，故不是
+  271 字段 PIT 证据，审计与晋升门继续 fail-closed。
+
 - **验证环境兼容已闭合**：本机原 Python 3.12 环境的 NumPy stub 与项目 mypy 目标 3.11 不兼容；
   使用已有 Python 3.11 解释器和隔离 uv 环境运行 `clean-scope --fail-on-error`，报告 `ok=true`、
   blocking/nonblocking failures 均为空。环境路径、命令与本轮报告记在
@@ -152,7 +161,11 @@ scripts/audit_tail_field_pit.py
 src/stock_analyzer/research/tail_observed_inputs.py
   immutable 14:45 observed input snapshot; minute-bar source/collection metadata; never full-chain PIT evidence
 src/stock_analyzer/runtime/services/week5_automation_service.py
-  forward-only live 1-minute producer; same-day and decision-clock filtering; fail-closed late/missing capture
+  forward-only live 1-minute producer; 14:45 candidate-only pipeline/runtime context; same-day and decision-clock filtering; fail-closed late/missing capture
+src/stock_analyzer/pipeline.py
+  per-symbol legacy latest-feature capture with input/computation clocks and feature-column digest; source identity remains unattested
+src/stock_analyzer/runtime/service.py
+  scheduler-only activation of production PIT input capture; propagate capture flags into the pipeline
 src/stock_analyzer/runtime/services/week5_market_snapshot_service.py
   批量行情快照计划时钟与应用响应接收时钟分离；注入数据不伪造 provider 接收时钟
 src/stock_analyzer/data/resilient_provider.py
@@ -161,8 +174,8 @@ src/stock_analyzer/feature/snapshot.py
   feature snapshot 来源签名使用配置 provider mode 回退值，保证构建与新鲜度校验一致
 src/stock_analyzer/runtime/services/trend_tail_shadow_service.py
   observed source metadata persistence and contract-local quote clock
-tests/test_week5_automation.py / tests/test_trend_tail_shadow_runtime.py
-  live capture filtering, late-window rejection, source metadata persistence, and timezone comparison
+tests/test_week5_automation.py / tests/test_week5_automation_scheduler.py / tests/test_trend_tail_shadow_runtime.py / tests/test_tail_observed_inputs.py / tests/test_week5_scan_funnel_policy.py
+  live capture filtering, scheduler activation, late-window rejection, immutable runtime-context persistence, feature-row shape, and clock ordering
 src/stock_analyzer/research/tail_score_direction.py
   same-pool daily high/low raw-score Top-K selection and paired moving-block comparison
 scripts/audit_tail_score_direction.py
