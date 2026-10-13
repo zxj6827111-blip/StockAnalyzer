@@ -1303,6 +1303,26 @@ class RuntimeWeek5AutomationService:
             and minute_capture.get("capture_role") == "decision_input"
             and capture_time_in_scheduled_minute
         )
+        observed_input_snapshot: dict[str, Any] | None = None
+        if runtime_capture_requested and isinstance(raw_capture_time, datetime):
+            contract = self._trend_tail_shadow._contract
+            capture_zone = ZoneInfo(str(contract.timezone))
+            capture_time = raw_capture_time.astimezone(capture_zone)
+            try:
+                # 分钟行情已在计划槽内收到；先落不可覆盖的原始观察输入，再运行可能跨槽的 pipeline。
+                observed_input_snapshot = self._trend_tail_shadow.capture_observed_inputs(
+                    timestamp=capture_time,
+                    trade_date=capture_time.date(),
+                    watch_pool=pool_rows,
+                    minute_bars=minute_capture["minute_bars"],
+                    minute_bar_sources=minute_capture["minute_bar_sources"],
+                )
+            except OSError as exc:
+                observed_input_snapshot = {
+                    "status": "failed",
+                    "reason": f"snapshot_write_failed:{type(exc).__name__}",
+                    "full_chain_pit_evidence": False,
+                }
         candidates = [
             str(row.get("symbol", "")).strip()
             for row in pool_rows
@@ -1402,23 +1422,31 @@ class RuntimeWeek5AutomationService:
             minute_bar_sources=minute_capture["minute_bar_sources"],
             minute_capture_summary=minute_capture["summary"],
             runtime_context=runtime_context,
+            observed_input_snapshot=observed_input_snapshot,
         )
         if runtime_capture_requested:
-            capture_report = _mapping(
-                _mapping(report.get("trend_tail_shadow")).get("observed_input_snapshot")
-            )
+            capture_report = observed_input_snapshot or {}
             capture_in_slot = (
                 decision_at.date() == scheduled_at.date()
                 and decision_at.strftime("%H:%M")
                 == str(self._trend_tail_shadow._contract.latest_confirmation_clock)
             )
+            capture_status = str(capture_report.get("status", "not_persisted"))
+            capture_reason = str(capture_report.get("reason", ""))
             report["pit_runtime_capture"] = {
-                "status": str(capture_report.get("status", "not_persisted")),
-                "reason": (
-                    str(capture_report.get("reason", ""))
-                    if capture_in_slot
-                    else "pipeline_completed_outside_decision_minute"
+                "status": (
+                    capture_status
+                    if capture_in_slot and capture_status == "captured"
+                    else "blocked"
                 ),
+                "reason": capture_reason or (
+                    "pipeline_completed_outside_decision_minute"
+                    if not capture_in_slot
+                    else capture_status
+                ),
+                "observed_input_snapshot_status": capture_status,
+                "observed_input_snapshot_path": str(capture_report.get("path", "")),
+                "observed_input_snapshot_sha256": str(capture_report.get("sha256", "")),
                 "decision_at": decision_at.isoformat(),
                 "scheduled_at": scheduled_at.isoformat(),
                 "symbol_count": len(candidates),
@@ -1734,6 +1762,7 @@ class RuntimeWeek5AutomationService:
         minute_bar_sources: Mapping[str, Mapping[str, Any]] | None = None,
         minute_capture_summary: Mapping[str, Any] | None = None,
         runtime_context: Mapping[str, Any] | None = None,
+        observed_input_snapshot: Mapping[str, Any] | None = None,
     ) -> dict[str, object]:
         """跑一次尾盘影子链路，使用本轮实时取得的分钟输入。
 
@@ -1754,6 +1783,7 @@ class RuntimeWeek5AutomationService:
                     minute_bars=minute_bars or {},
                     minute_bar_sources=minute_bar_sources or {},
                     runtime_context=runtime_context,
+                    observed_input_snapshot=observed_input_snapshot,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - job 边界：失败可见但不中断主链

@@ -80,6 +80,33 @@ class TrendTailShadowService:
         resolver = getattr(service, "_resolve_evolution_path", None)
         self._report_dir = Path(resolver(raw_dir)) if callable(resolver) else Path(raw_dir)
 
+    def capture_observed_inputs(
+        self,
+        *,
+        timestamp: datetime | None,
+        trade_date: date,
+        watch_pool: Sequence[Mapping[str, Any]],
+        minute_bars: Mapping[str, Any],
+        minute_bar_sources: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """在耗时 pipeline 前固定尾盘观察输入；此快照仍不是全链路 PIT 证明。"""
+        snapshot = write_tail_observed_input_snapshot(
+            self._report_dir,
+            timestamp=timestamp,
+            trade_date=trade_date,
+            contract=self._contract,
+            watch_pool=watch_pool,
+            minute_bars=minute_bars,
+            minute_bar_sources=minute_bar_sources or {},
+        )
+        if snapshot is None:
+            return {
+                "status": "not_persisted",
+                "reason": "capture_time_outside_decision_slot",
+                "full_chain_pit_evidence": False,
+            }
+        return snapshot
+
     def record_night_scan(
         self,
         report: Mapping[str, Any],
@@ -172,6 +199,7 @@ class TrendTailShadowService:
         write_artifacts: bool = True,
         trade_date: date | str | None = None,
         runtime_context: Mapping[str, Any] | None = None,
+        observed_input_snapshot: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """跑一次尾盘确认。
 
@@ -196,8 +224,10 @@ class TrendTailShadowService:
             quote_as_of = timestamp.astimezone(ZoneInfo(str(contract.timezone))).replace(
                 tzinfo=None
             )
-        observed_input: dict[str, Any] | None = None
-        if write_artifacts:
+        observed_input: dict[str, Any] | None = (
+            dict(observed_input_snapshot) if observed_input_snapshot is not None else None
+        )
+        if write_artifacts and observed_input is None:
             try:
                 # 先留存传入的原始决策输入，再做模型加载与逐只确认；后续耗时或失败
                 # 不会让 14:45 的唯一有效输入被 14:55 的日报覆盖。
