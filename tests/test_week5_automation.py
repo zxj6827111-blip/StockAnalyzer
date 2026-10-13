@@ -723,6 +723,7 @@ def test_live_runtime_enables_capture_only_for_scheduled_decision_slot(
         / "2026-10-09"
         / "tail_observed_input_1445.json"
     )
+    context_path = snapshot_path.with_name("tail_runtime_context_1445.json")
     original_run_pipeline = service.run_pipeline
 
     def run_pipeline_after_snapshot(**kwargs: object) -> dict[str, object]:
@@ -752,10 +753,19 @@ def test_live_runtime_enables_capture_only_for_scheduled_decision_slot(
     assert result["pit_runtime_capture"]["status"] == "captured"
     assert result["pit_runtime_capture"]["full_chain_pit_evidence"] is False
     assert result["pit_runtime_capture"]["observed_input_snapshot_status"] == "captured"
+    assert result["pit_runtime_capture"]["runtime_context_snapshot_status"] == "captured"
     saved_snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
     assert saved_snapshot["decision_at"] == "2026-10-09T14:45:15.000000+08:00"
     assert saved_snapshot["full_chain_pit_evidence"] is False
     assert received["observed_input_snapshot"]["path"] == str(snapshot_path.resolve())
+    saved_context = json.loads(context_path.read_text(encoding="utf-8"))
+    assert saved_context["schema"] == "tail_observed_runtime_context_snapshot.v1"
+    assert (
+        saved_context["input_snapshot"]["sha256"]
+        == received["observed_input_snapshot"]["sha256"]
+    )
+    assert saved_context["runtime_context"]["symbols"] == ["600000.SH"]
+    assert saved_context["full_chain_pit_evidence"] is False
 
 
 def test_live_runtime_skips_pipeline_capture_when_minute_collection_started_late(
@@ -844,6 +854,8 @@ def test_live_runtime_reports_when_pipeline_finishes_after_decision_minute(
         / "tail_observed_input_1445.json"
     )
     assert snapshot_path.exists()
+    assert result["pit_runtime_capture"]["runtime_context_snapshot_status"] == "not_persisted"
+    assert not snapshot_path.with_name("tail_runtime_context_1445.json").exists()
 
 
 def test_market_radar_full_market_flag_blocks_manual_run(tmp_path: Path) -> None:

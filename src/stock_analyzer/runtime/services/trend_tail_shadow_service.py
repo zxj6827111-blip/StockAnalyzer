@@ -59,7 +59,10 @@ from stock_analyzer.research.shadow_evidence import (
     summarize_shadow_evidence,
     trace_paths,
 )
-from stock_analyzer.research.tail_observed_inputs import write_tail_observed_input_snapshot
+from stock_analyzer.research.tail_observed_inputs import (
+    write_tail_observed_input_snapshot,
+    write_tail_observed_runtime_context_snapshot,
+)
 
 REPORT_DIR_DEFAULT = "artifacts/runtime/trend_tail_shadow"
 
@@ -106,6 +109,24 @@ class TrendTailShadowService:
                 "full_chain_pit_evidence": False,
             }
         return snapshot
+
+    def capture_runtime_context(
+        self,
+        *,
+        timestamp: datetime | None,
+        trade_date: date,
+        input_snapshot: Mapping[str, Any],
+        runtime_context: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """单独留存按时完成的 pipeline 上下文，绑定之前写入的原始输入快照。"""
+        return write_tail_observed_runtime_context_snapshot(
+            self._report_dir,
+            timestamp=timestamp,
+            trade_date=trade_date,
+            contract=self._contract,
+            input_snapshot=input_snapshot,
+            runtime_context=runtime_context,
+        )
 
     def record_night_scan(
         self,
