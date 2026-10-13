@@ -1354,8 +1354,15 @@ class RuntimeWeek5AutomationService:
         decision_at = scheduled_at
         if runtime_capture_requested:
             decision_at = datetime.now(scheduled_at.tzinfo or UTC)
+        capture_in_slot = (
+            runtime_capture_requested
+            and decision_at.date() == scheduled_at.date()
+            and decision_at.strftime("%H:%M")
+            == str(self._trend_tail_shadow._contract.latest_confirmation_clock)
+        )
 
         runtime_context: dict[str, Any] | None = None
+        runtime_context_snapshot: dict[str, Any] | None = None
         if runtime_capture_requested:
             runtime_context = self._build_tail_runtime_context(
                 scheduled_at=scheduled_at,
@@ -1364,6 +1371,32 @@ class RuntimeWeek5AutomationService:
                 market_snapshot=snapshot,
                 pipeline_report=pipeline_report,
             )
+            if not capture_in_slot:
+                runtime_context_snapshot = {
+                    "status": "not_persisted",
+                    "reason": "pipeline_completed_outside_decision_minute",
+                    "full_chain_pit_evidence": False,
+                }
+            elif str((observed_input_snapshot or {}).get("status", "")) != "captured":
+                runtime_context_snapshot = {
+                    "status": "not_persisted",
+                    "reason": "input_snapshot_not_captured",
+                    "full_chain_pit_evidence": False,
+                }
+            else:
+                try:
+                    runtime_context_snapshot = self._trend_tail_shadow.capture_runtime_context(
+                        timestamp=decision_at,
+                        trade_date=scheduled_at.date(),
+                        input_snapshot=observed_input_snapshot or {},
+                        runtime_context=runtime_context,
+                    )
+                except OSError as exc:
+                    runtime_context_snapshot = {
+                        "status": "failed",
+                        "reason": f"runtime_context_snapshot_write_failed:{type(exc).__name__}",
+                        "full_chain_pit_evidence": False,
+                    }
         actionable = _filter_actionable_rows(
             _mapping_list(pipeline_report.get("actionable_signals"))[:5],
             _mapping_list(pipeline_report.get("signals")),
@@ -1426,27 +1459,36 @@ class RuntimeWeek5AutomationService:
         )
         if runtime_capture_requested:
             capture_report = observed_input_snapshot or {}
-            capture_in_slot = (
-                decision_at.date() == scheduled_at.date()
-                and decision_at.strftime("%H:%M")
-                == str(self._trend_tail_shadow._contract.latest_confirmation_clock)
-            )
+            runtime_context_report = runtime_context_snapshot or {}
             capture_status = str(capture_report.get("status", "not_persisted"))
             capture_reason = str(capture_report.get("reason", ""))
+            runtime_context_status = str(runtime_context_report.get("status", "not_persisted"))
+            runtime_context_reason = str(runtime_context_report.get("reason", ""))
+            if capture_reason:
+                capture_block_reason = capture_reason
+            elif not capture_in_slot:
+                capture_block_reason = "pipeline_completed_outside_decision_minute"
+            elif capture_status != "captured":
+                capture_block_reason = capture_status
+            elif runtime_context_status != "captured":
+                capture_block_reason = runtime_context_reason or runtime_context_status
+            else:
+                capture_block_reason = ""
             report["pit_runtime_capture"] = {
                 "status": (
                     capture_status
-                    if capture_in_slot and capture_status == "captured"
+                    if capture_in_slot
+                    and capture_status == "captured"
+                    and runtime_context_status == "captured"
                     else "blocked"
                 ),
-                "reason": capture_reason or (
-                    "pipeline_completed_outside_decision_minute"
-                    if not capture_in_slot
-                    else capture_status
-                ),
+                "reason": capture_block_reason,
                 "observed_input_snapshot_status": capture_status,
                 "observed_input_snapshot_path": str(capture_report.get("path", "")),
                 "observed_input_snapshot_sha256": str(capture_report.get("sha256", "")),
+                "runtime_context_snapshot_status": runtime_context_status,
+                "runtime_context_snapshot_path": str(runtime_context_report.get("path", "")),
+                "runtime_context_snapshot_sha256": str(runtime_context_report.get("sha256", "")),
                 "decision_at": decision_at.isoformat(),
                 "scheduled_at": scheduled_at.isoformat(),
                 "symbol_count": len(candidates),

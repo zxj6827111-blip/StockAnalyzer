@@ -8,8 +8,10 @@ from zoneinfo import ZoneInfo
 
 from stock_analyzer.contracts.trend_strategy import DEFAULT_TREND_CONTRACT
 from stock_analyzer.research.tail_observed_inputs import (
+    RUNTIME_CONTEXT_SCHEMA,
     SCHEMA,
     write_tail_observed_input_snapshot,
+    write_tail_observed_runtime_context_snapshot,
 )
 
 
@@ -106,3 +108,63 @@ def test_runtime_context_is_saved_but_keeps_candidate_scope_limitation(tmp_path:
     assert payload["runtime_context"] == context
     assert "runtime_context_is_not_per_field_pit_evidence" in payload["limitations"]
     assert payload["full_chain_pit_evidence"] is False
+
+
+def test_runtime_context_sidecar_is_linked_and_only_written_inside_decision_slot(
+    tmp_path: Path,
+) -> None:
+    timestamp = datetime(2026, 10, 9, 14, 45, 20, tzinfo=ZoneInfo("Asia/Shanghai"))
+    input_snapshot = write_tail_observed_input_snapshot(
+        tmp_path,
+        timestamp=timestamp,
+        trade_date=date(2026, 10, 9),
+        contract=DEFAULT_TREND_CONTRACT,
+        watch_pool=[{"symbol": "600000.SH"}],
+        minute_bars={},
+    )
+    assert input_snapshot is not None
+    context = {"schema": "tail_live_runtime_context.v1", "symbols": ["600000.SH"]}
+
+    result = write_tail_observed_runtime_context_snapshot(
+        tmp_path,
+        timestamp=timestamp,
+        trade_date=date(2026, 10, 9),
+        contract=DEFAULT_TREND_CONTRACT,
+        input_snapshot=input_snapshot,
+        runtime_context=context,
+    )
+
+    assert result["status"] == "captured"
+    path = Path(result["path"])
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["schema"] == RUNTIME_CONTEXT_SCHEMA
+    assert payload["capture_scope"] == "candidate_pipeline_runtime_context_only"
+    assert payload["input_snapshot"]["sha256"] == input_snapshot["sha256"]
+    assert payload["runtime_context"] == context
+    assert payload["full_chain_pit_evidence"] is False
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == result["sha256"]
+
+    duplicate = write_tail_observed_runtime_context_snapshot(
+        tmp_path,
+        timestamp=timestamp,
+        trade_date=date(2026, 10, 9),
+        contract=DEFAULT_TREND_CONTRACT,
+        input_snapshot=input_snapshot,
+        runtime_context=context,
+    )
+    assert duplicate == {
+        "status": "blocked",
+        "reason": "runtime_context_snapshot_already_exists",
+    }
+    late = write_tail_observed_runtime_context_snapshot(
+        tmp_path,
+        timestamp=datetime(2026, 10, 9, 14, 46, tzinfo=ZoneInfo("Asia/Shanghai")),
+        trade_date=date(2026, 10, 9),
+        contract=DEFAULT_TREND_CONTRACT,
+        input_snapshot=input_snapshot,
+        runtime_context=context,
+    )
+    assert late == {
+        "status": "not_persisted",
+        "reason": "pipeline_completed_outside_decision_minute",
+    }

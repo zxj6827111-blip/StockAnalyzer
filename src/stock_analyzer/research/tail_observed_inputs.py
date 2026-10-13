@@ -19,6 +19,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 SCHEMA = "tail_observed_input_snapshot.v1"
+RUNTIME_CONTEXT_SCHEMA = "tail_observed_runtime_context_snapshot.v1"
 
 
 def _json_value(value: Any) -> Any:
@@ -155,5 +156,135 @@ def write_tail_observed_input_snapshot(
         "decision_at": payload["decision_at"],
         "input_symbol_count": len(symbols),
         "minute_bar_symbol_count": len(normalized_bars),
+        "full_chain_pit_evidence": False,
+    }
+
+
+def write_tail_observed_runtime_context_snapshot(
+    root: str | Path,
+    *,
+    timestamp: datetime | None,
+    trade_date: date,
+    contract: Any,
+    input_snapshot: Mapping[str, Any],
+    runtime_context: Mapping[str, Any],
+) -> dict[str, Any]:
+    """单独保存按时完成的候选 pipeline 上下文，并绑定预先落盘的原始输入快照。"""
+    if timestamp is None or timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        return {"status": "not_persisted", "reason": "runtime_context_clock_invalid"}
+    try:
+        zone = ZoneInfo(str(contract.timezone))
+        local = timestamp.astimezone(zone)
+    except (KeyError, ValueError):
+        return {"status": "not_persisted", "reason": "runtime_context_timezone_invalid"}
+    if local.date() != trade_date or local.strftime("%H:%M") != contract.latest_confirmation_clock:
+        return {
+            "status": "not_persisted",
+            "reason": "pipeline_completed_outside_decision_minute",
+        }
+    if input_snapshot.get("status") != "captured":
+        return {"status": "not_persisted", "reason": "input_snapshot_not_captured"}
+    if (
+        input_snapshot.get("schema") != SCHEMA
+        or input_snapshot.get("trade_date") != trade_date.isoformat()
+    ):
+        return {"status": "not_persisted", "reason": "input_snapshot_metadata_invalid"}
+
+    root_path = Path(root).resolve()
+    input_path_value = input_snapshot.get("path")
+    expected_input_sha = input_snapshot.get("sha256")
+    if not isinstance(input_path_value, str) or not isinstance(expected_input_sha, str):
+        return {"status": "not_persisted", "reason": "input_snapshot_reference_invalid"}
+    input_path = Path(input_path_value).resolve()
+    if not input_path.is_relative_to(root_path) or not input_path.is_file():
+        return {"status": "not_persisted", "reason": "input_snapshot_path_invalid"}
+    try:
+        input_bytes = input_path.read_bytes()
+    except OSError:
+        return {"status": "not_persisted", "reason": "input_snapshot_unreadable"}
+    if hashlib.sha256(input_bytes).hexdigest() != expected_input_sha:
+        return {"status": "not_persisted", "reason": "input_snapshot_hash_mismatch"}
+    try:
+        input_payload = json.loads(input_bytes)
+        if not isinstance(input_payload, Mapping):
+            raise ValueError("input snapshot payload is not an object")
+        input_clock = datetime.fromisoformat(str(input_payload["decision_at"]))
+        if (
+            input_payload.get("schema") != SCHEMA
+            or input_payload.get("trade_date") != trade_date.isoformat()
+            or input_snapshot.get("decision_at") != input_payload.get("decision_at")
+            or input_clock.tzinfo is None
+            or input_clock.astimezone(zone).date() != trade_date
+            or input_clock.astimezone(zone).strftime("%H:%M")
+            != contract.latest_confirmation_clock
+            or input_clock.astimezone(zone) > local
+        ):
+            raise ValueError("input snapshot clock or metadata mismatch")
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return {"status": "not_persisted", "reason": "input_snapshot_clock_invalid"}
+
+    relative_input_path = input_path.relative_to(root_path).as_posix()
+    payload = {
+        "schema": RUNTIME_CONTEXT_SCHEMA,
+        "capture_mode": "observed_snapshot",
+        "capture_scope": "candidate_pipeline_runtime_context_only",
+        "full_chain_pit_evidence": False,
+        "trade_date": trade_date.isoformat(),
+        "decision_at": local.isoformat(timespec="microseconds"),
+        "captured_at": local.isoformat(timespec="microseconds"),
+        "capture_clock_source": "runtime_pipeline_completion_clock",
+        "input_snapshot": {
+            "path": relative_input_path,
+            "sha256": expected_input_sha,
+        },
+        "runtime_context": _json_value(runtime_context),
+        "limitations": [
+            "covers_only_the_live_runtime_candidate_pool",
+            "does_not_attest_per_field_source_availability_or_imputation_history",
+            "does_not_pass_full_chain_field_pit_audit_by_itself",
+        ],
+    }
+    encoded = (
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    target_root = root_path / "observed_inputs" / trade_date.isoformat()
+    target_root.mkdir(parents=True, exist_ok=True)
+    slot_key = str(contract.latest_confirmation_clock).replace(":", "")
+    target = target_root / f"tail_runtime_context_{slot_key}.json"
+    fd, temporary_name = tempfile.mkstemp(prefix=".tail-context-", suffix=".tmp", dir=target_root)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, target)
+        except FileExistsError:
+            return {"status": "blocked", "reason": "runtime_context_snapshot_already_exists"}
+    finally:
+        temporary.unlink(missing_ok=True)
+
+    directory_fd = os.open(target_root, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    return {
+        "status": "captured",
+        "schema": RUNTIME_CONTEXT_SCHEMA,
+        "path": str(target.resolve()),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "input_snapshot_path": relative_input_path,
+        "input_snapshot_sha256": expected_input_sha,
+        "trade_date": trade_date.isoformat(),
+        "decision_at": payload["decision_at"],
         "full_chain_pit_evidence": False,
     }
