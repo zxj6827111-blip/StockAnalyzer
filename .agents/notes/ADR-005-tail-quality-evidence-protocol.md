@@ -2,7 +2,7 @@
 
 Status: Draft
 
-As-of: 2026-10-12 @ HEAD `5e4fe71fd8962b1bd57271979abb85caf1d52dab`（已核对主 pipeline 的 14:45 候选级运行上下文捕获实现、迟到拒收和定向验证；该提交待 PR / NAS 验证；271 字段仍无完整字段级 PIT 证据；策略仍无合格候选）
+As-of: 2026-10-13 @ HEAD `f51f1dbc5aaeae415db67a2dd39b3b3fc89c94f`（基于当前主线核对 14:45 快照先于耗时 pipeline 持久化、跨槽决策仍阻塞及定向验证；271 字段仍无完整字段级 PIT 证据；策略仍无合格候选）
 
 ## 1. 决策范围
 
@@ -118,8 +118,9 @@ As-of: 2026-10-12 @ HEAD `5e4fe71fd8962b1bd57271979abb85caf1d52dab`（已核对�
   `decision_input` 槽会开启捕获。主 pipeline 为每个候选信号留存 legacy `FeatureEngineer` 最新特征行、
   特征版本和列摘要，并记录应用拿到全部 pipeline 输入的时钟与特征计算时钟；不可覆盖快照另存本轮
   pipeline 报告、候选对应的批量行情行，以及明确标成“上下文”的 `features_light` 候选行。`scheduled_at`
-  与 pipeline 完成后的 `decision_at` 分开，实时行情陈旧度按实际决策时钟计算。若 pipeline 完成时已离开
-  14:45 分钟，采集报告会标为未留档，不把晚到数据伪装成该槽输入。此捕获仍限候选池；provider 仅记录配置链，
+  与 pipeline 完成后的 `decision_at` 分开，实时行情陈旧度按实际决策时钟计算。候选池和分钟行情的原始观察快照
+  在 pipeline 前先行持久化；若 pipeline 完成时已离开 14:45 分钟，整体 PIT 运行捕获仍标为 blocked，晚到的运行上下文
+  不写入该快照，也不把晚到数据伪装成该槽输入。此捕获仍限候选池；provider 仅记录配置链，
   不证明单次响应的实际 fallback 来源；仍缺逐字段供应商发布时间、来源文件 SHA 和字段级可用时钟，故不是
   271 字段 PIT 证据，审计与晋升门继续 fail-closed。
 

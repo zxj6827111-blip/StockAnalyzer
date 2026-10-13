@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import types
 from datetime import UTC, datetime, timedelta
@@ -689,6 +690,7 @@ def test_live_runtime_enables_capture_only_for_scheduled_decision_slot(
     monkeypatch.setattr(automation_module, "datetime", FrozenDateTime)
     service = FakeService(tmp_path)
     automation = RuntimeWeek5AutomationService(service)
+    automation._trend_tail_shadow._report_dir = tmp_path / "shadow"
     scheduled_at = datetime(2026, 10, 9, 14, 45, tzinfo=ZoneInfo("Asia/Shanghai"))
     automation._candidate_state.update(
         {
@@ -714,6 +716,20 @@ def test_live_runtime_enables_capture_only_for_scheduled_decision_slot(
         return {"observed_input_snapshot": {"status": "captured"}}
 
     automation._trend_tail_shadow_report = shadow_report
+    snapshot_path = (
+        tmp_path
+        / "shadow"
+        / "observed_inputs"
+        / "2026-10-09"
+        / "tail_observed_input_1445.json"
+    )
+    original_run_pipeline = service.run_pipeline
+
+    def run_pipeline_after_snapshot(**kwargs: object) -> dict[str, object]:
+        assert snapshot_path.exists()
+        return original_run_pipeline(**kwargs)
+
+    service.run_pipeline = run_pipeline_after_snapshot
     service.pipeline_response = {
         "trace_id": "live-capture-test",
         "signals": [{"symbol": "600000.SH", "decision_trace": {}}],
@@ -735,6 +751,11 @@ def test_live_runtime_enables_capture_only_for_scheduled_decision_slot(
     assert result["decision_at"] == "2026-10-09T14:45:20+08:00"
     assert result["pit_runtime_capture"]["status"] == "captured"
     assert result["pit_runtime_capture"]["full_chain_pit_evidence"] is False
+    assert result["pit_runtime_capture"]["observed_input_snapshot_status"] == "captured"
+    saved_snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    assert saved_snapshot["decision_at"] == "2026-10-09T14:45:15.000000+08:00"
+    assert saved_snapshot["full_chain_pit_evidence"] is False
+    assert received["observed_input_snapshot"]["path"] == str(snapshot_path.resolve())
 
 
 def test_live_runtime_skips_pipeline_capture_when_minute_collection_started_late(
@@ -779,6 +800,7 @@ def test_live_runtime_reports_when_pipeline_finishes_after_decision_minute(
     monkeypatch.setattr(automation_module, "datetime", FrozenDateTime)
     service = FakeService(tmp_path)
     automation = RuntimeWeek5AutomationService(service)
+    automation._trend_tail_shadow._report_dir = tmp_path / "shadow"
     scheduled_at = datetime(2026, 10, 9, 14, 45, tzinfo=ZoneInfo("Asia/Shanghai"))
     automation._candidate_state.update(
         {
@@ -808,11 +830,20 @@ def test_live_runtime_reports_when_pipeline_finishes_after_decision_minute(
     )
 
     assert service.pipeline_calls[0]["capture_pit_inputs"] is True
-    assert result["pit_runtime_capture"]["status"] == "not_persisted"
+    assert result["pit_runtime_capture"]["status"] == "blocked"
+    assert result["pit_runtime_capture"]["observed_input_snapshot_status"] == "captured"
     assert (
         result["pit_runtime_capture"]["reason"]
         == "pipeline_completed_outside_decision_minute"
     )
+    snapshot_path = (
+        tmp_path
+        / "shadow"
+        / "observed_inputs"
+        / "2026-10-09"
+        / "tail_observed_input_1445.json"
+    )
+    assert snapshot_path.exists()
 
 
 def test_market_radar_full_market_flag_blocks_manual_run(tmp_path: Path) -> None:
